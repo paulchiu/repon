@@ -1,0 +1,14 @@
+# Themes correct the terminal's palette rather than replace it
+
+Two coherent theme models exist in the prior art. superfile and yazi treat a theme as a full visual identity: every colour is a fixed hex value, twenty-odd themes ship as ports of Catppuccin and Nord, and the app looks the same in every terminal because it overrides the terminal. gitui, helix's default palette and bat's `ansi` theme treat a theme as a correction layer: the app names ANSI slots and inherits whatever palette the user's terminal already has, and a theme file exists to fix the handful of choices that clash rather than to repaint the screen.
+
+Repon takes the correction layer. The default theme names only the sixteen ANSI colours and `reset`, so it tracks the user's own scheme, which is a considered choice they made once and which a git dashboard has not earned the right to override. A theme file may still name a hex value or a 256-colour index, because forbidding it would stop someone repairing a genuinely broken palette without stopping them ruining a working one.
+
+## Consequences
+
+- Light and dark stop being a problem to solve. The default reads correctly on both backgrounds because it is the user's foreground and their sixteen slots, so Repon detects no background, ships no paired variants and carries no `appearance` key. The cost lands on whoever writes a hex theme: they maintain their own light and dark by editing `theme =`, and Repon will not help.
+- Repon has no look. There will never be a "Repon Catppuccin" screenshot, and the answer to "why does it look different on your machine" is "because your terminal does".
+- Roles are named for meaning and there are only nine of them, so the map from a domain fact to a colour lives in code and in [the theming spec](../spec/theming.md), not in a theme file. A user cannot recolour Gone independently of a failed probe. That is the price of nine keys instead of eighteen and it was paid deliberately.
+- A role is a foreground colour. Backgrounds are absent everywhere except the selected row, because setting a background is how a theme stops inheriting the terminal's background and starts fighting it, which is this decision unwinding one key at a time.
+- A future reader will see nine ANSI names where every comparable tool has forty hex values, and will want to add a bundled theme or two. Doing so is how the identity model arrives by increments.
+- No detection also avoids a hazard specific to Repon. An OSC 11 background probe reads the reply off the same stdin that the event thread reads, so it would have to run once before the terminal is claimed. If pairing is ever wanted, the shape to copy is tuicr's `theme_dark`/`theme_light` plus `appearance`, the probe is `terminal-colorsaurus`, and it runs before the alternate screen or not at all.

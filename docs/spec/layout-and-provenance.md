@@ -52,7 +52,7 @@ The detail pane always reports provenance per cell, which is the escape hatch fr
 
 ## Open
 
-- The exact palette belongs to the theming decision. The prototype's colour roles are input to that decision: dim for unresolved values and for known zeros, an accent colour for loading and for Worktree names, red for failed and for Gone, green for ahead, magenta for behind, yellow for Dirty and for Local only.
+- The palette is settled in [theming.md](theming.md): nine roles named for meaning, defaulting to the terminal's own ANSI slots. The prototype's colour roles carried over intact, so dim still marks unresolved values and known zeros, the accent still marks loading and Worktree names, and Gone, ahead, behind and Dirty keep the colours the prototype gave them.
 - The refresh model behind progressive fill. A benchmark of the git backend measured opening a Repo and reading its branch at about 10ms and reading its status at about 94ms at the median, so a row paints its branch almost immediately and fills in status progressively; how that becomes a refresh model is decided in [Decide the refresh model](https://github.com/paulchiu/repon/issues/7).
 
 ## Screens
