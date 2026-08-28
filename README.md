@@ -8,7 +8,17 @@ Repon owns the outer loop: the combined state of many Repos, and acting on many 
 
 ## Status
 
-Pre-alpha. There is no code yet. The design decisions needed to start building are being recorded as ADRs in [docs/adr/](docs/adr/), backed by the research in [docs/research/](docs/research/).
+Pre-alpha. The skeleton compiles and runs: it starts, draws a frame and exits, with the git backend and the worker model wired underneath but no features on top of them. The design decisions needed to build those features are being recorded as ADRs in [docs/adr/](docs/adr/) and specifications in [docs/spec/](docs/spec/), backed by the research in [docs/research/](docs/research/).
+
+## Building
+
+Needs a Rust toolchain that supports edition 2024.
+
+```sh
+cargo run -p repon
+```
+
+The workspace is two crates. `crates/repon-core` computes state and knows nothing about rendering; `crates/repon` is the terminal interface and, for now, its only consumer. The boundary between them is [ADR 0005](docs/adr/0005-rendering-agnostic-core.md), and it exists so that a second consumer can never become a second interface stack.
 
 ## Design principles
 
@@ -34,6 +44,7 @@ superfile and lazygit are both MIT licensed. Repon takes ideas from all three, a
 
 - [CONTEXT.md](CONTEXT.md): the project glossary. Terms like Repo, Worktree, Set, Filter, Selection, Launcher and Action are used in their defined senses throughout this repo.
 - [docs/adr/](docs/adr/): architecture decision records.
+- [docs/spec/](docs/spec/): the specifications those decisions point at.
 - [docs/research/](docs/research/): the research the decisions rest on.
 
 ## Licence

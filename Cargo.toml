@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/repon", "crates/repon-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/paulchiu/repon"
+
+[workspace.dependencies]
+crossbeam-channel = "0.5.16"
+repon-core = { path = "crates/repon-core" }
+
+# Read the optimization guideline for more details:
+# https://ratatui.rs/recipes/apps/release-your-app/#optimizations
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
