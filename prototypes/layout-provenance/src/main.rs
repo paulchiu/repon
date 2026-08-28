@@ -18,7 +18,8 @@ use variants::{cells, header, widths, Palette, RowState, Variant};
 
 /// Below this the detail pane takes the whole frame instead of sitting beside the list.
 const NARROW_COLS: u16 = 100;
-/// Worker pool depth, so early ticks show rows that have not been probed yet.
+/// Worker pool depth. A queued row reads as Loading, never as Unknown: nothing has
+/// been asked yet, so there is no answer to be missing.
 const WORKERS: u64 = 8;
 const START_STAGGER_MS: u64 = 55;
 
@@ -84,7 +85,7 @@ impl App {
         let failed = e.settled.fails;
 
         let branch = match phase(fast_at) {
-            Phase::NotStarted => Prov::Unknown,
+            Phase::NotStarted => Prov::Loading,
             Phase::Loading => Prov::Loading,
             Phase::Restaling => match e.settled.branch {
                 Some(b) => Prov::Stale(b.to_string(), stale_age(fast_at)),
@@ -103,7 +104,7 @@ impl App {
             e.settled.sync.map(Some)
         };
         let sync = match phase(slow_at) {
-            Phase::NotStarted => Prov::Unknown,
+            Phase::NotStarted => Prov::Loading,
             Phase::Loading => Prov::Loading,
             Phase::Restaling => match sync_settled {
                 Some(v) => Prov::Stale(v, stale_age(slow_at)),
@@ -117,7 +118,7 @@ impl App {
         };
 
         let dirty = match phase(slow_at) {
-            Phase::NotStarted => Prov::Unknown,
+            Phase::NotStarted => Prov::Loading,
             Phase::Loading => Prov::Loading,
             Phase::Restaling => match e.settled.dirty {
                 Some(v) => Prov::Stale(v, stale_age(slow_at)),
@@ -133,7 +134,7 @@ impl App {
         let state = match e.settled.state {
             None => Prov::Unknown,
             Some(s) => match phase(slow_at) {
-                Phase::NotStarted => Prov::Unknown,
+                Phase::NotStarted => Prov::Loading,
                 Phase::Loading => Prov::Loading,
                 Phase::Restaling => Prov::Stale(s, stale_age(slow_at)),
                 Phase::Arrived(at) => match failed {
@@ -554,6 +555,24 @@ fn snapshot() -> Result<(), Box<dyn std::error::Error>> {
             true,
         ),
         ("A list only, 88x24", 88, 24, 12_000, Variant::Glyph, false),
+        ("B first frame, 140x24", 140, 24, 40, Variant::Gutter, false),
+        (
+            "B detail beside list, 140x24",
+            140,
+            24,
+            12_000,
+            Variant::Gutter,
+            true,
+        ),
+        (
+            "B detail full frame, 88x24",
+            88,
+            24,
+            12_000,
+            Variant::Gutter,
+            true,
+        ),
+        ("B list only, 88x24", 88, 24, 12_000, Variant::Gutter, false),
     ];
     for (title, w, h, ms, v, detail) in shots {
         let mut app = App::new();
