@@ -22,11 +22,13 @@ One keystroke reaches lazygit, an editor, or a shell in the Repo under the curso
 
 ## Prior art
 
+Repon's problem statement comes from mrx, a multi-repo tool I forked, extended, and still use daily. mrx established that the outer loop is worth a tool of its own, and its recorded rough edges are the direct source of Repon's design principles: a screen whose columns disagreed with each other, mode changes that never announced themselves, and absent values that rendered as zero. Those became per-cell provenance and the feedback rules. mrx carries no licence and is entangled with work configuration, so Repon takes only the problem from it. Its source is not consulted while building, and every solution here is re-derived (see [the mrx research](<docs/research/2026-08-28 mrx history and requirements (clean room).md>) and [ADR 0003](docs/adr/0003-clean-room-from-mrx.md)).
+
 Repon takes its visual language from [superfile](https://github.com/yorukot/superfile): bordered panels, restrained colour, calm spacing, and the philosophy of picking a narrow lane and polishing it (see [the superfile research](<docs/research/2026-08-28 superfile design philosophy.md>)).
 
 It takes its interaction structure from [lazygit](https://github.com/jesseduffield/lazygit): context-sensitive keybindings, an always-visible footer, and a Selection that drives a detail pane (see [the lazygit research](<docs/research/2026-08-28 lazygit workflow UX and the multi-repo gap.md>)).
 
-Both are MIT licensed. Repon takes ideas from them, not code.
+superfile and lazygit are both MIT licensed. Repon takes ideas from all three, and code from none.
 
 ## Documents
 
