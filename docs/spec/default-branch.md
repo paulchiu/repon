@@ -17,7 +17,7 @@ Tried in order, first answer wins.
 | 3 | `<remote>/main`, then `<remote>/master`, then `<remote>/trunk` | yes |
 | 4 | Unknown | |
 
-Rung 1's shape (a table keyed by path, a Set-level default, or both) belongs to [Design the config schema](https://github.com/paulchiu/repon/issues/9). This spec fixes only that the rung exists and sits at the top.
+Rung 1's shape is settled in [the config spec](config.md): a `[[repo]]` entry with a `path` and a `default_branch`, matched by git common dir so one entry covers a Repo and all of its linked Worktrees, and no Set-level default. That keys rung 1 the same way the rest of this chain is already memoised.
 
 Not in the chain, and deliberately: `init.defaultBranch`, which records what the machine that ran `git init` was configured with and says nothing about a clone; `remote.origin.HEAD`, which is not a git config key and appeared in 0 of 409 measured entities; and local branch names, which resolved one measured Repo incorrectly because its only local branch was `master` while its default was `main`.
 

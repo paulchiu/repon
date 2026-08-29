@@ -71,15 +71,16 @@ Merge the parsed keys over the compiled-in default, so a theme file names only w
 | Unparseable colour value | Warn and keep the compiled default for that one key |
 | Malformed TOML | Warn and use the compiled default entirely; there are no keys left to merge |
 | `--theme` names a theme that does not exist | Exit non-zero before the terminal is claimed |
+| `theme` in `config.toml` names a theme that does not exist | Warn and use the compiled default. A flag is a thing typed moments ago; a file is a thing you have to go and fix |
 
-Warnings are reported twice, because a TUI has taken the alternate screen and `eprintln!` goes nowhere a user will ever see. The detail goes to `repon.log`. The screen carries one persistent word in the status bar, `theme: 2 warnings`, until dismissed. A theme that silently half-applied is the same class of quiet lie that per-cell provenance exists to prevent ([0001](../adr/0001-per-cell-provenance.md)).
+Warnings are reported twice, because a TUI has taken the alternate screen and `eprintln!` goes nowhere a user will ever see. The detail goes to `repon.log`. The screen carries one persistent warning slot in the status bar until dismissed. That slot is shared: [the config spec](config.md) amends this to one slot showing the most severe outstanding condition, expanding to a list on a keystroke, because config warnings and an abandoned discovery would otherwise each want their own word. A theme that silently half-applied is the same class of quiet lie that per-cell provenance exists to prevent ([0001](../adr/0001-per-cell-provenance.md)).
 
 ## Selection and resolution
 
 Mirrors tuicr, so two of the same person's tools do not disagree about where a theme lives.
 
 - `theme = "name"` in `config.toml`, overridden by `--theme <name>`.
-- A theme file is `themes/<name>.toml` in a directory beside `config.toml`. Where that directory actually sits is [Design the config schema](https://github.com/paulchiu/repon/issues/9)'s to settle: the skeleton currently resolves `ProjectDirs::config_local_dir()`, which on macOS is `~/Library/Application Support/repon`, while tuicr uses `~/.config/tuicr` for config and Application Support for data.
+- A theme file is `themes/<name>.toml` in a directory beside `config.toml`, which [the config spec](config.md) settles at `~/.config/repon/themes/` on macOS as well as Linux. State and the log stay in the platform data directory, the same split tuicr uses.
 - `default` is reserved for the compiled-in theme. `theme = "default"` always means the real default, and a `themes/default.toml` is ignored with a warning. With no other bundled themes, `default` is the entire reserved set.
 
 The theme is read at startup and read again on resume, both from a Launcher returning ([0007](../adr/0007-launchers-are-argv-vectors.md)) and from SIGTSTP. Resume is the one moment the file plausibly changed, since a user can open their theme in `$EDITOR` from inside Repon, and the reload costs a file read on a path already doing a full redraw. There is no filesystem watch and no runtime `:theme` command, because with one bundled theme there is nothing to switch to.
@@ -88,7 +89,7 @@ The theme is read at startup and read again on resume, both from a Launcher retu
 
 [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) rests on the gutter glyphs and the value glyphs being disjoint sets, and records that the first draft broke that contract by rendering both Unknown and a clean Worktree as `·`. A theme file that could set glyphs would let a user reintroduce that defect in their own config, and the blank-cell contract would stop holding silently. Disjointness is a correctness property, not taste, and no flat TOML schema can express "these two sets must not intersect" to someone editing it.
 
-There is one capability axis instead: a `glyphs = "full" | "ascii"` key that swaps the whole set, with `full` asserting that the terminal's font carries box drawing (U+2500), braille (U+2800) and the arrows and bullet in the value set, and `ascii` selecting a second set vetted for disjointness by the same rule. One switch, two vetted sets, no way to mix them. It describes the terminal rather than the user's taste and must survive a change of theme, so it belongs in `config.toml` and not in a theme file; its exact placement is [Design the config schema](https://github.com/paulchiu/repon/issues/9)'s.
+There is one capability axis instead: a `glyphs = "full" | "ascii"` key that swaps the whole set, with `full` asserting that the terminal's font carries box drawing (U+2500), braille (U+2800) and the arrows and bullet in the value set, and `ascii` selecting a second set vetted for disjointness by the same rule. One switch, two vetted sets, no way to mix them. It describes the terminal rather than the user's taste and must survive a change of theme, so it belongs in `config.toml` and not in a theme file, where [the config spec](config.md) puts it as a bare top-level key beside `theme`.
 
 ## The two palettes
 

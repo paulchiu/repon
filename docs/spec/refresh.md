@@ -50,6 +50,8 @@ Discovery re-runs at the start of every generation, because warm boundary-stop d
 
 The deep walk that also finds Submodules costs 11.4 seconds for 441 entities against 0.019 seconds for 403, a 575x difference. If [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13) chooses it, discovery leaves the refresh path and becomes its own gesture. That number is this spec's input to that ticket.
 
+Discovery is bounded by time rather than by any config key. At one second still walking it warns, naming the directory count reached; at thirty seconds it is abandoned, and an abandoned discovery leaves the refresh path and becomes manual until a Set's `roots` change, because a thirty second walk at the head of every generation is not a degraded mode. The bounds are specified in [the config spec](config.md).
+
 ## The poll
 
 Nothing watches the filesystem ([0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)). Between generations a metadata sweep runs every `refresh.poll_interval` (default 2 seconds), stat-ing `HEAD`, `index`, `packed-refs` and `refs/` in each entity's own gitdir. Cost across all 441 entities: 1.79ms single-threaded, 0.72ms in parallel, so it runs single-threaded and off the render path.
@@ -137,11 +139,11 @@ A finished fetch starts a normal generation, so the new behind counts arrive thr
 
 | key | default | meaning |
 | --- | --- | --- |
-| `refresh.poll_interval` | 2s | Metadata sweep cadence between generations; 0 disables the poll |
-| `refresh.status_stale_after` | 5m | Age at which phase C cells go Stale |
-| `refresh.on_focus` | true | Start a generation on terminal focus gained |
-| `fetch.enabled` | false | The periodic fetch |
-| `fetch.interval` | 5m | Cadence of the periodic fetch |
-| `fetch.concurrency` | 4 | Concurrent fetches in flight |
+| `refresh.poll_interval` | `"2s"` | Metadata sweep cadence between generations; `"0s"` disables the poll |
+| `refresh.status_stale_after` | `"5m"` | Age at which phase C cells go Stale |
+| `refresh.on_focus` | `true` | Start a generation on terminal focus gained |
+| `fetch.enabled` | `false` | The periodic fetch |
+| `fetch.interval` | `"5m"` | Cadence of the periodic fetch |
+| `fetch.concurrency` | `4` | Concurrent fetches in flight |
 
-Naming and nesting belong to [Design the config schema](https://github.com/paulchiu/repon/issues/9); this spec fixes the behaviours and the defaults. Disabling the poll does not remove `~`, since the status age threshold and the Launcher return still produce it.
+Naming and nesting are settled in [the config spec](config.md): `[refresh]` and `[fetch]` are tables, and every duration is a humantime string. The disable value is amended from `0` to `"0s"`, since `humantime-serde` rejects a bare TOML integer. Disabling the poll does not remove `~`, since the status age threshold and the Launcher return still produce it.
