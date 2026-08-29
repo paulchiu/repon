@@ -52,7 +52,7 @@ A user-defined command fanned out across the Selection. Discoverable through a p
 Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag.
 
 **Merged**:
-The branch is an ancestor of the Repo's default branch. The work has landed.
+The branch's work has landed in the Repo's default branch, either because the branch is an ancestor of it or because its changes are present there by patch equivalence.
 
 **Gone**:
 The upstream tracking branch no longer exists on the remote, typically after a squash-merged PR.

@@ -1,3 +1,7 @@
 # Worktrees have four exclusive states plus Dirty, and rebase is report-only
 
 Worktrees are the second-largest entity class (163 measured against 259 repos), so they are first class, with four mutually exclusive states, Merged, Gone, Local only and Active, plus the orthogonal Dirty flag (defined in [CONTEXT.md](../../CONTEXT.md)). Merged, Gone and Local only are three distinct states rather than one "stale" bucket because they imply different actions (Merged is safe to sweep, Gone probably landed via a squash merge, Local only was never pushed and is never safe to sweep); collapsing them is how you lose code. When Repon updates a default branch it reports which Worktrees are now behind but does not rebase them, per the narrowest-safe-operation rule ([0002](0002-repon-owns-the-outer-loop-only.md)): automatic action means the narrowest safe operation or none.
+
+## Amended by 0012
+
+Merged is no longer defined by ancestry alone. A squash-merged branch is never an ancestor of the default branch, so ancestry cannot see it, and on a Repo that squash-merges everything Merged would be dead while every landed branch arrived as Gone. Merged is now "the work has landed", proven by ancestry or by patch equivalence, and Gone is what remains: the upstream vanished and neither proof showed the work landed. Both states are sharper for it, since Gone is now the case worth looking at before sweeping rather than a mixed bag of squash merges and abandoned PRs. See [0012](0012-the-default-branch-is-a-remote-tracking-ref.md).

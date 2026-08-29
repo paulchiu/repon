@@ -12,7 +12,9 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 
 ## The list
 
-Columns are left-packed rather than right-aligned to the frame edge: name 28, branch 24, sync 9, dirty 6, state 10, then a filler column absorbing the slack. The one-character gutter precedes the name and carries the row's least-settled provenance state.
+Columns are left-packed rather than right-aligned to the frame edge: name 28, branch 24, sync 9, base 6, dirty 6, state 10, then a filler column absorbing the slack. With the gutter and single-space gaps that is 90 columns before the filler. The one-character gutter precedes the name and carries the row's least-settled provenance state.
+
+`sync` compares a branch against its upstream and `base` compares it against the Repo's default branch. They are different measurements, they coincide only on the default branch's own row, and they are separate provenance cells because they fail independently. `base` is specified in [default-branch.md](default-branch.md).
 
 Gutter glyphs:
 
@@ -31,15 +33,18 @@ In-cell glyphs for real values:
 | `≡` | in sync |
 | `·` | clean |
 | `-` | no upstream |
+| `∅` | the Repo has no remote at all |
 | `↑n` | ahead by n |
 | `↓n` | behind by n |
 | `●n` | n changed files |
+
+`-` and `∅` are different facts: `-` means you could push and have not, `∅` means there is nowhere to push. `∅` appears on the Repo row and on all of its Worktree rows, since none of them can have an upstream.
 
 The two sets stay disjoint: no provenance mark may share a glyph with a real value (see the [ADR](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)).
 
 ## Provenance
 
-Every value carries one of the five states from [0001](../adr/0001-per-cell-provenance.md). Fresh renders the value plainly behind a space in the gutter. Loading leaves the cell blank behind the row's spinner; on a re-probe the cell holds its previous value rendered as Stale instead of dropping back to Loading. Stale marks the row `~`. Unknown, marked `?`, is reserved for the settled answer "we asked and got nothing back"; a row whose probe has not started yet is Loading. Failed marks the row `!`. Worktree state has no meaning for a Repo, so that cell is not applicable: it renders blank and is excluded from the row summary. The ADR carries the reasoning for each of these.
+Every value carries one of the five states from [0001](../adr/0001-per-cell-provenance.md). Fresh renders the value plainly behind a space in the gutter. Loading leaves the cell blank behind the row's spinner; on a re-probe the cell holds its previous value rendered as Stale instead of dropping back to Loading. Stale marks the row `~`. Unknown, marked `?`, is reserved for the settled answer "we asked and got nothing back"; a row whose probe has not started yet is Loading. Failed marks the row `!`. Worktree state has no meaning for a Repo, so that cell is not applicable: it renders blank and is excluded from the row summary. `base` is not applicable on the same terms in two cases, on a row whose branch is itself the default branch, where it would only repeat `sync`, and on a Repo with no remote, where a `?` would report a settled fact as a missing one. The ADR carries the reasoning for each of these.
 
 ## The detail pane
 
@@ -57,7 +62,7 @@ The detail pane always reports provenance per cell, which is the escape hatch fr
 
 ## Screens
 
-These snapshots were generated from the prototype; colour does not survive the dump. The bottom row in each is the prototype's variant switcher, which is scaffolding rather than part of the design.
+These snapshots were generated from the prototype; colour does not survive the dump. The bottom row in each is the prototype's variant switcher, which is scaffolding rather than part of the design. They predate the `base` column and the `∅` glyph, so read them for the gutter and blank-cell behaviour they were made to settle rather than as the current column set.
 
 ### First frame, 140x24
 
