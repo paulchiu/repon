@@ -36,7 +36,7 @@ _Avoid_: Group, workspace, project
 A transient predicate that narrows the visible rows. A Filter never mutates the Selection.
 
 **Selection**:
-The Repos an operation will act on. An empty Selection means the row under the cursor, never nothing.
+The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.
 
 ### Acting
 
@@ -54,6 +54,9 @@ One look at the world: Repon re-reads the state of the Repos it knows about. A R
 
 **Generation**:
 One Refresh, named so a newer one can beat an older one still in flight. Every value on screen carries the Generation that produced it, which is how a slow answer to an old question is recognised and dropped.
+
+**Vanished**:
+A Repo or Worktree an earlier Refresh found and the current one did not. It keeps its last known values until the user dismisses it, so nothing leaves the list silently.
 
 ### Worktree state
 

@@ -291,5 +291,5 @@ args = ["pnpm", "install"]
 
 - The keys and gestures: [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12).
 - The walk itself: [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
-- Where the config types sit in the core: [Define the core library's API boundary](https://github.com/paulchiu/repon/issues/10).
+- Where the config types sit in the core: settled in [the core API spec](core-api.md). The core never reads a file. Everything in this spec is parsed on the consumer's side, which hands the core a Set as a bounding specification, the per-Repo overrides, and the three durations, and keeps the theme, the glyphs, the Launchers, the Actions and all four failure grades to itself.
 - Action execution: the run pane, output capture, partial failure and cancellation.

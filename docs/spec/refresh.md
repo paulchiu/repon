@@ -4,7 +4,7 @@ Everything on screen is a claim about a world that moves. This spec says when Re
 
 ## A refresh is a generation
 
-One refresh is one generation, identified by a monotonic counter. Every job dispatched carries its generation, and so does every result. Generations exist so that a newer refresh can beat an older one that is still draining. They are not a cache, and nothing about a generation is written to disk ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Where the counter and the per-entity results sit in the core's types belongs to [Define the core library's API boundary](https://github.com/paulchiu/repon/issues/10).
+One refresh is one generation, identified by a monotonic counter. Every job dispatched carries its generation, and so does every result. Generations exist so that a newer refresh can beat an older one that is still draining. They are not a cache, and nothing about a generation is written to disk ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Where the counter and the per-entity results sit in the core's types is settled in [the core API spec](core-api.md): the core owns the table and is the only code that applies the comparison below.
 
 ## Triggers
 
@@ -78,6 +78,8 @@ The misses are acceptable for specific reasons. The three working-tree cases are
 
 Staleness is evidence-driven where evidence exists and age-driven only where it does not. Branch, `sync` and `base` have the poll behind them, so they go Stale when the poll sees movement and never on a clock: Fresh for those cells means something checked two seconds ago. The phase C cells have no cheap detector, because an unstaged edit touches nothing in the gitdir, so they go Stale after `refresh.status_stale_after` (default 5 minutes).
 
+Both paths write the same stored flag on the cell, so a consumer never sees the threshold and rendering stays a total function of the state rather than a function of the state plus a config value. [The core API spec](core-api.md) carries the type.
+
 There is no global clock-driven staleness, because a table that turns `~` everywhere on a timer carries no information. Age itself lives in the detail pane, spelled out in words.
 
 ## What the gutter and the cells show
@@ -92,6 +94,8 @@ A newer generation supersedes an older one per entity, not globally. For every e
 
 The comparison happens at the point of writing the cell, not at the channel: each cell records the generation that last wrote it, and a result whose generation is lower is dropped. This is what stops a slow generation-1 result overwriting a fast generation-2 one for the same cell.
 
+Read that literally. The comparison is against the generation recorded on the cell being written, never against a global current generation. After a refresh scoped to the Selection, an entity the new generation did not cover is still on the older one and its results are still accepted, so a global check would strand exactly the rows a Selection refresh never spoke for.
+
 ## Cancellation
 
 An abandoned generation is cancelled, not merely discarded. Measured: cancelling brings the next generation to 1.04 times a cold run, and leaving the old one to finish costs 1.79 times, because both contend for the same cores.
@@ -105,6 +109,10 @@ gix checks the flag once per index entry, so one Repo stops in 0.5 to 0.9ms, and
 There is no per-cell timeout. A rayon task cannot be pre-empted, so a per-cell deadline could only mark a cell while the work carried on underneath it, and a probe that is still running has not asked and got nothing back, which is what Unknown means under [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md). Instead a generation is cancelled after 30 seconds, comfortably clear of the measured 4.4 second full probe, and every cell still Loading in that generation becomes Unknown at that moment.
 
 Unknown carries a reason, which the detail pane reports in words: timed out, no upstream, no default branch, no remote. All of them render `?` in the gutter.
+
+## Whose clocks these are
+
+The poll, the generation deadline and the status age threshold all belong to the core, which is what makes [the core API spec](core-api.md)'s constructor `Core::start` rather than `Core::new`. The poll and the deadline share one dedicated thread, since a 1.79ms sweep every two seconds does not earn a pool, and probes stay on rayon's global pool as below. Nothing here belongs to the render loop, which is why the terminal interface can be suspended without any of it being rescheduled.
 
 ## The fan-out shape
 

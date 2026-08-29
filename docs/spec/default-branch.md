@@ -57,7 +57,7 @@ Rung 3 runs even when rung 2 answers, and a disagreement between them is recorde
 
 This is not redundancy. Validation catches a dangling `origin/HEAD`, and the measured population has none. The failure that actually occurs is stale-but-resolvable: the ref exists, resolves cleanly, and is out of date, and no local inspection can detect it. A sweep of 220 common dirs against their remotes found 7 such Repos; on the one visible Repo among them, rung 3 disagreed with rung 2 and was right.
 
-The disagreement surfaces in the detail pane, not in the list. `origin/HEAD` still wins.
+The disagreement surfaces in the detail pane, not in the list. `origin/HEAD` still wins. It lives on the entity beside the cells rather than in one, along with the rung that answered and the reason resolution stopped, because none of the three is a value with its own provenance; [the core API spec](core-api.md) calls that field the diagnostics.
 
 The ceiling is stated rather than engineered around: on the six hidden Submodules in that sweep, both rungs agreed and both were wrong, because the true default was `qmk-master`. No local signal exists for that case, and only the network closes it.
 
