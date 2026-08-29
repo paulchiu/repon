@@ -132,11 +132,12 @@ Every child, Launcher or Action step, receives:
 | `REPON_REPO_NAME` | The entity's name as shown in the list | |
 | `REPON_COMMON_DIR` | The git common dir | The same for a Repo and all of its Worktrees |
 | `REPON_KIND` | `repo`, `worktree` or `submodule` | |
-| `REPON_BRANCH` | The current branch | |
+| `REPON_BRANCH` | The current branch | Unset on a detached HEAD, which has none ([head.md](head.md)) |
+| `REPON_HEAD` | The resolved commit id of HEAD | Absent on an unborn HEAD, which has none |
 | `REPON_DEFAULT_BRANCH` | The resolved default branch | |
 | `REPON_ACTION` | The Action's name | Actions only, absent for a Launcher |
 
-An Unknown or Not applicable value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher. Not applicable matters on a Submodule row, where `base` and the default branch are settled facts rather than missing ones, and setting the variable would substitute a default branch [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records as wrong there.
+An Unknown or Not applicable value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher. Not applicable matters on a Submodule row, where `base` and the default branch are settled facts rather than missing ones, and setting the variable would substitute a default branch [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records as wrong there. It matters again on `REPON_BRANCH`, which would otherwise carry an object id on 121 of the 163 measured Worktrees, so `git push -u origin "$REPON_BRANCH"` in a `shell = true` step would push a sha as a branch name; `REPON_HEAD` is where a step that wants the commit goes ([head.md](head.md)).
 
 Repon unsets all fifteen of git's local environment variables from every child: `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_OBJECT_DIRECTORY`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_GRAFT_FILE`, `GIT_INDEX_FILE`, `GIT_NO_REPLACE_OBJECTS`, `GIT_REPLACE_REF_BASE`, `GIT_PREFIX`, `GIT_SHALLOW_FILE`, `GIT_COMMON_DIR`. That is the output of `git rev-parse --local-env-vars` on git 2.50.1, and git's own hook documentation instructs a caller to clear them before running git against another repository.
 

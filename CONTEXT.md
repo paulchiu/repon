@@ -60,7 +60,7 @@ A Repo or Worktree an earlier Refresh found and the current one did not. It keep
 
 ### Worktree state
 
-Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag.
+Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag. A Worktree at a detached HEAD has no branch, so only Merged stays provable and the other three do not apply.
 
 **Merged**:
 The branch's work has landed in the Repo's default branch, either because the branch is an ancestor of it or because its changes are present there by patch equivalence.

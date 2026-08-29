@@ -5,3 +5,7 @@ Worktrees are the second-largest entity class (163 measured against 259 repos), 
 ## Amended by 0012
 
 Merged is no longer defined by ancestry alone. A squash-merged branch is never an ancestor of the default branch, so ancestry cannot see it, and on a Repo that squash-merges everything Merged would be dead while every landed branch arrived as Gone. Merged is now "the work has landed", proven by ancestry or by patch equivalence, and Gone is what remains: the upstream vanished and neither proof showed the work landed. Both states are sharper for it, since Gone is now the case worth looking at before sweeping rather than a mixed bag of squash merges and abandoned PRs. See [0012](0012-the-default-branch-is-a-remote-tracking-ref.md).
+
+## Amended by 0019
+
+The four states survive untouched and the classification rule changes. Merged is provable from a commit and a default branch, which [0012](0012-the-default-branch-is-a-remote-tracking-ref.md) already established and which needs no branch name, while Gone, Local only and Active each need an upstream. A Worktree at a detached HEAD has no branch to carry one, so its `state` cell is Merged when the proof succeeds and Not applicable when it does not, which the existing `Cell<WorktreeState>` expresses without a fifth state. This is not a corner: 121 of the 163 measured Worktrees are detached, and computing Merged on them takes the `state` column from 42 to 96 of 403 rows carrying a value. See [0019](0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md).

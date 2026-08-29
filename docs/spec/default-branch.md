@@ -104,7 +104,9 @@ Two constraints:
 
 ## Two passes on screen
 
-Ancestry resolves inside the cheap pass. Patch equivalence costs roughly 130ms per branch, and the load falls almost entirely on Worktree branches, since a Repo row is usually on the default branch itself and settles free on an object-id equality check. That is about 163 branches in the measured population: 21 seconds serial, under 2 seconds parallel.
+Ancestry resolves inside the cheap pass. Patch equivalence costs roughly 130ms per branch, and the load falls almost entirely on Worktree branches, since a Repo row is usually on the default branch itself and settles free on an object-id equality check. That is 176 entities in the measured population, 11 Repos, 42 attached Worktrees and 123 detached ([head.md](head.md)): 21 seconds serial, under 2 seconds parallel, and only with the memoisation below.
+
+The pass is memoised per git common dir. Its expensive half, the patch-ids of the default branch since the merge base, depends only on the common dir and the deepest merge base under it, and the 123 detached entities sit in 14 distinct common dirs with 110 of them in three. Computing that half once per common dir takes the pass from 321 seconds to 20.7 seconds serial, 10.67 seconds over 14 shared scans plus 10.04 seconds over 123 per-entity diffs at 82ms each. The 130ms per branch above is unreachable without it. It is keyed the way the `origin/HEAD` read already is, per common dir per Generation.
 
 The state cell stays **blank and Loading** for any branch where ancestry says no, until the second pass answers. It never shows `Gone` and then flips to `Merged`. A cell that changes value under the reader is a screen contradicting itself, which is the defect [0001](../adr/0001-per-cell-provenance.md) exists to prevent, and the blank-cell contract already covers "no value here yet, the gutter says why".
 
@@ -125,9 +127,13 @@ They coincide only when a branch's upstream *is* the default branch, which is th
 
 `base` is **not applicable**, rendering blank and excluded from the row summary, in two cases: on a row whose branch is itself the default branch, where it would duplicate `sync`; and on any Repo with no remote, where it would otherwise hold all 17 such Repos permanently at `?` over a fact that is settled rather than missing. Not applicable is the sixth case already named in [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md), the same rule that blanks Worktree state on a Repo row.
 
+A detached row is neither case, so `base` computes: measured on 125 of 125 detached entities, median 46 behind, p90 286, max 530. On the 4 jj colocated Repos in the population that makes `base` live and non-zero where a Repo row is normally exempt, because the exemption is about a row whose branch is the default branch and a detached row has no branch ([head.md](head.md)).
+
 ## Glyphs
 
-One addition to the value set: `∅` in the `sync` cell means the Repo has **no remote at all**, distinct from `-`, which stays "this branch has no upstream". Different facts: `-` means you could push and have not, `∅` means there is nowhere to push. It appears on the Repo row and on all of its Worktree rows, since none of them can have an upstream.
+One addition to the value set: `∅` in the `sync` cell means the Repo has **no remote at all**, distinct from `-`, which means nothing is configured to compare this row against. Different facts: `∅` means there is nowhere to push, `-` means there is nowhere named to push to. `∅` appears on the Repo row and on all of its Worktree rows, since none of them can have an upstream.
+
+`-` covers two causes and cannot gloss either as "you could push and have not": a branch with no upstream, and a row with no branch at all. The second is the larger population, all 16 Submodule rows already on screen and the 121 detached Worktrees [head.md](head.md) covers, and there is nothing to push there, because pushing a detached HEAD means naming a refspec.
 
 `∅` is disjoint from both the value set (`≡`, `·`, `-`, `↑n`, `↓n`, `●n`) and the gutter set (space, `~`, `?`, spinner, `!`), which is the rule [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) holds. It is an ambiguous-width character, as `≡`, `·`, `↑` and `↓` already are, and the `glyphs = "ascii"` switch in [theming.md](theming.md) covers terminals that cannot draw it.
 

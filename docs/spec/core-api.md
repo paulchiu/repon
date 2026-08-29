@@ -77,17 +77,15 @@ What [layout-and-provenance.md](layout-and-provenance.md) renders from each shap
 ### Unknown's reasons
 
 ```rust
-pub enum Unknown { TimedOut, NoUpstream, NoDefaultBranch, NoRemote }
+pub enum Unknown { TimedOut, NoDefaultBranch }
 ```
 
 | reason | meaning |
 | --- | --- |
 | `TimedOut` | The Generation hit its deadline while this cell was still Loading |
-| `NoUpstream` | The branch tracks nothing |
 | `NoDefaultBranch` | The resolution chain reached rung 4 |
-| `NoRemote` | There is nowhere to compare against |
 
-All render `?`; the detail pane says which. This set is closed, per [0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s amendment to [0001](../adr/0001-per-cell-provenance.md).
+All render `?`; the detail pane says which. This set is closed, per [0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s amendment to [0001](../adr/0001-per-cell-provenance.md). [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`: a branch that tracks nothing renders `-` and a Repo with no remote renders `∅`, both values behind a blank gutter, and `base` is already `NotApplicable` in the second case, so each was a settled fact wearing a missing one's mark and neither had a live case left.
 
 ### Not applicable
 
@@ -111,7 +109,7 @@ pub struct EntityState {
     pub name: Arc<str>,
     pub common_dir: Arc<Path>,
     pub kind: Kind,
-    pub branch: Cell<Arc<str>>,
+    pub branch: Cell<Head>,
     pub sync: Cell<AheadBehind>,
     pub base: Cell<u32>,
     pub dirty: Cell<u32>,
@@ -123,7 +121,15 @@ pub struct EntityState {
 }
 ```
 
-A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`. On a `Submodule` row `state` and `base` are both `NotApplicable`: no Worktree state means anything without a branch and every measured Submodule is at a detached HEAD, while `base` is the one place [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records its own answer as wrong with no local detector ([discovery.md](discovery.md)).
+A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`. On a `Submodule` row `state` and `base` are both `NotApplicable`, because [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) records that population's default branch as known-wrong with no local detector, so a proof computed against it would be a confident lie ([discovery.md](discovery.md)). Detachment is not the reason. [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) shows Merged needs a commit and a default branch rather than a branch name, so a detached Worktree, whose default branch resolves normally, computes both cells.
+
+### HEAD's three shapes
+
+```rust
+pub enum Head { Branch(Arc<str>), Detached(ObjectId), Unborn(Arc<str>) }
+```
+
+One to one with gix's `head::Kind`. `Detached` carries the object id and no name, `Unborn` carries the name and no id, and a bare `Cell<Arc<str>>` could hold neither distinction. Formatting the difference inside the core would hand it a glyph, which [0015](../adr/0015-the-core-owns-the-table.md) gives to the consumer. [head.md](head.md) fixes what every column shows for each shape.
 
 ### Diagnostics
 

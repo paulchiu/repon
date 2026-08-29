@@ -71,10 +71,12 @@ Once shown, a Submodule is a full citizen: selectable, counted in the Selection,
 
 The payload, stated honestly: all 16 initialised Submodules in the measured population are at a detached HEAD, and none has an attached branch. A Submodule row is mostly blank, and correctly so.
 
+Detachment is not what blanks those cells. [head.md](head.md) records a detached Worktree computing both `base` and Merged, because each needs a commit and a default branch rather than a branch name. A Submodule's stay blank because [default-branch.md](default-branch.md) records that population's default branch as known-wrong with no local detector, so a proof against it would be a confident lie.
+
 | column | on a Submodule row |
 | --- | --- |
 | `name` | the submodule path |
-| `branch` | the short object id; the detail pane says detached |
+| `branch` | the short object id; the detail pane says detached ([head.md](head.md)) |
 | `sync` | `-`, no upstream, for all 16 |
 | `base` | Not applicable |
 | `dirty` | normal |
@@ -105,4 +107,4 @@ A Submodule that appears or disappears between Generations goes Vanished by exac
 ## Open
 
 - Whether the pass should recurse one further level. Reopenable if a nested Submodule ever matters; `mcux-sdk` is the only measured instance.
-- How a detached HEAD reads in the `branch` column, and the `state` column generally. Every Submodule in the population needs an answer, and it is not this ticket's to settle.
+- Whether a Submodule should compute Merged once its default branch can be trusted. The proof itself needs no branch ([head.md](head.md)); the input is what is missing, and only the network closes it.

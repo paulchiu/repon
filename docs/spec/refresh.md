@@ -36,7 +36,7 @@ A and B together cover the entire population in about 0.15 seconds, a single fra
 
 Phase B's figure was measured on the upstream comparison. The `base` count against the default branch is a second rev-walk of the same shape and the same cost class, so the pair still lands inside one frame.
 
-Phase D is specified in [default-branch.md](default-branch.md) and splits the same way the others do. Ancestry resolves inside the cheap pass at about 20ms per branch with a commit-graph present. Patch equivalence, which is the only thing that can see a squash merge, costs roughly 130ms per branch and runs as its own pass over the branches ancestry said no to, about 163 of them, which is under two seconds in parallel. The state cell stays blank and Loading until that pass answers rather than showing `Gone` and flipping to `Merged`.
+Phase D is specified in [default-branch.md](default-branch.md) and splits the same way the others do. Ancestry resolves inside the cheap pass at about 20ms per branch with a commit-graph present. Patch equivalence, which is the only thing that can see a squash merge, costs roughly 130ms per branch and runs as its own pass over the entities ancestry said no to, 176 of them measured across the whole population and memoised per common dir ([head.md](head.md)), which is under two seconds in parallel. The state cell stays blank and Loading until that pass answers rather than showing `Gone` and flipping to `Merged`.
 
 A boolean dirty check via `gix::Repository::is_dirty()` was measured as a possible fourth phase and rejected: on a population that is 96% clean, proving clean costs the same as counting (8.64s against 7.96s uncontended), and it cannot answer the untracked count at all.
 
@@ -65,6 +65,7 @@ What the sweep can and cannot see:
 | change | seen |
 | --- | --- |
 | commit | yes, `index` and `refs/heads/<branch>` |
+| commit on a detached HEAD | yes, `index` and `HEAD` |
 | `git add` | yes, `index` |
 | checkout a branch | yes, `HEAD` and `index` |
 | `reset --hard` | yes, `index` |
@@ -74,7 +75,7 @@ What the sweep can and cannot see:
 | delete a tracked file | no |
 | fetch | no |
 
-The misses are acceptable for specific reasons. The three working-tree cases are exactly what phase C measures and nothing cheap can see them, which is why phase C cells age out instead (see Staleness). A fetch is missed because `refs/remotes/origin/` gains an entry without moving the mtime of `refs/` itself, and catching it would need a recursive readdir of `refs/` at 239ms rather than 1.79ms; Repon knows when it fetched, and an external fetch from a Launcher is covered by the return trigger. Two traps for anyone widening the path list: a commit does not touch `.git/HEAD` at all, only `.git/logs/HEAD`, and git creates then immediately deletes `HEAD.lock` and `packed-refs.lock` without touching the real files, so match exact names and ignore anything ending in `.lock`.
+The misses are acceptable for specific reasons. The three working-tree cases are exactly what phase C measures and nothing cheap can see them, which is why phase C cells age out instead (see Staleness). A fetch is missed because `refs/remotes/origin/` gains an entry without moving the mtime of `refs/` itself, and catching it would need a recursive readdir of `refs/` at 239ms rather than 1.79ms; Repon knows when it fetched, and an external fetch from a Launcher is covered by the return trigger. Two traps for anyone widening the path list: a commit on an attached HEAD does not touch `.git/HEAD` at all, only `.git/logs/HEAD`, while a commit on a detached HEAD writes the new object id straight into it ([head.md](head.md)), and git creates then immediately deletes `HEAD.lock` and `packed-refs.lock` without touching the real files, so match exact names and ignore anything ending in `.lock`.
 
 ## Staleness
 
