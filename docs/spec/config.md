@@ -47,7 +47,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | `theme` | string | `"default"` | Names `themes/<name>.toml`; `default` is reserved for the compiled-in theme ([theming.md](theming.md)) |
 | `glyphs` | `"full"` or `"ascii"` | `"full"` | The vetted glyph set; describes the terminal, not taste |
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
-| `show_submodules` | bool | `false` | Whether Submodules are rows ([0009](../adr/0009-worktree-state-model.md) hides them) |
+| `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
 
 The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
 
@@ -81,7 +81,7 @@ A Set bounds the work. An entity excluded by a Set is never discovered and never
 
 `roots` is required on every Set and there is no top-level fallback. Five Sets over the same roots is five honest lines, and a Set you can read in isolation is worth the repetition, since what varies between them is the globs.
 
-Globs are matched by `globset` against the absolute path, case-sensitive, with `**` crossing directory boundaries. The case-sensitivity is deliberate: the design machine's filesystem is case-insensitive (APFS), so `exclude = ["**/Node_modules/**"]` would match when the OS opens the path and not match in Repon, and Repon's answer is the one that counts.
+Globs are matched by `globset` against the absolute path, case-sensitive, with `**` crossing directory boundaries. The case-sensitivity is deliberate: the design machine's filesystem is case-insensitive (APFS), so `exclude = ["**/Node_modules/**"]` would match when the OS opens the path and not match in Repon, and Repon's answer is the one that counts. A Submodule's path is tested the same way, even though it reaches the Set from its parent's `.gitmodules` rather than from the walk ([discovery.md](discovery.md)).
 
 Selection order: `--set <name>`, then `REPON_SET`, then the first declared Set, then the implicit `all`. `all` is reserved: declaring a Set named `all` warns and the declaration wins, because shadowing the implicit Set is a reasonable thing to want and silently having two is not. `repon sets` prints each Set's name, roots and match count.
 
@@ -99,7 +99,7 @@ With no file at all there is one implicit Set, `all`, rooted at the working dire
 
 `default_branch` settles the shape [default-branch.md](default-branch.md) left open for its rung 1: a per-Repo string, no Set-level default.
 
-`exclude = true` means the entity is listed and never operated on, which is different from a Set's exclude glob, where the entity is never discovered at all.
+`exclude = true` means the entity is listed and never operated on, which is different from a Set's exclude glob, where the entity is never discovered at all. It cannot exclude a parent and its Submodules together, because a Submodule's git common dir is `<parent>/.git/modules/<name>` rather than the parent's; excluding a subtree is a Set's `exclude` glob.
 
 ## Launchers
 
@@ -160,7 +160,7 @@ Execution belongs elsewhere. Output capture, the run pane, what a partial failur
 
 ## Discovery bounds
 
-There is no `max_depth`, no denylist and no wall-clock budget in the file, because each would pre-empt [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
+There is no `max_depth`, no denylist and no wall-clock budget in the file, and there never will be. [discovery.md](discovery.md) settles the walk as boundary-stop only, leaving a Set's `roots` as the sole way to reach a repository sitting inside another repository's working tree.
 
 Discovery counts directory entries as it walks; a separate pre-count would cost the same walk twice. At one second still walking, a warning names the count reached and the roots. At thirty seconds discovery is abandoned, Repon shows what it found, and the warning becomes persistent, reading as `discovery: stopped at 412,000 directories`. An abandoned discovery leaves the refresh path and becomes manual until `roots` change, because [refresh.md](refresh.md) re-runs discovery at the start of every Generation and a thirty second walk every two seconds is not a degraded mode.
 
@@ -295,6 +295,6 @@ dismiss = ""               # unbind it entirely
 ## What this spec does not own
 
 - The keys and gestures, and the `[keys]` block's own schema: settled in [keybindings.md](keybindings.md). That block is the one place the file nests three deep, because a binding is identified by its context and its action together and flattening it would put the context name inside the key name.
-- The walk itself: [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
+- The walk itself, and how Submodules are reached: settled in [discovery.md](discovery.md).
 - Where the config types sit in the core: settled in [the core API spec](core-api.md). The core never reads a file. Everything in this spec is parsed on the consumer's side, which hands the core a Set as a bounding specification, the per-Repo overrides, and the three durations, and keeps the theme, the glyphs, the Launchers, the Actions and all four failure grades to itself.
 - Action execution: the run pane, output capture, partial failure and cancellation.

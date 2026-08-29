@@ -46,15 +46,15 @@ What is a dial is order. Phase C is dispatched cursor row first, then the visibl
 
 ## Discovery
 
-Discovery re-runs at the start of every generation, because warm boundary-stop discovery costs 19ms, a third of the cheap phase, and a Repo that appeared or vanished is exactly what a refresh should notice. The rule, rather than the constant: discovery rides on the refresh only while it costs less than the cheap phase.
+Discovery re-runs at the start of every generation, because warm boundary-stop discovery costs 19ms, a third of the cheap phase, and a Repo that appeared or vanished is exactly what a refresh should notice. The rule, rather than the constant: discovery rides on the refresh only while it costs less than the cheap phase. Discovery is two halves returning one entity list, the walk and then a 3.92ms pass reading `.gitmodules` in what the walk found, both settled in [discovery.md](discovery.md).
 
-The deep walk that also finds Submodules costs 11.4 seconds for 441 entities against 0.019 seconds for 403, a 575x difference. If [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13) chooses it, discovery leaves the refresh path and becomes its own gesture. That number is this spec's input to that ticket.
+The 11.4 second figure this spec previously carried for a deep walk was wrong. Re-measured warm in Rust across both roots, a deep walk costs 89.1 seconds and touches 6,424,758 entries, and the cheapest variant that still finds Submodules costs 20.9 seconds. No deep walk was adopted, so discovery never leaves the refresh path for that reason ([discovery.md](discovery.md)).
 
 Discovery is bounded by time rather than by any config key. At one second still walking it warns, naming the directory count reached; at thirty seconds it is abandoned, and an abandoned discovery leaves the refresh path and becomes manual until a Set's `roots` change, because a thirty second walk at the head of every generation is not a degraded mode. The bounds are specified in [the config spec](config.md).
 
 ## The poll
 
-Nothing watches the filesystem ([0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)). Between generations a metadata sweep runs every `refresh.poll_interval` (default 2 seconds), stat-ing `HEAD`, `index`, `packed-refs` and `refs/` in each entity's own gitdir. Cost across all 441 entities: 1.79ms single-threaded, 0.72ms in parallel, so it runs single-threaded and off the render path.
+Nothing watches the filesystem ([0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)). Between generations a metadata sweep runs every `refresh.poll_interval` (default 2 seconds), stat-ing `HEAD`, `index`, `packed-refs` and `refs/` in each entity's own gitdir. Cost across all 441 entities: 1.79ms single-threaded, 0.72ms in parallel, so it runs single-threaded and off the render path. The sweep covers only what is shown, so a hidden Submodule is known and never polled ([discovery.md](discovery.md)).
 
 When the sweep sees an entity move, Repon re-runs phases A and B for that entity only (0.4ms, and the value is then simply true) and marks that row's phase C cells Stale. The poll never starts a phase C probe on its own.
 

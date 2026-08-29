@@ -122,7 +122,7 @@ pub struct EntityState {
 }
 ```
 
-A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`.
+A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`. On a `Submodule` row `state` and `base` are both `NotApplicable`: no Worktree state means anything without a branch and every measured Submodule is at a detached HEAD, while `base` is the one place [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records its own answer as wrong with no local detector ([discovery.md](discovery.md)).
 
 ### Diagnostics
 
@@ -146,7 +146,7 @@ pub enum RowSummary { InFlight, Failed, Unknown, Stale, Fresh }
 pub fn summary(entity: &EntityState) -> RowSummary
 ```
 
-The rules it holds, all from existing decisions: in-flight outranks the least-settled summary ([refresh.md](refresh.md)); `NotApplicable` cells are excluded from the fold ([0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)); otherwise it is the least settled state present. The mapping from `RowSummary` to a space, `~`, `?`, a spinner or `!` is the consumer's, because that is the part that is about a screen.
+The rules it holds, all from existing decisions: in-flight outranks the least-settled summary ([refresh.md](refresh.md)); `NotApplicable` cells are excluded from the fold ([0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)); otherwise it is the least settled state present. The fold takes the entity's own derivations as well as its cells: a `.gitmodules` that will not parse or will not read makes the row `Failed` while every cell is fine, so a row can show `!` with nothing blank and only the detail pane names which derivation failed. That amends [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) and is specified in [discovery.md](discovery.md). The default branch's rung and its disagreement stay out of the fold, because those are metadata about how a value was obtained rather than values that can fail on their own. The mapping from `RowSummary` to a space, `~`, `?`, a spinner or `!` is the consumer's, because that is the part that is about a screen.
 
 ## The snapshot
 
@@ -280,7 +280,7 @@ Two things. `repon sets` is built as a literal second consumer calling `count`, 
 ## What this spec does not own
 
 - The keybindings for dismiss, refresh and the Selection refresh: settled in [keybindings.md](keybindings.md) as `d`, `r` and `R`.
-- How discovery walks and how Submodules are reached: [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
+- How discovery walks and how Submodules are reached: settled in [discovery.md](discovery.md).
 - What an Action's output looks like and what a partial failure means: [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14).
 - The gutter mark for a Vanished row.
 - CI itself: [Establish the distribution and release story](https://github.com/paulchiu/repon/issues/8).

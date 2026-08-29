@@ -43,6 +43,8 @@ In-cell glyphs for real values:
 
 The two sets stay disjoint: no provenance mark may share a glyph with a real value (see the [ADR](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)).
 
+A child row is indented under its parent and marked `└`, and a Submodule row carries the same mark as a Worktree row rather than one of its own. The screens below previously drew Submodules with `∙` (U+2219), which sits one codepoint from `·` (U+00B7), the clean value, on the same row; that is the disjointness rule failing in the value plane rather than through provenance. The cost is that a Submodule row and a Worktree row look alike, and the name column and the detail pane are what tell them apart. Submodule rows are settled in [discovery.md](discovery.md).
+
 ## Provenance
 
 Every value carries one of the five states from [0001](../adr/0001-per-cell-provenance.md), which [0015](../adr/0015-the-core-owns-the-table.md) amends into four settled answers plus an orthogonal in-flight flag without changing what a reader sees. Fresh renders the value plainly behind a space in the gutter. Loading leaves the cell blank, and the spinner marks where the gap is: while a row holds no values at all it sits in the gutter, and once the row holds some values with only some cells outstanding it sits in those cells while the gutter falls back to the row's least-settled settled state. On a re-probe the cell keeps its previous value rather than dropping back to blank. Stale marks the row `~` and means the value is known to be old with nothing currently going to fix it, which is what the metadata poll and the status age threshold produce. In-flight is a row property that outranks the least-settled-state summary; [refresh.md](refresh.md) carries the rule. Unknown, marked `?`, is reserved for the settled answer "we asked and got nothing back"; a row whose probe has not started yet is Loading. Failed marks the row `!`. Worktree state has no meaning for a Repo, so that cell is not applicable: it renders blank and is excluded from the row summary. `base` is not applicable on the same terms in two cases, on a row whose branch is itself the default branch, where it would only repeat `sync`, and on a Repo with no remote, where a `?` would report a settled fact as a missing one. The ADR carries the reasoning for each of these. Not applicable is a settled answer in the type rather than an absent value, and the fold of a row's cells into the gutter's single state is computed in the core and handed over as a state rather than a glyph, so both consumers summarise a row the same way; [the core API spec](core-api.md) carries both.
@@ -79,7 +81,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │⠋ vendor/legacy-terminal-sdk                                                                                                              │
 │! vendor/broken-checkout                                                                                                                  │
 │⠋ scratch/perf-notes           main                                                                                                       │
-│⠋   ∙ acquiring-gateway/protos v3                                                                                                         │
+│⠋   └ acquiring-gateway/protos v3                                                                                                         │
 │⠋ checkout-web                                                                                                                            │
 │⠋ checkout-web-e2e                                                                                                                        │
 │⠋ ledger-core                                                                                                                             │
@@ -108,7 +110,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │⠹ vendor/legacy-terminal-sdk                                                                                                              │
 │! vendor/broken-checkout                                                                                                                  │
 │  scratch/perf-notes           main                     -         ●2                                                                      │
-│⠹   ∙ acquiring-gateway/protos v3                                                                                                         │
+│⠹   └ acquiring-gateway/protos v3                                                                                                         │
 │⠹ checkout-web                 main                                                                                                       │
 │⠹ checkout-web-e2e             main                                                                                                       │
 │⠹ ledger-core                  main                                                                                                       │
@@ -137,7 +139,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │? vendor/legacy-terminal-sdk   master                                                                                                     │
 │! vendor/broken-checkout                                                                                                                  │
 │  scratch/perf-notes           main                     -         ●2                                                                      │
-│    ∙ acquiring-gateway/protos v3                       ↓12       ·                                                                       │
+│    └ acquiring-gateway/protos v3                       ↓12       ·                                                                       │
 │  checkout-web                 main                     ↓2        ·                                                                       │
 │  checkout-web-e2e             main                     ≡         ●1                                                                      │
 │  ledger-core                  main                     ↑1        ·                                                                       │
@@ -166,7 +168,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │? vendor/legacy-terminal-sdk   master                                                 │
 │! vendor/broken-checkout                                                              │
 │  scratch/perf-notes           main                     -         ●2                  │
-│    ∙ acquiring-gateway/protos v3                       ↓12       ·                   │
+│    └ acquiring-gateway/protos v3                       ↓12       ·                   │
 │  checkout-web                 main                     ↓2        ·                   │
 │  checkout-web-e2e             main                     ≡         ●1                  │
 │  ledger-core                  main                     ↑1        ·                   │
@@ -194,7 +196,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │  vendor/legacy-terminal-sdk    ││sync      3 ahead, 0 behind   fresh 9s ago                                                              │
 │! vendor/broken-checkout        ││dirty     4 changed   fresh 9s ago                                                                      │
 │  scratch/perf-notes            ││state     active   fresh 9s ago                                                                         │
-│   ∙ acquiring-gateway/protos   ││                                                                                                        │
+│   └ acquiring-gateway/protos   ││                                                                                                        │
 │  checkout-web                  ││recent                                                                                                  │
 │  checkout-web-e2e              ││  9ab7712  Split the checkout reducer per step                                                          │
 │  ledger-core                   ││  2c40f8e  Stop double-firing the analytics event                                                       │

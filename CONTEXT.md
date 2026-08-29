@@ -18,7 +18,7 @@ _Avoid_: Project, module, package
 An additional working directory attached to a Repo, sharing its object store and remotes. Repon understands the relationship and never double-counts a Worktree as a Repo.
 
 **Submodule**:
-A repository owned by a parent Repo. Detected so it can be excluded, hidden by default.
+A repository owned by a parent Repo, named in that Repo's .gitmodules file. Hidden by default, and found by reading that file rather than by walking into the parent's working tree.
 
 **Inner loop**:
 The work done inside one Repo: staging, committing, diffing, rebasing. Repon deliberately does not own this and hands off instead.
