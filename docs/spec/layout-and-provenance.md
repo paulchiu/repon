@@ -7,7 +7,7 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 - With the detail pane closed the table takes the full width of the frame.
 - Opening the detail pane collapses the list to a 34-column sidebar beside it. The sidebar keeps the same rows, the same order and the same cursor, and drops each row to the name plus the gutter mark.
 - Below 100 columns the detail pane takes the whole frame and the list is hidden.
-- There is no permanently pinned bottom output pane. Output from an Action fanned out across the Selection lives in the detail pane, per step, labelled, separately readable, and it survives the run.
+- There is no permanently pinned bottom output pane. Output from an Action fanned out across the Selection lives in the detail pane, per step, labelled, separately readable, and it survives the run. It wraps rather than truncates and keeps the colours the step emitted, settled in [actions.md](actions.md).
 - One footer line sits below the frame carrying the focused context's bindings, degrading by dropping whole bindings behind an ellipsis; it is specified in [keybindings.md](keybindings.md).
 - Visual language follows superfile: rounded borders, the panel title inline in the top border rather than in a separate title row, focus communicated by border colour, panels tiled edge to edge.
 
@@ -203,7 +203,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │  ledger-projections            ││                                                                                                        │
 │  merchant-portal               ││last action   fetch --all   (12 of 31 selected)                                                         │
 │  merchant-portal-design        ││  step 1  ok      fetch origin, 3 refs updated                                                          │
-│  payouts-scheduler             ││  step 2  skipped no upstream configured                                                                │
+│  payouts-scheduler             ││  step 2  failed  no upstream configured                                                                │
 │  payouts-rules                 ││                                                                                                        │
 │  risk-scoring                  ││                                                                                                        │
 │  risk-features                 ││                                                                                                        │
@@ -232,7 +232,7 @@ These snapshots were generated from the prototype; colour does not survive the d
 │                                                                                      │
 │last action   fetch --all   (12 of 31 selected)                                       │
 │  step 1  ok      fetch origin, 3 refs updated                                        │
-│  step 2  skipped no upstream configured                                              │
+│  step 2  failed  no upstream configured                                              │
 │                                                                                      │
 │                                                                                      │
 │                                                                                      │

@@ -45,7 +45,7 @@ A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an a
 _Avoid_: Handoff (that names the act, not the thing)
 
 **Action**:
-A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many of the selected Repos define it before it runs.
+A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
 ### Refreshing
 

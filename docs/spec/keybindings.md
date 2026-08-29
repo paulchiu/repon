@@ -56,6 +56,8 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `A` | Clear the Selection |
 | `Enter` | Open the detail pane |
 | `d` | Dismiss a Vanished row |
+| `n` | Next row whose last Action failed |
+| `N` | Previous row whose last Action failed |
 
 ### detail
 
@@ -125,7 +127,7 @@ Esc-twice gestures were measured safe against human typing: crossterm collapses 
 
 ## Quitting, suspending, confirming
 
-`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends. Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
 
 The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
 
@@ -139,7 +141,7 @@ When the Selection is empty, an Action and a Launcher both act on the cursor row
 
 The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+E` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
 
-What such a command does when it runs, how its lines gate, and what its output looks like belong to [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14). This spec fixes only the keys that reach it.
+What such a command does when it runs, how its lines gate, and what its output looks like are settled in [actions.md](actions.md), which makes it argv split with `shell-words` rather than a shell string, because [0007](../adr/0007-launchers-are-argv-vectors.md) puts the shell behind an explicit flag and an ad hoc command has no config entry in which to show one. This spec fixes only the keys that reach it.
 
 ## The footer
 

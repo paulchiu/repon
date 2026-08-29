@@ -29,6 +29,10 @@ Raw mode is `cfmakeraw`, and a C probe compiled against Apple's libc on the desi
 
 Two more constraints are keyboard decisions rather than footnotes. Bracketed paste is enabled, because the ad hoc command field accepts multiple lines: without it a pasted two-line command arrives as Enter, then Ctrl+J, then whatever else, so it submits itself halfway through, and with it the whole paste arrives as one event. Mouse capture is not enabled at all, because it takes the terminal's own select-and-copy away, and Repon's screen is mostly Repo paths and branch names that people copy out of it. That is a deliberate no for now rather than a closed door, and the condition for reopening it is someone wanting to try it.
 
+## Amended by 0018
+
+The table is no longer a pure function of context. While an Action is fanning out, `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch that re-runs discovery and a config reload that can delete the running entry each invalidate the run underneath itself. The footer is derived and follows for free, but the help overlay and the load time collision check are both over the static table and now describe keys that a moment of runtime state can disable. This ADR rejected lazygit's `GetDisabledReason` for making the escape hatch vanish where a user is most lost, and the narrower version taken here is four keys in one state rather than a general mechanism. See [0018](0018-an-action-is-a-fanout-of-pty-backed-steps.md).
+
 ## Consequences
 
 - The footer and the help overlay contain no literal binding strings; both render from the table and are tested against it, so neither can drift from what the keys do.

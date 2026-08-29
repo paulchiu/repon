@@ -8,11 +8,11 @@ Nine roles, named for meaning rather than for colour, plus two keys for the sele
 
 ```toml
 text           = "reset"          # the terminal's own foreground
-dim            = "dark-gray"      # unresolved values, known zeros, headers, ages, Merged, submodules
+dim            = "dark-gray"      # unresolved values, known zeros, headers, ages, Merged, submodules, an Action step that did not run
 accent         = "light-blue"     # loading spinner, Worktree names, Active
 ok             = "light-green"    # ahead counts, a succeeded Action step
-warn           = "light-yellow"   # Dirty, Local only, a skipped Action step, the Action palette border
-danger         = "light-red"      # Failed provenance, Gone
+warn           = "light-yellow"   # Dirty, Local only, the Action palette border
+danger         = "light-red"      # Failed provenance, Gone, a failed Action step
 behind         = "light-magenta"  # behind counts
 border         = "dark-gray"      # unfocused panel borders
 border_focused = "light-blue"     # the focused panel border
@@ -29,11 +29,11 @@ This map lives in code and here. A theme file cannot reach into it, so Gone and 
 | Meaning | Role |
 | --- | --- |
 | Fresh value | `text` |
-| Stale or Unknown gutter mark, a known zero, a Merged Worktree, a Submodule name, an age, a column header | `dim` |
+| Stale or Unknown gutter mark, a known zero, a Merged Worktree, a Submodule name, an age, a column header, an Action step that did not run or was cancelled | `dim` |
 | Loading spinner, a Worktree name, an Active Worktree, the focused border | `accent` / `border_focused` |
 | Ahead count, a succeeded Action step | `ok` |
-| Dirty, Local only, a skipped Action step, the Action palette border, a theme warning in the status bar | `warn` |
-| Failed provenance, a Gone Worktree | `danger` |
+| Dirty, Local only, the Action palette border, a theme warning in the status bar | `warn` |
+| Failed provenance, a Gone Worktree, a failed Action step | `danger` |
 | Behind count | `behind` |
 
 ### Surfaces the nine roles cover

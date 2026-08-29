@@ -118,6 +118,7 @@ pub struct EntityState {
     pub state: Cell<WorktreeState>,
     pub default_branch: Cell<DefaultBranch>,
     pub diagnostics: Diagnostics,
+    pub last_action: Option<ActionRun>,
     pub presence: Presence,
 }
 ```
@@ -146,7 +147,7 @@ pub enum RowSummary { InFlight, Failed, Unknown, Stale, Fresh }
 pub fn summary(entity: &EntityState) -> RowSummary
 ```
 
-The rules it holds, all from existing decisions: in-flight outranks the least-settled summary ([refresh.md](refresh.md)); `NotApplicable` cells are excluded from the fold ([0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)); otherwise it is the least settled state present. The fold takes the entity's own derivations as well as its cells: a `.gitmodules` that will not parse or will not read makes the row `Failed` while every cell is fine, so a row can show `!` with nothing blank and only the detail pane names which derivation failed. That amends [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) and is specified in [discovery.md](discovery.md). The default branch's rung and its disagreement stay out of the fold, because those are metadata about how a value was obtained rather than values that can fail on their own. The mapping from `RowSummary` to a space, `~`, `?`, a spinner or `!` is the consumer's, because that is the part that is about a screen.
+The rules it holds, all from existing decisions: in-flight outranks the least-settled summary ([refresh.md](refresh.md)); `NotApplicable` cells are excluded from the fold ([0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)); otherwise it is the least settled state present. The fold takes the entity's own derivations as well as its cells: a `.gitmodules` that will not parse or will not read makes the row `Failed` while every cell is fine, so a row can show `!` with nothing blank and only the detail pane names which derivation failed. That amends [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) and is specified in [discovery.md](discovery.md). A failed Action enters the fold by the same route and on the same terms, so `!` also means a step exited nonzero on a Repo that read perfectly; [actions.md](actions.md) carries that cost and the reasoning. The default branch's rung and its disagreement stay out of the fold, because those are metadata about how a value was obtained rather than values that can fail on their own. The mapping from `RowSummary` to a space, `~`, `?`, a spinner or `!` is the consumer's, because that is the part that is about a screen.
 
 ## The snapshot
 
@@ -281,6 +282,6 @@ Two things. `repon sets` is built as a literal second consumer calling `count`, 
 
 - The keybindings for dismiss, refresh and the Selection refresh: settled in [keybindings.md](keybindings.md) as `d`, `r` and `R`.
 - How discovery walks and how Submodules are reached: settled in [discovery.md](discovery.md).
-- What an Action's output looks like and what a partial failure means: [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14).
+- What an Action's output looks like and what a partial failure means: settled in [actions.md](actions.md).
 - The gutter mark for a Vanished row.
 - CI itself: [Establish the distribution and release story](https://github.com/paulchiu/repon/issues/8).

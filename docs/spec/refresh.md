@@ -16,6 +16,8 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 | Returning from a Launcher | The entity that was handed off is re-probed first and synchronously, then a normal generation starts. |
 | Terminal focus gained | A new generation over everything. Best effort: crossterm reports it via `Event::FocusGained` behind `EnableFocusChange` (XTerm private mode 1004), and a terminal that does not report focus simply never fires it. tmux gates this behind a `focus-events` server option that defaults to off. |
 | Switching Set | A new generation over the new Set's entities. |
+| Starting an Action | Any generation in flight is cancelled. Measured, a fan-out over a 60 entity Selection takes 0.85s alone and 3.14s beside a generation, while the generation itself barely moves, so the background read costs the foreground 3.7 times for nothing. |
+| An Action finishing | One normal generation over everything, the same path a finished fetch already takes. The first entity to finish therefore holds stale cells for the length of the run. |
 
 The Launcher return is the most precise signal in the design. Repon suspends, execs the tool and resumes, so the `SIGTSTP` call returning is a deterministic 'I am back' moment, and Repon knows exactly which entity the user was just working in.
 

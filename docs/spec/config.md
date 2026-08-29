@@ -99,7 +99,7 @@ With no file at all there is one implicit Set, `all`, rooted at the working dire
 
 `default_branch` settles the shape [default-branch.md](default-branch.md) left open for its rung 1: a per-Repo string, no Set-level default.
 
-`exclude = true` means the entity is listed and never operated on, which is different from a Set's exclude glob, where the entity is never discovered at all. It cannot exclude a parent and its Submodules together, because a Submodule's git common dir is `<parent>/.git/modules/<name>` rather than the parent's; excluding a subtree is a Set's `exclude` glob.
+`exclude = true` means the entity is listed and never operated on, which is different from a Set's exclude glob, where the entity is never discovered at all. It cannot exclude a parent and its Submodules together, because a Submodule's git common dir is `<parent>/.git/modules/<name>` rather than the parent's; excluding a subtree is a Set's `exclude` glob. An excluded entity is still a row, so it can be selected, and it is subtracted from the count the Action confirm gate and the palette border both show; [actions.md](actions.md) settles what it renders after a run.
 
 ## Launchers
 
@@ -136,7 +136,7 @@ Every child, Launcher or Action step, receives:
 | `REPON_DEFAULT_BRANCH` | The resolved default branch | |
 | `REPON_ACTION` | The Action's name | Actions only, absent for a Launcher |
 
-An Unknown value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher.
+An Unknown or Not applicable value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher. Not applicable matters on a Submodule row, where `base` and the default branch are settled facts rather than missing ones, and setting the variable would substitute a default branch [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records as wrong there.
 
 Repon unsets all fifteen of git's local environment variables from every child: `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_OBJECT_DIRECTORY`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_GRAFT_FILE`, `GIT_INDEX_FILE`, `GIT_NO_REPLACE_OBJECTS`, `GIT_REPLACE_REF_BASE`, `GIT_PREFIX`, `GIT_SHALLOW_FILE`, `GIT_COMMON_DIR`. That is the output of `git rev-parse --local-env-vars` on git 2.50.1, and git's own hook documentation instructs a caller to clear them before running git against another repository.
 
@@ -154,9 +154,9 @@ Repon exports nothing of its own selection state. `REPON_SET` stays an input var
 
 Steps run in order and stop at the first failure, where failure is a nonzero exit. Gating is implicit, following GitHub Actions' shape: there is no `on_success` field to write, and a later step that ran is proof the earlier ones succeeded.
 
-`confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable.
+`confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable. The fan-out runs on its own pool rather than rayon's global one, because a step blocked in `wait()` removes a worker from that pool and a `concurrency` at or above the pool's thread count stops the refresh entirely; [actions.md](actions.md) carries the measurement.
 
-Execution belongs elsewhere. Output capture, the run pane, what a partial failure looks like, cancellation, and how a run's result persists are owned by a separate ticket; this spec fixes only the fields.
+Execution belongs elsewhere. Output capture, the run pane, what a partial failure looks like, cancellation, and how a run's result persists are settled in [actions.md](actions.md); this spec fixes only the fields.
 
 ## Discovery bounds
 
