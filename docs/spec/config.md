@@ -1,6 +1,6 @@
 # Configuration
 
-One file, `config.toml`, holds everything Repon can be told: the theme, the glyph set, the Sets, the per-Repo overrides, the Launchers and the Actions. This spec fixes every key, its type, its default and its failure mode, precisely enough to hand to serde. The config is read-only and a Set bounds the work; the reasoning is in [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md).
+One file, `config.toml`, holds everything Repon can be told: the theme, the glyph set, the Sets, the per-Repo overrides, the Launchers, the Actions and the keybindings. This spec fixes every key, its type, its default and its failure mode, precisely enough to hand to serde. The config is read-only and a Set bounds the work; the reasoning is in [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md).
 
 ## Where it lives
 
@@ -30,7 +30,7 @@ Four failure grades, deliberately a mirror of [theming.md](theming.md)'s table w
 
 The exit path renders `toml::de::Error`, which exposes `.message()` and `.span()`, so the line and column come from the API rather than from parsing the Display output. The unknown-key path uses `serde_ignored`, which reports every unknown key in one pass; `#[serde(deny_unknown_fields)]` aborts on the first and cannot enumerate the rest.
 
-A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on a keystroke whose key belongs to [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12), with the detail in `repon.log`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
+A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
 
 A `theme` naming a theme that does not exist warns and falls back to the default, deliberately unlike `--theme <missing>`, which still exits: a flag is a thing typed moments ago and a file is a thing you have to go and fix.
 
@@ -38,7 +38,7 @@ A `theme` naming a theme that does not exist warns and falls back to the default
 
 One rule decides nesting: a bare scalar when the key is about the whole program, a table when it is about one subsystem or one named thing. Nothing nests three deep.
 
-That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[refresh]`, `[fetch]` and `[auto_update]` as tables; `[[set]]`, `[[repo]]`, `[[launcher]]` and `[[action]]` as arrays of tables, where file order is tab order and palette order. A duplicate `name` (or `path`, for `[[repo]]`) is rejected at load with the line number, because TOML itself cannot catch a duplicate inside an array of tables.
+That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[refresh]`, `[fetch]`, `[auto_update]` and `[keys]` as tables; `[[set]]`, `[[repo]]`, `[[launcher]]` and `[[action]]` as arrays of tables, where file order is tab order and palette order. A duplicate `name` (or `path`, for `[[repo]]`) is rejected at load with the line number, because TOML itself cannot catch a duplicate inside an array of tables.
 
 ## Top-level keys
 
@@ -201,7 +201,7 @@ Checked at load, each a warning rather than an exit:
 
 ## Reload
 
-Everything reloads in place on an explicit keystroke, whose key belongs to [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12). There is no file watcher.
+Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). There is no file watcher. Because that keystroke can change the keyboard itself, the footer and the help overlay are derived from the binding table rather than written as strings; [keybindings.md](keybindings.md) carries the rule.
 
 `theme`, `glyphs`, the two `show_` keys, `[[launcher]]`, `[[action]]`, `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in the status bar.
 
@@ -285,11 +285,16 @@ args = ["rm", "-rf", "node_modules"]
 
 [[action.steps]]
 args = ["pnpm", "install"]
+
+# Only what changes. Everything else keeps the default map.
+[keys.list]
+refresh = "F5"             # move one binding
+dismiss = ""               # unbind it entirely
 ```
 
 ## What this spec does not own
 
-- The keys and gestures: [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12).
+- The keys and gestures, and the `[keys]` block's own schema: settled in [keybindings.md](keybindings.md). That block is the one place the file nests three deep, because a binding is identified by its context and its action together and flattening it would put the context name inside the key name.
 - The walk itself: [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
 - Where the config types sit in the core: settled in [the core API spec](core-api.md). The core never reads a file. Everything in this spec is parsed on the consumer's side, which hands the core a Set as a bounding specification, the per-Repo overrides, and the three durations, and keeps the theme, the glyphs, the Launchers, the Actions and all four failure grades to itself.
 - Action execution: the run pane, output capture, partial failure and cancellation.

@@ -73,7 +73,7 @@ It is coupled to fetch instead. A fetch handshake already advertises HEAD, so th
 
 The transport needs `blocking-network-client` plus an HTTP transport feature, which pulls in a dependency set well beyond the read-only surface the core was scaffolded with. It is isolated behind a cargo feature.
 
-A user-triggered re-derive over the Selection uses the same path without fetching. Its key belongs to [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12).
+A user-triggered re-derive over the Selection uses the same path without fetching, on `b` ([keybindings.md](keybindings.md)).
 
 The answer is never written back to `refs/remotes/<remote>/HEAD`. That is a mutation, and gix has no `set-head` equivalent in any case; it would have to be a hand-built `RefEdit`.
 

@@ -11,8 +11,8 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 | trigger | what it does |
 | --- | --- |
 | Startup | Generation 1 over everything, with an empty prior state. |
-| The refresh key | A new generation over everything. Its key belongs to [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12). |
-| Refreshing the Selection | A new generation over the Selection only. A separate explicit gesture, not the default, because after acting on three Repos you want those three re-read now rather than a four second sweep. |
+| The refresh key | A new generation over everything, on `r`, settled in [keybindings.md](keybindings.md). |
+| Refreshing the Selection | A new generation over the Selection only, on `R`. A separate explicit gesture, not the default, because after acting on three Repos you want those three re-read now rather than a four second sweep. |
 | Returning from a Launcher | The entity that was handed off is re-probed first and synchronously, then a normal generation starts. |
 | Terminal focus gained | A new generation over everything. Best effort: crossterm reports it via `Event::FocusGained` behind `EnableFocusChange` (XTerm private mode 1004), and a terminal that does not report focus simply never fires it. tmux gates this behind a `focus-events` server option that defaults to off. |
 | Switching Set | A new generation over the new Set's entities. |

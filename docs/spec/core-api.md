@@ -134,7 +134,7 @@ The core computes it. [0006](../adr/0006-no-git-state-cache-session-state-by-nam
 
 ### Presence
 
-`Present` or `Vanished`. Discovery re-runs at the head of every Generation, so an entity that a previous Generation found and this one did not becomes `Vanished`: it stays in the snapshot with its last values and every cell Stale, because Stale already means known to be old with nothing currently going to fix it, which is exactly true of an entity that is no longer there. It leaves only when the user dismisses it. Dismissal never persists, because startup is Generation 1 with an empty prior state, so nothing can be Vanished at launch and there is nothing to carry across. The gutter mark for a Vanished row is deliberately not decided here; `~` is what the existing rule produces, and whether that is enough is left open. The dismiss key belongs to [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12).
+`Present` or `Vanished`. Discovery re-runs at the head of every Generation, so an entity that a previous Generation found and this one did not becomes `Vanished`: it stays in the snapshot with its last values and every cell Stale, because Stale already means known to be old with nothing currently going to fix it, which is exactly true of an entity that is no longer there. It leaves only when the user dismisses it. Dismissal never persists, because startup is Generation 1 with an empty prior state, so nothing can be Vanished at launch and there is nothing to carry across. The gutter mark for a Vanished row is deliberately not decided here; `~` is what the existing rule produces, and whether that is enough is left open. The dismiss key is `d` ([keybindings.md](keybindings.md)).
 
 ## The row summary
 
@@ -279,7 +279,7 @@ Two things. `repon sets` is built as a literal second consumer calling `count`, 
 
 ## What this spec does not own
 
-- The keybindings for dismiss, refresh and the Selection refresh: [Decide the keybinding map](https://github.com/paulchiu/repon/issues/12).
+- The keybindings for dismiss, refresh and the Selection refresh: settled in [keybindings.md](keybindings.md) as `d`, `r` and `R`.
 - How discovery walks and how Submodules are reached: [Decide the discovery strategy and how submodules are reached](https://github.com/paulchiu/repon/issues/13).
 - What an Action's output looks like and what a partial failure means: [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14).
 - The gutter mark for a Vanished row.

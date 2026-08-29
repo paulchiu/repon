@@ -1,0 +1,208 @@
+# Keybindings
+
+The map is context-sensitive per pane, after lazygit: a key means what the focused surface says it means, and nothing else. The vocabulary is vim's letters, an always-visible footer teaches whichever subset is live, and one binding table in code is the single source of truth from which the footer, the help overlay and the config merge are all derived. The reasoning is in [0016](../adr/0016-one-binding-table-feeds-every-surface.md).
+
+## The contexts
+
+Six named contexts. `global` is live in `list` and `detail` only, and is suspended entirely in the other four.
+
+| context | what it is |
+| --- | --- |
+| `global` | Live in `list` and `detail`. Suspended in every other context |
+| `list` | The table of Repos and their Worktrees |
+| `detail` | The detail pane, when it has focus |
+| `input` | The Filter line, the Launcher palette, the Action palette, and the ad hoc command field |
+| `overlay` | The help overlay, the expanded warning list, and the Set picker |
+| `confirm` | The yes/no gate before an Action fans out |
+
+An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
+
+## The default map
+
+### global
+
+| key | action |
+| --- | --- |
+| `?` | Open the help overlay |
+| `q` | Quit |
+| `Ctrl+C` | Quit |
+| `Ctrl+Z` | Suspend |
+| `!` | Open the Launcher palette |
+| `;` | Open the Action palette |
+| `/` | Enter a Filter |
+| `r` | Refresh everything |
+| `R` | Refresh the Selection |
+| `b` | Re-derive default branches over the Selection |
+| `w` | Expand the warning slot |
+| `s` | Open the Set picker |
+| `1` to `9` | Switch to the Nth declared Set |
+| `Ctrl+R` | Reload config |
+| `Tab` | Move focus between list and detail |
+| `Esc` | Unwind one level |
+
+### list
+
+| key | action |
+| --- | --- |
+| `j`, `Down` | Move down |
+| `k`, `Up` | Move up |
+| `g` | First row |
+| `G` | Last row |
+| `Ctrl+D`, `PageDown` | Half page down |
+| `Ctrl+U`, `PageUp` | Half page up |
+| `Space` | Toggle this row's Selection |
+| `v` | Anchor a range at the cursor, extended with `j` and `k` |
+| `a` | Select every visible row |
+| `A` | Clear the Selection |
+| `Enter` | Open the detail pane |
+| `d` | Dismiss a Vanished row |
+
+### detail
+
+| key | action |
+| --- | --- |
+| `j`, `Down` | Scroll down |
+| `k`, `Up` | Scroll up |
+| `g` | Top |
+| `G` | Bottom |
+| `Ctrl+D` | Half page down |
+| `Ctrl+U` | Half page up |
+| `Esc` | Close the pane and return focus to the list |
+| `Tab` | Return focus to the list and leave the pane open |
+
+### input
+
+| key | action |
+| --- | --- |
+| any printable character | Text |
+| `Enter` | Apply the Filter, or run the highlighted entry |
+| `Esc` | Cancel |
+| `Up`, `Ctrl+K` | Previous entry (palettes only) |
+| `Down`, `Ctrl+J` | Next entry (palettes only) |
+| `Ctrl+W` | Delete the previous word |
+| `Ctrl+U` | Clear the line |
+| `Ctrl+E` | Open the field in `$EDITOR` |
+
+### overlay
+
+| key | action |
+| --- | --- |
+| `j`, `k`, `g`, `G`, `Ctrl+D`, `Ctrl+U` | Scroll |
+| `Enter` | Choose (Set picker only) |
+| `Esc`, `q` | Close |
+
+### confirm
+
+| key | action |
+| --- | --- |
+| `y` | Run |
+| `n`, `Esc` | Decline |
+| every other key | Ignored |
+
+## Why these keys and not others
+
+`!` for the Launcher palette was settled in [0008](../adr/0008-two-palettes-not-one.md). `;` for the Action palette comes from mutt, whose generic map binds `!` to shell-escape and `;` to tag-prefix, "apply the next command to everything tagged". That is the same one-target versus N-target split, in a tool that has shipped it for thirty years. `;` is unshifted home row while `!` is Shift+1, so they are far apart under the fingers, which is what 0008 actually asks for. `@` was rejected despite reading well as "across", because Shift+2 sits directly beside Shift+1 and the whole requirement is that the two keys not be one slip apart. The cost of `;` is real: it is bound in lf, yazi, nnn, ranger and helix with five different meanings, so its prior is inconsistent rather than absent.
+
+`?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
+
+`space` toggles and `v` anchors a range. `v` is lazygit's. `space` is not: lazygit's `Universal.Select` is a per-context action key and lazygit has no point-toggle multi-select at all. The real precedents for space are k9s, ranger, nnn, yazi, gitui, lf and htop.
+
+Ruling out prefix counts freed `1` to `9`, which lazygit, gitui, k9s and nnn all spend on jumping between panes. Repon has two panes and does not need them, so they switch Sets instead.
+
+The Ctrl chords all sit inside the set that survives zellij 0.45.0 (which takes Ctrl+g, q, p, n, s, o, t, h and b) and tmux (Ctrl+b). Ctrl+I, Ctrl+M and Ctrl+[ are permanently unavailable because they mean different things on different terminals, which [0016](../adr/0016-one-binding-table-feeds-every-surface.md) records.
+
+`Ctrl+U` is deliberately half-page in three contexts and clear-line in the fourth. Contexts do not overlap, and both meanings are the ones a user already has in their fingers.
+
+## Modifiers and matching
+
+crossterm reports an uppercase character with the SHIFT modifier set, so `R`, `G` and `A` must be matched as `Char('R')` with SHIFT, and a match on NONE never fires. Ctrl chords arrive as the lowercase char with CONTROL. Ctrl+Shift+letter is not distinguishable from Ctrl+letter on four of the five macOS terminals and is not used. `KeyEventKind::Release` is filtered before dispatch, which the skeleton already does at crates/repon/src/tui.rs:217.
+
+## Esc
+
+Esc never quits, at any depth. It unwinds exactly one level per press. If an Action is fanning out, Esc cancels it. Otherwise, innermost first: cancel a range, then close the detail pane, then clear a committed Filter. That last step is why clearing a Filter has no key of its own.
+
+Esc-twice gestures were measured safe against human typing: crossterm collapses two Esc bytes into one event only when both arrive in a single `read()`, and at a 0.5ms gap it is already two events. They are still not used, because that measurement stops holding over SSH.
+
+## Quitting, suspending, confirming
+
+`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends. Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+
+The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
+
+## The Selection
+
+Selection is per row, so a Worktree is selected independently of its Repo and selecting a Repo does not select its Worktrees. The Repo row and its Worktree rows have different working directories, so a Launcher on one and a Launcher on the other are different acts. `j` and `k` step over every visible row without regard to depth.
+
+When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes CONTEXT.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
+
+## The ad hoc command field
+
+The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+E` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
+
+What such a command does when it runs, how its lines gate, and what its output looks like belong to [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14). This spec fixes only the keys that reach it.
+
+## The footer
+
+Derived from the binding table, never written as strings. Left-aligned. Each context renders its own.
+
+The list context's footer is 87 columns at full width, which fits inside both the 90-column list from [layout-and-provenance.md](layout-and-provenance.md) and the 88-column narrow screen the prototype ran at. It degrades like this:
+
+```
+ 88  j/k move  space select  enter detail  / filter  ! launcher  ; action  r refresh  ? help
+ 80  j/k move  space select  enter detail  / filter  ! launcher  ; action  ? help ...
+ 70  space select  enter detail  / filter  ! launcher  ; action  ? help ...
+ 60  space select  / filter  ! launcher  ; action  ? help ...
+ 50  space select  ! launcher  ; action  ? help ...
+ 40  ! launcher  ; action  ? help ...
+ 30  ? help ...
+  6  ? help
+```
+
+Four rules produce it:
+
+1. Items are separated by two spaces. The ellipsis is ` ...` in ASCII, because unicode-width scores U+2026 as 1 and `width_cjk` as 2, and the whole footer is ASCII words for the same reason.
+2. A hint drops earlier when its action has a second binding the user would guess anyway. `r refresh` goes first, because focus-gain and the poll already refresh without it. `j/k move` goes second, because the arrow keys are bound too. Below that there is no fallback, so the order is discoverability cost: `enter detail`, `/ filter`, `space select`, then the palettes, then help.
+3. `! launcher` and `; action` drop as one atomic pair and never separately. A footer advertising the one-Repo key while hiding the N-Repo key teaches the wrong reach at exactly the width where the user can least go and check.
+4. The ellipsis is reserved inside the budget rather than appended after it, and every item is width-checked including the first. The last surviving item drops the ellipsis rather than itself, which is what makes `? help` render at 6 columns instead of a bare ellipsis. Below 6 columns nothing renders.
+
+ratatui does none of this. `Buffer::set_stringn` (ratatui-core 0.1.2, src/buffer/buffer.rs:336) truncates silently at a grapheme boundary and neither wraps nor panics, so left alone it cuts a binding in half, and a half-rendered hint still reads as an instruction.
+
+The detail context's footer is 61 columns at full width and follows the same rules. The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+
+## The help overlay
+
+Generated from the same table. It shows the current context's bindings first, then `global`. It scrolls, and closes with Esc or `q`. `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+
+## Configuration
+
+A `[keys]` block in config.toml, one sub-table per context. The merge is per context, keyed on the action name rather than the key, so `[keys.list]` with `refresh = "F5"` moves one binding and leaves the rest of the default map alone. Binding an action to the empty string unbinds it. This block is the one place `config.toml` nests three deep, against the rule [config.md](config.md) otherwise holds, because a binding is identified by its context and its action together and flattening it would put the context name inside the key name.
+
+| case | behaviour |
+| --- | --- |
+| Unknown context or unknown action name | Warn, name the dotted path, continue, matching [config.md](config.md)'s unknown-key grade |
+| An unparseable key name | Exit non-zero before the terminal is claimed |
+| Two actions bound to the same key in one context | Exit non-zero before the terminal is claimed, naming both actions and the key |
+
+The collision case is the one worth explaining. [theming.md](theming.md) refused to make glyphs themeable because [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness is a correctness property that no flat TOML schema can express to someone editing the file. A key collision is the same class of property with one difference: it can be checked at load. So it is checked rather than forbidden. The same assertion runs over the compiled-in default map at startup in debug builds, because the default map can grow a collision in review just as easily as a config file can.
+
+`Ctrl+R` reloads config and can therefore change the keyboard mid-session, which is the whole reason the footer is derived rather than written.
+
+## Terminal state
+
+| state | setting | why |
+| --- | --- | --- |
+| Raw mode | on | `cfmakeraw` clears ISIG and IXON, so Ctrl+C, Ctrl+Z, Ctrl+S and Ctrl+Q all reach Repon |
+| Alternate screen | on | |
+| Bracketed paste | **on** | Without it a pasted two-line command arrives as Enter, then Ctrl+J, then the rest, so it submits itself halfway through |
+| Mouse capture | **off** | It takes the terminal's own select-and-copy away, and the screen is mostly Repo paths and branch names people copy out of it |
+| Focus reporting | on | [refresh.md](refresh.md) refreshes on focus gained |
+
+All five are restored around a Launcher handoff, per [config.md](config.md).
+
+An unbound printable key is ignored in silence and never beeps, because a split escape sequence can leak a literal character through the parser and a beep would then fire on the terminal's own noise.
+
+## Open
+
+- Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have.
+- Mouse support. Ruled out above for a stated reason rather than an absent one, and the reopening condition is someone wanting to try it.
+- The dismiss gesture has no undo. Whether it needs one, and whether a Vanished row wants a Filter of its own, is open in [layout-and-provenance.md](layout-and-provenance.md).
