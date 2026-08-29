@@ -47,6 +47,14 @@ _Avoid_: Handoff (that names the act, not the thing)
 **Action**:
 A user-defined command fanned out across the Selection. Discoverable through a palette that shows how many of the selected Repos define it before it runs.
 
+### Refreshing
+
+**Refresh**:
+One look at the world: Repon re-reads the state of the Repos it knows about. A Refresh always covers every Repo in view rather than a subset chosen to make it finish sooner.
+
+**Generation**:
+One Refresh, named so a newer one can beat an older one still in flight. Every value on screen carries the Generation that produced it, which is how a slow answer to an old question is recognised and dropped.
+
 ### Worktree state
 
 Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag.

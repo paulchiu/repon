@@ -23,7 +23,7 @@ Gutter glyphs:
 | (space) | fresh |
 | `~` | stale |
 | `?` | unknown |
-| braille spinner | loading; the spinner is per row, there is never one global spinner |
+| braille spinner | loading; per row while the row holds no values, per cell once only some cells are outstanding. There is never one global spinner |
 | `!` | failed |
 
 In-cell glyphs for real values:
@@ -44,7 +44,7 @@ The two sets stay disjoint: no provenance mark may share a glyph with a real val
 
 ## Provenance
 
-Every value carries one of the five states from [0001](../adr/0001-per-cell-provenance.md). Fresh renders the value plainly behind a space in the gutter. Loading leaves the cell blank behind the row's spinner; on a re-probe the cell holds its previous value rendered as Stale instead of dropping back to Loading. Stale marks the row `~`. Unknown, marked `?`, is reserved for the settled answer "we asked and got nothing back"; a row whose probe has not started yet is Loading. Failed marks the row `!`. Worktree state has no meaning for a Repo, so that cell is not applicable: it renders blank and is excluded from the row summary. `base` is not applicable on the same terms in two cases, on a row whose branch is itself the default branch, where it would only repeat `sync`, and on a Repo with no remote, where a `?` would report a settled fact as a missing one. The ADR carries the reasoning for each of these.
+Every value carries one of the five states from [0001](../adr/0001-per-cell-provenance.md). Fresh renders the value plainly behind a space in the gutter. Loading leaves the cell blank, and the spinner marks where the gap is: while a row holds no values at all it sits in the gutter, and once the row holds some values with only some cells outstanding it sits in those cells while the gutter falls back to the row's least-settled settled state. On a re-probe the cell keeps its previous value rather than dropping back to blank. Stale marks the row `~` and means the value is known to be old with nothing currently going to fix it, which is what the metadata poll and the status age threshold produce. In-flight is a row property that outranks the least-settled-state summary; [refresh.md](refresh.md) carries the rule. Unknown, marked `?`, is reserved for the settled answer "we asked and got nothing back"; a row whose probe has not started yet is Loading. Failed marks the row `!`. Worktree state has no meaning for a Repo, so that cell is not applicable: it renders blank and is excluded from the row summary. `base` is not applicable on the same terms in two cases, on a row whose branch is itself the default branch, where it would only repeat `sync`, and on a Repo with no remote, where a `?` would report a settled fact as a missing one. The ADR carries the reasoning for each of these.
 
 ## The detail pane
 
@@ -58,7 +58,7 @@ The detail pane always reports provenance per cell, which is the escape hatch fr
 ## Open
 
 - The palette is settled in [theming.md](theming.md): nine roles named for meaning, defaulting to the terminal's own ANSI slots. The prototype's colour roles carried over intact, so dim still marks unresolved values and known zeros, the accent still marks loading and Worktree names, and Gone, ahead, behind and Dirty keep the colours the prototype gave them.
-- The refresh model behind progressive fill. A benchmark of the git backend measured opening a Repo and reading its branch at about 10ms and reading its status at about 94ms at the median, so a row paints its branch almost immediately and fills in status progressively; how that becomes a refresh model is decided in [Decide the refresh model](https://github.com/paulchiu/repon/issues/7).
+- The refresh model behind progressive fill is settled in [refresh.md](refresh.md). Its measurements replace the figures this spec was written against: opening a Repo and reading its branch is 0.4ms rather than 10ms, the status median is 11ms uncontended rather than 94ms, and a full probe of every entity is 4.4 seconds rather than 7.2. A row paints its name within 50ms of launch, its cheap columns within 200ms, and its status behind a spinner over the following few seconds.
 
 ## Screens
 
