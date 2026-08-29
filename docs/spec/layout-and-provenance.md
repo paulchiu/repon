@@ -24,7 +24,7 @@ Gutter glyphs:
 | (space) | fresh |
 | `~` | stale |
 | `?` | unknown |
-| braille spinner | loading; per row while the row holds no values, per cell once only some cells are outstanding. There is never one global spinner |
+| braille spinner, `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` | loading; per row while the row holds no values, per cell once only some cells are outstanding. There is never one global spinner. Under `glyphs = "ascii"` the frames are `\`, `|` and `/` ([theming.md](theming.md)) |
 | `!` | failed |
 
 In-cell glyphs for real values:
@@ -39,11 +39,11 @@ In-cell glyphs for real values:
 | `↓n` | behind by n |
 | `●n` | n changed files |
 
-`-` and `∅` are different facts: `-` means you could push and have not, `∅` means there is nowhere to push. `∅` appears on the Repo row and on all of its Worktree rows, since none of them can have an upstream.
+`-` and `∅` are different facts. `-` means there is nowhere named to push to, covering both a branch with no upstream and a row with no branch at all; `∅` means there is nowhere to push. The older gloss here, "`-` means you could push and have not", is dropped: [default-branch.md](default-branch.md) refuses it, being false for a detached HEAD and for every Submodule row already carrying `-`. `∅` appears on the Repo row and on all of its Worktree rows, since none of them can have an upstream.
 
-The two sets stay disjoint: no provenance mark may share a glyph with a real value (see the [ADR](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)).
+The two sets stay disjoint: no provenance mark may share a glyph with a real value (see the [ADR](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)). The rule reaches the row interior, meaning the gutter, these cells and the child-row marker below, and stops at the frame and the footer; [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) fixes that scope and [theming.md](theming.md) carries the second, ascii set in full.
 
-A child row is indented under its parent and marked `└`, and a Submodule row carries the same mark as a Worktree row rather than one of its own. The screens below previously drew Submodules with `∙` (U+2219), which sits one codepoint from `·` (U+00B7), the clean value, on the same row; that is the disjointness rule failing in the value plane rather than through provenance. The cost is that a Submodule row and a Worktree row look alike, and the name column and the detail pane are what tell them apart. Submodule rows are settled in [discovery.md](discovery.md).
+A child row is indented under its parent and marked `└`, or `` ` `` under `glyphs = "ascii"` ([theming.md](theming.md)), and a Submodule row carries the same mark as a Worktree row rather than one of its own. The screens below previously drew Submodules with `∙` (U+2219), which sits one codepoint from `·` (U+00B7), the clean value, on the same row; that is the disjointness rule failing in the value plane rather than through provenance. The cost is that a Submodule row and a Worktree row look alike, and the name column and the detail pane are what tell them apart. Submodule rows are settled in [discovery.md](discovery.md).
 
 ## Provenance
 

@@ -213,7 +213,7 @@ Paths that came from a flag or the environment are fixed for the process, since 
 `repon config --example` prints this file. It parses, and every value shown that matches a default could be deleted.
 
 ```toml
-# This terminal draws box drawing and braille fine; keep the full set.
+# This terminal draws braille, ∅ and the rounded borders fine; keep the full set.
 theme = "default"
 glyphs = "full"
 

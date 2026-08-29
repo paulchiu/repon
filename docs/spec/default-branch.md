@@ -135,7 +135,7 @@ One addition to the value set: `∅` in the `sync` cell means the Repo has **no 
 
 `-` covers two causes and cannot gloss either as "you could push and have not": a branch with no upstream, and a row with no branch at all. The second is the larger population, all 16 Submodule rows already on screen and the 121 detached Worktrees [head.md](head.md) covers, and there is nothing to push there, because pushing a detached HEAD means naming a refspec.
 
-`∅` is disjoint from both the value set (`≡`, `·`, `-`, `↑n`, `↓n`, `●n`) and the gutter set (space, `~`, `?`, spinner, `!`), which is the rule [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) holds. It is an ambiguous-width character, as `≡`, `·`, `↑` and `↓` already are, and the `glyphs = "ascii"` switch in [theming.md](theming.md) covers terminals that cannot draw it.
+`∅` is disjoint from both the value set (`≡`, `·`, `-`, `↑n`, `↓n`, `●n`) and the gutter set (space, `~`, `?`, spinner, `!`), which is the rule [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) holds. It is not an ambiguous-width character, which this spec previously claimed. Measured with unicode-width 0.2.2, `∅` is one column under both `width()` and `width_cjk()`, where `≡`, `·`, `↑` and `↓` are two under the second. Its risk is font coverage instead, and it is the worst in the set: of the five macOS system monospace faces only Menlo carries it. The `glyphs = "ascii"` switch in [theming.md](theming.md) renders it `x`, and [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) carries the measurement.
 
 ## Column widths
 
