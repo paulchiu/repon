@@ -3,7 +3,7 @@ use std::time::Duration;
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::KeyEvent;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use repon_core::{Core, CoreSpec, EntityKey, SetSpec};
 use tracing::debug;
 
@@ -13,7 +13,9 @@ use crate::{
         Config,
         document::{self, Document},
     },
+    footer,
     glyphs::GlyphSet,
+    help::HelpOverlay,
     keys::{self, Action, Context},
     message::Message,
     selection::Selection,
@@ -41,6 +43,13 @@ pub struct App {
     /// read: an index into the current [`Snapshot`](repon_core::Snapshot)'s entities, which is
     /// this crate's only "visible list" until a Filter narrows it.
     cursor: usize,
+    /// `Some` while the help overlay has focus, carrying its scroll position; `None` while
+    /// `List` does. `Context::List` is the only context this ticket's `handle_key_event`
+    /// ever opens it from, since no `Detail` component exists yet to open it from the other.
+    help: Option<HelpOverlay>,
+    /// The last size `Tui` reported, so the help overlay's own scroll clamp
+    /// ([`HelpOverlay::apply`]) knows its viewport height without `Tui` reaching back in.
+    frame_size: Size,
     /// Cloned by anything that needs to reach the loop, including worker threads, which
     /// is why the channel is crossbeam rather than std.
     message_tx: Sender<Message>,
@@ -87,6 +96,8 @@ impl App {
             should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
+            help: None,
+            frame_size: Size::default(),
             message_tx,
             message_rx,
         })
@@ -100,7 +111,9 @@ impl App {
 
         self.list
             .register_message_handler(self.message_tx.clone())?;
-        self.list.init(tui.size()?)?;
+        let size = tui.size()?;
+        self.frame_size = size;
+        self.list.init(size)?;
 
         loop {
             self.handle_events(&tui)?;
@@ -142,12 +155,25 @@ impl App {
         Ok(())
     }
 
-    /// Routes the key through [`keys::dispatch`] and turns the actions already wired to
-    /// something into effect: `Quit` and `Suspend` raise a [`Message`], the movement and
-    /// Selection actions mutate `cursor` and `selection` directly, and `Unwind` reaches
-    /// [`unwind::unwind_one`]. Every other action dispatches correctly but has nothing to do
-    /// yet, since `List` is this app's only real focus target today.
+    /// Routes the key through [`keys::dispatch`]: `Context::Overlay` while the help overlay
+    /// is open, `Context::List` otherwise. `Quit` and `Suspend` raise a [`Message`], the
+    /// movement and Selection actions mutate `cursor` and `selection` directly, `OpenHelp`
+    /// opens the overlay and `Unwind` reaches [`unwind::unwind_one`]. Every other action
+    /// dispatches correctly but has nothing to do yet, since `List` is this app's only real
+    /// focus target today.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(overlay) = &mut self.help {
+            match keys::dispatch(Context::Overlay, key) {
+                Some(Action::Close) => self.help = None,
+                Some(action) => {
+                    let content_len = HelpOverlay::content_len(Context::List);
+                    overlay.apply(action, content_len, self.frame_size.height);
+                }
+                None => {}
+            }
+            return Ok(());
+        }
+
         let message = match keys::dispatch(Context::List, key) {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
@@ -188,6 +214,10 @@ impl App {
             }
             Some(Action::Unwind) => {
                 unwind::unwind_one(&mut [&mut self.selection]);
+                None
+            }
+            Some(Action::OpenHelp) => {
+                self.help = Some(HelpOverlay::default());
                 None
             }
             _ => None,
@@ -268,20 +298,29 @@ impl App {
 
     fn resize(&mut self, tui: &mut Tui, columns: u16, rows: u16) -> Result<()> {
         tui.resize(Rect::new(0, 0, columns, rows))?;
+        self.frame_size = Size::new(columns, rows);
         self.render(tui)
     }
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
     /// [`Snapshot`](repon_core::Snapshot) is cloned here, and every panel this tick draws
-    /// shares that same clone.
+    /// shares that same clone. The help overlay, when open, takes the whole frame in place
+    /// of `List` and its footer; otherwise `List` gets every row but the last, which
+    /// [`footer::draw`] renders into.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
         let snapshot = self.core.snapshot();
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
-            if let Err(err) = self.list.draw(frame, area, &snapshot) {
+            if let Some(overlay) = &self.help {
+                overlay.draw(frame, area, Context::List);
+                return;
+            }
+            let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+            if let Err(err) = self.list.draw(frame, areas[0], &snapshot) {
                 error = Some(err);
             }
+            footer::draw(frame, areas[1], Context::List);
         })?;
         if let Some(err) = error {
             self.message_tx

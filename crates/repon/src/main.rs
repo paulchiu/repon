@@ -12,7 +12,9 @@ mod cli;
 mod components;
 mod config;
 mod errors;
+mod footer;
 mod glyphs;
+mod help;
 mod keys;
 mod logging;
 mod message;
@@ -27,6 +29,11 @@ fn main() -> color_eyre::Result<()> {
     #[cfg(debug_assertions)]
     if args.panic_after_tui_enter {
         return panic_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
+    if args.suspend_after_tui_enter {
+        return suspend_after_tui_enter();
     }
 
     if let Some(command) = &args.command {
@@ -49,6 +56,18 @@ fn panic_after_tui_enter() -> color_eyre::Result<()> {
     let mut tui = tui::Tui::new()?;
     tui.enter()?;
     panic!("repon: test-triggered panic after claiming the terminal");
+}
+
+/// Claims the terminal, suspends it, then exits, so a test can attach to a real process over
+/// a pty and observe suspend-time restoration ordering, rather than trusting a description of
+/// it. Bypasses `Config` and the event loop: nothing here needs either.
+#[cfg(debug_assertions)]
+fn suspend_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    tui.suspend()?;
+    Ok(())
 }
 
 /// Runs a subcommand and exits without claiming the terminal or writing to the data
