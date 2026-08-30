@@ -362,3 +362,90 @@ fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
          EnterAlternateScreen appeared: {output:?}"
     );
 }
+
+/// keybindings.md's collision rule: two actions bound to the same key in one context is a
+/// load error before the terminal is claimed, naming both actions and the key. An exit-code-
+/// and-empty-stdout assertion is not sufficient proof of "before the terminal is claimed",
+/// per this ticket's brief: a mutant that claims the terminal and then fails in
+/// `enable_raw_mode` also exits non-zero with nothing on stdout. Attaching a real pty, the
+/// same technique `a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed`
+/// above uses, is what lets this assert the `EnterAlternateScreen` byte sequence never
+/// reaches the terminal at all, rather than merely that the process died.
+#[test]
+fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and_the_key() {
+    let (mut master, slave_path) = open_pty();
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "[keys.list]\ndismiss_vanished = \"z\"\nnext_failed = \"z\"\n",
+    )
+    .expect("write a config.toml with a keys collision");
+    let mut child = spawn_attached_to_pty_with(
+        &slave_path,
+        &[],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+
+    // Drains the pty concurrently, the same reason the tests above do.
+    let (output_tx, output_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = output_tx.send(output);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "repon with a colliding [keys] block did not exit within 5s; refusing to \
+                 trust a hung process's terminal state"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1), "expected a non-zero exit");
+
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pty reader thread did not report back after the child exited");
+    let _ = reader.join();
+    let output = String::from_utf8_lossy(&output);
+
+    assert!(
+        output.contains("dismiss_vanished"),
+        "expected the first colliding action named, got: {output:?}"
+    );
+    assert!(
+        output.contains("next_failed"),
+        "expected the second colliding action named, got: {output:?}"
+    );
+    assert!(
+        output.contains('z'),
+        "expected the colliding key named, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once a [keys] collision is detected, but \
+         EnterAlternateScreen appeared: {output:?}"
+    );
+}

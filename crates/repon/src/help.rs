@@ -1,11 +1,11 @@
 //! The help overlay [keybindings.md](../../../../docs/spec/keybindings.md#the-help-overlay)
 //! describes: generated from the same table as the footer, current context first then
 //! `global`, scrolling, and closing on either of its two close keys. Content comes straight
-//! from [`keys::describe`]; nothing here is transcribed.
+//! from [`BindingTable::describe`]; nothing here is transcribed.
 
 use ratatui::{Frame, layout::Rect, style::Style};
 
-use crate::keys::{self, Action, Context};
+use crate::keys::{Action, BindingTable, Context};
 
 /// The overlay's own scroll position: how many of its content lines are scrolled past the
 /// top of its viewport. Owns no content of its own, since [`HelpOverlay::content`] derives
@@ -21,15 +21,17 @@ impl HelpOverlay {
     /// than joined into one string: [theming.md](../../../../docs/spec/theming.md) fixes
     /// the keys' role as `accent` and the description's as `dim`, and that split only
     /// survives if nothing here bakes it together before [`Self::draw`] paints it. Current
-    /// context first then `global`, exactly as [`keys::describe`] orders them.
-    pub(crate) fn content(context: Context) -> Vec<(String, &'static str)> {
-        keys::describe(context)
+    /// context first then `global`, exactly as `table`'s own `describe` orders them; `table`
+    /// is `App`'s live binding table, so a rebind changes this overlay with no code change
+    /// here.
+    pub(crate) fn content(table: &BindingTable, context: Context) -> Vec<(String, &'static str)> {
+        table.describe(context)
     }
 
     /// How many lines [`Self::content`] would have, without building any of them: the
     /// scroll clamp only ever needs the count.
-    pub(crate) fn content_len(context: Context) -> usize {
-        keys::describe(context).len()
+    pub(crate) fn content_len(table: &BindingTable, context: Context) -> usize {
+        table.describe(context).len()
     }
 
     /// Folds one of the overlay's own scroll actions into the current offset, clamped so it
@@ -59,8 +61,14 @@ impl HelpOverlay {
     /// `set_string`, never `set_stringn`: a line longer than `area`'s width is ratatui's own
     /// clipping to worry about, not this ticket's width-budget concern, which is the
     /// footer's alone.
-    pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, context: Context) {
-        let lines = Self::content(context);
+    pub(crate) fn draw(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        context: Context,
+        table: &BindingTable,
+    ) {
+        let lines = Self::content(table, context);
         let buf = frame.buffer_mut();
         for (row, (keys_text, description)) in lines
             .iter()
@@ -78,19 +86,26 @@ impl HelpOverlay {
 mod tests {
     use super::*;
 
+    /// The compiled default table: none of these tests exercises a config rebind, only the
+    /// derivation, ordering and scrolling.
+    fn default_table() -> BindingTable {
+        BindingTable::compiled_default()
+    }
+
     // --- content is derived, not transcribed, and stays unjoined ---
 
     #[test]
-    fn content_is_exactly_keys_describe_with_no_reformatting() {
+    fn content_is_exactly_the_tables_own_describe_with_no_reformatting() {
+        let table = default_table();
         assert_eq!(
-            HelpOverlay::content(Context::List),
-            keys::describe(Context::List)
+            HelpOverlay::content(&table, Context::List),
+            table.describe(Context::List)
         );
     }
 
     #[test]
     fn content_shows_the_current_contexts_own_actions_before_global() {
-        let lines = HelpOverlay::content(Context::List);
+        let lines = HelpOverlay::content(&default_table(), Context::List);
         let own = lines
             .iter()
             .position(|(_, description)| *description == "Move down")
@@ -106,7 +121,7 @@ mod tests {
     fn content_omits_bindings_not_live_in_the_given_context() {
         // Confirm never dispatches Global, so a leaked "Move down" or "Quit" line would be
         // a context-scoping bug, not merely an ordering one.
-        let lines = HelpOverlay::content(Context::Confirm);
+        let lines = HelpOverlay::content(&default_table(), Context::Confirm);
         assert!(
             !lines
                 .iter()
@@ -118,12 +133,40 @@ mod tests {
 
     #[test]
     fn content_len_matches_content_without_building_any_of_it() {
+        let table = default_table();
         for context in [Context::List, Context::Detail, Context::Confirm] {
             assert_eq!(
-                HelpOverlay::content_len(context),
-                HelpOverlay::content(context).len()
+                HelpOverlay::content_len(&table, context),
+                HelpOverlay::content(&table, context).len()
             );
         }
+    }
+
+    #[test]
+    fn content_reflects_whatever_table_it_is_handed_rather_than_a_fixed_default() {
+        // Not a config-parsing test: `keys::merge`'s own tests own that. This only proves
+        // `content` is a pure function of the table it is given, which is what lets a config
+        // reload change the overlay by handing it a new table, with no code change here.
+        let mut context_table = toml::Table::new();
+        context_table.insert(
+            "dismiss_vanished".to_string(),
+            toml::Value::String("x".to_string()),
+        );
+        let mut document_keys = toml::Table::new();
+        document_keys.insert("list".to_string(), toml::Value::Table(context_table));
+        let (rebound, _) =
+            crate::keys::merge(&document_keys).expect("expected the merge to succeed");
+
+        let rows = HelpOverlay::content(&rebound, Context::List);
+        assert!(
+            rows.iter()
+                .any(|(keys, description)| keys == "x" && *description == "Dismiss a Vanished row"),
+            "expected the rebound key to appear in the overlay's own content, got: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(keys, _)| keys == "d"),
+            "the old default key must not still appear once it has been rebound, got: {rows:?}"
+        );
     }
 
     // --- scrolling ---

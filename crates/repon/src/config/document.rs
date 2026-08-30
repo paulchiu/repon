@@ -159,8 +159,11 @@ pub struct Document {
     pub launchers: Vec<LauncherConfig>,
     #[serde(rename = "action")]
     pub actions: Vec<ActionConfig>,
-    /// `[keys]`'s own schema is [keybindings.md](../../../../docs/spec/keybindings.md)'s;
-    /// captured whole so it, and every key inside it, never trips the unknown-key warning.
+    /// `[keys]`'s own schema is [keybindings.md](../../../../docs/spec/keybindings.md)'s, and
+    /// this crate's `keys` module ([`crate::keys::merge`]) is what parses it: captured whole
+    /// here so it, and every key inside it, never trips this module's own unknown-key
+    /// warning. [`crate::keys::merge`]'s own doc comment, not this one, is where this spec's
+    /// one nesting exception for `[keys]` is recorded.
     pub keys: toml::Table,
 }
 
@@ -849,6 +852,48 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "expected no unknown-key warnings, got: {unknown:?}"
+        );
+    }
+
+    // The example's own `[keys]` block, the "single source of truth shared by production and
+    // its tests" trap named in this ticket's brief: a hand-typed example that merely parses
+    // as a TOML table proves nothing about whether its context and action names are real.
+    // This runs it through the actual merge `crate::keys::merge` performs and asserts it
+    // raises neither an unknown-context nor an unknown-action warning, and does rebind and
+    // unbind the keys it names.
+    #[test]
+    fn the_annotated_examples_keys_block_merges_cleanly_and_does_what_its_comments_say() {
+        let loaded = parse_ok(annotated_example());
+        let (bindings, warnings) =
+            crate::keys::merge(&loaded.document.keys).expect("expected the keys block to merge");
+        assert!(
+            warnings.is_empty(),
+            "expected the shipped example's [keys] block to raise no warning, got: {warnings:?}"
+        );
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // "move one binding": refresh_all moved from `r` to F5, and its old key is gone.
+        assert_eq!(
+            bindings.dispatch(
+                crate::keys::Context::Global,
+                KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+            ),
+            Some(crate::keys::Action::RefreshAll)
+        );
+        assert_eq!(
+            bindings.dispatch(
+                crate::keys::Context::Global,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        // "unbind it entirely": dismiss_vanished no longer fires on `d`.
+        assert_eq!(
+            bindings.dispatch(
+                crate::keys::Context::List,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            ),
+            None
         );
     }
 

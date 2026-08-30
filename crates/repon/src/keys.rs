@@ -1,12 +1,14 @@
-//! The one compiled binding table ([`BINDINGS`]), and [`dispatch`], the only function that
-//! turns a key event into an [`Action`]. Restates
-//! [keybindings.md](../../../../docs/spec/keybindings.md) in code so the two never drift apart.
+//! The one compiled binding table ([`BINDINGS`]), and [`BindingTable::dispatch`], the only
+//! function that turns a key event into an [`Action`]. Restates
+//! [keybindings.md](../../../../docs/spec/keybindings.md) in code so the two never drift
+//! apart. [`merge`] is where a `[keys]` block joins the compiled table.
 
+use color_eyre::eyre::{Result, eyre};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The six named contexts [keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)
-/// fixes. `Global` is live only while `List` or `Detail` has focus; [`dispatch`] suspends it
-/// entirely for the other three.
+/// fixes. `Global` is live only while `List` or `Detail` has focus;
+/// [`BindingTable::dispatch`] suspends it entirely for the other three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Context {
     Global,
@@ -100,7 +102,7 @@ const fn binding(
     (context, code, modifiers, action)
 }
 
-/// The spec's own words for an action, read by [`describe`] for the help overlay and by
+/// The spec's own words for an action, read by [`describe_over`] for the help overlay and by
 /// this module's own spec-conformance test. Deriving it from the [`Action`] rather than
 /// storing it per row means a mislabelled binding permutes its description too, so neither
 /// reader can be fed a stale string.
@@ -479,26 +481,31 @@ const _: () = {
     );
 };
 
-/// The one place a key event becomes an [`Action`]: a pure function of the focused
-/// [`Context`] and the event, so routing is testable with no terminal and no running app.
+/// The one place a key event becomes an [`Action`]: a pure function of a binding table, the
+/// focused [`Context`] and the event, so routing is testable with no terminal and no running
+/// app. [`BindingTable::dispatch`] is the only production caller, over whichever table `App`
+/// currently holds (the compiled default until a `[keys]` block or a reload changes it).
 ///
 /// `Global` only dispatches while `context` is `List` or `Detail`
 /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)); `Input` also turns
 /// an unbound printable character into [`Action::Text`].
-pub(crate) fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
+fn dispatch_over(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Action> {
     match context {
         Context::List | Context::Detail => {
-            lookup(context, key).or_else(|| lookup(Context::Global, key))
+            lookup(bindings, context, key).or_else(|| lookup(bindings, Context::Global, key))
         }
-        Context::Input => lookup(Context::Input, key).or_else(|| printable(key).map(Action::Text)),
-        Context::Global | Context::Overlay | Context::Confirm => lookup(context, key),
+        Context::Input => {
+            lookup(bindings, Context::Input, key).or_else(|| printable(key).map(Action::Text))
+        }
+        Context::Global | Context::Overlay | Context::Confirm => lookup(bindings, context, key),
     }
 }
 
-/// Consults [`BINDINGS`] alone: [`PERMANENTLY_UNBINDABLE`] is refused for every row at build
-/// time (see the `const _` assertion above), so no row here can ever name one.
-fn lookup(context: Context, key: KeyEvent) -> Option<Action> {
-    BINDINGS
+/// Consults `bindings` alone: [`PERMANENTLY_UNBINDABLE`] is refused for every row of
+/// [`BINDINGS`] at build time (see the `const _` assertion above), but a user-merged table is
+/// built at runtime and gets no such guarantee for free; [`merge`] is what refuses it there.
+fn lookup(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Action> {
+    bindings
         .iter()
         .find(|(row_context, code, modifiers, _)| {
             *row_context == context && *code == key.code && *modifiers == key.modifiers
@@ -518,7 +525,8 @@ fn printable(key: KeyEvent) -> Option<char> {
 
 /// The chord text a human reads for one row, e.g. `"ctrl-r"` or `"?"` or `"enter"`. The one
 /// place a [`KeyCode`]/[`KeyModifiers`] pair turns into a word, so the footer and the help
-/// overlay agree on spelling without either hardcoding a chord.
+/// overlay agree on spelling without either hardcoding a chord. [`parse_chord`] is its
+/// inverse: whatever this renders is what a `[keys]` entry types back to rebind it.
 pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
     let base = match code {
         KeyCode::Enter => "enter".to_string(),
@@ -530,6 +538,7 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
         KeyCode::PageDown => "pagedown".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
         KeyCode::Char(c) => c.to_string(),
+        KeyCode::F(n) => format!("f{n}"),
         other => format!("{other:?}"),
     };
     if modifiers.contains(CTRL) {
@@ -539,22 +548,29 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
     }
 }
 
-/// The first chord [`BINDINGS`] binds `action` to in `context`, in table order. Table order
-/// lists a letter before its arrow-key alternate ([`dispatch`]'s own preference), which is
-/// why the footer reads this rather than every key an action answers to.
-pub(crate) fn primary_chord(context: Context, action: Action) -> Option<(KeyCode, KeyModifiers)> {
-    BINDINGS
+/// The first chord `bindings` binds `action` to in `context`, in table order. Table order
+/// lists a letter before its arrow-key alternate ([`BindingTable::dispatch`]'s own
+/// preference), which is why the footer reads this rather than every key an action answers
+/// to. [`BindingTable::primary_chord`] is the only production caller.
+fn primary_chord_over(
+    bindings: &[Binding],
+    context: Context,
+    action: Action,
+) -> Option<(KeyCode, KeyModifiers)> {
+    bindings
         .iter()
         .find(|(row_context, _, _, row_action)| *row_context == context && *row_action == action)
         .map(|(_, code, modifiers, _)| (*code, *modifiers))
 }
 
-/// Every distinct action live in `context`, as `(keys, description)`, current context first
-/// then `global` where it is live alongside it ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)).
-/// A row bound to more than one key (`` `j`, `Down` ``) collapses to one entry, its keys
-/// joined with `, ` in table order, because the help overlay shows one line per action, not
-/// per key. The help overlay's only source of content: nothing here is transcribed.
-pub(crate) fn describe(context: Context) -> Vec<(String, &'static str)> {
+/// Every distinct action live in `context` over `bindings`, as `(keys, description)`, current
+/// context first then `global` where it is live alongside it
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)). A row bound to more
+/// than one key (`` `j`, `Down` ``) collapses to one entry, its keys joined with `, ` in table
+/// order, because the help overlay shows one line per action, not per key.
+/// [`BindingTable::describe`] is the only production caller, and the help overlay's only
+/// source of content: nothing here is transcribed.
+fn describe_over(bindings: &[Binding], context: Context) -> Vec<(String, &'static str)> {
     let mut contexts = vec![context];
     if matches!(context, Context::List | Context::Detail) {
         contexts.push(Context::Global);
@@ -564,7 +580,7 @@ pub(crate) fn describe(context: Context) -> Vec<(String, &'static str)> {
     let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
         std::collections::HashMap::new();
     for ctx in contexts {
-        for &(row_context, code, modifiers, action) in BINDINGS {
+        for &(row_context, code, modifiers, action) in bindings {
             if row_context != ctx {
                 continue;
             }
@@ -583,12 +599,394 @@ pub(crate) fn describe(context: Context) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------------------
+// User-configurable rebinding: a `[keys]` block merges over `BINDINGS` by action name.
+// keybindings.md's "Configuration" section and config.md's "The shape of the document" are
+// the design of record; [`merge`]'s own doc comment below is where this crate records why
+// `[keys]` is allowed to nest three deep, config.toml's one exception to nesting no deeper
+// than one table.
+// ---------------------------------------------------------------------------------------
+
+/// A live binding table: the compiled default, or the compiled default with a `[keys]` block
+/// merged over it by [`merge`]. `App` holds one of these; the footer and the help overlay
+/// read it through [`Self::dispatch`], [`Self::primary_chord`] and [`Self::describe`], so a
+/// config reload changes what they show with no code change of their own, only a new table
+/// handed to the same read methods.
+#[derive(Debug, Clone)]
+pub(crate) struct BindingTable(Vec<Binding>);
+
+impl BindingTable {
+    /// The compiled default map, owned so it can be handed to a component that expects a
+    /// table rather than the `BINDINGS` slice directly; what a process without a `[keys]`
+    /// block ever runs, and what every reload starts from before merging.
+    pub(crate) fn compiled_default() -> Self {
+        Self(BINDINGS.to_vec())
+    }
+
+    pub(crate) fn dispatch(&self, context: Context, key: KeyEvent) -> Option<Action> {
+        dispatch_over(&self.0, context, key)
+    }
+
+    pub(crate) fn primary_chord(
+        &self,
+        context: Context,
+        action: Action,
+    ) -> Option<(KeyCode, KeyModifiers)> {
+        primary_chord_over(&self.0, context, action)
+    }
+
+    pub(crate) fn describe(&self, context: Context) -> Vec<(String, &'static str)> {
+        describe_over(&self.0, context)
+    }
+}
+
+/// This action's stable name in a `[keys]` block, distinct from [`description`]'s prose.
+/// Derived by hand from the variant, not from `Debug`, so a name never carries a case
+/// convention leaked from Rust identifiers; exhaustive with no wildcard arm, so a variant
+/// added to [`Action`] is a compile error here until it is either named or explicitly
+/// excluded, the same shape [`description`] already takes.
+///
+/// `Text` and `SwitchToSet` return `None`: `Text` is `dispatch`'s printable-character
+/// catch-all and never occupies a [`BINDINGS`] row to rebind, and `SwitchToSet`'s nine rows
+/// are positional (`1` to `9`, "the Nth declared Set") with no name a flat `[keys]` value
+/// could give a single one of without inventing a numbering scheme keybindings.md never
+/// specifies; both are deliberately out of this ticket's scope rather than an oversight.
+fn action_name(action: Action) -> Option<&'static str> {
+    Some(match action {
+        Action::OpenHelp => "open_help",
+        Action::Quit => "quit",
+        Action::Suspend => "suspend",
+        Action::OpenLauncher => "open_launcher",
+        Action::OpenActionPalette => "open_action_palette",
+        Action::EnterFilter => "enter_filter",
+        Action::RefreshAll => "refresh_all",
+        Action::RefreshSelection => "refresh_selection",
+        Action::RederiveDefaultBranches => "rederive_default_branches",
+        Action::ExpandWarning => "expand_warning",
+        Action::OpenSetPicker => "open_set_picker",
+        Action::SwitchToSet(_) => return None,
+        Action::ReloadConfig => "reload_config",
+        Action::MoveFocusBetweenListAndDetail => "move_focus_between_list_and_detail",
+        Action::Unwind => "unwind",
+        Action::MoveDown => "move_down",
+        Action::MoveUp => "move_up",
+        Action::FirstRow => "first_row",
+        Action::LastRow => "last_row",
+        Action::HalfPageDown => "half_page_down",
+        Action::HalfPageUp => "half_page_up",
+        Action::ToggleSelection => "toggle_selection",
+        Action::AnchorRange => "anchor_range",
+        Action::SelectAllVisible => "select_all_visible",
+        Action::ClearSelection => "clear_selection",
+        Action::OpenDetail => "open_detail",
+        Action::DismissVanished => "dismiss_vanished",
+        Action::NextFailed => "next_failed",
+        Action::PreviousFailed => "previous_failed",
+        Action::ScrollDown => "scroll_down",
+        Action::ScrollUp => "scroll_up",
+        Action::Top => "top",
+        Action::Bottom => "bottom",
+        Action::ClosePane => "close_pane",
+        Action::ReturnFocusToList => "return_focus_to_list",
+        Action::Text(_) => return None,
+        Action::Apply => "apply",
+        Action::Cancel => "cancel",
+        Action::PreviousEntry => "previous_entry",
+        Action::NextEntry => "next_entry",
+        Action::AcceptCompletion => "accept_completion",
+        Action::DeletePreviousWord => "delete_previous_word",
+        Action::ClearLine => "clear_line",
+        Action::OpenInEditor => "open_in_editor",
+        Action::Choose => "choose",
+        Action::Close => "close",
+        Action::Run => "run",
+        Action::Decline => "decline",
+    })
+}
+
+/// The action named `name` among [`BINDINGS`]'s own rows for `context`, the ground truth for
+/// which actions a `[keys.<context>]` table may name: looked up against the compiled table
+/// rather than a table already under construction, so which names are known never depends on
+/// what a merge has done so far.
+fn find_action_by_name(context: Context, name: &str) -> Option<Action> {
+    BINDINGS
+        .iter()
+        .filter(|(row_context, _, _, _)| *row_context == context)
+        .map(|(_, _, _, action)| *action)
+        .find(|action| action_name(*action) == Some(name))
+}
+
+/// This context's name in a `[keys.<context>]` table, the inverse of [`parse_context_name`].
+/// Production code never needs this direction (an error names the context from the raw TOML
+/// key text it was given, not by re-rendering the enum), so it exists for the round-trip test
+/// and the spec-conformance test alone.
+#[cfg(test)]
+fn context_name(context: Context) -> &'static str {
+    match context {
+        Context::Global => "global",
+        Context::List => "list",
+        Context::Detail => "detail",
+        Context::Input => "input",
+        Context::Overlay => "overlay",
+        Context::Confirm => "confirm",
+    }
+}
+
+/// The [`Context`] named `name` in a `[keys.<context>]` table, or `None` for anything else,
+/// which a caller reports as an unknown context.
+fn parse_context_name(name: &str) -> Option<Context> {
+    match name {
+        "global" => Some(Context::Global),
+        "list" => Some(Context::List),
+        "detail" => Some(Context::Detail),
+        "input" => Some(Context::Input),
+        "overlay" => Some(Context::Overlay),
+        "confirm" => Some(Context::Confirm),
+        _ => None,
+    }
+}
+
+/// A key name from `[keys]`, no more of the grammar than what this function accepts:
+/// [`chord_label`]'s own output, so whatever the footer or the help overlay shows is exactly
+/// what a user types back to rebind it. `ctrl-` is the one modifier prefix; an uppercase
+/// single letter carries an implied SHIFT, matching how the compiled table itself binds `R`,
+/// `G` and `N`. `None` means the text names no chord this parser recognises, which a caller
+/// reports as config.md's third failure grade: exit non-zero before the terminal is claimed.
+pub(crate) fn parse_chord(text: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let (ctrl, base) = match text.strip_prefix("ctrl-") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let code = named_key_code(base)?;
+    let mut modifiers = if ctrl { CTRL } else { NONE };
+    if let KeyCode::Char(c) = code
+        && c.is_ascii_uppercase()
+    {
+        modifiers |= SHIFT;
+    }
+    Some((code, modifiers))
+}
+
+/// The named-key half of [`parse_chord`]'s grammar, with no modifier prefix stripped yet: the
+/// words [`chord_label`] renders for a non-`Char` code, a bare single character, or a
+/// function key ([`function_key`]).
+fn named_key_code(base: &str) -> Option<KeyCode> {
+    Some(match base {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        _ => {
+            let mut chars = base.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => KeyCode::Char(c),
+                _ => return function_key(base),
+            }
+        }
+    })
+}
+
+/// `"f1"` through `"f24"`, case-sensitive lowercase to match [`chord_label`]'s own rendering;
+/// crossterm's own `KeyCode::F` range, unused by [`BINDINGS`] itself but real enough that
+/// config.md's own shipped example rebinds an action to `"F5"`.
+fn function_key(base: &str) -> Option<KeyCode> {
+    let digits = base.strip_prefix('f')?;
+    let n: u8 = digits.parse().ok()?;
+    (1..=24).contains(&n).then_some(KeyCode::F(n))
+}
+
+/// A load-time condition from merging `[keys]` that does not stop the program: an unknown
+/// context or action name, named by its dotted path, matching
+/// [config.md](../../../../docs/spec/config.md#reading-and-failing)'s unknown-key grade. Kept
+/// apart from [`crate::config::document::Warning`] the way `theme.rs`'s own `ThemeWarning` is:
+/// a domain-specific warning type for a domain-specific loader, rather than a shared enum a
+/// document-level field name has no business growing variants for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeysWarning {
+    /// A `[keys.<name>]` table whose `<name>` is not one of the six contexts.
+    UnknownContext(String),
+    /// A key inside a known `[keys.<context>]` table that names no action of that context's.
+    UnknownAction { context: String, action: String },
+}
+
+impl std::fmt::Display for KeysWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeysWarning::UnknownContext(path) => {
+                write!(f, "unknown config key `{path}`: no such keybinding context")
+            }
+            KeysWarning::UnknownAction { context, action } => write!(
+                f,
+                "unknown config key `keys.{context}.{action}`: no such action in that context"
+            ),
+        }
+    }
+}
+
+/// The first two bindings in `bindings` that share a context, a key and a modifier set but
+/// name different actions, in table order; `None` if every key in every context is claimed by
+/// at most one action. Not a `const fn` like
+/// [`any_binding_is_permanently_unbindable`]: that check only ever compares [`KeyCode`] and
+/// [`KeyModifiers`], both cheap to hand-roll in `const` context, where this one also has to
+/// tell two different [`Action`]s apart, and `Action`'s derived `PartialEq` is not `const`.
+/// [`merge`] must run this same check over an arbitrary table built at runtime from a config
+/// file regardless, so a second, `const`-only version just for [`BINDINGS`] would be a second
+/// implementation of the same rule, free to drift from this one; running this one function
+/// against both tables is what keeps the two collision definitions from ever disagreeing.
+fn find_collision(
+    bindings: &[Binding],
+) -> Option<(Context, KeyCode, KeyModifiers, Action, Action)> {
+    for (index, &(context_a, code_a, modifiers_a, action_a)) in bindings.iter().enumerate() {
+        for &(context_b, code_b, modifiers_b, action_b) in &bindings[index + 1..] {
+            if context_a == context_b
+                && code_a == code_b
+                && modifiers_a == modifiers_b
+                && action_a != action_b
+            {
+                return Some((context_a, code_a, modifiers_a, action_a, action_b));
+            }
+        }
+    }
+    None
+}
+
+fn collision_error(
+    (context, code, modifiers, action_a, action_b): (
+        Context,
+        KeyCode,
+        KeyModifiers,
+        Action,
+        Action,
+    ),
+) -> color_eyre::eyre::Error {
+    let chord = chord_label(code, modifiers);
+    eyre!(
+        "key `{chord}` in {context:?} is bound to both `{}` and `{}`",
+        action_name(action_a).unwrap_or("<unnamed action>"),
+        action_name(action_b).unwrap_or("<unnamed action>"),
+    )
+}
+
+/// Debug builds only: proves [`BINDINGS`] itself carries no collision, since review can grow
+/// one in the compiled default exactly as easily as a config file can. Not a `const fn`
+/// assertion like [`any_binding_is_permanently_unbindable`]'s, for the reason recorded on
+/// [`find_collision`]; called from [`merge`] so every process that ever builds a
+/// [`BindingTable`] re-checks the baseline it started from.
+#[cfg(debug_assertions)]
+fn debug_assert_compiled_default_has_no_collision() {
+    if let Some((context, code, modifiers, action_a, action_b)) = find_collision(BINDINGS) {
+        panic!(
+            "the compiled default map binds {} and {} to the same key `{}` in {context:?}",
+            action_name(action_a).unwrap_or("<unnamed action>"),
+            action_name(action_b).unwrap_or("<unnamed action>"),
+            chord_label(code, modifiers),
+        );
+    }
+}
+
+/// Merges a `[keys]` block over the compiled default, per
+/// [keybindings.md](../../../../docs/spec/keybindings.md#configuration): one sub-table per
+/// context, keyed on the action name rather than the key, so rebinding one action leaves
+/// every other binding, in every context, untouched. Binding an action to the empty string
+/// unbinds it outright, with no fallback to the compiled default. An unknown context or
+/// action name warns, naming its dotted path, and is otherwise ignored; an unparseable key
+/// name, or a value of the wrong TOML type, is a hard error; two actions left bound to the
+/// same key in the same context, whether that collision came entirely from the file or from
+/// a file entry landing on a default the file never mentioned, is the same hard error, naming
+/// both actions and the key. Every hard error here must reach the caller before the terminal
+/// is claimed, at both startup and reload.
+///
+/// `[keys.<context>]` is the one place `config.toml` nests three deep, the exception to
+/// [config.md](../../../../docs/spec/config.md#the-shape-of-the-document)'s rule that nothing
+/// nests past one table: a binding is identified by its context and its action together, and
+/// flattening the schema to two levels would have to fold the context name into the action
+/// key instead (`list_refresh = "F5"`), which reads as one word for two distinct facts. This
+/// paragraph is the one place that exception is recorded; every other reference to it
+/// (`Document`'s own `keys` field included) points back here rather than re-deriving it.
+pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<KeysWarning>)> {
+    #[cfg(debug_assertions)]
+    debug_assert_compiled_default_has_no_collision();
+
+    let BindingTable(mut bindings) = BindingTable::compiled_default();
+    let mut warnings = Vec::new();
+
+    for (context_name_text, context_value) in document_keys {
+        let Some(context) = parse_context_name(context_name_text) else {
+            warnings.push(KeysWarning::UnknownContext(format!(
+                "keys.{context_name_text}"
+            )));
+            continue;
+        };
+        let Some(context_table) = context_value.as_table() else {
+            return Err(eyre!(
+                "keys.{context_name_text} must be a table of action = \"key\" pairs"
+            ));
+        };
+        for (action_name_text, key_value) in context_table {
+            let Some(action) = find_action_by_name(context, action_name_text) else {
+                warnings.push(KeysWarning::UnknownAction {
+                    context: context_name_text.clone(),
+                    action: action_name_text.clone(),
+                });
+                continue;
+            };
+            let Some(key_text) = key_value.as_str() else {
+                return Err(eyre!(
+                    "keys.{context_name_text}.{action_name_text} must be a string"
+                ));
+            };
+
+            bindings.retain(|(row_context, _, _, row_action)| {
+                !(*row_context == context && *row_action == action)
+            });
+            if key_text.is_empty() {
+                continue; // unbound outright, no fallback to the compiled default
+            }
+            let Some((code, modifiers)) = parse_chord(key_text) else {
+                return Err(eyre!(
+                    "keys.{context_name_text}.{action_name_text} names an unparseable key `{key_text}`"
+                ));
+            };
+            bindings.push((context, code, modifiers, action));
+        }
+    }
+
+    if let Some(collision) = find_collision(&bindings) {
+        return Err(collision_error(collision));
+    }
+
+    Ok((BindingTable(bindings), warnings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    // The bulk of this module's tests exercise the compiled default map through these three,
+    // which existed as `pub(crate)` production functions before `BindingTable` took over as
+    // the only production caller of `dispatch_over`/`primary_chord_over`/`describe_over`.
+    // Keeping the same names here, backed by `BindingTable::compiled_default()`, is what lets
+    // those tests stay unchanged rather than growing a `BindingTable::compiled_default()` at
+    // every call site for no behavioural reason.
+
+    fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
+        BindingTable::compiled_default().dispatch(context, key)
+    }
+
+    fn primary_chord(context: Context, action: Action) -> Option<(KeyCode, KeyModifiers)> {
+        BindingTable::compiled_default().primary_chord(context, action)
+    }
+
+    fn describe(context: Context) -> Vec<(String, &'static str)> {
+        BindingTable::compiled_default().describe(context)
     }
 
     // --- vertical slices exercising one binding at a time ---
@@ -1253,17 +1651,6 @@ mod tests {
         }
     }
 
-    fn spec_context_name(context: Context) -> &'static str {
-        match context {
-            Context::Global => "global",
-            Context::List => "list",
-            Context::Detail => "detail",
-            Context::Input => "input",
-            Context::Overlay => "overlay",
-            Context::Confirm => "confirm",
-        }
-    }
-
     /// Reads `docs/spec/keybindings.md` at test time and asserts the compiled [`BINDINGS`]
     /// table matches its default map row for row, in both directions: nothing the spec binds
     /// is missing from the table, and nothing the table binds is absent from the spec. The
@@ -1288,7 +1675,7 @@ mod tests {
             .iter()
             .map(|(context, code, modifiers, action)| {
                 (
-                    spec_context_name(*context),
+                    context_name(*context),
                     *code,
                     *modifiers,
                     description(*action).to_string(),
@@ -1346,6 +1733,412 @@ mod tests {
                 && r.keys == "every other key"
                 && r.description == "Ignored"),
             "confirm's every-other-key fallback is no longer in the spec as written"
+        );
+    }
+
+    // =====================================================================================
+    // User-configurable rebinding: `merge`, `BindingTable`, `parse_chord`, collisions.
+    // =====================================================================================
+
+    fn keys_block(pairs: &[(&str, &[(&str, &str)])]) -> toml::Table {
+        let mut document_keys = toml::Table::new();
+        for (context, actions) in pairs {
+            let mut context_table = toml::Table::new();
+            for (action, key) in *actions {
+                context_table.insert(
+                    (*action).to_string(),
+                    toml::Value::String((*key).to_string()),
+                );
+            }
+            document_keys.insert((*context).to_string(), toml::Value::Table(context_table));
+        }
+        document_keys
+    }
+
+    fn merge_ok(pairs: &[(&str, &[(&str, &str)])]) -> (BindingTable, Vec<KeysWarning>) {
+        merge(&keys_block(pairs)).expect("expected the keys block to merge")
+    }
+
+    // --- chord_label / parse_chord: the grammar a `[keys]` value is written in ---
+
+    #[test]
+    fn parse_chord_is_the_inverse_of_chord_label_for_every_compiled_binding() {
+        for &(_, code, modifiers, _) in BINDINGS {
+            let label = chord_label(code, modifiers);
+            assert_eq!(
+                parse_chord(&label),
+                Some((code, modifiers)),
+                "chord_label/parse_chord round trip failed for {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_chord_reads_a_function_key_not_used_by_any_compiled_binding() {
+        // config.md's own shipped example rebinds an action to "F5", a chord no default
+        // binding uses; chord_label must render it back the same way.
+        assert_eq!(parse_chord("f5"), Some((KeyCode::F(5), NONE)));
+        assert_eq!(chord_label(KeyCode::F(5), NONE), "f5");
+        assert_eq!(parse_chord("f24"), Some((KeyCode::F(24), NONE)));
+        assert_eq!(
+            parse_chord("f25"),
+            None,
+            "F25 is out of crossterm's F-key range"
+        );
+    }
+
+    #[test]
+    fn parse_chord_rejects_text_that_names_no_chord() {
+        for garbage in ["", "asdf", "ctrl-", "ctrl-asdf", "fx", "shift-r"] {
+            assert_eq!(
+                parse_chord(garbage),
+                None,
+                "expected {garbage:?} to be unparseable"
+            );
+        }
+    }
+
+    // --- context_name / parse_context_name ---
+
+    #[test]
+    fn parse_context_name_is_the_inverse_of_context_name_for_all_six_contexts() {
+        for context in [
+            Context::Global,
+            Context::List,
+            Context::Detail,
+            Context::Input,
+            Context::Overlay,
+            Context::Confirm,
+        ] {
+            assert_eq!(parse_context_name(context_name(context)), Some(context));
+        }
+    }
+
+    #[test]
+    fn parse_context_name_rejects_anything_not_one_of_the_six() {
+        assert_eq!(parse_context_name("frobnicate"), None);
+    }
+
+    // --- action_name: every nameable BINDINGS action has one, SwitchToSet and Text do not ---
+
+    #[test]
+    fn every_action_in_bindings_is_nameable_except_switch_to_set() {
+        for &(_, _, _, action) in BINDINGS {
+            let name = action_name(action);
+            if matches!(action, Action::SwitchToSet(_)) {
+                assert_eq!(name, None);
+            } else {
+                assert!(name.is_some(), "{action:?} has no config action name");
+            }
+        }
+    }
+
+    // --- the criterion the ticket calls out by name: merge by action, not by key ---
+
+    /// The mutation this guards: a merge keyed on the *key* being assigned, rather than the
+    /// action being rebound, would look for an existing row already holding the new key to
+    /// evict and find none (since "x" starts out unbound), so it would only ever add a row
+    /// and never remove `dismiss_vanished`'s old one. The old key would then still fire the
+    /// action it used to.
+    #[test]
+    fn rebinding_an_action_removes_its_old_key_rather_than_only_adding_the_new_one() {
+        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "x")])]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('x'), NONE)),
+            Some(Action::DismissVanished),
+            "the new key must fire the rebound action"
+        );
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('d'), NONE)),
+            None,
+            "the old default key must no longer fire anything, not still fire DismissVanished"
+        );
+    }
+
+    #[test]
+    fn rebinding_one_action_leaves_every_other_binding_in_the_same_context_intact() {
+        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "x")])]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+
+        // Untouched List bindings still dispatch exactly as the compiled default does.
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('j'), NONE)),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('n'), NONE)),
+            Some(Action::NextFailed)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('N'), SHIFT)),
+            Some(Action::PreviousFailed)
+        );
+        // A different context's bindings are untouched too.
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('q'), NONE)),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn rebinding_one_action_leaves_every_other_actions_default_key_untouched_even_when_the_new_key_is_unrelated()
+     {
+        // A second, independent rebind in a different context: proves the merge does not
+        // accidentally cross-wire contexts either.
+        let (bindings, warnings) = merge_ok(&[
+            ("global", &[("refresh_all", "f5")]),
+            ("list", &[("dismiss_vanished", "x")]),
+        ]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::F(5), NONE)),
+            Some(Action::RefreshAll)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('r'), NONE)),
+            None,
+            "refresh_all's old key must be gone now it has moved to F5"
+        );
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('x'), NONE)),
+            Some(Action::DismissVanished)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('R'), SHIFT)),
+            Some(Action::RefreshSelection),
+            "refresh_selection, a different action, must be untouched by refresh_all's rebind"
+        );
+    }
+
+    #[test]
+    fn binding_an_action_to_the_empty_string_unbinds_it() {
+        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "")])]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('d'), NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn unbinding_an_action_leaves_its_former_key_bound_to_nothing_rather_than_falling_back_to_the_default()
+     {
+        // A build that "unbinds" by merely skipping the override (leaving the compiled row in
+        // place) would still dispatch DismissVanished here; the correct behaviour removes the
+        // row outright.
+        let (bindings, _) = merge_ok(&[("list", &[("dismiss_vanished", "")])]);
+        for context in [
+            Context::Global,
+            Context::List,
+            Context::Detail,
+            Context::Overlay,
+            Context::Confirm,
+        ] {
+            assert_eq!(
+                bindings.dispatch(context, press(KeyCode::Char('d'), NONE)),
+                None,
+                "{context:?} must not resurrect the unbound key via any fallback"
+            );
+        }
+    }
+
+    // --- four distinct behaviours: unknown context, unknown action, unparseable key, and a
+    // well-formed entry raising neither a warning nor an error ---
+
+    #[test]
+    fn an_unknown_context_warns_naming_its_dotted_path_and_continues() {
+        let (_, warnings) = merge_ok(&[("frobnicate", &[("dismiss_vanished", "x")])]);
+        assert_eq!(
+            warnings,
+            vec![KeysWarning::UnknownContext("keys.frobnicate".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_unknown_action_within_a_known_context_warns_naming_its_dotted_path_and_continues() {
+        let (bindings, warnings) = merge_ok(&[("list", &[("frobnicate", "x")])]);
+        assert_eq!(
+            warnings,
+            vec![KeysWarning::UnknownAction {
+                context: "list".to_string(),
+                action: "frobnicate".to_string(),
+            }]
+        );
+        // The unknown entry does not stop the rest of the table from parsing (there is
+        // nothing else here, but the compiled default must still be intact).
+        assert_eq!(
+            bindings.dispatch(Context::List, press(KeyCode::Char('j'), NONE)),
+            Some(Action::MoveDown)
+        );
+    }
+
+    #[test]
+    fn an_unparseable_key_name_is_a_hard_error_rather_than_a_warning() {
+        let result = merge(&keys_block(&[(
+            "list",
+            &[("dismiss_vanished", "not-a-real-chord")],
+        )]));
+        let message = result
+            .expect_err("an unparseable key name must be a hard error")
+            .to_string();
+        assert!(
+            message.contains("not-a-real-chord"),
+            "expected the offending text in the error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_rebind_raises_no_warning_and_does_not_error() {
+        let result = merge(&keys_block(&[("list", &[("dismiss_vanished", "x")])]));
+        let (_, warnings) = result.expect("a well-formed rebind must not error");
+        assert!(
+            warnings.is_empty(),
+            "a well-formed entry must raise no warning at all, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_context_value_that_is_not_a_table_is_a_hard_error() {
+        let mut document_keys = toml::Table::new();
+        document_keys.insert(
+            "list".to_string(),
+            toml::Value::String("not-a-table".to_string()),
+        );
+        assert!(merge(&document_keys).is_err());
+    }
+
+    #[test]
+    fn an_action_value_that_is_not_a_string_is_a_hard_error() {
+        let mut context_table = toml::Table::new();
+        context_table.insert("dismiss_vanished".to_string(), toml::Value::Integer(5));
+        let mut document_keys = toml::Table::new();
+        document_keys.insert("list".to_string(), toml::Value::Table(context_table));
+        assert!(merge(&document_keys).is_err());
+    }
+
+    // --- collisions: a load error naming both actions and the key ---
+
+    #[test]
+    fn find_collision_reports_none_over_the_compiled_default() {
+        assert!(
+            find_collision(BINDINGS).is_none(),
+            "the compiled default map must never carry a collision"
+        );
+    }
+
+    #[test]
+    fn find_collision_detects_two_different_actions_sharing_one_key_in_one_context() {
+        let synthetic: Vec<Binding> = vec![
+            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
+            (Context::List, KeyCode::Char('x'), NONE, Action::MoveUp),
+        ];
+        let (context, code, modifiers, a, b) =
+            find_collision(&synthetic).expect("expected a collision");
+        assert_eq!(context, Context::List);
+        assert_eq!(code, KeyCode::Char('x'));
+        assert_eq!(modifiers, NONE);
+        assert!(
+            (a == Action::MoveDown && b == Action::MoveUp)
+                || (a == Action::MoveUp && b == Action::MoveDown),
+            "expected MoveDown and MoveUp in some order, got {a:?} and {b:?}"
+        );
+    }
+
+    #[test]
+    fn find_collision_ignores_the_same_action_bound_to_the_same_key_twice() {
+        // Not a collision: it is a redundant duplicate row, not two different actions.
+        let synthetic: Vec<Binding> = vec![
+            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
+            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
+        ];
+        assert!(find_collision(&synthetic).is_none());
+    }
+
+    #[test]
+    fn find_collision_ignores_the_same_key_in_two_different_contexts() {
+        let synthetic: Vec<Binding> = vec![
+            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
+            (Context::Detail, KeyCode::Char('x'), NONE, Action::ScrollUp),
+        ];
+        assert!(find_collision(&synthetic).is_none());
+    }
+
+    #[test]
+    fn rebinding_an_action_onto_a_key_another_default_action_already_holds_is_a_hard_error_naming_both_and_the_key()
+     {
+        // List's 'j' already fires MoveDown; rebinding ToggleSelection onto it collides.
+        let message = merge(&keys_block(&[("list", &[("toggle_selection", "j")])]))
+            .expect_err("expected a collision error")
+            .to_string();
+        assert!(
+            message.contains("move_down"),
+            "expected MoveDown named, got: {message}"
+        );
+        assert!(
+            message.contains("toggle_selection"),
+            "expected ToggleSelection named, got: {message}"
+        );
+        assert!(
+            message.contains('j'),
+            "expected the colliding key named, got: {message}"
+        );
+    }
+
+    #[test]
+    fn two_rebinds_that_collide_only_with_each_other_are_also_a_hard_error() {
+        // Neither key is a compiled default for either action; the collision only exists
+        // because both entries in this file land on the same key.
+        let message = merge(&keys_block(&[(
+            "list",
+            &[("dismiss_vanished", "z"), ("next_failed", "z")],
+        )]))
+        .expect_err("expected a collision error")
+        .to_string();
+        assert!(message.contains("dismiss_vanished"));
+        assert!(message.contains("next_failed"));
+    }
+
+    // --- the debug-build check over the bare compiled default ---
+
+    #[test]
+    fn debug_assert_compiled_default_has_no_collision_does_not_panic_on_the_real_default() {
+        // A regression guard: this only proves the assertion function runs clean today, not
+        // that it can never fail. The report accompanying this ticket records a manual
+        // mutation of BINDINGS that made it panic, since introducing a real collision into
+        // the compiled table here would defeat the whole crate's own build.
+        debug_assert_compiled_default_has_no_collision();
+    }
+
+    #[test]
+    fn merge_runs_the_debug_assertion_and_still_succeeds_on_a_clean_default() {
+        // merge() calls the debug assertion internally; a clean BINDINGS table must not
+        // prevent an otherwise well-formed merge from succeeding.
+        let result = merge(&toml::Table::new());
+        assert!(result.is_ok());
+    }
+
+    // --- the one-place documentation of the three-deep nesting exception ---
+
+    /// keybindings.md's "Configuration" section says `[keys]` is config.toml's one exception
+    /// to nesting no deeper than one table; this crate must record *why* in exactly one
+    /// place (`merge`'s own doc comment) rather than re-deriving it at every reference, per
+    /// the ticket's own risk analysis. A test that merely parses a three-deep block would
+    /// prove the parser accepts the shape, not that the exception is written down anywhere;
+    /// this scans the crate's own source instead.
+    #[test]
+    fn the_three_deep_nesting_exception_is_recorded_in_exactly_one_place() {
+        let marker = "the one place `config.toml` nests three deep";
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut occurrences = 0usize;
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            occurrences += source.matches(marker).count();
+        }
+        assert_eq!(
+            occurrences, 1,
+            "expected the three-deep nesting exception recorded in exactly one place, found {occurrences}"
         );
     }
 }

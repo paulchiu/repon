@@ -2,13 +2,13 @@
 //! mandates: derived from the binding table every frame, never a literal binding string.
 //! [keybindings.md](../../../../docs/spec/keybindings.md#the-footer) fixes the four rules
 //! [`budget`] encodes and the per-context content [`list_items`], [`detail_items`] and
-//! [`confirm_items`] read off [`keys::primary_chord`].
+//! [`confirm_items`] read off [`BindingTable::primary_chord`].
 
 use std::fmt;
 
 use ratatui::{Frame, layout::Rect, style::Style};
 
-use crate::keys::{self, Action, Context};
+use crate::keys::{Action, BindingTable, Context};
 
 /// Where a hint sits in the drop order: lower drops first, and `Pinned` never drops, which
 /// is the escape hatch [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)
@@ -46,26 +46,33 @@ struct Item {
     priority: Priority,
 }
 
-/// One item's chord, read from the compiled table rather than typed here, paired with its
-/// short label. Panics naming the gap if `action` is not actually bound in `context`, since
-/// that is a wiring bug in this module, not a state the footer should render around.
-fn hint(context: Context, action: Action, label: &str) -> Hint {
-    let (code, modifiers) = keys::primary_chord(context, action).unwrap_or_else(|| {
+/// One item's chord, read from `table` rather than typed here, paired with its short label.
+/// Panics naming the gap if `action` is not actually bound in `context`, since that is a
+/// wiring bug in this module, not a state the footer should render around.
+fn hint(table: &BindingTable, context: Context, action: Action, label: &str) -> Hint {
+    let (code, modifiers) = table.primary_chord(context, action).unwrap_or_else(|| {
         panic!("{action:?} is not bound in {context:?}, but the footer names it")
     });
     Hint {
-        key: keys::chord_label(code, modifiers),
+        key: crate::keys::chord_label(code, modifiers),
         label: label.to_string(),
     }
 }
 
 /// Two actions' chords joined with `/` as one key, e.g. `j/k`, paired with a combined label
 /// like `move`.
-fn combined_hint(context: Context, first: Action, second: Action, label: &str) -> Hint {
+fn combined_hint(
+    table: &BindingTable,
+    context: Context,
+    first: Action,
+    second: Action,
+    label: &str,
+) -> Hint {
     let chord = |action| {
-        let (code, modifiers) = keys::primary_chord(context, action)
+        let (code, modifiers) = table
+            .primary_chord(context, action)
             .unwrap_or_else(|| panic!("{action:?} is not bound in {context:?}"));
-        keys::chord_label(code, modifiers)
+        crate::keys::chord_label(code, modifiers)
     };
     Hint {
         key: format!("{}/{}", chord(first), chord(second)),
@@ -76,38 +83,44 @@ fn combined_hint(context: Context, first: Action, second: Action, label: &str) -
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s list-context content,
 /// in display order. Drop order: refresh first, movement second, then `enter detail`,
 /// `/ filter`, `space select`, the launcher/action pair, and `? help` pinned last.
-fn list_items() -> Vec<Item> {
+fn list_items(table: &BindingTable) -> Vec<Item> {
     vec![
         Item {
-            hint: combined_hint(Context::List, Action::MoveDown, Action::MoveUp, "move"),
+            hint: combined_hint(
+                table,
+                Context::List,
+                Action::MoveDown,
+                Action::MoveUp,
+                "move",
+            ),
             priority: Priority::Drop(2),
         },
         Item {
-            hint: hint(Context::List, Action::ToggleSelection, "select"),
+            hint: hint(table, Context::List, Action::ToggleSelection, "select"),
             priority: Priority::Drop(5),
         },
         Item {
-            hint: hint(Context::List, Action::OpenDetail, "detail"),
+            hint: hint(table, Context::List, Action::OpenDetail, "detail"),
             priority: Priority::Drop(3),
         },
         Item {
-            hint: hint(Context::Global, Action::EnterFilter, "filter"),
+            hint: hint(table, Context::Global, Action::EnterFilter, "filter"),
             priority: Priority::Drop(4),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenLauncher, "launcher"),
+            hint: hint(table, Context::Global, Action::OpenLauncher, "launcher"),
             priority: Priority::Drop(6),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenActionPalette, "action"),
+            hint: hint(table, Context::Global, Action::OpenActionPalette, "action"),
             priority: Priority::Drop(6),
         },
         Item {
-            hint: hint(Context::Global, Action::RefreshAll, "refresh"),
+            hint: hint(table, Context::Global, Action::RefreshAll, "refresh"),
             priority: Priority::Drop(1),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenHelp, "help"),
+            hint: hint(table, Context::Global, Action::OpenHelp, "help"),
             priority: Priority::Pinned,
         },
     ]
@@ -116,10 +129,11 @@ fn list_items() -> Vec<Item> {
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s detail-context
 /// content: the same shape as [`list_items`] with `scroll` standing in for `move` and no
 /// `select`/`detail` hints, since neither action exists while the detail pane is focused.
-fn detail_items() -> Vec<Item> {
+fn detail_items(table: &BindingTable) -> Vec<Item> {
     vec![
         Item {
             hint: combined_hint(
+                table,
                 Context::Detail,
                 Action::ScrollDown,
                 Action::ScrollUp,
@@ -128,23 +142,23 @@ fn detail_items() -> Vec<Item> {
             priority: Priority::Drop(2),
         },
         Item {
-            hint: hint(Context::Global, Action::EnterFilter, "filter"),
+            hint: hint(table, Context::Global, Action::EnterFilter, "filter"),
             priority: Priority::Drop(3),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenLauncher, "launcher"),
+            hint: hint(table, Context::Global, Action::OpenLauncher, "launcher"),
             priority: Priority::Drop(4),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenActionPalette, "action"),
+            hint: hint(table, Context::Global, Action::OpenActionPalette, "action"),
             priority: Priority::Drop(4),
         },
         Item {
-            hint: hint(Context::Global, Action::RefreshAll, "refresh"),
+            hint: hint(table, Context::Global, Action::RefreshAll, "refresh"),
             priority: Priority::Drop(1),
         },
         Item {
-            hint: hint(Context::Global, Action::OpenHelp, "help"),
+            hint: hint(table, Context::Global, Action::OpenHelp, "help"),
             priority: Priority::Pinned,
         },
     ]
@@ -153,14 +167,14 @@ fn detail_items() -> Vec<Item> {
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s confirm-context
 /// content: both hints pinned, since its whole footer is documented at 15 columns, short
 /// enough to survive almost any frame.
-fn confirm_items() -> Vec<Item> {
+fn confirm_items(table: &BindingTable) -> Vec<Item> {
     vec![
         Item {
-            hint: hint(Context::Confirm, Action::Run, "run"),
+            hint: hint(table, Context::Confirm, Action::Run, "run"),
             priority: Priority::Pinned,
         },
         Item {
-            hint: hint(Context::Confirm, Action::Decline, "cancel"),
+            hint: hint(table, Context::Confirm, Action::Decline, "cancel"),
             priority: Priority::Pinned,
         },
     ]
@@ -258,31 +272,32 @@ fn budget(items: &[Item], width: usize) -> FooterLine {
     }
 }
 
-/// [`budget`]'s selection for `context` at `width` columns. `Input` has no content yet:
-/// `Context::Input` covers the Filter line and both palettes alike, and each is documented
-/// with a different footer, so the context alone cannot choose which to show. `Confirm`
-/// names one surface unambiguously and is implemented above.
-fn footer_line(context: Context, width: u16) -> FooterLine {
+/// [`budget`]'s selection for `context` at `width` columns, read off `table`. `Input` has no
+/// content yet: `Context::Input` covers the Filter line and both palettes alike, and each is
+/// documented with a different footer, so the context alone cannot choose which to show.
+/// `Confirm` names one surface unambiguously and is implemented above.
+fn footer_line(table: &BindingTable, context: Context, width: u16) -> FooterLine {
     let items = match context {
-        Context::List => list_items(),
-        Context::Detail => detail_items(),
-        Context::Confirm => confirm_items(),
+        Context::List => list_items(table),
+        Context::Detail => detail_items(table),
+        Context::Confirm => confirm_items(table),
         other => panic!("no footer content is defined yet for {other:?}"),
     };
     budget(&items, width as usize)
 }
 
-/// The footer text for `context` at `width` columns, ASCII throughout, from the compiled
-/// binding table: never a literal binding string, and never stale after a rebind.
-pub(crate) fn render(context: Context, width: u16) -> String {
-    footer_line(context, width).to_string()
+/// The footer text for `context` at `width` columns, ASCII throughout, read off `table`
+/// rather than a literal binding string: never stale after a rebind, because `App` hands this
+/// its live table on every frame, including one right after a config reload.
+pub(crate) fn render(table: &BindingTable, context: Context, width: u16) -> String {
+    footer_line(table, context, width).to_string()
 }
 
 /// Draws `context`'s footer into `area`, one row. Calls [`ratatui`]'s unbounded
 /// `Buffer::set_string` rather than `set_stringn`: [`render`] has already produced a string
 /// no wider than `area`, so nothing here needs, or should trust, a second truncation pass.
-pub(crate) fn draw(frame: &mut Frame, area: Rect, context: Context) {
-    let text = render(context, area.width);
+pub(crate) fn draw(frame: &mut Frame, area: Rect, context: Context, table: &BindingTable) {
+    let text = render(table, context, area.width);
     frame
         .buffer_mut()
         .set_string(area.x, area.y, &text, Style::new().dim());
@@ -293,6 +308,12 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+
+    /// The compiled default table, which is all these tests need: none of them exercises a
+    /// config rebind, only the derivation and the width budget.
+    fn default_table() -> BindingTable {
+        BindingTable::compiled_default()
+    }
 
     /// A synthetic single-word hint for the generic budget tests below, which exercise the
     /// drop algorithm independent of the real footer's key/label content.
@@ -409,11 +430,12 @@ mod tests {
     /// width from zero to the full unrounded line, in both contexts, can.
     #[test]
     fn launcher_and_action_hints_are_never_present_without_each_other_at_any_width() {
-        let launcher = hint(Context::Global, Action::OpenLauncher, "launcher").to_string();
-        let action = hint(Context::Global, Action::OpenActionPalette, "action").to_string();
+        let table = default_table();
+        let launcher = hint(&table, Context::Global, Action::OpenLauncher, "launcher").to_string();
+        let action = hint(&table, Context::Global, Action::OpenActionPalette, "action").to_string();
         for (context, items) in [
-            (Context::List, list_items()),
-            (Context::Detail, detail_items()),
+            (Context::List, list_items(&table)),
+            (Context::Detail, detail_items(&table)),
         ] {
             let full_width = items
                 .iter()
@@ -438,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_survivors_key_and_label_stay_separate_fields_after_budget_selects_it() {
-        let line = budget(&list_items(), 88);
+        let line = budget(&list_items(&default_table()), 88);
         let move_hint = line
             .hints
             .iter()
@@ -508,7 +530,7 @@ mod tests {
         assert!(!rows.is_empty(), "expected at least one documented width");
         for row in rows {
             assert_eq!(
-                render(Context::List, row.width),
+                render(&default_table(), Context::List, row.width),
                 row.expected,
                 "list footer mismatch at width {}",
                 row.width
@@ -526,7 +548,7 @@ mod tests {
         assert!(!rows.is_empty(), "expected at least one documented width");
         for row in rows {
             assert_eq!(
-                render(Context::Detail, row.width),
+                render(&default_table(), Context::Detail, row.width),
                 row.expected,
                 "detail footer mismatch at width {}",
                 row.width
@@ -538,18 +560,21 @@ mod tests {
 
     #[test]
     fn confirm_footer_matches_the_documented_text_at_its_full_width() {
-        assert_eq!(render(Context::Confirm, 15), "y run  n cancel");
+        assert_eq!(
+            render(&default_table(), Context::Confirm, 15),
+            "y run  n cancel"
+        );
     }
 
     #[test]
     fn confirm_footer_renders_nothing_once_even_the_pinned_pair_cannot_fit() {
-        assert_eq!(render(Context::Confirm, 14), "");
+        assert_eq!(render(&default_table(), Context::Confirm, 14), "");
     }
 
     #[test]
     #[should_panic(expected = "no footer content is defined yet for Input")]
     fn footer_still_panics_for_input_which_stays_deferred() {
-        render(Context::Input, 80);
+        render(&default_table(), Context::Input, 80);
     }
 
     // --- absences the ADR names by name ---
@@ -652,16 +677,17 @@ mod tests {
 
     #[test]
     fn draw_writes_the_rendered_text_at_the_areas_own_row() {
+        let table = default_table();
         let backend = TestBackend::new(87, 3);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 2, 87, 1);
-                draw(frame, area, Context::List);
+                draw(frame, area, Context::List, &table);
             })
             .expect("draw the frame");
         let buf = terminal.backend().buffer();
         let row: String = (0..87).map(|x| buf[(x, 2)].symbol().to_string()).collect();
-        assert_eq!(row.trim_end(), render(Context::List, 87));
+        assert_eq!(row.trim_end(), render(&table, Context::List, 87));
     }
 }
