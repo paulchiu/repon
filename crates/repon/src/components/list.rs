@@ -663,11 +663,8 @@ mod tests {
 
     /// The file's own production source, up to its test module: reused by every scan test
     /// below so each states one absence claim rather than re-reading the file.
-    fn production_source() -> &'static str {
-        include_str!("list.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("this file has a test module")
+    fn production_source() -> String {
+        crate::test_support::production_source(include_str!("list.rs"))
     }
 
     /// [layout-and-provenance.md]'s cell mapping must be total: a `Settled` shape added
@@ -676,7 +673,8 @@ mod tests {
     /// is exactly how a "just show the number" default sneaks back in unnoticed.
     #[test]
     fn no_wildcard_match_arm_hides_a_cell_rendering_default() {
-        let offending_lines: Vec<&str> = production_source()
+        let source = production_source();
+        let offending_lines: Vec<&str> = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("_ =>"))
@@ -717,7 +715,8 @@ mod tests {
     /// rather than by a test that would need a `Cell` in a state this crate cannot construct.
     #[test]
     fn no_column_formatter_reads_is_in_flight_to_decide_a_cells_text() {
-        let offending_lines: Vec<&str> = production_source()
+        let source = production_source();
+        let offending_lines: Vec<&str> = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("is_in_flight"))

@@ -361,6 +361,7 @@ fn core_spec(document: &Document) -> CoreSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{production_source_at, rust_source_files};
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
     /// pattern `repon-core`'s own tests use rather than a git-backend trait.
@@ -448,20 +449,6 @@ mod tests {
         );
     }
 
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("read a source directory") {
-            let path = entry.expect("read a directory entry").path();
-            if path.is_dir() {
-                files.extend(rust_source_files(&path));
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-        files
-    }
-
     /// `render`'s one already-scheduled `Snapshot` read (issue #34's "no second channel and
     /// no channel-select in the event loop") only holds if nothing in this crate ever races
     /// it with a `select!` over multiple channels. Built from two pieces, as `repon-core`'s
@@ -502,8 +489,7 @@ mod tests {
         let mut by_file: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let production = production_source_at(&path);
             let file_name = path
                 .file_name()
                 .expect("a source file has a name")
@@ -553,8 +539,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let production = production_source_at(&path);
             for (number, line) in production.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
@@ -603,10 +588,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            // `str::split` always yields at least one item, so this is the whole file when a
-            // source has no test module, and just its production half when it does.
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let production = production_source_at(&path);
             for (number, line) in production.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
