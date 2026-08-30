@@ -40,6 +40,30 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub suspend_after_tui_enter: bool,
 
+    /// Claims the terminal, runs a synthetic Launcher that writes a marker to its own stdio,
+    /// then exits. Debug-only: exists so a test can observe a real child writing to the same
+    /// pty between the handoff's restore and its reclaim, rather than describing it, and must
+    /// not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub launcher_marker_after_tui_enter: bool,
+
+    /// Claims the terminal, opens the ad hoc-editor handoff against a forced `$EDITOR` that
+    /// overwrites the scratch file with a marker, prints what was read back, then exits.
+    /// Debug-only: exists so a test can observe the second caller of the shared handoff
+    /// machinery in a real process rather than describing it, and must not reach a release
+    /// binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub editor_marker_after_tui_enter: bool,
+
+    /// Claims the terminal, runs a synthetic Launcher to completion, then panics. Debug-only:
+    /// exists so a test can observe panic-time restoration after a real handoff's reclaim,
+    /// separately from a panic with no handoff at all, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub panic_after_launcher_handoff: bool,
+
     /// Resolves the config path, prints it, sets `REPON_CONFIG` to the given value, resolves
     /// again and prints that too, then exits, claiming no terminal at all. Debug-only: exists
     /// so a test can observe that a path resolved from a flag or the environment is fixed for

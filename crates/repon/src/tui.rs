@@ -109,6 +109,30 @@ impl Tui {
         Ok(())
     }
 
+    /// Hands the terminal to `command` and takes it back: the shared machinery a Launcher
+    /// and the ad hoc command field's `$EDITOR` handoff both stand on
+    /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspend and exec in the
+    /// same terminal"). Restores the five pieces [`Tui::exit`] restores, runs `command` to
+    /// completion with the terminal's own stdio (the default, since this does not touch
+    /// `command`'s stdio handles), then claims them again with [`Tui::enter`] regardless of
+    /// whether the child could even be spawned, so a spawn failure still returns control to
+    /// Repon's own screen rather than stranding the shell.
+    ///
+    /// Panic-safe by construction rather than by a check here: [`crate::errors::init`]'s
+    /// panic hook calls the free function [`restore`] unconditionally, which is safe to call
+    /// at any point between this method's `exit` and `enter`, so a panic anywhere in the
+    /// handoff, including inside `command.status()`, still leaves the terminal as
+    /// `exit`/`restore` would.
+    pub fn suspend_for_child(
+        &mut self,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus> {
+        self.exit()?;
+        let status = command.status();
+        self.enter()?;
+        Ok(status?)
+    }
+
     /// Blocks until the next event, or returns `None` once the event thread has stopped.
     pub fn next_event(&self) -> Option<Event> {
         self.event_rx.recv().ok()
