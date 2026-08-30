@@ -6,18 +6,11 @@
 //! single-space gaps, ninety columns before the filler column that absorbs the slack.
 
 use color_eyre::eyre::Result;
-use ratatui::{
-    Frame,
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    symbols::border,
-    widgets::Block,
-};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{AheadBehind, Cell, EntityState, Head, Settled, Snapshot, WorktreeState, summary};
 
 use super::Component;
-use crate::{config::Config, glyphs::GlyphSet};
+use crate::{config::Config, glyphs::GlyphSet, theme};
 
 const GUTTER_WIDTH: u16 = 1;
 const NAME_WIDTH: u16 = 28;
@@ -41,12 +34,6 @@ const STATE_X: u16 = DIRTY_X + DIRTY_WIDTH + GAP;
 /// Row where the header sits, and where entity rows start: one line below the header.
 const HEADER_ROW: u16 = 0;
 const FIRST_ENTITY_ROW: u16 = HEADER_ROW + 1;
-
-/// The border colour a panel draws while it holds focus, matching
-/// [theming.md](../../../../docs/spec/theming.md)'s documented `border_focused` default. The
-/// list is the only panel this ticket draws, so it is always focused; the nine-role theme
-/// system, and a Detail pane sharing this scheme, are later work.
-const FOCUSED_BORDER: Color = Color::LightBlue;
 
 /// The repos panel. Holds no row data of its own: every draw reads the [`Snapshot`] the
 /// caller hands it, cloned once from the Core for that render tick.
@@ -81,7 +68,7 @@ impl List {
         };
         let block = Block::bordered()
             .border_set(border_set)
-            .border_style(Style::new().fg(FOCUSED_BORDER))
+            .border_style(theme::DEFAULT.style_for(theme::Role::BorderFocused))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
         let interior = block.inner(area);
@@ -136,7 +123,9 @@ fn write_cell(
 
 fn draw_header(buf: &mut Buffer, interior: Rect) {
     let y = interior.y + HEADER_ROW;
-    let style = Style::new().dim();
+    // A column header is `dim` per theming.md's meaning-to-role map, a foreground colour
+    // rather than the DIM text attribute this used to draw with.
+    let style = theme::DEFAULT.style_for(theme::Role::Dim);
     write_cell(
         buf,
         interior,
@@ -414,6 +403,19 @@ mod tests {
         assert_eq!(cell_text(buf, 67, 1, 4), "base");
         assert_eq!(cell_text(buf, 74, 1, 5), "dirty");
         assert_eq!(cell_text(buf, 81, 1, 5), "state");
+    }
+
+    #[test]
+    fn the_header_row_colours_its_labels_with_the_themes_dim_role_not_the_dim_attribute() {
+        let terminal = render(140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf[(3, 1)].fg,
+            Color::DarkGray,
+            "the header must show theming.md's documented dim default, dark-gray, as a \
+             foreground colour rather than the DIM text attribute"
+        );
     }
 
     #[test]
