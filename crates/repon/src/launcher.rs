@@ -168,6 +168,16 @@ pub fn run(tui: &mut Tui, launcher: &Launcher, entity: &EntityState) -> Result<E
     tui.suspend_for_child(&mut command)
 }
 
+/// `argv[0]` as the program, the rest as its arguments; an empty `argv` runs an empty
+/// program name, which fails to spawn rather than panicking. Shared by a Launcher's own,
+/// non-`shell` argv and [`crate::editor::edit`]'s editor-chain argv, the handoff machinery's
+/// other caller.
+pub(crate) fn command_from_argv(argv: &[String]) -> Command {
+    let mut command = Command::new(argv.first().cloned().unwrap_or_default());
+    command.args(argv.iter().skip(1));
+    command
+}
+
 fn build_command(launcher: &Launcher, entity: &EntityState) -> Command {
     let argv = launcher
         .source
@@ -181,9 +191,7 @@ fn build_command(launcher: &Launcher, entity: &EntityState) -> Command {
         command.arg("-c").arg(argv.join(" ")).arg("repon");
         command
     } else {
-        let mut command = Command::new(argv.first().cloned().unwrap_or_default());
-        command.args(argv.iter().skip(1));
-        command
+        command_from_argv(&argv)
     };
 
     command.current_dir(entity.key.path());

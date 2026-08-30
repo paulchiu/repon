@@ -7,11 +7,10 @@
 //! alone rather than belonging to the Launcher feature.
 
 use std::io::{Read, Write};
-use std::process::Command;
 
 use color_eyre::eyre::{Result, WrapErr};
 
-use crate::launcher::Source;
+use crate::launcher::{Source, command_from_argv};
 use crate::tui::Tui;
 
 /// Writes `initial_text` to a scratch file, opens it in the resolved editor chain (`VISUAL`,
@@ -24,8 +23,7 @@ pub fn edit(tui: &mut Tui, initial_text: &str) -> Result<String> {
     file.flush().wrap_err("flush the scratch file")?;
 
     let argv = Source::EditorChain.resolve_argv(|name| std::env::var(name).ok());
-    let mut command = Command::new(argv.first().cloned().unwrap_or_default());
-    command.args(argv.iter().skip(1));
+    let mut command = command_from_argv(&argv);
     command.arg(file.path());
 
     tui.suspend_for_child(&mut command)?;

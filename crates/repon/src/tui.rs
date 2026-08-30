@@ -20,8 +20,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     cursor,
     event::{
-        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read,
+        DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read,
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -79,9 +79,11 @@ impl Tui {
         self
     }
 
-    /// Claims the five pieces of terminal state [keybindings.md](../../../docs/spec/keybindings.md#terminal-state)
-    /// fixes: raw mode on, alternate screen on, bracketed paste on, mouse capture off
-    /// (explicit, against an inherited enabled state), focus reporting on.
+    /// Claims four of the five pieces of terminal state
+    /// [keybindings.md](../../../docs/spec/keybindings.md#terminal-state) fixes: raw mode on,
+    /// alternate screen on, bracketed paste on, focus reporting on. Mouse capture is the
+    /// fifth and is deliberately left exactly as found rather than fixed; see
+    /// [`write_enter_sequence`]'s doc comment for why.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         write_enter_sequence(&mut stdout())?;
@@ -253,17 +255,26 @@ fn translate(event: CrosstermEvent) -> Option<Event> {
     })
 }
 
-/// The four write-based pieces [`Tui::enter`] claims, in order: alternate screen, bracketed
-/// paste, mouse capture (explicitly off), focus reporting, then the cursor hidden. Raw mode
-/// is the fifth piece and is not a write; it is a separate `termios` call the caller makes
-/// before this. Generic over the writer so a test can assert the exact byte sequence against
-/// a `Vec<u8>` without a real terminal.
+/// The three write-based pieces [`Tui::enter`] claims, in order: alternate screen, bracketed
+/// paste, focus reporting, then the cursor hidden. Raw mode is the fourth piece and is not a
+/// write; it is a separate `termios` call the caller makes before this.
+///
+/// Mouse capture, [config.md](../../../docs/spec/config.md#launchers)'s fifth piece, is
+/// deliberately never written here. crossterm cannot report whether a terminal already had
+/// mouse capture on, so there is no way to tell "off" and "restore to what was there" apart
+/// at this call site; the choice is between never touching it (perfect for the terminal that
+/// never had it on, the overwhelming common case, and a no-op restoration for one that did)
+/// and unconditionally pairing an enable at [`write_restore_sequence`] with this disable
+/// (correct only for a terminal that already had it on, and a regression, on every single
+/// run, for the far more common terminal that did not). Leaving it untouched is the only one
+/// of the two that leaves *every* terminal exactly as found rather than only some of them.
+/// Generic over the writer so a test can assert the exact byte sequence against a `Vec<u8>`
+/// without a real terminal.
 fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        DisableMouseCapture,
         EnableFocusChange,
         cursor::Hide,
     )
@@ -272,7 +283,8 @@ fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 /// Releases what [`write_enter_sequence`] claimed: focus reporting, bracketed paste, alternate
 /// screen, then the cursor shown again last, after the screen mode is fully restored rather
 /// than in claim-reversed order. Disabling raw mode is the caller's separate final step,
-/// matching [`write_enter_sequence`].
+/// matching [`write_enter_sequence`]. Mouse capture is never written here either, for the
+/// same reason [`write_enter_sequence`] never claims it.
 fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
@@ -300,14 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn the_enter_sequence_claims_all_four_write_based_pieces_in_order() {
+    fn the_enter_sequence_claims_all_three_write_based_pieces_in_order() {
         let mut out = Vec::new();
         write_enter_sequence(&mut out).expect("write enter sequence");
 
         let mut expected = Vec::new();
         expected.extend(ansi_bytes(EnterAlternateScreen));
         expected.extend(ansi_bytes(EnableBracketedPaste));
-        expected.extend(ansi_bytes(DisableMouseCapture));
         expected.extend(ansi_bytes(EnableFocusChange));
         expected.extend(ansi_bytes(cursor::Hide));
 
@@ -326,6 +337,128 @@ mod tests {
         expected.extend(ansi_bytes(cursor::Show));
 
         assert_eq!(out, expected);
+    }
+
+    /// Whether `needle` occurs anywhere in `haystack`, for asserting on the encoded ANSI
+    /// bytes without decoding them back to a string.
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    /// [`crate::test_support::production_source_at`] over this file itself: the same
+    /// self-scan technique `no_signal_handler_is_installed_anywhere_in_this_crates_source`
+    /// below uses, applied here to prove raw mode's own enable/disable calls exist rather
+    /// than trusting a comment about them.
+    fn this_files_production_source() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate::test_support::production_source_at(&manifest_dir.join("src/tui.rs"))
+    }
+
+    /// Parses "Five independent pieces of terminal state must be restored: raw mode, the
+    /// alternate screen, mouse capture, bracketed paste and focus reporting." into five owned
+    /// names: split on the sentence's own commas after folding its one trailing " and " into
+    /// a comma, the same technique
+    /// [`crate::launcher`]'s own read of this file uses for its shipped-defaults sentence.
+    fn spec_five_terminal_state_pieces(spec: &str) -> Vec<String> {
+        const ANCHOR: &str = "Five independent pieces of terminal state must be restored:";
+        let after = spec
+            .split(ANCHOR)
+            .nth(1)
+            .expect("the five-pieces sentence is present");
+        let sentence = after.split('.').next().expect("a sentence terminator");
+        sentence
+            .replacen(" and ", ", ", 1)
+            .split(',')
+            .map(str::trim)
+            .filter(|phrase| !phrase.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    // Criterion 1's "single source of truth" trap, applied to config.md's own five-piece
+    // count: reads the names out of the spec at test time rather than a hand-copied list, so
+    // a sixth piece added there grows this vector and fails the equality assertion below
+    // rather than going unhandled by the per-piece checks that follow it.
+    #[test]
+    fn the_enter_and_restore_sequences_account_for_every_piece_the_spec_names() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
+            .expect("read docs/spec/config.md");
+        let pieces = spec_five_terminal_state_pieces(&spec);
+        assert_eq!(
+            pieces,
+            vec![
+                "raw mode".to_string(),
+                "the alternate screen".to_string(),
+                "mouse capture".to_string(),
+                "bracketed paste".to_string(),
+                "focus reporting".to_string(),
+            ],
+            "a piece added, removed or reworded here must be deliberately accounted for \
+             below, not merely counted"
+        );
+
+        // Raw mode has no ANSI trace; it is claimed and released by a direct termios call
+        // instead of write_enter_sequence/write_restore_sequence.
+        let source = this_files_production_source();
+        assert!(
+            source.contains("enable_raw_mode()"),
+            "expected Tui::enter to call enable_raw_mode()"
+        );
+        assert!(
+            source.contains("disable_raw_mode()"),
+            "expected restore() to call disable_raw_mode()"
+        );
+
+        let mut enter = Vec::new();
+        write_enter_sequence(&mut enter).expect("write enter sequence");
+        let mut restore = Vec::new();
+        write_restore_sequence(&mut restore).expect("write restore sequence");
+
+        // The alternate screen, bracketed paste and focus reporting are claimed on enter and
+        // released on restore, each an unconditional enable/disable pair.
+        for (claim, release) in [
+            (
+                ansi_bytes(EnterAlternateScreen),
+                ansi_bytes(LeaveAlternateScreen),
+            ),
+            (
+                ansi_bytes(EnableBracketedPaste),
+                ansi_bytes(DisableBracketedPaste),
+            ),
+            (
+                ansi_bytes(EnableFocusChange),
+                ansi_bytes(DisableFocusChange),
+            ),
+        ] {
+            assert!(
+                bytes_contain(&enter, &claim),
+                "expected {claim:?} in the enter sequence"
+            );
+            assert!(
+                bytes_contain(&restore, &release),
+                "expected {release:?} in the restore sequence"
+            );
+        }
+
+        // Mouse capture is deliberately never written in either direction; see
+        // write_enter_sequence's doc comment for why.
+        for mouse_bytes in [
+            ansi_bytes(crossterm::event::EnableMouseCapture),
+            ansi_bytes(crossterm::event::DisableMouseCapture),
+        ] {
+            assert!(
+                !bytes_contain(&enter, &mouse_bytes),
+                "mouse capture must never be written on enter: found {mouse_bytes:?}"
+            );
+            assert!(
+                !bytes_contain(&restore, &mouse_bytes),
+                "mouse capture must never be written on restore: found {mouse_bytes:?}"
+            );
+        }
     }
 
     /// crossterm's `KeyEventKind` has three variants, not two: a physical key held down

@@ -64,6 +64,14 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub panic_after_launcher_handoff: bool,
 
+    /// Claims the terminal, hands off to a synthetic Launcher whose argv names a binary that
+    /// cannot be spawned, then exits with that spawn error. Debug-only: exists so a test can
+    /// observe the terminal being reclaimed even when the child never started, rather than
+    /// trusting `Tui::suspend_for_child`'s doc comment, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub unspawnable_launcher_after_tui_enter: bool,
+
     /// Resolves the config path, prints it, sets `REPON_CONFIG` to the given value, resolves
     /// again and prints that too, then exits, claiming no terminal at all. Debug-only: exists
     /// so a test can observe that a path resolved from a flag or the environment is fixed for

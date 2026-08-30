@@ -57,6 +57,11 @@ fn main() -> color_eyre::Result<()> {
     }
 
     #[cfg(debug_assertions)]
+    if args.unspawnable_launcher_after_tui_enter {
+        return unspawnable_launcher_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
     if let Some(new_value) = &args.reprint_config_path_after_env_change {
         return reprint_config_path_after_env_change(new_value);
     }
@@ -175,6 +180,26 @@ fn panic_after_launcher_handoff() -> color_eyre::Result<()> {
     };
     launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
     panic!("repon: test-triggered panic after a Launcher handoff completed");
+}
+
+/// Claims the terminal, then hands it to a synthetic Launcher whose argv names a binary
+/// guaranteed not to exist, so a test can attach to a real process over a pty and read back
+/// whether `Tui::suspend_for_child` reclaims the terminal even when `command.status()` fails
+/// to spawn the child at all, rather than trusting its doc comment's claim. Propagates the
+/// spawn error rather than swallowing it, so this still exits non-zero.
+#[cfg(debug_assertions)]
+fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    let synthetic_launcher = launcher::Launcher {
+        name: "test".to_string(),
+        source: launcher::Source::Args(vec!["repon-test-binary-that-does-not-exist".to_string()]),
+        shell: false,
+        env: Default::default(),
+    };
+    launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
+    Ok(())
 }
 
 /// Resolves the config path once, prints it, then changes `REPON_CONFIG` and resolves again,
