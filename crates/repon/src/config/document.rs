@@ -614,6 +614,22 @@ mod tests {
         assert!(unknown.iter().any(|path| path.ends_with("typo_three")));
     }
 
+    // ADR 0011: Repon probes no terminal background and ships no paired light/dark theme,
+    // so there is no `appearance` key for one to select between. `appearance` falls through
+    // to the same unknown-key warning as any other typo, rather than being a recognised,
+    // parsed field.
+    #[test]
+    fn an_appearance_key_is_not_part_of_the_schema_and_warns_as_unknown() {
+        let loaded = parse_ok("appearance = \"dark\"\n");
+        assert!(
+            loaded.warnings.iter().any(
+                |warning| matches!(warning, Warning::UnknownKey(path) if path == "appearance")
+            ),
+            "expected `appearance` to warn as an unknown key, got: {:?}",
+            loaded.warnings
+        );
+    }
+
     // A duplicate `[[set]]` name is rejected at load with the line number.
     #[test]
     fn a_duplicate_set_name_is_rejected_with_a_line_number() {

@@ -16,6 +16,7 @@ mod glyphs;
 mod keys;
 mod logging;
 mod message;
+mod theme;
 mod tui;
 
 fn main() -> color_eyre::Result<()> {
