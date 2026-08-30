@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -44,12 +44,9 @@ use crate::snapshot::Snapshot;
 /// owns parsing it; the core only ever receives the result, and resolves `path` to
 /// the git common dir itself, since opening a repository is the core's own work.
 ///
-/// This amends `docs/spec/core-api.md`'s literal `RepoOverride { common_dir, .. }`
-/// snippet: matching by common dir alone cannot express "a Worktree named by its
-/// own path beats the entry it inherits" from a common dir shared with its parent
-/// Repo, since both would carry the identical common dir. `path` is what lets a
-/// match against an entity's own path outrank one only reached by a shared common
-/// dir; see [`find_override`].
+/// Keyed on `path` rather than the common dir `docs/spec/core-api.md` first named,
+/// which this amends: a Worktree and its parent Repo share one common dir, so only
+/// the entry's own path can outrank an entry reached by inheritance.
 #[derive(Debug, Clone)]
 pub struct RepoOverride {
     pub path: PathBuf,
@@ -185,6 +182,18 @@ pub struct Core {
     /// leaves what it found.
     #[allow(dead_code)] // read only by discovery_warning_for_test until a warning slot exists
     discovery_warning: Arc<Mutex<Option<String>>>,
+    /// Reset to zero at the start of every `refresh`, then incremented once per
+    /// distinct common dir among that Generation's dispatched entities whose
+    /// default-branch chain facts are actually computed, as opposed to reused from
+    /// another entity sharing the same common dir. Never persisted across
+    /// Generations, per [ADR 0006](https://github.com/paulchiu/repon/blob/main/docs/adr/0006-no-git-state-cache-session-state-by-name.md):
+    /// the memo cache itself lives only for the lifetime of one `refresh` call.
+    /// Read only by `default_branch_chain_reads_for_test`, which is what proves
+    /// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+    /// per-common-dir memoisation actually ran rather than merely agreeing by
+    /// coincidence.
+    #[allow(dead_code)] // read only by default_branch_chain_reads_for_test
+    default_branch_chain_reads: Arc<AtomicUsize>,
 }
 
 impl Core {
@@ -202,6 +211,11 @@ impl Core {
     /// dispatches nothing and carries no other meaning. Returns immediately: the
     /// probes run on rayon's global pool.
     pub fn refresh(&self, order: &[EntityKey]) -> Generation {
+        // Scoped to this one Generation, per default-branch.md's "memoised per
+        // common dir within a single refresh generation": a fresh cache every
+        // call, never carried over, never touched by the previous Generation's
+        // still-finishing tasks holding their own clone of the old one.
+        self.default_branch_chain_reads.store(0, Ordering::Release);
         let mut table = self.table.write().unwrap();
         table.generation += 1;
         let generation_number = table.generation;
@@ -252,21 +266,38 @@ impl Core {
                     .and_then(|entry| entry.default_branch.clone())
             })
             .collect();
+        let common_dirs: Vec<Arc<Path>> = dispatched
+            .iter()
+            .map(|(key, _)| Arc::clone(&table.entities[table.index[key]].common_dir))
+            .collect();
         drop(table);
 
-        for (((key, cancel), repo), override_branch) in
-            dispatched.into_iter().zip(repos).zip(override_branches)
+        // Scoped to this dispatch alone: every task below gets its own clone of
+        // this `Arc`, and once they all finish and drop it, the cache and every
+        // `ChainFacts` it holds are freed. Nothing here outlives one Generation.
+        let chain_cache: Arc<ChainFactsCache> = Arc::new(Mutex::new(HashMap::new()));
+
+        for ((((key, cancel), repo), override_branch), common_dir) in dispatched
+            .into_iter()
+            .zip(repos)
+            .zip(override_branches)
+            .zip(common_dirs)
         {
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
             let settle_gate = Arc::clone(&self.settle_gate);
+            let chain_cache = Arc::clone(&chain_cache);
+            let chain_reads = Arc::clone(&self.default_branch_chain_reads);
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
-                let default_branch_outcome = probe_default_branch(
+                let default_branch_outcome = probe_default_branch_memoised(
                     &path,
                     repo.as_deref(),
+                    &common_dir,
                     override_branch.as_deref(),
                     &cancel,
+                    &chain_cache,
+                    &chain_reads,
                 );
                 apply_probe_outcome(
                     &table_handle,
@@ -332,15 +363,7 @@ impl Core {
             table.entities[idx].branch.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
-            let applied = table.entities[idx]
-                .default_branch
-                .settle(generation, resolution.settled);
-            if applied {
-                table.entities[idx].diagnostics.default_branch_rung = Some(resolution.rung);
-                table.entities[idx]
-                    .diagnostics
-                    .default_branch_rung_disagreement = resolution.disagreement;
-            }
+            table.entities[idx].apply_default_branch_resolution(generation, resolution);
         }
         table.entities[idx].clone()
     }
@@ -432,6 +455,16 @@ impl Core {
         key: &EntityKey,
     ) -> Option<Arc<gix::ThreadSafeRepository>> {
         self.table.read().unwrap().repos.get(key).cloned()
+    }
+
+    /// How many times the most recent `refresh` actually computed the
+    /// default-branch chain's per-common-dir facts, as opposed to reusing an
+    /// already-computed answer for a common dir another dispatched entity already
+    /// paid for. What proves the per-common-dir memoisation ran at all: two
+    /// entities agreeing on their resolved default branch proves nothing on its
+    /// own, since two distinct common dirs can legitimately agree too.
+    pub(crate) fn default_branch_chain_reads_for_test(&self) -> usize {
+        self.default_branch_chain_reads.load(Ordering::Acquire)
     }
 
     /// `start`, with the tick source and the discovery-slow warning's threshold
@@ -625,6 +658,7 @@ fn start_internal(
             control,
             clock_thread: Some(clock_thread),
             discovery_warning,
+            default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -819,6 +853,75 @@ fn probe_default_branch(
     ))
 }
 
+/// One Generation's default-branch chain memo: at most one [`default_branch::ChainFacts`]
+/// per common dir, shared by every dispatched entity that names it. Built fresh in
+/// [`Core::refresh`] and dropped once every task from that dispatch has finished.
+type ChainFactsCache = Mutex<HashMap<Arc<Path>, Arc<OnceLock<default_branch::ChainFacts>>>>;
+
+/// The per-common-dir half of [`probe_default_branch_memoised`]: returns the
+/// already-cached facts for `common_dir` if another entity in this Generation's
+/// dispatch already computed them, blocking until that computation finishes if it
+/// is still running; otherwise runs `compute` itself, caches the result, and
+/// increments `reads` exactly once for the common dir this call is the first to
+/// reach.
+fn chain_facts_for(
+    cache: &ChainFactsCache,
+    common_dir: &Arc<Path>,
+    reads: &AtomicUsize,
+    compute: impl FnOnce() -> default_branch::ChainFacts,
+) -> default_branch::ChainFacts {
+    let cell = {
+        let mut cache = cache.lock().unwrap();
+        Arc::clone(
+            cache
+                .entry(Arc::clone(common_dir))
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    };
+    cell.get_or_init(|| {
+        reads.fetch_add(1, Ordering::Relaxed);
+        compute()
+    })
+    .clone()
+}
+
+/// Runs the four-rung default branch chain against `path`, memoising rungs 2 and
+/// 3's own per-common-dir facts in `cache` so every entity sharing `common_dir`
+/// within the same dispatch reads the loose file and its reference lookups once
+/// rather than once per entity, per [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "Memoised per common dir within a single refresh generation". `None` if
+/// `cancel` was already set before the read started; `override_branch` is rung 1's
+/// own entity-specific value, never memoised because it is not a common-dir fact.
+fn probe_default_branch_memoised(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    common_dir: &Arc<Path>,
+    override_branch: Option<&str>,
+    cancel: &AtomicBool,
+    cache: &ChainFactsCache,
+    reads: &AtomicUsize,
+) -> Option<default_branch::Resolution> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(default_branch::Resolution::failed(error)),
+        },
+    };
+    let local = repo.to_thread_local();
+    let facts = chain_facts_for(cache, common_dir, reads, || {
+        default_branch::ChainFacts::resolve(&local)
+    });
+    Some(default_branch::resolve_with_facts(&facts, override_branch))
+}
+
 /// Lands one probe's combined outcome for `key` at `generation`: writes the branch
 /// and default-branch cells subject to the per-cell supersession `Cell::settle`
 /// already enforces, records the default-branch diagnostics only on the write that
@@ -840,15 +943,7 @@ fn apply_probe_outcome(
             table.entities[idx].branch.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
-            let applied = table.entities[idx]
-                .default_branch
-                .settle(generation, resolution.settled);
-            if applied {
-                table.entities[idx].diagnostics.default_branch_rung = Some(resolution.rung);
-                table.entities[idx]
-                    .diagnostics
-                    .default_branch_rung_disagreement = resolution.disagreement;
-            }
+            table.entities[idx].apply_default_branch_resolution(generation, resolution);
         }
     }
     table.in_flight.remove(&key);
@@ -929,6 +1024,8 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::entity::DefaultBranchStopped;
+    use crate::test_support::{git, head_sha};
 
     fn init_repo_with_a_commit(path: &Path) {
         fs::create_dir_all(path).expect("create repo dir");
@@ -1910,33 +2007,6 @@ mod tests {
         );
     }
 
-    /// Runs `git` against `path` with a fixed identity, matching every other test
-    /// module's own helper of the same shape.
-    fn git(path: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
-            .args(args)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn head_sha(path: &Path) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("run git rev-parse");
-        assert!(output.status.success());
-        String::from_utf8(output.stdout)
-            .expect("utf8 sha")
-            .trim()
-            .to_string()
-    }
-
     fn spec_with_overrides(roots: Vec<PathBuf>, overrides: Vec<RepoOverride>) -> CoreSpec {
         let mut spec = spec(roots);
         spec.overrides = overrides;
@@ -2035,6 +2105,104 @@ mod tests {
         assert_eq!(entity.diagnostics.default_branch_rung, Some(1));
     }
 
+    /// The three named ways rung 4 is reached are recorded distinctly, not merged
+    /// into one opaque "gave up" fact: no remote at all, two or more remotes with
+    /// none named `origin`, and a chosen remote whose tracking refs matched
+    /// nothing in the name list.
+    #[test]
+    fn reaching_rung_four_with_no_remote_at_all_records_why() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
+        assert_eq!(
+            entity.diagnostics.default_branch_stopped,
+            Some(DefaultBranchStopped::NoRemote)
+        );
+    }
+
+    #[test]
+    fn reaching_rung_four_with_two_unnamed_remotes_records_why() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork-one",
+                "https://example.invalid/one.git",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork-two",
+                "https://example.invalid/two.git",
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
+        assert_eq!(
+            entity.diagnostics.default_branch_stopped,
+            Some(DefaultBranchStopped::AmbiguousRemote)
+        );
+    }
+
+    #[test]
+    fn reaching_rung_four_with_a_chosen_remote_and_no_matching_ref_records_why() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        // A remote-tracking ref exists, but under a name outside rung 3's list, and
+        // there is no origin/HEAD at all.
+        let sha = head_sha(&repo);
+        git(&repo, &["update-ref", "refs/remotes/origin/feature", &sha]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
+        assert_eq!(
+            entity.diagnostics.default_branch_stopped,
+            Some(DefaultBranchStopped::NameListExhausted)
+        );
+    }
+
     /// A Repo with no override and no resolvable remote reaches rung 4: Unknown,
     /// never Failed, which stays reserved for a git error.
     #[test]
@@ -2056,6 +2224,101 @@ mod tests {
             Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
         assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
+    }
+
+    /// The seam this proves: a stale symbolic `origin/HEAD` reaches all the way
+    /// through `Core::refresh` and `settle` into `Diagnostics`, not just the
+    /// fallen-through rung 3 answer, since the spec requires recording that the
+    /// stale case is what happened rather than leaving the same trail a merely
+    /// absent `origin/HEAD` would.
+    #[test]
+    fn a_stale_remote_head_is_recorded_in_diagnostics_through_a_real_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(&repo);
+        git(&repo, &["update-ref", "refs/remotes/origin/trunk", &sha]);
+        let remote_refs_dir = repo
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin");
+        fs::create_dir_all(&remote_refs_dir).expect("create refs/remotes/origin dir");
+        // Points at a name never created as a ref: the stale case, not merely absent.
+        fs::write(
+            remote_refs_dir.join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .expect("write HEAD");
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        match entity.default_branch.settled() {
+            Some(Settled::Known { value, .. }) => {
+                assert_eq!(value.name(), "origin/trunk")
+            }
+            other => panic!("expected the name list's answer, got {other:?}"),
+        }
+        assert!(
+            entity.diagnostics.default_branch_rung_two_stale,
+            "a stale origin/HEAD target must be recorded on the entity's diagnostics"
+        );
+    }
+
+    /// A resolvable `origin/HEAD` must never be marked stale, so the flag actually
+    /// distinguishes the two cases rather than always being set once rung 2 runs.
+    #[test]
+    fn a_resolvable_remote_head_is_not_recorded_as_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(&repo);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        let remote_refs_dir = repo
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin");
+        fs::create_dir_all(&remote_refs_dir).expect("create refs/remotes/origin dir");
+        fs::write(
+            remote_refs_dir.join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .expect("write HEAD");
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        assert!(!entity.diagnostics.default_branch_rung_two_stale);
     }
 
     /// The defining behaviour for per-Repo matching: one `[[repo]]` entry naming
@@ -2211,6 +2474,80 @@ mod tests {
             !submodule.excluded,
             "an entry naming only the parent's path must never reach a Submodule, \
              whose own common dir differs from its parent's"
+        );
+    }
+
+    /// The seam this proves: `Core::default_branch_chain_reads_for_test` counts
+    /// how many times a `refresh` actually computed the default-branch chain's
+    /// per-common-dir facts (`default_branch::ChainFacts::resolve`, the loose-file
+    /// read plus the reference lookups), rather than reusing an already-computed
+    /// answer for a common dir another entity in the same Generation already paid
+    /// for. Reading the count off `Core` this way is the seam, not an internal:
+    /// it is a named, stable test-only entry point in the same
+    /// `#[cfg(test)] impl Core` family as `cached_repo_handle_for_test`, which
+    /// already proves a different sharing question the same way. There is no
+    /// black-box way to observe "how many times an internal read ran" through
+    /// `Snapshot` alone, since two different common dirs can legitimately answer
+    /// with the same branch name.
+    ///
+    /// Three Worktrees share one common dir with their Repo (four entities); a
+    /// second, unrelated Repo has its own. Memoised, the count is 2, the number of
+    /// distinct common dirs; unmemoised, it is 4, the number of entities.
+    #[test]
+    fn the_default_branch_chain_is_memoised_once_per_common_dir_per_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        for name in ["wt-a", "wt-b", "wt-c"] {
+            let worktree = root.join(name);
+            git(
+                &parent,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    name,
+                    worktree.to_str().expect("utf8 path"),
+                ],
+            );
+        }
+        let other_repo = root.join("other");
+        init_repo_with_a_commit(&other_repo);
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            5,
+            "expected the parent, its three worktrees and the unrelated repo"
+        );
+
+        core.refresh(&keys);
+        core.settle(Duration::from_millis(500));
+
+        assert_eq!(
+            core.default_branch_chain_reads_for_test(),
+            2,
+            "four entities span exactly two common dirs; a memoised chain reads \
+             each common dir once, not once per entity"
+        );
+
+        // A second Generation pays the same two reads again. A cache hoisted onto
+        // `Core` would answer this refresh for free and read 0, which is the
+        // persistence ADR 0006 refuses.
+        core.refresh(&keys);
+        core.settle(Duration::from_millis(500));
+        assert_eq!(
+            core.default_branch_chain_reads_for_test(),
+            2,
+            "the memo lives inside one Generation's dispatch; the next Generation \
+             recomputes rather than inheriting it"
         );
     }
 }

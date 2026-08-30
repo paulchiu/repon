@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::cell::{Cell, Generation, Settled};
+use crate::default_branch;
 
 /// An Entity's identity: a newtype over its own resolved absolute working
 /// directory.
@@ -92,8 +93,24 @@ impl DefaultBranch {
     }
 }
 
+/// Why the default branch resolution chain reached rung 4, from facts the chain
+/// already has at no extra cost: which of gix's own remote enumeration, or rung
+/// 3's own name list, came up empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultBranchStopped {
+    /// The repository has no remote at all.
+    NoRemote,
+    /// Two or more remotes exist and none is named `origin`, so gix's own
+    /// fetch-default refuses to guess.
+    AmbiguousRemote,
+    /// A remote was chosen, but neither `origin/HEAD` nor the name list named a
+    /// ref that still resolves.
+    NameListExhausted,
+}
+
 /// Per-Entity facts that are not Cells: which rung of the default branch
-/// resolution chain answered, and whether rung 2 and rung 3 disagreed.
+/// resolution chain answered, whether rung 2 and rung 3 disagreed, and why
+/// resolution stopped when it did not settle.
 ///
 /// These reach the detail pane and stay out of the row summary fold, because they
 /// describe how a value was obtained rather than a value that can itself fail.
@@ -103,6 +120,13 @@ pub struct Diagnostics {
     pub default_branch_rung: Option<u8>,
     /// Whether rung 2's answer disagreed with rung 3's.
     pub default_branch_rung_disagreement: bool,
+    /// Whether rung 2 read a symbolic `origin/HEAD` whose target no longer
+    /// resolves, the stale-but-successful case neither `git symbolic-ref` nor
+    /// gix's own `target()` check for on their own.
+    pub default_branch_rung_two_stale: bool,
+    /// Why resolution reached rung 4, once it has; `None` while a rung 1 to 3
+    /// answer stands.
+    pub default_branch_stopped: Option<DefaultBranchStopped>,
     /// Why this entity's own `.gitmodules` would not read or parse, if it has one
     /// and it failed; `None` covers both "no `.gitmodules`" and "read cleanly".
     pub gitmodules_failed: Option<Arc<str>>,
@@ -183,6 +207,30 @@ impl EntityState {
         }
 
         entity
+    }
+
+    /// Settles `resolution` onto this entity's `default_branch` cell for
+    /// `generation`, and, only if that write actually applied (was not
+    /// superseded by a newer Generation already recorded there), records its
+    /// diagnostics beside it. The one place that write happens: a write the
+    /// supersession check rejects must never leave diagnostics describing an
+    /// answer the cell itself discarded.
+    pub(crate) fn apply_default_branch_resolution(
+        &mut self,
+        generation: Generation,
+        resolution: default_branch::Resolution,
+    ) {
+        let rung = resolution.rung;
+        let disagreement = resolution.disagreement;
+        let stale_remote_head = resolution.stale_remote_head;
+        let stopped = resolution.stopped;
+        let applied = self.default_branch.settle(generation, resolution.settled);
+        if applied {
+            self.diagnostics.default_branch_rung = Some(rung);
+            self.diagnostics.default_branch_rung_disagreement = disagreement;
+            self.diagnostics.default_branch_rung_two_stale = stale_remote_head;
+            self.diagnostics.default_branch_stopped = stopped;
+        }
     }
 }
 

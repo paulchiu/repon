@@ -157,22 +157,8 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
-
-    /// Runs `git` against `repo` with a fixed identity, so a commit never depends on
-    /// the machine's own global git config.
-    fn git(repo: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
-            .args(args)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed");
-    }
+    use crate::test_support::git;
 
     /// The path-taking shape most tests want: opens `path` fresh through the same
     /// shared-handle path production uses (`open_thread_safe` then

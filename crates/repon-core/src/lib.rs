@@ -60,6 +60,8 @@ mod entity;
 mod fanout;
 mod git;
 mod snapshot;
+#[cfg(test)]
+mod test_support;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
 pub use core::{Core, CoreSpec, RepoOverride};
