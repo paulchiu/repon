@@ -5,10 +5,15 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::config;
 
+/// The path [`init`] writes the log file to.
+pub fn log_file_path() -> std::path::PathBuf {
+    config::data_dir().join(concat!(env!("CARGO_PKG_NAME"), ".log"))
+}
+
 pub fn init() -> Result<()> {
     let directory = config::data_dir();
     std::fs::create_dir_all(&directory)?;
-    let log_file = std::fs::File::create(directory.join(concat!(env!("CARGO_PKG_NAME"), ".log")))?;
+    let log_file = std::fs::File::create(log_file_path())?;
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
         .with_env_var("REPON_LOG_LEVEL")

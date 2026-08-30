@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::tui::{MAX_RATE, MIN_RATE};
 
@@ -19,6 +19,20 @@ pub struct Cli {
     /// Path to config.toml, beating `REPON_CONFIG`
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// A subcommand that reports on configuration and exits without launching the terminal.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Prints resolved config paths, or the annotated example config.
+    Config {
+        /// Print the annotated example config to standard output and exit.
+        #[arg(long)]
+        example: bool,
+    },
 }
 
 /// A rate the event thread can honour. Rejected here so a typo reads as a usage error

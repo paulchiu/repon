@@ -123,7 +123,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// The file `config.toml` is read from; see [`resolve_config`] for precedence.
-fn config_file() -> PathBuf {
+pub fn config_file() -> PathBuf {
     resolved_config().file.clone()
 }
 

@@ -1,0 +1,78 @@
+# This terminal draws braille, ∅ and the rounded borders fine; keep the full set.
+theme = "default"
+glyphs = "full"
+
+# Worktrees are rows too; Submodules stay hidden.
+show_worktrees = true
+show_submodules = false
+
+[refresh]
+poll_interval = "2s"       # "0s" turns the sweep off
+status_stale_after = "5m"
+on_focus = true
+
+[fetch]
+enabled = true
+interval = "5m"
+concurrency = 4
+
+[auto_update]
+enabled = true             # fast-forward only, rides the fetch cycle
+
+# Everything, both roots. First declared, so this is the default Set.
+[[set]]
+name = "dev"
+roots = ["~/dev", "~/dev-misc"]
+
+# One client, minus the graveyard. Globs are case-sensitive.
+[[set]]
+name = "work"
+roots = ["~/dev"]
+include = ["**/acme/**"]
+exclude = ["**/archive/**", "**/node_modules/**"]
+
+# origin/HEAD on this one still says master; pin it.
+[[repo]]
+path = "~/dev/legacy-api"
+default_branch = "main"
+
+# A vendored mirror. List it, never touch it.
+[[repo]]
+path = "~/dev/vendor-mirror"
+exclude = true
+
+[[launcher]]
+name = "lazygit"
+args = ["lazygit"]
+
+[[launcher]]
+name = "tuicr"
+args = ["tuicr"]
+
+# VISUAL, then EDITOR, then vi. "code --wait" splits into two argv elements.
+[[launcher]]
+name = "editor"
+from_env = "EDITOR"
+
+# The pipe is why this one opts into the shell.
+[[launcher]]
+name = "log"
+args = ["git log --oneline -20 | less"]
+shell = true
+
+# Step two runs only if step one exited zero.
+[[action]]
+name = "reinstall"
+description = "Reinstall dependencies from scratch"
+concurrency = 4
+
+[[action.steps]]
+args = ["rm", "-rf", "node_modules"]
+
+[[action.steps]]
+args = ["pnpm", "install"]
+
+# Only what changes. Everything else keeps the default map.
+[keys.list]
+refresh = "F5"             # move one binding
+dismiss = ""               # unbind it entirely

@@ -212,6 +212,20 @@ pub struct Loaded {
     pub warnings: Vec<Warning>,
 }
 
+/// The pasteable, annotated example config from `config.md`'s "An annotated example"
+/// section, shipped as its own file beside this module rather than pulled from
+/// [config.md](../../../../docs/spec/config.md) with `include_str!`: `docs/` sits outside
+/// this crate's directory, so it is not among the files `cargo package` ships, and
+/// `repon config --example` must work for an installed binary with no `docs/` directory
+/// alongside it. A test below reads the specification at test time and asserts this file
+/// stays byte-identical to its fenced block, so the two cannot drift apart.
+const EXAMPLE_CONFIG: &str = include_str!("example.toml");
+
+/// The pasteable, annotated example config `repon config --example` prints.
+pub fn annotated_example() -> &'static str {
+    EXAMPLE_CONFIG
+}
+
 /// Reads and parses `path`. A missing file is not an error: it resolves to the compiled
 /// defaults with one implicit Set, `all`, rooted at the working directory.
 pub fn load(path: &Path) -> Result<Loaded> {
@@ -706,5 +720,110 @@ mod tests {
         );
         let loaded = parse_ok(&text);
         assert!(loaded.warnings.is_empty(), "got: {:?}", loaded.warnings);
+    }
+
+    // `repon config --example` prints this exact text; parsing it here, rather than a
+    // hand-typed copy, is what proves the printed example and the real schema cannot drift
+    // apart. No unknown key means every line the spec shows is a key this schema knows.
+    #[test]
+    fn the_annotated_example_parses_against_the_real_schema() {
+        let example = annotated_example();
+        assert!(
+            example.starts_with("# This terminal draws braille"),
+            "expected the extracted block to start with the spec's own comment, got: {example:?}"
+        );
+
+        let loaded = parse_ok(example);
+
+        let unknown: Vec<&Warning> = loaded
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, Warning::UnknownKey(_)))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "expected no unknown-key warnings, got: {unknown:?}"
+        );
+    }
+
+    // Every value the example shows that already equals the compiled default is annotation
+    // only: deleting it falls back to the same value through the deep merge. Comparing
+    // against each type's own `Default::default()`, the single source of truth, rather than a
+    // value copied by hand, is what would catch the example drifting from a changed default.
+    #[test]
+    fn every_default_valued_field_the_example_shows_could_be_deleted() {
+        let loaded = parse_ok(annotated_example());
+        let document = &loaded.document;
+
+        assert_eq!(document.theme, Document::default().theme);
+        assert_eq!(document.glyphs, Glyphs::default());
+        assert_eq!(document.show_worktrees, Document::default().show_worktrees);
+        assert_eq!(
+            document.show_submodules,
+            Document::default().show_submodules
+        );
+        assert_eq!(
+            document.refresh.poll_interval,
+            RefreshConfig::default().poll_interval
+        );
+        assert_eq!(
+            document.refresh.status_stale_after,
+            RefreshConfig::default().status_stale_after
+        );
+        assert_eq!(document.refresh.on_focus, RefreshConfig::default().on_focus);
+        assert_eq!(document.fetch.interval, FetchConfig::default().interval);
+        assert_eq!(
+            document.fetch.concurrency,
+            FetchConfig::default().concurrency
+        );
+
+        // The negative control: the example deliberately turns these two on to show what an
+        // active fetch and auto-update look like, so they must NOT equal the compiled
+        // default, or the assertions above would be vacuously true regardless of what they
+        // compared.
+        assert_ne!(document.fetch.enabled, FetchConfig::default().enabled);
+        assert_ne!(
+            document.auto_update.enabled,
+            AutoUpdateConfig::default().enabled
+        );
+    }
+
+    /// The same extraction `annotated_example()` used to do at compile time, run here at
+    /// test time instead so the specification can live outside the crate.
+    fn extract_fenced_example(spec: &str) -> &str {
+        const HEADING: &str = "## An annotated example";
+        const FENCE_OPEN: &str = "```toml\n";
+        const FENCE_CLOSE: &str = "\n```";
+
+        let after_heading = &spec[spec
+            .find(HEADING)
+            .expect("config.md must contain the annotated example section")..];
+        let body = &after_heading[after_heading
+            .find(FENCE_OPEN)
+            .expect("the annotated example section must open a ```toml fence")
+            + FENCE_OPEN.len()..];
+        let fence_close = body
+            .find(FENCE_CLOSE)
+            .expect("the annotated example section must close its ```toml fence");
+        &body[..=fence_close]
+    }
+
+    /// Reads `docs/spec/config.md` at test time via `CARGO_MANIFEST_DIR` rather than
+    /// `include_str!`, following repon-core's precedent for `CONTEXT.md`: the spec lives
+    /// outside this crate's directory, so `include_str!` would compile fine in the
+    /// workspace checkout but fail the packaged crate's build with no test to report it.
+    /// Comparing its fenced block against the shipped `example.toml` byte for byte is what
+    /// keeps `repon config --example`'s output and the specification from drifting apart.
+    #[test]
+    fn the_shipped_example_matches_the_specs_fenced_block() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
+            .expect("read the config specification");
+        let expected = extract_fenced_example(&spec);
+        assert_eq!(
+            annotated_example(),
+            expected,
+            "config/example.toml has drifted from docs/spec/config.md's annotated example"
+        );
     }
 }
