@@ -4,10 +4,11 @@
 //! "Decide the keybinding map". Until those land this reads the file if it is there,
 //! ignores everything in it, and carries only the directories.
 
-use std::{env, fs, io, path::PathBuf};
+use std::{env, fs, io, path::PathBuf, sync::OnceLock};
 
 use color_eyre::eyre::{Result, WrapErr};
 use directories::ProjectDirs;
+use etcetera::{BaseStrategy, choose_base_strategy};
 use serde::Deserialize;
 
 const CONFIG_FILE: &str = "config.toml";
@@ -23,9 +24,11 @@ pub struct Config {
 impl Config {
     /// Reads `config.toml` from the config directory. A missing file is not an error; a
     /// malformed one is, because silently running on defaults hides the mistake.
-    pub fn new() -> Result<Self> {
+    ///
+    /// `flag_config_file` is the `--config` value, if any; see [`config_file`] for precedence.
+    pub fn new(flag_config_file: Option<PathBuf>) -> Result<Self> {
         let config_dir = config_dir();
-        let path = config_dir.join(CONFIG_FILE);
+        let path = config_file(flag_config_file);
         let mut config = match fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .wrap_err_with(|| format!("could not parse {}", path.display()))?,
@@ -40,32 +43,156 @@ impl Config {
     }
 }
 
-/// `REPON_CONFIG` wins, then the platform's config directory, then the working directory.
-pub fn config_dir() -> PathBuf {
-    env::var_os("REPON_CONFIG").map_or_else(
-        || {
-            project_dirs().map_or_else(
-                || PathBuf::from(".config"),
-                |dirs| dirs.config_local_dir().to_path_buf(),
-            )
-        },
-        PathBuf::from,
-    )
+/// The config directory (holding `config.toml` and `themes/`) and the config file path, which
+/// can diverge when `--config` names a file outside that directory.
+struct ResolvedConfig {
+    dir: PathBuf,
+    file: PathBuf,
 }
 
-/// `REPON_DATA` wins, then the platform's data directory, then the working directory.
-pub fn data_dir() -> PathBuf {
-    env::var_os("REPON_DATA").map_or_else(
-        || {
-            project_dirs().map_or_else(
-                || PathBuf::from(".data"),
-                |dirs| dirs.data_local_dir().to_path_buf(),
-            )
-        },
-        PathBuf::from,
+/// `REPON_CONFIG` (a directory) beats `default_dir`; a flag-supplied file path beats both and
+/// does not move the directory, since themes still follow it.
+fn resolve_config(
+    env_config_dir: Option<PathBuf>,
+    flag_config_file: Option<PathBuf>,
+    default_dir: PathBuf,
+) -> ResolvedConfig {
+    let dir = env_config_dir.unwrap_or(default_dir);
+    let file = flag_config_file.unwrap_or_else(|| dir.join(CONFIG_FILE));
+    ResolvedConfig { dir, file }
+}
+
+/// `REPON_DATA` beats `default_dir`.
+fn resolve_data(env_data_dir: Option<PathBuf>, default_dir: PathBuf) -> PathBuf {
+    env_data_dir.unwrap_or(default_dir)
+}
+
+/// The config directory the XDG base strategy names for this package: `~/.config/repon` under
+/// XDG, the same relative location on macOS and Linux since neither is special-cased here.
+fn default_config_dir() -> PathBuf {
+    choose_base_strategy()
+        .map_or_else(
+            |_| PathBuf::from(".config"),
+            |strategy| strategy.config_dir(),
+        )
+        .join(env!("CARGO_PKG_NAME"))
+}
+
+fn default_data_dir() -> PathBuf {
+    project_dirs().map_or_else(
+        || PathBuf::from(".data"),
+        |dirs| dirs.data_local_dir().to_path_buf(),
     )
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
+}
+
+static CONFIG: OnceLock<ResolvedConfig> = OnceLock::new();
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Resolves the config half from the real environment and `flag_config_file`, once for the
+/// process. A later call's argument is ignored: the first call, from [`Config::new`], is the
+/// one that can see the `--config` flag, and the result must not move once read.
+fn resolved_config(flag_config_file: Option<PathBuf>) -> &'static ResolvedConfig {
+    CONFIG.get_or_init(|| {
+        resolve_config(
+            env::var_os("REPON_CONFIG").map(PathBuf::from),
+            flag_config_file,
+            default_config_dir(),
+        )
+    })
+}
+
+/// The directory `config.toml` and `themes/` live in.
+pub fn config_dir() -> PathBuf {
+    resolved_config(None).dir.clone()
+}
+
+/// The file `config.toml` is read from; see [`resolve_config`] for precedence.
+fn config_file(flag_config_file: Option<PathBuf>) -> PathBuf {
+    resolved_config(flag_config_file).file.clone()
+}
+
+/// The directory holding `state.toml` and the log, fixed for the process on first read.
+pub fn data_dir() -> PathBuf {
+    DATA_DIR
+        .get_or_init(|| {
+            resolve_data(
+                env::var_os("REPON_DATA").map(PathBuf::from),
+                default_data_dir(),
+            )
+        })
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_file_sits_under_the_default_config_dir() {
+        let resolved = resolve_config(None, None, PathBuf::from("/default/config"));
+        assert_eq!(resolved.dir, PathBuf::from("/default/config"));
+        assert_eq!(resolved.file, PathBuf::from("/default/config/config.toml"));
+    }
+
+    #[test]
+    fn env_override_beats_the_default_config_dir() {
+        let resolved = resolve_config(
+            Some(PathBuf::from("/env/config")),
+            None,
+            PathBuf::from("/default/config"),
+        );
+        assert_eq!(resolved.dir, PathBuf::from("/env/config"));
+        assert_eq!(resolved.file, PathBuf::from("/env/config/config.toml"));
+    }
+
+    #[test]
+    fn flag_config_file_beats_the_env_override() {
+        let resolved = resolve_config(
+            Some(PathBuf::from("/env/config")),
+            Some(PathBuf::from("/flag/custom.toml")),
+            PathBuf::from("/default/config"),
+        );
+        assert_eq!(resolved.file, PathBuf::from("/flag/custom.toml"));
+        // The flag names the file only; the directory (for themes) still follows the env override.
+        assert_eq!(resolved.dir, PathBuf::from("/env/config"));
+    }
+
+    #[test]
+    fn env_data_override_beats_the_default_data_dir() {
+        let resolved = resolve_data(
+            Some(PathBuf::from("/env/data")),
+            PathBuf::from("/default/data"),
+        );
+        assert_eq!(resolved, PathBuf::from("/env/data"));
+    }
+
+    #[test]
+    fn the_two_halves_resolve_independently_and_precedence_holds() {
+        let config = resolve_config(
+            Some(PathBuf::from("/env/config")),
+            Some(PathBuf::from("/flag/custom.toml")),
+            PathBuf::from("/default/config"),
+        );
+        let data = resolve_data(
+            Some(PathBuf::from("/env/data")),
+            PathBuf::from("/default/data"),
+        );
+
+        assert_eq!(config.file, PathBuf::from("/flag/custom.toml"));
+        assert_eq!(data, PathBuf::from("/env/data"));
+
+        // Overriding data does not touch the config directory, and vice versa: each half's
+        // inputs feed only its own resolution.
+        let config_only = resolve_config(None, None, PathBuf::from("/default/config"));
+        assert_eq!(config_only.dir, PathBuf::from("/default/config"));
+    }
+
+    #[test]
+    fn the_default_config_dir_is_named_for_the_package_regardless_of_platform() {
+        assert!(default_config_dir().ends_with(env!("CARGO_PKG_NAME")));
+    }
 }

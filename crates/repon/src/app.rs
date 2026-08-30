@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -25,10 +27,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
+    pub fn new(tick_rate: f64, frame_rate: f64, config_path: Option<PathBuf>) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         Ok(Self {
-            config: Config::new()?,
+            config: Config::new(config_path)?,
             tick_rate,
             frame_rate,
             components: vec![Box::new(Home)],

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 
 use crate::tui::{MAX_RATE, MIN_RATE};
@@ -13,6 +15,10 @@ pub struct Cli {
     /// Frames per second
     #[arg(short, long, value_name = "FLOAT", default_value_t = 60.0, value_parser = rate)]
     pub frame_rate: f64,
+
+    /// Path to config.toml, beating `REPON_CONFIG`
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 }
 
 /// A rate the event thread can honour. Rejected here so a typo reads as a usage error

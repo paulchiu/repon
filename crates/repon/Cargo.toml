@@ -21,6 +21,7 @@ color-eyre = "0.6.5"
 crossbeam-channel.workspace = true
 crossterm = { version = "0.29.0", features = ["serde"] }
 directories = "6.0.0"
+etcetera = "0.11.0"
 ratatui = "0.30"
 repon-core.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }

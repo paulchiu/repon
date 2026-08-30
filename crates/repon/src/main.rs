@@ -16,5 +16,5 @@ fn main() -> color_eyre::Result<()> {
     logging::init()?;
 
     let args = Cli::parse();
-    App::new(args.tick_rate, args.frame_rate)?.run()
+    App::new(args.tick_rate, args.frame_rate, args.config)?.run()
 }
