@@ -72,6 +72,36 @@ What a Cell has established: Unknown with a reason, Known with a value and a Tim
 **Timestamp**:
 The wall-clock moment a Cell's Known value was read. Kept for a reader's sense of age only: supersession decides which value wins by Generation, never by the clock.
 
+### The table
+
+**Entity**:
+One row of the table: a Repo, a Worktree or a Submodule. Its Kind names which.
+_Avoid_: Row (that names the rendering, not the domain object)
+
+**Entity key**:
+An Entity's identity: a newtype over its own resolved absolute working directory. Not its name, which collides across the population; not the git common dir, which a Repo shares with every Worktree attached to it.
+
+**Entity state**:
+The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action run and its Presence.
+
+**HEAD**:
+Exactly three shapes, one to one with git's own: attached to a branch with a commit, detached at a commit with no branch, or unborn with a branch and no commit yet.
+
+**Sync**:
+An Entity's ahead behind pair of commit counts against its upstream.
+
+**Diagnostics**:
+Per-Entity facts that are not Cells: which rung of the default branch chain answered, and whether rung 2 and rung 3 disagreed. Reaches the detail pane, never the list.
+
+**Presence**:
+Whether an Entity is Present or Vanished from the Refresh that just ran.
+
+**Row summary**:
+The one state a row's Cells fold into for the gutter: in flight outranks everything, a Not applicable Cell is excluded, and otherwise the least settled Cell present wins.
+
+**Snapshot**:
+The whole table, cloned, as a consumer reads it: a Generation, when it was discovered, and every Entity's state.
+
 ### Worktree state
 
 Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag. A Worktree at a detached HEAD has no branch, so only Merged stays provable and the other three do not apply.

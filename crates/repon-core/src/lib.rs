@@ -1,11 +1,33 @@
 //! The rendering-agnostic core: it computes git state and knows nothing about terminals.
 //!
 //! Its public surface is flat, re-exported from the crate root rather than through
-//! `fanout` or `git`, which stay private: a generic scatter primitive and a single
-//! branch read are not vocabulary a second consumer needs. `ProbeError` is the one
-//! name `git` contributes to the surface, because a `Failed` cell carries it. The
-//! rest of `docs/spec/core-api.md`'s types land in later work and get re-exported
-//! the same way once they exist.
+//! `fanout`, `git`, `entity` or `snapshot`, which stay private: a generic scatter
+//! primitive and a single branch read are not vocabulary a second consumer needs,
+//! and neither is which file happens to define `EntityState` or `Snapshot`. The
+//! entry points on `Core` itself (`start`, `refresh`, `snapshot`, `settle`, ...)
+//! land in later work and get re-exported the same way once they exist.
+//!
+//! ## Reviewing an addition to this surface
+//!
+//! Every addition to what this crate exports should hold each of these, from
+//! `docs/spec/core-api.md`'s ownership table and
+//! [ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md):
+//!
+//! - It does a git-shaped thing (discovery, a probe phase, the metadata poll, a Set
+//!   boundary, an override, Generation supersession, the row fold, the display
+//!   name, the default branch rung, the environment contract as data, Action
+//!   fan-out), never a terminal-shaped one (rendering, the cursor, glyphs, theme,
+//!   keybindings, the Launcher, config file discovery, `$HOME`, a user-specific
+//!   environment variable).
+//! - An empty Selection carries no meaning here: this crate never defaults it to
+//!   "the row under the cursor" or anything else that only makes sense on a screen.
+//! - `refresh` takes an already-ordered `&[EntityKey]`. This crate never computes
+//!   or second-guesses that order; cursor-row-first is the consumer's ordering to
+//!   make, not this crate's to infer.
+//! - A Filter is a pure predicate over these public types. Deciding when to apply
+//!   one, if ever, stays with the consumer.
+//! - It has no notification channel, update stream or callback: a consumer reads a
+//!   [`Snapshot`] when it decides to, it is never pushed one.
 //!
 //! Four refusals hold for every type this crate ever makes public, reasoned in
 //! [ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md):
@@ -31,11 +53,24 @@
 compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
 mod cell;
+mod entity;
 mod fanout;
 mod git;
+mod snapshot;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
+pub use entity::ActionRun;
+pub use entity::AheadBehind;
+pub use entity::DefaultBranch;
+pub use entity::Diagnostics;
+pub use entity::EntityKey;
+pub use entity::EntityState;
+pub use entity::Head;
+pub use entity::Kind;
+pub use entity::Presence;
+pub use entity::WorktreeState;
 pub use git::ProbeError;
+pub use snapshot::{RowSummary, Snapshot, summary};
 
 #[cfg(test)]
 mod tests {

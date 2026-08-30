@@ -129,7 +129,6 @@ pub enum Settled<T> {
 #[derive(Debug, Clone)]
 pub struct Cell<T> {
     settled: Option<Settled<T>>,
-    #[allow(dead_code)] // read only by tests until Core::refresh drives real probes
     in_flight: bool,
     #[allow(dead_code)] // read only by settle's own supersession check for now
     generation: Generation,
@@ -150,6 +149,12 @@ impl<T> Cell<T> {
     /// The only way to a `T`.
     pub fn settled(&self) -> Option<&Settled<T>> {
         self.settled.as_ref()
+    }
+
+    /// Whether a probe is running against this cell right now. A row's summary
+    /// treats in-flight as a property that outranks its least-settled Cell.
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight
     }
 
     /// Marks a probe as started, leaving any previous settled value untouched.
