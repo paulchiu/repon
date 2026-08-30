@@ -42,10 +42,16 @@ pub(crate) struct SubmoduleEntry {
 /// What opening one discovered boundary reveals about its own identity: which of
 /// Repo or Worktree it is, the common dir it shares with every Worktree attached to
 /// the same Repo, and the Submodules its own `.gitmodules` names.
+///
+/// `repo` is the same open handle this function already paid for `gix::open` to
+/// produce, converted to the thread-safe form: `Core::start` caches it so the
+/// entity's own phase A probe derives its per-task handle from this one instead
+/// of opening the repository a second time.
 pub(crate) struct Resolved {
     pub kind: Kind,
     pub common_dir: Arc<Path>,
     pub submodules: Result<Vec<SubmoduleEntry>, ProbeError>,
+    pub repo: gix::ThreadSafeRepository,
 }
 
 /// Opens `path` once and reads everything discovery's second half needs from it:
@@ -66,7 +72,23 @@ pub(crate) fn resolve_boundary(path: &Path) -> Result<Resolved, ProbeError> {
         kind,
         common_dir,
         submodules,
+        repo: repo.into_sync(),
     })
+}
+
+/// Opens `path` as a git repository and hands back the thread-safe form.
+///
+/// `gix::Repository` holds a `RefCell` free-list of buffers, so it is `Send` but
+/// not `Sync`; `gix::ThreadSafeRepository` is `Send`, `Sync` and `Clone`
+/// ([core-api.md](https://github.com/paulchiu/repon/blob/main/docs/spec/core-api.md)'s
+/// "Threads and lifecycle"). Every caller that wants to probe from more than one
+/// task opens through here once and has each task derive its own `Repository` via
+/// [`gix::ThreadSafeRepository::to_thread_local`], never sharing one `Repository`
+/// across tasks.
+pub(crate) fn open_thread_safe(path: &Path) -> Result<gix::ThreadSafeRepository, ProbeError> {
+    gix::open(path)
+        .map(gix::Repository::into_sync)
+        .map_err(|error| ProbeError::Open(error.to_string().into()))
 }
 
 /// Reads `repo`'s own `.gitmodules`, one level deep, or `None` where none exists.
@@ -98,14 +120,17 @@ fn read_gitmodules(repo: &gix::Repository) -> Result<Option<Vec<SubmoduleEntry>>
     Ok(Some(entries))
 }
 
-/// Reads `HEAD` and maps it onto the crate's own three-shape [`Head`], one to one
-/// with gix's `head::Kind`.
+/// Reads `HEAD` from an already-open `repo` and maps it onto the crate's own
+/// three-shape [`Head`], one to one with gix's `head::Kind`.
 ///
 /// This is Phase A, [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
 /// cheapest and least contended read, and the only probe this crate drives today;
-/// the remaining phases are later work.
-pub fn head_shape(repo: &Path) -> Result<Head, ProbeError> {
-    let repo = gix::open(repo).map_err(|error| ProbeError::Open(error.to_string().into()))?;
+/// the remaining phases are later work. `repo` is a per-task handle derived from a
+/// shared [`gix::ThreadSafeRepository`] via `to_thread_local`, never one shared
+/// across tasks, because `gix::Repository` is `Send` but not `Sync`. A `HEAD` that
+/// will not read at all is `Err` here, checked before any shape is classified, so
+/// it can never surface as Detached or Unborn.
+pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
     let head = repo
         .head()
         .map_err(|error| ProbeError::Read(error.to_string().into()))?;
@@ -137,12 +162,21 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// The path-taking shape most tests want: opens `path` fresh through the same
+    /// shared-handle path production uses (`open_thread_safe` then
+    /// `to_thread_local`) rather than calling `gix::open` directly, so a test
+    /// exercises the real seam.
+    fn head_shape_at(path: &Path) -> Result<Head, ProbeError> {
+        let repo = open_thread_safe(path)?;
+        head_shape(&repo.to_thread_local())
+    }
+
     #[test]
     fn a_freshly_initialised_repository_is_unborn() {
         let dir = tempfile::tempdir().expect("temp dir");
         gix::init(dir.path()).expect("init");
 
-        let head = head_shape(dir.path()).expect("read HEAD");
+        let head = head_shape_at(dir.path()).expect("read HEAD");
 
         assert!(matches!(head, Head::Unborn(_)));
     }
@@ -153,7 +187,7 @@ mod tests {
         gix::init(dir.path()).expect("init");
         git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
 
-        let head = head_shape(dir.path()).expect("read HEAD");
+        let head = head_shape_at(dir.path()).expect("read HEAD");
 
         match head {
             Head::Branch(name) => assert!(!name.is_empty()),
@@ -168,7 +202,7 @@ mod tests {
         git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
         git(dir.path(), &["checkout", "--detach", "HEAD"]);
 
-        let head = head_shape(dir.path()).expect("read HEAD");
+        let head = head_shape_at(dir.path()).expect("read HEAD");
 
         assert!(matches!(head, Head::Detached(_)));
     }
@@ -177,7 +211,61 @@ mod tests {
     fn a_directory_that_is_not_a_repo_is_an_error() {
         let dir = tempfile::tempdir().expect("temp dir");
 
-        assert!(matches!(head_shape(dir.path()), Err(ProbeError::Open(_))));
+        assert!(matches!(
+            head_shape_at(dir.path()),
+            Err(ProbeError::Open(_))
+        ));
+    }
+
+    /// A `HEAD` that opens fine but will not parse must fail rather than being
+    /// misread as Detached or Unborn: this is the check the whole crate leans on
+    /// to keep a broken repository off the two settled shapes.
+    #[test]
+    fn a_head_file_that_will_not_parse_is_a_failure_not_a_shape() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+        std::fs::write(
+            dir.path().join(".git").join("HEAD"),
+            "not a ref or an object id\n",
+        )
+        .expect("corrupt HEAD");
+
+        let result = head_shape_at(dir.path());
+
+        assert!(
+            result.is_err(),
+            "a HEAD that will not parse must be an error, got {result:?}"
+        );
+    }
+
+    /// The defining behaviour behind the shared-handle probe path: two
+    /// `Repository` instances derived from the same `ThreadSafeRepository`, on two
+    /// different threads, each read `HEAD` correctly, proving the shared handle is
+    /// never the thing actually touched by a probe, only the source each task's
+    /// own private handle is derived from.
+    #[test]
+    fn two_threads_each_derive_their_own_repository_from_one_shared_handle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+
+        let shared = Arc::new(open_thread_safe(dir.path()).expect("open thread-safe repo"));
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || head_shape(&shared.to_thread_local()))
+            })
+            .collect();
+
+        for reader in readers {
+            let head = reader
+                .join()
+                .expect("reader thread panicked")
+                .expect("read HEAD");
+            assert!(matches!(head, Head::Branch(_)));
+        }
     }
 
     #[test]

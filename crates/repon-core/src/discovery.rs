@@ -89,6 +89,12 @@ pub(crate) struct DiscoveredEntity {
     pub key: EntityKey,
     pub kind: Kind,
     pub common_dir: Arc<Path>,
+    /// The thread-safe handle `git::resolve_boundary` already opened to answer
+    /// `kind` and `common_dir`, kept so the entity's first phase A probe derives
+    /// its own `Repository` from this instead of opening the repository again.
+    /// `None` for a Submodule, which `resolve` names from `.gitmodules` without
+    /// opening it, and for a boundary that would not even open in the first place.
+    pub repo: Option<Arc<gix::ThreadSafeRepository>>,
 }
 
 /// Discovery's second half: resolves every boundary's own Kind (Repo or Worktree)
@@ -113,19 +119,30 @@ pub(crate) fn resolve(
 
     for key in boundaries {
         let path = key.path();
-        let (kind, common_dir, submodules) = match git::resolve_boundary(path) {
-            Ok(resolved) => (resolved.kind, resolved.common_dir, resolved.submodules),
+        let (kind, common_dir, submodules, repo) = match git::resolve_boundary(path) {
+            Ok(resolved) => (
+                resolved.kind,
+                resolved.common_dir,
+                resolved.submodules,
+                Some(Arc::new(resolved.repo)),
+            ),
             // A boundary the walk just found that will not even open is treated as
             // an ordinary Repo with no Submodules rather than dropped: an opaque
             // git-open failure surfaces later, on the branch probe that already
             // reports it, not by discovery silently shrinking its own result.
-            Err(_) => (Kind::Repo, Arc::from(path.join(".git")), Ok(Vec::new())),
+            Err(_) => (
+                Kind::Repo,
+                Arc::from(path.join(".git")),
+                Ok(Vec::new()),
+                None,
+            ),
         };
 
         entities.push(DiscoveredEntity {
             key: key.clone(),
             kind,
             common_dir: Arc::clone(&common_dir),
+            repo,
         });
 
         match submodules {
@@ -147,6 +164,7 @@ pub(crate) fn resolve(
                         key: EntityKey::new(Arc::from(submodule_path.as_path())),
                         kind: Kind::Submodule,
                         common_dir: Arc::from(submodule_common_dir),
+                        repo: None,
                     });
                 }
             }
@@ -653,6 +671,58 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    /// `resolve` opens each boundary once and hands the resulting thread-safe
+    /// handle back rather than discarding it, so a later phase A probe can derive
+    /// its own `Repository` from it instead of opening the repository again.
+    #[test]
+    fn resolve_hands_back_the_thread_safe_handle_it_already_opened() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let repo = root_dir.join("repo");
+        init_repo(&repo);
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+        let (entities, _) = resolve(&set, &discovery.entities);
+
+        let entity = entities
+            .iter()
+            .find(|entity| entity.key.path() == repo)
+            .expect("repo entity present");
+        let repo_handle = entity
+            .repo
+            .as_ref()
+            .expect("resolve should hand back the handle it opened");
+        // Proof it is a working handle, not a placeholder: deriving a `Repository`
+        // from it and opening it once more independently agree on the same HEAD.
+        assert_eq!(
+            repo_handle.to_thread_local().head_id().ok(),
+            gix::open(&repo).unwrap().head_id().ok()
+        );
+    }
+
+    /// A Submodule is named from `.gitmodules` without discovery ever opening it,
+    /// so it carries no cached handle for a later probe to reuse.
+    #[test]
+    fn a_submodule_carries_no_cached_repository_handle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        write_gitmodules(&outer, "lib", "vendor/lib");
+        fs::create_dir_all(outer.join("vendor").join("lib")).expect("create submodule dir");
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+        let (entities, _) = resolve(&set, &discovery.entities);
+
+        let submodule = entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("submodule entity present");
+        assert!(submodule.repo.is_none());
     }
 
     /// The defining behaviour: a Submodule is found by reading its parent's

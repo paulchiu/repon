@@ -80,6 +80,12 @@ struct Table {
     /// When each still-live Generation's dispatch started, for the deadline sweep.
     /// Pruned once nothing is left in flight for a Generation.
     generation_started_at: HashMap<u64, Instant>,
+    /// Each entity's thread-safe repository handle, opened once by discovery.
+    /// A probe task clones the `Arc` (cheap, a refcount bump) and derives its own
+    /// `Repository` from it via `to_thread_local`, so no task ever shares a
+    /// `Repository` with another one; a missing entry (a Submodule, or a boundary
+    /// that would not open) falls back to opening fresh at probe time.
+    repos: HashMap<EntityKey, Arc<gix::ThreadSafeRepository>>,
 }
 
 /// A message the dedicated thread's control channel carries; distinct from a tick.
@@ -161,14 +167,18 @@ impl Core {
             let (lock, _cvar) = &*self.settle_gate;
             *lock.lock().unwrap() += dispatched.len();
         }
+        let repos: Vec<Option<Arc<gix::ThreadSafeRepository>>> = dispatched
+            .iter()
+            .map(|(key, _)| table.repos.get(key).cloned())
+            .collect();
         drop(table);
 
-        for (key, cancel) in dispatched {
+        for ((key, cancel), repo) in dispatched.into_iter().zip(repos) {
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
             let settle_gate = Arc::clone(&self.settle_gate);
             rayon::spawn(move || {
-                let outcome = probe_branch(&path, &cancel);
+                let outcome = probe_branch(&path, repo.as_deref(), &cancel);
                 let mut table = table_handle.write().unwrap();
                 if let Some(settled) = outcome
                     && let Some(&idx) = table.index.get(&key)
@@ -190,7 +200,11 @@ impl Core {
     /// caller can otherwise only reach this with a key `snapshot` just handed it.
     pub fn probe_now(&self, key: &EntityKey) -> EntityState {
         let never_cancelled = AtomicBool::new(false);
-        let outcome = probe_branch(key.path(), &never_cancelled);
+        let cached_repo = {
+            let table = self.table.read().unwrap();
+            table.repos.get(key).cloned()
+        };
+        let outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
 
         let mut table = self.table.write().unwrap();
         let generation = Generation::new(table.generation);
@@ -291,6 +305,17 @@ pub(crate) struct StartForTest {
 
 #[cfg(test)]
 impl Core {
+    /// The cached thread-safe repository handle discovery left for `key`, if any,
+    /// so a test can prove the cache was actually populated and, by comparing
+    /// `Arc::ptr_eq` across two reads, that a probe reused it rather than
+    /// replacing it with a freshly opened one.
+    pub(crate) fn cached_repo_handle_for_test(
+        &self,
+        key: &EntityKey,
+    ) -> Option<Arc<gix::ThreadSafeRepository>> {
+        self.table.read().unwrap().repos.get(key).cloned()
+    }
+
     /// `start`, with the tick source and the discovery-slow warning's threshold
     /// injected rather than real, so a test drives the dedicated thread's cadence
     /// through a channel it controls and never waits out a real second.
@@ -372,8 +397,12 @@ fn start_internal(
 
     let mut entities = Vec::with_capacity(discovered.len());
     let mut index = HashMap::with_capacity(discovered.len());
+    let mut repos = HashMap::new();
     for discovered in discovered {
         let name = display_name(discovered.key.path());
+        if let Some(repo) = discovered.repo {
+            repos.insert(discovered.key.clone(), repo);
+        }
         index.insert(discovered.key.clone(), entities.len());
         entities.push(EntityState::new(
             discovered.key,
@@ -395,6 +424,7 @@ fn start_internal(
         index,
         in_flight: HashMap::new(),
         generation_started_at: HashMap::new(),
+        repos,
     }));
 
     let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -538,11 +568,32 @@ fn complete_many(settle_gate: &(Mutex<usize>, Condvar), finished: usize) {
 /// no interruption point to check `cancel` against mid-read, unlike the later
 /// phases [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)
 /// describes gix taking it through directly.
-fn probe_branch(path: &Path, cancel: &AtomicBool) -> Option<Settled<Head>> {
+///
+/// `repo` is the entity's cached thread-safe handle when discovery already opened
+/// one; this task derives its own `Repository` from it via `to_thread_local`
+/// rather than sharing that derived handle with any other task. `None` (a
+/// Submodule, or a boundary discovery could not open) falls back to opening fresh,
+/// which is where an unreadable repository's `ProbeError::Open` still surfaces.
+fn probe_branch(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    cancel: &AtomicBool,
+) -> Option<Settled<Head>> {
     if cancel.load(Ordering::Acquire) {
         return None;
     }
-    Some(match git::head_shape(path) {
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(Settled::Failed(error)),
+        },
+    };
+    Some(match git::head_shape(&repo.to_thread_local()) {
         Ok(head) => Settled::Known {
             value: head,
             at: Timestamp::now(),
@@ -555,6 +606,11 @@ fn probe_branch(path: &Path, cancel: &AtomicBool) -> Option<Settled<Head>> {
 /// A basename read from the entity's own resolved path. A real display name has
 /// collision handling that belongs to [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md);
 /// this is a placeholder good enough to populate the table.
+///
+/// This is the one function that computes it: `start_internal`'s discovery loop
+/// and `probe_now`'s fallback insert for an unknown key both call it rather than
+/// formatting a name of their own, which is what keeps the name shown on screen
+/// and the name a future state file would key by byte-identical.
 fn display_name(path: &Path) -> Arc<str> {
     Arc::from(
         path.file_name()
@@ -686,6 +742,62 @@ mod tests {
         }
     }
 
+    /// The defining behaviour for the shared-handle probe path: discovery leaves
+    /// one thread-safe handle per entity, and a `refresh` reuses that same `Arc`
+    /// rather than opening the repository again, proven by pointer identity
+    /// surviving a probe rather than by inference from timing.
+    #[test]
+    fn refresh_reuses_the_cached_repository_handle_rather_than_reopening_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let before = core
+            .cached_repo_handle_for_test(&key)
+            .expect("discovery should have cached a handle");
+
+        core.refresh(std::slice::from_ref(&key));
+        core.settle(Duration::from_millis(500));
+
+        let after = core
+            .cached_repo_handle_for_test(&key)
+            .expect("the cached handle should still be there after a refresh");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a refresh must reuse the cached handle, not replace it with a new one"
+        );
+    }
+
+    /// A key with no cached handle, either because it was never discovered or
+    /// because discovery could not open it, still gets a real answer: the probe
+    /// falls back to opening the repository itself rather than failing outright.
+    #[test]
+    fn probing_a_key_with_no_cached_handle_still_opens_the_repository_itself() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        // A core discovering an unrelated, empty root, so `repo` is never cached.
+        let empty_root = root_of(&tempfile::tempdir().expect("temp dir"));
+        let core = Core::start(spec(vec![empty_root]));
+        let key = EntityKey::new(Arc::from(repo.as_path()));
+        assert!(core.cached_repo_handle_for_test(&key).is_none());
+
+        let entity = core.probe_now(&key);
+
+        assert!(matches!(
+            entity.branch.settled(),
+            Some(Settled::Known {
+                value: Head::Branch(_),
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn an_empty_order_dispatches_nothing_and_settle_returns_immediately() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -720,6 +832,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The one-function guarantee: whether an entity's name is set by discovery at
+    /// `Core::start` or by `probe_now`'s fallback insert for a key the table did
+    /// not already know, both routes must produce the same string for the same
+    /// path, since a future state file keys the Selection by this name and a
+    /// second formatting of it would silently break restoring by name.
+    #[test]
+    fn the_display_name_agrees_between_discovery_and_probe_nows_fallback_insert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("named-repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let discovered = core.snapshot().entities[0].clone();
+        assert_eq!(&*discovered.name, "named-repo");
+
+        core.dismiss(&discovered.key);
+        assert!(core.snapshot().entities.is_empty());
+
+        let reinserted = core.probe_now(&discovered.key);
+
+        assert_eq!(
+            reinserted.name, discovered.name,
+            "the name discovery assigned and the name probe_now's fallback insert \
+             assigns for the same path must be byte-identical"
+        );
     }
 
     #[test]
@@ -1039,6 +1179,233 @@ mod tests {
         assert_eq!(
             ran, 3,
             "expected cancellation to stop the loop after its third step"
+        );
+    }
+
+    /// Phase A's own per-entity timing distribution: opens (or reuses a cached
+    /// handle for) every entity in `population` and reads `HEAD` from it, exactly
+    /// the work `probe_branch` does, one rayon task per entity via `fanout::scatter`
+    /// rather than `Core::refresh`, so the timing is not entangled with the
+    /// settle-gate bookkeeping a full `Core` also pays for. Returns one
+    /// [`Duration`] per entity actually probed, so a caller reports a real
+    /// distribution rather than a total divided by a count.
+    fn benchmark_identity_phase(
+        population: Vec<crate::discovery::DiscoveredEntity>,
+    ) -> (Duration, Vec<Duration>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let started = Instant::now();
+        crate::fanout::scatter(population, tx, |entity| {
+            let task_started = Instant::now();
+            let repo = match &entity.repo {
+                Some(repo) => repo.to_thread_local(),
+                None => match git::open_thread_safe(entity.key.path()) {
+                    Ok(repo) => repo.to_thread_local(),
+                    Err(_) => return None,
+                },
+            };
+            let _ = git::head_shape(&repo);
+            Some(task_started.elapsed())
+        });
+        let wall = started.elapsed();
+        let durations: Vec<Duration> = rx.into_iter().flatten().collect();
+        (wall, durations)
+    }
+
+    /// Every root this machine actually has of the two the owner's real corpus
+    /// lives under. Read from `$HOME` at run time rather than a literal in this
+    /// file, so no personal path is ever recorded in committed source.
+    fn real_corpus_roots() -> Vec<PathBuf> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let home = PathBuf::from(home);
+        ["dev", "dev-misc"]
+            .into_iter()
+            .map(|leaf| home.join(leaf))
+            .filter(|root| root.is_dir())
+            .collect()
+    }
+
+    /// A `.git`-committed disposable repository per index, standing in for the
+    /// real corpus when it is absent or too small to be meaningful. Each one gets
+    /// a distinct commit so opening it is not a single cached filesystem page for
+    /// every entity.
+    fn generated_fixture_corpus(size: usize) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("temp dir for generated fixture corpus");
+        for i in 0..size {
+            let repo = root.path().join(format!("fixture-repo-{i}"));
+            fs::create_dir_all(&repo).expect("create fixture repo dir");
+            gix::init(&repo).expect("init fixture repo");
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(["commit", "--allow-empty", "-m", &format!("commit {i}")])
+                .status()
+                .expect("run git commit");
+            assert!(status.success());
+        }
+        root
+    }
+
+    /// Percentile `p` (0 to 100) of an already-sorted, non-empty slice.
+    fn percentile(sorted: &[Duration], p: usize) -> Duration {
+        let index = (sorted.len() - 1) * p / 100;
+        sorted[index]
+    }
+
+    /// Path-component names to keep out of the benchmark's population entirely,
+    /// read from an environment variable rather than a literal in this file: a
+    /// standing project rule keeps certain names out of committed source, so a
+    /// real run supplies them at invocation time
+    /// (`REPON_BENCHMARK_EXCLUDE_NAMES=name-one,name-two`) instead of this file
+    /// ever spelling one out. Empty, and therefore excluding nothing, when unset.
+    fn extra_excluded_names() -> Vec<String> {
+        parse_excluded_names(&std::env::var("REPON_BENCHMARK_EXCLUDE_NAMES").unwrap_or_default())
+    }
+
+    /// The comma-separated parsing `extra_excluded_names` applies to whatever the
+    /// environment variable holds, split out so it can be proven against a literal
+    /// string rather than by mutating process environment state a parallel test
+    /// run could race on.
+    fn parse_excluded_names(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Discovers, resolves and excluded-name-filters one root list into a
+    /// population, without opening anything `excluded_names` names at any depth.
+    /// Returns the wall time of discovery and resolution alongside the
+    /// population, since resolution is where every entity's repository is
+    /// actually opened the first time ([`git::resolve_boundary`]); the identity
+    /// phase timed afterwards only re-reads `HEAD` from the handle that step
+    /// already cached.
+    fn discover_population(
+        roots: Vec<PathBuf>,
+        excluded_names: &[String],
+    ) -> (Vec<crate::discovery::DiscoveredEntity>, Duration) {
+        let set = SetSpec {
+            name: "identity-probe-benchmark".to_string(),
+            roots,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let started = Instant::now();
+        let discovery = discovery::discover(&set);
+        let (discovered, _) = discovery::resolve(&set, &discovery.entities);
+        let elapsed = started.elapsed();
+        let population = discovered
+            .into_iter()
+            .filter(|entity| {
+                !entity.key.path().components().any(|component| {
+                    excluded_names
+                        .iter()
+                        .any(|name| component.as_os_str() == name.as_str())
+                })
+            })
+            .collect();
+        (population, elapsed)
+    }
+
+    /// The exclusion mechanism proven against a fixture: a name present nowhere
+    /// but this test's own excluded-names list still keeps a matching boundary
+    /// out of the discovered population, and its two siblings still get through.
+    #[test]
+    fn a_boundary_whose_path_matches_an_excluded_name_is_left_out_of_the_population() {
+        let fixture = generated_fixture_corpus(3);
+        let excluded = vec!["fixture-repo-1".to_string()];
+
+        let (population, _) = discover_population(vec![fixture.path().to_path_buf()], &excluded);
+
+        assert_eq!(population.len(), 2);
+        assert!(
+            population
+                .iter()
+                .all(|entity| entity.key.path().file_name().unwrap() != "fixture-repo-1"),
+            "the excluded name must never appear in the population discovery returns"
+        );
+    }
+
+    #[test]
+    fn excluded_names_parses_a_comma_separated_list_and_ignores_blanks() {
+        assert_eq!(
+            parse_excluded_names("foo, bar ,,baz"),
+            vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
+        );
+        assert!(parse_excluded_names("").is_empty());
+        assert!(parse_excluded_names("   ").is_empty());
+    }
+
+    /// Benchmarks the identity probe (phase A: open the repository, read `HEAD`)
+    /// against the owner's real corpus under `$HOME/dev` and `$HOME/dev-misc`,
+    /// falling back to a generated fixture when the real corpus is absent or too
+    /// small to be meaningful (fewer than 20 entities). Never run by `just ci`:
+    /// this is a hand-run measurement, per this project's convention of recording
+    /// hand-run figures with the date, machine and toolchain rather than asserting
+    /// a timing budget in a committed test. Run it with:
+    /// `cargo test -p repon-core --release -- --ignored --nocapture identity_probe_benchmark`
+    ///
+    /// Read-only throughout: discovery only stats for a `.git` entry and phase A
+    /// only reads `HEAD`. Any boundary whose path has a component named by
+    /// `REPON_BENCHMARK_EXCLUDE_NAMES` is dropped before discovery's second half
+    /// would ever open it, which is how a standing exclusion is honoured without
+    /// this file naming what it excludes.
+    #[test]
+    #[ignore = "hand-run against the owner's real corpus; see docs/spec/refresh.md for the recorded figures"]
+    fn identity_probe_benchmark() {
+        let excluded_names = extra_excluded_names();
+
+        // `_fixture` is held for the rest of the test whenever a fixture is used,
+        // so its directories still exist when the identity phase opens them; it is
+        // simply never populated on the real-corpus path.
+        let mut _fixture: Option<tempfile::TempDir> = None;
+
+        let (real_population, real_discovery_wall) =
+            discover_population(real_corpus_roots(), &excluded_names);
+        let (population, using_fixture, discovery_wall) = if real_population.len() >= 20 {
+            (real_population, false, real_discovery_wall)
+        } else {
+            println!(
+                "real corpus absent or too small to be meaningful ({} entities); \
+                 using a generated fixture instead",
+                real_population.len()
+            );
+            let fixture = generated_fixture_corpus(300);
+            let (population, fixture_discovery_wall) =
+                discover_population(vec![fixture.path().to_path_buf()], &excluded_names);
+            _fixture = Some(fixture);
+            (population, true, fixture_discovery_wall)
+        };
+
+        let population_size = population.len();
+        assert!(
+            population_size > 0,
+            "neither a real corpus root nor the generated fixture produced any entities"
+        );
+
+        let (wall, mut durations) = benchmark_identity_phase(population);
+        durations.sort();
+
+        println!(
+            "identity probe benchmark: corpus = {}, population = {population_size}",
+            if using_fixture {
+                "generated fixture"
+            } else {
+                "real corpus"
+            }
+        );
+        println!(
+            "discovery + first open (serial, every entity's own gix::open): {discovery_wall:?}"
+        );
+        println!("identity phase, warm, parallel (HEAD re-read from the cached handle): {wall:?}");
+        println!(
+            "identity phase per entity: p50 {:?}, p90 {:?}, max {:?}",
+            percentile(&durations, 50),
+            percentile(&durations, 90),
+            durations.last().copied().unwrap_or_default(),
         );
     }
 }
