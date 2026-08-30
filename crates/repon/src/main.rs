@@ -18,8 +18,10 @@ mod help;
 mod keys;
 mod logging;
 mod message;
+mod selection;
 mod theme;
 mod tui;
+mod unwind;
 
 fn main() -> color_eyre::Result<()> {
     let args = Cli::parse();
