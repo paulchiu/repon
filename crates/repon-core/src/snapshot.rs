@@ -8,7 +8,7 @@
 //! against a 16.7 millisecond frame.
 
 use crate::cell::{Cell, Generation, Settled, Timestamp};
-use crate::entity::EntityState;
+use crate::entity::{ActionRun, Diagnostics, EntityState};
 
 /// The one state a row's Cells fold into, for the gutter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,11 @@ enum Settledness {
 trait FoldableCell {
     fn is_in_flight(&self) -> bool;
     fn settledness(&self) -> Option<Settledness>;
+    /// Whether this Cell has ever settled to a genuine value: `Known`, `Unknown`
+    /// or `Failed`. Never-probed and `NotApplicable` both read `false`, since
+    /// neither is a value the row's first-probe spinner rule should treat as
+    /// already shown.
+    fn holds_a_value(&self) -> bool;
 }
 
 impl<T> FoldableCell for Cell<T> {
@@ -56,35 +61,72 @@ impl<T> FoldableCell for Cell<T> {
             None => Some(Settledness::Unknown),
         }
     }
+
+    fn holds_a_value(&self) -> bool {
+        matches!(
+            self.settled(),
+            Some(Settled::Known { .. }) | Some(Settled::Unknown(_)) | Some(Settled::Failed(_))
+        )
+    }
 }
 
 /// Folds one Entity's Cells into the state its row's gutter shows.
 ///
-/// In-flight is a row property that outranks the least-settled summary; a
-/// `NotApplicable` Cell is excluded from the fold entirely, which is what lets a
-/// Repo row (Worktree state Not applicable by kind) or a Submodule row (`state`
-/// and `base` both Not applicable) read Fresh on cells that simply do not apply.
-/// Otherwise the row shows its least settled Cell, widened by two entity-level
-/// derivations that are not Cells at all: an unparseable `.gitmodules` and a
-/// failed last Action both drive the row to `Failed` even when every Cell reads
-/// fine. The default branch's rung and its disagreement stay out, being metadata
-/// about how a value was obtained rather than a value that can itself fail.
+/// In-flight outranks the least-settled summary only while the row holds no
+/// values at all, its first probe; once any Cell has settled to something, the
+/// gutter falls back to the row's least-settled settled state instead and the
+/// spinner moves into whichever Cells are still outstanding
+/// (`docs/spec/refresh.md`'s "What the gutter and the cells show", amended by
+/// ADR 0013). A `NotApplicable` Cell counts as holding no value either, and is
+/// excluded from the fold entirely, which is what lets a Repo row (Worktree
+/// state Not applicable by kind) or a Submodule row (`state` and `base` both Not
+/// applicable) read Fresh, or still show the first-probe spinner, on cells that
+/// simply do not apply. Otherwise the row shows its least settled Cell, widened
+/// by two entity-level derivations that are not Cells at all: an unparseable
+/// `.gitmodules` and a failed last Action both drive the row to `Failed` even
+/// when every Cell reads fine. The default branch's rung and its disagreement
+/// stay out, being metadata about how a value was obtained rather than a value
+/// that can itself fail.
 pub fn summary(entity: &EntityState) -> RowSummary {
-    let cells: [&dyn FoldableCell; 6] = [
-        &entity.branch,
-        &entity.sync,
-        &entity.base,
-        &entity.dirty,
-        &entity.state,
-        &entity.default_branch,
-    ];
+    // Exhaustive: a Cell or derivation source added to EntityState or Diagnostics
+    // later must be named here or the pattern fails to compile, so it cannot be
+    // silently left out of the fold below.
+    let EntityState {
+        key: _,
+        name: _,
+        common_dir: _,
+        kind: _,
+        branch,
+        sync,
+        base,
+        dirty,
+        state,
+        default_branch,
+        diagnostics,
+        last_action,
+        presence: _,
+        excluded: _,
+    } = entity;
+    let Diagnostics {
+        default_branch_rung: _,
+        default_branch_rung_disagreement: _,
+        default_branch_rung_two_stale: _,
+        default_branch_stopped: _,
+        gitmodules_failed,
+    } = diagnostics;
 
-    if cells.iter().any(|cell| cell.is_in_flight()) {
+    let cells: [&dyn FoldableCell; 6] = [branch, sync, base, dirty, state, default_branch];
+
+    let holds_no_values = cells.iter().all(|cell| !cell.holds_a_value());
+    if holds_no_values && cells.iter().any(|cell| cell.is_in_flight()) {
         return RowSummary::InFlight;
     }
 
-    let derivation_failed = entity.diagnostics.gitmodules_failed.is_some()
-        || entity.last_action.as_ref().is_some_and(|run| run.failed);
+    let derivation_failed = gitmodules_failed.is_some()
+        || last_action.as_ref().is_some_and(|run| {
+            let ActionRun { failed } = run;
+            *failed
+        });
 
     let worst = cells
         .iter()
@@ -259,12 +301,54 @@ mod tests {
     }
 
     #[test]
-    fn an_in_flight_cell_outranks_a_failed_one() {
+    fn once_a_row_holds_values_a_failed_cell_outranks_an_in_flight_one() {
         let mut entity = fresh_entity("repo");
         entity.dirty.settle(
             Generation::new(2),
             Settled::Failed(crate::git::ProbeError::Read(Arc::from("boom"))),
         );
+        entity.branch.begin_probe();
+
+        assert_eq!(summary(&entity), RowSummary::Failed);
+    }
+
+    #[test]
+    fn a_freshly_discovered_row_shows_in_flight_while_it_holds_no_values_at_all() {
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("repo"))),
+            Arc::from("repo"),
+            Arc::from(Path::new("repo")),
+            Kind::Repo,
+        );
+
+        entity.branch.begin_probe();
+
+        assert_eq!(summary(&entity), RowSummary::InFlight);
+    }
+
+    #[test]
+    fn a_submodule_whose_only_settled_cells_are_not_applicable_still_shows_in_flight_on_its_first_probe()
+     {
+        // A Submodule is constructed with `state` and `base` already
+        // Not-applicable (see `EntityState::new`). Not-applicable is excluded from
+        // the fold entirely, so it must not count as the row already holding a
+        // value either, or this row would jump straight to Unknown instead of
+        // showing the first-probe spinner.
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("/repo/vendor/lib"))),
+            Arc::from("lib"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Submodule,
+        );
+        assert!(matches!(
+            entity.state.settled(),
+            Some(Settled::NotApplicable)
+        ));
+        assert!(matches!(
+            entity.base.settled(),
+            Some(Settled::NotApplicable)
+        ));
+
         entity.branch.begin_probe();
 
         assert_eq!(summary(&entity), RowSummary::InFlight);
@@ -290,6 +374,79 @@ mod tests {
         );
 
         assert_eq!(summary(&entity), RowSummary::Unknown);
+    }
+
+    /// Every unordered pair of settledness cases, applied to two different Cells
+    /// on one otherwise-fresh entity, so the fold sees both at once. No other test
+    /// puts, say, an Unknown cell and a Failed cell on the same row, so an
+    /// accidental reorder of `Settledness`'s declaration (its `Ord` is derived
+    /// from that order) would still pass every test that only ever compares one
+    /// settledness against a Fresh baseline.
+    #[test]
+    fn every_pair_of_cell_settlednesses_folds_to_the_worse_of_the_two() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            Fresh,
+            Stale,
+            Unknown,
+            Failed,
+        }
+
+        fn settle(cell: &mut Cell<u32>, generation: Generation, case: Case) {
+            let settled = match case {
+                Case::Fresh => Settled::Known {
+                    value: 0,
+                    at: Timestamp::now(),
+                    stale: false,
+                },
+                Case::Stale => Settled::Known {
+                    value: 0,
+                    at: Timestamp::now(),
+                    stale: true,
+                },
+                Case::Unknown => Settled::Unknown(crate::cell::Unknown::TimedOut),
+                Case::Failed => Settled::Failed(crate::git::ProbeError::Read(Arc::from("boom"))),
+            };
+            cell.settle(generation, settled);
+        }
+
+        fn rank(summary: RowSummary) -> u8 {
+            match summary {
+                RowSummary::Fresh => 0,
+                RowSummary::Stale => 1,
+                RowSummary::Unknown => 2,
+                RowSummary::Failed => 3,
+                RowSummary::InFlight => 4,
+            }
+        }
+
+        let cases = [
+            ("fresh", Case::Fresh, RowSummary::Fresh),
+            ("stale", Case::Stale, RowSummary::Stale),
+            ("unknown", Case::Unknown, RowSummary::Unknown),
+            ("failed", Case::Failed, RowSummary::Failed),
+        ];
+        let generation = Generation::new(2);
+
+        for &(label_a, case_a, rank_a) in &cases {
+            for &(label_b, case_b, rank_b) in &cases {
+                let mut entity = fresh_entity("repo");
+                settle(&mut entity.dirty, generation, case_a);
+                settle(&mut entity.base, generation, case_b);
+
+                let expected = if rank(rank_a) >= rank(rank_b) {
+                    rank_a
+                } else {
+                    rank_b
+                };
+
+                assert_eq!(
+                    summary(&entity),
+                    expected,
+                    "case: dirty={label_a}, base={label_b}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -456,7 +613,7 @@ mod tests {
                 RowSummary::Failed,
             ),
             (
-                "one cell in flight outranks another cell that failed",
+                "a failed cell outranks an in-flight one once the row already holds values",
                 |entity, generation| {
                     entity.dirty.settle(
                         generation,
@@ -464,7 +621,7 @@ mod tests {
                     );
                     entity.branch.begin_probe();
                 },
-                RowSummary::InFlight,
+                RowSummary::Failed,
             ),
             (
                 "a Not-applicable cell would have been the worst cell had it been \

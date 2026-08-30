@@ -268,12 +268,10 @@ fn draw_row(
 }
 
 /// Maps one row's [`RowSummary`](repon_core::RowSummary) fold to the active table's gutter
-/// glyph. The mapping the fold to a character is exactly the consumer-side job
+/// glyph, the consumer-side job
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) reserves for
-/// here rather than the core; a plain function over the enum keeps that mapping testable
-/// without needing a Cell in any particular state to reach it. In-flight always shows the
-/// loading table's first frame; animating the spinner is [refresh.md]'s progressive-fill
-/// concern, not this ticket's.
+/// here rather than the core. In-flight always shows the loading table's first frame;
+/// animating the spinner is [refresh.md]'s progressive-fill concern, not this one's.
 fn gutter_glyph_for(row_summary: repon_core::RowSummary, glyphs: &'static GlyphSet) -> char {
     use repon_core::RowSummary;
     match row_summary {
@@ -290,15 +288,12 @@ fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
     gutter_glyph_for(summary(entity), glyphs)
 }
 
-/// The one function every column widget renders a cell's text through, per
+/// The one function every column widget renders a cell's text through: a Known value renders
+/// through `format`, every other shape renders the blank cell
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The mapping
-/// is exactly" table: a Known value renders through `format`, every other shape (Unknown,
-/// Failed, NotApplicable, or nothing settled yet) renders the blank cell the provenance
-/// contract commits to. The match is exhaustive over `Option<&Settled<T>>` with no wildcard
-/// arm, so a state added to `Settled` later fails to compile here rather than silently
-/// falling through a catch-all into a raw value or a raw default. Takes the cell's already-
-/// read `Settled` rather than the `Cell` itself: whether a probe is in flight never changes
-/// this text, only the row's gutter, which [`gutter_glyph_for`] computes separately.
+/// is exactly" table commits to. Exhaustive over `Option<&Settled<T>>` with no wildcard arm,
+/// so a state added to `Settled` later fails to compile here instead of silently falling
+/// through into a raw value or a raw default.
 fn render_cell<T>(settled: Option<&Settled<T>>, format: impl FnOnce(&T) -> String) -> String {
     match settled {
         Some(Settled::Known { value, .. }) => format(value),
@@ -641,6 +636,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gutter_glyph_for_maps_every_row_summary_to_the_ascii_sets_own_glyph() {
+        // `full` and `ascii` share identical characters for every gutter meaning
+        // except the spinner, so a test against `full` alone cannot tell a
+        // correctly threaded glyph set apart from four hardcoded literals; the
+        // spinner assertion below is what a hardcode would actually fail.
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+
+        assert_eq!(gutter_glyph_for(RowSummary::Fresh, glyphs), glyphs.fresh);
+        assert_eq!(gutter_glyph_for(RowSummary::Stale, glyphs), glyphs.stale);
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Unknown, glyphs),
+            glyphs.unknown
+        );
+        assert_eq!(gutter_glyph_for(RowSummary::Failed, glyphs), glyphs.failed);
+        assert_eq!(
+            gutter_glyph_for(RowSummary::InFlight, glyphs),
+            glyphs.loading[0],
+            "the ascii set's own three-frame spinner, distinct from the full set's ten-frame \
+             one"
+        );
+    }
+
     /// The file's own production source, up to its test module: reused by every scan test
     /// below so each states one absence claim rather than re-reading the file.
     fn production_source() -> &'static str {
@@ -675,7 +693,11 @@ mod tests {
     /// ticket forbids; this counts the file's own occurrences rather than trusting review.
     #[test]
     fn every_column_formatter_reaches_settled_known_only_through_render_cell() {
-        let occurrences = production_source().matches("Settled::Known").count();
+        let occurrences: usize = production_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches("Settled::Known").count())
+            .sum();
 
         assert_eq!(
             occurrences, 1,

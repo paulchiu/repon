@@ -249,14 +249,11 @@ mod tests {
         );
     }
 
-    /// [`RowSummary`](crate::RowSummary) is an enum of English variant names, and
-    /// mapping it to a gutter glyph is `docs/spec/core-api.md`'s explicit
-    /// consumer-side job, never this crate's. Scans every source file under `src`
-    /// for the two shapes that mapping would take here: a function returning a
-    /// bare `char`, or a match arm whose right-hand side is a character literal.
-    /// Comment lines are skipped, the same rule the interrupt-static check above
-    /// uses, and the two needles are built from two pieces so this check's own
-    /// source line is never a match for what it scans for.
+    /// [`RowSummary`](crate::RowSummary)'s mapping to a gutter glyph is
+    /// `docs/spec/core-api.md`'s explicit consumer-side job, never this crate's.
+    /// Scans every source file under `src` for the two shapes that mapping would
+    /// take here: a function returning a bare `char`, or a match arm whose
+    /// right-hand side is a character literal.
     #[test]
     fn no_state_is_mapped_to_a_character_anywhere_in_this_crate() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

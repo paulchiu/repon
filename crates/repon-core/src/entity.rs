@@ -109,11 +109,13 @@ pub enum DefaultBranchStopped {
 }
 
 /// Per-Entity facts that are not Cells: which rung of the default branch
-/// resolution chain answered, whether rung 2 and rung 3 disagreed, and why
-/// resolution stopped when it did not settle.
+/// resolution chain answered, whether rung 2 and rung 3 disagreed, why
+/// resolution stopped when it did not settle, and whether `.gitmodules` failed to
+/// read or parse.
 ///
-/// These reach the detail pane and stay out of the row summary fold, because they
-/// describe how a value was obtained rather than a value that can itself fail.
+/// Every field but `gitmodules_failed` reaches the detail pane and stays out of
+/// the row summary fold, describing how a value was obtained rather than a value
+/// that can itself fail; `gitmodules_failed` is the one exception the fold reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diagnostics {
     /// The rung (1 to 4) that resolved the default branch, once resolution has run.
@@ -132,11 +134,12 @@ pub struct Diagnostics {
     pub gitmodules_failed: Option<Arc<str>>,
 }
 
-/// The most recent Action run against this Entity.
+/// The most recent Action run against this Entity, read by the row summary fold.
 ///
-/// Mostly opaque for now: the full receipt's shape (per-step output, labels,
-/// timing) is a later design's concern. `failed` exists because the row summary
-/// fold reads it, on the same terms as a `.gitmodules` that will not parse.
+/// Deliberately narrower than the full receipt `docs/spec/actions.md` already
+/// specifies under the name `ActionReceipt` (`label`, `steps`, `not_applicable`,
+/// `finished_at`); `failed` is the one field the fold needs, and unlike
+/// `Diagnostics::gitmodules_failed`, nothing outside a test writes it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionRun {
     pub failed: bool,
