@@ -579,24 +579,21 @@ mod tests {
     /// precedent in `repon-core` solves with string concatenation instead, which does not
     /// scale to a list of a dozen banned words here.
     ///
-    /// Assumes the `#[cfg(test)]` line found is the one that starts the file's trailing
-    /// tests module, so nothing production follows it; enforced below rather than assumed.
+    /// Cuts at the trailing tests module rather than at the first `#[cfg(test)]`, since a
+    /// file may gate a single item on it too. A file without that module is scanned whole:
+    /// both fallbacks can only over-report, never let a real violation through.
     fn production_source(path: &Path) -> String {
         let source = std::fs::read_to_string(path).expect("read a crate source file");
-        let cfg_test_lines = source
-            .lines()
-            .filter(|line| line.trim() == "#[cfg(test)]")
-            .count();
-        assert!(
-            cfg_test_lines <= 1,
-            "{}: production_source assumes at most one `#[cfg(test)]` line, the one that \
-             starts the trailing tests module; found {cfg_test_lines}, so a real production \
-             item ahead of the tests module may have been silently dropped from the scan",
-            path.display()
-        );
+        let lines: Vec<&str> = source.lines().collect();
+        let tests_module = lines.iter().enumerate().position(|(index, line)| {
+            line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+        });
         let mut production = String::new();
-        for line in source.lines() {
-            if line.trim() == "#[cfg(test)]" {
+        for (index, line) in lines.iter().enumerate() {
+            if Some(index) == tests_module {
                 break;
             }
             production.push_str(line);
@@ -605,20 +602,40 @@ mod tests {
         production
     }
 
-    /// A file with two `#[cfg(test)]`-gated items violates `production_source`'s one-cut-point
-    /// assumption; it must panic rather than silently scan only up to the first one.
+    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
+    /// there, or every real production line after it goes unscanned.
     #[test]
-    #[should_panic(expected = "production_source assumes at most one")]
-    fn production_source_panics_on_a_file_with_more_than_one_cfg_test_line() {
+    fn production_source_reads_past_a_test_only_item_to_the_tests_module() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("two_cfg_test_lines.rs");
+        let file = dir.path().join("gated_item_then_tests.rs");
         std::fs::write(
             &file,
-            "#[cfg(test)]\nfn only_built_for_tests() {}\n\n#[cfg(test)]\nmod tests {}\n",
+            "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
+             #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n",
         )
         .expect("write the fixture file");
 
-        production_source(&file);
+        let production = production_source(&file);
+
+        assert!(
+            production.contains("real_production"),
+            "a test-only item must not cut the scan short of real production code"
+        );
+        assert!(
+            !production.contains("inside_the_tests_module"),
+            "the trailing tests module must still be excluded"
+        );
+    }
+
+    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
+    /// rather than skipping a file the ban applies to.
+    #[test]
+    fn production_source_scans_a_file_with_no_tests_module_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("no_tests_module.rs");
+        std::fs::write(&file, "fn real_production() {}\n").expect("write the fixture file");
+
+        assert!(production_source(&file).contains("real_production"));
     }
 
     /// theming.md and ADR 0011: no bundled third-party palette, and no paired light/dark
