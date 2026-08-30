@@ -5,6 +5,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::entity::Head;
+
 /// Error from a git read, cheap to clone because the whole state table is cloned
 /// every frame. A shared trait object was rejected: it gives no discriminant to
 /// branch on and nothing to serialise, and nothing in this crate reads a source chain.
@@ -27,45 +29,86 @@ impl std::fmt::Display for ProbeError {
 
 impl std::error::Error for ProbeError {}
 
-/// Short name of the branch HEAD points at, or `None` when HEAD is detached.
+/// Reads `HEAD` and maps it onto the crate's own three-shape [`Head`], one to one
+/// with gix's `head::Kind`.
 ///
-/// This is the whole of the backend for now: the smallest read that proves gix is
-/// wired, and the same call the scale benchmark measured at roughly 10ms per Repo.
-#[allow(dead_code)] // no caller until a state model re-exports it
-pub fn head_branch(repo: &Path) -> Result<Option<String>, ProbeError> {
+/// This is Phase A, [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// cheapest and least contended read, and the only probe this crate drives today;
+/// the remaining phases are later work.
+pub fn head_shape(repo: &Path) -> Result<Head, ProbeError> {
     let repo = gix::open(repo).map_err(|error| ProbeError::Open(error.to_string().into()))?;
-    let name = repo
-        .head_name()
+    let head = repo
+        .head()
         .map_err(|error| ProbeError::Read(error.to_string().into()))?;
-    Ok(name.map(|name| name.shorten().to_string()))
+    Ok(match head.kind {
+        gix::head::Kind::Symbolic(reference) => {
+            Head::Branch(Arc::from(reference.name.shorten().to_string()))
+        }
+        gix::head::Kind::Unborn(name) => Head::Unborn(Arc::from(name.shorten().to_string())),
+        gix::head::Kind::Detached { target, peeled } => Head::Detached(peeled.unwrap_or(target)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::process::Command;
 
     use super::*;
 
+    /// Runs `git` against `repo` with a fixed identity, so a commit never depends on
+    /// the machine's own global git config.
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     #[test]
-    fn shortens_the_branch_that_head_points_at() {
+    fn a_freshly_initialised_repository_is_unborn() {
         let dir = tempfile::tempdir().expect("temp dir");
         gix::init(dir.path()).expect("init");
-        let head = fs::read_to_string(dir.path().join(".git/HEAD")).expect("read HEAD");
-        let expected = head
-            .trim()
-            .strip_prefix("ref: refs/heads/")
-            .expect("a symbolic HEAD");
 
-        let branch = head_branch(dir.path()).expect("read the branch");
+        let head = head_shape(dir.path()).expect("read HEAD");
 
-        assert_eq!(branch.as_deref(), Some(expected));
+        assert!(matches!(head, Head::Unborn(_)));
+    }
+
+    #[test]
+    fn a_commit_on_a_branch_reads_as_attached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+
+        let head = head_shape(dir.path()).expect("read HEAD");
+
+        match head {
+            Head::Branch(name) => assert!(!name.is_empty()),
+            other => panic!("expected an attached branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_detached_checkout_carries_the_commit_and_no_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+        git(dir.path(), &["checkout", "--detach", "HEAD"]);
+
+        let head = head_shape(dir.path()).expect("read HEAD");
+
+        assert!(matches!(head, Head::Detached(_)));
     }
 
     #[test]
     fn a_directory_that_is_not_a_repo_is_an_error() {
         let dir = tempfile::tempdir().expect("temp dir");
 
-        assert!(matches!(head_branch(dir.path()), Err(ProbeError::Open(_))));
+        assert!(matches!(head_shape(dir.path()), Err(ProbeError::Open(_))));
     }
 
     #[test]

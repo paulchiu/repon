@@ -42,6 +42,18 @@ A transient predicate that narrows the visible rows. A Filter never mutates the 
 **Selection**:
 The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.
 
+### Lifecycle
+
+**Core**:
+The running instance `Core::start` hands back: its own table, its own dedicated thread for the metadata poll and the Generation deadline, and the rayon pool it shares with the rest of the process for probes. Never constructed with a plain constructor, because starting it spawns threads, and dropping it joins every thread it spawned.
+_Avoid_: Engine, Runtime
+
+**Core spec**:
+Everything `Core::start` needs, handed as plain data: a Set spec, every Repo override, and the three durations (the poll interval, the status staleness threshold, the Generation deadline). The core reads no file, no path and no environment variable to get any of it.
+
+**Repo override**:
+One Repo's config-level correction, crossing into the core as plain data: its common dir, an optional default branch name, and whether it is excluded. The core never resolves the file or path that produced it.
+
 ### Discovery
 
 **Discovery**:

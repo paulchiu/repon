@@ -53,6 +53,7 @@
 compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
 mod cell;
+mod core;
 mod discovery;
 mod entity;
 mod fanout;
@@ -60,7 +61,8 @@ mod git;
 mod snapshot;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
-pub use discovery::{Discovery, SetSpec, discover};
+pub use core::{Core, CoreSpec, RepoOverride};
+pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionRun;
 pub use entity::AheadBehind;
 pub use entity::DefaultBranch;

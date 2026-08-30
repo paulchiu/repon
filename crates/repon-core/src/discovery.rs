@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::entity::EntityKey;
@@ -51,7 +52,27 @@ const ABANDON_AFTER: Duration = Duration::from_secs(30);
 /// set this module does keep exists only to give a symlink's target the same identity as
 /// its real name, never to remember a path already walked. Never reads or writes a cache.
 pub fn discover(spec: &SetSpec) -> Discovery {
-    walk(spec, ABANDON_AFTER)
+    walk(spec, ABANDON_AFTER, None)
+}
+
+/// Runs the same walk as [`discover`], but publishes the running directory count to
+/// `progress` as it goes.
+///
+/// Discovery itself has no callback and no notion of "still running": it returns once,
+/// at the end. This is the seam that lets something outside the walk, namely
+/// `Core::start`'s dedicated thread, watch an in-flight walk and warn once it has run
+/// for a second without finishing, per
+/// [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md).
+pub(crate) fn discover_watched(spec: &SetSpec, progress: Arc<AtomicUsize>) -> Discovery {
+    walk(spec, ABANDON_AFTER, Some(&progress))
+}
+
+/// Matches a Set against the boundary-stop walk with no probing and no provenance,
+/// for `repon sets` to print a count per declared Set. Infallible, like [`discover`]
+/// itself: an unreadable or missing root is silently zero entities rather than an
+/// error, so there is no `DiscoveryError` for this to return.
+pub fn count(spec: &SetSpec) -> usize {
+    discover(spec).entities.len()
 }
 
 /// A directory is a boundary when it holds a `.git` entry, file or directory form alike.
@@ -91,7 +112,7 @@ impl Globs {
     }
 }
 
-fn walk(spec: &SetSpec, abandon_after: Duration) -> Discovery {
+fn walk(spec: &SetSpec, abandon_after: Duration, progress: Option<&AtomicUsize>) -> Discovery {
     let globs = Globs::compile(&spec.include, &spec.exclude);
     let mut entities = Vec::new();
     // Populated by every ordinary (non-symlink) boundary hit, canonicalized. Ordinary hits
@@ -113,6 +134,9 @@ fn walk(spec: &SetSpec, abandon_after: Duration) -> Discovery {
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
             directories_visited += 1;
+            if let Some(progress) = progress {
+                progress.store(directories_visited, Ordering::Relaxed);
+            }
             if started.elapsed() >= abandon_after {
                 abandoned = true;
                 break 'roots;
@@ -489,10 +513,31 @@ mod tests {
             fs::create_dir_all(root_dir.join(format!("plain-{i}"))).expect("create plain dir");
         }
 
-        let discovery = walk(&spec(vec![root_dir.clone()]), Duration::ZERO);
+        let discovery = walk(&spec(vec![root_dir.clone()]), Duration::ZERO, None);
 
         assert!(discovery.abandoned);
         assert!(discovery.directories_visited >= 1);
+    }
+
+    #[test]
+    fn a_watched_walk_publishes_its_running_directory_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        for i in 0..5 {
+            fs::create_dir_all(root_dir.join(format!("plain-{i}"))).expect("create plain dir");
+        }
+        let progress = Arc::new(AtomicUsize::new(0));
+
+        let discovery = discover_watched(&spec(vec![root_dir.clone()]), Arc::clone(&progress));
+
+        // The walk has finished, so progress should have been updated at least once and
+        // land on the same final count discovery itself reports; a stub that never wrote
+        // through the atomic would leave `progress` at zero.
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            discovery.directories_visited
+        );
+        assert!(progress.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
