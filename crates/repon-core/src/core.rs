@@ -1921,7 +1921,7 @@ mod tests {
         let core = started.core;
         assert!(
             core.discovery_manual_for_test(),
-            "walking 4,000 decoy directories against a 500 microsecond deadline \
+            "walking 20,000 decoy directories against a 500 microsecond deadline \
              must have abandoned and taken the Set manual"
         );
 
@@ -1983,7 +1983,7 @@ mod tests {
         // a loaded machine. A 500us deadline against 4,000 decoys failed twice in
         // six runs under parallel load.
         let decoys = root.join("decoys");
-        for i in 0..4_000 {
+        for i in 0..20_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
                 .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
                 .expect("create decoy dir");
