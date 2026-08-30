@@ -113,7 +113,7 @@ gix checks the flag once per index entry, so one Repo stops in 0.5 to 0.9ms, and
 
 There is no per-cell timeout. A rayon task cannot be pre-empted, so a per-cell deadline could only mark a cell while the work carried on underneath it, and a probe that is still running has not asked and got nothing back, which is what Unknown means under [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md). Instead a generation is cancelled after 30 seconds, comfortably clear of the measured 4.4 second full probe, and every cell still Loading in that generation becomes Unknown at that moment.
 
-Unknown carries a reason, which the detail pane reports in words: timed out, no upstream, no default branch, no remote. All of them render `?` in the gutter.
+Unknown carries a reason, which the detail pane reports in words: timed out, or no default branch. Both render `?` in the gutter. This sentence previously listed four reasons; [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`, and [core-api.md](core-api.md) records the set as closed at two. `unknown:timed-out` reaches the first from the Filter line ([filter.md](filter.md)).
 
 ## Whose clocks these are
 

@@ -62,7 +62,7 @@ The Submodule row is the exception, and it states its own reason: [discovery.md]
 
 ## The branch cell
 
-The cost, stated plainly: an object id is a legal git branch name, so the cell holds two categorically different things and the detail pane is the only discriminator. [discovery.md](discovery.md) already accepts that for 16 Submodule rows; it now covers 141 rows. Colour cannot carry the distinction, because [theming.md](theming.md) forbids colour as the only carrier of meaning, so the branch cell takes the ordinary text role in all three shapes. A `detached` Filter term makes those rows reachable without opening the detail pane, on the precedent of the `failed` term [actions.md](actions.md) added.
+The cost, stated plainly: an object id is a legal git branch name, so the cell holds two categorically different things and the detail pane is the only discriminator. [discovery.md](discovery.md) already accepts that for 16 Submodule rows; it now covers 141 rows. Colour cannot carry the distinction, because [theming.md](theming.md) forbids colour as the only carrier of meaning, so the branch cell takes the ordinary text role in all three shapes. The `head:detached` term ([filter.md](filter.md)) makes those rows reachable without opening the detail pane, on the precedent of the failure term [actions.md](actions.md) added.
 
 The abbreviation is nine characters, fixed, rather than git's own. `core.abbrev auto` scales with object count, measured at 9 characters in one Repo of the population and 7 in another, so leaving it to git gives a ragged column, and nine is what the largest Repo measured already needs. Nothing consumes the id as an input, so uniqueness is not load-bearing; the detail pane carries the full id for anything that is.
 

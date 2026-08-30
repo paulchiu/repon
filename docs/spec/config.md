@@ -49,7 +49,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
 | `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
 
-The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
+The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter, `kind:worktree` in [filter.md](filter.md), beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
 
 ## Refresh, fetch and auto-update
 

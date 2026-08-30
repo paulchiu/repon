@@ -162,7 +162,7 @@ The bar this section meets: a row may carry only a status, as long as the output
 
 `n` and `N` in the `list` context move the cursor to the next and previous row whose `last_action` holds a `Failed` step. Both keys are free: `n` is bound only in `confirm`, and contexts do not overlap, the same split [keybindings.md](keybindings.md) already defends for Ctrl+U being half-page in three contexts and clear-line in the fourth. That spec also records that Repon has no backward to search, which is exactly why the vim search pair was never claimed.
 
-The `last_action` field makes a `failed` Filter term expressible, so the list can be narrowed to the failures as well as walked through them.
+The `last_action` field makes the `action:failed` term expressible ([filter.md](filter.md)), so the list can be narrowed to the failures as well as walked through them. That term reads `last_action` and therefore selects exactly the rows `n` and `N` walk; `row:failed` is the wider set the `!` gutter shows, which also covers a failed probe and a failed derivation.
 
 While the detail pane is open beside the list, moving the cursor re-targets it. Stated plainly because nothing ever asserted it: `n`, `n`, `n` with the pane open is the compare-failures loop, each press landing the pane on the next failure's captured output. At full frame the pane is 88 columns, 86 interior:
 

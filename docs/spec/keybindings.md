@@ -77,10 +77,11 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | key | action |
 | --- | --- |
 | any printable character | Text |
-| `Enter` | Apply the Filter, or run the highlighted entry |
+| `Enter` | Apply the Filter, or run the highlighted entry. In the Filter line it **always** commits and never accepts a completion ([filter.md](filter.md)) |
 | `Esc` | Cancel |
-| `Up`, `Ctrl+K` | Previous entry (palettes only) |
-| `Down`, `Ctrl+J` | Next entry (palettes only) |
+| `Up`, `Ctrl+K` | Previous entry |
+| `Down`, `Ctrl+J` | Next entry |
+| `Tab` | Accept the highlighted completion (the Filter line only) |
 | `Ctrl+W` | Delete the previous word |
 | `Ctrl+U` | Clear the line |
 | `Ctrl+E` | Open the field in `$EDITOR` |
@@ -169,7 +170,7 @@ Four rules produce it:
 
 ratatui does none of this. `Buffer::set_stringn` (ratatui-core 0.1.2, src/buffer/buffer.rs:336) truncates silently at a grapheme boundary and neither wraps nor panics, so left alone it cuts a binding in half, and a half-rendered hint still reads as an instruction.
 
-The detail context's footer is 61 columns at full width and follows the same rules. The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+The detail context's footer is 61 columns at full width and follows the same rules. The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
 
 ## The help overlay
 

@@ -37,7 +37,15 @@ A Set's bounding specification as the core receives it: roots, include and exclu
 _Avoid_: SetConfig (that names the consumer's parsed TOML shape, not the core's)
 
 **Filter**:
-A transient predicate that narrows the visible rows. A Filter never mutates the Selection.
+A transient predicate that narrows the visible rows. A Filter never mutates the Selection, and never reorders what it does not hide.
+
+**Filter term**:
+One unit of a Filter. Either a bare word, which always matches the display name, or a key and a value joined by a colon. Terms always combine with and.
+_Avoid_: token, clause, qualifier
+
+**Committed Filter**:
+A Filter that has been applied with Enter and is narrowing the list while the cursor is back on it. Distinct from the text still being typed into the Filter line, which narrows live but is abandoned by Esc. Only a committed Filter persists, and only a committed Filter is what Esc clears at the last rung of its unwind.
+_Avoid_: active filter, saved filter (a Set is the saved one)
 
 **Selection**:
 The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.

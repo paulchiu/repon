@@ -19,7 +19,7 @@ One table settles every ownership question this document answers in detail below
 | The default branch rung and disagreement | core | They are computed facts, not presentation |
 | The environment contract as data | core | It is derived entirely from git facts the core already holds |
 | Action fan-out | core | No terminal is involved |
-| The Filter predicate | core | The decision to apply it is the consumer's |
+| The Filter predicate | core | The decision to apply it is the consumer's; the language is [filter.md](filter.md) |
 | Config file discovery and parsing | consumer | The core never reads a file or an environment variable |
 | The terminal | consumer | The whole point of [0005](../adr/0005-rendering-agnostic-core.md) |
 | The Launcher | consumer | Suspending and exec-ing are terminal acts |
