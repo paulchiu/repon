@@ -440,8 +440,10 @@ impl App {
     /// re-applied here: `Core` has no way to move to a new [`repon_core::CoreSpec`] short of
     /// rebuilding the whole thing, and rebuilding it for every reload regardless of relevance
     /// would restart discovery even for a reload that only changed the theme, which
-    /// config.md's Reload section does not ask for. `[[launcher]]` and `[[action]]` need no
-    /// re-apply of their own: nothing in this crate reads them yet.
+    /// config.md's Reload section does not ask for. `[[launcher]]` is read by
+    /// [`crate::launcher::resolve`], but `App` caches no resolved list to refresh, since no
+    /// key dispatches to a Launcher yet; `[[action]]` needs no re-apply of its own, since
+    /// nothing in this crate reads it yet.
     fn reload_config(&mut self) {
         let new_config = match Config::new() {
             Ok(config) => config,

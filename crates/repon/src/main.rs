@@ -11,11 +11,13 @@ mod app;
 mod cli;
 mod components;
 mod config;
+mod editor;
 mod errors;
 mod footer;
 mod glyphs;
 mod help;
 mod keys;
+mod launcher;
 mod logging;
 mod message;
 mod scroll;
@@ -37,6 +39,26 @@ fn main() -> color_eyre::Result<()> {
     #[cfg(debug_assertions)]
     if args.suspend_after_tui_enter {
         return suspend_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
+    if args.launcher_marker_after_tui_enter {
+        return launcher_marker_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
+    if args.editor_marker_after_tui_enter {
+        return editor_marker_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
+    if args.panic_after_launcher_handoff {
+        return panic_after_launcher_handoff();
+    }
+
+    #[cfg(debug_assertions)]
+    if args.unspawnable_launcher_after_tui_enter {
+        return unspawnable_launcher_after_tui_enter();
     }
 
     #[cfg(debug_assertions)]
@@ -75,6 +97,108 @@ fn suspend_after_tui_enter() -> color_eyre::Result<()> {
     let mut tui = tui::Tui::new()?;
     tui.enter()?;
     tui.suspend()?;
+    Ok(())
+}
+
+/// A minimal, otherwise-unpopulated Entity: enough for [`launcher::run`] to resolve a
+/// working directory and an environment contract from, with nothing else read by the debug
+/// scenarios that use it.
+#[cfg(debug_assertions)]
+fn synthetic_entity() -> repon_core::EntityState {
+    let cwd: std::sync::Arc<std::path::Path> = std::sync::Arc::from(std::env::temp_dir().as_path());
+    repon_core::EntityState::new(
+        repon_core::EntityKey::new(std::sync::Arc::clone(&cwd)),
+        std::sync::Arc::from("synthetic"),
+        cwd,
+        repon_core::Kind::Repo,
+    )
+}
+
+/// Claims the terminal, then hands it to a Launcher named `test`, resolved through the real
+/// `config.toml` pipeline ([`config::Config::new`] then [`launcher::resolve`]) rather than
+/// hand-built, whose child writes a marker to the terminal's own stdio, then exits. A test
+/// attached to a real pty can then find the marker positioned between the handoff's restore
+/// and its reclaim, which is the same proof [`suspend_after_tui_enter`] gives for `SIGTSTP`
+/// applied to a Launcher's suspend-and-exec instead, and going through the real pipeline is
+/// what exercises `[[launcher]]` parsing and merge in a real process rather than only in a
+/// unit test.
+#[cfg(debug_assertions)]
+fn launcher_marker_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    config::init(None);
+    let config = config::Config::new()?;
+    let resolved = launcher::resolve(&config.document);
+    let test_launcher = resolved
+        .iter()
+        .find(|launcher| launcher.name == "test")
+        .expect("the config this flag is run against must declare a [[launcher]] named `test`");
+
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    launcher::run(&mut tui, test_launcher, &synthetic_entity())?;
+    Ok(())
+}
+
+/// Claims the terminal, forces `$EDITOR` to a script that overwrites its file argument with a
+/// marker (rather than depending on a real editor being installed), runs the ad hoc-editor
+/// handoff, prints what was read back, then exits. Proves [`editor::edit`] as a real second
+/// caller of the same handoff machinery [`launcher_marker_after_tui_enter`] exercises.
+#[cfg(debug_assertions)]
+fn editor_marker_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    // Safety: single-threaded so far, and nothing above this line has read the environment
+    // concurrently with this write, the same argument `reprint_config_path_after_env_change`
+    // makes for its own `set_var` call.
+    unsafe {
+        std::env::set_var(
+            "EDITOR",
+            r#"sh -c 'printf EDITOR_HANDOFF_MARKER > "$1"' --"#,
+        );
+    }
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    let edited = editor::edit(&mut tui, "before the handoff\n")?;
+    tui.exit()?;
+    println!("EDITED:{edited}");
+    Ok(())
+}
+
+/// Claims the terminal, runs a synthetic Launcher to completion, then panics. Distinct from
+/// [`panic_after_tui_enter`]: this proves a real handoff's reclaim leaves the terminal in a
+/// state a subsequent panic still restores correctly, rather than only proving that of the
+/// single, original `enter()`.
+#[cfg(debug_assertions)]
+fn panic_after_launcher_handoff() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    let synthetic_launcher = launcher::Launcher {
+        name: "test".to_string(),
+        source: launcher::Source::Args(vec!["true".to_string()]),
+        shell: false,
+        env: Default::default(),
+    };
+    launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
+    panic!("repon: test-triggered panic after a Launcher handoff completed");
+}
+
+/// Claims the terminal, then hands it to a synthetic Launcher whose argv names a binary
+/// guaranteed not to exist, so a test can attach to a real process over a pty and read back
+/// whether `Tui::suspend_for_child` reclaims the terminal even when `command.status()` fails
+/// to spawn the child at all, rather than trusting its doc comment's claim. Propagates the
+/// spawn error rather than swallowing it, so this still exits non-zero.
+#[cfg(debug_assertions)]
+fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    let synthetic_launcher = launcher::Launcher {
+        name: "test".to_string(),
+        source: launcher::Source::Args(vec!["repon-test-binary-that-does-not-exist".to_string()]),
+        shell: false,
+        env: Default::default(),
+    };
+    launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
     Ok(())
 }
 

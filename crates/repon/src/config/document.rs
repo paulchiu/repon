@@ -1,14 +1,13 @@
 //! The config document: its schema, its defaults, the deep merge and the four failure grades.
 //!
 //! `docs/spec/config.md` is the specification. This module implements the top-level bare
-//! keys, `[refresh]`, `[fetch]`, `[auto_update]` and the `[[set]]` fields in full. `[[repo]]`,
-//! `[[launcher]]` and `[[action]]` are parsed only enough to prove the document shape: a
-//! required identity field, file order preserved, duplicates rejected. Their own field
-//! schemas belong to later tickets, so anything else in one of those tables is captured
-//! whole rather than validated.
+//! keys, `[refresh]`, `[fetch]`, `[auto_update]`, the `[[set]]` fields and `[[launcher]]` in
+//! full. `[[action]]` is parsed only enough to prove the document shape: a required identity
+//! field, file order preserved, duplicates rejected. Its own field schema belongs to a later
+//! ticket, so anything else in it is captured whole rather than validated.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs, io,
     ops::Range,
     path::{Path, PathBuf},
@@ -117,14 +116,22 @@ pub fn repo_overrides(document: &Document) -> Vec<repon_core::RepoOverride> {
         .collect()
 }
 
-/// A `[[launcher]]` entry, parsed only enough to prove the document shape. Its fields are a
-/// later ticket's schema.
+/// A `[[launcher]]` entry, per [config.md](../../../../docs/spec/config.md#launchers)'s
+/// full field table. `args` and `from_env` are mutually exclusive argv sources;
+/// [`crate::launcher::resolve`] is where a declared entry turns into something runnable.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LauncherConfig {
     pub name: toml::Spanned<String>,
-    #[serde(flatten)]
-    #[allow(dead_code)]
-    pub rest: toml::Table,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub from_env: Option<String>,
+    #[serde(default)]
+    pub shell: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// An `[[action]]` entry, parsed only enough to prove the document shape. Its fields are a
@@ -670,11 +677,21 @@ mod tests {
         assert_eq!(names, vec!["zeta", "alpha"]);
     }
 
-    // [[launcher]] and [[action]] still only prove the shape without their own field
-    // schemas: a field this ticket does not implement is not an unknown key.
+    // [[launcher]]'s full field schema (name, args, from_env, shell, env, disabled) parses
+    // with no unknown-key warnings, and each field's value lands where declared.
     #[test]
-    fn an_unimplemented_launcher_field_is_not_reported_as_an_unknown_key() {
-        let text = "[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n";
+    fn a_launcher_entrys_full_field_schema_parses_with_no_unknown_keys() {
+        let text = "[[launcher]]\n\
+                     name = \"lazygit\"\n\
+                     args = [\"lazygit\"]\n\
+                     shell = false\n\
+                     disabled = false\n\
+                     [launcher.env]\n\
+                     FOO = \"bar\"\n\
+                     \n\
+                     [[launcher]]\n\
+                     name = \"editor\"\n\
+                     from_env = \"EDITOR\"\n";
         let loaded = parse_ok(text);
         assert!(
             !loaded
@@ -682,6 +699,36 @@ mod tests {
                 .iter()
                 .any(|warning| matches!(warning, Warning::UnknownKey(_))),
             "expected no unknown-key warnings, got: {:?}",
+            loaded.warnings
+        );
+
+        let lazygit = &loaded.document.launchers[0];
+        assert_eq!(
+            lazygit.args.as_deref(),
+            Some(["lazygit".to_string()].as_slice())
+        );
+        assert_eq!(lazygit.from_env, None);
+        assert!(!lazygit.shell);
+        assert!(!lazygit.disabled);
+        assert_eq!(lazygit.env.get("FOO").map(String::as_str), Some("bar"));
+
+        let editor = &loaded.document.launchers[1];
+        assert_eq!(editor.from_env.as_deref(), Some("EDITOR"));
+        assert_eq!(editor.args, None);
+    }
+
+    // A genuinely unknown [[launcher]] key still warns now that the real schema is
+    // implemented: there is no more catch-all field standing in for it.
+    #[test]
+    fn a_launcher_entrys_actually_unknown_key_still_warns() {
+        let text = "[[launcher]]\nname = \"lazygit\"\ntypo_field = 1\n";
+        let loaded = parse_ok(text);
+        assert!(
+            loaded.warnings.iter().any(|warning| matches!(
+                warning,
+                Warning::UnknownKey(path) if path.ends_with("typo_field")
+            )),
+            "expected an unknown-key warning for the stray field, got: {:?}",
             loaded.warnings
         );
     }

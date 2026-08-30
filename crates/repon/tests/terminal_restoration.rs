@@ -118,6 +118,61 @@ fn wifstopped(status: c_int) -> bool {
     (status & 0xff) == 0x7f
 }
 
+/// Spawns `repon` with `args` and `envs` over a real pty, drains the pty concurrently with
+/// the child (the same reason every test above does its own draining), waits up to 5s, and
+/// returns the exit status alongside everything the child wrote. Shared by the handoff tests
+/// below, which only care about the final output and exit code rather than an intermediate
+/// state like `suspend_restores_the_terminal_before_the_process_actually_stops` does.
+fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
+    let (mut master, slave_path) = open_pty();
+    let mut child = spawn_attached_to_pty_with(&slave_path, args, envs);
+
+    let (output_tx, output_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = output_tx.send(output);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "repon {args:?} did not exit within 5s; refusing to trust a hung process's \
+                 terminal state"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pty reader thread did not report back after the child exited");
+    let _ = reader.join();
+    (status, String::from_utf8_lossy(&output).into_owned())
+}
+
+/// Every byte offset at which `needle` starts in `haystack`, in order: how the handoff tests
+/// below tell the initial `enter()` apart from the reclaim, and the handoff's own restore
+/// apart from a panic hook's.
+fn indices_of(haystack: &str, needle: &str) -> Vec<usize> {
+    haystack
+        .match_indices(needle)
+        .map(|(index, _)| index)
+        .collect()
+}
+
 #[test]
 fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_panics() {
     let (mut master, slave_path) = open_pty();
@@ -447,5 +502,198 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
         !output.contains(&enter_alt),
         "the terminal must never be claimed once a [keys] collision is detected, but \
          EnterAlternateScreen appeared: {output:?}"
+    );
+}
+
+/// Criterion 2's clean path for the Launcher caller: a non-zero exit plus empty stdout is not
+/// evidence about ordering, so this asserts on the literal `EnterAlternateScreen` and
+/// `LeaveAlternateScreen` byte sequences and on a marker only the handed-off child could have
+/// written, all under a real pty. `--launcher-marker-after-tui-enter` resolves a Launcher
+/// named `test` through the real `config.toml` pipeline (`Config::new` then
+/// `launcher::resolve`, exercised in the binary under test rather than only in a unit test)
+/// and hands it a synthetic Entity to run against.
+#[test]
+fn a_launcher_handoff_restores_the_terminal_before_the_child_runs_and_reclaims_it_after() {
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "[[launcher]]\n\
+         name = \"test\"\n\
+         args = [\"sh\", \"-c\", \"printf LAUNCHER_HANDOFF_MARKER\"]\n",
+    )
+    .expect("write a config.toml declaring the test launcher");
+
+    let (status, output) = run_over_pty(
+        &["--launcher-marker-after-tui-enter"],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    const MARKER: &str = "LAUNCHER_HANDOFF_MARKER";
+
+    let enter_at = indices_of(&output, &enter_alt);
+    let leave_at = indices_of(&output, &leave_alt);
+    let marker_at = output
+        .find(MARKER)
+        .unwrap_or_else(|| panic!("expected {MARKER} in: {output:?}"));
+
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen, the initial one and the \
+         handoff's reclaim: {output:?}"
+    );
+    assert_eq!(
+        leave_at.len(),
+        2,
+        "expected exactly two restores, the handoff's own and the final one on exit: {output:?}"
+    );
+    assert!(
+        enter_at[0] < leave_at[0] && leave_at[0] < marker_at,
+        "the terminal must be fully restored before the child's own output reaches the pty: \
+         {output:?}"
+    );
+    assert!(
+        marker_at < enter_at[1],
+        "the child's own output must arrive before the handoff reclaims the terminal: \
+         {output:?}"
+    );
+}
+
+/// Criterion 2's clean path for the ad hoc-editor caller (`editor::edit`): the same handoff
+/// machinery the Launcher test above exercises, proven through a second, independent caller
+/// whose own interface never mentions a Launcher. `--editor-marker-after-tui-enter` forces
+/// `$EDITOR` to a script that overwrites its file argument, so the printed `EDITED:` line can
+/// only be correct if a real child process actually held the terminal, wrote the scratch
+/// file, and exited before Repon read it back.
+#[test]
+fn an_editor_handoff_restores_the_terminal_around_a_real_child_and_the_edit_survives_it() {
+    let (status, output) = run_over_pty(&["--editor-marker-after-tui-enter"], &[]);
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    assert!(
+        output.contains("EDITED:EDITOR_HANDOFF_MARKER"),
+        "expected the scratch file's content, written by the handed-off editor and read back \
+         by Repon, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    let enter_at = indices_of(&output, &enter_alt);
+    let leave_at = indices_of(&output, &leave_alt);
+    let edited_at = output
+        .find("EDITED:")
+        .expect("already asserted present above");
+
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen, the initial one and the \
+         handoff's reclaim: {output:?}"
+    );
+    assert_eq!(
+        leave_at.len(),
+        2,
+        "expected exactly two restores, the handoff's own and the explicit exit before \
+         printing: {output:?}"
+    );
+    assert!(
+        enter_at[0] < leave_at[0] && leave_at[0] < enter_at[1] && enter_at[1] < leave_at[1],
+        "expected one full restore-then-reclaim cycle around the editor, then a second \
+         restore before the edited text was printed: {output:?}"
+    );
+    assert!(
+        leave_at[1] < edited_at,
+        "the edited text must be printed only after the terminal is restored: {output:?}"
+    );
+}
+
+/// Criterion 3's own proof, separate from the clean path above: a panic that strikes after a
+/// real Launcher handoff has already completed (its own restore, the child, and its reclaim)
+/// must still leave the terminal exactly as
+/// `terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_panics` proves
+/// for a panic with no handoff at all. Proving only the clean path would say nothing about
+/// this case: a build that left the event thread or raw-mode tracking inconsistent after a
+/// second `enter()` could still pass every assertion above and still leave a broken terminal
+/// behind here.
+#[test]
+fn a_panic_after_a_launcher_handoff_completes_still_restores_the_terminal_symmetrically() {
+    let (status, output) = run_over_pty(&["--panic-after-launcher-handoff"], &[]);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the panic hook exits 1 once it has restored the terminal: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    let enter_at = indices_of(&output, &enter_alt);
+    let leave_at = indices_of(&output, &leave_alt);
+
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen, the initial one and the \
+         handoff's reclaim, before the panic: {output:?}"
+    );
+    assert_eq!(
+        leave_at.len(),
+        2,
+        "expected exactly two restores, the handoff's own and the panic hook's: {output:?}"
+    );
+    assert!(
+        enter_at[0] < leave_at[0] && leave_at[0] < enter_at[1] && enter_at[1] < leave_at[1],
+        "expected the handoff's own restore-then-reclaim cycle to complete in full before the \
+         panic hook's own restore: {output:?}"
+    );
+}
+
+/// `Tui::suspend_for_child`'s doc comment claims `enter()` runs "regardless of whether the
+/// child could even be spawned". A build that instead propagates `command.status()`'s error
+/// immediately (`command.status()?`) would skip that reclaim and still exit non-zero, exactly
+/// as this build does, so the exit code alone cannot tell the two apart: this asserts on the
+/// literal `EnterAlternateScreen` byte sequence appearing a second time, after the failed
+/// spawn, instead. `--unspawnable-launcher-after-tui-enter` hands off to a Launcher whose
+/// argv names a binary that cannot possibly exist, so the spawn fails deterministically
+/// rather than depending on anything installed on the test machine.
+#[test]
+fn a_launcher_that_cannot_be_spawned_still_reclaims_the_terminal() {
+    let (status, output) = run_over_pty(&["--unspawnable-launcher-after-tui-enter"], &[]);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a launcher that cannot be spawned must still exit non-zero: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    let enter_at = indices_of(&output, &enter_alt);
+    let leave_at = indices_of(&output, &leave_alt);
+
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen, the initial one and the \
+         reclaim after the failed spawn: {output:?}"
+    );
+    assert_eq!(
+        leave_at.len(),
+        2,
+        "expected exactly two restores, suspend_for_child's own exit before attempting the \
+         spawn and the Drop-based safety net once the spawn error unwinds out of main: \
+         {output:?}"
+    );
+    assert!(
+        enter_at[0] < leave_at[0] && leave_at[0] < enter_at[1] && enter_at[1] < leave_at[1],
+        "the terminal must be reclaimed (a second EnterAlternateScreen) even though the \
+         child was never spawned: {output:?}"
     );
 }

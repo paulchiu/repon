@@ -109,6 +109,30 @@ impl Tui {
         Ok(())
     }
 
+    /// Hands the terminal to `command` and takes it back: the shared machinery a Launcher
+    /// and the ad hoc command field's `$EDITOR` handoff both stand on
+    /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspend and exec in the
+    /// same terminal"). Restores the five pieces [`Tui::exit`] restores, runs `command` to
+    /// completion with the terminal's own stdio (the default, since this does not touch
+    /// `command`'s stdio handles), then claims them again with [`Tui::enter`] regardless of
+    /// whether the child could even be spawned, so a spawn failure still returns control to
+    /// Repon's own screen rather than stranding the shell.
+    ///
+    /// Panic-safe by construction rather than by a check here: [`crate::errors::init`]'s
+    /// panic hook calls the free function [`restore`] unconditionally, which is safe to call
+    /// at any point between this method's `exit` and `enter`, so a panic anywhere in the
+    /// handoff, including inside `command.status()`, still leaves the terminal as
+    /// `exit`/`restore` would.
+    pub fn suspend_for_child(
+        &mut self,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus> {
+        self.exit()?;
+        let status = command.status();
+        self.enter()?;
+        Ok(status?)
+    }
+
     /// Blocks until the next event, or returns `None` once the event thread has stopped.
     pub fn next_event(&self) -> Option<Event> {
         self.event_rx.recv().ok()
@@ -249,6 +273,14 @@ fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 /// screen, then the cursor shown again last, after the screen mode is fully restored rather
 /// than in claim-reversed order. Disabling raw mode is the caller's separate final step,
 /// matching [`write_enter_sequence`].
+///
+/// Mouse capture is the one piece [`write_enter_sequence`] claims that this does not release.
+/// [keybindings.md](../../../docs/spec/keybindings.md#terminal-state) requires it off for the
+/// whole time Repon is running, which is why entry disables it unconditionally; but crossterm
+/// cannot report whether the terminal had it on beforehand, so there is no way to restore
+/// "what was there" rather than either always leaving it off or always turning it back on.
+/// This is a known, deliberate gap against [config.md](../../../docs/spec/config.md#launchers)'s
+/// "all five restored" line, not an oversight.
 fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
@@ -302,6 +334,132 @@ mod tests {
         expected.extend(ansi_bytes(cursor::Show));
 
         assert_eq!(out, expected);
+    }
+
+    /// Whether `needle` occurs anywhere in `haystack`, for asserting on the encoded ANSI
+    /// bytes without decoding them back to a string.
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    /// [`crate::test_support::production_source_at`] over this file itself: the same
+    /// self-scan technique `no_signal_handler_is_installed_anywhere_in_this_crates_source`
+    /// below uses, applied here to prove raw mode's own enable/disable calls exist rather
+    /// than trusting a comment about them.
+    fn this_files_production_source() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate::test_support::production_source_at(&manifest_dir.join("src/tui.rs"))
+    }
+
+    /// Parses "Five independent pieces of terminal state must be restored: raw mode, the
+    /// alternate screen, mouse capture, bracketed paste and focus reporting." into five owned
+    /// names: split on the sentence's own commas after folding its one trailing " and " into
+    /// a comma, the same technique
+    /// [`crate::launcher`]'s own read of this file uses for its shipped-defaults sentence.
+    fn spec_five_terminal_state_pieces(spec: &str) -> Vec<String> {
+        const ANCHOR: &str = "Five independent pieces of terminal state must be restored:";
+        let after = spec
+            .split(ANCHOR)
+            .nth(1)
+            .expect("the five-pieces sentence is present");
+        let sentence = after.split('.').next().expect("a sentence terminator");
+        sentence
+            .replacen(" and ", ", ", 1)
+            .split(',')
+            .map(str::trim)
+            .filter(|phrase| !phrase.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    // Criterion 1's "single source of truth" trap, applied to config.md's own five-piece
+    // count: reads the names out of the spec at test time rather than a hand-copied list, so
+    // a sixth piece added there grows this vector and fails the equality assertion below
+    // rather than going unhandled by the per-piece checks that follow it.
+    #[test]
+    fn the_enter_and_restore_sequences_account_for_every_piece_the_spec_names() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
+            .expect("read docs/spec/config.md");
+        let pieces = spec_five_terminal_state_pieces(&spec);
+        assert_eq!(
+            pieces,
+            vec![
+                "raw mode".to_string(),
+                "the alternate screen".to_string(),
+                "mouse capture".to_string(),
+                "bracketed paste".to_string(),
+                "focus reporting".to_string(),
+            ],
+            "a piece added, removed or reworded here must be deliberately accounted for \
+             below, not merely counted"
+        );
+
+        // Raw mode has no ANSI trace; it is claimed and released by a direct termios call
+        // instead of write_enter_sequence/write_restore_sequence.
+        let source = this_files_production_source();
+        assert!(
+            source.contains("enable_raw_mode()"),
+            "expected Tui::enter to call enable_raw_mode()"
+        );
+        assert!(
+            source.contains("disable_raw_mode()"),
+            "expected restore() to call disable_raw_mode()"
+        );
+
+        let mut enter = Vec::new();
+        write_enter_sequence(&mut enter).expect("write enter sequence");
+        let mut restore = Vec::new();
+        write_restore_sequence(&mut restore).expect("write restore sequence");
+
+        // The alternate screen, bracketed paste and focus reporting are claimed on enter and
+        // released on restore, each an unconditional enable/disable pair.
+        for (claim, release) in [
+            (
+                ansi_bytes(EnterAlternateScreen),
+                ansi_bytes(LeaveAlternateScreen),
+            ),
+            (
+                ansi_bytes(EnableBracketedPaste),
+                ansi_bytes(DisableBracketedPaste),
+            ),
+            (
+                ansi_bytes(EnableFocusChange),
+                ansi_bytes(DisableFocusChange),
+            ),
+        ] {
+            assert!(
+                bytes_contain(&enter, &claim),
+                "expected {claim:?} in the enter sequence"
+            );
+            assert!(
+                bytes_contain(&restore, &release),
+                "expected {release:?} in the restore sequence"
+            );
+        }
+
+        // Mouse capture is the one piece of the five that is not restored: claimed (disabled)
+        // on enter, per keybindings.md's "off" requirement, and left alone on restore because
+        // crossterm cannot report whether the terminal had it on beforehand. See
+        // write_restore_sequence's doc comment for why this is a deliberate exception rather
+        // than a bug; if a second piece ever goes asymmetric, the loop above already fails,
+        // since it requires every other piece to appear on both sides.
+        assert!(
+            bytes_contain(&enter, &ansi_bytes(crossterm::event::DisableMouseCapture)),
+            "expected mouse capture to be disabled in the enter sequence"
+        );
+        for mouse_bytes in [
+            ansi_bytes(crossterm::event::EnableMouseCapture),
+            ansi_bytes(crossterm::event::DisableMouseCapture),
+        ] {
+            assert!(
+                !bytes_contain(&restore, &mouse_bytes),
+                "mouse capture must never be written on restore: found {mouse_bytes:?}"
+            );
+        }
     }
 
     /// crossterm's `KeyEventKind` has three variants, not two: a physical key held down
