@@ -41,7 +41,7 @@ fn main() -> color_eyre::Result<()> {
     errors::init()?;
     logging::init()?;
     config::init(args.config);
-    App::new(args.tick_rate, args.frame_rate)?.run()
+    App::new(args.tick_rate, args.frame_rate, args.theme)?.run()
 }
 
 /// Claims the terminal then panics, so a test can attach to a real process over a pty and
@@ -93,10 +93,7 @@ fn print_config_paths() {
         config_file.display(),
         existence(&config_file)
     );
-    println!(
-        "themes dir:  {}",
-        config::config_dir().join("themes").display()
-    );
+    println!("themes dir:  {}", config::themes_dir().display());
     println!("data dir:    {}", config::data_dir().display());
     println!(
         "log file:    {} ({})",

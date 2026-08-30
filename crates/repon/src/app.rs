@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::{
     components::{Component, list::List},
     config::{
-        Config,
+        self, Config,
         document::{self, Document},
     },
     footer,
@@ -18,6 +18,7 @@ use crate::{
     help::HelpOverlay,
     keys::{self, Action, Context},
     message::Message,
+    theme::{self, Theme},
     tui::{Event, Tui},
 };
 
@@ -45,17 +46,37 @@ pub struct App {
     /// is why the channel is crossbeam rather than std.
     message_tx: Sender<Message>,
     message_rx: Receiver<Message>,
+    /// Resolved once at startup and again on resume ([`App::run`]'s suspend branch does not
+    /// reload it yet, a later ticket's work); not read outside tests until a component styles
+    /// itself by role instead of a hand-picked ratatui colour.
+    #[allow(dead_code)]
+    theme: Theme,
 }
 
 impl App {
-    pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
+    /// `flag_theme` is `--theme`, which beats `theme` in `config.toml` and, unlike it, exits
+    /// non-zero on a missing name: since this runs before [`App::run`] ever constructs a
+    /// [`Tui`], that exit happens before the terminal is claimed.
+    pub fn new(tick_rate: f64, frame_rate: f64, flag_theme: Option<String>) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
         let glyph_set = GlyphSet::for_config(config.document.glyphs);
+
+        let theme_source = if flag_theme.is_some() {
+            theme::ThemeSource::Flag
+        } else {
+            theme::ThemeSource::Config
+        };
+        let theme_name = flag_theme.unwrap_or_else(|| config.document.theme.clone());
+        let loaded_theme = theme::load(&config::themes_dir(), &theme_name, theme_source)?;
+        for warning in &loaded_theme.warnings {
+            tracing::warn!("{warning}");
+        }
+
         debug!(
             config_dir = %config.config_dir.display(),
             data_dir = %config.data_dir.display(),
-            theme = %config.document.theme,
+            theme = %theme_name,
             glyphs = ?config.document.glyphs,
             clean_glyph = %glyph_set.clean,
             sets = config.document.sets.len(),
@@ -89,6 +110,7 @@ impl App {
             frame_size: Size::default(),
             message_tx,
             message_rx,
+            theme: loaded_theme.theme,
         })
     }
 

@@ -20,6 +20,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Theme name, beating `theme` in config.toml. A name that does not exist under
+    /// `themes/` exits non-zero before the terminal is claimed, per
+    /// docs/spec/theming.md's "Five outcomes".
+    #[arg(long, value_name = "NAME")]
+    pub theme: Option<String>,
+
     /// Claims the terminal, then panics immediately, before the event loop starts.
     /// Debug-only: exists so a test can observe panic-time terminal restoration in a real
     /// process rather than describing it, and must not reach a release binary.

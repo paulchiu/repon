@@ -7,6 +7,13 @@
 //! yet, since their callers (a theme-file loader, a renderer keyed by domain meaning) are
 //! later work; each site names only which future caller that is.
 
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use ratatui::style::{Color, Modifier, Style};
 
 /// Declares an enum together with its `ALL: [Self; N]` constant from one variant list, so a
@@ -133,6 +140,23 @@ impl Theme {
         }
     }
 
+    /// Sets this role's colour, [`role_color`](Self::role_color)'s inverse: a theme file
+    /// merges a parsed value in by role rather than by field name, so this is the one place
+    /// a loader writes one back.
+    fn set_role(&mut self, role: Role, color: Color) {
+        match role {
+            Role::Text => self.text = color,
+            Role::Dim => self.dim = color,
+            Role::Accent => self.accent = color,
+            Role::Ok => self.ok = color,
+            Role::Warn => self.warn = color,
+            Role::Danger => self.danger = color,
+            Role::Behind => self.behind = color,
+            Role::Border => self.border = color,
+            Role::BorderFocused => self.border_focused = color,
+        }
+    }
+
     /// A role's style: a foreground colour, never a background. The selected row
     /// ([`Theme::selection_style`]) is the only place this crate ever sets one.
     pub fn style_for(&self, role: Role) -> Style {
@@ -235,6 +259,203 @@ const _MEANING_TO_ROLE_NEEDS_NO_RUNTIME_DATA: [Role; Meaning::ALL.len()] = {
     }
     roles
 };
+
+/// The reserved theme name: it always means the compiled-in [`DEFAULT`]. A user file named
+/// this is never read, per theming.md's "Selection and resolution".
+pub const RESERVED_DEFAULT_NAME: &str = "default";
+
+/// Where the theme name for this run came from, which is the one thing that changes what a
+/// missing theme does: `--theme` is a name typed moments ago and exits non-zero before the
+/// terminal is claimed; `theme` in `config.toml` is a name in a file the user has to go and
+/// fix, so it only warns and falls back to [`DEFAULT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSource {
+    Flag,
+    Config,
+}
+
+/// A load-time condition that does not stop the program, per theming.md's "Five outcomes".
+/// The fifth outcome there, `--theme` naming a theme that does not exist, is instead a hard
+/// [`Result::Err`] from [`load`], since program startup must fail before the terminal is
+/// claimed rather than merely warn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThemeWarning {
+    /// A key in a theme file that no role or selection key consumed; the file still applies
+    /// every key it does recognise.
+    UnknownKey { key: String },
+    /// A value that failed to parse as a [`Color`]; the compiled default for this one key
+    /// still applies.
+    UnparseableValue { key: String, value: String },
+    /// The file could not be parsed as TOML at all; the compiled default applies whole, since
+    /// there are no keys left to merge.
+    MalformedFile { path: PathBuf, message: String },
+    /// `theme` in `config.toml` names a file that does not exist; the compiled default
+    /// applies whole. The same condition named on `--theme` is a hard error instead of a
+    /// warning, see [`load`].
+    NamedThemeMissing { name: String },
+    /// `themes/default.toml` exists, but `default` is reserved for the compiled-in theme, so
+    /// the file was never read.
+    ReservedDefaultNameIgnored,
+}
+
+impl std::fmt::Display for ThemeWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThemeWarning::UnknownKey { key } => write!(f, "unknown theme key `{key}`"),
+            ThemeWarning::UnparseableValue { key, value } => write!(
+                f,
+                "theme key `{key}` has a value that will not parse as a colour: `{value}`"
+            ),
+            ThemeWarning::MalformedFile { path, message } => {
+                write!(
+                    f,
+                    "could not parse theme file {}: {message}",
+                    path.display()
+                )
+            }
+            ThemeWarning::NamedThemeMissing { name } => {
+                write!(f, "theme `{name}` named in config.toml does not exist")
+            }
+            ThemeWarning::ReservedDefaultNameIgnored => write!(
+                f,
+                "a themes/{RESERVED_DEFAULT_NAME}.toml file exists but `{RESERVED_DEFAULT_NAME}` \
+                 is reserved for the compiled-in theme; the file was ignored"
+            ),
+        }
+    }
+}
+
+/// A theme resolved for this run, plus the warnings its load raised.
+#[derive(Debug)]
+pub struct LoadedTheme {
+    pub theme: Theme,
+    pub warnings: Vec<ThemeWarning>,
+}
+
+/// Resolves `name` against `themes_dir` and returns the merged theme plus any warnings.
+///
+/// `source` decides the one outcome that differs by where `name` came from: naming a missing
+/// theme on `--theme` is a hard error, so the caller can exit before claiming the terminal;
+/// naming one in `config.toml` only warns. Every other theming.md outcome, an unknown key, an
+/// unparseable value, a malformed file, the reserved `default` name, behaves the same either
+/// way.
+pub fn load(themes_dir: &Path, name: &str, source: ThemeSource) -> Result<LoadedTheme> {
+    if name == RESERVED_DEFAULT_NAME {
+        let warnings = if theme_file_path(themes_dir, RESERVED_DEFAULT_NAME).exists() {
+            vec![ThemeWarning::ReservedDefaultNameIgnored]
+        } else {
+            Vec::new()
+        };
+        return Ok(LoadedTheme {
+            theme: DEFAULT,
+            warnings,
+        });
+    }
+
+    let path = theme_file_path(themes_dir, name);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(parse(&text, &path)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => match source {
+            ThemeSource::Flag => Err(eyre!(
+                "theme `{name}` named on --theme does not exist at {}",
+                path.display()
+            )),
+            ThemeSource::Config => Ok(LoadedTheme {
+                theme: DEFAULT,
+                warnings: vec![ThemeWarning::NamedThemeMissing {
+                    name: name.to_string(),
+                }],
+            }),
+        },
+        Err(err) => Err(err).wrap_err_with(|| format!("could not read {}", path.display())),
+    }
+}
+
+fn theme_file_path(themes_dir: &Path, name: &str) -> PathBuf {
+    themes_dir.join(format!("{name}.toml"))
+}
+
+/// Parses a theme file as a flat map of strings, per theming.md's "Loading": each value goes
+/// through [`Color::from_str`] individually rather than through ratatui's `Deserialize` for
+/// `Color`, which fails the whole struct on one bad value and would contradict the per-key
+/// behaviour below. Parsed keys merge over the compiled-in [`DEFAULT`], so a file names only
+/// what it changes; a key this cannot place at all still counts as consumed, not unknown.
+///
+/// `Color::from_str` already accepts the whole grammar theming.md's "Colour values" section
+/// promises (ANSI names with light/bright prefixes in any separator style, either spelling of
+/// grey, `reset`, `#RRGGBB`, a bare index), so nothing here re-validates or narrows it. Nothing
+/// here reduces an `Rgb` value to fewer colours or probes the terminal for truecolor support
+/// either: ratatui and crossterm do neither, and `COLORTERM` is absent on plenty of terminals
+/// that do support truecolor, so a detector built on it would degrade screens that did not
+/// need it.
+fn parse(text: &str, path: &Path) -> LoadedTheme {
+    let raw: toml::Table = match toml::from_str(text) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return LoadedTheme {
+                theme: DEFAULT,
+                warnings: vec![ThemeWarning::MalformedFile {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                }],
+            };
+        }
+    };
+
+    let mut theme = DEFAULT;
+    let mut warnings = Vec::new();
+
+    for (key, value) in raw {
+        if let Some(role) = Role::ALL
+            .into_iter()
+            .find(|role| role.spec_key() == key.as_str())
+        {
+            match value_as_color(&value) {
+                Some(color) => theme.set_role(role, color),
+                None => warnings.push(unparseable(key, &value)),
+            }
+            continue;
+        }
+        match key.as_str() {
+            "selection_bg" => match value_as_color(&value) {
+                Some(color) => theme.selection_bg = Some(color),
+                None => warnings.push(unparseable(key, &value)),
+            },
+            "selection_fg" => match value_as_color(&value) {
+                Some(color) => theme.selection_fg = Some(color),
+                None => warnings.push(unparseable(key, &value)),
+            },
+            _ => warnings.push(ThemeWarning::UnknownKey { key }),
+        }
+    }
+
+    LoadedTheme { theme, warnings }
+}
+
+fn unparseable(key: String, value: &toml::Value) -> ThemeWarning {
+    ThemeWarning::UnparseableValue {
+        key,
+        value: display_value(value),
+    }
+}
+
+/// A theme value is only ever a string in a well-formed file; a value of any other TOML type
+/// is unparseable by definition, since [`Color::from_str`] takes a string.
+fn value_as_color(value: &toml::Value) -> Option<Color> {
+    let toml::Value::String(text) = value else {
+        return None;
+    };
+    Color::from_str(text).ok()
+}
+
+/// A warning-friendly rendering of a raw value: a string as itself, anything else as TOML
+/// would print it.
+fn display_value(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -704,5 +925,278 @@ mod tests {
             !cargo_toml.to_lowercase().contains("colorsaurus"),
             "terminal-colorsaurus must not be a dependency; the probe it enables is not built"
         );
+    }
+
+    /// theming.md's "Colour values": `COLORTERM` is absent on plenty of terminals that do
+    /// support truecolor, so a detector built on reading it would degrade screens that did
+    /// not need it. Scans for the call shape an env-var read would take (`var("colorterm"` or
+    /// `var_os("colorterm"`, built from parts so this line is never a match for itself),
+    /// rather than the bare word, since the reasoning above has to say `COLORTERM` in prose
+    /// without tripping its own guard.
+    #[test]
+    fn no_colorterm_capability_probe_exists_in_the_crate_source() {
+        let needles = [
+            format!("{}(\"{}\"", "var", "colorterm"),
+            format!("{}(\"{}\"", "var_os", "colorterm"),
+        ];
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source(&path).to_lowercase();
+            if needles
+                .iter()
+                .any(|needle| source.contains(needle.as_str()))
+            {
+                offending.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "found a COLORTERM capability-probe read in source: {offending:?}"
+        );
+    }
+
+    fn write_theme_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create themes dir");
+        let path = dir.join(format!("{name}.toml"));
+        std::fs::write(&path, contents).expect("write theme file");
+        path
+    }
+
+    // Criterion: per-value parsing. One bad value costs only that value: the good value in
+    // the same file still applies, the bad one keeps the compiled default, and both are
+    // observable, not just the good one (a loader that bails on the first error and returns
+    // the compiled default whole would still pass a test that only checked the good value).
+    #[test]
+    fn a_theme_file_with_one_good_and_one_bad_value_only_loses_the_bad_ones_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(
+            &themes_dir,
+            "mixed",
+            "accent = \"light-red\"\ndanger = \"not-a-colour\"\n",
+        );
+
+        let loaded = load(&themes_dir, "mixed", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(
+            loaded.theme.accent,
+            Color::LightRed,
+            "the good value must still apply"
+        );
+        assert_eq!(
+            loaded.theme.danger, DEFAULT.danger,
+            "the bad value must keep the compiled default for that one key only"
+        );
+        assert!(
+            loaded.warnings.contains(&ThemeWarning::UnparseableValue {
+                key: "danger".to_string(),
+                value: "not-a-colour".to_string(),
+            }),
+            "expected an unparseable-value warning naming `danger`, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // Criterion: merge over the compiled default. A theme naming a strict subset of roles
+    // must leave every unnamed role at its own compiled value, not some other placeholder a
+    // wholesale-replacement merge would leave behind.
+    #[test]
+    fn a_theme_naming_a_strict_subset_of_roles_leaves_the_rest_at_their_compiled_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(
+            &themes_dir,
+            "subset",
+            "accent = \"light-red\"\ndanger = \"light-blue\"\n",
+        );
+
+        let loaded = load(&themes_dir, "subset", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(loaded.theme.accent, Color::LightRed);
+        assert_eq!(loaded.theme.danger, Color::LightBlue);
+        for role in Role::ALL {
+            if role == Role::Accent || role == Role::Danger {
+                continue;
+            }
+            assert_eq!(
+                loaded.theme.role_color(role),
+                DEFAULT.role_color(role),
+                "unnamed role {role:?} must keep its compiled default"
+            );
+        }
+        assert_eq!(loaded.theme.selection_bg, None);
+        assert_eq!(loaded.theme.selection_fg, None);
+        assert!(loaded.warnings.is_empty());
+    }
+
+    // Criterion: the five outcomes, outcome one (unknown key): warns and is ignored, and a
+    // known key in the same file still applies.
+    #[test]
+    fn an_unknown_key_warns_and_is_ignored_while_a_known_key_in_the_same_file_still_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(
+            &themes_dir,
+            "unknown-key",
+            "accent = \"light-red\"\nnot_a_real_role = \"light-blue\"\n",
+        );
+
+        let loaded = load(&themes_dir, "unknown-key", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(loaded.theme.accent, Color::LightRed);
+        assert!(
+            loaded.warnings.contains(&ThemeWarning::UnknownKey {
+                key: "not_a_real_role".to_string(),
+            }),
+            "expected an unknown-key warning, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // Criterion: the five outcomes, outcome two (malformed file): warns and the compiled
+    // default applies whole, since there are no keys left to merge.
+    #[test]
+    fn a_malformed_theme_file_warns_and_uses_the_compiled_default_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(&themes_dir, "malformed", "this is not = = valid toml [[[\n");
+
+        let loaded = load(&themes_dir, "malformed", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(loaded.theme, DEFAULT);
+        assert_eq!(
+            loaded.warnings.len(),
+            1,
+            "expected exactly one warning, got: {:?}",
+            loaded.warnings
+        );
+        assert!(matches!(
+            loaded.warnings[0],
+            ThemeWarning::MalformedFile { .. }
+        ));
+    }
+
+    // Criterion: the five outcomes, outcome three: `--theme` naming a theme that does not
+    // exist is a hard error rather than a warning, so the caller can exit non-zero before the
+    // terminal is claimed (crates/repon/tests/theme_flag.rs proves that ordering against the
+    // real binary).
+    #[test]
+    fn a_theme_named_on_the_flag_that_does_not_exist_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+
+        let result = load(&themes_dir, "does-not-exist", ThemeSource::Flag);
+
+        assert!(
+            result.is_err(),
+            "expected a hard error for a missing theme named on --theme"
+        );
+    }
+
+    // Criterion: the five outcomes, outcome four: the same missing name in `config.toml`
+    // warns and falls back, rather than exiting, since a file is a thing the user has to go
+    // and fix rather than a thing typed moments ago.
+    #[test]
+    fn a_theme_named_in_config_that_does_not_exist_warns_and_falls_back_to_the_compiled_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+
+        let loaded = load(&themes_dir, "does-not-exist", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(loaded.theme, DEFAULT);
+        assert_eq!(
+            loaded.warnings,
+            vec![ThemeWarning::NamedThemeMissing {
+                name: "does-not-exist".to_string()
+            }]
+        );
+    }
+
+    // Criterion: the reserved default name. A `themes/default.toml` file must never win: the
+    // compiled default applies and the file's presence is warned about, not just its colours
+    // being absent (a test only checking colours would still pass a loader that silently
+    // dropped the file with no warning at all).
+    #[test]
+    fn a_themes_default_toml_file_is_ignored_with_a_warning_and_never_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(&themes_dir, "default", "accent = \"light-red\"\n");
+
+        let loaded = load(&themes_dir, "default", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(
+            loaded.theme, DEFAULT,
+            "a themes/default.toml file must never override the compiled default"
+        );
+        assert_eq!(
+            loaded.warnings,
+            vec![ThemeWarning::ReservedDefaultNameIgnored]
+        );
+    }
+
+    // Negative control for the above: with no themes/default.toml file at all, selecting
+    // `default` is the ordinary case and raises no warning.
+    #[test]
+    fn selecting_default_with_no_themes_default_toml_file_present_warns_about_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+
+        let loaded = load(&themes_dir, "default", ThemeSource::Flag).expect("expected Ok");
+
+        assert_eq!(loaded.theme, DEFAULT);
+        assert!(loaded.warnings.is_empty());
+    }
+
+    /// Criterion: the grammar. One row per theme key (nine roles, `selection_bg`,
+    /// `selection_fg`), so a form dropped from the grammar without a matching row here is
+    /// visible: light and bright prefixes in every separator style ratatui accepts, either
+    /// spelling of grey, `reset`, hex truecolor, and a bare index.
+    const GRAMMAR_CASES: &[(&str, &str, Color)] = &[
+        ("text", "red", Color::Red),
+        ("dim", "light-red", Color::LightRed),
+        ("accent", "light_green", Color::LightGreen),
+        ("ok", "lightBlue", Color::LightBlue),
+        ("warn", "bright-red", Color::LightRed),
+        ("danger", "brightgreen", Color::LightGreen),
+        ("behind", "dark-grey", Color::DarkGray),
+        ("border", "dark_gray", Color::DarkGray),
+        ("border_focused", "reset", Color::Reset),
+        ("selection_bg", "#1a2b3c", Color::Rgb(0x1a, 0x2b, 0x3c)),
+        ("selection_fg", "42", Color::Indexed(42)),
+    ];
+
+    #[test]
+    fn every_accepted_colour_grammar_form_parses_with_no_warnings() {
+        let text: String = GRAMMAR_CASES
+            .iter()
+            .map(|(key, value, _)| format!("{key} = \"{value}\"\n"))
+            .collect();
+
+        let loaded = parse(&text, Path::new("grammar.toml"));
+
+        assert!(
+            loaded.warnings.is_empty(),
+            "expected every grammar case to parse, got warnings: {:?}",
+            loaded.warnings
+        );
+        for (key, value, expected) in GRAMMAR_CASES {
+            let actual = match *key {
+                "selection_bg" => loaded.theme.selection_bg,
+                "selection_fg" => loaded.theme.selection_fg,
+                _ => {
+                    let role = Role::ALL
+                        .into_iter()
+                        .find(|role| role.spec_key() == *key)
+                        .unwrap_or_else(|| panic!("no role named `{key}`"));
+                    Some(loaded.theme.role_color(role))
+                }
+            };
+            assert_eq!(
+                actual,
+                Some(*expected),
+                "`{key} = \"{value}\"` did not resolve to {expected:?}"
+            );
+        }
     }
 }
