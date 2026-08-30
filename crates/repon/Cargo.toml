@@ -35,3 +35,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# The width function ratatui itself budgets glyphs with; the width test in `glyphs.rs`
+# measures against this, not against ratatui's own re-export, so the version is pinned here.
+unicode-width = "0.2.2"

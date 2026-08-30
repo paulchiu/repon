@@ -12,6 +12,7 @@ mod cli;
 mod components;
 mod config;
 mod errors;
+mod glyphs;
 mod logging;
 mod message;
 mod tui;

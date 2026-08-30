@@ -7,6 +7,7 @@ use tracing::debug;
 use crate::{
     components::{Component, home::Home},
     config::Config,
+    glyphs::GlyphSet,
     message::Message,
     tui::{Event, Tui},
 };
@@ -28,10 +29,13 @@ impl App {
     pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
+        let glyph_set = GlyphSet::for_config(config.document.glyphs);
         debug!(
             config_dir = %config.config_dir.display(),
             data_dir = %config.data_dir.display(),
             theme = %config.document.theme,
+            glyphs = ?config.document.glyphs,
+            clean_glyph = %glyph_set.clean,
             sets = config.document.sets.len(),
             warnings = config.warnings.len(),
             "config loaded",
