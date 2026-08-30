@@ -87,16 +87,43 @@ pub struct SetConfig {
     pub exclude: Option<Vec<String>>,
 }
 
-/// A `[[repo]]` entry, parsed only enough to prove the document shape. `default_branch` and
-/// `exclude` are a later ticket's schema.
+/// A `[[repo]]` entry: rung 1 of [default-branch.md](../../../../docs/spec/default-branch.md)'s
+/// resolution chain and the exclude flag, matched by git common dir rather than this entry's
+/// own `path` (a Worktree named directly by its own path still beats an entry it would
+/// otherwise inherit; [`repo_overrides`] is where `path` crosses to the core to be resolved).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
     pub path: toml::Spanned<String>,
-    /// Captures every other key so an unimplemented field is never mistaken for an unknown
-    /// one; the schema lands in its own ticket.
-    #[serde(flatten)]
+    // Read only by `repo_overrides` until `Core::start`'s `CoreSpec` assembly lands
+    // in `app.rs`, outside this ticket's owned paths; exercised directly by this
+    // module's own tests in the meantime.
+    #[serde(default)]
     #[allow(dead_code)]
-    pub rest: toml::Table,
+    pub default_branch: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub exclude: bool,
+}
+
+/// Turns the parsed `[[repo]]` entries into the crossing type `Core::start` reads
+/// ([core-api.md](../../../../docs/spec/core-api.md)'s "What crosses from config"), `~`-expanding
+/// `path` the same way every other path in this file is expanded. The core resolves each
+/// `path` to its own git common dir itself, since opening a repository is its own work, not
+/// this crate's.
+///
+/// No caller until `app.rs` assembles a `CoreSpec` from a chosen Set and this document; that
+/// wiring sits outside this ticket's owned paths. Exercised directly by this module's tests.
+#[allow(dead_code)]
+pub fn repo_overrides(document: &Document) -> Vec<repon_core::RepoOverride> {
+    document
+        .repos
+        .iter()
+        .map(|repo| repon_core::RepoOverride {
+            path: expand_home(repo.path.get_ref()),
+            default_branch: repo.default_branch.clone(),
+            excluded: repo.exclude,
+        })
+        .collect()
 }
 
 /// A `[[launcher]]` entry, parsed only enough to prove the document shape. Its fields are a
@@ -633,16 +660,12 @@ mod tests {
         assert_eq!(names, vec!["zeta", "alpha"]);
     }
 
-    // [[repo]], [[launcher]] and [[action]] parse enough to prove the shape without their
-    // own field schemas: a field this ticket does not implement is not an unknown key.
+    // [[launcher]] and [[action]] still only prove the shape without their own field
+    // schemas: a field this ticket does not implement is not an unknown key.
     #[test]
-    fn an_unimplemented_repo_field_is_not_reported_as_an_unknown_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let text = format!(
-            "[[repo]]\npath = \"{}\"\ndefault_branch = \"main\"\n",
-            dir.path().display()
-        );
-        let loaded = parse_ok(&text);
+    fn an_unimplemented_launcher_field_is_not_reported_as_an_unknown_key() {
+        let text = "[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n";
+        let loaded = parse_ok(text);
         assert!(
             !loaded
                 .warnings
@@ -651,6 +674,82 @@ mod tests {
             "expected no unknown-key warnings, got: {:?}",
             loaded.warnings
         );
+    }
+
+    // `[[repo]]`'s real schema: `default_branch` and `exclude` parse as typed fields, with
+    // `exclude` defaulting to `false` when absent.
+    #[test]
+    fn a_repo_entrys_default_branch_and_exclude_parse_with_excludes_stated_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = format!(
+            "[[repo]]\npath = \"{}\"\ndefault_branch = \"main\"\nexclude = true\n\n[[repo]]\npath = \"{}\"\n",
+            dir.path().display(),
+            dir.path().join("other").display()
+        );
+        let loaded = parse_ok(&text);
+
+        assert_eq!(
+            loaded.document.repos[0].default_branch.as_deref(),
+            Some("main")
+        );
+        assert!(loaded.document.repos[0].exclude);
+        // The second entry states neither field: `default_branch` is absent and
+        // `exclude` falls back to its stated default of `false`.
+        assert_eq!(loaded.document.repos[1].default_branch, None);
+        assert!(!loaded.document.repos[1].exclude);
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::UnknownKey(_))),
+            "expected no unknown-key warnings, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // A genuinely unknown `[[repo]]` key still warns now that the real schema is
+    // implemented: there is no more catch-all field standing in for it.
+    #[test]
+    fn a_repo_entrys_actually_unknown_key_still_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = format!(
+            "[[repo]]\npath = \"{}\"\ntypo_field = 1\n",
+            dir.path().display()
+        );
+        let loaded = parse_ok(&text);
+
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::UnknownKey(path) if path.ends_with("typo_field"))),
+            "expected an unknown-key warning for the stray field, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // The seam `Core::start` reads: `repo_overrides` turns the parsed `[[repo]]` entries
+    // into `repon_core::RepoOverride`, `~`-expanding `path` the same way every other path
+    // in this file is expanded.
+    #[test]
+    fn repo_overrides_tilde_expands_the_path_and_carries_default_branch_and_exclude() {
+        let loaded = parse_ok(
+            "[[repo]]\npath = \"~/dev/legacy-api\"\ndefault_branch = \"main\"\n\n[[repo]]\npath = \"/absolute/vendor-mirror\"\nexclude = true\n",
+        );
+
+        let overrides = repo_overrides(&loaded.document);
+
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(
+            overrides[0].path,
+            expand_home("~/dev/legacy-api"),
+            "a `~`-prefixed path must expand the same way every other path in this file does"
+        );
+        assert_eq!(overrides[0].default_branch.as_deref(), Some("main"));
+        assert!(!overrides[0].excluded);
+        assert_eq!(overrides[1].path, PathBuf::from("/absolute/vendor-mirror"));
+        assert_eq!(overrides[1].default_branch, None);
+        assert!(overrides[1].excluded);
     }
 
     // Cross-key check: auto_update.enabled with fetch.enabled = false can never fire.

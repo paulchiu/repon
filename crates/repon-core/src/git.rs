@@ -76,6 +76,18 @@ pub(crate) fn resolve_boundary(path: &Path) -> Result<Resolved, ProbeError> {
     })
 }
 
+/// Opens `path` and returns its git common dir, canonicalized, with nothing else
+/// `resolve_boundary` also reads (Kind, Submodules): a `[[repo]]` override's own
+/// `path` only ever needs this one fact to key its match, per
+/// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries).
+pub(crate) fn common_dir_of(path: &Path) -> Result<Arc<Path>, ProbeError> {
+    let repo = gix::open(path).map_err(|error| ProbeError::Open(error.to_string().into()))?;
+    let common_dir = repo.common_dir();
+    Ok(Arc::from(
+        std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf()),
+    ))
+}
+
 /// Opens `path` as a git repository and hands back the thread-safe form.
 ///
 /// `gix::Repository` holds a `RefCell` free-list of buffers, so it is `Send` but

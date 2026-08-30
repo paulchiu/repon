@@ -163,14 +163,17 @@ impl<T> Cell<T> {
 
     /// Records one probe's result for `generation`; dropped without effect if a
     /// later Generation has already written this cell, which is the write-time half
-    /// of supersession.
-    pub(crate) fn settle(&mut self, generation: Generation, settled: Settled<T>) {
+    /// of supersession. Returns whether the write was applied, which is what lets a
+    /// caller update entity-level diagnostics (not themselves a Cell, so not
+    /// self-superseding) only on the write that actually won.
+    pub(crate) fn settle(&mut self, generation: Generation, settled: Settled<T>) -> bool {
         if generation < self.generation {
-            return;
+            return false;
         }
         self.generation = generation;
         self.settled = Some(settled);
         self.in_flight = false;
+        true
     }
 }
 

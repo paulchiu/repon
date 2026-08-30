@@ -54,6 +54,7 @@ compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
 mod cell;
 mod core;
+mod default_branch;
 mod discovery;
 mod entity;
 mod fanout;

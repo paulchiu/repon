@@ -33,19 +33,85 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, select};
 
 use crate::cell::{Generation, Settled, Timestamp, Unknown};
+use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{EntityKey, EntityState, Head, Kind};
 use crate::git;
 use crate::snapshot::Snapshot;
 
 /// One Repo's config-level override, crossing from the consumer as plain data: no
-/// TOML type, no file path. [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)
-/// owns parsing it; the core only ever receives the result.
+/// TOML type, no `~` expansion left undone. [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)
+/// owns parsing it; the core only ever receives the result, and resolves `path` to
+/// the git common dir itself, since opening a repository is the core's own work.
+///
+/// This amends `docs/spec/core-api.md`'s literal `RepoOverride { common_dir, .. }`
+/// snippet: matching by common dir alone cannot express "a Worktree named by its
+/// own path beats the entry it inherits" from a common dir shared with its parent
+/// Repo, since both would carry the identical common dir. `path` is what lets a
+/// match against an entity's own path outrank one only reached by a shared common
+/// dir; see [`find_override`].
 #[derive(Debug, Clone)]
 pub struct RepoOverride {
-    pub common_dir: PathBuf,
+    pub path: PathBuf,
     pub default_branch: Option<String>,
     pub excluded: bool,
+}
+
+/// A [`RepoOverride`] with its common dir already resolved, built once at
+/// `Core::start` rather than on every match.
+#[derive(Debug, Clone)]
+struct ResolvedOverride {
+    path: PathBuf,
+    common_dir: PathBuf,
+    default_branch: Option<String>,
+    excluded: bool,
+}
+
+/// Opens every override's own `path` to learn its common dir, silently dropping
+/// one that will not even open: a path that matches no discovered entity already
+/// gets its own warning on the consumer's side
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#cross-key-validity)),
+/// and the core raises no second one for the same fact.
+fn resolve_overrides(overrides: &[RepoOverride]) -> Vec<ResolvedOverride> {
+    overrides
+        .iter()
+        .filter_map(|entry| {
+            let common_dir = git::common_dir_of(&entry.path).ok()?;
+            Some(ResolvedOverride {
+                path: entry.path.clone(),
+                common_dir: common_dir.to_path_buf(),
+                default_branch: entry.default_branch.clone(),
+                excluded: entry.excluded,
+            })
+        })
+        .collect()
+}
+
+/// The entry that applies to an entity at `path` sharing `common_dir`: one naming
+/// `path` itself, or else the first declared entry sharing `common_dir`, which is
+/// what lets one entry cover a Repo and every Worktree attached to it while a
+/// Worktree named directly by its own path still beats the entry it would
+/// otherwise inherit ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)).
+///
+/// A consequence worth stating rather than working around here: a Submodule's own
+/// common dir (`<parent common dir>/modules/<name>`, per `discovery.rs`'s
+/// `resolve`) is never equal to its parent's, so one entry naming the parent's path
+/// can never also exclude the parent's Submodules. The documented workaround is a
+/// Set's own `exclude` glob over the subtree, which keeps the Submodule out of
+/// discovery entirely rather than merely marking it excluded here.
+fn find_override<'a>(
+    overrides: &'a [ResolvedOverride],
+    path: &Path,
+    common_dir: &Path,
+) -> Option<&'a ResolvedOverride> {
+    overrides
+        .iter()
+        .find(|entry| entry.path == path)
+        .or_else(|| {
+            overrides
+                .iter()
+                .find(|entry| entry.common_dir == common_dir)
+        })
 }
 
 /// Everything `Core::start` needs, handed as plain data. The core reads no file, no
@@ -103,6 +169,11 @@ enum ClockControl {
 /// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause` and `resume`.
 pub struct Core {
     table: Arc<RwLock<Table>>,
+    /// Resolved once at `start` and never mutated afterwards: overrides only
+    /// change on a config reload, which re-derives a whole new `Core`
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#reload)
+    /// is later work).
+    overrides: Arc<Vec<ResolvedOverride>>,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
@@ -156,6 +227,7 @@ impl Core {
                 },
             );
             table.entities[idx].branch.begin_probe();
+            table.entities[idx].default_branch.begin_probe();
             dispatched.push((key.clone(), cancel));
         }
 
@@ -171,15 +243,39 @@ impl Core {
             .iter()
             .map(|(key, _)| table.repos.get(key).cloned())
             .collect();
+        let override_branches: Vec<Option<String>> = dispatched
+            .iter()
+            .map(|(key, _)| {
+                let idx = table.index[key];
+                let common_dir = &table.entities[idx].common_dir;
+                find_override(&self.overrides, key.path(), common_dir)
+                    .and_then(|entry| entry.default_branch.clone())
+            })
+            .collect();
         drop(table);
 
-        for ((key, cancel), repo) in dispatched.into_iter().zip(repos) {
+        for (((key, cancel), repo), override_branch) in
+            dispatched.into_iter().zip(repos).zip(override_branches)
+        {
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
             let settle_gate = Arc::clone(&self.settle_gate);
             rayon::spawn(move || {
-                let outcome = probe_branch(&path, repo.as_deref(), &cancel);
-                apply_probe_outcome(&table_handle, &settle_gate, key, generation, outcome);
+                let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
+                let default_branch_outcome = probe_default_branch(
+                    &path,
+                    repo.as_deref(),
+                    override_branch.as_deref(),
+                    &cancel,
+                );
+                apply_probe_outcome(
+                    &table_handle,
+                    &settle_gate,
+                    key,
+                    generation,
+                    branch_outcome,
+                    default_branch_outcome,
+                );
             });
         }
 
@@ -192,11 +288,27 @@ impl Core {
     /// caller can otherwise only reach this with a key `snapshot` just handed it.
     pub fn probe_now(&self, key: &EntityKey) -> EntityState {
         let never_cancelled = AtomicBool::new(false);
-        let cached_repo = {
+        let (cached_repo, common_dir_hint) = {
             let table = self.table.read().unwrap();
-            table.repos.get(key).cloned()
+            let repo = table.repos.get(key).cloned();
+            let common_dir = table
+                .index
+                .get(key)
+                .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
+            (repo, common_dir)
         };
-        let outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
+        let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
+        let override_branch = matched.and_then(|entry| entry.default_branch.clone());
+        let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
+
+        let branch_outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let default_branch_outcome = probe_default_branch(
+            key.path(),
+            cached_repo.as_deref(),
+            override_branch.as_deref(),
+            &never_cancelled,
+        );
 
         let mut table = self.table.write().unwrap();
         let generation = Generation::new(table.generation);
@@ -204,17 +316,31 @@ impl Core {
             Some(idx) => idx,
             None => {
                 let name = display_name(key.path());
-                let common_dir: Arc<Path> = Arc::from(key.path().join(".git"));
-                table
-                    .entities
-                    .push(EntityState::new(key.clone(), name, common_dir, Kind::Repo));
+                table.entities.push(EntityState::new(
+                    key.clone(),
+                    name,
+                    common_dir_hint,
+                    Kind::Repo,
+                ));
                 let idx = table.entities.len() - 1;
                 table.index.insert(key.clone(), idx);
                 idx
             }
         };
-        if let Some(settled) = outcome {
+        table.entities[idx].excluded = excluded;
+        if let Some(settled) = branch_outcome {
             table.entities[idx].branch.settle(generation, settled);
+        }
+        if let Some(resolution) = default_branch_outcome {
+            let applied = table.entities[idx]
+                .default_branch
+                .settle(generation, resolution.settled);
+            if applied {
+                table.entities[idx].diagnostics.default_branch_rung = Some(resolution.rung);
+                table.entities[idx]
+                    .diagnostics
+                    .default_branch_rung_disagreement = resolution.disagreement;
+            }
         }
         table.entities[idx].clone()
     }
@@ -403,6 +529,7 @@ impl Core {
             key.clone(),
             generation,
             Some(settled),
+            None,
         );
     }
 }
@@ -439,6 +566,7 @@ fn start_internal(
     // its Submodules. One combined list, with nothing recording which half
     // produced a given entry.
     let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
+    let overrides = Arc::new(resolve_overrides(&spec.overrides));
 
     let mut entities = Vec::with_capacity(discovered.len());
     let mut index = HashMap::with_capacity(discovered.len());
@@ -448,13 +576,19 @@ fn start_internal(
         if let Some(repo) = discovered.repo {
             repos.insert(discovered.key.clone(), repo);
         }
-        index.insert(discovered.key.clone(), entities.len());
-        entities.push(EntityState::new(
-            discovered.key,
+        let mut entity = EntityState::new(
+            discovered.key.clone(),
             name,
-            discovered.common_dir,
+            Arc::clone(&discovered.common_dir),
             discovered.kind,
-        ));
+        );
+        if let Some(matched) =
+            find_override(&overrides, discovered.key.path(), &discovered.common_dir)
+        {
+            entity.excluded = matched.excluded;
+        }
+        index.insert(discovered.key, entities.len());
+        entities.push(entity);
     }
     for (key, message) in gitmodules_failures {
         if let Some(&idx) = index.get(&key) {
@@ -486,6 +620,7 @@ fn start_internal(
     StartForTest {
         core: Core {
             table,
+            overrides,
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
@@ -581,6 +716,9 @@ fn sweep_deadline(
             table.entities[idx]
                 .branch
                 .settle(*generation, Settled::Unknown(Unknown::TimedOut));
+            table.entities[idx]
+                .default_branch
+                .settle(*generation, Settled::Unknown(Unknown::TimedOut));
         }
         table.in_flight.remove(key);
     }
@@ -648,24 +786,70 @@ fn probe_branch(
     })
 }
 
-/// Lands one probe's outcome for `key` at `generation`: writes it to the branch
-/// cell subject to the per-cell supersession `Cell::settle` already enforces,
-/// clears `key` from the table's in-flight set and signals `settle_gate`. The one
-/// place a dispatched probe's result and a test's simulated late result both go
-/// through, so a test can land a result out of order without duplicating this
-/// bookkeeping.
+/// Runs the four-rung default branch chain against `path`, or `None` if `cancel`
+/// was already set before the read started. `override_branch` is rung 1's
+/// config-supplied value, already matched by common dir before this is called.
+///
+/// `repo` follows the same cached-handle convention as [`probe_branch`]: `None`
+/// falls back to opening fresh, which is where an unreadable repository surfaces
+/// as [`default_branch::Resolution::failed`] rather than a settled Unknown.
+fn probe_default_branch(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    override_branch: Option<&str>,
+    cancel: &AtomicBool,
+) -> Option<default_branch::Resolution> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(default_branch::Resolution::failed(error)),
+        },
+    };
+    Some(default_branch::resolve(
+        &repo.to_thread_local(),
+        override_branch,
+    ))
+}
+
+/// Lands one probe's combined outcome for `key` at `generation`: writes the branch
+/// and default-branch cells subject to the per-cell supersession `Cell::settle`
+/// already enforces, records the default-branch diagnostics only on the write that
+/// actually won, clears `key` from the table's in-flight set and signals
+/// `settle_gate` once for the whole entity. The one place a dispatched probe's
+/// result and a test's simulated late result both go through, so a test can land a
+/// result out of order without duplicating this bookkeeping.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
     settle_gate: &Arc<(Mutex<usize>, Condvar)>,
     key: EntityKey,
     generation: Generation,
-    outcome: Option<Settled<Head>>,
+    branch_outcome: Option<Settled<Head>>,
+    default_branch_outcome: Option<default_branch::Resolution>,
 ) {
     let mut table = table.write().unwrap();
-    if let Some(settled) = outcome
-        && let Some(&idx) = table.index.get(&key)
-    {
-        table.entities[idx].branch.settle(generation, settled);
+    if let Some(&idx) = table.index.get(&key) {
+        if let Some(settled) = branch_outcome {
+            table.entities[idx].branch.settle(generation, settled);
+        }
+        if let Some(resolution) = default_branch_outcome {
+            let applied = table.entities[idx]
+                .default_branch
+                .settle(generation, resolution.settled);
+            if applied {
+                table.entities[idx].diagnostics.default_branch_rung = Some(resolution.rung);
+                table.entities[idx]
+                    .diagnostics
+                    .default_branch_rung_disagreement = resolution.disagreement;
+            }
+        }
     }
     table.in_flight.remove(&key);
     drop(table);
@@ -1723,6 +1907,310 @@ mod tests {
             percentile(&durations, 50),
             percentile(&durations, 90),
             durations.last().copied().unwrap_or_default(),
+        );
+    }
+
+    /// Runs `git` against `path` with a fixed identity, matching every other test
+    /// module's own helper of the same shape.
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn head_sha(path: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string()
+    }
+
+    fn spec_with_overrides(roots: Vec<PathBuf>, overrides: Vec<RepoOverride>) -> CoreSpec {
+        let mut spec = spec(roots);
+        spec.overrides = overrides;
+        spec
+    }
+
+    /// The seam this proves: an explicit per-Repo override reaches all the way
+    /// through `Core::refresh` and `settle` into the `default_branch` cell as
+    /// rung 1, recorded in diagnostics, even though `origin/HEAD` and the name
+    /// list would both answer differently if asked.
+    #[test]
+    fn a_per_repo_override_resolves_the_default_branch_at_rung_one_through_a_real_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(&repo);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        let remote_refs_dir = repo
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin");
+        fs::create_dir_all(&remote_refs_dir).expect("create refs/remotes/origin dir");
+        fs::write(
+            remote_refs_dir.join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .expect("write HEAD");
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: repo.clone(),
+                default_branch: Some("develop".to_string()),
+                excluded: false,
+            }],
+        ));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        match entity.default_branch.settled() {
+            Some(Settled::Known { value, .. }) => assert_eq!(
+                value.name(),
+                "origin/develop",
+                "the override must win even though origin/HEAD names a different branch"
+            ),
+            other => panic!("expected the override's own answer, got {other:?}"),
+        }
+        assert_eq!(
+            entity.diagnostics.default_branch_rung,
+            Some(1),
+            "an override must be recorded as rung 1"
+        );
+    }
+
+    /// `probe_now`'s synchronous path carries the same override wiring as
+    /// `refresh`, proven directly since a Launcher return uses it without ever
+    /// calling `refresh` first.
+    #[test]
+    fn a_per_repo_override_also_resolves_through_probe_now() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: repo.clone(),
+                default_branch: Some("release".to_string()),
+                excluded: false,
+            }],
+        ));
+        let key = core.snapshot().entities[0].key.clone();
+
+        let entity = core.probe_now(&key);
+
+        match entity.default_branch.settled() {
+            // No remote at all: the override still answers, using the bare name.
+            Some(Settled::Known { value, .. }) => assert_eq!(value.name(), "release"),
+            other => panic!("expected the override's own answer, got {other:?}"),
+        }
+        assert_eq!(entity.diagnostics.default_branch_rung, Some(1));
+    }
+
+    /// A Repo with no override and no resolvable remote reaches rung 4: Unknown,
+    /// never Failed, which stays reserved for a git error.
+    #[test]
+    fn a_repo_with_nothing_to_resolve_settles_unknown_never_failed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_millis(500));
+        let entity = &settled.entities[0];
+
+        assert!(matches!(
+            entity.default_branch.settled(),
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
+        ));
+        assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
+    }
+
+    /// The defining behaviour for per-Repo matching: one `[[repo]]` entry naming
+    /// only the parent Repo's own path still applies to a linked Worktree sharing
+    /// its common dir, proven against a real `git worktree add` rather than a
+    /// hand-built stand-in for the on-disk relationship.
+    #[test]
+    fn one_override_on_a_repos_path_covers_a_worktree_sharing_its_common_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree = root.join("worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: parent.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let snapshot = core.snapshot();
+
+        for entity in &snapshot.entities {
+            assert!(
+                entity.excluded,
+                "both the Repo and its Worktree must inherit the entry declared on the Repo's own path, entity: {:?}",
+                entity.key
+            );
+        }
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "expected the parent plus its worktree"
+        );
+    }
+
+    /// The other direction: an entry naming a Worktree's own path beats the entry
+    /// it would otherwise inherit from the Repo it shares a common dir with, while
+    /// a second Worktree with no entry of its own still inherits the Repo's entry.
+    #[test]
+    fn an_entry_naming_a_worktrees_own_path_beats_the_inherited_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree_own = root.join("worktree-own");
+        let worktree_inherits = root.join("worktree-inherits");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-own",
+                worktree_own.to_str().expect("utf8 path"),
+            ],
+        );
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-inherits",
+                worktree_inherits.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![
+                RepoOverride {
+                    path: parent.clone(),
+                    default_branch: None,
+                    excluded: true,
+                },
+                RepoOverride {
+                    path: worktree_own.clone(),
+                    default_branch: None,
+                    excluded: false,
+                },
+            ],
+        ));
+        let snapshot = core.snapshot();
+
+        let find = |path: &Path| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == path)
+                .unwrap_or_else(|| panic!("entity at {path:?} present"))
+        };
+
+        assert!(
+            find(&parent).excluded,
+            "the parent Repo has no entry of its own and inherits the excluding one"
+        );
+        assert!(
+            !find(&worktree_own).excluded,
+            "the Worktree named directly by its own path must use its own entry, not the inherited one"
+        );
+        assert!(
+            find(&worktree_inherits).excluded,
+            "a sibling Worktree with no entry of its own still inherits the Repo's entry"
+        );
+    }
+
+    /// A Submodule's own common dir differs from its parent's
+    /// (`<parent common dir>/modules/<name>`), so an entry naming only the
+    /// parent's path can never also exclude the parent's Submodule: the entry
+    /// covers the parent and its Worktrees, never a Submodule reached through it.
+    #[test]
+    fn an_override_on_the_parents_path_never_excludes_its_submodule() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: parent.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let snapshot = core.snapshot();
+
+        let submodule = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("the submodule is still discovered and listed");
+        assert!(
+            !submodule.excluded,
+            "an entry naming only the parent's path must never reach a Submodule, \
+             whose own common dir differs from its parent's"
         );
     }
 }

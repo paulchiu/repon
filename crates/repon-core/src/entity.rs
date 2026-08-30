@@ -141,6 +141,12 @@ pub struct EntityState {
     pub diagnostics: Diagnostics,
     pub last_action: Option<ActionRun>,
     pub presence: Presence,
+    /// Listed, never operated on, per a matching `[[repo]]` entry's `exclude = true`
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)).
+    /// Distinct from a Set's exclude glob, which keeps an entity out of discovery
+    /// entirely: an excluded entity is still a row here, still selectable, and this
+    /// is the fact a row count or a confirm gate subtracts it against.
+    pub excluded: bool,
 }
 
 impl EntityState {
@@ -164,6 +170,7 @@ impl EntityState {
             diagnostics: Diagnostics::default(),
             last_action: None,
             presence: Presence::default(),
+            excluded: false,
         };
 
         if matches!(entity.kind, Kind::Submodule) {
