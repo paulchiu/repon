@@ -970,6 +970,7 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{production_source_at, rust_source_files};
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1306,29 +1307,6 @@ mod tests {
 
     // --- the table is the only place a default binding is written down ---
 
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("read a source directory") {
-            let path = entry.expect("read a directory entry").path();
-            if path.is_dir() {
-                files.extend(rust_source_files(&path));
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-        files
-    }
-
-    /// A file's production half only: everything before the line that is exactly the
-    /// `#[cfg(test)]` attribute directly ahead of `mod tests`. Cuts at the trailing tests
-    /// module rather than the first `#[cfg(test)]`, since a doc comment can name the
-    /// attribute in prose or a lone item can be test-gated ahead of the module; a file with
-    /// no such module is scanned whole.
-    fn production_source_at(path: &std::path::Path) -> String {
-        production_source(&std::fs::read_to_string(path).expect("read a crate source file"))
-    }
-
     /// This module is the only place a `KeyCode` or `KeyModifiers` literal may appear as
     /// part of a binding; everywhere a binding is meant, code must go through [`dispatch`].
     /// Scans every source file's production half under `src` except this one, so a binding
@@ -1367,54 +1345,6 @@ mod tests {
 
     // --- no per-binding disabled-reason mechanism exists ---
 
-    /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than the first
-    /// `#[cfg(test)]`, since a file may gate a single item on it too (this file's own doc
-    /// comment below names that literal well before its own tests module starts). A file
-    /// with no such module is scanned whole: both fallbacks can only over-report, never let
-    /// a violation through.
-    fn production_source(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let tests_module = lines.iter().enumerate().position(|(index, line)| {
-            line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
-        });
-        let mut production = String::new();
-        for (index, line) in lines.iter().enumerate() {
-            if Some(index) == tests_module {
-                break;
-            }
-            production.push_str(line);
-            production.push('\n');
-        }
-        production
-    }
-
-    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
-    /// there, or every real production line after it goes unscanned.
-    #[test]
-    fn production_source_reads_past_a_test_only_item_to_the_tests_module() {
-        let source = "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
-                       #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n";
-        let production = production_source(source);
-        assert!(
-            production.contains("real_production"),
-            "a test-only item must not cut the scan short of real production code"
-        );
-        assert!(
-            !production.contains("inside_the_tests_module"),
-            "the trailing tests module must still be excluded"
-        );
-    }
-
-    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
-    /// rather than skipping a file the ban applies to.
-    #[test]
-    fn production_source_scans_a_file_with_no_tests_module_whole() {
-        assert!(production_source("fn real_production() {}\n").contains("real_production"));
-    }
-
     /// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md) rejects
     /// the mechanism lazygit calls `Get` + `DisabledReason`: a way to hide a binding at
     /// runtime is what makes `?` vanish from a popup context in the tool this is modelled
@@ -1433,8 +1363,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            let source = production_source(&source);
+            let source = production_source_at(&path);
             for (number, line) in source.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;

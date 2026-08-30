@@ -462,6 +462,7 @@ mod tests {
     use std::{collections::HashMap, path::Path, str::FromStr};
 
     use super::*;
+    use crate::test_support::{production_source_at, rust_source_files};
 
     /// Exhaustive with no wildcard arm: a `Color` variant this doesn't name (`Rgb`,
     /// `Indexed`) falls to the second arm and reports `false`, and a future ratatui
@@ -777,88 +778,6 @@ mod tests {
         );
     }
 
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_source_files(dir: &Path) -> Vec<std::path::PathBuf> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("read a source directory") {
-            let path = entry.expect("read a directory entry").path();
-            if path.is_dir() {
-                files.extend(rust_source_files(&path));
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-        files
-    }
-
-    /// A file's production half only: everything before the line that is exactly the
-    /// `#[cfg(test)]` attribute, not merely a line that mentions it (a doc comment naming
-    /// the attribute in prose, as several in this very file do, must not count). The two
-    /// absence scans below name the very words they must not find in production code inside
-    /// their own `#[cfg(test)]` module (this file included), so scanning whole files would
-    /// make the scan fail on itself; this is what the `gix_interrupt_is_interrupted_is_never_used`
-    /// precedent in `repon-core` solves with string concatenation instead, which does not
-    /// scale to a list of a dozen banned words here.
-    ///
-    /// Cuts at the trailing tests module rather than at the first `#[cfg(test)]`, since a
-    /// file may gate a single item on it too. A file without that module is scanned whole:
-    /// both fallbacks can only over-report, never let a real violation through.
-    fn production_source(path: &Path) -> String {
-        let source = std::fs::read_to_string(path).expect("read a crate source file");
-        let lines: Vec<&str> = source.lines().collect();
-        let tests_module = lines.iter().enumerate().position(|(index, line)| {
-            line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
-        });
-        let mut production = String::new();
-        for (index, line) in lines.iter().enumerate() {
-            if Some(index) == tests_module {
-                break;
-            }
-            production.push_str(line);
-            production.push('\n');
-        }
-        production
-    }
-
-    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
-    /// there, or every real production line after it goes unscanned.
-    #[test]
-    fn production_source_reads_past_a_test_only_item_to_the_tests_module() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("gated_item_then_tests.rs");
-        std::fs::write(
-            &file,
-            "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
-             #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n",
-        )
-        .expect("write the fixture file");
-
-        let production = production_source(&file);
-
-        assert!(
-            production.contains("real_production"),
-            "a test-only item must not cut the scan short of real production code"
-        );
-        assert!(
-            !production.contains("inside_the_tests_module"),
-            "the trailing tests module must still be excluded"
-        );
-    }
-
-    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
-    /// rather than skipping a file the ban applies to.
-    #[test]
-    fn production_source_scans_a_file_with_no_tests_module_whole() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("no_tests_module.rs");
-        std::fs::write(&file, "fn real_production() {}\n").expect("write the fixture file");
-
-        assert!(production_source(&file).contains("real_production"));
-    }
-
     /// theming.md and ADR 0011: no bundled third-party palette, and no paired light/dark
     /// variant. Scans this crate's own source for the tells a ported palette or a pairing
     /// mechanism would leave: a well-known palette's name, or the `theme_dark`/`theme_light`
@@ -882,7 +801,7 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = production_source(&path).to_lowercase();
+            let source = production_source_at(&path).to_lowercase();
             for needle in banned {
                 if source.contains(needle) {
                     offending.push(format!("{}: {needle}", path.display()));
@@ -907,7 +826,7 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = production_source(&path).to_lowercase();
+            let source = production_source_at(&path).to_lowercase();
             if osc_11_needles.iter().any(|needle| source.contains(needle))
                 || source.contains("colorsaurus")
             {
@@ -942,7 +861,7 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = production_source(&path).to_lowercase();
+            let source = production_source_at(&path).to_lowercase();
             if needles
                 .iter()
                 .any(|needle| source.contains(needle.as_str()))

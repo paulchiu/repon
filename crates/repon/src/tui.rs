@@ -264,6 +264,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
+    use crate::test_support::rust_source_files;
 
     /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
     /// an expectation here comes from crossterm's own encoding rather than a hand-copied
@@ -322,20 +323,6 @@ mod tests {
                 "a {kind:?} key event must not reach dispatch"
             );
         }
-    }
-
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("read a source directory") {
-            let path = entry.expect("read a directory entry").path();
-            if path.is_dir() {
-                files.extend(rust_source_files(&path));
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-        files
     }
 
     /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-suspending-confirming):

@@ -579,57 +579,10 @@ mod tests {
 
     // --- absences the ADR names by name ---
 
-    /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than the first
-    /// `#[cfg(test)]`, since a file may gate a single item on it too. A file with no such
-    /// module is scanned whole: both fallbacks can only over-report, never let a violation
-    /// through.
-    fn cut_before_tests_module(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let tests_module = lines.iter().enumerate().position(|(index, line)| {
-            line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
-        });
-        let mut production = String::new();
-        for (index, line) in lines.iter().enumerate() {
-            if Some(index) == tests_module {
-                break;
-            }
-            production.push_str(line);
-            production.push('\n');
-        }
-        production
-    }
-
-    /// This file's own production source, up to its trailing tests module: reused by both
-    /// scans below so each states one absence claim rather than re-reading the file.
+    /// This file's own production source, up to its tests module: reused by both scans below
+    /// so each states one absence claim rather than re-reading the file.
     fn production_source() -> String {
-        cut_before_tests_module(include_str!("footer.rs"))
-    }
-
-    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
-    /// there, or every real production line after it goes unscanned.
-    #[test]
-    fn cut_before_tests_module_reads_past_a_test_only_item_to_the_tests_module() {
-        let source = "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
-                       #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n";
-        let production = cut_before_tests_module(source);
-        assert!(
-            production.contains("real_production"),
-            "a test-only item must not cut the scan short of real production code"
-        );
-        assert!(
-            !production.contains("inside_the_tests_module"),
-            "the trailing tests module must still be excluded"
-        );
-    }
-
-    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
-    /// rather than skipping a file the ban applies to.
-    #[test]
-    fn cut_before_tests_module_scans_a_file_with_no_tests_module_whole() {
-        assert!(cut_before_tests_module("fn real_production() {}\n").contains("real_production"));
+        crate::test_support::production_source(include_str!("footer.rs"))
     }
 
     /// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md) names

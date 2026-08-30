@@ -22,11 +22,13 @@ pub(crate) fn rust_source_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than at the first
 /// `#[cfg(test)]`, since a doc comment can name that attribute in prose and a lone item can
-/// be test-gated ahead of the module. A file with no such module is scanned whole: both
-/// fallbacks can only over-report, never let a violation through.
+/// be test-gated ahead of the module. Finds the *last* such line for the same reason: a file
+/// that ever gains a test-gated module ahead of its main one must still cut at the real tests
+/// module, not the earlier one. A file with no such module is scanned whole: both fallbacks
+/// can only over-report, never let a violation through.
 pub(crate) fn production_source(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
-    let tests_module = lines.iter().enumerate().position(|(index, line)| {
+    let tests_module = lines.iter().enumerate().rposition(|(index, line)| {
         line.trim() == "#[cfg(test)]"
             && lines
                 .get(index + 1)
@@ -70,6 +72,25 @@ mod tests {
         let source = "fn only_production() {}\n";
 
         assert!(production_source(source).contains("fn only_production"));
+    }
+
+    /// The cut finds the *last* `#[cfg(test)] mod tests` line, not the first: a file that
+    /// gains a test-gated module ahead of its main one must still be scanned up to the real
+    /// tests module rather than truncated at the earlier one. No file in this crate has two
+    /// such modules today, so this is a specification test for the doc comment's claim.
+    #[test]
+    fn production_source_cuts_at_the_trailing_tests_module_when_a_file_has_two() {
+        let source = "#[cfg(test)]\nmod tests {\n    fn first_module() {}\n}\n\n\
+                      fn real_production() {}\n\n\
+                      #[cfg(test)]\nmod tests {\n    fn second_module() {}\n}\n";
+
+        let production = production_source(source);
+
+        assert!(
+            production.contains("fn first_module") && production.contains("fn real_production"),
+            "everything up to the real, trailing tests module counts as production"
+        );
+        assert!(!production.contains("fn second_module"));
     }
 
     /// The defect this module exists to prevent, pinned to the file that actually triggered
@@ -159,6 +180,107 @@ mod tests {
             offending_locations.is_empty(),
             "found the naive `#[cfg(test)]` split this ticket replaced with \
              `production_source_at`, at: {offending_locations:?}"
+        );
+    }
+
+    /// The comparison [`production_source`]'s cut is built on: a trimmed line checked against
+    /// the `#[cfg(test)]` attribute. Fragmented so this needle is never a self-match;
+    /// [`production_source`]'s own line writes the pieces out directly rather than through
+    /// `format!`.
+    fn tests_module_cut_comparison_needle() -> String {
+        format!("{}() == \"{}{}{}\"", "trim", "#[cfg(", "test", ")]")
+    }
+
+    /// Every line in `source` shaped like a second definition of [`production_source`]'s cut,
+    /// comment lines excluded. This crate accumulated three copies of that cut
+    /// (`production_source` in `keys.rs` and `theme.rs`, `cut_before_tests_module` in
+    /// `footer.rs`) before this module existed, each under a different name, so a guard keyed
+    /// to a name would have missed the fourth; this matches the comparison itself instead.
+    fn lines_shaped_like_the_tests_module_cut(source: &str) -> Vec<usize> {
+        let needle = tests_module_cut_comparison_needle();
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains(&needle))
+            .map(|(index, _)| index + 1)
+            .collect()
+    }
+
+    /// Proves the mechanism before trusting it over the crate: a reintroduction under a brand
+    /// new name must still be caught, since a name is exactly what the last three copies did
+    /// not have in common.
+    #[test]
+    fn the_scan_would_catch_a_reintroduction_of_the_tests_module_cut_under_a_new_name() {
+        let offender = format!(
+            "fn a_totally_new_name_for_the_same_cut(line: &str) -> bool {{\n    line.{}\n}}\n",
+            tests_module_cut_comparison_needle()
+        );
+
+        assert_eq!(lines_shaped_like_the_tests_module_cut(&offender), vec![2]);
+    }
+
+    /// The species this ticket closes: three copies of [`production_source`]'s cut, each
+    /// under a different name, before this module existed to hold the one true
+    /// implementation. Every other file in the crate must stay free of the shape, not just
+    /// the three retired names; `test_support.rs` itself is the one legitimate owner and is
+    /// excluded rather than expected to match exactly once, since its own tests build the
+    /// comparison out of fragments and a literal match count would be an implementation
+    /// detail of this file, not a fact about the rest of the crate.
+    ///
+    /// Scoped to `src`, the same as [`the_naive_cfg_test_cut_never_reappears_in_this_crates_source`]:
+    /// `crates/repon/tests/config_reload_paths.rs` is a separate crate that cannot see this
+    /// `#[cfg(test)]`-gated module and keeps its own file-walker for that reason (documented
+    /// on its own copy), which this scan tolerates by never reading outside `src` at all.
+    #[test]
+    fn no_second_definition_of_the_tests_module_cut_exists_anywhere_in_this_crates_source() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "test_support.rs")
+            {
+                continue;
+            }
+            let whole = std::fs::read_to_string(&path).expect("read a crate source file");
+            for line_number in lines_shaped_like_the_tests_module_cut(&whole) {
+                offending_locations.push(format!("{}:{}", path.display(), line_number));
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "found a second definition of the tests-module cut, by shape rather than by one \
+             of the three names this ticket retired, at: {offending_locations:?}"
+        );
+    }
+
+    /// The criterion this ticket exists to satisfy: consolidating every scan onto
+    /// [`rust_source_files`] and [`production_source_at`] must not narrow what either one
+    /// reads. Every scan in this crate now shares these two functions, so proving their
+    /// combined read here proves it for all of them at once. A pinned exact count would go
+    /// stale on every ordinary edit; a lower bound well below the count measured when this
+    /// ticket started (21 files, 5,050 production lines) stays green through ordinary growth
+    /// while still failing on a truncation the size of the one this ticket's history records:
+    /// `theme.rs` alone cut to six lines would drop the total by several hundred.
+    #[test]
+    fn rust_source_files_and_production_source_at_together_read_the_full_crate_source() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_source_files(&manifest_dir.join("src"));
+        let total_production_lines: usize = files
+            .iter()
+            .map(|path| production_source_at(path).lines().count())
+            .sum();
+
+        assert!(
+            files.len() >= 20,
+            "expected at least the 21 files measured when this ticket started, found {}",
+            files.len()
+        );
+        assert!(
+            total_production_lines >= 4_800,
+            "expected at least (a lower bound under) the 5,050 production lines measured \
+             when this ticket started, found {total_production_lines}; a lower count means a \
+             scan's input shrank"
         );
     }
 }
