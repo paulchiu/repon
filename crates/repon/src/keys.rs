@@ -1,11 +1,6 @@
-//! The one compiled binding table, and the context-gated dispatch seam over it.
-//!
-//! Every default key Repon responds to is declared exactly once, in [`BINDINGS`] below,
-//! and [`dispatch`] is the only function that turns a key event into an
-//! [`Action`]. Nothing else in this crate may match a [`KeyCode`] or [`KeyModifiers`]
-//! literal; a test at the bottom of this file scans the rest of the crate's source to hold
-//! that. The full map is [keybindings.md](../../../../docs/spec/keybindings.md); this table
-//! restates it in code and nowhere else.
+//! The one compiled binding table ([`BINDINGS`]), and [`dispatch`], the only function that
+//! turns a key event into an [`Action`]. Restates
+//! [keybindings.md](../../../../docs/spec/keybindings.md) in code so the two never drift apart.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -92,20 +87,77 @@ pub(crate) enum Action {
     Decline,
 }
 
-/// One row of the compiled table: a context, the chord that fires in it, the action it
-/// fires, and the spec's own words for that action. A tuple rather than a named struct so
-/// that the description, read only by this module's own spec-conformance test, does not
-/// sit in production code as a struct field nothing there reads.
-type Binding = (Context, KeyCode, KeyModifiers, Action, &'static str);
+/// One row of the compiled table: a context, the chord that fires in it, and the action it
+/// fires.
+type Binding = (Context, KeyCode, KeyModifiers, Action);
 
 const fn binding(
     context: Context,
     code: KeyCode,
     modifiers: KeyModifiers,
     action: Action,
-    description: &'static str,
 ) -> Binding {
-    (context, code, modifiers, action, description)
+    (context, code, modifiers, action)
+}
+
+/// The spec's own words for an action, used only by this module's spec-conformance test.
+/// Deriving it from the [`Action`] rather than storing it per row means a mislabelled
+/// binding permutes its description too, so the conformance test cannot pass on one.
+#[cfg(test)]
+fn description(action: Action) -> &'static str {
+    match action {
+        Action::OpenHelp => "Open the help overlay",
+        Action::Quit => "Quit",
+        Action::Suspend => "Suspend",
+        Action::OpenLauncher => "Open the Launcher palette",
+        Action::OpenActionPalette => "Open the Action palette",
+        Action::EnterFilter => "Enter a Filter",
+        Action::RefreshAll => "Refresh everything",
+        Action::RefreshSelection => "Refresh the Selection",
+        Action::RederiveDefaultBranches => "Re-derive default branches over the Selection",
+        Action::ExpandWarning => "Expand the warning slot",
+        Action::OpenSetPicker => "Open the Set picker",
+        Action::SwitchToSet(_) => "Switch to the Nth declared Set",
+        Action::ReloadConfig => "Reload config",
+        Action::MoveFocusBetweenListAndDetail => "Move focus between list and detail",
+        Action::Unwind => "Unwind one level",
+        Action::MoveDown => "Move down",
+        Action::MoveUp => "Move up",
+        Action::FirstRow => "First row",
+        Action::LastRow => "Last row",
+        Action::HalfPageDown => "Half page down",
+        Action::HalfPageUp => "Half page up",
+        Action::ToggleSelection => "Toggle this row's Selection",
+        Action::AnchorRange => "Anchor a range at the cursor, extended with `j` and `k`",
+        Action::SelectAllVisible => "Select every visible row",
+        Action::ClearSelection => "Clear the Selection",
+        Action::OpenDetail => "Open the detail pane",
+        Action::DismissVanished => "Dismiss a Vanished row",
+        Action::NextFailed => "Next row whose last Action failed",
+        Action::PreviousFailed => "Previous row whose last Action failed",
+        Action::ScrollDown => "Scroll down",
+        Action::ScrollUp => "Scroll up",
+        Action::Top => "Top",
+        Action::Bottom => "Bottom",
+        Action::ClosePane => "Close the pane and return focus to the list",
+        Action::ReturnFocusToList => "Return focus to the list and leave the pane open",
+        Action::Text(_) => "Text",
+        Action::Apply => {
+            "Apply the Filter, or run the highlighted entry. In the Filter line it **always** \
+             commits and never accepts a completion ([filter.md](filter.md))"
+        }
+        Action::Cancel => "Cancel",
+        Action::PreviousEntry => "Previous entry",
+        Action::NextEntry => "Next entry",
+        Action::AcceptCompletion => "Accept the highlighted completion (the Filter line only)",
+        Action::DeletePreviousWord => "Delete the previous word",
+        Action::ClearLine => "Clear the line",
+        Action::OpenInEditor => "Open the field in `$EDITOR`",
+        Action::Choose => "Choose (Set picker only)",
+        Action::Close => "Close",
+        Action::Run => "Run",
+        Action::Decline => "Decline",
+    }
 }
 
 /// A plain lowercase letter, no modifier: crossterm's baseline for an unshifted key.
@@ -124,294 +176,173 @@ const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 /// `spec_conformance` test reads the same document and asserts the two never drift apart.
 const BINDINGS: &[Binding] = &[
     // global
-    binding(
-        Context::Global,
-        KeyCode::Char('?'),
-        NONE,
-        Action::OpenHelp,
-        "Open the help overlay",
-    ),
-    binding(
-        Context::Global,
-        KeyCode::Char('q'),
-        NONE,
-        Action::Quit,
-        "Quit",
-    ),
-    binding(
-        Context::Global,
-        KeyCode::Char('c'),
-        CTRL,
-        Action::Quit,
-        "Quit",
-    ),
-    binding(
-        Context::Global,
-        KeyCode::Char('z'),
-        CTRL,
-        Action::Suspend,
-        "Suspend",
-    ),
+    binding(Context::Global, KeyCode::Char('?'), NONE, Action::OpenHelp),
+    binding(Context::Global, KeyCode::Char('q'), NONE, Action::Quit),
+    binding(Context::Global, KeyCode::Char('c'), CTRL, Action::Quit),
+    binding(Context::Global, KeyCode::Char('z'), CTRL, Action::Suspend),
     binding(
         Context::Global,
         KeyCode::Char('!'),
         NONE,
         Action::OpenLauncher,
-        "Open the Launcher palette",
     ),
     binding(
         Context::Global,
         KeyCode::Char(';'),
         NONE,
         Action::OpenActionPalette,
-        "Open the Action palette",
     ),
     binding(
         Context::Global,
         KeyCode::Char('/'),
         NONE,
         Action::EnterFilter,
-        "Enter a Filter",
     ),
     binding(
         Context::Global,
         KeyCode::Char('r'),
         NONE,
         Action::RefreshAll,
-        "Refresh everything",
     ),
     binding(
         Context::Global,
         KeyCode::Char('R'),
         SHIFT,
         Action::RefreshSelection,
-        "Refresh the Selection",
     ),
     binding(
         Context::Global,
         KeyCode::Char('b'),
         NONE,
         Action::RederiveDefaultBranches,
-        "Re-derive default branches over the Selection",
     ),
     binding(
         Context::Global,
         KeyCode::Char('w'),
         NONE,
         Action::ExpandWarning,
-        "Expand the warning slot",
     ),
     binding(
         Context::Global,
         KeyCode::Char('s'),
         NONE,
         Action::OpenSetPicker,
-        "Open the Set picker",
     ),
     binding(
         Context::Global,
         KeyCode::Char('1'),
         NONE,
         Action::SwitchToSet(1),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('2'),
         NONE,
         Action::SwitchToSet(2),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('3'),
         NONE,
         Action::SwitchToSet(3),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('4'),
         NONE,
         Action::SwitchToSet(4),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('5'),
         NONE,
         Action::SwitchToSet(5),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('6'),
         NONE,
         Action::SwitchToSet(6),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('7'),
         NONE,
         Action::SwitchToSet(7),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('8'),
         NONE,
         Action::SwitchToSet(8),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('9'),
         NONE,
         Action::SwitchToSet(9),
-        "Switch to the Nth declared Set",
     ),
     binding(
         Context::Global,
         KeyCode::Char('r'),
         CTRL,
         Action::ReloadConfig,
-        "Reload config",
     ),
     binding(
         Context::Global,
         KeyCode::Tab,
         NONE,
         Action::MoveFocusBetweenListAndDetail,
-        "Move focus between list and detail",
     ),
-    binding(
-        Context::Global,
-        KeyCode::Esc,
-        NONE,
-        Action::Unwind,
-        "Unwind one level",
-    ),
+    binding(Context::Global, KeyCode::Esc, NONE, Action::Unwind),
     // list
-    binding(
-        Context::List,
-        KeyCode::Char('j'),
-        NONE,
-        Action::MoveDown,
-        "Move down",
-    ),
-    binding(
-        Context::List,
-        KeyCode::Down,
-        NONE,
-        Action::MoveDown,
-        "Move down",
-    ),
-    binding(
-        Context::List,
-        KeyCode::Char('k'),
-        NONE,
-        Action::MoveUp,
-        "Move up",
-    ),
-    binding(Context::List, KeyCode::Up, NONE, Action::MoveUp, "Move up"),
-    binding(
-        Context::List,
-        KeyCode::Char('g'),
-        NONE,
-        Action::FirstRow,
-        "First row",
-    ),
-    binding(
-        Context::List,
-        KeyCode::Char('G'),
-        SHIFT,
-        Action::LastRow,
-        "Last row",
-    ),
+    binding(Context::List, KeyCode::Char('j'), NONE, Action::MoveDown),
+    binding(Context::List, KeyCode::Down, NONE, Action::MoveDown),
+    binding(Context::List, KeyCode::Char('k'), NONE, Action::MoveUp),
+    binding(Context::List, KeyCode::Up, NONE, Action::MoveUp),
+    binding(Context::List, KeyCode::Char('g'), NONE, Action::FirstRow),
+    binding(Context::List, KeyCode::Char('G'), SHIFT, Action::LastRow),
     binding(
         Context::List,
         KeyCode::Char('d'),
         CTRL,
         Action::HalfPageDown,
-        "Half page down",
     ),
-    binding(
-        Context::List,
-        KeyCode::PageDown,
-        NONE,
-        Action::HalfPageDown,
-        "Half page down",
-    ),
-    binding(
-        Context::List,
-        KeyCode::Char('u'),
-        CTRL,
-        Action::HalfPageUp,
-        "Half page up",
-    ),
-    binding(
-        Context::List,
-        KeyCode::PageUp,
-        NONE,
-        Action::HalfPageUp,
-        "Half page up",
-    ),
+    binding(Context::List, KeyCode::PageDown, NONE, Action::HalfPageDown),
+    binding(Context::List, KeyCode::Char('u'), CTRL, Action::HalfPageUp),
+    binding(Context::List, KeyCode::PageUp, NONE, Action::HalfPageUp),
     binding(
         Context::List,
         KeyCode::Char(' '),
         NONE,
         Action::ToggleSelection,
-        "Toggle this row's Selection",
     ),
-    binding(
-        Context::List,
-        KeyCode::Char('v'),
-        NONE,
-        Action::AnchorRange,
-        "Anchor a range at the cursor, extended with `j` and `k`",
-    ),
+    binding(Context::List, KeyCode::Char('v'), NONE, Action::AnchorRange),
     binding(
         Context::List,
         KeyCode::Char('a'),
         NONE,
         Action::SelectAllVisible,
-        "Select every visible row",
     ),
     binding(
         Context::List,
         KeyCode::Char('A'),
         SHIFT,
         Action::ClearSelection,
-        "Clear the Selection",
     ),
-    binding(
-        Context::List,
-        KeyCode::Enter,
-        NONE,
-        Action::OpenDetail,
-        "Open the detail pane",
-    ),
+    binding(Context::List, KeyCode::Enter, NONE, Action::OpenDetail),
     binding(
         Context::List,
         KeyCode::Char('d'),
         NONE,
         Action::DismissVanished,
-        "Dismiss a Vanished row",
     ),
-    binding(
-        Context::List,
-        KeyCode::Char('n'),
-        NONE,
-        Action::NextFailed,
-        "Next row whose last Action failed",
-    ),
+    binding(Context::List, KeyCode::Char('n'), NONE, Action::NextFailed),
     binding(
         Context::List,
         KeyCode::Char('N'),
         SHIFT,
         Action::PreviousFailed,
-        "Previous row whose last Action failed",
     ),
     // detail
     binding(
@@ -419,136 +350,56 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char('j'),
         NONE,
         Action::ScrollDown,
-        "Scroll down",
     ),
-    binding(
-        Context::Detail,
-        KeyCode::Down,
-        NONE,
-        Action::ScrollDown,
-        "Scroll down",
-    ),
-    binding(
-        Context::Detail,
-        KeyCode::Char('k'),
-        NONE,
-        Action::ScrollUp,
-        "Scroll up",
-    ),
-    binding(
-        Context::Detail,
-        KeyCode::Up,
-        NONE,
-        Action::ScrollUp,
-        "Scroll up",
-    ),
-    binding(
-        Context::Detail,
-        KeyCode::Char('g'),
-        NONE,
-        Action::Top,
-        "Top",
-    ),
-    binding(
-        Context::Detail,
-        KeyCode::Char('G'),
-        SHIFT,
-        Action::Bottom,
-        "Bottom",
-    ),
+    binding(Context::Detail, KeyCode::Down, NONE, Action::ScrollDown),
+    binding(Context::Detail, KeyCode::Char('k'), NONE, Action::ScrollUp),
+    binding(Context::Detail, KeyCode::Up, NONE, Action::ScrollUp),
+    binding(Context::Detail, KeyCode::Char('g'), NONE, Action::Top),
+    binding(Context::Detail, KeyCode::Char('G'), SHIFT, Action::Bottom),
     binding(
         Context::Detail,
         KeyCode::Char('d'),
         CTRL,
         Action::HalfPageDown,
-        "Half page down",
     ),
     binding(
         Context::Detail,
         KeyCode::Char('u'),
         CTRL,
         Action::HalfPageUp,
-        "Half page up",
     ),
-    binding(
-        Context::Detail,
-        KeyCode::Esc,
-        NONE,
-        Action::ClosePane,
-        "Close the pane and return focus to the list",
-    ),
+    binding(Context::Detail, KeyCode::Esc, NONE, Action::ClosePane),
     binding(
         Context::Detail,
         KeyCode::Tab,
         NONE,
         Action::ReturnFocusToList,
-        "Return focus to the list and leave the pane open",
     ),
     // input (the printable-character catch-all is `dispatch`'s fallback, not a row here)
-    binding(
-        Context::Input,
-        KeyCode::Enter,
-        NONE,
-        Action::Apply,
-        "Apply the Filter, or run the highlighted entry. In the Filter line it **always** \
-         commits and never accepts a completion ([filter.md](filter.md))",
-    ),
-    binding(Context::Input, KeyCode::Esc, NONE, Action::Cancel, "Cancel"),
-    binding(
-        Context::Input,
-        KeyCode::Up,
-        NONE,
-        Action::PreviousEntry,
-        "Previous entry",
-    ),
+    binding(Context::Input, KeyCode::Enter, NONE, Action::Apply),
+    binding(Context::Input, KeyCode::Esc, NONE, Action::Cancel),
+    binding(Context::Input, KeyCode::Up, NONE, Action::PreviousEntry),
     binding(
         Context::Input,
         KeyCode::Char('k'),
         CTRL,
         Action::PreviousEntry,
-        "Previous entry",
     ),
-    binding(
-        Context::Input,
-        KeyCode::Down,
-        NONE,
-        Action::NextEntry,
-        "Next entry",
-    ),
-    binding(
-        Context::Input,
-        KeyCode::Char('j'),
-        CTRL,
-        Action::NextEntry,
-        "Next entry",
-    ),
-    binding(
-        Context::Input,
-        KeyCode::Tab,
-        NONE,
-        Action::AcceptCompletion,
-        "Accept the highlighted completion (the Filter line only)",
-    ),
+    binding(Context::Input, KeyCode::Down, NONE, Action::NextEntry),
+    binding(Context::Input, KeyCode::Char('j'), CTRL, Action::NextEntry),
+    binding(Context::Input, KeyCode::Tab, NONE, Action::AcceptCompletion),
     binding(
         Context::Input,
         KeyCode::Char('w'),
         CTRL,
         Action::DeletePreviousWord,
-        "Delete the previous word",
     ),
-    binding(
-        Context::Input,
-        KeyCode::Char('u'),
-        CTRL,
-        Action::ClearLine,
-        "Clear the line",
-    ),
+    binding(Context::Input, KeyCode::Char('u'), CTRL, Action::ClearLine),
     binding(
         Context::Input,
         KeyCode::Char('e'),
         CTRL,
         Action::OpenInEditor,
-        "Open the field in `$EDITOR`",
     ),
     // overlay
     binding(
@@ -556,91 +407,37 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char('j'),
         NONE,
         Action::ScrollDown,
-        "Scroll",
     ),
-    binding(
-        Context::Overlay,
-        KeyCode::Char('k'),
-        NONE,
-        Action::ScrollUp,
-        "Scroll",
-    ),
-    binding(
-        Context::Overlay,
-        KeyCode::Char('g'),
-        NONE,
-        Action::Top,
-        "Scroll",
-    ),
-    binding(
-        Context::Overlay,
-        KeyCode::Char('G'),
-        SHIFT,
-        Action::Bottom,
-        "Scroll",
-    ),
+    binding(Context::Overlay, KeyCode::Char('k'), NONE, Action::ScrollUp),
+    binding(Context::Overlay, KeyCode::Char('g'), NONE, Action::Top),
+    binding(Context::Overlay, KeyCode::Char('G'), SHIFT, Action::Bottom),
     binding(
         Context::Overlay,
         KeyCode::Char('d'),
         CTRL,
         Action::HalfPageDown,
-        "Scroll",
     ),
     binding(
         Context::Overlay,
         KeyCode::Char('u'),
         CTRL,
         Action::HalfPageUp,
-        "Scroll",
     ),
-    binding(
-        Context::Overlay,
-        KeyCode::Enter,
-        NONE,
-        Action::Choose,
-        "Choose (Set picker only)",
-    ),
-    binding(Context::Overlay, KeyCode::Esc, NONE, Action::Close, "Close"),
-    binding(
-        Context::Overlay,
-        KeyCode::Char('q'),
-        NONE,
-        Action::Close,
-        "Close",
-    ),
+    binding(Context::Overlay, KeyCode::Enter, NONE, Action::Choose),
+    binding(Context::Overlay, KeyCode::Esc, NONE, Action::Close),
+    binding(Context::Overlay, KeyCode::Char('q'), NONE, Action::Close),
     // confirm (every other key is `dispatch`'s fallback of "nothing happens", not a row here)
-    binding(
-        Context::Confirm,
-        KeyCode::Char('y'),
-        NONE,
-        Action::Run,
-        "Run",
-    ),
-    binding(
-        Context::Confirm,
-        KeyCode::Char('n'),
-        NONE,
-        Action::Decline,
-        "Decline",
-    ),
-    binding(
-        Context::Confirm,
-        KeyCode::Esc,
-        NONE,
-        Action::Decline,
-        "Decline",
-    ),
+    binding(Context::Confirm, KeyCode::Char('y'), NONE, Action::Run),
+    binding(Context::Confirm, KeyCode::Char('n'), NONE, Action::Decline),
+    binding(Context::Confirm, KeyCode::Esc, NONE, Action::Decline),
 ];
 
 /// The one place a key event becomes an [`Action`]: a pure function of the focused
 /// [`Context`] and the event, so routing is testable with no terminal and no running app.
 ///
-/// `Global` dispatches only while `context` is `List` or `Detail`
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)); the other three
-/// contexts never fall back to it. `Input` additionally turns any unbound printable
-/// character into [`Action::Text`]; `Confirm` and `Overlay` return `None` for anything
-/// outside their own small table, which is what leaves them, and every other context,
-/// silent on a key they do not bind.
+/// `Global` only dispatches while `context` is `List` or `Detail`
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)); `Input` also turns
+/// an unbound printable character into [`Action::Text`].
 pub(crate) fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
     match context {
         Context::List | Context::Detail => {
@@ -654,10 +451,10 @@ pub(crate) fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
 fn lookup(context: Context, key: KeyEvent) -> Option<Action> {
     BINDINGS
         .iter()
-        .find(|(row_context, code, modifiers, ..)| {
+        .find(|(row_context, code, modifiers, _)| {
             *row_context == context && *code == key.code && *modifiers == key.modifiers
         })
-        .map(|(_, _, _, action, _)| *action)
+        .map(|(_, _, _, action)| *action)
 }
 
 /// A character an input field can hold: printable, and typed with at most the modifier an
@@ -709,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn list_shifted_g_is_matched_with_the_shift_modifier_not_none() {
+    fn list_last_row_only_fires_when_g_is_shifted() {
         assert_eq!(
             dispatch(Context::List, press(KeyCode::Char('G'), SHIFT)),
             Some(Action::LastRow)
@@ -719,6 +516,22 @@ mod tests {
             dispatch(Context::List, press(KeyCode::Char('G'), NONE)),
             None
         );
+    }
+
+    /// The spec collapses `1` through `9` into one shared description ("Switch to the Nth
+    /// declared Set"), so [`compiled_table_matches_the_spec_default_map_row_for_row`] cannot
+    /// tell a permuted digit apart from a correct one: it only ever compares descriptions.
+    /// This test checks the actual dispatched `Set` number for every digit directly.
+    #[test]
+    fn each_digit_key_switches_to_its_own_set_number() {
+        for n in 1..=9u8 {
+            let c = char::from_digit(u32::from(n), 10).expect("1..=9 is a single ASCII digit");
+            assert_eq!(
+                dispatch(Context::Global, press(KeyCode::Char(c), NONE)),
+                Some(Action::SwitchToSet(n)),
+                "expected {c:?} to switch to Set {n}"
+            );
+        }
     }
 
     #[test]
@@ -734,27 +547,54 @@ mod tests {
     // --- context gating: the negative tests the brief calls out by name ---
 
     /// A representative sample of Global's own keys, none of which is bound by name in
-    /// Input, Overlay or Confirm, so a leak through a broken gate is unambiguous. `q` is
-    /// deliberately excluded: Overlay binds it to `Close` in its own right, which is a
-    /// correct context-specific override rather than a leak, so it would not tell the two
-    /// apart.
-    const GLOBAL_PROBE_KEYS: [(KeyCode, KeyModifiers); 5] = [
+    /// Input, Overlay or Confirm, so a leak through a broken gate is unambiguous. Covers
+    /// both plain and Ctrl-modified Global bindings, since a gate could plausibly fail on
+    /// one and not the other (a stray `Ctrl+C` reaching the Confirm gate would quit mid
+    /// fan-out). `q` is deliberately excluded: Overlay binds it to `Close` in its own right,
+    /// which is a correct context-specific override rather than a leak, so it would not tell
+    /// the two apart. `Tab` is excluded for the same reason (Input binds it to
+    /// `AcceptCompletion`) and is instead probed directly against Overlay and Confirm below,
+    /// where it is unambiguous.
+    const GLOBAL_PROBE_KEYS: [(KeyCode, KeyModifiers); 8] = [
         (KeyCode::Char('!'), NONE),
         (KeyCode::Char(';'), NONE),
         (KeyCode::Char('/'), NONE),
         (KeyCode::Char('r'), NONE),
         (KeyCode::Char('s'), NONE),
+        (KeyCode::Char('c'), CTRL),
+        (KeyCode::Char('z'), CTRL),
+        (KeyCode::Char('r'), CTRL),
     ];
 
     #[test]
     fn global_bindings_never_dispatch_while_input_is_focused() {
         for (code, modifiers) in GLOBAL_PROBE_KEYS {
             let action = dispatch(Context::Input, press(code, modifiers));
-            // Every one of these is a printable character, so Input still consumes it,
-            // just as its own catch-all text rather than the Global action.
-            assert!(
-                matches!(action, Some(Action::Text(_))),
-                "expected {code:?} to fall through to Text in Input, got {action:?}"
+            if modifiers.contains(CTRL) {
+                // None of these is one of Input's own five Ctrl chords, and Ctrl is excluded
+                // from the printable catch-all, so Input must stay silent on them.
+                assert_eq!(
+                    action, None,
+                    "expected {code:?} to be silently unbound in Input, got {action:?}"
+                );
+            } else {
+                // Every one of these is a printable character, so Input still consumes it,
+                // just as its own catch-all text rather than the Global action.
+                assert!(
+                    matches!(action, Some(Action::Text(_))),
+                    "expected {code:?} to fall through to Text in Input, got {action:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_move_focus_between_list_and_detail_never_dispatches_outside_list_and_detail() {
+        for context in [Context::Overlay, Context::Confirm] {
+            assert_eq!(
+                dispatch(context, press(KeyCode::Tab, NONE)),
+                None,
+                "{context:?} must not reach Global's Tab binding"
             );
         }
     }
@@ -821,6 +661,26 @@ mod tests {
         #[test]
         fn suspended_in_confirm() {
             assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
+        }
+    }
+
+    // --- overlay's own bindings, not just the absence of a Global leak ---
+
+    #[test]
+    fn overlay_binds_its_own_scroll_choose_and_close_keys() {
+        let cases = [
+            (press(KeyCode::Char('j'), NONE), Action::ScrollDown),
+            (press(KeyCode::Char('k'), NONE), Action::ScrollUp),
+            (press(KeyCode::Char('g'), NONE), Action::Top),
+            (press(KeyCode::Char('G'), SHIFT), Action::Bottom),
+            (press(KeyCode::Char('d'), CTRL), Action::HalfPageDown),
+            (press(KeyCode::Char('u'), CTRL), Action::HalfPageUp),
+            (press(KeyCode::Enter, NONE), Action::Choose),
+            (press(KeyCode::Esc, NONE), Action::Close),
+            (press(KeyCode::Char('q'), NONE), Action::Close),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(dispatch(Context::Overlay, key), Some(expected));
         }
     }
 
@@ -1097,12 +957,12 @@ mod tests {
 
         let mut compiled: Vec<(&'static str, KeyCode, KeyModifiers, String)> = BINDINGS
             .iter()
-            .map(|(context, code, modifiers, _, description)| {
+            .map(|(context, code, modifiers, action)| {
                 (
                     spec_context_name(*context),
                     *code,
                     *modifiers,
-                    description.to_string(),
+                    description(*action).to_string(),
                 )
             })
             .collect();

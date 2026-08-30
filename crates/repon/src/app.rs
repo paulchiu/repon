@@ -131,13 +131,9 @@ impl App {
         Ok(())
     }
 
-    /// Routes the key through [`keys::dispatch`], the one place a chord becomes an
-    /// [`Action`]. The list is this app's only focus target today, so `Context::List` is
-    /// fixed here rather than tracked; a Detail pane, and the Input, Overlay and Confirm
-    /// contexts, are later tickets, and only the two actions those tickets' predecessors
-    /// already wired (`Quit`, `Suspend`) are turned into a [`Message`] here. Every other
-    /// action dispatches correctly but has nothing to do yet, which is this ticket's scope:
-    /// the table and the routing, not the features the bindings will go on to invoke.
+    /// Routes the key through [`keys::dispatch`] and turns the two actions already wired to a
+    /// [`Message`] (`Quit`, `Suspend`); every other action dispatches correctly but has
+    /// nothing to do yet, since `List` is this app's only real focus target today.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         let message = match keys::dispatch(Context::List, key) {
             Some(Action::Quit) => Some(Message::Quit),
