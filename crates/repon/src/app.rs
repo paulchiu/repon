@@ -16,7 +16,7 @@ use crate::{
     footer,
     glyphs::GlyphSet,
     help::HelpOverlay,
-    keys::{self, Action, Context},
+    keys::{self, Action, BindingTable, Context},
     message::Message,
     selection::Selection,
     theme::{self, Theme},
@@ -88,6 +88,31 @@ impl UnwindLevel for ClosePaneOnUnwind<'_> {
 /// than left as a bare literal at the one call site that needs it.
 const GENERATION_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The Set [`App::core`] is currently running over, and exactly the fields
+/// [`App::reload_active_set`] needs to decide whether a reload's Set changed: its name (for
+/// the vanished-Set fallback) and the three fields that bound discovery (for the
+/// discards-discovery decision). Kept as one snapshot rather than re-deriving it from
+/// `self.core` each time, since `Core` retains no public way to read the `SetSpec` it started
+/// from ([core.rs]'s own `set` field is deliberately private and immutable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveSet {
+    name: String,
+    roots: Vec<String>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+}
+
+impl ActiveSet {
+    fn from_config(set: &document::SetConfig) -> Self {
+        Self {
+            name: set.name.get_ref().clone(),
+            roots: set.roots.clone(),
+            include: set.include.clone(),
+            exclude: set.exclude.clone(),
+        }
+    }
+}
+
 pub struct App {
     tick_rate: f64,
     frame_rate: f64,
@@ -114,7 +139,7 @@ pub struct App {
     pane: Option<EntityKey>,
     /// Which of `List` or `Detail` the non-Global part of a key event routes to. `Global` is
     /// never a value here: it dispatches through whichever of the two is focused, per
-    /// [`keys::dispatch`].
+    /// [`BindingTable::dispatch`].
     focus: Context,
     /// `Some` while the help overlay has focus, carrying its scroll position; `None` while
     /// `focus` does. Opened from whichever of `List` or `Detail` `focus` names at the time,
@@ -127,11 +152,22 @@ pub struct App {
     /// is why the channel is crossbeam rather than std.
     message_tx: Sender<Message>,
     message_rx: Receiver<Message>,
-    /// Resolved once at startup and again on resume ([`App::run`]'s suspend branch does not
-    /// reload it yet, a later ticket's work); not read outside tests until a component styles
-    /// itself by role instead of a hand-picked ratatui colour.
+    /// Resolved once at startup and again on every config reload (`Action::ReloadConfig`);
+    /// not read outside tests until a component styles itself by role instead of a
+    /// hand-picked ratatui colour.
     #[allow(dead_code)]
     theme: Theme,
+    /// The live binding table the footer and the help overlay read every frame: the compiled
+    /// default merged with `[keys]`, per [`keys::merge`]. Replaced wholesale on a config
+    /// reload, never mutated in place, so `handle_key_event`, `footer::draw` and
+    /// `HelpOverlay::draw` all see a rebind on the very next frame with no code change of
+    /// their own.
+    bindings: BindingTable,
+    /// The Set `self.core` is currently running over, tracked so `Action::ReloadConfig` can
+    /// tell whether it changed. Set switching (`1` to `9`, the Set picker) is later work, so
+    /// this is fixed at startup to the first declared Set and only ever moves on reload's own
+    /// fallback rule.
+    active_set: ActiveSet,
 }
 
 impl App {
@@ -142,6 +178,11 @@ impl App {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
         let glyph_set = GlyphSet::for_config(config.document.glyphs);
+
+        let (bindings, keys_warnings) = keys::merge(&config.document.keys)?;
+        for warning in &keys_warnings {
+            tracing::warn!("{warning}");
+        }
 
         let theme_source = if flag_theme.is_some() {
             theme::ThemeSource::Flag
@@ -165,7 +206,13 @@ impl App {
             "config loaded",
         );
 
-        let core = Core::start(core_spec(&config.document));
+        let active_set_config =
+            config.document.sets.first().expect(
+                "Document::load always leaves at least one Set, `all` if none was declared",
+            );
+        let active_set = ActiveSet::from_config(active_set_config);
+
+        let core = Core::start(core_spec(&config.document, &active_set));
         // Discovery already ran inside `Core::start`; dispatch the identity probe for
         // every row it found so the list fills in progressively rather than sitting on
         // blank branch cells until something else asks for a refresh.
@@ -193,6 +240,8 @@ impl App {
             message_tx,
             message_rx,
             theme: loaded_theme.theme,
+            bindings,
+            active_set,
         })
     }
 
@@ -248,19 +297,21 @@ impl App {
         Ok(())
     }
 
-    /// Routes the key through [`keys::dispatch`]: `Context::Overlay` while the help overlay is
-    /// open, `self.focus` (`List` or `Detail`) otherwise, so `Global`'s bindings stay live from
-    /// either. `Quit` and `Suspend` raise a [`Message`], the movement and Selection actions
-    /// mutate `cursor` and `selection` directly, `OpenDetail`/`ClosePane` open and close the
-    /// pane, `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two
-    /// without touching what the pane shows, `OpenHelp` opens the overlay and `Unwind` reaches
-    /// [`unwind::unwind_one`] over the range anchor then the pane.
+    /// Routes the key through `self.bindings`, the live table a config reload replaces:
+    /// `Context::Overlay` while the help overlay is open, `self.focus` (`List` or `Detail`)
+    /// otherwise, so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
+    /// [`Message`], the movement and Selection actions mutate `cursor` and `selection`
+    /// directly, `OpenDetail`/`ClosePane` open and close the pane,
+    /// `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two without
+    /// touching what the pane shows, `OpenHelp` opens the overlay, `ReloadConfig` reaches
+    /// [`Self::reload_config`] and `Unwind` reaches [`unwind::unwind_one`] over the range
+    /// anchor then the pane.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
-            match keys::dispatch(Context::Overlay, key) {
+            match self.bindings.dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
                 Some(action) => {
-                    let content_len = HelpOverlay::content_len(self.focus);
+                    let content_len = HelpOverlay::content_len(&self.bindings, self.focus);
                     overlay.apply(action, content_len, self.frame_size.height);
                 }
                 None => {}
@@ -268,9 +319,13 @@ impl App {
             return Ok(());
         }
 
-        let message = match keys::dispatch(self.focus, key) {
+        let message = match self.bindings.dispatch(self.focus, key) {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
+            Some(Action::ReloadConfig) => {
+                self.reload_config();
+                None
+            }
             Some(Action::MoveDown) => {
                 self.move_cursor(1);
                 None
@@ -369,6 +424,120 @@ impl App {
             self.message_tx.send(message)?;
         }
         Ok(())
+    }
+
+    /// `Action::ReloadConfig`'s whole effect: re-reads `config.toml` from the same fixed path
+    /// [`App::new`] read it from, re-merges `[keys]` into a fresh [`BindingTable`] and
+    /// replaces `self.bindings` wholesale, re-loads the theme, hands the Component tree the
+    /// reloaded [`Config`] and re-resolves the active Set ([`Self::reload_active_set`]).
+    ///
+    /// A failure here (malformed TOML, a collision the edit just introduced) is logged and
+    /// otherwise swallowed rather than propagated: the terminal is already claimed, so this
+    /// is not the "exit before the terminal is claimed" grade [`keys::merge`] and
+    /// [`document::load`] give the same failure at startup, and a session mid-work should not
+    /// be torn down by a typo in a file it can simply go on using the previous, still-valid
+    /// reading of. `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` are deliberately not
+    /// re-applied here: `Core` has no way to move to a new [`repon_core::CoreSpec`] short of
+    /// rebuilding the whole thing, and rebuilding it for every reload regardless of relevance
+    /// would restart discovery even for a reload that only changed the theme, which
+    /// config.md's Reload section does not ask for. `[[launcher]]` and `[[action]]` need no
+    /// re-apply of their own: nothing in this crate reads them yet.
+    fn reload_config(&mut self) {
+        let new_config = match Config::new() {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!(
+                    "config reload failed, keeping the previous configuration: {err:#}"
+                );
+                return;
+            }
+        };
+        self.apply_reloaded_config(new_config);
+    }
+
+    /// The state-mutating half of a reload, split out from [`Self::reload_config`] so a test
+    /// can drive it with a hand-built [`Config`] and never touch the process-wide path
+    /// [`config::config_file`] resolves, which is fixed once for the whole process
+    /// ([`config::init`]) and cannot be pointed at a tempdir per test.
+    fn apply_reloaded_config(&mut self, new_config: Config) {
+        let (bindings, keys_warnings) = match keys::merge(&new_config.document.keys) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(
+                    "config reload failed to merge [keys], keeping the previous keyboard: {err:#}"
+                );
+                return;
+            }
+        };
+        for warning in &keys_warnings {
+            tracing::warn!("{warning}");
+        }
+        self.bindings = bindings;
+
+        let theme_name = new_config.document.theme.clone();
+        match theme::load(
+            &config::themes_dir(),
+            &theme_name,
+            theme::ThemeSource::Config,
+        ) {
+            Ok(loaded_theme) => {
+                for warning in &loaded_theme.warnings {
+                    tracing::warn!("{warning}");
+                }
+                self.theme = loaded_theme.theme;
+            }
+            Err(err) => {
+                tracing::error!("config reload failed to load theme `{theme_name}`: {err:#}");
+            }
+        }
+
+        if let Err(err) = self.list.register_config_handler(new_config.clone()) {
+            tracing::error!("config reload failed to hand the new config to a component: {err:#}");
+        }
+
+        self.reload_active_set(&new_config.document);
+    }
+
+    /// config.md's Reload section, the other half `reload_config` delegates to: resolves the
+    /// Set named `self.active_set.name` in the freshly reloaded `document`, falling back to
+    /// the first declared Set and announcing it (a warning naming both names) if it no longer
+    /// exists. If the resolved Set's `roots`, `include` or `exclude` differ from what
+    /// `self.core` is currently running over, discards discovery and starts a fresh
+    /// Generation by rebuilding `self.core` outright, per
+    /// [core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
+    /// own doc comment: a Set's `roots` or globs changing is a config reload, which re-derives
+    /// a whole new `Core` rather than mutating one in place. Leaves `self.core` untouched, with
+    /// no rediscovery at all, when the resolved Set matches the one already running.
+    fn reload_active_set(&mut self, document: &Document) {
+        let fallback = document
+            .sets
+            .first()
+            .expect("Document::load always leaves at least one Set, `all` if none was declared");
+        let chosen = document
+            .sets
+            .iter()
+            .find(|set| set.name.get_ref() == &self.active_set.name)
+            .unwrap_or(fallback);
+
+        if chosen.name.get_ref() != &self.active_set.name {
+            tracing::warn!(
+                "the active Set `{}` no longer exists; falling back to `{}`",
+                self.active_set.name,
+                chosen.name.get_ref(),
+            );
+        }
+
+        let resolved = ActiveSet::from_config(chosen);
+        let bounds_changed = resolved.roots != self.active_set.roots
+            || resolved.include != self.active_set.include
+            || resolved.exclude != self.active_set.exclude;
+        self.active_set = resolved;
+
+        if bounds_changed {
+            self.core = Core::start(core_spec(document, &self.active_set));
+            let keys = entity_keys(&self.core.snapshot());
+            self.core.refresh(&keys);
+        }
     }
 
     /// Every currently known Entity's key, in table order: this crate's whole "visible list"
@@ -477,7 +646,7 @@ impl App {
         tui.draw(|frame| {
             let area = frame.area();
             if let Some(overlay) = &self.help {
-                overlay.draw(frame, area, self.focus);
+                overlay.draw(frame, area, self.focus, &self.bindings);
                 return;
             }
             let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
@@ -517,7 +686,7 @@ impl App {
                     }
                 }
             }
-            footer::draw(frame, areas[1], self.footer_context());
+            footer::draw(frame, areas[1], self.footer_context(), &self.bindings);
         })?;
         if let Some(err) = error {
             self.message_tx
@@ -537,25 +706,22 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
         .collect()
 }
 
-/// Builds the Core's own crossing type from the loaded config: the active Set (the first
-/// declared, or the implicit `all` Set `Document::load` always adds), the `[[repo]]`
-/// overrides, and the refresh cadence. Set switching (`1` to `9`, the Set picker) is later
-/// work, so only the first Set is ever active today.
-fn core_spec(document: &Document) -> CoreSpec {
-    let set = document
-        .sets
-        .first()
-        .expect("Document::load always leaves at least one Set, `all` if none was declared");
+/// Builds the Core's own crossing type from the loaded config and `active_set` (the first
+/// declared Set at startup; [`App::reload_active_set`]'s own resolution, including its
+/// vanished-Set fallback, on a reload), plus the `[[repo]]` overrides and the refresh
+/// cadence. Set switching (`1` to `9`, the Set picker) is later work, so only one Set is ever
+/// active at a time today.
+fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec {
     CoreSpec {
         set: SetSpec {
-            name: set.name.get_ref().clone(),
-            roots: set
+            name: active_set.name.clone(),
+            roots: active_set
                 .roots
                 .iter()
                 .map(|root| document::expand_home(root))
                 .collect(),
-            include: set.include.clone().unwrap_or_default(),
-            exclude: set.exclude.clone().unwrap_or_default(),
+            include: active_set.include.clone().unwrap_or_default(),
+            exclude: active_set.exclude.clone().unwrap_or_default(),
         },
         overrides: document::repo_overrides(document),
         poll_interval: document.refresh.poll_interval,
@@ -624,6 +790,13 @@ mod tests {
             message_tx,
             message_rx,
             theme: theme::DEFAULT,
+            bindings: BindingTable::compiled_default(),
+            active_set: ActiveSet {
+                name: "test".to_string(),
+                roots: vec![root.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
         }
     }
 
@@ -862,8 +1035,8 @@ mod tests {
 
         assert_eq!(app.footer_context(), Context::Detail);
         assert_ne!(
-            footer::render(app.footer_context(), 80),
-            footer::render(Context::List, 80),
+            footer::render(&app.bindings, app.footer_context(), 80),
+            footer::render(&app.bindings, Context::List, 80),
             "the detail footer's own content must differ from the list's, which is what a \
              hardcoded Context::List would fail to produce"
         );
@@ -1027,6 +1200,243 @@ mod tests {
             "found state that suggests a press-twice-to-force gesture, which \
              keybindings.md's \"Esc\" section refuses: {offending_locations:?}"
         );
+    }
+
+    // =====================================================================================
+    // Reload: keys re-merge in place, derived surfaces update immediately, and a Set change
+    // discards discovery and starts a fresh Generation.
+    // =====================================================================================
+
+    /// The Set `test_app` wires `App` to: same name and roots every reload test starts from,
+    /// so `apply_reloaded_config`'s own Set stays unchanged unless a test deliberately gives
+    /// it a different one.
+    fn matching_set_config(root: &std::path::Path) -> document::SetConfig {
+        document::SetConfig {
+            name: toml::Spanned::new(0..0, "test".to_string()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+        }
+    }
+
+    fn config_with_document(document: Document) -> Config {
+        Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Criterion 6's own risk: a build that rebuilds the table but leaves the footer reading
+    /// a stale copy would still pass a test that only inspected `app.bindings` directly. This
+    /// reads the footer's own rendered text instead, the same seam `App::render` reads, so it
+    /// proves the derived surface itself moved, not merely the table underneath it.
+    #[test]
+    fn reload_rebinds_the_live_table_and_the_footer_reflects_it_immediately_with_no_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let before = crate::footer::render(&app.bindings, Context::List, 87);
+        assert!(
+            before.contains("? help"),
+            "expected the compiled default's help hint, got: {before:?}"
+        );
+
+        let mut open_help_rebind = toml::Table::new();
+        open_help_rebind.insert(
+            "open_help".to_string(),
+            toml::Value::String("x".to_string()),
+        );
+        let mut keys_block = toml::Table::new();
+        keys_block.insert("global".to_string(), toml::Value::Table(open_help_rebind));
+
+        let mut document = Document {
+            keys: keys_block,
+            ..Document::default()
+        };
+        document.sets.push(matching_set_config(&root));
+
+        app.apply_reloaded_config(config_with_document(document));
+
+        let after = crate::footer::render(&app.bindings, Context::List, 87);
+        assert!(
+            after.contains("x help"),
+            "expected the rebound help hint in the footer with no restart, got: {after:?}"
+        );
+        assert!(
+            !after.contains("? help"),
+            "the old help hint must not still render once it has been rebound, got: {after:?}"
+        );
+    }
+
+    /// Criterion 7's first half. Two temp roots, each with its own distinctly named repo, so
+    /// the entities `self.core.snapshot()` reports after the reload are direct, functional
+    /// proof that discovery re-ran over the new root rather than the mutation the ticket
+    /// names: keeping the old Generation (and so the old root's rows) across a roots change.
+    #[test]
+    fn a_change_to_the_active_sets_roots_discards_discovery_and_starts_a_fresh_generation() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+
+        let mut app = test_app(&root_a);
+        let before_names: Vec<String> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_string())
+            .collect();
+        assert!(
+            before_names.iter().any(|name| name == "repo-a"),
+            "expected repo-a discovered under the first root, got {before_names:?}"
+        );
+
+        let mut document = Document::default();
+        document.sets.push(document::SetConfig {
+            name: toml::Spanned::new(0..0, "test".to_string()),
+            roots: vec![root_b.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+        });
+
+        app.reload_active_set(&document);
+
+        let after_names: Vec<String> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_string())
+            .collect();
+        assert!(
+            after_names.iter().any(|name| name == "repo-b"),
+            "expected discovery to re-run over the new root, got {after_names:?}"
+        );
+        assert!(
+            !after_names.iter().any(|name| name == "repo-a"),
+            "expected the old root's discovery to be discarded, got {after_names:?}"
+        );
+    }
+
+    /// The negative control for the test above: a reload naming the exact same roots must
+    /// not rebuild `self.core` at all. Proven by a Generation identity a rebuild could not
+    /// preserve (a brand new `Core` always starts its own Generation counter over), rather
+    /// than by re-checking the entity list, which a same-roots rebuild would leave looking
+    /// identical anyway.
+    #[test]
+    fn reload_with_the_same_active_set_leaves_discovery_and_its_generation_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        // Advance the Generation past what a freshly rebuilt Core would start at, so an
+        // unwanted rebuild is distinguishable from the untouched case by more than luck.
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        app.core.refresh(&keys);
+        app.core.refresh(&keys);
+        let before = app.core.snapshot().generation;
+
+        let mut document = Document::default();
+        document.sets.push(matching_set_config(&root));
+        app.reload_active_set(&document);
+
+        assert_eq!(
+            app.core.snapshot().generation,
+            before,
+            "an unchanged Set must not rebuild Core or start a new Generation"
+        );
+    }
+
+    /// Criterion 7's second half: a vanished active Set falls back to the first declared Set
+    /// and announces it. The announcement is checked as an observable log line, not merely
+    /// `active_set.name`'s new value, since a silent fallback would still pass an assertion
+    /// that only inspected the field.
+    #[test]
+    fn a_vanished_active_set_falls_back_to_the_first_declared_set_and_announces_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(app.active_set.name, "test");
+
+        let mut document = Document::default();
+        document.sets.push(document::SetConfig {
+            name: toml::Spanned::new(0..0, "renamed".to_string()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+        });
+
+        let logs = capture_tracing(|| app.reload_active_set(&document));
+
+        assert_eq!(
+            app.active_set.name, "renamed",
+            "expected the fallback to the first declared Set"
+        );
+        assert!(
+            logs.contains("test") && logs.contains("renamed"),
+            "expected the fallback announced naming both the vanished and the new Set, got: {logs:?}"
+        );
+    }
+
+    /// Runs `f` under a subscriber that captures every log line to a string, rather than the
+    /// process-wide default `logging::init` installs (never called in a unit test):
+    /// `tracing::subscriber::with_default` scopes the override to the current thread only,
+    /// so this cannot race another test's own logging on a different thread.
+    fn capture_tracing(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured-log mutex")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+
+        let bytes = captured.0.lock().expect("captured-log mutex").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     // --- criterion 2: no permanently pinned bottom output pane ---

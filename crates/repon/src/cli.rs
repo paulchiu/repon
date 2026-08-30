@@ -40,6 +40,15 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub suspend_after_tui_enter: bool,
 
+    /// Resolves the config path, prints it, sets `REPON_CONFIG` to the given value, resolves
+    /// again and prints that too, then exits, claiming no terminal at all. Debug-only: exists
+    /// so a test can observe that a path resolved from a flag or the environment is fixed for
+    /// the process and never re-resolved, rather than describing it, and must not reach a
+    /// release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub reprint_config_path_after_env_change: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

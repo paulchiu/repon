@@ -39,6 +39,11 @@ fn main() -> color_eyre::Result<()> {
         return suspend_after_tui_enter();
     }
 
+    #[cfg(debug_assertions)]
+    if let Some(new_value) = &args.reprint_config_path_after_env_change {
+        return reprint_config_path_after_env_change(new_value);
+    }
+
     if let Some(command) = &args.command {
         return run_command(command, args.config);
     }
@@ -70,6 +75,25 @@ fn suspend_after_tui_enter() -> color_eyre::Result<()> {
     let mut tui = tui::Tui::new()?;
     tui.enter()?;
     tui.suspend()?;
+    Ok(())
+}
+
+/// Resolves the config path once, prints it, then changes `REPON_CONFIG` and resolves again,
+/// printing that too: proves config.md's "Paths that came from a flag or environment variable
+/// are fixed for the process and never re-resolved" by observation rather than by
+/// description. Safe to mutate the environment here with no lock: this process is still
+/// single-threaded at this point, before `App::new` or anything else could be reading it
+/// concurrently.
+#[cfg(debug_assertions)]
+fn reprint_config_path_after_env_change(new_value: &Path) -> color_eyre::Result<()> {
+    config::init(None);
+    println!("{}", config::config_file().display());
+    // Safety: single-threaded so far, and nothing above this line has read the environment
+    // concurrently with this write.
+    unsafe {
+        std::env::set_var("REPON_CONFIG", new_value);
+    }
+    println!("{}", config::config_file().display());
     Ok(())
 }
 

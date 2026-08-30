@@ -200,7 +200,7 @@ A `[keys]` block in config.toml, one sub-table per context. The merge is per con
 | --- | --- |
 | Unknown context or unknown action name | Warn, name the dotted path, continue, matching [config.md](config.md)'s unknown-key grade |
 | An unparseable key name | Exit non-zero before the terminal is claimed |
-| Two actions bound to the same key in one context | Exit non-zero before the terminal is claimed, naming both actions and the key |
+| Two or more actions bound to the same key in one context | Exit non-zero before the terminal is claimed, naming every colliding action and key |
 
 The collision case is the one worth explaining. [theming.md](theming.md) refused to make glyphs themeable because [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness is a correctness property that no flat TOML schema can express to someone editing the file. A key collision is the same class of property with one difference: it can be checked at load. So it is checked rather than forbidden. [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) sharpens the contrast rather than removing it: glyph disjointness can be checked earlier still, at compile time, precisely because glyph sets are never user-supplied and there is nothing at load to check. The same assertion runs over the compiled-in default map at startup in debug builds, because the default map can grow a collision in review just as easily as a config file can.
 
