@@ -141,6 +141,17 @@ pub struct Diagnostics {
 pub struct ActionRun {}
 
 /// Whether an Entity was found by the Refresh that just ran.
+///
+/// Open, recorded here as well as in the open-questions register: the gutter
+/// mark a Vanished row should carry. Every `Known` cell going stale folds
+/// today's rendered row to the ordinary stale mark whenever every cell has a
+/// value to force stale in the first place; while probing is still limited to
+/// `branch` and `default_branch`, a Vanished Entity's other, never-yet-probed
+/// cells fold as Unknown instead and can outrank that stale mark, so the row
+/// may render `?` rather than `~` until every phase is probing. Two further
+/// open points from the same design gap: whether dismissing a Vanished row
+/// wants an undo gesture or a Filter of its own, and the exact progressive-fill
+/// timing targets a Vanished row's redraw should honour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Presence {
     #[default]
@@ -232,11 +243,26 @@ impl EntityState {
             self.diagnostics.default_branch_stopped = stopped;
         }
     }
+
+    /// Marks this Entity Vanished: it stays in the table with its last known
+    /// values, and every Cell's `Known` value is forced stale rather than
+    /// blanked. The same call for a Repo, a Worktree or a Submodule alike; a
+    /// Cell already `NotApplicable`, `Unknown` or `Failed` is untouched.
+    pub(crate) fn mark_vanished(&mut self) {
+        self.presence = Presence::Vanished;
+        self.branch.force_stale();
+        self.sync.force_stale();
+        self.base.force_stale();
+        self.dirty.force_stale();
+        self.state.force_stale();
+        self.default_branch.force_stale();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::Timestamp;
 
     fn key(path: &str) -> EntityKey {
         EntityKey::new(Arc::from(Path::new(path)))
@@ -285,6 +311,154 @@ mod tests {
 
         assert!(entity.state.settled().is_none());
         assert!(entity.base.settled().is_none());
+    }
+
+    /// The defining behaviour a naive implementation gets wrong: marking an
+    /// Entity Vanished must keep every Cell's own value while forcing every one
+    /// stale, not blank them. Every readable Cell carries a distinct value here
+    /// so a bug that clobbers even one of them shows up, and `NotApplicable`
+    /// cells (a Submodule's `state` and `base`) must survive untouched rather
+    /// than being forced into some other shape.
+    #[test]
+    fn marking_an_entity_vanished_keeps_every_cells_value_and_forces_every_one_stale() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Repo,
+        );
+        let generation = Generation::default();
+        entity.branch.settle(
+            generation,
+            Settled::Known {
+                value: Head::Branch(Arc::from("main")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.sync.settle(
+            generation,
+            Settled::Known {
+                value: AheadBehind {
+                    ahead: 1,
+                    behind: 2,
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.base.settle(
+            generation,
+            Settled::Known {
+                value: 3,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: 4,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.state.settle(
+            generation,
+            Settled::Known {
+                value: WorktreeState::Active,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.default_branch.settle(
+            generation,
+            Settled::Known {
+                value: DefaultBranch::new(Arc::from("main")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        entity.mark_vanished();
+
+        assert_eq!(entity.presence, Presence::Vanished);
+        match entity.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                stale: true,
+                ..
+            }) => assert_eq!(&**name, "main"),
+            other => panic!("expected branch to keep its value and go stale, got {other:?}"),
+        }
+        match entity.sync.settled() {
+            Some(Settled::Known {
+                value: AheadBehind { ahead, behind },
+                stale: true,
+                ..
+            }) => {
+                assert_eq!(*ahead, 1);
+                assert_eq!(*behind, 2);
+            }
+            other => panic!("expected sync to keep its value and go stale, got {other:?}"),
+        }
+        match entity.base.settled() {
+            Some(Settled::Known {
+                value: 3,
+                stale: true,
+                ..
+            }) => {}
+            other => panic!("expected base to keep its value and go stale, got {other:?}"),
+        }
+        match entity.dirty.settled() {
+            Some(Settled::Known {
+                value: 4,
+                stale: true,
+                ..
+            }) => {}
+            other => panic!("expected dirty to keep its value and go stale, got {other:?}"),
+        }
+        match entity.state.settled() {
+            Some(Settled::Known {
+                value: WorktreeState::Active,
+                stale: true,
+                ..
+            }) => {}
+            other => panic!("expected state to keep its value and go stale, got {other:?}"),
+        }
+        match entity.default_branch.settled() {
+            Some(Settled::Known {
+                value, stale: true, ..
+            }) => assert_eq!(value.name(), "main"),
+            other => {
+                panic!("expected default_branch to keep its value and go stale, got {other:?}")
+            }
+        }
+    }
+
+    /// A Submodule's construction-time `NotApplicable` cells must survive being
+    /// marked Vanished untouched: forcing staleness applies only to a settled
+    /// `Known` value, never to a settled fact that simply does not apply here.
+    #[test]
+    fn marking_a_submodule_vanished_leaves_its_not_applicable_cells_untouched() {
+        let mut entity = EntityState::new(
+            key("/repo/vendor/lib"),
+            Arc::from("lib"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Submodule,
+        );
+
+        entity.mark_vanished();
+
+        assert_eq!(entity.presence, Presence::Vanished);
+        assert!(matches!(
+            entity.state.settled(),
+            Some(Settled::NotApplicable)
+        ));
+        assert!(matches!(
+            entity.base.settled(),
+            Some(Settled::NotApplicable)
+        ));
     }
 
     #[test]

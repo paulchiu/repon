@@ -13,17 +13,23 @@
 //! than a bare `thread::sleep`, which is what lets a test drive the poll and
 //! deadline cadence deterministically instead of sleeping and hoping.
 //!
-//! Discovery re-running on every Generation ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md))
-//! and the four probe phases beyond identity (branch) are later work; this module
-//! runs discovery once at `start` and probes only `branch`, the one read
-//! [`crate::git::head_shape`] already does correctly, so the threading and
-//! supersession machinery has a real payload to move rather than a stub. Nothing
-//! here is written to or read from disk, so every `start` recomputes from scratch;
-//! the consequence is that first-frame speed has to come from progressive loading
-//! rather than a cache, which is future work this crate does not yet do (`start`
-//! blocks on its one discovery walk, at 20ms for the measured population).
+//! Discovery, both halves, re-runs at the head of every Generation
+//! ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md),
+//! [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)):
+//! an Entity a later walk does not find goes [`crate::entity::Presence::Vanished`]
+//! rather than disappearing, and one an abandoned walk cannot finish in time takes
+//! its Set out of this automatic path until a fresh `Core` starts over different
+//! roots. The four probe phases beyond identity (`branch`) and `default_branch`
+//! are later work; this module probes only those two, the reads
+//! [`crate::git::head_shape`] and [`crate::default_branch::resolve`] already do
+//! correctly, so the threading and supersession machinery has a real payload to
+//! move rather than a stub. Nothing here is written to or read from disk, so
+//! every `start` recomputes from scratch; the consequence is that first-frame
+//! speed has to come from progressive loading rather than a cache, which is
+//! future work this crate does not yet do (`start` blocks on its one discovery
+//! walk, at 20ms for the measured population).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
@@ -35,7 +41,7 @@ use crossbeam_channel::{Receiver, Sender, select};
 use crate::cell::{Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
-use crate::entity::{EntityKey, EntityState, Head, Kind};
+use crate::entity::{EntityKey, EntityState, Head, Kind, Presence};
 use crate::git;
 use crate::snapshot::Snapshot;
 
@@ -171,6 +177,29 @@ pub struct Core {
     /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#reload)
     /// is later work).
     overrides: Arc<Vec<ResolvedOverride>>,
+    /// The Set `start` was given, retained so `refresh` can re-run discovery over
+    /// the same bounding specification at the head of every Generation
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md),
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
+    /// Immutable for the same reason `overrides` is: a Set's `roots` or globs
+    /// changing is a config reload, which re-derives a whole new `Core` rather
+    /// than mutating this one in place.
+    set: SetSpec,
+    /// Set once discovery abandons a walk (thirty seconds against a misconfigured
+    /// root), and never cleared for the life of this `Core`: it takes the Set out
+    /// of the automatic refresh path, per
+    /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#discovery-bounds),
+    /// because re-running a thirty-second walk at the head of every Generation is
+    /// not a degraded mode. `refresh` checks this before re-running discovery;
+    /// nothing in this crate clears it, since the only way `roots` or globs
+    /// change today is a fresh `Core::start`, which always begins Automatic.
+    discovery_manual: Arc<AtomicBool>,
+    /// How long a re-run discovery walk may run before the still-walking warning
+    /// fires; real value is one second outside a test.
+    discovery_warn_after: Duration,
+    /// How long a re-run discovery walk may run before it is abandoned; real
+    /// value is [`discovery::ABANDON_AFTER`] outside a test.
+    discovery_abandon_after: Duration,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
@@ -203,7 +232,14 @@ impl Core {
         let interval = spec.poll_interval.max(Duration::from_nanos(1));
         let ticks = crossbeam_channel::tick(interval);
         let alive = Arc::new(AtomicBool::new(true));
-        start_internal(spec, Duration::from_secs(1), ticks, alive).core
+        start_internal(
+            spec,
+            Duration::from_secs(1),
+            discovery::ABANDON_AFTER,
+            ticks,
+            alive,
+        )
+        .core
     }
 
     /// Starts a new Generation, dispatching a probe for every key in `order` that
@@ -216,6 +252,17 @@ impl Core {
         // call, never carried over, never touched by the previous Generation's
         // still-finishing tasks holding their own clone of the old one.
         self.default_branch_chain_reads.store(0, Ordering::Release);
+
+        // Both halves of discovery re-run at the head of every Generation, per
+        // refresh.md and discovery.md: an entity no longer found becomes
+        // Vanished, and one found again (new, or previously Vanished) is
+        // Present. Skipped once an earlier walk has abandoned, which takes the
+        // Set out of this automatic path until a fresh `Core` starts over
+        // different roots.
+        if !self.discovery_manual.load(Ordering::Acquire) {
+            self.rerun_discovery();
+        }
+
         let mut table = self.table.write().unwrap();
         table.generation += 1;
         let generation_number = table.generation;
@@ -311,6 +358,61 @@ impl Core {
         }
 
         generation
+    }
+
+    /// Re-runs both halves of discovery over `self.set` and reconciles the
+    /// result into the live table, per [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)
+    /// and [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md).
+    /// The walk and resolve run outside the table lock, since an abandoned walk
+    /// can take up to thirty seconds; only reconciling the result briefly holds
+    /// the write lock. Already-known boundaries reuse their cached repository
+    /// handle rather than reopening it, which is what keeps re-running discovery
+    /// every Generation from paying every entity's open cost again.
+    fn rerun_discovery(&self) {
+        let repos_cache: HashMap<EntityKey, Arc<gix::ThreadSafeRepository>> =
+            self.table.read().unwrap().repos.clone();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let warning_slot = Arc::clone(&self.discovery_warning);
+        let roots = self.set.roots.clone();
+        let warn_after = self.discovery_warn_after;
+        thread::spawn({
+            let progress = Arc::clone(&progress);
+            let finished = Arc::clone(&finished);
+            move || {
+                if let Some(message) =
+                    watch_for_slow_discovery(progress, finished, roots, warn_after)
+                {
+                    *warning_slot.lock().unwrap() = Some(message);
+                }
+            }
+        });
+
+        let discovery = discovery::discover_watched_with_deadline(
+            &self.set,
+            Arc::clone(&progress),
+            self.discovery_abandon_after,
+        );
+        finished.store(true, Ordering::Release);
+
+        if discovery.abandoned {
+            self.discovery_manual.store(true, Ordering::Release);
+            *self.discovery_warning.lock().unwrap() =
+                Some(abandoned_discovery_message(discovery.directories_visited));
+        }
+
+        let (discovered, gitmodules_failures) =
+            discovery::resolve_with_cache(&self.set, &discovery.entities, &repos_cache);
+
+        let mut table = self.table.write().unwrap();
+        table.discovered_at = Timestamp::now();
+        let cancelled =
+            merge_discovery(&mut table, &self.overrides, discovered, gitmodules_failures);
+        drop(table);
+        if cancelled > 0 {
+            complete_many(&self.settle_gate, cancelled);
+        }
     }
 
     /// Re-probes one entity synchronously against the table's current Generation,
@@ -475,14 +577,38 @@ impl Core {
         warn_after: Duration,
         ticks: Receiver<Instant>,
     ) -> StartForTest {
+        Self::start_for_test_with_discovery_abandon(
+            spec,
+            warn_after,
+            discovery::ABANDON_AFTER,
+            ticks,
+        )
+    }
+
+    /// `start_for_test`, with the discovery abandon deadline also injected, so a
+    /// test can force a walk to abandon deterministically instead of running one
+    /// for the real thirty seconds.
+    pub(crate) fn start_for_test_with_discovery_abandon(
+        spec: CoreSpec,
+        warn_after: Duration,
+        discovery_abandon_after: Duration,
+        ticks: Receiver<Instant>,
+    ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
-        start_internal(spec, warn_after, ticks, alive)
+        start_internal(spec, warn_after, discovery_abandon_after, ticks, alive)
     }
 
     /// Reads whatever the discovery-slow watcher last recorded, for a test to
     /// check without a public entry point existing for it yet.
     pub(crate) fn discovery_warning_for_test(&self) -> Option<String> {
         self.discovery_warning.lock().unwrap().clone()
+    }
+
+    /// Whether an abandoned discovery has already taken this `Core` out of the
+    /// automatic refresh path, so a test can assert the precondition explicitly
+    /// rather than infer it from a later refresh's behaviour alone.
+    pub(crate) fn discovery_manual_for_test(&self) -> bool {
+        self.discovery_manual.load(Ordering::Acquire)
     }
 
     /// Puts one already-known entity into the in-flight state a real `refresh`
@@ -572,6 +698,7 @@ impl Core {
 fn start_internal(
     spec: CoreSpec,
     warn_after: Duration,
+    discovery_abandon_after: Duration,
     ticks: Receiver<Instant>,
     alive: Arc<AtomicBool>,
 ) -> StartForTest {
@@ -591,8 +718,17 @@ fn start_internal(
         })
     };
 
-    let discovery = discovery::discover_watched(&spec.set, Arc::clone(&progress));
+    let discovery = discovery::discover_watched_with_deadline(
+        &spec.set,
+        Arc::clone(&progress),
+        discovery_abandon_after,
+    );
     finished.store(true, Ordering::Release);
+    let discovery_manual = Arc::new(AtomicBool::new(discovery.abandoned));
+    if discovery.abandoned {
+        *discovery_warning.lock().unwrap() =
+            Some(abandoned_discovery_message(discovery.directories_visited));
+    }
 
     // Discovery's second half: every boundary the walk just found becomes a Repo
     // or a Worktree, and each one's own `.gitmodules` (never recursed into) names
@@ -601,43 +737,22 @@ fn start_internal(
     let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
     let overrides = Arc::new(resolve_overrides(&spec.overrides));
 
-    let mut entities = Vec::with_capacity(discovered.len());
-    let mut index = HashMap::with_capacity(discovered.len());
-    let mut repos = HashMap::new();
-    for discovered in discovered {
-        let name = display_name(discovered.key.path());
-        if let Some(repo) = discovered.repo {
-            repos.insert(discovered.key.clone(), repo);
-        }
-        let mut entity = EntityState::new(
-            discovered.key.clone(),
-            name,
-            Arc::clone(&discovered.common_dir),
-            discovered.kind,
-        );
-        if let Some(matched) =
-            find_override(&overrides, discovered.key.path(), &discovered.common_dir)
-        {
-            entity.excluded = matched.excluded;
-        }
-        index.insert(discovered.key, entities.len());
-        entities.push(entity);
-    }
-    for (key, message) in gitmodules_failures {
-        if let Some(&idx) = index.get(&key) {
-            entities[idx].diagnostics.gitmodules_failed = Some(Arc::from(message.as_str()));
-        }
-    }
-
     let table = Arc::new(RwLock::new(Table {
         generation: 0,
         discovered_at: Timestamp::now(),
-        entities,
-        index,
+        entities: Vec::new(),
+        index: HashMap::new(),
         in_flight: HashMap::new(),
         generation_started_at: HashMap::new(),
-        repos,
+        repos: HashMap::new(),
     }));
+    {
+        let mut table = table.write().unwrap();
+        // A fresh table has nothing in flight yet, so nothing here is ever
+        // cancelled: the same reconciliation `refresh` uses later, run once
+        // against an empty starting point.
+        merge_discovery(&mut table, &overrides, discovered, gitmodules_failures);
+    }
 
     let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
     let (control, control_rx) = crossbeam_channel::unbounded();
@@ -654,6 +769,10 @@ fn start_internal(
         core: Core {
             table,
             overrides,
+            set: spec.set,
+            discovery_manual,
+            discovery_warn_after: warn_after,
+            discovery_abandon_after,
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
@@ -951,6 +1070,91 @@ fn apply_probe_outcome(
     complete_one(settle_gate);
 }
 
+/// Reconciles one discovery result into `table`: a boundary or Submodule
+/// discovery just found is inserted (new) or marked Present again (already
+/// known, including a previously Vanished one); an already-known entity
+/// discovery no longer finds is marked Vanished via [`EntityState::mark_vanished`],
+/// which keeps its last values and forces every cell stale. One code path for
+/// both halves of discovery, since the combined entity list they return never
+/// records which half produced a given entry: a Repo and a Submodule vanish and
+/// reappear by the exact same rule.
+///
+/// Returns how many previously in-flight probes were cancelled because their
+/// entity just vanished, which the caller signals `settle_gate` for; `start`'s
+/// own first build always returns zero, since a fresh table has nothing in
+/// flight yet.
+fn merge_discovery(
+    table: &mut Table,
+    overrides: &[ResolvedOverride],
+    discovered: Vec<discovery::DiscoveredEntity>,
+    gitmodules_failures: Vec<(EntityKey, String)>,
+) -> usize {
+    let mut found: HashSet<EntityKey> = HashSet::with_capacity(discovered.len());
+
+    for discovered in discovered {
+        found.insert(discovered.key.clone());
+        match table.index.get(&discovered.key).copied() {
+            Some(idx) => {
+                table.entities[idx].presence = Presence::Present;
+                if let Some(repo) = discovered.repo {
+                    table.repos.insert(discovered.key.clone(), repo);
+                }
+            }
+            None => {
+                let name = display_name(discovered.key.path());
+                let mut entity = EntityState::new(
+                    discovered.key.clone(),
+                    name,
+                    Arc::clone(&discovered.common_dir),
+                    discovered.kind,
+                );
+                if let Some(matched) =
+                    find_override(overrides, discovered.key.path(), &discovered.common_dir)
+                {
+                    entity.excluded = matched.excluded;
+                }
+                if let Some(repo) = discovered.repo {
+                    table.repos.insert(discovered.key.clone(), repo);
+                }
+                let idx = table.entities.len();
+                table.index.insert(discovered.key, idx);
+                table.entities.push(entity);
+            }
+        }
+    }
+
+    // A boundary's `.gitmodules` failure is re-derived from this pass alone,
+    // never carried over from a previous one: a failure that was fixed since the
+    // last Generation must clear, not stay stuck forever.
+    let now_failing: HashMap<EntityKey, String> = gitmodules_failures.into_iter().collect();
+    for key in &found {
+        if let Some(&idx) = table.index.get(key) {
+            table.entities[idx].diagnostics.gitmodules_failed = now_failing
+                .get(key)
+                .map(|message| Arc::from(message.as_str()));
+        }
+    }
+
+    let missing: Vec<EntityKey> = table
+        .index
+        .keys()
+        .filter(|key| !found.contains(*key))
+        .cloned()
+        .collect();
+    let mut cancelled = 0usize;
+    for key in missing {
+        if let Some(&idx) = table.index.get(&key) {
+            table.entities[idx].mark_vanished();
+        }
+        if let Some(in_flight) = table.in_flight.remove(&key) {
+            in_flight.cancel.store(true, Ordering::Release);
+            cancelled += 1;
+        }
+    }
+
+    cancelled
+}
+
 /// A basename read from the entity's own resolved path. A real display name has
 /// collision handling that belongs to [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md);
 /// this is a placeholder good enough to populate the table.
@@ -995,6 +1199,14 @@ fn still_walking_message(directories_visited: usize, roots: &[PathBuf]) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     format!("discovery: still walking, {directories_visited} directories reached under {roots}")
+}
+
+/// The persistent warning left once a walk abandons, per
+/// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#discovery-bounds):
+/// unlike the still-walking warning, this one never clears itself, since the Set
+/// stays out of the automatic refresh path for the life of this `Core`.
+fn abandoned_discovery_message(directories_visited: usize) -> String {
+    format!("discovery: stopped at {directories_visited} directories")
 }
 
 /// Runs `step` until it says it is done or `cancel` is observed set, checked before
@@ -1225,6 +1437,331 @@ mod tests {
         core.dismiss(&key);
 
         assert!(core.snapshot().entities.is_empty());
+    }
+
+    /// Asserts `entity` reads exactly as a Vanished row must: still in the table,
+    /// its last known branch value untouched, and that same cell's staleness
+    /// forced on. Shared by the Repo and the Submodule vanish tests so both
+    /// exercise the identical assertion rather than a Repo-shaped one and a
+    /// Submodule-shaped one that only look alike.
+    fn assert_vanished_with_stale_branch(entity: &EntityState, expected_branch: &str) {
+        assert_eq!(entity.presence, crate::entity::Presence::Vanished);
+        match entity.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                stale: true,
+                ..
+            }) => assert_eq!(
+                &**name, expected_branch,
+                "a Vanished entity must keep its last known branch value"
+            ),
+            other => panic!(
+                "expected the branch cell to keep its Known value and go stale, got {other:?}"
+            ),
+        }
+    }
+
+    /// The central behaviour this ticket adds: an entity discovery no longer
+    /// finds stays in the table with its last known values, every cell forced
+    /// stale, rather than disappearing. Proven end to end through `refresh` and
+    /// `settle`, which is what proves discovery itself re-ran rather than the
+    /// entity merely being left alone.
+    #[test]
+    fn a_repo_removed_from_disk_stays_in_the_table_vanished_with_its_last_values() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&key));
+        let before = core.settle(Duration::from_millis(500));
+        let branch_name = match before.entities[0].branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => name.to_string(),
+            other => panic!("expected the first refresh to settle a branch, got {other:?}"),
+        };
+
+        fs::remove_dir_all(&repo).expect("remove the repo from disk");
+
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        assert_eq!(
+            after.entities.len(),
+            1,
+            "a vanished entity must stay in the snapshot, not disappear from it"
+        );
+        assert_vanished_with_stale_branch(&after.entities[0], &branch_name);
+    }
+
+    /// A Submodule vanishes by exactly the same rule as a Repo: no code path here
+    /// is specific to which half of discovery produced the entry. Driven through
+    /// the Submodule half (removing its declaration from `.gitmodules`, never
+    /// touched by the boundary walk) and asserted with the very same helper the
+    /// Repo test above uses.
+    #[test]
+    fn a_submodule_removed_from_gitmodules_vanishes_by_the_same_rule_as_a_repo() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        let submodule_path = parent.join("vendor").join("lib");
+        init_repo_with_a_commit(&submodule_path);
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let submodule_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("submodule discovered")
+            .key
+            .clone();
+        core.refresh(std::slice::from_ref(&submodule_key));
+        let before = core.settle(Duration::from_millis(500));
+        let submodule_before = before
+            .entities
+            .iter()
+            .find(|entity| entity.key == submodule_key)
+            .expect("submodule present");
+        let branch_name = match submodule_before.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => name.to_string(),
+            other => {
+                panic!("expected the submodule's first refresh to settle a branch, got {other:?}")
+            }
+        };
+
+        // The submodule is no longer declared: discovery's second half will no
+        // longer produce this entry, exactly as removing the parent's own `.git`
+        // boundary would remove a Repo's entry.
+        fs::write(parent.join(".gitmodules"), "").expect("clear .gitmodules");
+
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        let submodule_after = after
+            .entities
+            .iter()
+            .find(|entity| entity.key == submodule_key)
+            .expect("the vanished submodule must stay in the snapshot");
+        assert_vanished_with_stale_branch(submodule_after, &branch_name);
+    }
+
+    /// Dismissal writes nothing to disk, so a Repo dismissed from one `Core`
+    /// reads as an ordinary, freshly discovered Present entity on a brand new
+    /// `Core` over the same roots, never as a restored Vanished row: startup is
+    /// always a Generation with an empty prior state.
+    #[test]
+    fn dismissal_persists_nothing_across_a_fresh_core() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let first_core = Core::start(spec(vec![root.clone()]));
+        let key = first_core.snapshot().entities[0].key.clone();
+        first_core.dismiss(&key);
+        assert!(first_core.snapshot().entities.is_empty());
+        drop(first_core);
+
+        let second_core = Core::start(spec(vec![root]));
+        let snapshot = second_core.snapshot();
+
+        assert_eq!(
+            snapshot.entities.len(),
+            1,
+            "a fresh Core must discover the repo again"
+        );
+        assert_eq!(
+            snapshot.entities[0].presence,
+            crate::entity::Presence::Present,
+            "nothing from the dismissing Core's lifetime may be persisted, so the \
+             repo must come back Present, never restored as Vanished"
+        );
+    }
+
+    /// An entity that moves reads as vanished plus new: its old key stays in the
+    /// table Vanished with its last values, and a brand new entity appears at the
+    /// new path, rather than the move being recognised as a rename.
+    #[test]
+    fn a_repo_that_moves_reads_as_vanished_plus_new() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let original_path = root.join("original-name");
+        init_repo_with_a_commit(&original_path);
+
+        let core = Core::start(spec(vec![root.clone()]));
+        let original_key = core.snapshot().entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&original_key));
+        let before = core.settle(Duration::from_millis(500));
+        let branch_name = match before.entities[0].branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => name.to_string(),
+            other => panic!("expected the first refresh to settle a branch, got {other:?}"),
+        };
+
+        let moved_path = root.join("new-name");
+        fs::rename(&original_path, &moved_path).expect("move the repo on disk");
+
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        assert_eq!(
+            after.entities.len(),
+            2,
+            "a moved entity must read as the old key vanished plus a new one present, \
+             never as one renamed entity"
+        );
+        let old_entity = after
+            .entities
+            .iter()
+            .find(|entity| entity.key == original_key)
+            .expect("the old key must stay in the table");
+        assert_vanished_with_stale_branch(old_entity, &branch_name);
+        let new_entity = after
+            .entities
+            .iter()
+            .find(|entity| entity.key != original_key)
+            .expect("a new entity at the moved path must be present");
+        assert_eq!(new_entity.presence, crate::entity::Presence::Present);
+        assert_eq!(new_entity.key.path(), moved_path);
+    }
+
+    /// Discovery riding the refresh is what lets a brand new entity appear
+    /// without a fresh `Core::start`: a repo created after `start` is picked up
+    /// by the very next `refresh`, even though the caller's `order` cannot yet
+    /// name a key it never saw.
+    #[test]
+    fn a_new_repo_created_after_start_is_discovered_by_the_next_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("first"));
+
+        let core = Core::start(spec(vec![root.clone()]));
+        assert_eq!(core.snapshot().entities.len(), 1);
+
+        init_repo_with_a_commit(&root.join("second"));
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        assert_eq!(
+            after.entities.len(),
+            2,
+            "a new repo created after start must be found by the next refresh's own discovery"
+        );
+    }
+
+    /// The abandon path takes the Set out of the automatic refresh path: once one
+    /// discovery invocation abandons, a later `refresh` does not re-run discovery
+    /// at all, proven by a repo created afterward never appearing, not merely by
+    /// reading an internal flag.
+    #[test]
+    fn an_abandoned_discovery_stops_riding_later_refreshes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        // A wide fan of plain directories, real enough for the walk to measurably
+        // outrun a millisecond-scale deadline, so `start`'s own discovery
+        // abandons rather than merely being told to (`Duration::ZERO` would trip
+        // on the very first directory regardless of what is actually here, which
+        // could never distinguish a guarded `refresh` from an unguarded one that
+        // simply keeps re-abandoning against the same still-huge tree).
+        let decoys = root.join("decoys");
+        for i in 0..4_000 {
+            fs::create_dir(decoys.join(format!("decoy-{i}")))
+                .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
+                .expect("create decoy dir");
+        }
+        let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+
+        let started = Core::start_for_test_with_discovery_abandon(
+            spec(vec![root.clone()]),
+            Duration::from_secs(3600),
+            Duration::from_micros(500),
+            tick_rx,
+        );
+        let core = started.core;
+        assert!(
+            core.discovery_manual_for_test(),
+            "walking 4,000 decoy directories against a 500 microsecond deadline \
+             must have abandoned and taken the Set manual"
+        );
+
+        // The tree shrinks back to nothing slow: if `refresh` were still (wrongly)
+        // re-running discovery, this walk would finish comfortably inside the
+        // same deadline and find the new repo below. Only the manual guard can
+        // account for it staying undiscovered.
+        fs::remove_dir_all(&decoys).expect("remove decoy directories");
+        init_repo_with_a_commit(&root.join("second"));
+
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        assert!(
+            !after
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "second"),
+            "once discovery has abandoned, a later refresh must not re-run it, so a \
+             repo created afterward, on a tree that would now resolve quickly, \
+             must still never appear"
+        );
+    }
+
+    /// The other half: an abandoned Set going manual must not leak into a
+    /// different `Core`. The only way this crate can express "the Set's roots or
+    /// globs changed" today is a fresh `Core::start` (a live in-place reload has
+    /// no entry point in `Core` yet), so this proves the manual flag lives on one
+    /// `Core` instance rather than anywhere global.
+    #[test]
+    fn a_fresh_core_over_different_roots_is_unaffected_by_another_cores_abandoned_discovery() {
+        let abandoned_dir = tempfile::tempdir().expect("temp dir");
+        let abandoned_root = root_of(&abandoned_dir);
+        init_repo_with_a_commit(&abandoned_root.join("first"));
+        let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let started = Core::start_for_test_with_discovery_abandon(
+            spec(vec![abandoned_root]),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            tick_rx,
+        );
+        started.core.refresh(&[]);
+        started.core.settle(Duration::from_millis(500));
+        assert!(
+            started.core.discovery_manual_for_test(),
+            "the zero-length abandon deadline must have already taken this Core manual"
+        );
+        drop(started.core);
+
+        let fresh_dir = tempfile::tempdir().expect("temp dir");
+        let fresh_root = root_of(&fresh_dir);
+        init_repo_with_a_commit(&fresh_root.join("first"));
+        let fresh_core = Core::start(spec(vec![fresh_root.clone()]));
+        assert_eq!(fresh_core.snapshot().entities.len(), 1);
+
+        init_repo_with_a_commit(&fresh_root.join("second"));
+        fresh_core.refresh(&[]);
+        let after = fresh_core.settle(Duration::from_millis(500));
+
+        assert_eq!(
+            after.entities.len(),
+            2,
+            "a fresh Core, standing in for the Set's roots changing, must discover \
+             normally regardless of an earlier, unrelated Core having gone manual"
+        );
     }
 
     /// Proves shutdown is clean: dropping the core blocks until the dedicated

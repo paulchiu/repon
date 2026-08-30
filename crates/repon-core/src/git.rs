@@ -54,12 +54,18 @@ pub(crate) struct Resolved {
     pub repo: gix::ThreadSafeRepository,
 }
 
-/// Opens `path` once and reads everything discovery's second half needs from it:
+/// Reads everything discovery's second half needs from an already-open `repo`:
 /// its own Kind and common dir, from gix's own worktree and `commondir`
 /// resolution rather than this crate re-deriving the `.git` file and `commondir`
 /// file formats by hand, plus its Submodules.
-pub(crate) fn resolve_boundary(path: &Path) -> Result<Resolved, ProbeError> {
-    let repo = gix::open(path).map_err(|error| ProbeError::Open(error.to_string().into()))?;
+///
+/// Split out from [`resolve_boundary`] so a boundary discovery already has a
+/// cached [`gix::ThreadSafeRepository`] for (because a Generation earlier than
+/// this one already opened it) can be resolved again without a second
+/// `gix::open`, which is what lets discovery re-run every Generation
+/// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md))
+/// without paying the open cost every time.
+pub(crate) fn resolve_from_open(repo: gix::Repository) -> Resolved {
     let kind = match repo.kind() {
         gix::repository::Kind::LinkedWorkTree => Kind::Worktree,
         gix::repository::Kind::Common | gix::repository::Kind::Submodule => Kind::Repo,
@@ -68,12 +74,19 @@ pub(crate) fn resolve_boundary(path: &Path) -> Result<Resolved, ProbeError> {
     let common_dir: Arc<Path> =
         Arc::from(std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf()));
     let submodules = read_gitmodules(&repo).map(|entries| entries.unwrap_or_default());
-    Ok(Resolved {
+    Resolved {
         kind,
         common_dir,
         submodules,
         repo: repo.into_sync(),
-    })
+    }
+}
+
+/// Opens `path` and resolves it via [`resolve_from_open`]. The first-time path:
+/// every caller with no cached handle for `path` yet comes through here.
+pub(crate) fn resolve_boundary(path: &Path) -> Result<Resolved, ProbeError> {
+    let repo = gix::open(path).map_err(|error| ProbeError::Open(error.to_string().into()))?;
+    Ok(resolve_from_open(repo))
 }
 
 /// Opens `path` and returns its git common dir, canonicalized, with nothing else

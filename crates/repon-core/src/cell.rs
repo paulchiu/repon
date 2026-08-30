@@ -175,6 +175,17 @@ impl<T> Cell<T> {
         self.in_flight = false;
         true
     }
+
+    /// Marks a `Known` value stale in place, keeping its value and timestamp. A
+    /// no-op on every other shape: `Unknown`, `Failed` and `NotApplicable` carry
+    /// no staleness of their own, and a cell nothing has looked at yet has no
+    /// value to mark old. This is what a Vanished Entity forces on every cell it
+    /// holds, never blanking the last known values.
+    pub(crate) fn force_stale(&mut self) {
+        if let Some(Settled::Known { stale, .. }) = &mut self.settled {
+            *stale = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +280,44 @@ mod tests {
             not_applicable_cell.settled(),
             Some(Settled::NotApplicable)
         ));
+    }
+
+    #[test]
+    fn force_stale_marks_a_known_value_stale_without_changing_it() {
+        let mut cell: Cell<u32> = Cell::default();
+        cell.settle(
+            Generation::new(1),
+            Settled::Known {
+                value: 42,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        cell.force_stale();
+
+        match cell.settled() {
+            Some(Settled::Known { value, stale, .. }) => {
+                assert_eq!(*value, 42, "the value must survive being forced stale");
+                assert!(*stale, "the cell must be marked stale");
+            }
+            other => panic!("expected the Known value to survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_stale_on_a_cell_with_no_known_value_is_a_no_op() {
+        let mut unknown_cell: Cell<u32> = Cell::default();
+        unknown_cell.settle(Generation::new(1), Settled::Unknown(Unknown::TimedOut));
+        unknown_cell.force_stale();
+        assert!(matches!(
+            unknown_cell.settled(),
+            Some(Settled::Unknown(Unknown::TimedOut))
+        ));
+
+        let mut never_probed: Cell<u32> = Cell::default();
+        never_probed.force_stale();
+        assert!(never_probed.settled().is_none());
     }
 
     #[test]

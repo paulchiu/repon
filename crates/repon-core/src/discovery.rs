@@ -9,7 +9,7 @@
 //! same globs. Discovery returns one combined entity list either way: nothing
 //! records which half produced a given entry.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,8 +48,10 @@ pub struct Discovery {
 
 /// The walk gives up and reports what it found rather than run unbounded against a
 /// misconfigured root; [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)
-/// fixes this at thirty seconds.
-const ABANDON_AFTER: Duration = Duration::from_secs(30);
+/// fixes this at thirty seconds. `pub(crate)` so `Core` can hand the same real
+/// deadline to every discovery invocation it makes, at `start` and at the head of
+/// every later Generation alike, and so a test can inject a shorter one instead.
+pub(crate) const ABANDON_AFTER: Duration = Duration::from_secs(30);
 
 /// Walks every root in `spec`, stopping at each Repo boundary, and returns the bounded
 /// list. Never descends into a boundary and never descends through a symlink, so a cycle
@@ -68,8 +70,17 @@ pub fn discover(spec: &SetSpec) -> Discovery {
 /// `Core::start`'s dedicated thread, watch an in-flight walk and warn once it has run
 /// for a second without finishing, per
 /// [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md).
-pub(crate) fn discover_watched(spec: &SetSpec, progress: Arc<AtomicUsize>) -> Discovery {
-    walk(spec, ABANDON_AFTER, Some(&progress))
+/// The abandon deadline is injected rather than always the real thirty seconds,
+/// so a test can force abandonment deterministically instead of waiting it out.
+/// `Core` calls this at the head of every Generation it re-runs discovery for
+/// (at `start`, and again at the head of every later `refresh`), always with the
+/// real [`ABANDON_AFTER`] outside a test.
+pub(crate) fn discover_watched_with_deadline(
+    spec: &SetSpec,
+    progress: Arc<AtomicUsize>,
+    abandon_after: Duration,
+) -> Discovery {
+    walk(spec, abandon_after, Some(&progress))
 }
 
 /// Matches a Set against the boundary-stop walk with no probing and no provenance,
@@ -113,29 +124,54 @@ pub(crate) fn resolve(
     spec: &SetSpec,
     boundaries: &[EntityKey],
 ) -> (Vec<DiscoveredEntity>, Vec<(EntityKey, String)>) {
+    resolve_with_cache(spec, boundaries, &HashMap::new())
+}
+
+/// [`resolve`], but reusing an already-open handle for a boundary `cache` already
+/// holds one for, rather than opening it again via `gix::open`. This is what lets
+/// discovery re-run every Generation ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md))
+/// without paying every boundary's open cost again each time: only a boundary
+/// `cache` has no entry for (a genuinely new one) is opened fresh. A boundary
+/// resolved from the cache hands back the same `Arc` `cache` gave it, never a new
+/// one, so a caller can tell reuse happened by pointer identity.
+pub(crate) fn resolve_with_cache(
+    spec: &SetSpec,
+    boundaries: &[EntityKey],
+    cache: &HashMap<EntityKey, Arc<gix::ThreadSafeRepository>>,
+) -> (Vec<DiscoveredEntity>, Vec<(EntityKey, String)>) {
     let globs = Globs::compile(&spec.include, &spec.exclude);
     let mut entities = Vec::with_capacity(boundaries.len());
     let mut failures = Vec::new();
 
     for key in boundaries {
         let path = key.path();
-        let (kind, common_dir, submodules, repo) = match git::resolve_boundary(path) {
-            Ok(resolved) => (
+        let (kind, common_dir, submodules, repo) = if let Some(cached) = cache.get(key) {
+            let resolved = git::resolve_from_open(cached.to_thread_local());
+            (
                 resolved.kind,
                 resolved.common_dir,
                 resolved.submodules,
-                Some(Arc::new(resolved.repo)),
-            ),
-            // A boundary the walk just found that will not even open is treated as
-            // an ordinary Repo with no Submodules rather than dropped: an opaque
-            // git-open failure surfaces later, on the branch probe that already
-            // reports it, not by discovery silently shrinking its own result.
-            Err(_) => (
-                Kind::Repo,
-                Arc::from(path.join(".git")),
-                Ok(Vec::new()),
-                None,
-            ),
+                Some(Arc::clone(cached)),
+            )
+        } else {
+            match git::resolve_boundary(path) {
+                Ok(resolved) => (
+                    resolved.kind,
+                    resolved.common_dir,
+                    resolved.submodules,
+                    Some(Arc::new(resolved.repo)),
+                ),
+                // A boundary the walk just found that will not even open is treated as
+                // an ordinary Repo with no Submodules rather than dropped: an opaque
+                // git-open failure surfaces later, on the branch probe that already
+                // reports it, not by discovery silently shrinking its own result.
+                Err(_) => (
+                    Kind::Repo,
+                    Arc::from(path.join(".git")),
+                    Ok(Vec::new()),
+                    None,
+                ),
+            }
         };
 
         entities.push(DiscoveredEntity {
@@ -628,7 +664,11 @@ mod tests {
         }
         let progress = Arc::new(AtomicUsize::new(0));
 
-        let discovery = discover_watched(&spec(vec![root_dir.clone()]), Arc::clone(&progress));
+        let discovery = discover_watched_with_deadline(
+            &spec(vec![root_dir.clone()]),
+            Arc::clone(&progress),
+            ABANDON_AFTER,
+        );
 
         // The walk has finished, so progress should have been updated at least once and
         // land on the same final count discovery itself reports; a stub that never wrote
@@ -700,6 +740,68 @@ mod tests {
         assert_eq!(
             repo_handle.to_thread_local().head_id().ok(),
             gix::open(&repo).unwrap().head_id().ok()
+        );
+    }
+
+    /// The defining behaviour that lets discovery re-run every Generation without
+    /// paying every entity's open cost again: a boundary `resolve_with_cache`
+    /// already has a handle for comes back with that exact same `Arc`, proven by
+    /// pointer identity rather than by two handles merely agreeing on `HEAD`.
+    #[test]
+    fn resolve_with_cache_reuses_an_already_open_handle_by_pointer_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let repo = root_dir.join("repo");
+        init_repo(&repo);
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+        let cached = Arc::new(git::open_thread_safe(&repo).expect("open repo"));
+        let mut cache = HashMap::new();
+        cache.insert(
+            EntityKey::new(Arc::from(repo.as_path())),
+            Arc::clone(&cached),
+        );
+
+        let (entities, _) = resolve_with_cache(&set, &discovery.entities, &cache);
+
+        let entity = entities
+            .iter()
+            .find(|entity| entity.key.path() == repo)
+            .expect("repo entity present");
+        let handle = entity
+            .repo
+            .as_ref()
+            .expect("a cached boundary must still carry a handle");
+        assert!(
+            Arc::ptr_eq(handle, &cached),
+            "resolve_with_cache must hand back the very same Arc it was given, not a freshly opened one"
+        );
+    }
+
+    /// The other half: a boundary with no entry in `cache` is still resolved
+    /// correctly, exactly as a plain [`resolve`] call would, so an empty or
+    /// partial cache never drops or misreads a boundary.
+    #[test]
+    fn resolve_with_cache_still_resolves_a_boundary_absent_from_the_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let repo = root_dir.join("repo");
+        init_repo(&repo);
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+
+        let (entities, _) = resolve_with_cache(&set, &discovery.entities, &HashMap::new());
+
+        let entity = entities
+            .iter()
+            .find(|entity| entity.key.path() == repo)
+            .expect("repo entity present");
+        assert!(matches!(entity.kind, Kind::Repo));
+        assert!(
+            entity.repo.is_some(),
+            "an uncached boundary must still be opened and carry a handle"
         );
     }
 
