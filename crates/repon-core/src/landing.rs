@@ -170,7 +170,15 @@ fn is_ancestor(
 /// to the commit it currently points at. Tries it as a remote-tracking ref first,
 /// since that is what every rung of the chain but a remote-less override
 /// produces, then falls back to `name` exactly as given for that one case.
-fn resolve_ref_commit(repo: &gix::Repository, name: &str) -> Result<gix::ObjectId, ProbeError> {
+///
+/// `pub(crate)` rather than private: [`crate::patch_equivalence`]'s second pass
+/// needs the same default-branch commit ancestry already resolved, and doing so
+/// through this function is what keeps both passes reading the same ref the same
+/// way rather than growing a second implementation of it.
+pub(crate) fn resolve_ref_commit(
+    repo: &gix::Repository,
+    name: &str,
+) -> Result<gix::ObjectId, ProbeError> {
     let candidates = [format!("refs/remotes/{name}"), name.to_string()];
     for candidate in candidates {
         if let Some(mut reference) = repo.try_find_reference(candidate.as_str()).ok().flatten() {

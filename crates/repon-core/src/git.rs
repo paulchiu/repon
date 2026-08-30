@@ -21,6 +21,9 @@ pub enum ProbeError {
     /// The ancestry check between a branch and the default branch could not run:
     /// a missing or corrupt commit, never a stand-in for "not an ancestor".
     Ancestry(Arc<str>),
+    /// The patch-equivalence check could not run: a missing or corrupt commit
+    /// or tree, never a stand-in for "not equivalent".
+    PatchEquivalence(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -30,6 +33,9 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Read(message) => write!(f, "failed to read HEAD: {message}"),
             ProbeError::Submodules(message) => write!(f, "failed to read .gitmodules: {message}"),
             ProbeError::Ancestry(message) => write!(f, "failed to check ancestry: {message}"),
+            ProbeError::PatchEquivalence(message) => {
+                write!(f, "failed to check patch equivalence: {message}")
+            }
         }
     }
 }
