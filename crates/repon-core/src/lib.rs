@@ -80,7 +80,7 @@ pub use entity::Kind;
 pub use entity::Presence;
 pub use entity::WorktreeState;
 pub use environment::environment;
-pub use git::ProbeError;
+pub use git::{InProgressOperation, ProbeError, RecentCommit};
 pub use snapshot::{RowSummary, Snapshot, summary};
 
 #[cfg(test)]

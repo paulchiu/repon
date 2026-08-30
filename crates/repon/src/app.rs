@@ -4,11 +4,11 @@ use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
-use repon_core::{Core, CoreSpec, EntityKey, SetSpec, Snapshot};
+use repon_core::{Core, CoreSpec, EntityKey, EntityState, SetSpec, Snapshot};
 use tracing::debug;
 
 use crate::{
-    components::{Component, list::List},
+    components::{Component, detail::Detail, list::List},
     config::{
         self, Config,
         document::{self, Document},
@@ -21,8 +21,66 @@ use crate::{
     selection::Selection,
     theme::{self, Theme},
     tui::{Event, Tui},
-    unwind,
+    unwind::{self, UnwindLevel},
 };
+
+/// Below this many columns, the detail pane takes the whole frame and the list is hidden
+/// entirely; at or above it, an open pane sits beside the list's own fixed sidebar
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The frame").
+const NARROW_BREAKPOINT: u16 = 100;
+
+/// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
+/// `pub(crate)` so `list.rs`'s own sidebar tests render at this constant rather than a
+/// hardcoded literal, per [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
+/// "34-column sidebar", pinned against that document by this module's own
+/// `sidebar_width_and_narrow_breakpoint_match_the_spec_of_record`.
+pub(crate) const SIDEBAR_WIDTH: u16 = 34;
+
+/// The three layout states the frame can be in, a pure function of the frame's width and
+/// whether the pane is open: no pane at all, open with the list collapsed to its sidebar
+/// beside it, or open with the list hidden entirely below the narrow breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout3 {
+    ListOnly,
+    SideBySide,
+    DetailOnly,
+}
+
+/// Which of the three layout states applies at `width` with the pane open or closed.
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes the
+/// breakpoint at 100 columns: `width < NARROW_BREAKPOINT` is `DetailOnly`, so the boundary
+/// value itself is the first `SideBySide` width, never a sliver of list at `DetailOnly`.
+fn layout_state(width: u16, pane_open: bool) -> Layout3 {
+    if !pane_open {
+        Layout3::ListOnly
+    } else if width < NARROW_BREAKPOINT {
+        Layout3::DetailOnly
+    } else {
+        Layout3::SideBySide
+    }
+}
+
+/// Closing the detail pane is the unwind stack's second level
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)'s fixed order: an in-flight
+/// fan-out, then a range anchor, then the detail pane, then a committed Filter), live only
+/// while the pane is open and tried only once [`Selection`]'s own range-anchor level is
+/// already empty.
+struct ClosePaneOnUnwind<'a> {
+    pane: &'a mut Option<EntityKey>,
+    focus: &'a mut Context,
+}
+
+impl UnwindLevel for ClosePaneOnUnwind<'_> {
+    fn unwind(&mut self) -> bool {
+        if self.pane.is_some() {
+            *self.pane = None;
+            *self.focus = Context::List;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// The dedicated thread's metadata-poll-and-deadline cadence has no config key yet
 /// ([core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
@@ -60,18 +118,32 @@ pub struct App {
     frame_rate: f64,
     core: Core,
     list: List,
+    detail: Detail,
+    /// The resolved glyph table, read by [`Detail::draw`] the same way `List` reads its own
+    /// copy: computed once from config at construction, since neither component's glyph set
+    /// changes mid-session outside a config reload.
+    glyphs: &'static GlyphSet,
     should_quit: bool,
     should_suspend: bool,
-    /// The rows this session's Actions and Launchers will act on, and the one Escape-unwind
-    /// level ([`unwind`]) this ticket builds: cancelling a live range anchor.
+    /// The rows this session's Actions and Launchers will act on, and the innermost
+    /// Escape-unwind level ([`unwind`]): cancelling a live range anchor.
     selection: Selection,
     /// The row the movement keys move and the toggle, anchor and empty-Selection default all
     /// read: an index into the current [`Snapshot`]'s entities, which is
     /// this crate's only "visible list" until a Filter narrows it.
     cursor: usize,
+    /// `Some` while the detail pane is open, carrying the Entity it shows: opening it never
+    /// touches `cursor` or reorders anything, since the pane is an overlay onto the same
+    /// table the list already reads. The unwind stack's second level closes it
+    /// ([`ClosePaneOnUnwind`]).
+    pane: Option<EntityKey>,
+    /// Which of `List` or `Detail` the non-Global part of a key event routes to. `Global` is
+    /// never a value here: it dispatches through whichever of the two is focused, per
+    /// [`BindingTable::dispatch`].
+    focus: Context,
     /// `Some` while the help overlay has focus, carrying its scroll position; `None` while
-    /// `List` does. `Context::List` is the only context this ticket's `handle_key_event`
-    /// ever opens it from, since no `Detail` component exists yet to open it from the other.
+    /// `focus` does. Opened from whichever of `List` or `Detail` `focus` names at the time,
+    /// and its own content describes that same context once open.
     help: Option<HelpOverlay>,
     /// The last size `Tui` reported, so the help overlay's own scroll clamp
     /// ([`HelpOverlay::apply`]) knows its viewport height without `Tui` reaching back in.
@@ -155,10 +227,14 @@ impl App {
             frame_rate,
             core,
             list,
+            detail: Detail::default(),
+            glyphs: glyph_set,
             should_quit: false,
             should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
+            pane: None,
+            focus: Context::List,
             help: None,
             frame_size: Size::default(),
             message_tx,
@@ -222,18 +298,20 @@ impl App {
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
-    /// `Context::Overlay` while the help overlay is open, `Context::List` otherwise. `Quit`
-    /// and `Suspend` raise a [`Message`], the movement and Selection actions mutate `cursor`
-    /// and `selection` directly, `OpenHelp` opens the overlay, `ReloadConfig` reaches
-    /// [`Self::reload_config`] and `Unwind` reaches [`unwind::unwind_one`]. Every other action
-    /// dispatches correctly but has nothing to do yet, since `List` is this app's only real
-    /// focus target today.
+    /// `Context::Overlay` while the help overlay is open, `self.focus` (`List` or `Detail`)
+    /// otherwise, so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
+    /// [`Message`], the movement and Selection actions mutate `cursor` and `selection`
+    /// directly, `OpenDetail`/`ClosePane` open and close the pane,
+    /// `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two without
+    /// touching what the pane shows, `OpenHelp` opens the overlay, `ReloadConfig` reaches
+    /// [`Self::reload_config`] and `Unwind` reaches [`unwind::unwind_one`] over the range
+    /// anchor then the pane.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
                 Some(action) => {
-                    let content_len = HelpOverlay::content_len(&self.bindings, Context::List);
+                    let content_len = HelpOverlay::content_len(&self.bindings, self.focus);
                     overlay.apply(action, content_len, self.frame_size.height);
                 }
                 None => {}
@@ -241,7 +319,7 @@ impl App {
             return Ok(());
         }
 
-        let message = match self.bindings.dispatch(Context::List, key) {
+        let message = match self.bindings.dispatch(self.focus, key) {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
             Some(Action::ReloadConfig) => {
@@ -285,8 +363,55 @@ impl App {
                 self.selection.clear();
                 None
             }
+            // Opening the pane never touches `cursor` or `visible_keys`' order: it is an
+            // overlay onto the same table the list already reads, keeping the same rows, the
+            // same order and the same cursor per docs/spec/layout-and-provenance.md.
+            Some(Action::OpenDetail) => {
+                if let Some(key) = self.cursor_key() {
+                    self.pane = Some(key);
+                    self.focus = Context::Detail;
+                }
+                None
+            }
+            Some(Action::ClosePane) => {
+                self.pane = None;
+                self.focus = Context::List;
+                None
+            }
+            Some(Action::ReturnFocusToList) => {
+                self.focus = Context::List;
+                None
+            }
+            // `Detail`'s own Tab intercepts before Global's ever would, per `keys::dispatch`,
+            // so this only ever fires while `List` is focused; a no-op with no pane open.
+            Some(Action::MoveFocusBetweenListAndDetail) => {
+                if self.pane.is_some() {
+                    self.focus = Context::Detail;
+                }
+                None
+            }
+            Some(
+                action @ (Action::ScrollDown
+                | Action::ScrollUp
+                | Action::Top
+                | Action::Bottom
+                | Action::HalfPageDown
+                | Action::HalfPageUp),
+            ) if self.focus == Context::Detail => {
+                let content_len = self
+                    .pane_entity()
+                    .map(|entity| Detail::content_len(&entity))
+                    .unwrap_or(0);
+                self.detail
+                    .apply(action, content_len, self.frame_size.height);
+                None
+            }
             Some(Action::Unwind) => {
-                unwind::unwind_one(&mut [&mut self.selection]);
+                let mut close_pane = ClosePaneOnUnwind {
+                    pane: &mut self.pane,
+                    focus: &mut self.focus,
+                };
+                unwind::unwind_one(&mut [&mut self.selection, &mut close_pane]);
                 None
             }
             Some(Action::OpenHelp) => {
@@ -427,6 +552,26 @@ impl App {
         self.visible_keys().get(self.cursor).cloned()
     }
 
+    /// The context [`Self::render`]'s footer draws for: `self.focus`, named as its own method
+    /// so a mutation that hardcoded `Context::List` there instead is something a test can
+    /// call directly rather than needing a full terminal render to observe.
+    fn footer_context(&self) -> Context {
+        self.focus
+    }
+
+    /// The Entity the open pane shows, read fresh off the current Snapshot rather than cached,
+    /// so the pane's content always reflects the latest probe result for it. `None` while no
+    /// pane is open, or (rarely) for a key that vanished from the table between the open and
+    /// this read.
+    fn pane_entity(&self) -> Option<EntityState> {
+        let key = self.pane.as_ref()?;
+        self.core
+            .snapshot()
+            .entities
+            .into_iter()
+            .find(|entity| &entity.key == key)
+    }
+
     /// Moves the cursor by `delta`, clamped to the table, and extends a live range anchor to
     /// cover the rows the cursor just crossed.
     fn move_cursor(&mut self, delta: i32) {
@@ -484,24 +629,64 @@ impl App {
     }
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
-    /// [`Snapshot`] is cloned here, and every panel this tick draws
-    /// shares that same clone. The help overlay, when open, takes the whole frame in place
-    /// of `List` and its footer; otherwise `List` gets every row but the last, which
-    /// [`footer::draw`] renders into.
+    /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
+    /// The help overlay, when open, takes the whole frame in place of everything else;
+    /// otherwise [`layout_state`] decides between the three shapes
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
+    /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
+    /// There is no permanently pinned bottom output pane: an Action's own output, once wired,
+    /// lives inside the detail pane rather than a fourth region here.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
         let snapshot = self.core.snapshot();
+        let pane_entity = self
+            .pane
+            .as_ref()
+            .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
             if let Some(overlay) = &self.help {
-                overlay.draw(frame, area, Context::List, &self.bindings);
+                overlay.draw(frame, area, self.focus, &self.bindings);
                 return;
             }
             let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-            if let Err(err) = self.list.draw(frame, areas[0], &snapshot) {
-                error = Some(err);
+            let content_area = areas[0];
+            match layout_state(content_area.width, pane_entity.is_some()) {
+                Layout3::ListOnly => {
+                    if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
+                        error = Some(err);
+                    }
+                }
+                Layout3::SideBySide => {
+                    let columns =
+                        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+                            .split(content_area);
+                    if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
+                        error = Some(err);
+                    }
+                    if let Some(entity) = pane_entity {
+                        self.detail.draw(
+                            frame,
+                            columns[1],
+                            entity,
+                            self.glyphs,
+                            self.focus == Context::Detail,
+                        );
+                    }
+                }
+                Layout3::DetailOnly => {
+                    if let Some(entity) = pane_entity {
+                        self.detail.draw(
+                            frame,
+                            content_area,
+                            entity,
+                            self.glyphs,
+                            self.focus == Context::Detail,
+                        );
+                    }
+                }
             }
-            footer::draw(frame, areas[1], Context::List, &self.bindings);
+            footer::draw(frame, areas[1], self.footer_context(), &self.bindings);
         })?;
         if let Some(err) = error {
             self.message_tx
@@ -592,10 +777,14 @@ mod tests {
             frame_rate: 60.0,
             core,
             list: List::default(),
+            detail: Detail::default(),
+            glyphs: GlyphSet::for_config(document::Glyphs::default()),
             should_quit: false,
             should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
+            pane: None,
+            focus: Context::List,
             help: None,
             frame_size: Size::default(),
             message_tx,
@@ -641,6 +830,215 @@ mod tests {
         assert!(
             app.selection.has_range_anchor(),
             "the anchor itself must stay live; only its extension by a jump is refused"
+        );
+    }
+
+    fn press(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    // --- criterion 1: three layout states, cursor and row order kept across opening ---
+
+    #[test]
+    fn layout_state_is_list_only_with_no_pane_open_regardless_of_width() {
+        assert_eq!(layout_state(140, false), Layout3::ListOnly);
+        assert_eq!(layout_state(40, false), Layout3::ListOnly);
+    }
+
+    /// The breakpoint itself, tested at the width either side of it rather than at a width
+    /// well clear of it: 99 is the last `DetailOnly` width and 100 is the first `SideBySide`
+    /// one, per docs/spec/layout-and-provenance.md's "Below 100 columns".
+    #[test]
+    fn layout_state_crosses_from_detail_only_to_side_by_side_exactly_at_the_documented_breakpoint()
+    {
+        assert_eq!(layout_state(99, true), Layout3::DetailOnly);
+        assert_eq!(layout_state(100, true), Layout3::SideBySide);
+    }
+
+    /// The number after `anchor` in `spec`, up to the first non-digit character: how
+    /// [`sidebar_width_and_narrow_breakpoint_match_the_spec_of_record`] pulls a width out of
+    /// the document's own prose rather than restating it, so the test cannot agree with a
+    /// changed constant by construction.
+    fn number_after<'a>(spec: &'a str, anchor: &str) -> &'a str {
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{anchor:?} is present in the spec"));
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md), read at
+    /// test time from `CARGO_MANIFEST_DIR` rather than transcribed a second time, matching the
+    /// pattern `environment.rs`'s own `spec_config_md` test already uses for a file outside
+    /// this crate's own directory. `SIDEBAR_WIDTH` and `NARROW_BREAKPOINT` are the two figures
+    /// the spec states in parseable form ("a 34-column sidebar", "Below 100 columns"); both are
+    /// asserted here rather than only the one `list.rs`'s literals drifted on, since a
+    /// constant with nothing joining it to the spec is exactly this ticket's defect.
+    #[test]
+    fn sidebar_width_and_narrow_breakpoint_match_the_spec_of_record() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec =
+            std::fs::read_to_string(manifest_dir.join("../../docs/spec/layout-and-provenance.md"))
+                .expect("read docs/spec/layout-and-provenance.md");
+
+        let spec_sidebar_width: u16 = number_after(&spec, "collapses the list to a ")
+            .parse()
+            .expect("the sidebar width is a number");
+        assert_eq!(
+            SIDEBAR_WIDTH, spec_sidebar_width,
+            "SIDEBAR_WIDTH must match layout-and-provenance.md's own sidebar width"
+        );
+
+        let spec_narrow_breakpoint: u16 = number_after(&spec, "Below ")
+            .parse()
+            .expect("the narrow breakpoint is a number");
+        assert_eq!(
+            NARROW_BREAKPOINT, spec_narrow_breakpoint,
+            "NARROW_BREAKPOINT must match layout-and-provenance.md's own breakpoint"
+        );
+    }
+
+    #[test]
+    fn opening_the_detail_pane_keeps_the_same_cursor_and_the_same_row_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        let before = app.visible_keys();
+        app.set_cursor(1);
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle enter");
+
+        assert_eq!(app.cursor, 1, "opening the pane must not reset the cursor");
+        assert_eq!(
+            app.visible_keys(),
+            before,
+            "opening the pane must not reorder the rows"
+        );
+        assert_eq!(app.pane, Some(before[1].clone()));
+        assert_eq!(app.focus, Context::Detail);
+    }
+
+    #[test]
+    fn closing_the_pane_with_its_own_esc_clears_the_pane_and_returns_focus_to_the_list() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+        app.pane = Some(key);
+        app.focus = Context::Detail;
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle esc");
+
+        assert_eq!(app.pane, None);
+        assert_eq!(app.focus, Context::List);
+    }
+
+    /// keybindings.md's fixed Esc order: a live range anchor unwinds before the pane does, so
+    /// the first Esc with both live must cancel the anchor and leave the pane open.
+    #[test]
+    fn escape_while_focused_on_the_list_closes_the_pane_only_once_the_range_anchor_is_already_empty()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+        app.pane = Some(key.clone());
+        app.focus = Context::List;
+        app.selection.anchor_range(key);
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle first esc");
+        assert!(
+            app.pane.is_some(),
+            "the range anchor must be cancelled first, not the pane"
+        );
+        assert!(!app.selection.has_range_anchor());
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle second esc");
+        assert_eq!(app.pane, None, "the second Esc must close the pane");
+        assert_eq!(app.focus, Context::List);
+    }
+
+    #[test]
+    fn tab_moves_focus_to_the_pane_only_once_it_is_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle tab with no pane open");
+        assert_eq!(
+            app.focus,
+            Context::List,
+            "no pane open: Tab must be a no-op"
+        );
+
+        let key = app.visible_keys()[0].clone();
+        app.pane = Some(key);
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle tab with the pane open");
+        assert_eq!(app.focus, Context::Detail);
+    }
+
+    // --- criterion 2: one footer line for the focused context ---
+
+    /// The mutation the ticket names by name: hardcoding `Context::List` regardless of focus.
+    /// `footer_context` is the one place that would live, so a test against it directly is the
+    /// honest seam rather than needing a full terminal render to observe the same fact.
+    #[test]
+    fn the_footer_context_follows_focus_rather_than_a_hardcoded_list() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        assert_eq!(app.footer_context(), Context::List);
+
+        let key = app.visible_keys()[0].clone();
+        app.pane = Some(key);
+        app.focus = Context::Detail;
+
+        assert_eq!(app.footer_context(), Context::Detail);
+        assert_ne!(
+            footer::render(&app.bindings, app.footer_context(), 80),
+            footer::render(&app.bindings, Context::List, 80),
+            "the detail footer's own content must differ from the list's, which is what a \
+             hardcoded Context::List would fail to produce"
         );
     }
 
@@ -1039,5 +1437,67 @@ mod tests {
 
         let bytes = captured.0.lock().expect("captured-log mutex").clone();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // --- criterion 2: no permanently pinned bottom output pane ---
+
+    /// The absence is half the criterion, so a scan is the honest form: `render`'s one
+    /// vertical split reserves the footer's single row and nothing else. A second
+    /// `Layout::vertical` call anywhere in this crate's production source would be exactly
+    /// what carves out a fourth, permanently pinned region.
+    #[test]
+    fn there_is_exactly_one_vertical_layout_split_in_the_crate_reserving_only_the_footer_row() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut occurrences = 0usize;
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let production = production_source_at(&path);
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains("Layout::vertical(") {
+                    occurrences += 1;
+                }
+            }
+        }
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one Layout::vertical split (the footer row), found {occurrences}: \
+             a second split would carve out a pinned region this ticket forbids"
+        );
+    }
+
+    // --- criterion 5: the in-progress operation is surfaced in the detail pane only ---
+
+    /// Absence claims want a scan, not a behavioural test: there is no gate refusing an
+    /// Action, which a passing test could only prove for the specific Actions it tried. This
+    /// proves the stronger claim that `in_progress_operation` is read nowhere in this crate
+    /// except `components/detail.rs`, so no gate reading it can exist anywhere else either.
+    #[test]
+    fn the_git_operation_field_is_read_only_by_the_detail_pane_component() {
+        // Built from two pieces, as this crate's other absence scans are, so neither this
+        // line nor this function's own name (which must avoid the joined word too) is ever a
+        // self-match for the very field name it looks for.
+        let needle = format!("{}_{}", "in_progress", "operation");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            if path.file_name().is_some_and(|name| name == "detail.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "the field must be read only by the detail pane, found also at: {offending_locations:?}"
+        );
     }
 }

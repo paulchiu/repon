@@ -6,6 +6,7 @@
 use ratatui::{Frame, layout::Rect, style::Style};
 
 use crate::keys::{Action, BindingTable, Context};
+use crate::scroll::scroll_after;
 
 /// The overlay's own scroll position: how many of its content lines are scrolled past the
 /// top of its viewport. Owns no content of its own, since [`HelpOverlay::content`] derives
@@ -39,21 +40,7 @@ impl HelpOverlay {
     /// (`Choose`, `Close`) is the caller's concern: `Close` unmounts this overlay entirely,
     /// which is not a state this struct can represent about itself.
     pub(crate) fn apply(&mut self, action: Action, content_len: usize, viewport_height: u16) {
-        let max_scroll = u16::try_from(content_len)
-            .unwrap_or(u16::MAX)
-            .saturating_sub(viewport_height);
-        self.scroll = match action {
-            Action::ScrollDown => self.scroll.saturating_add(1).min(max_scroll),
-            Action::ScrollUp => self.scroll.saturating_sub(1),
-            Action::Top => 0,
-            Action::Bottom => max_scroll,
-            Action::HalfPageDown => self
-                .scroll
-                .saturating_add(viewport_height / 2)
-                .min(max_scroll),
-            Action::HalfPageUp => self.scroll.saturating_sub(viewport_height / 2),
-            _ => self.scroll,
-        };
+        self.scroll = scroll_after(self.scroll, action, content_len, viewport_height);
     }
 
     /// Draws as many content lines as fit in `area`, starting from the current scroll
