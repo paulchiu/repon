@@ -1,15 +1,22 @@
 //! The two vetted glyph tables, `full` and `ascii`, from `docs/spec/theming.md`'s "The two
 //! sets" and [ADR 0020](../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md).
 //!
-//! Both tables share one [`GlyphSet`] type, one field per meaning, so a meaning added to one
-//! and forgotten in the other is a struct-literal compile error rather than a runtime gap.
+//! Both tables share one [`GlyphSet`] type, and the `glyph_set!` macro below declares the
+//! row interior's meaning-to-field mapping exactly once: it emits `GlyphSet`'s char fields,
+//! [`Meaning`]'s variants, [`GlyphSet::row_interior`]'s body and the two field-extraction
+//! methods the compile-time check reads, all from the one list. A meaning added to that list
+//! and not given a value in both `FULL` and `ASCII` is a struct-literal compile error; a
+//! meaning left out of the list entirely cannot reach any of the checks below, because
+//! nothing else restates the field names to fall out of sync with it.
+//!
 //! `docs/spec/theming.md`'s "Enforcement" section names two obligations for the row interior
 //! (the gutter, the value cells and the child-row marker): each table stays injective, and a
 //! character shared by both tables carries the same meaning in each. The `tests` module below
-//! proves both by reading these tables' own fields, so a collision introduced later is caught
-//! by the glyph it actually renders rather than by a separately maintained list of pairs.
-//! The panel frame and the capture elision are outside that scope and may collapse shapes onto
-//! one character in `ascii`, per the same section.
+//! proves both by reading these tables' own fields through [`GlyphSet::row_interior`], so a
+//! collision introduced later is caught by the glyph it actually renders rather than by a
+//! separately maintained list of pairs. The panel frame and the capture elision are outside
+//! that scope and may collapse shapes onto one character in `ascii`, per the same section, so
+//! they stay hand-declared on `GlyphSet` rather than going through the macro.
 
 use std::time::Duration;
 
@@ -27,114 +34,131 @@ pub struct Border {
     pub vertical: char,
 }
 
-/// A vetted glyph table: one field per meaning. [`FULL`] and [`ASCII`] are the only two
-/// instances, per `docs/spec/theming.md`'s "one switch, two vetted sets, no way to mix them".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GlyphSet {
-    // Gutter marks (row interior).
-    pub fresh: char,
-    pub stale: char,
-    pub unknown: char,
-    pub failed: char,
-    /// Loading: in the gutter while a row holds no values, in a cell once some do
-    /// ([ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)).
-    pub loading: &'static [char],
-
-    // Value marks (row interior).
-    pub in_sync: char,
-    pub clean: char,
-    pub no_upstream: char,
-    pub no_remote: char,
-    pub ahead: char,
-    pub behind: char,
-    pub changed: char,
-    /// The child-row marker. In scope with the gutter and the value cells per ADR 0020,
-    /// unlike the panel frame below.
-    pub child_row: char,
-
-    // Outside the row interior: exempt from the disjointness obligation.
-    pub border: Border,
-    pub capture_elision: &'static str,
+/// Counts the identifiers passed to it, for sizing a row-interior array without a
+/// hand-maintained number that could drift from `glyph_set!`'s own list.
+macro_rules! count_idents {
+    () => { 0usize };
+    ($head:ident $(, $tail:ident)* $(,)?) => {
+        1usize + count_idents!($($tail),*)
+    };
 }
 
-/// One named meaning a row interior glyph renders, gutter or value alike.
-///
-/// Read outside `#[cfg(test)]` only once a renderer consumes [`GlyphSet::row_interior`]; until
-/// then the disjointness and shape tests below are its only caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub enum Meaning {
-    Fresh,
-    Stale,
-    Unknown,
-    Failed,
-    Loading,
-    InSync,
-    Clean,
-    NoUpstream,
-    NoRemote,
-    Ahead,
-    Behind,
-    Changed,
-    ChildRow,
-}
-
-impl GlyphSet {
-    /// Every glyph this table draws inside the row interior, paired with the meaning it
-    /// renders. Every entry reads one of this table's own fields, so a change to a field
-    /// (deliberate or not) is what a caller of this method sees, never a copy of it.
-    ///
-    /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests below
-    /// are its only caller.
-    #[allow(dead_code)]
-    pub fn row_interior(&self) -> Vec<(Meaning, char)> {
-        let mut glyphs = vec![
-            (Meaning::Fresh, self.fresh),
-            (Meaning::Stale, self.stale),
-            (Meaning::Unknown, self.unknown),
-            (Meaning::Failed, self.failed),
-            (Meaning::InSync, self.in_sync),
-            (Meaning::Clean, self.clean),
-            (Meaning::NoUpstream, self.no_upstream),
-            (Meaning::NoRemote, self.no_remote),
-            (Meaning::Ahead, self.ahead),
-            (Meaning::Behind, self.behind),
-            (Meaning::Changed, self.changed),
-            (Meaning::ChildRow, self.child_row),
-        ];
-        glyphs.extend(self.loading.iter().map(|&frame| (Meaning::Loading, frame)));
-        glyphs
-    }
-
-    /// Every glyph in this table, row interior and frame alike: the population the width
-    /// obligation covers, since `docs/spec/theming.md` requires every glyph Repon draws, not
-    /// only the row interior, to measure one column under the renderer's width function.
-    ///
-    /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests below
-    /// are its only caller.
-    #[allow(dead_code)]
-    pub fn all_glyphs(&self) -> Vec<char> {
-        let mut glyphs: Vec<char> = self.row_interior().into_iter().map(|(_, c)| c).collect();
-        glyphs.extend([
-            self.border.top_left,
-            self.border.top_right,
-            self.border.bottom_left,
-            self.border.bottom_right,
-            self.border.horizontal,
-            self.border.vertical,
-        ]);
-        glyphs.extend(self.capture_elision.chars());
-        glyphs
-    }
-
-    /// The table [`Glyphs`] (`config.toml`'s `glyphs` key, #22) selects. This is what the
-    /// switch switches between; the switch itself is not duplicated here.
-    pub fn for_config(glyphs: Glyphs) -> &'static GlyphSet {
-        match glyphs {
-            Glyphs::Full => &FULL,
-            Glyphs::Ascii => &ASCII,
+/// Declares `GlyphSet`'s row-interior char fields, the [`Meaning`] enum and
+/// [`GlyphSet::row_interior`] from one meaning-to-field list, each entry marked `gutter` or
+/// `value`. `GlyphSet::gutter_core` and `GlyphSet::value_core` are generated from the same
+/// list, so the compile-time disjointness check below reads exactly what `row_interior` reads,
+/// not a retyped copy of it. `loading`, `border` and `capture_elision` are declared on
+/// `GlyphSet` separately, outside this macro: `loading` is a slice rather than one `char`, and
+/// the frame and the elision sit outside the row interior this macro's obligation covers.
+macro_rules! glyph_set {
+    (
+        gutter: { $($g_variant:ident : $g_field:ident),* $(,)? },
+        value: { $($v_variant:ident : $v_field:ident),* $(,)? } $(,)?
+    ) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct GlyphSet {
+            $( pub $g_field: char, )*
+            $( pub $v_field: char, )*
+            /// Loading: in the gutter while a row holds no values, in a cell once some do
+            /// ([ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)).
+            pub loading: &'static [char],
+            pub border: Border,
+            pub capture_elision: &'static str,
         }
-    }
+
+        /// One named meaning a row interior glyph renders, gutter or value alike.
+        ///
+        /// Read outside `#[cfg(test)]` only once a renderer consumes
+        /// [`GlyphSet::row_interior`]; until then the tests below are its only caller.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[allow(dead_code)]
+        pub enum Meaning {
+            $( $g_variant, )*
+            $( $v_variant, )*
+            Loading,
+        }
+
+        impl GlyphSet {
+            /// Every glyph this table draws inside the row interior, paired with the meaning
+            /// it renders. Every entry reads one of this table's own fields, so a change to a
+            /// field (deliberate or not) is what a caller of this method sees, never a copy.
+            ///
+            /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests
+            /// below are its only caller.
+            #[allow(dead_code)]
+            pub fn row_interior(&self) -> Vec<(Meaning, char)> {
+                let mut glyphs = vec![
+                    $( (Meaning::$g_variant, self.$g_field), )*
+                    $( (Meaning::$v_variant, self.$v_field), )*
+                ];
+                glyphs.extend(self.loading.iter().map(|&frame| (Meaning::Loading, frame)));
+                glyphs
+            }
+
+            /// Every glyph in this table, row interior and frame alike: the population the
+            /// width obligation covers, since `docs/spec/theming.md` requires every glyph
+            /// Repon draws, not only the row interior, to measure one column under the
+            /// renderer's width function.
+            ///
+            /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests
+            /// below are its only caller.
+            #[allow(dead_code)]
+            pub fn all_glyphs(&self) -> Vec<char> {
+                let mut glyphs: Vec<char> =
+                    self.row_interior().into_iter().map(|(_, c)| c).collect();
+                glyphs.extend([
+                    self.border.top_left,
+                    self.border.top_right,
+                    self.border.bottom_left,
+                    self.border.bottom_right,
+                    self.border.horizontal,
+                    self.border.vertical,
+                ]);
+                glyphs.extend(self.capture_elision.chars());
+                glyphs
+            }
+
+            /// This table's gutter-core glyphs, `loading` excluded since its length differs
+            /// per table: the field list the compile-time check below reads, identical to the
+            /// gutter half of `row_interior`'s.
+            const fn gutter_core(&self) -> [char; count_idents!($($g_variant),*)] {
+                [ $( self.$g_field ),* ]
+            }
+
+            /// This table's value glyphs, for the same compile-time check.
+            const fn value_core(&self) -> [char; count_idents!($($v_variant),*)] {
+                [ $( self.$v_field ),* ]
+            }
+
+            /// The table [`Glyphs`] (`config.toml`'s `glyphs` key) selects. This is what the
+            /// switch switches between; the switch itself is not duplicated here.
+            pub fn for_config(glyphs: Glyphs) -> &'static GlyphSet {
+                match glyphs {
+                    Glyphs::Full => &FULL,
+                    Glyphs::Ascii => &ASCII,
+                }
+            }
+        }
+    };
+}
+
+glyph_set! {
+    gutter: {
+        Fresh: fresh,
+        Stale: stale,
+        Unknown: unknown,
+        Failed: failed,
+    },
+    value: {
+        InSync: in_sync,
+        Clean: clean,
+        NoUpstream: no_upstream,
+        NoRemote: no_remote,
+        Ahead: ahead,
+        Behind: behind,
+        Changed: changed,
+        ChildRow: child_row,
+    },
 }
 
 /// The canonical ten-frame `dots` spinner, matching both frames the mockups already drew
@@ -146,7 +170,7 @@ const FULL_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 /// in 800ms.
 ///
 /// Read outside `#[cfg(test)]` only once a renderer schedules spinner frames; recorded now
-/// because ADR 0020 requires the cadence written down beside the frames, per the ticket.
+/// because ADR 0020 requires the cadence written down beside the frames.
 #[allow(dead_code)]
 pub const FULL_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
@@ -227,62 +251,35 @@ const fn disjoint(a: &[char], b: &[char]) -> bool {
     true
 }
 
-// Each table's gutter marks against its own value marks, read from the same `FULL`/`ASCII`
-// constants above rather than retyped, so this cannot drift from what the tables declare.
-const FULL_GUTTER: [char; 14] = [
-    FULL.fresh,
-    FULL.stale,
-    FULL.unknown,
-    FULL.failed,
-    FULL.loading[0],
-    FULL.loading[1],
-    FULL.loading[2],
-    FULL.loading[3],
-    FULL.loading[4],
-    FULL.loading[5],
-    FULL.loading[6],
-    FULL.loading[7],
-    FULL.loading[8],
-    FULL.loading[9],
-];
-const FULL_VALUE: [char; 8] = [
-    FULL.in_sync,
-    FULL.clean,
-    FULL.no_upstream,
-    FULL.no_remote,
-    FULL.ahead,
-    FULL.behind,
-    FULL.changed,
-    FULL.child_row,
-];
-const _: () = assert!(
-    disjoint(&FULL_GUTTER, &FULL_VALUE),
-    "the full glyph table's gutter marks and value marks intersect"
-);
+// Each assertion reads `gutter_core`/`value_core`/`loading`, the same fields `row_interior`
+// reads, generated by the one `glyph_set!` invocation above; nothing here retypes a field
+// list of its own. The gutter marks as a whole are the core fields plus the loading frames,
+// so full gutter-versus-value disjointness is the conjunction of the two assertions.
+const _: () = {
+    let gutter = FULL.gutter_core();
+    let value = FULL.value_core();
+    assert!(
+        disjoint(&gutter, &value),
+        "the full glyph table's gutter marks and value marks intersect"
+    );
+    assert!(
+        disjoint(FULL.loading, &value),
+        "the full spinner's loading frames intersect the full table's value marks"
+    );
+};
 
-const ASCII_GUTTER: [char; 7] = [
-    ASCII.fresh,
-    ASCII.stale,
-    ASCII.unknown,
-    ASCII.failed,
-    ASCII.loading[0],
-    ASCII.loading[1],
-    ASCII.loading[2],
-];
-const ASCII_VALUE: [char; 8] = [
-    ASCII.in_sync,
-    ASCII.clean,
-    ASCII.no_upstream,
-    ASCII.no_remote,
-    ASCII.ahead,
-    ASCII.behind,
-    ASCII.changed,
-    ASCII.child_row,
-];
-const _: () = assert!(
-    disjoint(&ASCII_GUTTER, &ASCII_VALUE),
-    "the ascii glyph table's gutter marks and value marks intersect"
-);
+const _: () = {
+    let gutter = ASCII.gutter_core();
+    let value = ASCII.value_core();
+    assert!(
+        disjoint(&gutter, &value),
+        "the ascii glyph table's gutter marks and value marks intersect"
+    );
+    assert!(
+        disjoint(ASCII.loading, &value),
+        "the ascii spinner's loading frames intersect the ascii table's value marks"
+    );
+};
 
 #[cfg(test)]
 mod tests {
