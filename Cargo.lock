@@ -2528,6 +2528,7 @@ dependencies = [
  "repon-core",
  "serde",
  "signal-hook 0.4.4",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",

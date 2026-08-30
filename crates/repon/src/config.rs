@@ -25,10 +25,11 @@ impl Config {
     /// Reads `config.toml` from the config directory. A missing file is not an error; a
     /// malformed one is, because silently running on defaults hides the mistake.
     ///
-    /// `flag_config_file` is the `--config` value, if any; see [`config_file`] for precedence.
-    pub fn new(flag_config_file: Option<PathBuf>) -> Result<Self> {
-        let config_dir = config_dir();
-        let path = config_file(flag_config_file);
+    /// Call [`init`] once, from the entry point, before this, so a `--config` flag reaches
+    /// the resolved path.
+    pub fn new() -> Result<Self> {
+        let dir = config_dir();
+        let path = config_file();
         let mut config = match fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .wrap_err_with(|| format!("could not parse {}", path.display()))?,
@@ -38,7 +39,7 @@ impl Config {
             }
         };
         config.data_dir = data_dir();
-        config.config_dir = config_dir;
+        config.config_dir = dir;
         Ok(config)
     }
 }
@@ -92,27 +93,35 @@ fn project_dirs() -> Option<ProjectDirs> {
 static CONFIG: OnceLock<ResolvedConfig> = OnceLock::new();
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Resolves the config half from the real environment and `flag_config_file`, once for the
-/// process. A later call's argument is ignored: the first call, from [`Config::new`], is the
-/// one that can see the `--config` flag, and the result must not move once read.
-fn resolved_config(flag_config_file: Option<PathBuf>) -> &'static ResolvedConfig {
-    CONFIG.get_or_init(|| {
-        resolve_config(
-            env::var_os("REPON_CONFIG").map(PathBuf::from),
-            flag_config_file,
-            default_config_dir(),
-        )
-    })
+/// Fixes the config half for the process from the real environment and a `--config` flag value.
+/// Call once, from the entry point, before any other config accessor; a later call is a no-op,
+/// since the result must not move once read.
+pub fn init(flag_config_file: Option<PathBuf>) {
+    CONFIG.get_or_init(|| resolve_config_from_env(flag_config_file));
+}
+
+/// Reads the config half already fixed by [`init`]; if that was never called, resolves with no
+/// flag, the honest answer for a process that never had one.
+fn resolved_config() -> &'static ResolvedConfig {
+    CONFIG.get_or_init(|| resolve_config_from_env(None))
+}
+
+fn resolve_config_from_env(flag_config_file: Option<PathBuf>) -> ResolvedConfig {
+    resolve_config(
+        env::var_os("REPON_CONFIG").map(PathBuf::from),
+        flag_config_file,
+        default_config_dir(),
+    )
 }
 
 /// The directory `config.toml` and `themes/` live in.
 pub fn config_dir() -> PathBuf {
-    resolved_config(None).dir.clone()
+    resolved_config().dir.clone()
 }
 
 /// The file `config.toml` is read from; see [`resolve_config`] for precedence.
-fn config_file(flag_config_file: Option<PathBuf>) -> PathBuf {
-    resolved_config(flag_config_file).file.clone()
+fn config_file() -> PathBuf {
+    resolved_config().file.clone()
 }
 
 /// The directory holding `state.toml` and the log, fixed for the process on first read.
