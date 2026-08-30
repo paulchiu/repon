@@ -922,24 +922,8 @@ mod tests {
     /// module rather than the first `#[cfg(test)]`, since a doc comment can name the
     /// attribute in prose or a lone item can be test-gated ahead of the module; a file with
     /// no such module is scanned whole.
-    fn production_source(path: &std::path::Path) -> String {
-        let source = std::fs::read_to_string(path).expect("read a crate source file");
-        let lines: Vec<&str> = source.lines().collect();
-        let tests_module = lines.iter().enumerate().position(|(index, line)| {
-            line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
-        });
-        let mut production = String::new();
-        for (index, line) in lines.iter().enumerate() {
-            if Some(index) == tests_module {
-                break;
-            }
-            production.push_str(line);
-            production.push('\n');
-        }
-        production
+    fn production_source_at(path: &std::path::Path) -> String {
+        production_source(&std::fs::read_to_string(path).expect("read a crate source file"))
     }
 
     /// This module is the only place a `KeyCode` or `KeyModifiers` literal may appear as
@@ -962,7 +946,7 @@ mod tests {
             if path.file_name().is_some_and(|name| name == "keys.rs") {
                 continue;
             }
-            let source = production_source(&path);
+            let source = production_source_at(&path);
             for (number, line) in source.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;

@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 // `status` is a valid out-pointer for the duration of the call.
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
+    fn setpgid(pid: c_int, pgid: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
     fn unlockpt(fd: c_int) -> c_int;
     fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
@@ -66,11 +68,26 @@ fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
     let stdout = stdin.try_clone().expect("clone pty slave for stdout");
     let stderr = stdin.try_clone().expect("clone pty slave for stderr");
 
-    Command::new(env!("CARGO_BIN_EXE_repon"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_repon"));
+    command
         .arg(flag)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+
+    // Its own process group, still in this test's session, so the group is never the
+    // orphaned kind that POSIX has discard SIGTSTP: inheriting the test runner's group
+    // makes stopping depend on ancestry above cargo, which is not stable under load.
+    unsafe {
+        command.pre_exec(|| {
+            if setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    command
         .spawn()
         .unwrap_or_else(|error| panic!("spawn repon {flag}: {error}"))
 }
