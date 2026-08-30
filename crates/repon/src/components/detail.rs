@@ -7,8 +7,8 @@
 
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    ActionRun, AheadBehind, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState, Head,
-    InProgressOperation, Kind, Settled, Timestamp, Unknown,
+    ActionReceipt, AheadBehind, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState,
+    Head, InProgressOperation, Kind, Settled, Timestamp, Unknown,
 };
 
 use super::list::worktree_state_word;
@@ -174,8 +174,8 @@ fn content_lines(entity: &EntityState) -> Vec<String> {
 
     lines.push(String::new());
     lines.push(match last_action {
-        Some(ActionRun { failed: true }) => "last action   failed".to_string(),
-        Some(ActionRun { failed: false }) => "last action   ok".to_string(),
+        Some(receipt) if receipt.failed() => "last action   failed".to_string(),
+        Some(_) => "last action   ok".to_string(),
         None => "last action   none yet".to_string(),
     });
 
@@ -334,11 +334,14 @@ fn stopped_word(stopped: DefaultBranchStopped) -> &'static str {
     }
 }
 
-fn row_level_failure(diagnostics: &Diagnostics, last_action: &Option<ActionRun>) -> Option<String> {
+fn row_level_failure(
+    diagnostics: &Diagnostics,
+    last_action: &Option<ActionReceipt>,
+) -> Option<String> {
     if let Some(reason) = &diagnostics.gitmodules_failed {
         return Some(format!("failed to read .gitmodules: {reason}"));
     }
-    if last_action.is_some_and(|run| run.failed) {
+    if last_action.as_ref().is_some_and(ActionReceipt::failed) {
         return Some("the last Action failed".to_string());
     }
     None
@@ -348,7 +351,9 @@ fn row_level_failure(diagnostics: &Diagnostics, last_action: &Option<ActionRun>)
 mod tests {
     use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
-    use repon_core::{Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec};
+    use repon_core::{
+        Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec, StepOutcome, StepResult,
+    };
 
     use super::*;
 
@@ -359,6 +364,60 @@ mod tests {
             Arc::from(Path::new(name)),
             Kind::Worktree,
         )
+    }
+
+    /// A receipt with one step, whose outcome is `Ok` or `Failed`: this module only ever
+    /// needs to distinguish the two words the pane shows, never a step's own label or output.
+    fn receipt(outcome: StepOutcome) -> ActionReceipt {
+        ActionReceipt {
+            label: Arc::from("action"),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from("step"),
+                outcome,
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        }
+    }
+
+    /// Criterion 2's "never written to disk" claim, the one absence a source scan is the
+    /// honest form of: no file in this crate that mentions an Action receipt also performs a
+    /// disk write. Neither half exists yet (there is no `[[action]]` executor and no session
+    /// persistence path), so this is a regression guard against the two being wired together
+    /// silently, not a claim about code that runs today.
+    #[test]
+    fn no_source_file_writes_an_action_receipt_to_disk() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let receipt_markers = ["ActionReceipt", "StepResult", "last_action"];
+        let disk_write_markers = [
+            "fs::write",
+            "File::create",
+            "toml::to_string",
+            "OpenOptions::new",
+            "serde_json::to",
+        ];
+
+        let mut offending = Vec::new();
+        for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
+            let production = crate::test_support::production_source_at(&path);
+            let mentions_receipt = receipt_markers
+                .iter()
+                .any(|marker| production.contains(marker));
+            let writes_to_disk = disk_write_markers
+                .iter()
+                .any(|marker| production.contains(marker));
+            if mentions_receipt && writes_to_disk {
+                offending.push(path);
+            }
+        }
+
+        assert!(
+            offending.is_empty(),
+            "found a file whose production source both mentions an Action receipt and \
+             writes to disk: {offending:?}"
+        );
     }
 
     // --- describe_cell: provenance in words, plus age computed from the settled timestamp ---
@@ -477,7 +536,7 @@ mod tests {
         gitmodules_row.diagnostics.gitmodules_failed = Some(Arc::from("bad syntax"));
 
         let mut action_row = entity("b");
-        action_row.last_action = Some(ActionRun { failed: true });
+        action_row.last_action = Some(receipt(StepOutcome::Failed(1)));
 
         let gitmodules_reason =
             row_level_failure(&gitmodules_row.diagnostics, &gitmodules_row.last_action)
@@ -729,7 +788,7 @@ mod tests {
     #[test]
     fn content_lines_shows_the_last_actions_own_outcome() {
         let mut ok_run = entity("a");
-        ok_run.last_action = Some(ActionRun { failed: false });
+        ok_run.last_action = Some(receipt(StepOutcome::Ok));
         assert!(
             content_lines(&ok_run)
                 .join("\n")
@@ -737,7 +796,7 @@ mod tests {
         );
 
         let mut failed_run = entity("b");
-        failed_run.last_action = Some(ActionRun { failed: true });
+        failed_run.last_action = Some(receipt(StepOutcome::Failed(1)));
         assert!(
             content_lines(&failed_run)
                 .join("\n")

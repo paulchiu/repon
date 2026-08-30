@@ -171,7 +171,8 @@ enum ClockControl {
 ///
 /// Construction is `start`, never a plain constructor, because it spawns; `Drop`
 /// joins every thread it spawned. The public entry points are exactly `start`,
-/// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause` and `resume`.
+/// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause`, `resume` and
+/// `run_action`, the last a seam only (see its own doc comment).
 pub struct Core {
     table: Arc<RwLock<Table>>,
     /// Resolved once at `start` and never mutated afterwards: overrides only
@@ -600,6 +601,21 @@ impl Core {
         }
     }
 
+    /// The fan-out entry point [`docs/spec/core-api.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/core-api.md)
+    /// reserves for Action fan-out ("no terminal is involved"), placed as a seam only: `order`
+    /// names which entities a caller intends to act on, and this call does nothing else.
+    ///
+    /// Deliberately unimplemented, not merely unfinished: spawning a step's child, capturing
+    /// its output, and writing the result to [`EntityState::last_action`] are all
+    /// [`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// own design, still open, and building any of them here would be guessing at a shape
+    /// this signature cannot yet commit to. This body will therefore always run to completion
+    /// having touched nothing; it never panics and never blocks, so a caller reaching it early
+    /// is safe.
+    pub fn run_action(&self, order: &[EntityKey]) {
+        let _ = order;
+    }
+
     /// Stops all background work: the dedicated thread stops ticking and every
     /// probe currently in flight is cancelled. The core is never told why.
     pub fn pause(&self) {
@@ -812,6 +828,20 @@ impl Core {
                 state: None,
             },
         );
+    }
+
+    /// Writes `receipt` directly onto `key`'s `last_action`, bypassing `run_action`'s seam
+    /// (which writes nothing): the only way a test can put a receipt on a live `Core`'s table
+    /// until a real executor exists to produce one.
+    pub(crate) fn set_last_action_for_test(
+        &self,
+        key: &EntityKey,
+        receipt: crate::entity::ActionReceipt,
+    ) {
+        let mut table = self.table.write().unwrap();
+        if let Some(&idx) = table.index.get(key) {
+            table.entities[idx].last_action = Some(receipt);
+        }
     }
 }
 
@@ -2013,6 +2043,33 @@ mod tests {
         assert!(core.snapshot().entities.is_empty());
     }
 
+    /// Criterion 7's seam, proven rather than merely declared: a real, running `Core`
+    /// survives the call with nothing observable changed, which is what "deliberately
+    /// unimplemented" has to mean here rather than "untested".
+    #[test]
+    fn run_action_is_a_safely_callable_seam_that_writes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let before = core.snapshot();
+        let keys: Vec<EntityKey> = before.entities.iter().map(|e| e.key.clone()).collect();
+
+        core.run_action(&keys);
+
+        let after = core.snapshot();
+        assert_eq!(after.entities.len(), before.entities.len());
+        assert!(
+            after
+                .entities
+                .iter()
+                .all(|entity| entity.last_action.is_none()),
+            "run_action is a seam only: it must never write EntityState::last_action"
+        );
+    }
+
     /// Asserts `entity` reads exactly as a Vanished row must: still in the table,
     /// its last known branch value untouched, and that same cell's staleness
     /// forced on. Shared by the Repo and the Submodule vanish tests so both
@@ -2070,6 +2127,40 @@ mod tests {
             "a vanished entity must stay in the snapshot, not disappear from it"
         );
         assert_vanished_with_stale_branch(&after.entities[0], &branch_name);
+    }
+
+    /// Criterion 2's "untouched by the vanished-staleness path" made behavioural, through a
+    /// real `Core::refresh` rather than calling `mark_vanished` directly: the same pass that
+    /// forces every settled Cell stale on this entity must leave its receipt exactly as it was.
+    #[test]
+    fn a_vanished_entitys_action_receipt_survives_the_vanished_staleness_pass_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let receipt = crate::entity::ActionReceipt {
+            label: Arc::from("reinstall"),
+            steps: Arc::from(vec![crate::entity::StepResult {
+                label: Arc::from("pnpm install"),
+                outcome: crate::entity::StepOutcome::Ok,
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        };
+        core.set_last_action_for_test(&key, receipt.clone());
+
+        fs::remove_dir_all(&repo).expect("remove the repo from disk");
+        core.refresh(&[]);
+        let after = core.settle(Duration::from_millis(500));
+
+        let entity = &after.entities[0];
+        assert_eq!(entity.presence, crate::entity::Presence::Vanished);
+        assert_eq!(entity.last_action, Some(receipt));
     }
 
     /// A Submodule vanishes by exactly the same rule as a Repo: no code path here
@@ -2861,6 +2952,59 @@ mod tests {
             "a Repo's Not applicable state must survive the sweep untouched, got {:?}",
             repo_after.state.settled()
         );
+    }
+
+    /// Criterion 2's "never goes stale on a poll" made behavioural: the dedicated thread's
+    /// tick-driven sweep is what a poll is in this codebase today (`spawn_clock_thread` calls
+    /// [`sweep_deadline`] on every tick), and it must leave a receipt exactly as it was even
+    /// while it is busy timing out a genuinely outstanding Cell on the very same entity.
+    #[test]
+    fn the_deadline_sweeps_poll_never_touches_an_entitys_action_receipt() {
+        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let mut spec = spec(vec![root]);
+        spec.generation_deadline = Duration::ZERO;
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let core = started.core;
+        let key = core.snapshot().entities[0].key.clone();
+
+        let receipt = crate::entity::ActionReceipt {
+            label: Arc::from("reinstall"),
+            steps: Arc::from(vec![crate::entity::StepResult {
+                label: Arc::from("pnpm install"),
+                outcome: crate::entity::StepOutcome::Ok,
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        };
+        core.set_last_action_for_test(&key, receipt.clone());
+
+        // Left mid-flight in a Generation whose (zero) deadline has already elapsed, so the
+        // sweep this tick triggers has a real Cell to time out on this very entity.
+        core.begin_untracked_probe_for_test(&key);
+        tick_tx.send(Instant::now()).expect("send one tick");
+        let after = core.settle(Duration::from_millis(500));
+
+        let entity = after
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("entity present");
+        assert!(
+            matches!(
+                entity.branch.settled(),
+                Some(Settled::Unknown(Unknown::TimedOut))
+            ),
+            "sanity check: the sweep must have actually timed out the in-flight cell, got {:?}",
+            entity.branch.settled()
+        );
+        assert_eq!(entity.last_action, Some(receipt));
     }
 
     /// Cancellation observed before a probe's very first read stops it from ever

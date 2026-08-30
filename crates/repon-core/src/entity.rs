@@ -6,8 +6,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::cell::{Cell, Generation, Settled};
+use crate::cell::{Cell, Generation, Settled, Timestamp};
 use crate::default_branch;
 use crate::git::{InProgressOperation, RecentCommit};
 
@@ -141,15 +142,93 @@ pub struct Diagnostics {
     pub gitmodules_failed: Option<Arc<str>>,
 }
 
-/// The most recent Action run against this Entity, read by the row summary fold.
+/// One step's own outcome: a closed set of exactly four
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "Step outcomes"). No wildcard arm ever matches this: a fifth variant must be named at
+/// every match site or the crate fails to compile.
 ///
-/// Deliberately narrower than the full receipt `docs/spec/actions.md` already
-/// specifies under the name `ActionReceipt` (`label`, `steps`, `not_applicable`,
-/// `finished_at`); `failed` is the one field the fold needs, and unlike
-/// `Diagnostics::gitmodules_failed`, nothing outside a test writes it yet.
+/// `Cancelled` is explicitly not a failure and is never themed as one, following
+/// [ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s
+/// precedent that interrupted work becomes Unknown rather than Failed; [`Self::is_failure`]
+/// is the one place that classification lives; a match on the four variants should still
+/// name each one rather than borrow this method to skip a step, since the two calls answer
+/// different questions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActionRun {
-    pub failed: bool,
+pub enum StepOutcome {
+    /// Ran and exited zero.
+    Ok,
+    /// Ran and exited nonzero; the code is carried.
+    Failed(i32),
+    /// An earlier step failed, so this one never started.
+    NotRun,
+    /// The run was cancelled before this step finished, or before it started.
+    Cancelled,
+}
+
+impl StepOutcome {
+    /// Whether this outcome counts as a failure for the row summary fold: only
+    /// `Failed`, never `Cancelled`, `NotRun` or `Ok`.
+    pub fn is_failure(self) -> bool {
+        matches!(self, StepOutcome::Failed(_))
+    }
+}
+
+/// One step's own result within an [`ActionReceipt`]: its label, its outcome, its
+/// captured output and its elapsed time
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "Where the result lives").
+///
+/// `label` and `output` are `Arc` rather than `String`/`Vec<u8>` for the same reason
+/// every text-bearing value on [`EntityState`] is: `Core::snapshot` clones the whole table
+/// every frame, and an `Arc` clone is a refcount bump rather than a copy of the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepResult {
+    /// The step's argv, rendered for display.
+    pub label: Arc<str>,
+    pub outcome: StepOutcome,
+    /// Raw bytes, bounded, never interpreted here.
+    pub output: Arc<[u8]>,
+    pub elapsed: Duration,
+}
+
+/// The most recent Action run against this Entity: a receipt of something Repon did,
+/// not a reading of the world, read by the row summary fold
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md),
+/// [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)).
+///
+/// Deliberately outside the Cell machinery this module otherwise builds on: `crate::snapshot`'s
+/// private `FoldableCell` trait, the only way a value ever joins the row fold's Cell array, is
+/// implemented once, generically, for `Cell<T>` alone, and is not visible outside `crate::snapshot`
+/// at all, so nothing in this module could implement it even by mistake. A receipt carries no
+/// [`Generation`], never goes stale on the metadata poll, is never superseded (there is no older
+/// or newer receipt to compare against, only the latest one), and the vanished-staleness
+/// path's own exhaustive destructure names this field only to skip it (`last_action: _`),
+/// leaving it exactly as it was. It also never persists: it lives in memory for the session
+/// and dies with the process, which satisfies "keep until the next run" with no key, no clock
+/// and no expiry; the
+/// configurable-expiry half of the recorded requirement is dropped outright on the startup-cost
+/// grounds `docs/spec/actions.md` measures, not deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionReceipt {
+    /// The Action's name, or the typed command string.
+    pub label: Arc<str>,
+    /// Empty when `not_applicable`.
+    pub steps: Arc<[StepResult]>,
+    /// An excluded row that was in the Selection: nothing failed and nothing was
+    /// blocked, the row was simply never operated on.
+    pub not_applicable: bool,
+    pub finished_at: Timestamp,
+}
+
+impl ActionReceipt {
+    /// Whether any step in this run failed, which is what widens the row summary fold
+    /// even though every Cell reads fine
+    /// (`docs/spec/core-api.md`'s "row summary", `docs/spec/actions.md`'s "Where the
+    /// result lives"). A `NotRun` or `Cancelled` step never counts, only a genuine
+    /// `Failed` one.
+    pub fn failed(&self) -> bool {
+        self.steps.iter().any(|step| step.outcome.is_failure())
+    }
 }
 
 /// Whether an Entity was found by the Refresh that just ran.
@@ -186,7 +265,7 @@ pub struct EntityState {
     pub state: Cell<WorktreeState>,
     pub default_branch: Cell<DefaultBranch>,
     pub diagnostics: Diagnostics,
-    pub last_action: Option<ActionRun>,
+    pub last_action: Option<ActionReceipt>,
     pub presence: Presence,
     /// Listed, never operated on, per a matching `[[repo]]` entry's `exclude = true`
     /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)).
@@ -410,6 +489,135 @@ mod tests {
         assert_eq!(name(WorktreeState::Active), "active");
     }
 
+    // --- StepOutcome / StepResult / ActionReceipt: the receipt widening, docs/spec/actions.md ---
+
+    /// Absence claim: the four `StepOutcome` variants are the whole set. This match has no
+    /// wildcard arm, so a fifth variant added to `StepOutcome` fails to compile here rather
+    /// than silently falling through an `_`.
+    #[test]
+    fn step_outcome_is_exactly_four_mutually_exclusive_variants() {
+        fn name(outcome: StepOutcome) -> &'static str {
+            match outcome {
+                StepOutcome::Ok => "ok",
+                StepOutcome::Failed(_) => "failed",
+                StepOutcome::NotRun => "not_run",
+                StepOutcome::Cancelled => "cancelled",
+            }
+        }
+
+        assert_eq!(name(StepOutcome::Ok), "ok");
+        assert_eq!(name(StepOutcome::Failed(1)), "failed");
+        assert_eq!(name(StepOutcome::NotRun), "not_run");
+        assert_eq!(name(StepOutcome::Cancelled), "cancelled");
+    }
+
+    /// `Cancelled` is explicitly not a failure, tested apart from the shape above: the closed
+    /// set's arity says nothing about which of the four count as failing, and a naive
+    /// classification (anything but `Ok` fails) would wrongly colour a cancelled step as one.
+    #[test]
+    fn cancelled_and_not_run_are_not_failures_only_failed_is() {
+        assert!(!StepOutcome::Ok.is_failure());
+        assert!(StepOutcome::Failed(1).is_failure());
+        assert!(!StepOutcome::NotRun.is_failure());
+        assert!(!StepOutcome::Cancelled.is_failure());
+    }
+
+    fn ok_step(label: &str) -> StepResult {
+        StepResult {
+            label: Arc::from(label),
+            outcome: StepOutcome::Ok,
+            output: Arc::from(&b""[..]),
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    fn failed_step(label: &str, code: i32) -> StepResult {
+        StepResult {
+            label: Arc::from(label),
+            outcome: StepOutcome::Failed(code),
+            output: Arc::from(&b"boom"[..]),
+            elapsed: Duration::from_millis(2),
+        }
+    }
+
+    fn receipt(label: &str, steps: Vec<StepResult>) -> ActionReceipt {
+        ActionReceipt {
+            label: Arc::from(label),
+            steps: Arc::from(steps),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        }
+    }
+
+    /// Two absence claims read off one exhaustive destructure: no `Generation` field (a
+    /// receipt is not superseded, so it carries none to compare) and no success-condition
+    /// field (the whole gating mechanism is "stop at the first failure", never a schema flag).
+    /// A field added under either name, or any other, later fails to compile here rather than
+    /// silently landing unacknowledged.
+    #[test]
+    fn action_receipt_and_step_result_carry_no_generation_and_no_success_condition_field() {
+        let original = receipt("reinstall", vec![ok_step("rm -rf node_modules")]);
+        let ActionReceipt {
+            label,
+            steps,
+            not_applicable,
+            finished_at: _,
+        } = original;
+        let StepResult {
+            label: step_label,
+            outcome,
+            output: _,
+            elapsed: _,
+        } = steps[0].clone();
+
+        assert_eq!(&*label, "reinstall");
+        assert!(!not_applicable);
+        assert_eq!(&*step_label, "rm -rf node_modules");
+        assert_eq!(outcome, StepOutcome::Ok);
+    }
+
+    /// The point of `Arc<str>` and `Arc<[T]>` here isn't the type, it's that cloning a
+    /// receipt must not copy its bytes, since the whole Entity table is cloned every frame
+    /// ([`crate::snapshot::Snapshot`]). Proven by pointer identity surviving the clone, not by
+    /// asserting a field's declared type.
+    #[test]
+    fn cloning_an_action_receipt_shares_its_label_and_steps_rather_than_copying_them() {
+        let original = receipt("reinstall", vec![failed_step("pnpm install", 1)]);
+
+        let cloned = original.clone();
+
+        assert!(
+            Arc::ptr_eq(&original.label, &cloned.label),
+            "cloning a receipt must bump the label's refcount, not allocate a new string"
+        );
+        assert!(
+            Arc::ptr_eq(&original.steps, &cloned.steps),
+            "cloning a receipt must bump the steps slice's refcount, not allocate a new one, \
+             which is also what shares every step's own captured output"
+        );
+    }
+
+    /// `ActionReceipt::failed` is what widens the row summary fold; proven at the unit level,
+    /// distinct from `snapshot.rs`'s own fold tests, which cover only the fold's own reaction.
+    #[test]
+    fn action_receipt_failed_is_true_only_when_a_step_actually_failed() {
+        assert!(!receipt("ok", vec![ok_step("a")]).failed());
+        assert!(receipt("broken", vec![ok_step("a"), failed_step("b", 1)]).failed());
+        assert!(
+            !receipt(
+                "cancelled",
+                vec![StepResult {
+                    label: Arc::from("a"),
+                    outcome: StepOutcome::Cancelled,
+                    output: Arc::from(&b""[..]),
+                    elapsed: Duration::from_millis(1),
+                }]
+            )
+            .failed(),
+            "a cancelled step must never read as a failure"
+        );
+    }
+
     #[test]
     fn a_worktree_is_constructed_with_state_and_base_unset() {
         let entity = EntityState::new(
@@ -572,6 +780,36 @@ mod tests {
             entity.base.settled(),
             Some(Settled::NotApplicable)
         ));
+    }
+
+    /// The vanished-staleness path is one of `ActionReceipt`'s absence claims made
+    /// behavioural: `mark_vanished` forces every settled Cell stale, but a receipt is not a
+    /// Cell and carries no staleness of its own, so driving this pass must leave it byte for
+    /// byte as it was, not merely leave some field unnamed.
+    #[test]
+    fn marking_an_entity_vanished_leaves_its_action_receipt_untouched() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Repo,
+        );
+        let original = ActionReceipt {
+            label: Arc::from("reinstall"),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from("pnpm install"),
+                outcome: StepOutcome::Ok,
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        };
+        entity.last_action = Some(original.clone());
+
+        entity.mark_vanished();
+
+        assert_eq!(entity.last_action, Some(original));
     }
 
     // --- apply_branch_probe: the pipe between a branch read and the pane's own facts ---
