@@ -1,11 +1,11 @@
 //! The rendering-agnostic core: it computes git state and knows nothing about terminals.
 //!
 //! Its public surface is flat, re-exported from the crate root rather than through
-//! `fanout` or `git`, which are private: a generic scatter primitive and a single
-//! branch read are not vocabulary a second consumer needs. That surface is currently
-//! empty, because neither of today's two primitives is a name the project glossary
-//! (`CONTEXT.md`) names either; the types `docs/spec/core-api.md` describes land in
-//! later work and get re-exported the same way once they exist.
+//! `fanout` or `git`, which stay private: a generic scatter primitive and a single
+//! branch read are not vocabulary a second consumer needs. `ProbeError` is the one
+//! name `git` contributes to the surface, because a `Failed` cell carries it. The
+//! rest of `docs/spec/core-api.md`'s types land in later work and get re-exported
+//! the same way once they exist.
 //!
 //! Four refusals hold for every type this crate ever makes public, reasoned in
 //! [ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md):
@@ -30,8 +30,12 @@
 #[cfg(not(unix))]
 compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
+mod cell;
 mod fanout;
 mod git;
+
+pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
+pub use git::ProbeError;
 
 #[cfg(test)]
 mod tests {

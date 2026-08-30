@@ -58,6 +58,20 @@ One Refresh, named so a newer one can beat an older one still in flight. Every v
 **Vanished**:
 A Repo or Worktree an earlier Refresh found and the current one did not. It keeps its last known values until the user dismisses it, so nothing leaves the list silently.
 
+### Provenance
+
+**Probe**:
+One git read the core makes against a single Repo. A Probe that breaks produces a Probe error, which a Failed Cell carries; a Probe that runs to its Generation's deadline with no answer settles Unknown instead, since asking and getting nothing back is a different fact from something going wrong.
+
+**Cell**:
+A displayed value bundled with the whole story of where it came from: the Settled state a Probe last left it in, an orthogonal flag for a Probe running against it right now, and the Generation that wrote it. The only way out is a match on its Settled state, so an absent value can never render as a default.
+
+**Settled**:
+What a Cell has established: Unknown with a reason, Known with a value and a Timestamp, Failed with a Probe error, or Not applicable. Never a sixth case, and never a bare absence a caller can read as zero.
+
+**Timestamp**:
+The wall-clock moment a Cell's Known value was read. Kept for a reader's sense of age only: supersession decides which value wins by Generation, never by the clock.
+
 ### Worktree state
 
 Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag. A Worktree at a detached HEAD has no branch, so only Merged stays provable and the other three do not apply.
