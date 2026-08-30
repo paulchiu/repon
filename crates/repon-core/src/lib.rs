@@ -35,10 +35,63 @@ mod git;
 
 #[cfg(test)]
 mod tests {
-    /// Names this crate re-exports from its root. There is no `pub use` yet, so
-    /// this is empty; update it by hand alongside any `pub use` this crate root
-    /// gains, since nothing here parses the source to find them automatically.
-    const PUBLIC_SURFACE: &[&str] = &[];
+    /// The exported name from one `pub use` item: `Name`, or the alias in
+    /// `Name as Alias`. Panics naming `line` if `item` is neither, so a form this
+    /// cannot read fails the test rather than being silently dropped.
+    fn exported_name(item: &str, line: &str) -> String {
+        if let Some((_, alias)) = item.split_once(" as ") {
+            return alias.trim().to_string();
+        }
+        let name = item.trim();
+        assert!(
+            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+            "cannot read an exported name from `{item}` in `pub use` line `{line}`"
+        );
+        name.to_string()
+    }
+
+    /// The crate's actual public surface: every name a `pub use` line in `source`
+    /// brings into the crate root, read from the crate's own `src/lib.rs` rather
+    /// than a hand-kept list, so a `pub use` added without a matching glossary
+    /// entry has nowhere to hide. A line scan, not a parser, since this crate
+    /// controls the formatting of its own `pub use` lines: it recognises
+    /// `pub use path::Name;`, `pub use path::Name as Alias;`, and a single-line
+    /// braced group `pub use path::{Name, Other as Alias};`, and panics naming
+    /// any `pub use` line it cannot make sense of, since a scanner that quietly
+    /// skips an unfamiliar form is the same drift this test exists to catch.
+    /// Stops at the test module, so its own `pub use` (if any) is not scanned.
+    fn crate_root_public_surface(source: &str) -> Vec<String> {
+        let before_tests = source.split("mod tests {").next().unwrap_or(source);
+        let mut names = Vec::new();
+        for line in before_tests.lines() {
+            let line = line.trim();
+            if !line.starts_with("pub use ") {
+                continue;
+            }
+            let body = line
+                .strip_prefix("pub use ")
+                .and_then(|s| s.strip_suffix(';'))
+                .unwrap_or_else(|| panic!("`pub use` line is not `;`-terminated: `{line}`"));
+            match body.split_once('{') {
+                Some((_path, rest)) => {
+                    let group = rest.strip_suffix('}').unwrap_or_else(|| {
+                        panic!("`pub use` group is not `}}`-terminated: `{line}`")
+                    });
+                    for item in group.split(',') {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            names.push(exported_name(item, line));
+                        }
+                    }
+                }
+                None => {
+                    let last = body.rsplit("::").next().unwrap_or(body);
+                    names.push(exported_name(last, line));
+                }
+            }
+        }
+        names
+    }
 
     /// True if `name`'s words, read together as one phrase, appear in `glossary`.
     ///
@@ -78,24 +131,28 @@ mod tests {
     /// names, so that reading the crate root and reading the glossary give the same
     /// answer.
     ///
-    /// Read from `CARGO_MANIFEST_DIR` at test time rather than with `include_str!`:
-    /// `CONTEXT.md` lives at the repository root, outside this crate's own directory,
-    /// so it is not among the files `cargo package` ships. `include_str!` was tried
-    /// first; it compiles fine in the workspace checkout and does not itself break
-    /// `cargo publish --dry-run` (packaging only builds, it does not run tests), but
-    /// `cargo test` against the extracted package (`target/package/repon-core-*`)
-    /// then fails to compile at all, a missing-file error with no test to report it.
-    /// Reading the path at runtime instead degrades that to one failing assertion in
-    /// a context nothing here needs to support, rather than a compile error in any
-    /// context that later turns test code on.
+    /// Both files are read at test time from `CARGO_MANIFEST_DIR` rather than with
+    /// `include_str!`: `CONTEXT.md` lives at the repository root, outside this
+    /// crate's own directory, so it is not among the files `cargo package` ships.
+    /// `include_str!` was tried first; it compiles fine in the workspace checkout
+    /// and does not itself break `cargo publish --dry-run` (packaging only builds,
+    /// it does not run tests), but `cargo test` against the extracted package
+    /// (`target/package/repon-core-*`) then fails to compile at all, a missing-file
+    /// error with no test to report it. Reading both paths at runtime instead
+    /// degrades that to one failing assertion in a context nothing here needs to
+    /// support, rather than a compile error in any context that later turns test
+    /// code on.
     #[test]
     fn public_surface_matches_glossary() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CONTEXT.md");
-        let glossary = std::fs::read_to_string(&path).expect("read the project glossary");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(manifest_dir.join("src/lib.rs"))
+            .expect("read this crate's own source");
+        let glossary = std::fs::read_to_string(manifest_dir.join("../../CONTEXT.md"))
+            .expect("read the project glossary");
 
-        for name in PUBLIC_SURFACE {
+        for name in crate_root_public_surface(&source) {
             assert!(
-                glossary_covers(&glossary, name),
+                glossary_covers(&glossary, &name),
                 "public re-export `{name}` has no matching entry in the project glossary"
             );
         }
