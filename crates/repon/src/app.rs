@@ -144,18 +144,16 @@ impl App {
         Ok(())
     }
 
-    /// Routes the key through [`keys::dispatch`]. While the help overlay is open the whole
-    /// keyboard is `Context::Overlay`'s, per [keybindings.md](../../../../docs/spec/keybindings.md#the-contexts);
-    /// otherwise it is `Context::List`'s, turning the two actions already wired to a
-    /// [`Message`] (`Quit`, `Suspend`) plus `OpenHelp`. Every other action dispatches
-    /// correctly but has nothing to do yet, since `List` is this app's only real focus
-    /// target today.
+    /// Routes the key through [`keys::dispatch`]: `Context::Overlay` while the help overlay
+    /// is open, `Context::List` otherwise, wiring `Quit`, `Suspend` and `OpenHelp` to
+    /// messages or overlay state. Every other action dispatches but has nothing to do yet,
+    /// since `List` is this app's only real focus target today.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match keys::dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
                 Some(action) => {
-                    let content_len = HelpOverlay::content(Context::List).len();
+                    let content_len = HelpOverlay::content_len(Context::List);
                     overlay.apply(action, content_len, self.frame_size.height);
                 }
                 None => {}

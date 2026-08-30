@@ -17,13 +17,19 @@ pub(crate) struct HelpOverlay {
 }
 
 impl HelpOverlay {
-    /// One line per action live in `context`: its bound key(s) and its description, current
+    /// One line per action live in `context`, as `(keys, description)` kept apart rather
+    /// than joined into one string: [theming.md](../../../../docs/spec/theming.md) fixes
+    /// the keys' role as `accent` and the description's as `dim`, and that split only
+    /// survives if nothing here bakes it together before [`Self::draw`] paints it. Current
     /// context first then `global`, exactly as [`keys::describe`] orders them.
-    pub(crate) fn content(context: Context) -> Vec<String> {
+    pub(crate) fn content(context: Context) -> Vec<(String, &'static str)> {
         keys::describe(context)
-            .into_iter()
-            .map(|(keys_text, description)| format!("{keys_text}  {description}"))
-            .collect()
+    }
+
+    /// How many lines [`Self::content`] would have, without building any of them: the
+    /// scroll clamp only ever needs the count.
+    pub(crate) fn content_len(context: Context) -> usize {
+        keys::describe(context).len()
     }
 
     /// Folds one of the overlay's own scroll actions into the current offset, clamped so it
@@ -49,19 +55,21 @@ impl HelpOverlay {
     }
 
     /// Draws as many content lines as fit in `area`, starting from the current scroll
-    /// offset. Calls `set_string`, never `set_stringn`: a line longer than `area`'s width
-    /// is ratatui's own clipping to worry about, the same as every other panel's text, not
-    /// this ticket's width-budget concern, which is the footer's alone.
+    /// offset, each joined into one string only here, at the point of painting. Calls
+    /// `set_string`, never `set_stringn`: a line longer than `area`'s width is ratatui's own
+    /// clipping to worry about, not this ticket's width-budget concern, which is the
+    /// footer's alone.
     pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, context: Context) {
         let lines = Self::content(context);
         let buf = frame.buffer_mut();
-        for (row, line) in lines
+        for (row, (keys_text, description)) in lines
             .iter()
             .skip(self.scroll as usize)
             .take(area.height as usize)
             .enumerate()
         {
-            buf.set_string(area.x, area.y + row as u16, line, Style::new());
+            let line = format!("{keys_text}  {description}");
+            buf.set_string(area.x, area.y + row as u16, &line, Style::new());
         }
     }
 }
@@ -70,15 +78,14 @@ impl HelpOverlay {
 mod tests {
     use super::*;
 
-    // --- content is derived, not transcribed: proven by comparing to keys::describe ---
+    // --- content is derived, not transcribed, and stays unjoined ---
 
     #[test]
-    fn content_is_exactly_keys_describe_reformatted() {
-        let expected: Vec<String> = keys::describe(Context::List)
-            .into_iter()
-            .map(|(keys_text, description)| format!("{keys_text}  {description}"))
-            .collect();
-        assert_eq!(HelpOverlay::content(Context::List), expected);
+    fn content_is_exactly_keys_describe_with_no_reformatting() {
+        assert_eq!(
+            HelpOverlay::content(Context::List),
+            keys::describe(Context::List)
+        );
     }
 
     #[test]
@@ -86,11 +93,11 @@ mod tests {
         let lines = HelpOverlay::content(Context::List);
         let own = lines
             .iter()
-            .position(|line| line.ends_with("Move down"))
+            .position(|(_, description)| *description == "Move down")
             .expect("List's own Move down must appear");
         let global = lines
             .iter()
-            .position(|line| line.ends_with("Quit"))
+            .position(|(_, description)| *description == "Quit")
             .expect("Global's Quit must appear alongside List");
         assert!(own < global, "expected List before global, got {lines:?}");
     }
@@ -100,9 +107,23 @@ mod tests {
         // Confirm never dispatches Global, so a leaked "Move down" or "Quit" line would be
         // a context-scoping bug, not merely an ordering one.
         let lines = HelpOverlay::content(Context::Confirm);
-        assert!(!lines.iter().any(|line| line.ends_with("Move down")));
-        assert!(!lines.iter().any(|line| line.ends_with("Quit")));
-        assert!(lines.iter().any(|line| line.ends_with("Run")));
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, description)| *description == "Move down")
+        );
+        assert!(!lines.iter().any(|(_, description)| *description == "Quit"));
+        assert!(lines.iter().any(|(_, description)| *description == "Run"));
+    }
+
+    #[test]
+    fn content_len_matches_content_without_building_any_of_it() {
+        for context in [Context::List, Context::Detail, Context::Confirm] {
+            assert_eq!(
+                HelpOverlay::content_len(context),
+                HelpOverlay::content(context).len()
+            );
+        }
     }
 
     // --- scrolling ---

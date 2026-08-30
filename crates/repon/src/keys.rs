@@ -863,13 +863,61 @@ mod tests {
 
     // --- no per-binding disabled-reason mechanism exists ---
 
+    /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than the first
+    /// `#[cfg(test)]`, since a file may gate a single item on it too (this file's own doc
+    /// comment below names that literal well before its own tests module starts). A file
+    /// with no such module is scanned whole: both fallbacks can only over-report, never let
+    /// a violation through.
+    fn production_source(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let tests_module = lines.iter().enumerate().position(|(index, line)| {
+            line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+        });
+        let mut production = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if Some(index) == tests_module {
+                break;
+            }
+            production.push_str(line);
+            production.push('\n');
+        }
+        production
+    }
+
+    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
+    /// there, or every real production line after it goes unscanned.
+    #[test]
+    fn production_source_reads_past_a_test_only_item_to_the_tests_module() {
+        let source = "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
+                       #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n";
+        let production = production_source(source);
+        assert!(
+            production.contains("real_production"),
+            "a test-only item must not cut the scan short of real production code"
+        );
+        assert!(
+            !production.contains("inside_the_tests_module"),
+            "the trailing tests module must still be excluded"
+        );
+    }
+
+    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
+    /// rather than skipping a file the ban applies to.
+    #[test]
+    fn production_source_scans_a_file_with_no_tests_module_whole() {
+        assert!(production_source("fn real_production() {}\n").contains("real_production"));
+    }
+
     /// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md) rejects
     /// the mechanism lazygit calls `Get` + `DisabledReason`: a way to hide a binding at
     /// runtime is what makes `?` vanish from a popup context in the tool this is modelled
-    /// on. Scans every file's production source (this test's own name included, which is
-    /// why only the part before `#[cfg(test)]` counts), not just this file, since the
-    /// mechanism this proves absent is exactly the kind a later change could add anywhere
-    /// and have the footer or the help overlay quietly obey.
+    /// on. Scans every file's production source, cut at its trailing tests module rather
+    /// than its first `#[cfg(test)]`, since the mechanism this proves absent is exactly the
+    /// kind a later change could add anywhere and have the footer or the help overlay
+    /// quietly obey.
     #[test]
     fn no_per_binding_disabled_reason_mechanism_exists_anywhere_in_the_crate() {
         // Built from two pieces each, as `app.rs`'s own `banned` string is, so this line is
@@ -882,11 +930,8 @@ mod tests {
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
             let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            let production_source = source
-                .split("#[cfg(test)]")
-                .next()
-                .expect("split always yields at least one piece");
-            for (number, line) in production_source.lines().enumerate() {
+            let source = production_source(&source);
+            for (number, line) in source.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }

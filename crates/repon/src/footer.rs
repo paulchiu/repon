@@ -1,8 +1,10 @@
 //! The footer line [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)
 //! mandates: derived from the binding table every frame, never a literal binding string.
 //! [keybindings.md](../../../../docs/spec/keybindings.md#the-footer) fixes the four rules
-//! [`budget`] encodes and the per-context content [`list_items`] and [`detail_items`] read
-//! off [`keys::primary_chord`].
+//! [`budget`] encodes and the per-context content [`list_items`], [`detail_items`] and
+//! [`confirm_items`] read off [`keys::primary_chord`].
+
+use std::fmt;
 
 use ratatui::{Frame, layout::Rect, style::Style};
 
@@ -18,29 +20,57 @@ enum Priority {
     Pinned,
 }
 
+/// One hint's chord text and its label, kept as two fields rather than joined into one
+/// opaque string: [theming.md](../../../../docs/spec/theming.md) fixes the key's role as
+/// `accent` and the label's as `dim`, and a later styling ticket can only apply that split
+/// if it survives to where [`draw`] paints the line. This ticket applies no role yet; the
+/// interim rendering still paints every hint with one `.dim()`.
+#[derive(Clone, Debug)]
+struct Hint {
+    key: String,
+    label: String,
+}
+
+impl fmt::Display for Hint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.label.is_empty() {
+            write!(f, "{}", self.key)
+        } else {
+            write!(f, "{} {}", self.key, self.label)
+        }
+    }
+}
+
 struct Item {
-    text: String,
+    hint: Hint,
     priority: Priority,
 }
 
-/// One item's chord, read from the compiled table rather than typed here, joined to its
+/// One item's chord, read from the compiled table rather than typed here, paired with its
 /// short label. Panics naming the gap if `action` is not actually bound in `context`, since
 /// that is a wiring bug in this module, not a state the footer should render around.
-fn hint(context: Context, action: Action, label: &str) -> String {
+fn hint(context: Context, action: Action, label: &str) -> Hint {
     let (code, modifiers) = keys::primary_chord(context, action).unwrap_or_else(|| {
         panic!("{action:?} is not bound in {context:?}, but the footer names it")
     });
-    format!("{} {label}", keys::chord_label(code, modifiers))
+    Hint {
+        key: keys::chord_label(code, modifiers),
+        label: label.to_string(),
+    }
 }
 
-/// Two actions' chords joined with `/`, for a combined hint like `j/k move`.
-fn combined_hint(context: Context, first: Action, second: Action, label: &str) -> String {
+/// Two actions' chords joined with `/` as one key, e.g. `j/k`, paired with a combined label
+/// like `move`.
+fn combined_hint(context: Context, first: Action, second: Action, label: &str) -> Hint {
     let chord = |action| {
         let (code, modifiers) = keys::primary_chord(context, action)
             .unwrap_or_else(|| panic!("{action:?} is not bound in {context:?}"));
         keys::chord_label(code, modifiers)
     };
-    format!("{}/{} {label}", chord(first), chord(second))
+    Hint {
+        key: format!("{}/{}", chord(first), chord(second)),
+        label: label.to_string(),
+    }
 }
 
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s list-context content,
@@ -49,35 +79,35 @@ fn combined_hint(context: Context, first: Action, second: Action, label: &str) -
 fn list_items() -> Vec<Item> {
     vec![
         Item {
-            text: combined_hint(Context::List, Action::MoveDown, Action::MoveUp, "move"),
+            hint: combined_hint(Context::List, Action::MoveDown, Action::MoveUp, "move"),
             priority: Priority::Drop(2),
         },
         Item {
-            text: hint(Context::List, Action::ToggleSelection, "select"),
+            hint: hint(Context::List, Action::ToggleSelection, "select"),
             priority: Priority::Drop(5),
         },
         Item {
-            text: hint(Context::List, Action::OpenDetail, "detail"),
+            hint: hint(Context::List, Action::OpenDetail, "detail"),
             priority: Priority::Drop(3),
         },
         Item {
-            text: hint(Context::Global, Action::EnterFilter, "filter"),
+            hint: hint(Context::Global, Action::EnterFilter, "filter"),
             priority: Priority::Drop(4),
         },
         Item {
-            text: hint(Context::Global, Action::OpenLauncher, "launcher"),
+            hint: hint(Context::Global, Action::OpenLauncher, "launcher"),
             priority: Priority::Drop(6),
         },
         Item {
-            text: hint(Context::Global, Action::OpenActionPalette, "action"),
+            hint: hint(Context::Global, Action::OpenActionPalette, "action"),
             priority: Priority::Drop(6),
         },
         Item {
-            text: hint(Context::Global, Action::RefreshAll, "refresh"),
+            hint: hint(Context::Global, Action::RefreshAll, "refresh"),
             priority: Priority::Drop(1),
         },
         Item {
-            text: hint(Context::Global, Action::OpenHelp, "help"),
+            hint: hint(Context::Global, Action::OpenHelp, "help"),
             priority: Priority::Pinned,
         },
     ]
@@ -89,7 +119,7 @@ fn list_items() -> Vec<Item> {
 fn detail_items() -> Vec<Item> {
     vec![
         Item {
-            text: combined_hint(
+            hint: combined_hint(
                 Context::Detail,
                 Action::ScrollDown,
                 Action::ScrollUp,
@@ -98,23 +128,39 @@ fn detail_items() -> Vec<Item> {
             priority: Priority::Drop(2),
         },
         Item {
-            text: hint(Context::Global, Action::EnterFilter, "filter"),
+            hint: hint(Context::Global, Action::EnterFilter, "filter"),
             priority: Priority::Drop(3),
         },
         Item {
-            text: hint(Context::Global, Action::OpenLauncher, "launcher"),
+            hint: hint(Context::Global, Action::OpenLauncher, "launcher"),
             priority: Priority::Drop(4),
         },
         Item {
-            text: hint(Context::Global, Action::OpenActionPalette, "action"),
+            hint: hint(Context::Global, Action::OpenActionPalette, "action"),
             priority: Priority::Drop(4),
         },
         Item {
-            text: hint(Context::Global, Action::RefreshAll, "refresh"),
+            hint: hint(Context::Global, Action::RefreshAll, "refresh"),
             priority: Priority::Drop(1),
         },
         Item {
-            text: hint(Context::Global, Action::OpenHelp, "help"),
+            hint: hint(Context::Global, Action::OpenHelp, "help"),
+            priority: Priority::Pinned,
+        },
+    ]
+}
+
+/// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s confirm-context
+/// content: both hints pinned, since its whole footer is documented at 15 columns, short
+/// enough to survive almost any frame.
+fn confirm_items() -> Vec<Item> {
+    vec![
+        Item {
+            hint: hint(Context::Confirm, Action::Run, "run"),
+            priority: Priority::Pinned,
+        },
+        Item {
+            hint: hint(Context::Confirm, Action::Decline, "cancel"),
             priority: Priority::Pinned,
         },
     ]
@@ -127,16 +173,43 @@ const ELLIPSIS: &str = " ...";
 /// The two-space gap rule 1 puts between every item.
 const SEPARATOR: &str = "  ";
 
-/// Renders `items` into at most `width` ASCII columns, following
+/// The footer's content at some width: the surviving hints in display order, plus whether
+/// the ellipsis was reserved for a dropped one, kept unflattened so a later ticket can style
+/// each [`Hint`]'s key and label separately at the point [`draw`] paints them.
+#[derive(Debug)]
+struct FooterLine {
+    hints: Vec<Hint>,
+    truncated: bool,
+}
+
+impl fmt::Display for FooterLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let joined = self
+            .hints
+            .iter()
+            .map(Hint::to_string)
+            .collect::<Vec<_>>()
+            .join(SEPARATOR);
+        write!(f, "{joined}")?;
+        if self.truncated {
+            write!(f, "{ELLIPSIS}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Selects `items` into at most `width` ASCII columns, following
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s four rules: every
 /// item is width-checked including the first (rule 4), the ellipsis is reserved inside the
 /// budget rather than appended once something already fits (rule 4), items sharing a
 /// [`Priority`] drop together (rule 3), and a [`Priority::Pinned`] item never drops; only
 /// the ellipsis drops from it (rule 4). Widths are ASCII byte counts, which is exactly
 /// `unicode-width`'s score for the vocabulary this module builds, per rule 1.
-fn budget(items: &[Item], width: usize) -> String {
+fn budget(items: &[Item], width: usize) -> FooterLine {
     debug_assert!(
-        items.iter().all(|item| item.text.is_ascii()),
+        items
+            .iter()
+            .all(|item| item.hint.key.is_ascii() && item.hint.label.is_ascii()),
         "a footer item must be ASCII, or its byte length is not its display width"
     );
     let mut current: Vec<&Item> = items.iter().collect();
@@ -144,16 +217,19 @@ fn budget(items: &[Item], width: usize) -> String {
         let dropped = current.len() < items.len();
         let joined = current
             .iter()
-            .map(|item| item.text.as_str())
+            .map(|item| item.hint.to_string())
             .collect::<Vec<_>>()
             .join(SEPARATOR);
-        let with_ellipsis = if dropped {
-            format!("{joined}{ELLIPSIS}")
+        let rendered_len = if dropped {
+            joined.len() + ELLIPSIS.len()
         } else {
-            joined.clone()
+            joined.len()
         };
-        if with_ellipsis.len() <= width {
-            return with_ellipsis;
+        if rendered_len <= width {
+            return FooterLine {
+                hints: current.iter().map(|item| item.hint.clone()).collect(),
+                truncated: dropped,
+            };
         }
 
         let lowest_droppable = current
@@ -167,24 +243,39 @@ fn budget(items: &[Item], width: usize) -> String {
                 // Nothing left that may drop; the ellipsis itself is what overruns, so it
                 // drops instead of the last surviving item.
                 return if joined.len() <= width {
-                    joined
+                    FooterLine {
+                        hints: current.iter().map(|item| item.hint.clone()).collect(),
+                        truncated: false,
+                    }
                 } else {
-                    String::new()
+                    FooterLine {
+                        hints: Vec::new(),
+                        truncated: false,
+                    }
                 };
             }
         }
     }
 }
 
-/// The footer text for `context` at `width` columns, ASCII throughout, from the compiled
-/// binding table: never a literal binding string, and never stale after a rebind.
-pub(crate) fn render(context: Context, width: u16) -> String {
+/// [`budget`]'s selection for `context` at `width` columns. `Input` has no content yet:
+/// `Context::Input` covers the Filter line and both palettes alike, and each is documented
+/// with a different footer, so the context alone cannot choose which to show. `Confirm`
+/// names one surface unambiguously and is implemented above.
+fn footer_line(context: Context, width: u16) -> FooterLine {
     let items = match context {
         Context::List => list_items(),
         Context::Detail => detail_items(),
+        Context::Confirm => confirm_items(),
         other => panic!("no footer content is defined yet for {other:?}"),
     };
     budget(&items, width as usize)
+}
+
+/// The footer text for `context` at `width` columns, ASCII throughout, from the compiled
+/// binding table: never a literal binding string, and never stale after a rebind.
+pub(crate) fn render(context: Context, width: u16) -> String {
+    footer_line(context, width).to_string()
 }
 
 /// Draws `context`'s footer into `area`, one row. Calls [`ratatui`]'s unbounded
@@ -203,6 +294,15 @@ mod tests {
 
     use super::*;
 
+    /// A synthetic single-word hint for the generic budget tests below, which exercise the
+    /// drop algorithm independent of the real footer's key/label content.
+    fn bare(text: &str) -> Hint {
+        Hint {
+            key: text.to_string(),
+            label: String::new(),
+        }
+    }
+
     // --- the generic budget algorithm, proven against synthetic items so each clause has
     // its own test independent of the real footer content ---
 
@@ -215,15 +315,15 @@ mod tests {
         // the first item too, drops it, and returns "Y ..." instead.
         let items = [
             Item {
-                text: "XXXXXXXXXX".to_string(),
+                hint: bare("XXXXXXXXXX"),
                 priority: Priority::Drop(1),
             },
             Item {
-                text: "Y".to_string(),
+                hint: bare("Y"),
                 priority: Priority::Pinned,
             },
         ];
-        let rendered = budget(&items, 5);
+        let rendered = budget(&items, 5).to_string();
         assert_eq!(rendered, "Y ...");
         assert!(rendered.len() <= 5, "must never overrun the given width");
     }
@@ -235,19 +335,19 @@ mod tests {
         // would stop here and overrun; the correct pass drops further, to "C ...".
         let items = [
             Item {
-                text: "AAAA".to_string(),
+                hint: bare("AAAA"),
                 priority: Priority::Drop(1),
             },
             Item {
-                text: "BB".to_string(),
+                hint: bare("BB"),
                 priority: Priority::Drop(2),
             },
             Item {
-                text: "C".to_string(),
+                hint: bare("C"),
                 priority: Priority::Pinned,
             },
         ];
-        let rendered = budget(&items, 8);
+        let rendered = budget(&items, 8).to_string();
         assert_eq!(rendered, "C ...");
         assert!(rendered.len() <= 8, "must never overrun the given width");
     }
@@ -256,24 +356,24 @@ mod tests {
     fn budget_drops_the_ellipsis_from_the_last_surviving_item_rather_than_dropping_that_item() {
         let items = [
             Item {
-                text: "AAAA".to_string(),
+                hint: bare("AAAA"),
                 priority: Priority::Drop(1),
             },
             Item {
-                text: "BB".to_string(),
+                hint: bare("BB"),
                 priority: Priority::Pinned,
             },
         ];
-        assert_eq!(budget(&items, 5), "BB");
+        assert_eq!(budget(&items, 5).to_string(), "BB");
     }
 
     #[test]
     fn budget_renders_nothing_once_even_the_pinned_item_alone_cannot_fit() {
         let items = [Item {
-            text: "BB".to_string(),
+            hint: bare("BB"),
             priority: Priority::Pinned,
         }];
-        assert_eq!(budget(&items, 1), "");
+        assert_eq!(budget(&items, 1).to_string(), "");
     }
 
     #[test]
@@ -284,19 +384,67 @@ mod tests {
         // drops both together, giving "HELP ...".
         let items = [
             Item {
-                text: "LAUNCHER".to_string(),
+                hint: bare("LAUNCHER"),
                 priority: Priority::Drop(1),
             },
             Item {
-                text: "ACTION".to_string(),
+                hint: bare("ACTION"),
                 priority: Priority::Drop(1),
             },
             Item {
-                text: "HELP".to_string(),
+                hint: bare("HELP"),
                 priority: Priority::Pinned,
             },
         ];
-        assert_eq!(budget(&items, 16), "HELP ...");
+        assert_eq!(budget(&items, 16).to_string(), "HELP ...");
+    }
+
+    // --- the launcher/action pair, proven across every width rather than at a named one ---
+
+    /// Rule 3 pairs `! launcher` and `; action` so one never renders without the other.
+    /// `list_items` and `detail_items` each build the pair inline with its own two
+    /// [`Priority`] literals, so nothing stops the two numbers drifting apart under a future
+    /// edit; the documented widths for detail happen to land where both are present or both
+    /// are gone, so a table lookup at those widths alone cannot catch it. Scanning every
+    /// width from zero to the full unrounded line, in both contexts, can.
+    #[test]
+    fn launcher_and_action_hints_are_never_present_without_each_other_at_any_width() {
+        let launcher = hint(Context::Global, Action::OpenLauncher, "launcher").to_string();
+        let action = hint(Context::Global, Action::OpenActionPalette, "action").to_string();
+        for (context, items) in [
+            (Context::List, list_items()),
+            (Context::Detail, detail_items()),
+        ] {
+            let full_width = items
+                .iter()
+                .map(|item| item.hint.to_string())
+                .collect::<Vec<_>>()
+                .join(SEPARATOR)
+                .len();
+            for width in 0..=full_width {
+                let rendered = budget(&items, width).to_string();
+                let has_launcher = rendered.contains(&launcher);
+                let has_action = rendered.contains(&action);
+                assert_eq!(
+                    has_launcher, has_action,
+                    "{context:?} at width {width}: launcher present = {has_launcher}, action \
+                     present = {has_action}, rendered {rendered:?}"
+                );
+            }
+        }
+    }
+
+    // --- a survivor's key and label stay separate values, not pre-joined ---
+
+    #[test]
+    fn a_survivors_key_and_label_stay_separate_fields_after_budget_selects_it() {
+        let line = budget(&list_items(), 88);
+        let move_hint = line
+            .hints
+            .iter()
+            .find(|hint| hint.label == "move")
+            .expect("the move hint must survive at full width");
+        assert_eq!(move_hint.key, "j/k");
     }
 
     // --- the real list and detail content, against the documented degradation table ---
@@ -386,15 +534,77 @@ mod tests {
         }
     }
 
+    // --- confirm: implemented, unlike input which stays deferred ---
+
+    #[test]
+    fn confirm_footer_matches_the_documented_text_at_its_full_width() {
+        assert_eq!(render(Context::Confirm, 15), "y run  n cancel");
+    }
+
+    #[test]
+    fn confirm_footer_renders_nothing_once_even_the_pinned_pair_cannot_fit() {
+        assert_eq!(render(Context::Confirm, 14), "");
+    }
+
+    #[test]
+    #[should_panic(expected = "no footer content is defined yet for Input")]
+    fn footer_still_panics_for_input_which_stays_deferred() {
+        render(Context::Input, 80);
+    }
+
     // --- absences the ADR names by name ---
 
-    /// This file's own production source, up to its test module: reused by both scans below
-    /// so each states one absence claim rather than re-reading the file.
-    fn production_source() -> &'static str {
-        include_str!("footer.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("this file has a test module")
+    /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than the first
+    /// `#[cfg(test)]`, since a file may gate a single item on it too. A file with no such
+    /// module is scanned whole: both fallbacks can only over-report, never let a violation
+    /// through.
+    fn cut_before_tests_module(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let tests_module = lines.iter().enumerate().position(|(index, line)| {
+            line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+        });
+        let mut production = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if Some(index) == tests_module {
+                break;
+            }
+            production.push_str(line);
+            production.push('\n');
+        }
+        production
+    }
+
+    /// This file's own production source, up to its trailing tests module: reused by both
+    /// scans below so each states one absence claim rather than re-reading the file.
+    fn production_source() -> String {
+        cut_before_tests_module(include_str!("footer.rs"))
+    }
+
+    /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
+    /// there, or every real production line after it goes unscanned.
+    #[test]
+    fn cut_before_tests_module_reads_past_a_test_only_item_to_the_tests_module() {
+        let source = "#[cfg(test)]\nfn only_built_for_tests() {}\n\nfn real_production() {}\n\n\
+                       #[cfg(test)]\nmod tests {\n    fn inside_the_tests_module() {}\n}\n";
+        let production = cut_before_tests_module(source);
+        assert!(
+            production.contains("real_production"),
+            "a test-only item must not cut the scan short of real production code"
+        );
+        assert!(
+            !production.contains("inside_the_tests_module"),
+            "the trailing tests module must still be excluded"
+        );
+    }
+
+    /// A file with no trailing tests module is scanned whole, erring towards over-reporting
+    /// rather than skipping a file the ban applies to.
+    #[test]
+    fn cut_before_tests_module_scans_a_file_with_no_tests_module_whole() {
+        assert!(cut_before_tests_module("fn real_production() {}\n").contains("real_production"));
     }
 
     /// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md) names
@@ -402,7 +612,8 @@ mod tests {
     /// whole items; this module must never call it, only the unbounded `set_string`.
     #[test]
     fn footer_never_calls_the_silently_truncating_set_stringn_helper() {
-        let offending: Vec<&str> = production_source()
+        let source = production_source();
+        let offending: Vec<&str> = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| line.contains("set_stringn"))
@@ -425,7 +636,8 @@ mod tests {
             format!("{} {} 0", "index", ">"),
             format!("{}(1)", ".skip"),
         ];
-        let offending: Vec<&str> = production_source()
+        let source = production_source();
+        let offending: Vec<&str> = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .filter(|line| banned.iter().any(|needle| line.contains(needle.as_str())))
