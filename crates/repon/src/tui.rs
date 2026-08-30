@@ -261,6 +261,8 @@ fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
     use super::*;
 
     /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
@@ -299,5 +301,71 @@ mod tests {
         expected.extend(ansi_bytes(cursor::Show));
 
         assert_eq!(out, expected);
+    }
+
+    /// crossterm's `KeyEventKind` has three variants, not two: a physical key held down
+    /// generates `Repeat` events between the `Press` and the eventual `Release`. Only `Press`
+    /// may reach [`dispatch`](crate::keys::dispatch), or every bound key would fire twice.
+    #[test]
+    fn translate_passes_through_a_press_and_filters_every_other_key_event_kind() {
+        let press = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate(CrosstermEvent::Key(press)),
+            Some(Event::Key(_))
+        ));
+
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            let key = KeyEvent { kind, ..press };
+            assert!(
+                translate(CrosstermEvent::Key(key)).is_none(),
+                "a {kind:?} key event must not reach dispatch"
+            );
+        }
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_dir() {
+                files.extend(rust_source_files(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-suspending-confirming):
+    /// raw mode clears ISIG, so quit and suspend are ordinary key handlers rather than signal
+    /// handlers. The only legitimate `signal_hook` use in this crate is [`Tui::suspend`]
+    /// raising `SIGTSTP` on itself after the terminal is restored; nothing may install a
+    /// handler for a signal arriving from outside the process.
+    #[test]
+    fn no_signal_handler_is_installed_anywhere_in_this_crates_source() {
+        // Built from pieces so this line is never a self-match once this file is scanned,
+        // the same trick `app.rs`'s own source-scan tests use.
+        let needle = format!("{}_{}", "signal", "hook");
+        let allowed_call = format!("{needle}::{}::{}", "low_level", "raise");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) && !line.contains(&allowed_call) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "quit and suspend must stay ordinary key handlers rather than signal handlers; \
+             found {needle} usage other than raising SIGTSTP at: {offending_locations:?}"
+        );
     }
 }
