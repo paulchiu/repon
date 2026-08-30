@@ -64,9 +64,11 @@ impl<T> FoldableCell for Cell<T> {
 /// `NotApplicable` Cell is excluded from the fold entirely, which is what lets a
 /// Repo row (Worktree state Not applicable by kind) or a Submodule row (`state`
 /// and `base` both Not applicable) read Fresh on cells that simply do not apply.
-/// Otherwise the row shows its least settled Cell. Derivation failures (a
-/// `.gitmodules` that will not parse, a failed Action) are discovery's and
-/// Action's own concerns and are not folded in here.
+/// Otherwise the row shows its least settled Cell, widened by two entity-level
+/// derivations that are not Cells at all: an unparseable `.gitmodules` and a
+/// failed last Action both drive the row to `Failed` even when every Cell reads
+/// fine. The default branch's rung and its disagreement stay out, being metadata
+/// about how a value was obtained rather than a value that can itself fail.
 pub fn summary(entity: &EntityState) -> RowSummary {
     let cells: [&dyn FoldableCell; 6] = [
         &entity.branch,
@@ -81,7 +83,16 @@ pub fn summary(entity: &EntityState) -> RowSummary {
         return RowSummary::InFlight;
     }
 
-    match cells.iter().filter_map(|cell| cell.settledness()).max() {
+    let derivation_failed = entity.diagnostics.gitmodules_failed.is_some()
+        || entity.last_action.as_ref().is_some_and(|run| run.failed);
+
+    let worst = cells
+        .iter()
+        .filter_map(|cell| cell.settledness())
+        .chain(derivation_failed.then_some(Settledness::Failed))
+        .max();
+
+    match worst {
         None => RowSummary::Fresh,
         Some(Settledness::Fresh) => RowSummary::Fresh,
         Some(Settledness::Stale) => RowSummary::Stale,
@@ -279,6 +290,197 @@ mod tests {
         );
 
         assert_eq!(summary(&entity), RowSummary::Unknown);
+    }
+
+    #[test]
+    fn an_unparseable_gitmodules_drives_the_row_to_failed_even_though_every_cell_is_fine() {
+        let mut entity = fresh_entity("repo");
+        entity.diagnostics.gitmodules_failed = Some(Arc::from("unexpected EOF"));
+
+        assert_eq!(summary(&entity), RowSummary::Failed);
+    }
+
+    #[test]
+    fn a_failed_last_action_drives_the_row_to_failed_even_though_every_cell_is_fine() {
+        let mut entity = fresh_entity("repo");
+        entity.last_action = Some(crate::entity::ActionRun { failed: true });
+
+        assert_eq!(summary(&entity), RowSummary::Failed);
+    }
+
+    #[test]
+    fn a_successful_last_action_does_not_drag_an_otherwise_fresh_row_down() {
+        let mut entity = fresh_entity("repo");
+        entity.last_action = Some(crate::entity::ActionRun { failed: false });
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    #[test]
+    fn the_default_branchs_rung_and_its_disagreement_never_enter_the_fold() {
+        let mut entity = fresh_entity("repo");
+        entity.diagnostics.default_branch_rung = Some(2);
+        entity.diagnostics.default_branch_rung_disagreement = true;
+        entity.diagnostics.default_branch_rung_two_stale = true;
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    #[test]
+    fn a_repo_row_whose_state_cell_is_not_applicable_folds_to_fresh_rather_than_unknown() {
+        let mut entity = fresh_entity("repo");
+        assert_eq!(entity.kind, Kind::Repo);
+        entity
+            .state
+            .settle(Generation::new(2), Settled::NotApplicable);
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    #[test]
+    fn a_detached_row_whose_state_cell_is_not_applicable_folds_to_fresh_rather_than_unknown() {
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("/repo-pr-1"))),
+            Arc::from("repo-pr-1"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let generation = Generation::new(1);
+        entity.branch.settle(
+            generation,
+            Settled::Known {
+                value: Head::Detached(gix::hash::Kind::Sha1.null()),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.sync.settle(
+            generation,
+            Settled::Unknown(crate::cell::Unknown::NoDefaultBranch),
+        );
+        entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: 0,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.default_branch.settle(
+            generation,
+            Settled::Known {
+                value: DefaultBranch::new(Arc::from("main")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        // The Merged proof found neither ancestry nor patch equivalence against the
+        // default branch, so `state` is Not applicable rather than a fifth exclusive
+        // state (ADR 0019).
+        entity.state.settle(generation, Settled::NotApplicable);
+        entity.base.settle(
+            generation,
+            Settled::Known {
+                value: 46,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        assert_eq!(
+            summary(&entity),
+            RowSummary::Unknown,
+            "sanity check: an Unknown sync cell should still win over the excluded \
+             Not-applicable state cell"
+        );
+
+        entity.sync.settle(
+            generation,
+            Settled::Known {
+                value: AheadBehind {
+                    ahead: 0,
+                    behind: 0,
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    /// One ordering case: a label, a mutation applied to an otherwise-fresh entity,
+    /// and the expected fold.
+    type OrderingCase = (&'static str, fn(&mut EntityState, Generation), RowSummary);
+
+    #[test]
+    fn row_summary_follows_the_documented_ordering_over_every_settledness() {
+        let generation = Generation::new(2);
+        let cases: [OrderingCase; 6] = [
+            (
+                "every cell fresh",
+                |_entity, _generation| {},
+                RowSummary::Fresh,
+            ),
+            (
+                "one cell stale",
+                |entity, generation| {
+                    entity.dirty.settle(
+                        generation,
+                        Settled::Known {
+                            value: 3,
+                            at: Timestamp::now(),
+                            stale: true,
+                        },
+                    );
+                },
+                RowSummary::Stale,
+            ),
+            (
+                "one cell unknown",
+                |entity, generation| {
+                    entity
+                        .dirty
+                        .settle(generation, Settled::Unknown(crate::cell::Unknown::TimedOut));
+                },
+                RowSummary::Unknown,
+            ),
+            (
+                "one cell failed",
+                |entity, generation| {
+                    entity.dirty.settle(
+                        generation,
+                        Settled::Failed(crate::git::ProbeError::Read(Arc::from("boom"))),
+                    );
+                },
+                RowSummary::Failed,
+            ),
+            (
+                "one cell in flight outranks another cell that failed",
+                |entity, generation| {
+                    entity.dirty.settle(
+                        generation,
+                        Settled::Failed(crate::git::ProbeError::Read(Arc::from("boom"))),
+                    );
+                    entity.branch.begin_probe();
+                },
+                RowSummary::InFlight,
+            ),
+            (
+                "a Not-applicable cell would have been the worst cell had it been \
+                 counted, but is excluded, so the row is fresh",
+                |entity, generation| {
+                    entity.state.settle(generation, Settled::NotApplicable);
+                },
+                RowSummary::Fresh,
+            ),
+        ];
+
+        for (label, mutate, expected) in cases {
+            let mut entity = fresh_entity("repo");
+            mutate(&mut entity, generation);
+            assert_eq!(summary(&entity), expected, "case: {label}");
+        }
     }
 
     #[test]

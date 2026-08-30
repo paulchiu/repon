@@ -134,11 +134,13 @@ pub struct Diagnostics {
 
 /// The most recent Action run against this Entity.
 ///
-/// Opaque for now: the receipt's shape (exit status, output, timing) is fixed by
-/// the Action result design, not by this ticket. Only `Option::is_some` is
-/// meaningful today.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActionRun {}
+/// Mostly opaque for now: the full receipt's shape (per-step output, labels,
+/// timing) is a later design's concern. `failed` exists because the row summary
+/// fold reads it, on the same terms as a `.gitmodules` that will not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionRun {
+    pub failed: bool,
+}
 
 /// Whether an Entity was found by the Refresh that just ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

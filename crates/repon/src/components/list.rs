@@ -267,12 +267,16 @@ fn draw_row(
     );
 }
 
-/// The row's gutter mark: its [`summary`] fold, mapped through the config's chosen glyph
-/// table. In-flight always shows the loading table's first frame; animating the spinner is
-/// [refresh.md]'s progressive-fill concern, not this ticket's.
-fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
+/// Maps one row's [`RowSummary`](repon_core::RowSummary) fold to the active table's gutter
+/// glyph. The mapping the fold to a character is exactly the consumer-side job
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) reserves for
+/// here rather than the core; a plain function over the enum keeps that mapping testable
+/// without needing a Cell in any particular state to reach it. In-flight always shows the
+/// loading table's first frame; animating the spinner is [refresh.md]'s progressive-fill
+/// concern, not this ticket's.
+fn gutter_glyph_for(row_summary: repon_core::RowSummary, glyphs: &'static GlyphSet) -> char {
     use repon_core::RowSummary;
-    match summary(entity) {
+    match row_summary {
         RowSummary::Fresh => glyphs.fresh,
         RowSummary::Stale => glyphs.stale,
         RowSummary::Unknown => glyphs.unknown,
@@ -281,18 +285,32 @@ fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
     }
 }
 
-/// The shared shape behind every cell formatter: a Known value renders through `format`,
-/// every other Settled shape (loading, not applicable, failed, unknown) renders the blank
-/// cell the provenance contract already commits to.
-fn format_known<T>(cell: &Cell<T>, format: impl FnOnce(&T) -> String) -> String {
-    match cell.settled() {
+/// The row's gutter mark: its [`summary`] fold, mapped through [`gutter_glyph_for`].
+fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
+    gutter_glyph_for(summary(entity), glyphs)
+}
+
+/// The one function every column widget renders a cell's text through, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The mapping
+/// is exactly" table: a Known value renders through `format`, every other shape (Unknown,
+/// Failed, NotApplicable, or nothing settled yet) renders the blank cell the provenance
+/// contract commits to. The match is exhaustive over `Option<&Settled<T>>` with no wildcard
+/// arm, so a state added to `Settled` later fails to compile here rather than silently
+/// falling through a catch-all into a raw value or a raw default. Takes the cell's already-
+/// read `Settled` rather than the `Cell` itself: whether a probe is in flight never changes
+/// this text, only the row's gutter, which [`gutter_glyph_for`] computes separately.
+fn render_cell<T>(settled: Option<&Settled<T>>, format: impl FnOnce(&T) -> String) -> String {
+    match settled {
         Some(Settled::Known { value, .. }) => format(value),
-        _ => String::new(),
+        Some(Settled::Unknown(_)) => String::new(),
+        Some(Settled::Failed(_)) => String::new(),
+        Some(Settled::NotApplicable) => String::new(),
+        None => String::new(),
     }
 }
 
 fn format_head(cell: &Cell<Head>) -> String {
-    format_known(cell, |value| match value {
+    render_cell(cell.settled(), |value| match value {
         Head::Branch(name) | Head::Unborn(name) => name.to_string(),
         Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
     })
@@ -302,7 +320,7 @@ fn format_head(cell: &Cell<Head>) -> String {
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
 /// glyphs for real values".
 fn format_ahead_behind(cell: &Cell<AheadBehind>, glyphs: &'static GlyphSet) -> String {
-    format_known(cell, |value| {
+    render_cell(cell.settled(), |value| {
         if value.ahead == 0 && value.behind == 0 {
             return glyphs.in_sync.to_string();
         }
@@ -320,7 +338,7 @@ fn format_ahead_behind(cell: &Cell<AheadBehind>, glyphs: &'static GlyphSet) -> S
 /// `base`'s glyph: `≡` level, `↓n` behind. No ahead-of-default glyph exists, per
 /// [default-branch.md](../../../../docs/spec/default-branch.md).
 fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    format_known(cell, |value| {
+    render_cell(cell.settled(), |value| {
         if *value == 0 {
             glyphs.in_sync.to_string()
         } else {
@@ -331,7 +349,7 @@ fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
 
 /// `dirty`'s glyph: `·` clean, `●n` changed.
 fn format_dirty(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    format_known(cell, |value| {
+    render_cell(cell.settled(), |value| {
         if *value == 0 {
             glyphs.clean.to_string()
         } else {
@@ -341,7 +359,7 @@ fn format_dirty(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
 }
 
 fn format_state(cell: &Cell<WorktreeState>) -> String {
-    format_known(cell, |value| {
+    render_cell(cell.settled(), |value| {
         match value {
             WorktreeState::Merged => "merged",
             WorktreeState::Gone => "gone",
@@ -357,7 +375,10 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
-    use repon_core::{EntityKey, EntityState, Generation, Kind, Snapshot, Timestamp};
+    use repon_core::{
+        EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot, Timestamp,
+        Unknown,
+    };
 
     use super::*;
 
@@ -522,6 +543,166 @@ mod tests {
             " ",
             "must not spill past the interior's own right edge even though the raw buffer \
              has room"
+        );
+    }
+
+    #[test]
+    fn render_cell_renders_a_known_value_through_the_formatter() {
+        let settled = Settled::Known {
+            value: 5u32,
+            at: Timestamp::now(),
+            stale: false,
+        };
+
+        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "5");
+    }
+
+    #[test]
+    fn render_cell_renders_a_known_stale_value_the_same_as_a_known_fresh_one() {
+        // Stale marks the row's gutter, per layout-and-provenance.md; the cell's own text is
+        // unaffected, since no glyph is drawn in a value cell for a provenance state.
+        let settled = Settled::Known {
+            value: 5u32,
+            at: Timestamp::now(),
+            stale: true,
+        };
+
+        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "5");
+    }
+
+    #[test]
+    fn render_cell_renders_unknown_as_blank() {
+        let settled: Settled<u32> = Settled::Unknown(Unknown::TimedOut);
+
+        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+    }
+
+    #[test]
+    fn render_cell_renders_failed_as_blank() {
+        let settled: Settled<u32> = Settled::Failed(ProbeError::Read(Arc::from("boom")));
+
+        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+    }
+
+    #[test]
+    fn render_cell_renders_not_applicable_as_blank() {
+        let settled: Settled<u32> = Settled::NotApplicable;
+
+        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+    }
+
+    #[test]
+    fn render_cell_renders_nothing_settled_as_blank() {
+        // Covers both a cell nothing has probed yet and one currently in flight: neither
+        // carries a value, and `render_cell` never looks at `is_in_flight` to decide the
+        // text, only `gutter_glyph_for` does, on the row's summary.
+        let settled: Option<&Settled<u32>> = None;
+
+        assert_eq!(render_cell(settled, |value| value.to_string()), "");
+    }
+
+    #[test]
+    fn no_numeric_bearing_cell_ever_renders_a_raw_default_instead_of_blank() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let unset: Cell<u32> = Cell::default();
+        let unset_sync: Cell<AheadBehind> = Cell::default();
+
+        for text in [
+            format_base(&unset, glyphs),
+            format_dirty(&unset, glyphs),
+            format_ahead_behind(&unset_sync, glyphs),
+        ] {
+            assert_eq!(
+                text, "",
+                "an uncomputed numeric-bearing cell must render blank"
+            );
+            assert_ne!(
+                text, "0",
+                "an uncomputed numeric-bearing cell must never render a raw zero default"
+            );
+        }
+    }
+
+    #[test]
+    fn gutter_glyph_for_maps_every_row_summary_to_its_own_glyph() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(gutter_glyph_for(RowSummary::Fresh, glyphs), glyphs.fresh);
+        assert_eq!(gutter_glyph_for(RowSummary::Stale, glyphs), glyphs.stale);
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Unknown, glyphs),
+            glyphs.unknown
+        );
+        assert_eq!(gutter_glyph_for(RowSummary::Failed, glyphs), glyphs.failed);
+        assert_eq!(
+            gutter_glyph_for(RowSummary::InFlight, glyphs),
+            glyphs.loading[0],
+            "nothing settled while in flight shows the loading mark in the gutter"
+        );
+    }
+
+    /// The file's own production source, up to its test module: reused by every scan test
+    /// below so each states one absence claim rather than re-reading the file.
+    fn production_source() -> &'static str {
+        include_str!("list.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file has a test module")
+    }
+
+    /// [layout-and-provenance.md]'s cell mapping must be total: a `Settled` shape added
+    /// later should fail to compile in `render_cell` rather than fall silently through a
+    /// catch-all. Scans this file's own production source for a wildcard match arm, which
+    /// is exactly how a "just show the number" default sneaks back in unnoticed.
+    #[test]
+    fn no_wildcard_match_arm_hides_a_cell_rendering_default() {
+        let offending_lines: Vec<&str> = production_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("_ =>"))
+            .collect();
+
+        assert!(
+            offending_lines.is_empty(),
+            "found a wildcard match arm, which can hide an unhandled cell state: {offending_lines:?}"
+        );
+    }
+
+    /// Every column formatter must funnel through `render_cell`, the one function this
+    /// ticket's cell mapping is implemented against. A second, ad hoc match on
+    /// `Settled::Known` anywhere else in this file would bypass that mapping and show a
+    /// cell's raw value without it, which is exactly the "just show the number" path the
+    /// ticket forbids; this counts the file's own occurrences rather than trusting review.
+    #[test]
+    fn every_column_formatter_reaches_settled_known_only_through_render_cell() {
+        let occurrences = production_source().matches("Settled::Known").count();
+
+        assert_eq!(
+            occurrences, 1,
+            "expected `Settled::Known` matched in exactly one place (render_cell), found \
+             {occurrences}"
+        );
+    }
+
+    /// A re-probing cell must keep showing its previous value rather than reverting to
+    /// blank, which `Cell`'s own `re_probing_keeps_the_previous_value_instead_of_blanking`
+    /// test proves at the core: `Cell::settled()` is unaffected by `is_in_flight()`. This is
+    /// the matching consumer-side guarantee: no column formatter here ever reads
+    /// `is_in_flight` to decide a cell's text, so a bug that blanks an in-flight cell's
+    /// still-known value cannot be introduced without this scan catching it, structurally
+    /// rather than by a test that would need a `Cell` in a state this crate cannot construct.
+    #[test]
+    fn no_column_formatter_reads_is_in_flight_to_decide_a_cells_text() {
+        let offending_lines: Vec<&str> = production_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("is_in_flight"))
+            .collect();
+
+        assert!(
+            offending_lines.is_empty(),
+            "a column formatter must never read is_in_flight; only the row's gutter does, \
+             found at: {offending_lines:?}"
         );
     }
 }
