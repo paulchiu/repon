@@ -29,10 +29,12 @@ fn a_missing_theme_named_on_the_flag_fails_before_the_terminal_is_claimed() {
         "expected the missing theme's name in the error, got: {stderr}",
     );
 
-    // The observable proof that the theme was resolved before the terminal was claimed:
-    // `enter()` writes `EnterAlternateScreen` to this same stdout only after `App::new`
-    // returns `Ok`, so a byte here would mean the TUI started before the missing theme was
-    // reported.
+    // This does not prove the before-the-terminal-is-claimed ordering: with no controlling
+    // terminal at all, `enable_raw_mode()` fails before the theme is even looked up, so
+    // stdout comes back empty here regardless of which order a build checks the two in.
+    // `terminal_restoration.rs`'s
+    // `a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed` attaches a real
+    // pty, where `enter()` can actually succeed, and is the test that proves the ordering.
     assert!(
         output.stdout.is_empty(),
         "expected no terminal bytes on stdout, got: {:?}",

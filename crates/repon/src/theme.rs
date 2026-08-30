@@ -998,6 +998,88 @@ mod tests {
         );
     }
 
+    // Criterion: per-value isolation, proven independently of iteration order. `raw` is a
+    // `toml::Table` (a `BTreeMap`), so its keys are visited in sorted order regardless of
+    // the file's own key order; `accent` sorts before `warn`. A loader that stopped at the
+    // first bad value instead of continuing past it would never reach `warn`, so this test
+    // states its intent by key choice rather than depending on it staying that way by luck.
+    #[test]
+    fn a_bad_value_that_sorts_before_a_good_key_does_not_cost_the_good_key_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(
+            &themes_dir,
+            "bad-before-good",
+            "accent = \"not-a-colour\"\nwarn = \"light-red\"\n",
+        );
+
+        let loaded =
+            load(&themes_dir, "bad-before-good", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(
+            loaded.theme.warn,
+            Color::LightRed,
+            "a good value named after a bad one, in sorted-key order, must still apply"
+        );
+        assert_eq!(
+            loaded.theme.accent, DEFAULT.accent,
+            "the bad value keeps the compiled default for its own key only"
+        );
+        assert_eq!(
+            loaded.warnings,
+            vec![ThemeWarning::UnparseableValue {
+                key: "accent".to_string(),
+                value: "not-a-colour".to_string(),
+            }]
+        );
+    }
+
+    // Criterion: per-value isolation is a per-value claim, not a per-file one. Two bad
+    // values, one sorting before and one sorting after a good value in between (`border` <
+    // `ok` < `warn`), each independently keeping its own compiled default and raising its
+    // own warning: a single-bad-value test cannot tell "one bad value costs only that
+    // value" apart from "the first bad value costs everything after it".
+    #[test]
+    fn two_bad_values_in_the_same_file_each_independently_keep_their_own_compiled_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        write_theme_file(
+            &themes_dir,
+            "two-bad",
+            "border = \"not-a-colour\"\nok = \"light-green\"\nwarn = \"also-not-a-colour\"\n",
+        );
+
+        let loaded = load(&themes_dir, "two-bad", ThemeSource::Config).expect("expected Ok");
+
+        assert_eq!(
+            loaded.theme.ok,
+            Color::LightGreen,
+            "the good value between the two bad ones must still apply"
+        );
+        assert_eq!(
+            loaded.theme.border, DEFAULT.border,
+            "the first bad value keeps its own compiled default"
+        );
+        assert_eq!(
+            loaded.theme.warn, DEFAULT.warn,
+            "the second bad value keeps its own compiled default"
+        );
+        assert_eq!(
+            loaded.warnings,
+            vec![
+                ThemeWarning::UnparseableValue {
+                    key: "border".to_string(),
+                    value: "not-a-colour".to_string(),
+                },
+                ThemeWarning::UnparseableValue {
+                    key: "warn".to_string(),
+                    value: "also-not-a-colour".to_string(),
+                },
+            ],
+            "each bad value must raise its own warning, independently of the other"
+        );
+    }
+
     // Criterion: merge over the compiled default. A theme naming a strict subset of roles
     // must leave every unnamed role at its own compiled value, not some other placeholder a
     // wholesale-replacement merge would leave behind.
@@ -1148,27 +1230,11 @@ mod tests {
         assert!(loaded.warnings.is_empty());
     }
 
-    /// Criterion: the grammar. One row per theme key (nine roles, `selection_bg`,
-    /// `selection_fg`), so a form dropped from the grammar without a matching row here is
-    /// visible: light and bright prefixes in every separator style ratatui accepts, either
-    /// spelling of grey, `reset`, hex truecolor, and a bare index.
-    const GRAMMAR_CASES: &[(&str, &str, Color)] = &[
-        ("text", "red", Color::Red),
-        ("dim", "light-red", Color::LightRed),
-        ("accent", "light_green", Color::LightGreen),
-        ("ok", "lightBlue", Color::LightBlue),
-        ("warn", "bright-red", Color::LightRed),
-        ("danger", "brightgreen", Color::LightGreen),
-        ("behind", "dark-grey", Color::DarkGray),
-        ("border", "dark_gray", Color::DarkGray),
-        ("border_focused", "reset", Color::Reset),
-        ("selection_bg", "#1a2b3c", Color::Rgb(0x1a, 0x2b, 0x3c)),
-        ("selection_fg", "42", Color::Indexed(42)),
-    ];
-
-    #[test]
-    fn every_accepted_colour_grammar_form_parses_with_no_warnings() {
-        let text: String = GRAMMAR_CASES
+    /// Builds one theme file from `cases` (`key = "value"` per line, so every case in one
+    /// call needs its own key) and asserts each parses with no warnings and resolves to its
+    /// expected colour. Shared by both grammar tests below.
+    fn assert_grammar_cases_parse(cases: &[(&str, &str, Color)]) {
+        let text: String = cases
             .iter()
             .map(|(key, value, _)| format!("{key} = \"{value}\"\n"))
             .collect();
@@ -1180,7 +1246,7 @@ mod tests {
             "expected every grammar case to parse, got warnings: {:?}",
             loaded.warnings
         );
-        for (key, value, expected) in GRAMMAR_CASES {
+        for (key, value, expected) in cases {
             let actual = match *key {
                 "selection_bg" => loaded.theme.selection_bg,
                 "selection_fg" => loaded.theme.selection_fg,
@@ -1198,5 +1264,44 @@ mod tests {
                 "`{key} = \"{value}\"` did not resolve to {expected:?}"
             );
         }
+    }
+
+    /// Criterion: the grammar. One row per theme key (nine roles, `selection_bg`,
+    /// `selection_fg`), so a form dropped from the grammar without a matching row here is
+    /// visible: light and bright prefixes in every separator style ratatui accepts, `reset`,
+    /// hex truecolor, and a bare index. A bare spelling of grey and the space-separated
+    /// separator style are in [`GREY_AND_SPACE_SEPARATED_CASES`] instead, since every one of
+    /// the eleven theme keys here already carries a row.
+    const GRAMMAR_CASES: &[(&str, &str, Color)] = &[
+        ("text", "red", Color::Red),
+        ("dim", "light-red", Color::LightRed),
+        ("accent", "light_green", Color::LightGreen),
+        ("ok", "lightBlue", Color::LightBlue),
+        ("warn", "bright-red", Color::LightRed),
+        ("danger", "brightgreen", Color::LightGreen),
+        ("behind", "dark-grey", Color::DarkGray),
+        ("border", "dark_gray", Color::DarkGray),
+        ("border_focused", "reset", Color::Reset),
+        ("selection_bg", "#1a2b3c", Color::Rgb(0x1a, 0x2b, 0x3c)),
+        ("selection_fg", "42", Color::Indexed(42)),
+    ];
+
+    #[test]
+    fn every_accepted_colour_grammar_form_parses_with_no_warnings() {
+        assert_grammar_cases_parse(GRAMMAR_CASES);
+    }
+
+    /// Criterion: the grammar, continued. `dark-grey` and `dark_gray` are in
+    /// [`GRAMMAR_CASES`] above, but neither a bare `grey`/`gray` nor the space-separated
+    /// separator style (`"light red"`) had a case anywhere.
+    const GREY_AND_SPACE_SEPARATED_CASES: &[(&str, &str, Color)] = &[
+        ("dim", "grey", Color::Gray),
+        ("accent", "gray", Color::Gray),
+        ("warn", "light red", Color::LightRed),
+    ];
+
+    #[test]
+    fn a_bare_grey_a_bare_gray_and_the_space_separated_form_also_parse() {
+        assert_grammar_cases_parse(GREY_AND_SPACE_SEPARATED_CASES);
     }
 }
