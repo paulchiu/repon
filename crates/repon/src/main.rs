@@ -19,6 +19,8 @@ mod keys;
 mod logging;
 mod message;
 mod selection;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tui;
 mod unwind;

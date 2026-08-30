@@ -77,6 +77,9 @@ _Avoid_: Handoff (that names the act, not the thing)
 **Action**:
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
+**Environment contract**:
+The set-or-unset variable pairs a Launcher or an Action step's child receives, computed from an Entity's already-settled Cells as plain data. An Unknown or Not applicable value unsets its variable rather than setting it empty, and Repon exports none of its own Selection state.
+
 ### Refreshing
 
 **Refresh**:
