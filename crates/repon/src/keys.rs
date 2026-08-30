@@ -102,7 +102,7 @@ const fn binding(
     (context, code, modifiers, action)
 }
 
-/// The spec's own words for an action, read by [`describe_over`] for the help overlay and by
+/// The spec's own words for an action, read by [`BindingTable::describe`] for the help overlay and by
 /// this module's own spec-conformance test. Deriving it from the [`Action`] rather than
 /// storing it per row means a mislabelled binding permutes its description too, so neither
 /// reader can be fed a stale string.
@@ -481,26 +481,6 @@ const _: () = {
     );
 };
 
-/// The one place a key event becomes an [`Action`]: a pure function of a binding table, the
-/// focused [`Context`] and the event, so routing is testable with no terminal and no running
-/// app. [`BindingTable::dispatch`] is the only production caller, over whichever table `App`
-/// currently holds (the compiled default until a `[keys]` block or a reload changes it).
-///
-/// `Global` only dispatches while `context` is `List` or `Detail`
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)); `Input` also turns
-/// an unbound printable character into [`Action::Text`].
-fn dispatch_over(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Action> {
-    match context {
-        Context::List | Context::Detail => {
-            lookup(bindings, context, key).or_else(|| lookup(bindings, Context::Global, key))
-        }
-        Context::Input => {
-            lookup(bindings, Context::Input, key).or_else(|| printable(key).map(Action::Text))
-        }
-        Context::Global | Context::Overlay | Context::Confirm => lookup(bindings, context, key),
-    }
-}
-
 /// Consults `bindings` alone: [`PERMANENTLY_UNBINDABLE`] is refused for every row of
 /// [`BINDINGS`] at build time (see the `const _` assertion above), but a user-merged table is
 /// built at runtime and gets no such guarantee for free; [`merge`] is what refuses it there.
@@ -548,57 +528,6 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
     }
 }
 
-/// The first chord `bindings` binds `action` to in `context`, in table order. Table order
-/// lists a letter before its arrow-key alternate ([`BindingTable::dispatch`]'s own
-/// preference), which is why the footer reads this rather than every key an action answers
-/// to. [`BindingTable::primary_chord`] is the only production caller.
-fn primary_chord_over(
-    bindings: &[Binding],
-    context: Context,
-    action: Action,
-) -> Option<(KeyCode, KeyModifiers)> {
-    bindings
-        .iter()
-        .find(|(row_context, _, _, row_action)| *row_context == context && *row_action == action)
-        .map(|(_, code, modifiers, _)| (*code, *modifiers))
-}
-
-/// Every distinct action live in `context` over `bindings`, as `(keys, description)`, current
-/// context first then `global` where it is live alongside it
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)). A row bound to more
-/// than one key (`` `j`, `Down` ``) collapses to one entry, its keys joined with `, ` in table
-/// order, because the help overlay shows one line per action, not per key.
-/// [`BindingTable::describe`] is the only production caller, and the help overlay's only
-/// source of content: nothing here is transcribed.
-fn describe_over(bindings: &[Binding], context: Context) -> Vec<(String, &'static str)> {
-    let mut contexts = vec![context];
-    if matches!(context, Context::List | Context::Detail) {
-        contexts.push(Context::Global);
-    }
-
-    let mut order: Vec<&'static str> = Vec::new();
-    let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
-        std::collections::HashMap::new();
-    for ctx in contexts {
-        for &(row_context, code, modifiers, action) in bindings {
-            if row_context != ctx {
-                continue;
-            }
-            let desc = description(action);
-            let keys = keys_by_description.entry(desc).or_insert_with(|| {
-                order.push(desc);
-                Vec::new()
-            });
-            keys.push(chord_label(code, modifiers));
-        }
-    }
-
-    order
-        .into_iter()
-        .map(|desc| (keys_by_description[desc].join(", "), desc))
-        .collect()
-}
-
 // ---------------------------------------------------------------------------------------
 // User-configurable rebinding: a `[keys]` block merges over `BINDINGS` by action name.
 // keybindings.md's "Configuration" section and config.md's "The shape of the document" are
@@ -623,20 +552,73 @@ impl BindingTable {
         Self(BINDINGS.to_vec())
     }
 
+    /// The one place a key event becomes an [`Action`]: over whichever table `self` holds
+    /// (the compiled default until a `[keys]` block or a reload changes it).
+    ///
+    /// `Global` only dispatches while `context` is `List` or `Detail`
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)); `Input` also
+    /// turns an unbound printable character into [`Action::Text`].
     pub(crate) fn dispatch(&self, context: Context, key: KeyEvent) -> Option<Action> {
-        dispatch_over(&self.0, context, key)
+        match context {
+            Context::List | Context::Detail => {
+                lookup(&self.0, context, key).or_else(|| lookup(&self.0, Context::Global, key))
+            }
+            Context::Input => {
+                lookup(&self.0, Context::Input, key).or_else(|| printable(key).map(Action::Text))
+            }
+            Context::Global | Context::Overlay | Context::Confirm => lookup(&self.0, context, key),
+        }
     }
 
+    /// The first chord bound to `action` in `context`, in table order. Table order lists a
+    /// letter before its arrow-key alternate ([`Self::dispatch`]'s own preference), which is
+    /// why the footer reads this rather than every key an action answers to.
     pub(crate) fn primary_chord(
         &self,
         context: Context,
         action: Action,
     ) -> Option<(KeyCode, KeyModifiers)> {
-        primary_chord_over(&self.0, context, action)
+        self.0
+            .iter()
+            .find(|(row_context, _, _, row_action)| {
+                *row_context == context && *row_action == action
+            })
+            .map(|(_, code, modifiers, _)| (*code, *modifiers))
     }
 
+    /// Every distinct action live in `context`, as `(keys, description)`, current context
+    /// first then `global` where it is live alongside it
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)). A row bound to
+    /// more than one key (`` `j`, `Down` ``) collapses to one entry, its keys joined with `, `
+    /// in table order, because the help overlay shows one line per action, not per key. The
+    /// help overlay's only source of content: nothing here is transcribed.
     pub(crate) fn describe(&self, context: Context) -> Vec<(String, &'static str)> {
-        describe_over(&self.0, context)
+        let mut contexts = vec![context];
+        if matches!(context, Context::List | Context::Detail) {
+            contexts.push(Context::Global);
+        }
+
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
+            std::collections::HashMap::new();
+        for ctx in contexts {
+            for &(row_context, code, modifiers, action) in &self.0 {
+                if row_context != ctx {
+                    continue;
+                }
+                let desc = description(action);
+                let keys = keys_by_description.entry(desc).or_insert_with(|| {
+                    order.push(desc);
+                    Vec::new()
+                });
+                keys.push(chord_label(code, modifiers));
+            }
+        }
+
+        order
+            .into_iter()
+            .map(|desc| (keys_by_description[desc].join(", "), desc))
+            .collect()
     }
 }
 
@@ -827,63 +809,84 @@ impl std::fmt::Display for KeysWarning {
     }
 }
 
-/// The first two bindings in `bindings` that share a context, a key and a modifier set but
-/// name different actions, in table order; `None` if every key in every context is claimed by
-/// at most one action. Not a `const fn` like
+/// Every key, in table order, bound to more than one distinct action in the same context,
+/// each paired with all of its colliding actions in table order; empty if every key in every
+/// context is claimed by at most one action. Not a `const fn` like
 /// [`any_binding_is_permanently_unbindable`]: that check only ever compares [`KeyCode`] and
 /// [`KeyModifiers`], both cheap to hand-roll in `const` context, where this one also has to
-/// tell two different [`Action`]s apart, and `Action`'s derived `PartialEq` is not `const`.
+/// tell different [`Action`]s apart, and `Action`'s derived `PartialEq` is not `const`.
 /// [`merge`] must run this same check over an arbitrary table built at runtime from a config
 /// file regardless, so a second, `const`-only version just for [`BINDINGS`] would be a second
 /// implementation of the same rule, free to drift from this one; running this one function
 /// against both tables is what keeps the two collision definitions from ever disagreeing.
-fn find_collision(
-    bindings: &[Binding],
-) -> Option<(Context, KeyCode, KeyModifiers, Action, Action)> {
-    for (index, &(context_a, code_a, modifiers_a, action_a)) in bindings.iter().enumerate() {
-        for &(context_b, code_b, modifiers_b, action_b) in &bindings[index + 1..] {
-            if context_a == context_b
-                && code_a == code_b
-                && modifiers_a == modifiers_b
-                && action_a != action_b
-            {
-                return Some((context_a, code_a, modifiers_a, action_a, action_b));
-            }
+fn find_collisions(bindings: &[Binding]) -> Vec<(Context, KeyCode, KeyModifiers, Vec<Action>)> {
+    let mut groups: Vec<(Context, KeyCode, KeyModifiers, Vec<Action>)> = Vec::new();
+    for &(context, code, modifiers, action) in bindings {
+        match groups
+            .iter_mut()
+            .find(|(c, k, m, _)| *c == context && *k == code && *m == modifiers)
+        {
+            Some((_, _, _, actions)) if !actions.contains(&action) => actions.push(action),
+            Some(_) => {}
+            None => groups.push((context, code, modifiers, vec![action])),
         }
     }
-    None
+    groups.retain(|(_, _, _, actions)| actions.len() > 1);
+    groups
 }
 
-fn collision_error(
-    (context, code, modifiers, action_a, action_b): (
-        Context,
-        KeyCode,
-        KeyModifiers,
-        Action,
-        Action,
-    ),
+/// `actions`' names joined for a human sentence: `` `a` and `b` `` for two, `` `a`, `b` and
+/// `c` `` for more. [`collisions_error`]'s only caller; broken out because it is the one place
+/// that has to handle both shapes.
+fn action_name_list(actions: &[Action]) -> String {
+    let names: Vec<&str> = actions
+        .iter()
+        .map(|&action| action_name(action).unwrap_or("<unnamed action>"))
+        .collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => format!("`{last}`"),
+        Some((last, rest)) => {
+            let rest = rest
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{rest} and `{last}`")
+        }
+    }
+}
+
+/// One error naming every collision in `collisions`, so a user fixing what they are told about
+/// is not sent back to reload and be told about the next one.
+fn collisions_error(
+    collisions: &[(Context, KeyCode, KeyModifiers, Vec<Action>)],
 ) -> color_eyre::eyre::Error {
-    let chord = chord_label(code, modifiers);
-    eyre!(
-        "key `{chord}` in {context:?} is bound to both `{}` and `{}`",
-        action_name(action_a).unwrap_or("<unnamed action>"),
-        action_name(action_b).unwrap_or("<unnamed action>"),
-    )
+    let sentences: Vec<String> = collisions
+        .iter()
+        .map(|(context, code, modifiers, actions)| {
+            let chord = chord_label(*code, *modifiers);
+            format!(
+                "key `{chord}` in {context:?} is bound to {}",
+                action_name_list(actions)
+            )
+        })
+        .collect();
+    eyre!(sentences.join("; "))
 }
 
 /// Debug builds only: proves [`BINDINGS`] itself carries no collision, since review can grow
 /// one in the compiled default exactly as easily as a config file can. Not a `const fn`
 /// assertion like [`any_binding_is_permanently_unbindable`]'s, for the reason recorded on
-/// [`find_collision`]; called from [`merge`] so every process that ever builds a
+/// [`find_collisions`]; called from [`merge`] so every process that ever builds a
 /// [`BindingTable`] re-checks the baseline it started from.
 #[cfg(debug_assertions)]
 fn debug_assert_compiled_default_has_no_collision() {
-    if let Some((context, code, modifiers, action_a, action_b)) = find_collision(BINDINGS) {
+    let collisions = find_collisions(BINDINGS);
+    if !collisions.is_empty() {
         panic!(
-            "the compiled default map binds {} and {} to the same key `{}` in {context:?}",
-            action_name(action_a).unwrap_or("<unnamed action>"),
-            action_name(action_b).unwrap_or("<unnamed action>"),
-            chord_label(code, modifiers),
+            "the compiled default map has a key collision: {}",
+            collisions_error(&collisions)
         );
     }
 }
@@ -894,11 +897,12 @@ fn debug_assert_compiled_default_has_no_collision() {
 /// every other binding, in every context, untouched. Binding an action to the empty string
 /// unbinds it outright, with no fallback to the compiled default. An unknown context or
 /// action name warns, naming its dotted path, and is otherwise ignored; an unparseable key
-/// name, or a value of the wrong TOML type, is a hard error; two actions left bound to the
-/// same key in the same context, whether that collision came entirely from the file or from
-/// a file entry landing on a default the file never mentioned, is the same hard error, naming
-/// both actions and the key. Every hard error here must reach the caller before the terminal
-/// is claimed, at both startup and reload.
+/// name, or a value of the wrong TOML type, is a hard error; two or more actions left bound
+/// to the same key in the same context, whether that collision came entirely from the file or
+/// from a file entry landing on a default the file never mentioned, is the same hard error,
+/// naming every colliding action and key rather than stopping at the first pair. Every hard
+/// error here must reach the caller before the terminal is claimed, at both startup and
+/// reload.
 ///
 /// `[keys.<context>]` is the one place `config.toml` nests three deep, the exception to
 /// [config.md](../../../../docs/spec/config.md#the-shape-of-the-document)'s rule that nothing
@@ -955,8 +959,9 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
         }
     }
 
-    if let Some(collision) = find_collision(&bindings) {
-        return Err(collision_error(collision));
+    let collisions = find_collisions(&bindings);
+    if !collisions.is_empty() {
+        return Err(collisions_error(&collisions));
     }
 
     Ok((BindingTable(bindings), warnings))
@@ -970,12 +975,12 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    // The bulk of this module's tests exercise the compiled default map through these three,
-    // which existed as `pub(crate)` production functions before `BindingTable` took over as
-    // the only production caller of `dispatch_over`/`primary_chord_over`/`describe_over`.
-    // Keeping the same names here, backed by `BindingTable::compiled_default()`, is what lets
-    // those tests stay unchanged rather than growing a `BindingTable::compiled_default()` at
-    // every call site for no behavioural reason.
+    // The bulk of this module's tests exercise the compiled default map through these three
+    // wrappers, which existed as `pub(crate)` production functions before `BindingTable` took
+    // over as the production API. Keeping the same names here, backed by
+    // `BindingTable::compiled_default()`, is what lets those tests stay unchanged rather than
+    // growing a `BindingTable::compiled_default()` at every call site for no behavioural
+    // reason.
 
     fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
         BindingTable::compiled_default().dispatch(context, key)
@@ -2018,51 +2023,122 @@ mod tests {
         assert!(merge(&document_keys).is_err());
     }
 
-    // --- collisions: a load error naming both actions and the key ---
+    // --- collisions: a load error naming every colliding action and key ---
 
     #[test]
-    fn find_collision_reports_none_over_the_compiled_default() {
+    fn find_collisions_reports_none_over_the_compiled_default() {
         assert!(
-            find_collision(BINDINGS).is_none(),
+            find_collisions(BINDINGS).is_empty(),
             "the compiled default map must never carry a collision"
         );
     }
 
     #[test]
-    fn find_collision_detects_two_different_actions_sharing_one_key_in_one_context() {
+    fn find_collisions_detects_two_different_actions_sharing_one_key_in_one_context() {
         let synthetic: Vec<Binding> = vec![
             (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
             (Context::List, KeyCode::Char('x'), NONE, Action::MoveUp),
         ];
-        let (context, code, modifiers, a, b) =
-            find_collision(&synthetic).expect("expected a collision");
-        assert_eq!(context, Context::List);
-        assert_eq!(code, KeyCode::Char('x'));
-        assert_eq!(modifiers, NONE);
+        let collisions = find_collisions(&synthetic);
+        assert_eq!(collisions.len(), 1, "expected exactly one colliding key");
+        let (context, code, modifiers, actions) = &collisions[0];
+        assert_eq!(*context, Context::List);
+        assert_eq!(*code, KeyCode::Char('x'));
+        assert_eq!(*modifiers, NONE);
         assert!(
-            (a == Action::MoveDown && b == Action::MoveUp)
-                || (a == Action::MoveUp && b == Action::MoveDown),
-            "expected MoveDown and MoveUp in some order, got {a:?} and {b:?}"
+            actions.contains(&Action::MoveDown) && actions.contains(&Action::MoveUp),
+            "expected MoveDown and MoveUp both named, got {actions:?}"
         );
     }
 
     #[test]
-    fn find_collision_ignores_the_same_action_bound_to_the_same_key_twice() {
+    fn find_collisions_names_every_action_bound_to_a_key_shared_by_three() {
+        let synthetic: Vec<Binding> = vec![
+            (
+                Context::List,
+                KeyCode::Char('z'),
+                NONE,
+                Action::DismissVanished,
+            ),
+            (Context::List, KeyCode::Char('z'), NONE, Action::NextFailed),
+            (
+                Context::List,
+                KeyCode::Char('z'),
+                NONE,
+                Action::PreviousFailed,
+            ),
+        ];
+        let collisions = find_collisions(&synthetic);
+        assert_eq!(collisions.len(), 1, "expected exactly one colliding key");
+        let (_, _, _, actions) = &collisions[0];
+        assert_eq!(
+            actions.len(),
+            3,
+            "expected all three colliding actions named, got {actions:?}"
+        );
+        assert!(actions.contains(&Action::DismissVanished));
+        assert!(actions.contains(&Action::NextFailed));
+        assert!(actions.contains(&Action::PreviousFailed));
+    }
+
+    #[test]
+    fn find_collisions_names_every_key_when_two_separate_keys_each_collide() {
+        let synthetic: Vec<Binding> = vec![
+            (
+                Context::List,
+                KeyCode::Char('y'),
+                NONE,
+                Action::SelectAllVisible,
+            ),
+            (
+                Context::List,
+                KeyCode::Char('y'),
+                NONE,
+                Action::ClearSelection,
+            ),
+            (
+                Context::List,
+                KeyCode::Char('z'),
+                NONE,
+                Action::DismissVanished,
+            ),
+            (Context::List, KeyCode::Char('z'), NONE, Action::NextFailed),
+        ];
+        let collisions = find_collisions(&synthetic);
+        assert_eq!(
+            collisions.len(),
+            2,
+            "expected both colliding keys reported, got {collisions:?}"
+        );
+        let y = collisions
+            .iter()
+            .find(|(_, code, _, _)| *code == KeyCode::Char('y'))
+            .expect("expected `y`'s collision reported");
+        assert!(y.3.contains(&Action::SelectAllVisible) && y.3.contains(&Action::ClearSelection));
+        let z = collisions
+            .iter()
+            .find(|(_, code, _, _)| *code == KeyCode::Char('z'))
+            .expect("expected `z`'s collision reported");
+        assert!(z.3.contains(&Action::DismissVanished) && z.3.contains(&Action::NextFailed));
+    }
+
+    #[test]
+    fn find_collisions_ignores_the_same_action_bound_to_the_same_key_twice() {
         // Not a collision: it is a redundant duplicate row, not two different actions.
         let synthetic: Vec<Binding> = vec![
             (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
             (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
         ];
-        assert!(find_collision(&synthetic).is_none());
+        assert!(find_collisions(&synthetic).is_empty());
     }
 
     #[test]
-    fn find_collision_ignores_the_same_key_in_two_different_contexts() {
+    fn find_collisions_ignores_the_same_key_in_two_different_contexts() {
         let synthetic: Vec<Binding> = vec![
             (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
             (Context::Detail, KeyCode::Char('x'), NONE, Action::ScrollUp),
         ];
-        assert!(find_collision(&synthetic).is_none());
+        assert!(find_collisions(&synthetic).is_empty());
     }
 
     #[test]
@@ -2083,6 +2159,59 @@ mod tests {
         assert!(
             message.contains('j'),
             "expected the colliding key named, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_key_bound_to_three_actions_names_all_three_in_the_error_not_just_the_first_two() {
+        // Regression: `find_collisions` must not stop at the first pair sharing a key.
+        let message = merge(&keys_block(&[(
+            "list",
+            &[
+                ("dismiss_vanished", "z"),
+                ("next_failed", "z"),
+                ("previous_failed", "z"),
+            ],
+        )]))
+        .expect_err("expected a collision error")
+        .to_string();
+        assert!(
+            message.contains("dismiss_vanished"),
+            "expected DismissVanished named, got: {message}"
+        );
+        assert!(
+            message.contains("next_failed"),
+            "expected NextFailed named, got: {message}"
+        );
+        assert!(
+            message.contains("previous_failed"),
+            "expected PreviousFailed named, got: {message}"
+        );
+    }
+
+    #[test]
+    fn two_separate_colliding_keys_are_both_named_in_one_error_not_just_the_first() {
+        // Regression: `find_collisions` must not stop at the first colliding key.
+        let message = merge(&keys_block(&[(
+            "list",
+            &[
+                ("dismiss_vanished", "z"),
+                ("next_failed", "z"),
+                ("select_all_visible", "y"),
+                ("clear_selection", "y"),
+            ],
+        )]))
+        .expect_err("expected a collision error")
+        .to_string();
+        assert!(message.contains('z'), "expected `z` named, got: {message}");
+        assert!(message.contains('y'), "expected `y` named, got: {message}");
+        assert!(
+            message.contains("dismiss_vanished") && message.contains("next_failed"),
+            "expected both of z's colliding actions named, got: {message}"
+        );
+        assert!(
+            message.contains("select_all_visible") && message.contains("clear_selection"),
+            "expected both of y's colliding actions named, got: {message}"
         );
     }
 
