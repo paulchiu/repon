@@ -46,11 +46,17 @@ pub enum Kind {
 /// HEAD's three shapes, one to one with gix's `head::Kind`.
 ///
 /// `Detached` carries the commit and no name; `Unborn` carries the name and no
-/// commit; a bare `Cell<Arc<str>>` could hold neither distinction.
+/// commit; a bare `Cell<Arc<str>>` could hold neither distinction. `Branch`
+/// carries both, because an attached, born HEAD always has one: the environment
+/// contract's `REPON_HEAD` needs the resolved commit on this shape too, not only
+/// on `Detached`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Head {
     /// Attached to a branch, which points at a commit.
-    Branch(Arc<str>),
+    Branch {
+        name: Arc<str>,
+        commit: gix::ObjectId,
+    },
     /// Detached at a commit, with no branch name.
     Detached(gix::ObjectId),
     /// A branch with no commit yet: `## No commits yet on <name>`.
@@ -435,7 +441,10 @@ mod tests {
         entity.branch.settle(
             generation,
             Settled::Known {
-                value: Head::Branch(Arc::from("main")),
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -489,7 +498,7 @@ mod tests {
         assert_eq!(entity.presence, Presence::Vanished);
         match entity.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch { name, .. },
                 stale: true,
                 ..
             }) => assert_eq!(&**name, "main"),

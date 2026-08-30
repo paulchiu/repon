@@ -283,9 +283,20 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
     let head = repo
         .head()
         .map_err(|error| ProbeError::Read(error.to_string().into()))?;
+    let commit = head.id().map(|id| id.detach());
     Ok(match head.kind {
         gix::head::Kind::Symbolic(reference) => {
-            Head::Branch(Arc::from(reference.name.shorten().to_string()))
+            let Some(commit) = commit else {
+                // An attached, born HEAD always has a commit to peel; reached only if
+                // that invariant breaks.
+                return Err(ProbeError::Read(
+                    "attached HEAD resolved no commit".to_string().into(),
+                ));
+            };
+            Head::Branch {
+                name: Arc::from(reference.name.shorten().to_string()),
+                commit,
+            }
         }
         gix::head::Kind::Unborn(name) => Head::Unborn(Arc::from(name.shorten().to_string())),
         gix::head::Kind::Detached { target, peeled } => Head::Detached(peeled.unwrap_or(target)),
@@ -325,7 +336,24 @@ mod tests {
         let head = head_shape_at(dir.path()).expect("read HEAD");
 
         match head {
-            Head::Branch(name) => assert!(!name.is_empty()),
+            Head::Branch { name, .. } => assert!(!name.is_empty()),
+            other => panic!("expected an attached branch, got {other:?}"),
+        }
+    }
+
+    /// The environment contract's `REPON_HEAD` needs this: an attached branch's
+    /// commit, not only a detached HEAD's.
+    #[test]
+    fn an_attached_branch_carries_its_own_resolved_commit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+        let sha = crate::test_support::head_sha(dir.path());
+
+        let head = head_shape_at(dir.path()).expect("read HEAD");
+
+        match head {
+            Head::Branch { commit, .. } => assert_eq!(commit.to_string(), sha),
             other => panic!("expected an attached branch, got {other:?}"),
         }
     }
@@ -399,7 +427,7 @@ mod tests {
                 .join()
                 .expect("reader thread panicked")
                 .expect("read HEAD");
-            assert!(matches!(head, Head::Branch(_)));
+            assert!(matches!(head, Head::Branch { .. }));
         }
     }
 

@@ -238,7 +238,7 @@ fn format_age(at: Timestamp) -> String {
 
 fn head_word(value: &Head) -> String {
     match value {
-        Head::Branch(name) => name.to_string(),
+        Head::Branch { name, .. } => name.to_string(),
         Head::Unborn(name) => format!("{name} (no commits yet)"),
         Head::Detached(oid) => {
             format!(

@@ -225,11 +225,8 @@ mod tests {
 
     /// This file's own production source, up to its test module: reused by the scan below so
     /// it states one absence claim rather than re-reading the file.
-    fn production_source() -> &'static str {
-        include_str!("selection.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("this file has a test module")
+    fn production_source() -> String {
+        crate::test_support::production_source(include_str!("selection.rs"))
     }
 
     /// The sharpest criterion in the ticket: a Selection made under a Filter must not change
@@ -241,7 +238,8 @@ mod tests {
     /// behavioural test, the same as this crate's other absence claims.
     #[test]
     fn targets_signature_takes_no_parameter_shaped_like_a_visible_row_list() {
-        let signature = production_source()
+        let source = production_source();
+        let signature = source
             .lines()
             .find(|line| line.contains("fn targets"))
             .expect("targets must still exist");

@@ -3,7 +3,11 @@
 //! The document's schema, deep merge and four failure grades are [`document`]'s; this
 //! module resolves the file's path and wires the loaded document into [`Config`].
 
-use std::{env, path::PathBuf, sync::OnceLock};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use color_eyre::eyre::Result;
 use directories::ProjectDirs;
@@ -127,6 +131,19 @@ pub fn config_file() -> PathBuf {
     resolved_config().file.clone()
 }
 
+/// Where theme files (`<name>.toml`) live: a `themes` directory beside `config.toml`, per
+/// [theming.md](../../../../docs/spec/theming.md#selection-and-resolution). Deliberately not
+/// `~/Library/Application Support` on macOS, the same reason [`default_config_dir`] resolves
+/// identically on both platforms; state and the log stay in [`data_dir`], which does follow
+/// the platform convention.
+pub fn themes_dir() -> PathBuf {
+    themes_dir_under(&config_dir())
+}
+
+fn themes_dir_under(config_dir: &Path) -> PathBuf {
+    config_dir.join("themes")
+}
+
 /// The directory holding `state.toml` and the log, fixed for the process on first read.
 pub fn data_dir() -> PathBuf {
     DATA_DIR
@@ -206,5 +223,80 @@ mod tests {
     #[test]
     fn the_default_config_dir_is_named_for_the_package_regardless_of_platform() {
         assert!(default_config_dir().ends_with(env!("CARGO_PKG_NAME")));
+    }
+
+    // theming.md's "Selection and resolution": themes are deliberately not resolved to the
+    // macOS convention (`~/Library/Application Support`), unlike `data_dir`. `ProjectDirs`
+    // (the `directories` crate) is what would give that path on macOS; asserting its absence
+    // is what would fail if `default_config_dir` were ever rebuilt on it.
+    #[test]
+    fn the_default_config_dir_does_not_follow_the_platform_convention_the_directories_crate_would_give()
+     {
+        let config_dir = default_config_dir();
+        assert!(
+            !config_dir.to_string_lossy().contains("Application Support"),
+            "config dir (and so themes/) must not follow the macOS Application Support \
+             convention, got {config_dir:?}"
+        );
+    }
+
+    /// This function's own source: any attribute lines directly above its `fn` line (so a
+    /// gate such as `#[cfg(target_os = "...")]` on the function itself is not missed for
+    /// sitting one line above where a plain forward scan would start), up to but not
+    /// including the next top-level `fn` after it.
+    fn function_source(source: &str, signature: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let fn_line = lines
+            .iter()
+            .position(|line| line.contains(signature))
+            .unwrap_or_else(|| panic!("no `{signature}` in source"));
+
+        let mut start = fn_line;
+        while start > 0 && lines[start - 1].trim_start().starts_with('#') {
+            start -= 1;
+        }
+
+        let mut end = fn_line + 1;
+        while end < lines.len() && !lines[end].starts_with("fn ") {
+            end += 1;
+        }
+
+        lines[start..end].join("\n")
+    }
+
+    // The path assertion above only catches a platform branch on the one host running it
+    // (`ProjectDirs` resolves to the same `~/.config/repon` on Linux that `default_config_dir`
+    // already gives, so swapping to it would slip past that assertion there). "Resolved
+    // identically on macOS and Linux" is a claim about the function having no platform branch
+    // at all, which a source scan proves on every host regardless of which one runs it.
+    #[test]
+    fn default_config_dir_contains_no_platform_specific_branch() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source =
+            crate::test_support::production_source_at(&manifest_dir.join("src/config/mod.rs"));
+        let body = function_source(&source, "fn default_config_dir");
+        let needles = [
+            "cfg(target_os",
+            "cfg(windows",
+            "cfg(unix",
+            "cfg(target_family",
+        ];
+        for needle in needles {
+            assert!(
+                !body.contains(needle),
+                "default_config_dir must resolve identically on every host, found `{needle}` \
+                 in its body: {body}"
+            );
+        }
+    }
+
+    // Theme files live beside config.toml in a `themes` directory: a pure join with no
+    // platform branch, so this holds identically wherever it runs.
+    #[test]
+    fn theme_files_live_in_a_themes_directory_beside_config_toml() {
+        assert_eq!(
+            themes_dir_under(Path::new("/default/config")),
+            PathBuf::from("/default/config/themes")
+        );
     }
 }

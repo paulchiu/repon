@@ -179,7 +179,10 @@ mod tests {
         entity.branch.settle(
             generation,
             Settled::Known {
-                value: Head::Branch(Arc::from("main")),
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -270,7 +273,10 @@ mod tests {
         entity.branch.settle(
             generation,
             Settled::Known {
-                value: Head::Branch(Arc::from("main")),
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -325,7 +331,10 @@ mod tests {
         entity.branch.settle(
             generation,
             Settled::Known {
-                value: Head::Branch(Arc::from("main")),
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
                 at: Timestamp::now(),
                 stale: false,
             },

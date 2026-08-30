@@ -60,6 +60,16 @@ fn open_pty() -> (File, String) {
 /// Spawns `repon <flag>` with the pty slave wired to all three standard streams, the same
 /// shape a real terminal session gives it.
 fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
+    spawn_attached_to_pty_with(slave_path, &[flag], &[])
+}
+
+/// [`spawn_attached_to_pty`], generalised to an argv of any length plus extra environment
+/// variables, for a caller that needs `--theme <name>` rather than a single bare flag.
+fn spawn_attached_to_pty_with(
+    slave_path: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Child {
     let stdin = OpenOptions::new()
         .read(true)
         .write(true)
@@ -70,7 +80,8 @@ fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_repon"));
     command
-        .arg(flag)
+        .args(args)
+        .envs(envs.iter().copied())
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -89,7 +100,7 @@ fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
 
     command
         .spawn()
-        .unwrap_or_else(|error| panic!("spawn repon {flag}: {error}"))
+        .unwrap_or_else(|error| panic!("spawn repon {args:?}: {error}"))
 }
 
 /// The ANSI bytes crossterm itself would emit for `command`, so an expectation here comes
@@ -276,5 +287,78 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
         "the terminal must be restored before the process stops, but no \
          LeaveAlternateScreen appeared in the output collected while it was stopped: \
          {output:?}"
+    );
+}
+
+/// theming.md's third outcome: `--theme` naming a theme that does not exist "exits non-zero
+/// before the terminal is claimed". `tests/theme_flag.rs` can only run the binary with no
+/// controlling terminal at all, where `enable_raw_mode()` fails before the theme is even
+/// looked up, so a build that checked the theme after `tui.enter()` would still leave stdout
+/// empty there for an unrelated reason; that test cannot tell the two orders apart. Attaching
+/// a real pty lets `enter()` actually succeed, which is the one place a wrong-order build
+/// would leave `EnterAlternateScreen` in the output that this test asserts never appears.
+#[test]
+fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
+    let (mut master, slave_path) = open_pty();
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    let mut child = spawn_attached_to_pty_with(
+        &slave_path,
+        &["--theme", "does-not-exist-anywhere"],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+
+    // Drains the pty concurrently, the same reason the two tests above do.
+    let (output_tx, output_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = output_tx.send(output);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "repon --theme does-not-exist-anywhere did not exit within 5s; refusing to \
+                 trust a hung process's terminal state"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1), "expected a non-zero exit");
+
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pty reader thread did not report back after the child exited");
+    let _ = reader.join();
+    let output = String::from_utf8_lossy(&output);
+
+    assert!(
+        output.contains("does-not-exist-anywhere"),
+        "expected the missing theme's name in the error, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once a --theme name fails to resolve, but \
+         EnterAlternateScreen appeared: {output:?}"
     );
 }

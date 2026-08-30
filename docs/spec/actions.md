@@ -14,7 +14,7 @@ The child is put in a new session with `setsid(2)` in `pre_exec`. setsid does th
 
 A trap for the implementer: setsid and Rust's safe `CommandExt::process_group(0)` are mutually exclusive. `process_group(0)` is `setpgid(0, 0)`, which makes the child a process-group leader, and setsid then fails EPERM. Measured: setpgid-then-setsid fails, setsid alone succeeds, setpgid alone succeeds. So it is setsid alone, which needs `pre_exec` (unsafe) or the command-group crate, never `process_group`.
 
-The environment is the contract in [the config spec](config.md): the seven `REPON_` variables, `GIT_TERMINAL_PROMPT=0` set for every step, and the fifteen git local environment variables staying unset. The fd policy also earns a footnote [0008](../adr/0008-two-palettes-not-one.md) anticipated: `lazygit` typed into the Action palette, the case 0008 accepts with open eyes, exits immediately under stdin null plus setsid (measured, rc 1) rather than hanging.
+The environment is the contract in [the config spec](config.md): the eight `REPON_` variables, `GIT_TERMINAL_PROMPT=0` set for every step, and the fifteen git local environment variables staying unset. The fd policy also earns a footnote [0008](../adr/0008-two-palettes-not-one.md) anticipated: `lazygit` typed into the Action palette, the case 0008 accepts with open eyes, exits immediately under stdin null plus setsid (measured, rc 1) rather than hanging.
 
 ## The PTY
 
