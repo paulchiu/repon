@@ -104,5 +104,10 @@ ci: fmt-check lint test docs check-core-isolation build
 # which is what makes the binary's publish rehearsable before the library exists
 # on crates.io. Kept out of `ci` because it refuses a dirty tree, and `ci` is the
 # recipe you run with work in progress.
+#
+# Its own target directory, because the packaged crates are built with
+# `-L dependency=<target>/debug/deps`: sharing that directory with the workspace
+# build lets the packaged binary resolve the workspace's own repon-core rather
+# than the packaged one, and the rehearsal stops rehearsing what it claims to.
 publish-check:
-    cargo publish --workspace --dry-run --locked
+    CARGO_TARGET_DIR=target/publish-check cargo publish --workspace --dry-run --locked
