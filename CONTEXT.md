@@ -124,7 +124,10 @@ Exactly three shapes, one to one with git's own: attached to a branch with a com
 An Entity's ahead behind pair of commit counts against its upstream.
 
 **Diagnostics**:
-Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2 and rung 3 disagreed, and why an entity's own `.gitmodules` failed to read or parse, if it did. Reaches the detail pane, never the list.
+Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2's `origin/HEAD` named a target that no longer resolves, whether rung 2 and rung 3 disagreed, why the default branch stopped resolving when no rung answered, and why an entity's own `.gitmodules` failed to read or parse, if it did. Every field but the `.gitmodules` one reaches the detail pane and never the list.
+
+**DefaultBranchStopped**:
+Why the default branch chain reached rung 4 with nothing settled: no remote at all, two or more remotes with none named origin, or a chosen remote whose `origin/HEAD` and name list both came up empty.
 
 **In progress operation**:
 An Entity's in progress git operation (a rebase, a merge, a cherry-pick and the rest of git's own ten shapes), read fresh from the repository state alongside HEAD. Not a Cell, not a state and never a gutter mark: it carries no provenance of its own and is surfaced in the detail pane only, never as a gate refusing an Action.

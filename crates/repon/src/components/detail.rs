@@ -7,8 +7,8 @@
 
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    ActionRun, AheadBehind, DefaultBranch, Diagnostics, EntityState, Head, InProgressOperation,
-    Kind, Settled, Timestamp, Unknown,
+    ActionRun, AheadBehind, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState, Head,
+    InProgressOperation, Kind, Settled, Timestamp, Unknown,
 };
 
 use super::list::worktree_state_word;
@@ -148,6 +148,9 @@ fn content_lines(entity: &EntityState) -> Vec<String> {
         "default branch  {}",
         describe_cell(default_branch.settled(), default_branch_word)
     ));
+    for diagnostic_line in default_branch_diagnostics_lines(diagnostics) {
+        lines.push(format!("                {diagnostic_line}"));
+    }
 
     if let Some(reason) = row_level_failure(diagnostics, last_action) {
         lines.push(String::new());
@@ -296,6 +299,41 @@ fn in_progress_word(operation: InProgressOperation) -> &'static str {
 /// distinct words from each other, and from a per-cell probe's own Failed message above, since
 /// the gutter's one `!` cannot itself tell any of the three apart and the pane is where that
 /// happens.
+/// The default branch cell's own diagnostics, beside it rather than in it, per
+/// `default-branch.md`: which rung answered (only rung 3, the name list, is called
+/// out by name), whether rung 2's `origin/HEAD` disagreed with rung 3, and why
+/// resolution stopped when it did not settle. None has its own Cell, so none of
+/// this reaches `list.rs`, which never imports [`Diagnostics`] at all.
+fn default_branch_diagnostics_lines(diagnostics: &Diagnostics) -> Vec<String> {
+    let mut lines = Vec::new();
+    if diagnostics.default_branch_rung == Some(3) {
+        lines.push("resolved by the name list, not origin/HEAD".to_string());
+    }
+    if diagnostics.default_branch_rung_disagreement {
+        lines.push(
+            "origin/HEAD and the name list disagree; origin/HEAD's answer is used".to_string(),
+        );
+    }
+    if diagnostics.default_branch_rung_two_stale {
+        lines.push("origin/HEAD named a target that no longer resolves".to_string());
+    }
+    if let Some(stopped) = diagnostics.default_branch_stopped {
+        lines.push(format!("no default branch: {}", stopped_word(stopped)));
+    }
+    lines
+}
+
+/// Why the chain reached rung 4 with nothing settled, in words. Exhaustive over the three
+/// [`DefaultBranchStopped`] reasons with no wildcard arm, the same discipline `describe_unknown`
+/// holds over the two [`Unknown`] reasons.
+fn stopped_word(stopped: DefaultBranchStopped) -> &'static str {
+    match stopped {
+        DefaultBranchStopped::NoRemote => "no remote is configured",
+        DefaultBranchStopped::AmbiguousRemote => "two or more remotes and none named origin",
+        DefaultBranchStopped::NameListExhausted => "origin/HEAD and the name list found no match",
+    }
+}
+
 fn row_level_failure(diagnostics: &Diagnostics, last_action: &Option<ActionRun>) -> Option<String> {
     if let Some(reason) = &diagnostics.gitmodules_failed {
         return Some(format!("failed to read .gitmodules: {reason}"));
@@ -462,6 +500,152 @@ mod tests {
         );
     }
 
+    // --- default_branch_diagnostics_lines: the three per-entity facts beside the cell ---
+
+    /// Criterion 3's marked case: rung 3 (the name list) answering rather than `origin/HEAD`
+    /// is the one case `default-branch.md` requires called out by name, "marked in the detail
+    /// pane and nowhere in the list".
+    #[test]
+    fn a_rung_three_default_branch_is_marked_resolved_by_the_name_list() {
+        let mut rung_three = entity("a");
+        rung_three.diagnostics.default_branch_rung = Some(3);
+
+        let lines = default_branch_diagnostics_lines(&rung_three.diagnostics).join("\n");
+
+        assert!(lines.contains("name list"), "got {lines:?}");
+    }
+
+    /// The other half: rung 2 (or rung 1) answering is the ordinary path and carries no mark,
+    /// or every entity whose `origin/HEAD` resolves cleanly would read as remarkable.
+    #[test]
+    fn a_rung_two_default_branch_carries_no_name_list_mark() {
+        let mut rung_two = entity("a");
+        rung_two.diagnostics.default_branch_rung = Some(2);
+
+        let lines = default_branch_diagnostics_lines(&rung_two.diagnostics);
+
+        assert!(lines.is_empty(), "got {lines:?}");
+    }
+
+    /// The disagreement is recorded even though `origin/HEAD` still wins: the pane must say
+    /// both, not merely that a disagreement happened, or a reader could not tell which answer
+    /// is live.
+    #[test]
+    fn a_recorded_disagreement_says_origin_head_still_wins() {
+        let mut disagreeing = entity("a");
+        disagreeing.diagnostics.default_branch_rung_disagreement = true;
+
+        let lines = default_branch_diagnostics_lines(&disagreeing.diagnostics).join("\n");
+
+        assert!(lines.contains("disagree"), "got {lines:?}");
+        assert!(lines.contains("origin/HEAD"), "got {lines:?}");
+    }
+
+    #[test]
+    fn no_disagreement_recorded_carries_no_disagreement_line() {
+        let agreeing = entity("a");
+
+        let lines = default_branch_diagnostics_lines(&agreeing.diagnostics);
+
+        assert!(lines.is_empty(), "got {lines:?}");
+    }
+
+    #[test]
+    fn a_stale_origin_head_target_is_named() {
+        let mut stale = entity("a");
+        stale.diagnostics.default_branch_rung_two_stale = true;
+
+        let lines = default_branch_diagnostics_lines(&stale.diagnostics).join("\n");
+
+        assert!(lines.contains("no longer resolves"), "got {lines:?}");
+    }
+
+    #[test]
+    fn a_resolvable_origin_head_target_carries_no_stale_line() {
+        let resolvable = entity("a");
+
+        let lines = default_branch_diagnostics_lines(&resolvable.diagnostics);
+
+        assert!(lines.is_empty(), "got {lines:?}");
+    }
+
+    /// Absence claim: the three [`DefaultBranchStopped`] reasons are the whole set. This match
+    /// has no wildcard arm, so a fourth variant added later fails to compile here rather than
+    /// silently falling through an `_`, the same discipline `worktree_state_is_exactly_four...`
+    /// holds for `WorktreeState` in `repon-core`.
+    #[test]
+    fn every_stopped_reason_reads_as_its_own_distinct_words() {
+        let words = [
+            stopped_word(DefaultBranchStopped::NoRemote),
+            stopped_word(DefaultBranchStopped::AmbiguousRemote),
+            stopped_word(DefaultBranchStopped::NameListExhausted),
+        ];
+
+        for (index, word) in words.iter().enumerate() {
+            for (other_index, other) in words.iter().enumerate() {
+                if index != other_index {
+                    assert_ne!(word, other, "got duplicate stopped words: {words:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stopped_reason_is_named_only_once_recorded() {
+        let mut exhausted = entity("a");
+        exhausted.diagnostics.default_branch_stopped =
+            Some(DefaultBranchStopped::NameListExhausted);
+
+        let lines = default_branch_diagnostics_lines(&exhausted.diagnostics).join("\n");
+
+        assert!(lines.contains(stopped_word(DefaultBranchStopped::NameListExhausted)));
+    }
+
+    #[test]
+    fn a_rung_that_answered_carries_no_stopped_reason_line() {
+        let answered = entity("a");
+
+        let lines = default_branch_diagnostics_lines(&answered.diagnostics);
+
+        assert!(lines.is_empty(), "got {lines:?}");
+    }
+
+    // --- criterion 3's absence half: the list never reads these facts ---
+
+    /// The harder half of criterion 3: `default-branch.md` requires these four facts marked
+    /// "in the detail pane and nowhere in the list". A behavioural test of `list.rs`'s own
+    /// output cannot prove that; `list.rs` does not even import [`Diagnostics`], so nothing
+    /// stops a future column from reading one of these fields directly off `EntityState`. A
+    /// source scan is the honest form of an absence claim, the same pattern this crate already
+    /// holds for `no_path_from_escape_to_quit_exists_anywhere_in_this_crates_production_source`
+    /// in `app.rs`: this file is the one place allowed to read any of the four field names, so
+    /// every other file's production source must read none of them.
+    #[test]
+    fn the_default_branchs_diagnostics_fields_are_read_nowhere_outside_this_file() {
+        let needles = ["default_branch_rung", "default_branch_stopped"];
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
+            if path.file_name().is_some_and(|name| name == "detail.rs") {
+                continue;
+            }
+            let production = crate::test_support::production_source_at(&path);
+            for (number, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "a default branch diagnostics field was read outside detail.rs, the one place \
+             `default-branch.md` allows it, at: {offending_locations:?}"
+        );
+    }
+
     // --- content_lines: assembly ---
 
     #[test]
@@ -483,6 +667,23 @@ mod tests {
                 "expected a {label} line, got {lines:?}"
             );
         }
+    }
+
+    /// The wiring half of criterion 3: `default_branch_diagnostics_lines` above proves the
+    /// words are right, but nothing yet proves `content_lines` actually calls it. Without this,
+    /// a diagnostics fact computed correctly could still sit unread and never reach the pane.
+    #[test]
+    fn content_lines_carries_the_default_branchs_own_diagnostics_lines() {
+        let mut disagreeing_at_rung_three = entity("a");
+        disagreeing_at_rung_three.diagnostics.default_branch_rung = Some(3);
+        disagreeing_at_rung_three
+            .diagnostics
+            .default_branch_rung_disagreement = true;
+
+        let lines = content_lines(&disagreeing_at_rung_three).join("\n");
+
+        assert!(lines.contains("name list"), "got {lines:?}");
+        assert!(lines.contains("disagree"), "got {lines:?}");
     }
 
     #[test]

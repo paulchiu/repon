@@ -72,6 +72,7 @@ pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionRun;
 pub use entity::AheadBehind;
 pub use entity::DefaultBranch;
+pub use entity::DefaultBranchStopped;
 pub use entity::Diagnostics;
 pub use entity::EntityKey;
 pub use entity::EntityState;
