@@ -17,6 +17,13 @@ categories.workspace = true
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
+# Off by default: gates test-only affordances that would otherwise ship on the
+# published surface forever, per ADR 0021. `repon` enables it through
+# `[dev-dependencies]` only, so its own tests keep working without reaching the
+# feature from its production build.
+[features]
+test-util = []
+
 [dependencies]
 crossbeam-channel.workspace = true
 # Matched against a Set's roots case-sensitively, per docs/spec/config.md; discovery's
