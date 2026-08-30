@@ -248,4 +248,33 @@ mod tests {
             "gix's process-global interrupt static must never be used outside a comment, found at: {offending_locations:?}"
         );
     }
+
+    /// [`RowSummary`](crate::RowSummary)'s mapping to a gutter glyph is
+    /// `docs/spec/core-api.md`'s explicit consumer-side job, never this crate's.
+    /// Scans every source file under `src` for the two shapes that mapping would
+    /// take here: a function returning a bare `char`, or a match arm whose
+    /// right-hand side is a character literal.
+    #[test]
+    fn no_state_is_mapped_to_a_character_anywhere_in_this_crate() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let banned_return = format!("-{}", "> char");
+        let banned_arm = format!("={}", "> '");
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&banned_return) || line.contains(&banned_arm) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "repon-core must never map a state to a character; the mapping belongs to the \
+             consumer, found at: {offending_locations:?}"
+        );
+    }
 }
