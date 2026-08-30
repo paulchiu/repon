@@ -57,6 +57,7 @@ mod core;
 mod default_branch;
 mod discovery;
 mod entity;
+mod environment;
 mod fanout;
 mod git;
 mod landing;
@@ -77,6 +78,7 @@ pub use entity::Head;
 pub use entity::Kind;
 pub use entity::Presence;
 pub use entity::WorktreeState;
+pub use environment::environment;
 pub use git::ProbeError;
 pub use snapshot::{RowSummary, Snapshot, summary};
 

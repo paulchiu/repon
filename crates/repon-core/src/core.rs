@@ -1473,7 +1473,7 @@ mod tests {
         let entity = &settled.entities[0];
         match entity.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(_),
+                value: Head::Branch(..),
                 ..
             }) => {}
             other => panic!("expected an attached branch, got {other:?}"),
@@ -1530,7 +1530,7 @@ mod tests {
         assert!(matches!(
             entity.branch.settled(),
             Some(Settled::Known {
-                value: Head::Branch(_),
+                value: Head::Branch(..),
                 ..
             })
         ));
@@ -1566,7 +1566,7 @@ mod tests {
         assert!(matches!(
             entity.branch.settled(),
             Some(Settled::Known {
-                value: Head::Branch(_),
+                value: Head::Branch(..),
                 ..
             })
         ));
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(entity.presence, crate::entity::Presence::Vanished);
         match entity.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 stale: true,
                 ..
             }) => assert_eq!(
@@ -1655,7 +1655,7 @@ mod tests {
         let before = core.settle(Duration::from_millis(500));
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => name.to_string(),
             other => panic!("expected the first refresh to settle a branch, got {other:?}"),
@@ -1711,7 +1711,7 @@ mod tests {
             .expect("submodule present");
         let branch_name = match submodule_before.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => name.to_string(),
             other => {
@@ -1784,7 +1784,7 @@ mod tests {
         let before = core.settle(Duration::from_millis(500));
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => name.to_string(),
             other => panic!("expected the first refresh to settle a branch, got {other:?}"),
@@ -2217,7 +2217,7 @@ mod tests {
             matches!(
                 a_after_gen2.branch.settled(),
                 Some(Settled::Known {
-                    value: Head::Branch(_),
+                    value: Head::Branch(..),
                     ..
                 })
             ),
@@ -2231,7 +2231,10 @@ mod tests {
             &key_a,
             Generation::new(1),
             Settled::Known {
-                value: Head::Branch(Arc::from("stale-from-generation-one")),
+                value: Head::Branch(
+                    Arc::from("stale-from-generation-one"),
+                    gix::hash::Kind::Sha1.null(),
+                ),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -2244,7 +2247,7 @@ mod tests {
             .expect("entity a present");
         match a_final.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => assert_ne!(
                 &**name, "stale-from-generation-one",
@@ -2259,7 +2262,10 @@ mod tests {
             &key_b,
             Generation::new(1),
             Settled::Known {
-                value: Head::Branch(Arc::from("b-generation-one-result")),
+                value: Head::Branch(
+                    Arc::from("b-generation-one-result"),
+                    gix::hash::Kind::Sha1.null(),
+                ),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -2272,7 +2278,7 @@ mod tests {
             .expect("entity b present");
         match b_final.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => assert_eq!(
                 &**name, "b-generation-one-result",
@@ -2321,7 +2327,7 @@ mod tests {
         let a_settled = core.probe_now(&key_a);
         let a_value_before = match a_settled.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => Arc::clone(name),
             other => panic!("expected A's synchronous probe to settle a branch, got {other:?}"),
@@ -2350,7 +2356,7 @@ mod tests {
             .expect("entity a present");
         match a_after.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name),
+                value: Head::Branch(name, _),
                 ..
             }) => assert_eq!(
                 name, &a_value_before,
@@ -2556,11 +2562,11 @@ mod tests {
         ) {
             (
                 Some(Settled::Known {
-                    value: Head::Branch(repo_name),
+                    value: Head::Branch(repo_name, _),
                     ..
                 }),
                 Some(Settled::Known {
-                    value: Head::Branch(worktree_name),
+                    value: Head::Branch(worktree_name, _),
                     ..
                 }),
             ) => {
