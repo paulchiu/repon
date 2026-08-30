@@ -504,8 +504,8 @@ impl Core {
             }
         };
         table.entities[idx].excluded = excluded;
-        if let Some(settled) = branch_outcome {
-            table.entities[idx].branch.settle(generation, settled);
+        if let Some((settled, in_progress, recent)) = branch_outcome {
+            table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
@@ -752,7 +752,7 @@ impl Core {
             key.clone(),
             generation,
             ProbeOutcomes {
-                branch: Some(settled),
+                branch: Some((settled, None, Vec::new())),
                 default_branch: None,
                 state: None,
             },
@@ -997,6 +997,8 @@ fn sweep_deadline(
                 last_action: _,
                 presence: _,
                 excluded: _,
+                in_progress_operation: _,
+                recent_commits: _,
             } = &mut table.entities[idx];
             let cells: [&mut dyn TimeoutableCell; 6] =
                 [branch, sync, base, dirty, state, default_branch];
@@ -1046,6 +1048,8 @@ fn begin_probes(entity: &mut EntityState) {
         last_action: _,
         presence: _,
         excluded: _,
+        in_progress_operation: _,
+        recent_commits: _,
     } = entity;
     branch.begin_probe();
     default_branch.begin_probe();
@@ -1081,11 +1085,24 @@ fn complete_many(settle_gate: &(Mutex<usize>, Condvar), finished: usize) {
 /// rather than sharing that derived handle with any other task. `None` (a
 /// Submodule, or a boundary discovery could not open) falls back to opening fresh,
 /// which is where an unreadable repository's `ProbeError::Open` still surfaces.
+///
+/// Also reads the entity's in-progress git operation and recent commits off the
+/// same open handle, since both ride along at negligible extra cost
+/// ([ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)).
+/// Neither is a Cell in its own right, so both travel with the branch read they
+/// were taken alongside rather than getting independent supersession of their
+/// own; [`EntityState::apply_branch_probe`] is where that pairing lands.
+const RECENT_COMMITS_LIMIT: usize = 5;
+
 fn probe_branch(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     cancel: &AtomicBool,
-) -> Option<Settled<Head>> {
+) -> Option<(
+    Settled<Head>,
+    Option<git::InProgressOperation>,
+    Vec<git::RecentCommit>,
+)> {
     if cancel.load(Ordering::Acquire) {
         return None;
     }
@@ -1097,17 +1114,21 @@ fn probe_branch(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(Settled::Failed(error)),
+            Err(error) => return Some((Settled::Failed(error), None, Vec::new())),
         },
     };
-    Some(match git::head_shape(&repo.to_thread_local()) {
+    let local = repo.to_thread_local();
+    let settled = match git::head_shape(&local) {
         Ok(head) => Settled::Known {
             value: head,
             at: Timestamp::now(),
             stale: false,
         },
         Err(error) => Settled::Failed(error),
-    })
+    };
+    let in_progress = git::in_progress_operation(&local);
+    let recent = git::recent_commits(&local, RECENT_COMMITS_LIMIT);
+    Some((settled, in_progress, recent))
 }
 
 /// Runs the four-rung default branch chain against `path`, or `None` if `cancel`
@@ -1351,7 +1372,11 @@ fn probe_default_branch_memoised(
 /// transposed pair of trailing `None`s cannot compile silently into the wrong
 /// cell.
 struct ProbeOutcomes {
-    branch: Option<Settled<Head>>,
+    branch: Option<(
+        Settled<Head>,
+        Option<git::InProgressOperation>,
+        Vec<git::RecentCommit>,
+    )>,
     default_branch: Option<default_branch::Resolution>,
     state: Option<Settled<WorktreeState>>,
 }
@@ -1383,8 +1408,8 @@ fn apply_probe_outcome(
     } = outcomes;
     let mut table = table.write().unwrap();
     if let Some(&idx) = table.index.get(&key) {
-        if let Some(settled) = branch_outcome {
-            table.entities[idx].branch.settle(generation, settled);
+        if let Some((settled, in_progress, recent)) = branch_outcome {
+            table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);

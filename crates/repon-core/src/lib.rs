@@ -78,7 +78,7 @@ pub use entity::Head;
 pub use entity::Kind;
 pub use entity::Presence;
 pub use entity::WorktreeState;
-pub use git::ProbeError;
+pub use git::{InProgressOperation, ProbeError, RecentCommit};
 pub use snapshot::{RowSummary, Snapshot, summary};
 
 #[cfg(test)]

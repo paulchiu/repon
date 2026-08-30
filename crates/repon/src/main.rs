@@ -18,6 +18,7 @@ mod help;
 mod keys;
 mod logging;
 mod message;
+mod scroll;
 mod selection;
 mod theme;
 mod tui;

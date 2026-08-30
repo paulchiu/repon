@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::cell::{Cell, Generation, Settled};
 use crate::default_branch;
+use crate::git::{InProgressOperation, RecentCommit};
 
 /// An Entity's identity: a newtype over its own resolved absolute working
 /// directory.
@@ -187,6 +188,14 @@ pub struct EntityState {
     /// entirely: an excluded entity is still a row here, still selectable, and this
     /// is the fact a row count or a confirm gate subtracts it against.
     pub excluded: bool,
+    /// The in-progress git operation read from this entity's own repository
+    /// state, if any: not a Cell, not part of the row summary fold, and read by
+    /// the detail pane alone
+    /// ([ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)).
+    pub in_progress_operation: Option<InProgressOperation>,
+    /// Up to a fixed handful of this entity's most recent commits, most recent
+    /// first. Empty before the first probe, or when HEAD is unborn.
+    pub recent_commits: Vec<RecentCommit>,
 }
 
 impl EntityState {
@@ -217,6 +226,8 @@ impl EntityState {
             last_action: None,
             presence: Presence::default(),
             excluded: false,
+            in_progress_operation: None,
+            recent_commits: Vec::new(),
         };
 
         if matches!(entity.kind, Kind::Submodule | Kind::Repo) {
@@ -257,6 +268,28 @@ impl EntityState {
         }
     }
 
+    /// Settles `branch` onto this entity's `branch` cell for `generation`, and,
+    /// only if that write actually applied, records the in-progress operation
+    /// and recent commits read alongside it. The same supersession-gated pattern
+    /// as [`Self::apply_default_branch_resolution`]: neither of these two facts is
+    /// a Cell in its own right, so without this gate a probe result landing out
+    /// of Generation order could overwrite a newer branch read's own facts with
+    /// an older read's.
+    pub(crate) fn apply_branch_probe(
+        &mut self,
+        generation: Generation,
+        branch: Settled<Head>,
+        in_progress_operation: Option<InProgressOperation>,
+        recent_commits: Vec<RecentCommit>,
+    ) -> bool {
+        let applied = self.branch.settle(generation, branch);
+        if applied {
+            self.in_progress_operation = in_progress_operation;
+            self.recent_commits = recent_commits;
+        }
+        applied
+    }
+
     /// Whether this Entity's `state` cell is ever (re)probed: `false` once
     /// construction has settled it `NotApplicable` (a Repo or a Submodule),
     /// `true` for a Worktree. Reads the cell itself rather than re-deriving the
@@ -290,6 +323,8 @@ impl EntityState {
             last_action: _,
             presence: _,
             excluded: _,
+            in_progress_operation: _,
+            recent_commits: _,
         } = self;
         branch.force_stale();
         sync.force_stale();

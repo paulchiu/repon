@@ -410,6 +410,62 @@ mod tests {
         }
     }
 
+    // --- the panel frame's exemption from the row-interior disjointness rule ---
+
+    /// `docs/spec/theming.md`'s Enforcement section scopes the disjointness obligation to the
+    /// row interior and exempts the panel frame. Proving the exemption is real rather than
+    /// accidental means actually running the row-interior check over the frame's own glyphs
+    /// and watching it fail: the ascii border's horizontal rule and the ascii value set's
+    /// no-upstream mark are both `-`, so `disjoint` reports them as intersecting.
+    #[test]
+    fn running_the_row_interior_disjointness_check_over_the_ascii_frame_table_fails() {
+        let frame_glyphs = [
+            ASCII.border.top_left,
+            ASCII.border.top_right,
+            ASCII.border.bottom_left,
+            ASCII.border.bottom_right,
+            ASCII.border.horizontal,
+            ASCII.border.vertical,
+        ];
+        assert!(
+            !disjoint(&ASCII.value_core(), &frame_glyphs),
+            "expected the ascii frame to collide with the row interior's value glyphs, which \
+             is the collision the frame's exemption exists to permit"
+        );
+    }
+
+    /// The exemption itself, asserted explicitly so a future tightening of the disjointness
+    /// check that folded `border` into `row_interior` or `all_glyphs` without meaning to would
+    /// fail here first, naming the known collision, rather than failing silently somewhere
+    /// else. `GlyphSet::row_interior` and `all_glyphs` never read `border` for this purpose:
+    /// the two tests above and below are what actually holds that line, not this comment.
+    #[test]
+    fn the_ascii_border_shares_its_horizontal_rule_with_the_no_upstream_value_mark_and_that_is_permitted()
+     {
+        assert_eq!(
+            ASCII.border.horizontal, ASCII.no_upstream,
+            "the specific known collision the frame's exemption from row-interior \
+             disjointness covers"
+        );
+    }
+
+    /// ADR 0020: line art need not stay injective the way the row interior's vocabulary must,
+    /// because a border is read as a region rather than decoded character by character. The
+    /// ascii set exercises that liberty fully: all four corners collapse onto one `+`.
+    #[test]
+    fn the_ascii_frames_four_corners_collapse_onto_one_character() {
+        let corners = [
+            ASCII.border.top_left,
+            ASCII.border.top_right,
+            ASCII.border.bottom_left,
+            ASCII.border.bottom_right,
+        ];
+        assert!(
+            corners.iter().all(|&corner| corner == '+'),
+            "expected every ascii corner to collapse onto '+', got {corners:?}"
+        );
+    }
+
     #[test]
     fn for_config_selects_the_table_the_glyphs_key_names() {
         assert_eq!(GlyphSet::for_config(Glyphs::Full), &FULL);

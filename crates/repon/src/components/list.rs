@@ -50,7 +50,7 @@ impl List {
             .unwrap_or_else(|| GlyphSet::for_config(crate::config::document::Glyphs::default()))
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
+    fn render(&self, frame: &mut Frame, area: Rect, snapshot: &Snapshot, compact: bool) {
         let glyphs = self.glyphs();
         let border = glyphs.border;
         let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
@@ -75,9 +75,14 @@ impl List {
         frame.render_widget(block, area);
 
         let buf = frame.buffer_mut();
-        draw_header(buf, interior);
+        // The sidebar has no header row to leave room for: the mockup's rows start
+        // immediately below the border, not one row down as the full list's do.
+        let first_row = if compact { 0 } else { FIRST_ENTITY_ROW };
+        if !compact {
+            draw_header(buf, interior);
+        }
         for (offset, entity) in snapshot.entities.iter().enumerate() {
-            let Some(y) = interior.y.checked_add(FIRST_ENTITY_ROW + offset as u16) else {
+            let Some(y) = interior.y.checked_add(first_row + offset as u16) else {
                 break;
             };
             if y >= interior.bottom() {
@@ -85,7 +90,11 @@ impl List {
                 // the visible area are left undrawn rather than pushing the frame to scroll.
                 break;
             }
-            draw_row(buf, interior, y, entity, glyphs);
+            if compact {
+                draw_row_compact(buf, interior, y, entity, glyphs);
+            } else {
+                draw_row(buf, interior, y, entity, glyphs);
+            }
         }
     }
 }
@@ -97,7 +106,25 @@ impl Component for List {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) -> Result<()> {
-        self.render(frame, area, snapshot);
+        self.render(frame, area, snapshot, false);
+        Ok(())
+    }
+}
+
+impl List {
+    /// Draws the narrow sidebar
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) collapses
+    /// the list to once the detail pane opens: the same rows, in the same order, with only
+    /// the gutter and the name column, and no header row (there is nothing left to label).
+    /// Reads the same [`Snapshot`] the full list does, so the rows, their order and whichever
+    /// row the caller has as the cursor are exactly what the full list would have shown.
+    pub fn draw_sidebar(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+    ) -> Result<()> {
+        self.render(frame, area, snapshot, true);
         Ok(())
     }
 }
@@ -256,6 +283,38 @@ fn draw_row(
     );
 }
 
+/// The sidebar's own row: the gutter and the name, nothing else. Shares [`gutter_glyph`] with
+/// [`draw_row`] rather than recomputing the fold, so the two never disagree about which mark a
+/// row shows.
+fn draw_row_compact(
+    buf: &mut Buffer,
+    interior: Rect,
+    y: u16,
+    entity: &EntityState,
+    glyphs: &'static GlyphSet,
+) {
+    let gutter = gutter_glyph(entity, glyphs).to_string();
+    let style = Style::new();
+    write_cell(
+        buf,
+        interior,
+        interior.x + GUTTER_X,
+        y,
+        GUTTER_WIDTH,
+        &gutter,
+        style,
+    );
+    write_cell(
+        buf,
+        interior,
+        interior.x + NAME_X,
+        y,
+        NAME_WIDTH,
+        &entity.name,
+        style,
+    );
+}
+
 /// Maps one row's [`RowSummary`](repon_core::RowSummary) fold to the active table's gutter
 /// glyph, the consumer-side job
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) reserves for
@@ -342,15 +401,21 @@ fn format_dirty(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
     })
 }
 
+/// The word for one of the four Worktree states, shared with the detail pane's own
+/// per-cell provenance line so the two surfaces never drift onto different wording for the
+/// same value.
+pub(crate) fn worktree_state_word(value: &WorktreeState) -> &'static str {
+    match value {
+        WorktreeState::Merged => "merged",
+        WorktreeState::Gone => "gone",
+        WorktreeState::LocalOnly => "local only",
+        WorktreeState::Active => "active",
+    }
+}
+
 fn format_state(cell: &Cell<WorktreeState>) -> String {
     render_cell(cell.settled(), |value| {
-        match value {
-            WorktreeState::Merged => "merged",
-            WorktreeState::Gone => "gone",
-            WorktreeState::LocalOnly => "local only",
-            WorktreeState::Active => "active",
-        }
-        .to_string()
+        worktree_state_word(value).to_string()
     })
 }
 
@@ -396,6 +461,133 @@ mod tests {
             })
             .expect("draw the frame");
         terminal
+    }
+
+    /// Renders `List::draw_sidebar` against a fresh `TestBackend`, the compact counterpart to
+    /// [`render`] above.
+    fn render_sidebar(width: u16, height: u16, snapshot: &Snapshot) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut list = List::default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw_sidebar(frame, area, snapshot)
+                    .expect("draw the sidebar");
+            })
+            .expect("draw the frame");
+        terminal
+    }
+
+    /// The sidebar keeps the same rows in the same order as the full list: a mutation that
+    /// reordered or dropped a row here would fail this the same way it would fail the full
+    /// list's own two-entities test.
+    #[test]
+    fn the_sidebar_keeps_the_same_rows_in_the_same_order_as_the_full_list() {
+        let terminal = render_sidebar(34, 24, &snapshot(vec![entity("first"), entity("second")]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(cell_text(buf, 3, 1, 5), "first");
+        assert_eq!(cell_text(buf, 3, 2, 6), "second");
+    }
+
+    /// Inits a real disposable git repository at `path` with one empty commit, on a named
+    /// branch: the same real-repo pattern `app.rs`'s own tests use rather than a hand-built
+    /// `Cell`, since `Cell::settle` is `pub(crate)` to `repon-core` and unreachable from here.
+    fn init_repo_on_branch(path: &Path, branch: &str) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", branch])
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "--allow-empty", "-m", "first"])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+    }
+
+    /// A real `Snapshot` off a real disposable repo, settled: what a "the sidebar never draws
+    /// a value only the full list shows" test needs, since `Cell::settle` itself is
+    /// unreachable from this crate.
+    fn settled_snapshot_with_a_known_branch(branch: &str) -> repon_core::Snapshot {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_on_branch(&root, branch);
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_secs(5))
+    }
+
+    /// The defining behaviour of criterion 1: the sidebar shows only the gutter and the name,
+    /// never the columns the full list draws. A mutation that kept `branch` in the compact row
+    /// would make this fail, since a real branch value is exactly what the full list would
+    /// show at `BRANCH_X` and what the criterion forbids the sidebar from also showing.
+    #[test]
+    fn the_sidebar_shows_only_the_gutter_and_the_name_never_the_other_columns() {
+        let snapshot = settled_snapshot_with_a_known_branch("a-real-branch-name");
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        // 32 is `BRANCH_X`'s absolute buffer column: the header test above already fixes it
+        // there (`cell_text(buf, 32, 1, 6), "branch"`), one column right of the constant's
+        // own interior-relative value because of the panel's left border.
+        let full = render(140, 24, &snapshot);
+        assert_eq!(
+            cell_text(full.backend().buffer(), 32, 2, 19).trim_end(),
+            "a-real-branch-name",
+            "the full list must show the real branch value at its usual column"
+        );
+
+        // A 34-column sidebar's interior right edge sits one column past `BRANCH_X`, so this
+        // reads the one interior column the branch column would otherwise start at rather
+        // than a run that would run past the panel's own border.
+        let compact = render_sidebar(34, 24, &snapshot);
+        assert_eq!(
+            cell_text(compact.backend().buffer(), 32, 1, 1),
+            " ",
+            "the sidebar must never draw the branch column, even for a row that has one"
+        );
+    }
+
+    /// No header row exists in the sidebar: there is nothing left worth labelling once only
+    /// the gutter and the name remain.
+    #[test]
+    fn the_sidebar_draws_no_header_row() {
+        let terminal = render_sidebar(34, 24, &snapshot(vec![entity("acquiring-gateway")]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 3, 1, 17),
+            "acquiring-gateway",
+            "with no header row, the first entity must render one row below the border"
+        );
     }
 
     fn cell_text(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
