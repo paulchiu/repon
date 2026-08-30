@@ -23,7 +23,7 @@
 
 use crate::cell::{Settled, Timestamp};
 use crate::entity::{DefaultBranch, WorktreeState};
-use crate::git::ProbeError;
+use crate::git::{self, ProbeError};
 
 /// One entity's Phase D verdict: settle the `state` cell now, or leave it
 /// exactly as unsettled as it already is (`Outstanding`), which is what lets a
@@ -139,31 +139,15 @@ fn settle_known(value: WorktreeState) -> Outcome {
 /// Whether `commit` is an ancestor of `ancestor_of`, `git merge-base
 /// --is-ancestor`'s own three-way contract: `Ok(true)` for an ancestor,
 /// `Ok(false)` for a real negative answer (including two commits with no shared
-/// history at all), and `Err` for anything else. `gix::Repository::merge_base`
-/// folds a missing commit object into the exact same `NotFound` it uses for
-/// unrelated histories, so both objects' existence is checked first: skipping
-/// that check is exactly the defect this function exists to rule out, every
-/// broken repository would otherwise render as unmerged rather than failed.
+/// history at all), and `Err` for anything else, via [`git::checked_merge_base`].
 fn is_ancestor(
     repo: &gix::Repository,
     commit: gix::ObjectId,
     ancestor_of: gix::ObjectId,
 ) -> Result<bool, ProbeError> {
-    if commit == ancestor_of {
-        return Ok(true);
-    }
-    for id in [commit, ancestor_of] {
-        if !repo.has_object(id) {
-            return Err(ProbeError::Ancestry(
-                format!("commit object not found: {id}").into(),
-            ));
-        }
-    }
-    match repo.merge_base(commit, ancestor_of) {
-        Ok(base) => Ok(base.detach() == commit),
-        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
-        Err(other) => Err(ProbeError::Ancestry(other.to_string().into())),
-    }
+    let base = git::checked_merge_base(repo, commit, ancestor_of)
+        .map_err(|error| ProbeError::Ancestry(error.into()))?;
+    Ok(base == Some(commit))
 }
 
 /// Resolves `name` (as [`DefaultBranch::name`] hands it back, e.g. `origin/main`)

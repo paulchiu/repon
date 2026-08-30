@@ -34,7 +34,7 @@ use gix::bstr::BString;
 
 use crate::cell::{Settled, Timestamp};
 use crate::entity::WorktreeState;
-use crate::git::ProbeError;
+use crate::git::{self, ProbeError};
 
 /// One changed path between two trees, kept at blob-identity granularity: an
 /// add or delete carries the one side's object id, a modification both. Mode
@@ -201,33 +201,16 @@ fn to_entry(change: gix::object::tree::diff::ChangeDetached) -> Option<PatchEntr
     }
 }
 
-/// `commit`'s ancestor common with `other`, mirroring
-/// [`crate::landing::is_ancestor`]'s existence-check discipline: `gix`'s own
-/// `merge_base` folds a missing commit object into the same `NotFound` it uses
-/// for two commits with no shared history, so both objects' existence is
-/// checked first. `Ok(None)` is the real "no shared history at all" answer
-/// (two orphan roots), not a failure; `Err` is reserved for an actual read
-/// error.
+/// `commit`'s ancestor common with `other`, via [`git::checked_merge_base`].
+/// `Ok(None)` is the real "no shared history at all" answer (two orphan
+/// roots), not a failure; `Err` is reserved for an actual read error.
 fn merge_base(
     repo: &gix::Repository,
     commit: gix::ObjectId,
     other: gix::ObjectId,
 ) -> Result<Option<gix::ObjectId>, ProbeError> {
-    if commit == other {
-        return Ok(Some(commit));
-    }
-    for id in [commit, other] {
-        if !repo.has_object(id) {
-            return Err(ProbeError::PatchEquivalence(
-                format!("commit object not found: {id}").into(),
-            ));
-        }
-    }
-    match repo.merge_base(commit, other) {
-        Ok(base) => Ok(Some(base.detach())),
-        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
-        Err(other) => Err(ProbeError::PatchEquivalence(other.to_string().into())),
-    }
+    git::checked_merge_base(repo, commit, other)
+        .map_err(|error| ProbeError::PatchEquivalence(error.into()))
 }
 
 #[cfg(test)]
@@ -236,7 +219,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::test_support::{git, head_sha};
+    use crate::test_support::{git, head_sha, loose_object_count};
 
     fn init_repo_with_a_commit(path: &Path) {
         fs::create_dir_all(path).expect("create repo dir");
@@ -250,28 +233,6 @@ mod tests {
 
     fn id(sha: &str) -> gix::ObjectId {
         gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha")
-    }
-
-    /// Counts loose object files under `.git/objects`, excluding the `pack` and
-    /// `info` housekeeping directories, so a test can assert a probe left the
-    /// object database exactly as it found it.
-    fn loose_object_count(repo: &Path) -> usize {
-        let objects = repo.join(".git").join("objects");
-        let mut count = 0;
-        for fan_out in fs::read_dir(&objects).expect("read objects dir") {
-            let fan_out = fan_out.expect("dir entry");
-            if !fan_out.file_type().expect("file type").is_dir() {
-                continue;
-            }
-            let name = fan_out.file_name();
-            if name == "pack" || name == "info" {
-                continue;
-            }
-            count += fs::read_dir(fan_out.path())
-                .expect("read fan-out dir")
-                .count();
-        }
-        count
     }
 
     /// The squash-merge case this whole ticket is named for: `feature`'s two

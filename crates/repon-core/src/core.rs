@@ -1544,7 +1544,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{DefaultBranchStopped, WorktreeState};
-    use crate::test_support::{git, head_sha};
+    use crate::test_support::{git, head_sha, loose_object_count};
 
     fn init_repo_with_a_commit(path: &Path) {
         fs::create_dir_all(path).expect("create repo dir");
@@ -2924,6 +2924,101 @@ mod tests {
             0,
             "ancestry already settled this entity, so patch equivalence's shared \
              scan must never run for its common dir at all"
+        );
+    }
+
+    /// [`patch_equivalence`]'s own unit test proves the module itself writes no
+    /// loose object; this proves the same through the real dispatch path a
+    /// user's refresh actually runs, so a write introduced in `core.rs`'s glue
+    /// rather than in the module would be caught too. Reuses the squash-merge
+    /// fixture that routes a real `Core::refresh` into patch equivalence's
+    /// second pass, and counts loose objects in the parent repository, since a
+    /// linked Worktree shares its object database with its common dir.
+    #[test]
+    fn a_full_refresh_reaching_patch_equivalence_writes_no_loose_objects() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(worktree_path.join("a.txt"), "one\n").expect("write a.txt");
+        git(&worktree_path, &["add", "a.txt"]);
+        git(&worktree_path, &["commit", "-m", "add a"]);
+        fs::write(worktree_path.join("b.txt"), "two\n").expect("write b.txt");
+        git(&worktree_path, &["add", "b.txt"]);
+        git(&worktree_path, &["commit", "-m", "add b"]);
+        let feature_sha = head_sha(&worktree_path);
+
+        git(&parent, &["merge", "--squash", "feature"]);
+        git(&parent, &["commit", "-m", "squashed feature"]);
+        let main_sha = head_sha(&parent);
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &main_sha],
+        );
+        git(&parent, &["config", "branch.feature.remote", "origin"]);
+        git(
+            &parent,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        let before = loose_object_count(&parent);
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+        let after = loose_object_count(&parent);
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Merged,
+                    ..
+                })
+            ),
+            "expected this refresh to actually reach patch equivalence and settle \
+             Merged, got {:?}",
+            worktree_entity.state.settled()
+        );
+        assert_eq!(
+            before, after,
+            "a full refresh reaching patch equivalence must never write a loose \
+             object to the repository"
         );
     }
 

@@ -42,6 +42,34 @@ impl std::fmt::Display for ProbeError {
 
 impl std::error::Error for ProbeError {}
 
+/// The checked merge base of `a` and `b`: verifies both commit objects exist
+/// before asking gix, since [`gix::Repository::merge_base`] folds a missing
+/// commit object into the same `NotFound` it uses for two commits with no
+/// shared history, which would otherwise read as a confident "no common
+/// ancestor" rather than the read error it actually is. `Ok(None)` is that
+/// real "no shared history at all" answer (including `a == b`'s reflexive
+/// case, folded in early); `Err` is reserved for an actual read error, and is
+/// a plain `String` so each caller wraps it in its own [`ProbeError`] variant.
+pub(crate) fn checked_merge_base(
+    repo: &gix::Repository,
+    a: gix::ObjectId,
+    b: gix::ObjectId,
+) -> Result<Option<gix::ObjectId>, String> {
+    if a == b {
+        return Ok(Some(a));
+    }
+    for id in [a, b] {
+        if !repo.has_object(id) {
+            return Err(format!("commit object not found: {id}"));
+        }
+    }
+    match repo.merge_base(a, b) {
+        Ok(base) => Ok(Some(base.detach())),
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
 /// One name and working-tree-relative path an entity's own `.gitmodules` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubmoduleEntry {
