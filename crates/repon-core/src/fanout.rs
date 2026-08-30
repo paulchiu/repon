@@ -4,6 +4,8 @@
 //! whoever holds the receiver, which is gitui's proven shape and matches gitoxide's own
 //! preference to keep git off an async runtime. Supersession of an in-flight round is
 //! not decided here; it belongs to the refresh model.
+//!
+//! Private, and its item is not yet re-exported: see the crate root doc comment.
 
 use crossbeam_channel::Sender;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -12,6 +14,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 ///
 /// Blocks until every job has been sent, so call it from a worker thread rather than
 /// from a render loop. A closed receiver ends in dropped results, not a panic.
+#[allow(dead_code)] // no caller until a state model re-exports it
 pub fn scatter<J, R, F>(jobs: Vec<J>, results: Sender<R>, work: F)
 where
     J: Send,

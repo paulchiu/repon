@@ -1,4 +1,6 @@
 //! The git backend. gix reads; nothing here writes.
+//!
+//! Private, and nothing here is re-exported yet: see the crate root doc comment.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ impl std::error::Error for ProbeError {}
 ///
 /// This is the whole of the backend for now: the smallest read that proves gix is
 /// wired, and the same call the scale benchmark measured at roughly 10ms per Repo.
+#[allow(dead_code)] // no caller until a state model re-exports it
 pub fn head_branch(repo: &Path) -> Result<Option<String>, ProbeError> {
     let repo = gix::open(repo).map_err(|error| ProbeError::Open(error.to_string().into()))?;
     let name = repo
