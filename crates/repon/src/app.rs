@@ -30,7 +30,11 @@ use crate::{
 const NARROW_BREAKPOINT: u16 = 100;
 
 /// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
-const SIDEBAR_WIDTH: u16 = 34;
+/// `pub(crate)` so `list.rs`'s own sidebar tests render at this constant rather than a
+/// hardcoded literal, per [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
+/// "34-column sidebar", pinned against that document by this module's own
+/// `sidebar_width_and_narrow_breakpoint_match_the_spec_of_record`.
+pub(crate) const SIDEBAR_WIDTH: u16 = 34;
 
 /// The three layout states the frame can be in, a pure function of the frame's width and
 /// whether the pane is open: no pane at all, open with the list collapsed to its sidebar
@@ -681,6 +685,52 @@ mod tests {
         assert_eq!(layout_state(100, true), Layout3::SideBySide);
     }
 
+    /// The number after `anchor` in `spec`, up to the first non-digit character: how
+    /// [`sidebar_width_and_narrow_breakpoint_match_the_spec_of_record`] pulls a width out of
+    /// the document's own prose rather than restating it, so the test cannot agree with a
+    /// changed constant by construction.
+    fn number_after<'a>(spec: &'a str, anchor: &str) -> &'a str {
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{anchor:?} is present in the spec"));
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md), read at
+    /// test time from `CARGO_MANIFEST_DIR` rather than transcribed a second time, matching the
+    /// pattern `environment.rs`'s own `spec_config_md` test already uses for a file outside
+    /// this crate's own directory. `SIDEBAR_WIDTH` and `NARROW_BREAKPOINT` are the two figures
+    /// the spec states in parseable form ("a 34-column sidebar", "Below 100 columns"); both are
+    /// asserted here rather than only the one `list.rs`'s literals drifted on, since a
+    /// constant with nothing joining it to the spec is exactly this ticket's defect.
+    #[test]
+    fn sidebar_width_and_narrow_breakpoint_match_the_spec_of_record() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec =
+            std::fs::read_to_string(manifest_dir.join("../../docs/spec/layout-and-provenance.md"))
+                .expect("read docs/spec/layout-and-provenance.md");
+
+        let spec_sidebar_width: u16 = number_after(&spec, "collapses the list to a ")
+            .parse()
+            .expect("the sidebar width is a number");
+        assert_eq!(
+            SIDEBAR_WIDTH, spec_sidebar_width,
+            "SIDEBAR_WIDTH must match layout-and-provenance.md's own sidebar width"
+        );
+
+        let spec_narrow_breakpoint: u16 = number_after(&spec, "Below ")
+            .parse()
+            .expect("the narrow breakpoint is a number");
+        assert_eq!(
+            NARROW_BREAKPOINT, spec_narrow_breakpoint,
+            "NARROW_BREAKPOINT must match layout-and-provenance.md's own breakpoint"
+        );
+    }
+
     #[test]
     fn opening_the_detail_pane_keeps_the_same_cursor_and_the_same_row_order() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -990,8 +1040,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut occurrences = 0usize;
         for path in rust_source_files(&manifest_dir.join("src")) {
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let production = production_source_at(&path);
             for line in production.lines() {
                 if line.trim_start().starts_with("//") {
                     continue;

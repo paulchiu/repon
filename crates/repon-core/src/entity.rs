@@ -574,6 +574,96 @@ mod tests {
         ));
     }
 
+    // --- apply_branch_probe: the pipe between a branch read and the pane's own facts ---
+
+    fn known_branch(name: &str) -> Settled<Head> {
+        Settled::Known {
+            value: Head::Branch {
+                name: Arc::from(name),
+                commit: gix::hash::Kind::Sha1.null(),
+            },
+            at: Timestamp::now(),
+            stale: false,
+        }
+    }
+
+    fn commit(short_id: &str, summary: &str) -> RecentCommit {
+        RecentCommit {
+            short_id: Arc::from(short_id),
+            summary: Arc::from(summary),
+        }
+    }
+
+    /// Half of [`EntityState::apply_branch_probe`]'s own doc comment: a write that applies
+    /// (nothing newer already recorded on `branch`) stores the in-progress operation and the
+    /// recent commits it was handed, not only the branch cell itself.
+    #[test]
+    fn a_branch_probe_that_applies_stores_its_in_progress_operation_and_recent_commits() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let commits = vec![commit("abc1234", "a commit")];
+
+        let applied = entity.apply_branch_probe(
+            Generation::default(),
+            known_branch("main"),
+            Some(InProgressOperation::Rebase),
+            commits.clone(),
+        );
+
+        assert!(applied);
+        assert_eq!(
+            entity.in_progress_operation,
+            Some(InProgressOperation::Rebase)
+        );
+        assert_eq!(entity.recent_commits, commits);
+    }
+
+    /// The other half: a probe superseded by Generation order (older than the branch cell's
+    /// own already-recorded Generation) applies neither fact, leaving the newer read's own
+    /// in-progress operation and commits exactly as they were.
+    #[test]
+    fn a_superseded_branch_probe_leaves_the_newer_reads_facts_intact() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let newer_commits = vec![commit("newer12", "the newer read")];
+        let applied_first = entity.apply_branch_probe(
+            Generation::new(5),
+            known_branch("main"),
+            Some(InProgressOperation::Merge),
+            newer_commits.clone(),
+        );
+        assert!(
+            applied_first,
+            "the first write, at Generation 5, must apply"
+        );
+
+        let older_commits = vec![commit("older12", "a stale read")];
+        let applied_second = entity.apply_branch_probe(
+            Generation::new(2),
+            known_branch("main"),
+            Some(InProgressOperation::Rebase),
+            older_commits,
+        );
+
+        assert!(
+            !applied_second,
+            "a write at an older Generation must not apply"
+        );
+        assert_eq!(
+            entity.in_progress_operation,
+            Some(InProgressOperation::Merge)
+        );
+        assert_eq!(entity.recent_commits, newer_commits);
+    }
+
     #[test]
     fn the_entity_key_is_not_the_common_dir() {
         let entity = EntityState::new(

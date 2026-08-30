@@ -308,9 +308,9 @@ fn row_level_failure(diagnostics: &Diagnostics, last_action: &Option<ActionRun>)
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
-    use repon_core::{EntityKey, ProbeError, RecentCommit};
+    use repon_core::{Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec};
 
     use super::*;
 
@@ -549,6 +549,169 @@ mod tests {
             content_lines(&no_run)
                 .join("\n")
                 .contains("last action   none yet")
+        );
+    }
+
+    // --- content_lines: each label line reads its own cell, never a neighbour's ---
+
+    /// A git call against `path` with a fixed identity, so a commit never depends on the
+    /// machine's own global git config.
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A real disposable repository at `path`, on `branch`, with one commit and a fabricated
+    /// `origin/main` remote-tracking ref plus a symbolic `origin/HEAD`: `default_branch`
+    /// resolves to a real Known value at rung 2 without a real remote, the same hermetic
+    /// fixture `repon-core`'s own default-branch tests use.
+    fn init_repo_with_a_resolvable_default_branch(path: &Path, branch: &str) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        let status = Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", branch])
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        git(path, &["commit", "--allow-empty", "-m", "first"]);
+        git(
+            path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha_output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(sha_output.status.success());
+        let sha = String::from_utf8(sha_output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+        git(path, &["update-ref", "refs/remotes/origin/main", &sha]);
+        let remote_refs_dir = path
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin");
+        std::fs::create_dir_all(&remote_refs_dir).expect("create refs/remotes/origin dir");
+        std::fs::write(
+            remote_refs_dir.join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .expect("write refs/remotes/origin/HEAD");
+    }
+
+    /// The line whose label starts `lines`' entry, panicking with the whole pane's content if
+    /// none does: every assertion below reads the pane by label, never by position, so a
+    /// reordering of [`content_lines`]'s own pushes could not make this pass by accident.
+    fn line_labelled<'a>(lines: &'a [String], label: &str) -> &'a str {
+        lines
+            .iter()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("no {label:?} line in {lines:?}"))
+    }
+
+    /// The defining behaviour of criterion 2: every one of the six per-Cell lines reads its
+    /// own cell's value and its own cell's age, never a neighbour's. `base` and `dirty` are
+    /// the one pair the type system does not guard, both `Cell<u32>`, so a wiring bug that
+    /// reads one from the other compiles silently; every other pair has a distinct Cell type
+    /// and could not compile if `content_lines` swapped them. A Kind::Submodule entity is
+    /// built from a real disposable repository (`branch` and `default_branch` are the only
+    /// two Cells this crate probes for real today) nested under a `.gitmodules` boundary,
+    /// which construction alone settles `state` and `base` to `NotApplicable` while `sync`
+    /// and `dirty` stay forever unprobed: exactly the combination that gives `base` and
+    /// `dirty` distinct, non-`Known` text ("not applicable" against "loading") without a way
+    /// to reach into a private `Cell` from this crate.
+    #[test]
+    fn content_lines_never_reads_one_cells_line_from_a_different_cell() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let outer = root.join("outer");
+        let submodule_path = outer.join("vendor").join("lib");
+
+        std::fs::create_dir_all(&outer).expect("create outer dir");
+        let status = Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", "outer-main"])
+            .arg(&outer)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        git(&outer, &["commit", "--allow-empty", "-m", "first"]);
+        std::fs::write(
+            outer.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.invalid/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        init_repo_with_a_resolvable_default_branch(&submodule_path, "feature-distinct-branch");
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_secs(5));
+        let submodule = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("submodule entity present");
+
+        let lines = content_lines(submodule);
+
+        let branch_line = line_labelled(&lines, "branch");
+        let sync_line = line_labelled(&lines, "sync");
+        let base_line = line_labelled(&lines, "base");
+        let dirty_line = line_labelled(&lines, "dirty");
+        let state_line = line_labelled(&lines, "state");
+        let default_branch_line = line_labelled(&lines, "default branch");
+
+        assert!(
+            branch_line.contains("feature-distinct-branch") && branch_line.contains("fresh"),
+            "got {branch_line:?}"
+        );
+        assert!(
+            default_branch_line.contains("origin/main") && default_branch_line.contains("fresh"),
+            "got {default_branch_line:?}"
+        );
+        assert!(sync_line.ends_with("loading"), "got {sync_line:?}");
+        assert!(dirty_line.ends_with("loading"), "got {dirty_line:?}");
+        assert!(base_line.ends_with("not applicable"), "got {base_line:?}");
+        assert!(state_line.ends_with("not applicable"), "got {state_line:?}");
+
+        // The one pair sharing a Cell type: a wiring bug that read one from the other would
+        // still compile, so only a real value difference at runtime catches it.
+        assert_ne!(
+            base_line, dirty_line,
+            "base and dirty must never read alike: {base_line:?} vs {dirty_line:?}"
         );
     }
 }

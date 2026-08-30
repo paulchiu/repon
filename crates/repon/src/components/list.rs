@@ -429,6 +429,8 @@ mod tests {
         Unknown,
     };
 
+    use crate::app::SIDEBAR_WIDTH;
+
     use super::*;
 
     fn entity(name: &str) -> EntityState {
@@ -484,7 +486,11 @@ mod tests {
     /// list's own two-entities test.
     #[test]
     fn the_sidebar_keeps_the_same_rows_in_the_same_order_as_the_full_list() {
-        let terminal = render_sidebar(34, 24, &snapshot(vec![entity("first"), entity("second")]));
+        let terminal = render_sidebar(
+            SIDEBAR_WIDTH,
+            24,
+            &snapshot(vec![entity("first"), entity("second")]),
+        );
         let buf = terminal.backend().buffer();
 
         assert_eq!(cell_text(buf, 3, 1, 5), "first");
@@ -568,7 +574,7 @@ mod tests {
         // A 34-column sidebar's interior right edge sits one column past `BRANCH_X`, so this
         // reads the one interior column the branch column would otherwise start at rather
         // than a run that would run past the panel's own border.
-        let compact = render_sidebar(34, 24, &snapshot);
+        let compact = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot);
         assert_eq!(
             cell_text(compact.backend().buffer(), 32, 1, 1),
             " ",
@@ -580,7 +586,11 @@ mod tests {
     /// the gutter and the name remain.
     #[test]
     fn the_sidebar_draws_no_header_row() {
-        let terminal = render_sidebar(34, 24, &snapshot(vec![entity("acquiring-gateway")]));
+        let terminal = render_sidebar(
+            SIDEBAR_WIDTH,
+            24,
+            &snapshot(vec![entity("acquiring-gateway")]),
+        );
         let buf = terminal.backend().buffer();
 
         assert_eq!(
