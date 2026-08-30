@@ -174,12 +174,19 @@ fn content_lines(entity: &EntityState) -> Vec<String> {
 
     lines.push(String::new());
     lines.push(match last_action {
-        Some(receipt) if receipt.failed() => "last action   failed".to_string(),
-        Some(_) => "last action   ok".to_string(),
+        Some(receipt) => format!("last action   {}", last_action_word(receipt)),
         None => "last action   none yet".to_string(),
     });
 
     lines
+}
+
+/// The one word this pane shows for a finished receipt. Delegates to
+/// [`ActionReceipt::failed`], the classification chokepoint, rather than a wildcard arm of
+/// its own, so this can never quietly disagree with what the gutter's row summary already
+/// calls a failure.
+fn last_action_word(receipt: &ActionReceipt) -> &'static str {
+    if receipt.failed() { "failed" } else { "ok" }
 }
 
 fn kind_word(kind: Kind) -> &'static str {
@@ -383,13 +390,18 @@ mod tests {
     }
 
     /// Criterion 2's "never written to disk" claim, the one absence a source scan is the
-    /// honest form of: no file in this crate that mentions an Action receipt also performs a
-    /// disk write. Neither half exists yet (there is no `[[action]]` executor and no session
-    /// persistence path), so this is a regression guard against the two being wired together
-    /// silently, not a claim about code that runs today.
+    /// honest form of: no file in either crate that mentions an Action receipt also performs
+    /// a disk write. `ActionReceipt` and `StepResult` are defined in `repon-core`, where the
+    /// executor will land, so a scan of this crate's own `src` alone is blind to half the
+    /// claim's subject; `repon-core/src` is walked too, the same `manifest_dir.join("../repon-core/src")`
+    /// precedent `main.rs`'s workspace-wide scan uses. Neither half exists yet (there is no
+    /// `[[action]]` executor and no session persistence path), so this is a regression guard
+    /// against the two being wired together silently, not a claim about code that runs today.
     #[test]
     fn no_source_file_writes_an_action_receipt_to_disk() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let core_src = manifest_dir.join("../repon-core/src");
+        let repon_src = manifest_dir.join("src");
         let receipt_markers = ["ActionReceipt", "StepResult", "last_action"];
         let disk_write_markers = [
             "fs::write",
@@ -400,7 +412,10 @@ mod tests {
         ];
 
         let mut offending = Vec::new();
-        for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
+        for path in crate::test_support::rust_source_files(&core_src)
+            .into_iter()
+            .chain(crate::test_support::rust_source_files(&repon_src))
+        {
             let production = crate::test_support::production_source_at(&path);
             let mentions_receipt = receipt_markers
                 .iter()

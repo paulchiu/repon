@@ -167,9 +167,16 @@ pub enum StepOutcome {
 
 impl StepOutcome {
     /// Whether this outcome counts as a failure for the row summary fold: only
-    /// `Failed`, never `Cancelled`, `NotRun` or `Ok`.
+    /// `Failed`, never `Cancelled`, `NotRun` or `Ok`. One arm per variant, no
+    /// catch-all, so a fifth variant must be classified here or the crate fails
+    /// to compile, rather than silently falling through as a non-failure.
     pub fn is_failure(self) -> bool {
-        matches!(self, StepOutcome::Failed(_))
+        match self {
+            StepOutcome::Ok => false,
+            StepOutcome::Failed(_) => true,
+            StepOutcome::NotRun => false,
+            StepOutcome::Cancelled => false,
+        }
     }
 }
 
@@ -576,26 +583,11 @@ mod tests {
         assert_eq!(outcome, StepOutcome::Ok);
     }
 
-    /// The point of `Arc<str>` and `Arc<[T]>` here isn't the type, it's that cloning a
-    /// receipt must not copy its bytes, since the whole Entity table is cloned every frame
-    /// ([`crate::snapshot::Snapshot`]). Proven by pointer identity surviving the clone, not by
-    /// asserting a field's declared type.
-    #[test]
-    fn cloning_an_action_receipt_shares_its_label_and_steps_rather_than_copying_them() {
-        let original = receipt("reinstall", vec![failed_step("pnpm install", 1)]);
-
-        let cloned = original.clone();
-
-        assert!(
-            Arc::ptr_eq(&original.label, &cloned.label),
-            "cloning a receipt must bump the label's refcount, not allocate a new string"
-        );
-        assert!(
-            Arc::ptr_eq(&original.steps, &cloned.steps),
-            "cloning a receipt must bump the steps slice's refcount, not allocate a new one, \
-             which is also what shares every step's own captured output"
-        );
-    }
+    // Criterion 6's own proof, "cloning a receipt shares rather than copies", moved to
+    // `core.rs`'s `two_snapshots_of_an_entity_share_its_last_actions_label_and_steps_by_pointer`:
+    // a bare `ActionReceipt::clone()` here only proves `Arc::clone` shares, which holds by
+    // definition and says nothing about this design, whereas the reason the criterion gives
+    // ("the snapshot is cloned every frame") is provable through a real `Core::snapshot`.
 
     /// `ActionReceipt::failed` is what widens the row summary fold; proven at the unit level,
     /// distinct from `snapshot.rs`'s own fold tests, which cover only the fold's own reaction.

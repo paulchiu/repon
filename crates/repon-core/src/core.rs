@@ -612,6 +612,11 @@ impl Core {
     /// this signature cannot yet commit to. This body will therefore always run to completion
     /// having touched nothing; it never panics and never blocks, so a caller reaching it early
     /// is safe.
+    ///
+    /// Also deferred: running steps in order and stopping at the first failure, the schema's
+    /// whole gating mechanism (there is no success-condition field, so sequential stop-on-fail
+    /// is the only one). Nothing here produces [`crate::entity::StepOutcome::NotRun`] yet;
+    /// that variant has no producer until this seam is filled.
     pub fn run_action(&self, order: &[EntityKey]) {
         let _ = order;
     }
@@ -2161,6 +2166,58 @@ mod tests {
         let entity = &after.entities[0];
         assert_eq!(entity.presence, crate::entity::Presence::Vanished);
         assert_eq!(entity.last_action, Some(receipt));
+    }
+
+    /// Criterion 6's reason for `ActionReceipt` sharing rather than copying is "the snapshot
+    /// is cloned every frame"; a bare `ActionReceipt::clone()` only proves `Arc::clone` shares,
+    /// which holds by definition and says nothing about this design. Proven instead through
+    /// `Core::snapshot` itself: put a receipt on a live `Core`'s table, take two snapshots, and
+    /// assert the label and steps are the same allocation across them, not merely equal. This
+    /// passes as written, since the sharing does hold end to end; it exists to fail if some
+    /// intermediate step ever re-materialised the receipt's bytes.
+    #[test]
+    fn two_snapshots_of_an_entity_share_its_last_actions_label_and_steps_by_pointer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let receipt = crate::entity::ActionReceipt {
+            label: Arc::from("reinstall"),
+            steps: Arc::from(vec![crate::entity::StepResult {
+                label: Arc::from("pnpm install"),
+                outcome: crate::entity::StepOutcome::Failed(1),
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        };
+        core.set_last_action_for_test(&key, receipt);
+
+        let first = core.snapshot();
+        let second = core.snapshot();
+        let first_receipt = first.entities[0]
+            .last_action
+            .as_ref()
+            .expect("receipt was set");
+        let second_receipt = second.entities[0]
+            .last_action
+            .as_ref()
+            .expect("receipt was set");
+
+        assert!(
+            Arc::ptr_eq(&first_receipt.label, &second_receipt.label),
+            "two snapshots of the same receipt must share the label's allocation, not \
+             re-copy it"
+        );
+        assert!(
+            Arc::ptr_eq(&first_receipt.steps, &second_receipt.steps),
+            "two snapshots of the same receipt must share the steps slice's allocation, not \
+             re-copy it, which is also what shares every step's own captured output"
+        );
     }
 
     /// A Submodule vanishes by exactly the same rule as a Repo: no code path here
