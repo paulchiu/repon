@@ -1,46 +1,49 @@
-//! Where configuration lives on disk, and the little of it that is settled.
+//! Where configuration lives on disk, and the document read from it.
 //!
-//! The schema is decided in "Design the config schema" and the keybinding map in
-//! "Decide the keybinding map". Until those land this reads the file if it is there,
-//! ignores everything in it, and carries only the directories.
+//! The document's schema, deep merge and four failure grades are [`document`]'s; this
+//! module resolves the file's path and wires the loaded document into [`Config`].
 
-use std::{env, fs, io, path::PathBuf, sync::OnceLock};
+use std::{env, path::PathBuf, sync::OnceLock};
 
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::Result;
 use directories::ProjectDirs;
 use etcetera::{BaseStrategy, choose_base_strategy};
-use serde::Deserialize;
+use tracing::warn;
+
+pub mod document;
+
+pub use document::{Document, Warning};
 
 const CONFIG_FILE: &str = "config.toml";
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Config {
-    #[serde(skip)]
     pub config_dir: PathBuf,
-    #[serde(skip)]
     pub data_dir: PathBuf,
+    pub document: Document,
+    pub warnings: Vec<Warning>,
 }
 
 impl Config {
-    /// Reads `config.toml` from the config directory. A missing file is not an error; a
-    /// malformed one is, because silently running on defaults hides the mistake.
+    /// Reads and parses `config.toml` from the config directory, deep-merged over the
+    /// compiled defaults. A missing file is not an error; malformed TOML or a bad value in
+    /// a known key is, exiting non-zero with the offending line and column.
     ///
     /// Call [`init`] once, from the entry point, before this, so a `--config` flag reaches
     /// the resolved path.
     pub fn new() -> Result<Self> {
         let dir = config_dir();
         let path = config_file();
-        let mut config = match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text)
-                .wrap_err_with(|| format!("could not parse {}", path.display()))?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("could not read {}", path.display()));
-            }
-        };
-        config.data_dir = data_dir();
-        config.config_dir = dir;
-        Ok(config)
+        let loaded = document::load(&path)?;
+        for warning in &loaded.warnings {
+            warn!("{warning}");
+        }
+        Ok(Self {
+            config_dir: dir,
+            data_dir: data_dir(),
+            document: loaded.document,
+            warnings: loaded.warnings,
+        })
     }
 }
 

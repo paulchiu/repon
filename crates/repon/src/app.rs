@@ -27,8 +27,17 @@ pub struct App {
 impl App {
     pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
+        let config = Config::new()?;
+        debug!(
+            config_dir = %config.config_dir.display(),
+            data_dir = %config.data_dir.display(),
+            theme = %config.document.theme,
+            sets = config.document.sets.len(),
+            warnings = config.warnings.len(),
+            "config loaded",
+        );
         Ok(Self {
-            config: Config::new()?,
+            config,
             tick_rate,
             frame_rate,
             components: vec![Box::new(Home)],
