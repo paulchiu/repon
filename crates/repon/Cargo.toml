@@ -40,6 +40,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# Enables `Timestamp::at` for this crate's own tests without reaching it from the
+# `[dependencies]` entry above, which is what keeps a production build of `repon`
+# from carrying it.
+repon-core = { workspace = true, features = ["test-util"] }
 # The width function ratatui itself budgets glyphs with; the width test in `glyphs.rs`
 # measures against this, not against ratatui's own re-export, so the version is pinned here.
 unicode-width = "0.2.2"

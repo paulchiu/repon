@@ -569,6 +569,8 @@ mod tests {
         entity.diagnostics.default_branch_rung = Some(2);
         entity.diagnostics.default_branch_rung_disagreement = true;
         entity.diagnostics.default_branch_rung_two_stale = true;
+        entity.diagnostics.default_branch_stopped =
+            Some(crate::entity::DefaultBranchStopped::NameListExhausted);
 
         assert_eq!(summary(&entity), RowSummary::Fresh);
     }

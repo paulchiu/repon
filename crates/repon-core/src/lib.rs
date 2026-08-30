@@ -72,6 +72,7 @@ pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionRun;
 pub use entity::AheadBehind;
 pub use entity::DefaultBranch;
+pub use entity::DefaultBranchStopped;
 pub use entity::Diagnostics;
 pub use entity::EntityKey;
 pub use entity::EntityState;
@@ -279,6 +280,36 @@ mod tests {
             offending_locations.is_empty(),
             "repon-core must never map a state to a character; the mapping belongs to the \
              consumer, found at: {offending_locations:?}"
+        );
+    }
+
+    /// The manifest text a consumer actually resolves against, not a copy: `test-util` gates
+    /// `Timestamp::at` off the default published surface per
+    /// [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md),
+    /// and a `default = [...]` naming it would silently turn every consumer's default build
+    /// back into the thing the gate exists to prevent.
+    #[test]
+    fn test_util_is_never_a_default_feature() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+            .expect("read this crate's own Cargo.toml");
+        let features_section = manifest
+            .split("[features]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .unwrap_or("");
+        assert!(
+            features_section.contains("test-util"),
+            "expected a `test-util` feature declared in `[features]`; this test's own premise \
+             is stale if it moved: {manifest}"
+        );
+        let default_line = features_section
+            .lines()
+            .find(|line| line.trim_start().starts_with("default"));
+        assert!(
+            default_line.is_none_or(|line| !line.contains("test-util")),
+            "`test-util` must never be named in a default feature list, or it ships on every \
+             consumer's default build: {default_line:?}"
         );
     }
 }

@@ -480,6 +480,14 @@ mod tests {
 
     /// Rung 3 always runs alongside rung 2, so a resolvable but out-of-date
     /// `origin/HEAD` is recorded as a disagreement even though rung 2 still wins.
+    ///
+    /// The ceiling this chain cannot close: a Repo where both rungs agree and both
+    /// are wrong (`default-branch.md`'s six hidden Submodules, cached `master`
+    /// against a true `qmk-master`) records no disagreement at all, since nothing
+    /// here disagrees with anything. No local fixture exercises that case
+    /// meaningfully; only a real network round trip against the remote's own HEAD
+    /// closes it, which is the spec's own conclusion and not a gap this test
+    /// pretends to cover.
     #[test]
     fn rung_two_and_rung_three_disagreeing_is_recorded_while_rung_two_still_wins() {
         let dir = tempfile::tempdir().expect("temp dir");
