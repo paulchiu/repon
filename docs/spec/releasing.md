@@ -7,7 +7,7 @@ Repon's release channels are whatever its tag pipeline publishes, and nothing is
 | channel | status | trigger |
 | --- | --- | --- |
 | `cargo install --git` | live | none; it works against `main` today |
-| crates.io | at beta | the four blockers below cleared, and the tag pipeline carrying a publish job |
+| crates.io | at beta | the four blockers below cleared; the tag pipeline now carries the publish job, but no tag has been cut yet |
 | prebuilt binaries | deferred | beta; a binary is worth shipping when there is a user without a Rust toolchain to hand it to |
 | Homebrew | deferred | the repository clearing homebrew-core's age and notability bars, at which point the path is a personal tap |
 
@@ -102,38 +102,46 @@ Two mechanics were each got wrong once, and measured, so they are recorded:
 
 ## Before the first crates.io publish
 
-The channel is at beta, and the gap between now and then is not polish. crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever 0.1.0 contains is carried forever, which is what makes the first four items blockers rather than preferences.
+The channel is at beta, and the gap between now and then is not polish. crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever 0.1.0 contains is carried forever, which is what makes the four items below blockers rather than preferences.
 
-Blocking:
+This spec has always carried four items in this gate. [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s own Consequences section names only the first two, the surface demolition and the config move, because it was written before the tag pipeline and the README's registry-copy review existed as separate, checkable items. That gap is recorded here rather than resolved by editing the ADR, which is a point-in-time record of the decision as it stood; this spec is the living checklist, so it carries all four.
 
-1. [0015](../adr/0015-the-core-owns-the-table.md)'s core API has landed. Publishing today would pin a surface 0015 has already scheduled for demolition: 0015 says "`fanout` and `git` become private modules" and that the `Box<dyn std::error::Error + Send + Sync>` placeholder "is not `Clone` and cannot survive", while `crates/repon-core/src/lib.rs` itself says "What this crate exposes is not settled". A permanent publish of an unsettled surface is the worst trade on offer.
-2. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)'s config path has moved to `etcetera`. `crates/repon/Cargo.toml` still carries `directories = "6.0.0"`, so a published 0.1.0 would read config from `~/Library/Application Support/repon/`, the location 0014 argues is wrong ([config.md](config.md) settles the right one), and moving it after a release breaks a user-visible path with no migration story.
-3. The tag pipeline has a crates.io publish job, for the reason [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) records: a channel fed by hand is a channel that silently stops being fed.
-4. The README's Influences section has been read as what it is: the crates.io page. `readme` ships in both archives, so every sentence in it becomes front matter on a public registry page rather than a repository aside.
+1. [0015](../adr/0015-the-core-owns-the-table.md)'s core API has landed. **Done.** `crates/repon-core/src/lib.rs` declares `mod fanout;` and `mod git;` with no `pub`, and no `Box<dyn std::error::Error>` remains anywhere in the crate; the git error is now a closed, cloneable enum. Verified against the tree at commit `c44a8fc`.
+2. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)'s config path has moved to `etcetera`. **Done.** `crates/repon/src/config/mod.rs` resolves `config_dir()` from `etcetera::choose_base_strategy`, not `directories::ProjectDirs`. `directories` is still a dependency, but only for `data_dir()`, which 0014's own Consequences section says explicitly stays on `directories`; the concern this item names, config read from the wrong platform path, is closed.
+3. The tag pipeline has a crates.io publish job, for the reason [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) records: a channel fed by hand is a channel that silently stops being fed. **Done.** `.github/workflows/release.yml`'s `publish` job runs `cargo publish --workspace --locked` on every version tag; see below.
+4. The README's Influences section has been read as what it is: the crates.io page. `readme` ships in both archives, so every sentence in it becomes front matter on a public registry page rather than a repository aside. **Done**, as of this review: the section names mrx, superfile and lazygit as influences and says nothing about mrx's upstream repository, no colleague name, no private-conversation quote, no local path, no description of its internals or history. This re-read has to happen again before the actual first publish, not just once here.
 
-Done already:
+All four blockers are now cleared, but nothing has been published: no tag has been cut, and the tag pipeline's crates.io leg has never run. Cutting the first tag is a separate act from clearing the gate.
 
-- the `version` on the `repon-core` path dependency, `rust-version`, `readme`, `homepage`, `authors`, `keywords`, `categories` and the symlinked `LICENSE`, all of which `just publish-check` rehearses on every push
+Done already, proved by CI on every push:
+
+- the `version` on the `repon-core` path dependency, `rust-version`, `readme`, `homepage`, `authors`, `keywords`, `categories` and the symlinked `LICENSE`, all of which `just publish-check` rehearses
 - the docs.rs target override in both crates, which nothing local can prove because only docs.rs builds those targets
-- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc` and now proved on every push by the `windows-target-guard` job, which fails with the guard's own sentence and no other diagnostic
-- CI itself: every recipe passes locally, and the workflow has not yet run on GitHub because this is the commit that adds it
+- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc` and proved by the `windows-target-guard` job, which fails with the guard's own sentence and no other diagnostic
 
-## What the tag pipeline must do
+## What the tag pipeline does
 
-The pipeline is not designed here; it is the next ticket, and this section is that ticket's brief. The requirements it has to meet:
+`.github/workflows/release.yml` is two jobs, because a tag pushed by an automated step and a tag pushed by a human need different tokens to fire the second job at all:
 
-- Every channel Repon claims is published by it. That is [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s rule restated as an acceptance criterion.
-- A crates.io publish job is mandatory even if the pipeline is built on tooling that ships everything else. cargo-dist states its own scope boundary as not handling "publishing to crates.io", and the consequence is observable in the wild: the owner's blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21. A pipeline without the job produces exactly that drift.
-- A version bump moves both crates and the pinned dependency together. `cargo set-version --workspace` does all three in one command, including the `version` on the `repon-core` path dependency.
-- A tag pushed with the default `GITHUB_TOKEN` starts no further workflows, by GitHub's own recursion guard, so a release triggered by a tag needs a token that can: a PAT, a deploy key or a GitHub App token, chosen in that ticket.
+| job | trigger | does |
+| --- | --- | --- |
+| `prepare` | `workflow_dispatch`, a maintainer supplies the version | `cargo set-version --workspace` (moving both crates' version and the pinned `repon-core` dependency version together in one command), commits the bump, tags it `vX.Y.Z`, pushes both |
+| `publish` | a pushed tag matching `v*.*.*` | `cargo publish --workspace --locked`, the rehearsal command minus `--dry-run`; then creates a GitHub release with `generate_release_notes: true` |
 
-Two questions the ticket must answer rather than inherit: whether the pipeline is cargo-dist or hand-rolled, and whether crates.io trusted publishing can be configured for a crate name that does not yet exist, which is unverified.
+The `prepare` job pushes using a `RELEASE_TOKEN` secret, not the default `GITHUB_TOKEN`. GitHub's own recursion guard means a push authenticated with `GITHUB_TOKEN` starts no further workflow runs, so a tag pushed that way would never reach the `publish` job; `RELEASE_TOKEN` is a personal access token, a deploy key or a GitHub App token would also do, with repo push scope. The `publish` job's `cargo publish` step reads a `CARGO_REGISTRY_TOKEN` secret, cargo's own conventional name for it.
+
+The registry publish job stays mandatory in this pipeline even if release tooling that excludes registries is adopted later. cargo-dist states its own scope boundary as not handling "publishing to crates.io", and the consequence is observable in the wild: the owner's blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21, thirteen releases stale on the one channel that sat outside its pipeline. That is the evidence this rule rests on.
+
+A changelog is produced by this pipeline rather than by hand: GitHub's auto-generated release notes, built from the commits and merged pull requests since the previous tag, attached to the release the `publish` job creates.
+
+The two questions the previous revision of this section left open are answered by what got built rather than by further research: the pipeline is hand-rolled, not cargo-dist, because cargo-dist's own scope excludes the one channel this project actually needs, crates.io; and crates.io trusted publishing (OIDC, no stored token) is still unverified for a crate name that does not yet exist, so the pipeline uses a stored `CARGO_REGISTRY_TOKEN` instead and sidesteps the question rather than resolving it. Trusted publishing stays a candidate for after the first publish, once `repon` and `repon-core` exist on the index to configure it against.
+
+Neither job has been exercised against a real tag; `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"` confirms the workflow parses, which is what a doc-and-CI change can prove before the first real release cuts it.
 
 ## What is deliberately not here
 
 - **Prebuilt binaries.** The gzipped release binary is 774,513 bytes, so the asset is cheap; what is missing is anyone to hand it to. The trigger is beta.
 - **Homebrew.** The repository is two days old with 0 stars, 0 forks and 0 watchers. homebrew-core's rule that "a code repository less than 30 days old is normally not eligible" rules it out before its notability bar (30 forks, 30 watchers or 75 stars for a third-party submission; 90, 90 or 225 for a self-submission) is even reached. When the trigger fires, the path is a personal tap, not a core submission.
-- **A changelog.** Deferred to the tag pipeline ticket, since what generates it is that ticket's question.
-- **release-plz.** Choosing release automation before the pipeline is designed would be the pipeline decision made by default.
+- **release-plz.** Choosing release automation before the pipeline is designed would be the pipeline decision made by default; the pipeline that got built is hand-rolled instead, per "What the tag pipeline does" above.
 - **A support-window MSRV promise**, per the MSRV section.
 - **Reserving the crate name with a placeholder publish.** `repon`, `repon-core`, `repo-n` and `repo_n` are all unclaimed, and the neighbourhood is occupied: `reponest` 0.1.0-alpha ("A TUI/CLI tool for managing multiple git repositories written in Rust", published 2025-12-14) and `gitpane` ("Multi-repo Git workspace dashboard TUI", 1,638 downloads, released 2026-08-29) both sit one search away. The risk of losing the name is real and accepted, because a placeholder publish is itself a publish: permanent, and of nothing.

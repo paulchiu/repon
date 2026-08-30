@@ -1,0 +1,101 @@
+name: Release
+
+# Two triggers, two jobs, because a tag pushed by an automated step and a tag
+# pushed by a human need different tokens to work at all; see the prepare job
+# below for why.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 1.2.3 (no leading v)"
+        required: true
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  prepare:
+    name: Bump the version and tag the release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          # RELEASE_TOKEN is a personal access token with repo push scope (a
+          # deploy key or a GitHub App token would also do), stored as a
+          # repository secret. The default GITHUB_TOKEN is deliberately not
+          # used here: GitHub's own recursion guard means a push authenticated
+          # with GITHUB_TOKEN starts no further workflow runs, so the tag this
+          # job pushes would never trigger the publish job below.
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      # cargo set-version --workspace moves both crates' version and the
+      # pinned repon-core path dependency version together in one command
+      # (and updates Cargo.lock to match), so the two crates and the
+      # dependency between them can never drift out of lockstep.
+      - name: Bump both crates and the pinned inter-crate dependency
+        run: cargo set-version --workspace "${{ inputs.version }}"
+
+      - name: Commit the version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml crates/repon/Cargo.toml crates/repon-core/Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump to ${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Tag the release
+        run: |
+          git tag "v${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
+
+  publish:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # This is docs/spec/releasing.md's rehearsal command
+      # (cargo publish --workspace --dry-run --locked) with --dry-run
+      # removed. --workspace makes cargo order the publishes itself, library
+      # first, and wait for the index between them. This job is mandatory in
+      # this pipeline even if release tooling that excludes registries is
+      # adopted later: cargo-dist states its own scope boundary as not
+      # handling publishing to crates.io, and the owner's own blubat is the
+      # evidence for what a channel outside the pipeline costs, it published
+      # 0.4.0 on 2026-08-02 and nothing since, thirteen releases stale
+      # against its own GitHub releases through v0.17.2.
+      - name: Publish both crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked
+
+      # GitHub's auto-generated release notes are the changelog this pipeline
+      # produces: built from the commits and merged pull requests since the
+      # previous tag, rather than written by hand for each release.
+      - name: Create the GitHub release with an auto-generated changelog
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
