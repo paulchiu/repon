@@ -15,7 +15,7 @@ Six named contexts. `global` is live in `list` and `detail` only, and is suspend
 | `overlay` | The help overlay, the expanded warning list, and the Set picker |
 | `confirm` | The yes/no gate before an Action fans out |
 
-An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
+An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
 ## The default map
 
@@ -90,7 +90,12 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 
 | key | action |
 | --- | --- |
-| `j`, `k`, `g`, `G`, `Ctrl+D`, `Ctrl+U` | Scroll |
+| `j` | Scroll down |
+| `k` | Scroll up |
+| `g` | Top |
+| `G` | Bottom |
+| `Ctrl+D` | Half page down |
+| `Ctrl+U` | Half page up |
 | `Enter` | Choose (Set picker only) |
 | `Esc`, `q` | Close |
 

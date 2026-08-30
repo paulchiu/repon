@@ -13,6 +13,7 @@ mod components;
 mod config;
 mod errors;
 mod glyphs;
+mod keys;
 mod logging;
 mod message;
 mod tui;
