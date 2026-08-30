@@ -1214,7 +1214,6 @@ struct BoundGate {
     bound: OnceLock<Option<gix::ObjectId>>,
 }
 
-#[derive(Default)]
 struct BoundGateState {
     remaining: usize,
     candidates: Vec<gix::ObjectId>,
@@ -1250,17 +1249,19 @@ impl BoundGate {
 
     /// Blocks until every entity sharing this common dir has reported, then
     /// returns the deepest merge base among their contributions (`None` if
-    /// none contributed one, so the scan is left unbounded). `repo` is read
-    /// only by whichever call is first to finish waiting; every later call
-    /// reads the memoised answer.
+    /// none contributed one, so the scan is left unbounded). The candidates are
+    /// taken and folded into `bound` inside the same critical section, so
+    /// whichever call is first to finish waiting is guaranteed to be the one
+    /// that computes the memoised answer from them; computing outside the lock
+    /// would let a later call, left holding an empty list by
+    /// [`std::mem::take`], win the race into [`OnceLock::get_or_init`] and
+    /// memoise `None` regardless of what the first call actually contributed.
     fn deepest(&self, repo: &gix::Repository) -> Option<gix::ObjectId> {
-        let candidates = {
-            let mut state = self.state.lock().unwrap();
-            while state.remaining != 0 {
-                state = self.condvar.wait(state).unwrap();
-            }
-            std::mem::take(&mut state.candidates)
-        };
+        let mut state = self.state.lock().unwrap();
+        while state.remaining != 0 {
+            state = self.condvar.wait(state).unwrap();
+        }
+        let candidates = std::mem::take(&mut state.candidates);
         *self
             .bound
             .get_or_init(|| deepest_merge_base(repo, &candidates))
@@ -4430,23 +4431,24 @@ mod tests {
         );
     }
 
-    /// Criterion 3's widen direction, plus criterion 1's collection-order trap:
-    /// `feature-deep` forks at the parent commit `deep_fork_sha` and is squashed
-    /// into main immediately afterwards; `feature-shallow` forks at that squash
-    /// commit (strictly more recent, so its own merge base is shallower) and is
-    /// squashed in turn to produce `main`'s tip. The deepest merge base among the
-    /// two siblings is `feature-deep`'s own, `deep_fork_sha`, not
-    /// `feature-shallow`'s.
+    /// Criterion 3's widen direction, end to end: `feature-deep` forks at the
+    /// parent commit `deep_fork_sha` and is squashed into main immediately
+    /// afterwards; `feature-shallow` forks at that squash commit (strictly more
+    /// recent, so its own merge base is shallower) and is squashed in turn to
+    /// produce `main`'s tip. The deepest merge base among the two siblings is
+    /// `feature-deep`'s own, `deep_fork_sha`, not `feature-shallow`'s.
     ///
     /// A scan bounded by the *shallowest* sibling's merge base instead of the
     /// deepest would stop before reaching the commit that squashed
     /// `feature-deep` in, since that commit sits strictly between the two
-    /// bounds: `feature-deep` would then settle `Active` instead of `Merged`,
-    /// exactly the mutation an unbounded-walk-agreement test cannot catch.
-    /// `feature-deep` is also dispatched last in `order`, so a lazy
-    /// first-entity-to-arrive bound (rather than one collected from every
-    /// Outstanding entity before the scan runs) would use `feature-shallow`'s
-    /// own narrower bound and fail the same way.
+    /// bounds: `feature-deep` would then settle `Active` instead of `Merged`.
+    /// This is a smoke test for that outcome through the real dispatch
+    /// pipeline, not a proof: rayon's work stealing gives dispatch `order` no
+    /// ordering guarantee, so `feature-deep` landing last here is a nudge
+    /// towards, never proof of, exercising a lazy first-arrival bound.
+    /// `bound_gate_deepest_folds_every_candidate_regardless_of_report_order`
+    /// below is what deterministically proves the bound is collected from
+    /// every sibling rather than computed lazily from whichever arrives first.
     #[test]
     fn an_entity_whose_merge_base_is_deeper_than_its_siblings_widens_the_shared_scan() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4606,6 +4608,163 @@ mod tests {
             1,
             "both worktrees share one common dir and must still scan its default-branch \
              history once between them, not once per entity"
+        );
+    }
+
+    fn id(sha: &str) -> gix::ObjectId {
+        gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha")
+    }
+
+    /// Criterion 1, proved at the barrier itself rather than through rayon's
+    /// unordered dispatch: `shallow` is reported before `deep` on purpose, so a
+    /// lazy first-arrival implementation (answer with whichever candidate
+    /// showed up first, rather than collecting every sibling's own merge base)
+    /// would settle on `shallow` and fail this assertion. `deep` is an ancestor
+    /// of `shallow`, so the correct fold finds it regardless of report order.
+    #[test]
+    fn bound_gate_deepest_folds_every_candidate_regardless_of_report_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo_path = root_of(&dir).join("repo");
+        init_repo_with_a_commit(&repo_path);
+        let deep_sha = id(&head_sha(&repo_path));
+        fs::write(repo_path.join("child.txt"), "child\n").expect("write child.txt");
+        git(&repo_path, &["add", "."]);
+        git(&repo_path, &["commit", "-m", "child of deep"]);
+        let shallow_sha = id(&head_sha(&repo_path));
+
+        let repo = gix::open(&repo_path).expect("open repo");
+        let gate = BoundGate::new(2);
+        gate.report(Some(shallow_sha));
+        gate.report(Some(deep_sha));
+
+        assert_eq!(
+            gate.deepest(&repo),
+            Some(deep_sha),
+            "the deepest candidate must win even though the shallower one reported first"
+        );
+    }
+
+    /// The edge [`deepest_merge_base`] exists for: no entity sharing a common
+    /// dir ever had a merge base to offer (every one settled by ancestry, was
+    /// cancelled, or shared no history with the default branch at all), so the
+    /// scan is left unbounded. `deepest_merge_base` returns before its first
+    /// candidate lookup here, which is what lets this fixture skip building any
+    /// commit history at all.
+    #[test]
+    fn bound_gate_deepest_with_no_candidates_leaves_the_scan_unbounded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo_path = root_of(&dir).join("repo");
+        gix::init(&repo_path).expect("init repo");
+        let repo = gix::open(&repo_path).expect("open repo");
+
+        let gate = BoundGate::new(2);
+        gate.report(None);
+        gate.report(None);
+
+        assert_eq!(
+            gate.deepest(&repo),
+            None,
+            "no contributed candidate must leave the scan unbounded"
+        );
+    }
+
+    /// `probe_patch_equivalence`'s `Ok(None)` arm bypasses the shared scan for
+    /// an Outstanding entity with no shared history at all. `unrelated` is a
+    /// real branch, with a live upstream so `landing::probe`
+    /// leaves it `Outstanding`, whose own root commit shares no history with
+    /// `main`'s, driven through `Core` end to end rather than by calling
+    /// `probe_patch_equivalence` or `patch_equivalence::probe` directly, so a
+    /// removed bypass (the shared scan run unconditionally instead) is
+    /// exercised for real: `BoundGate::deepest` would then block forever on a
+    /// scan this entity never asked for.
+    #[test]
+    fn an_outstanding_entity_with_no_shared_history_settles_active_without_the_shared_scan() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(&parent, &["branch", "-M", "main"]);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let main_sha = head_sha(&parent);
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &main_sha],
+        );
+
+        git(&parent, &["checkout", "--orphan", "unrelated"]);
+        git(
+            &parent,
+            &["commit", "--allow-empty", "-m", "unrelated root"],
+        );
+        let unrelated_sha = head_sha(&parent);
+        git(&parent, &["checkout", "main"]);
+
+        let worktree = root.join("unrelated");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf8 path"),
+                "unrelated",
+            ],
+        );
+        git(&parent, &["config", "branch.unrelated.remote", "origin"]);
+        git(
+            &parent,
+            &["config", "branch.unrelated.merge", "refs/heads/unrelated"],
+        );
+        git(
+            &parent,
+            &[
+                "update-ref",
+                "refs/remotes/origin/unrelated",
+                &unrelated_sha,
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let worktree_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == worktree)
+            .expect("unrelated worktree discovered")
+            .key
+            .clone();
+
+        core.refresh(std::slice::from_ref(&worktree_key));
+        let settled = core.settle(Duration::from_millis(500));
+
+        let state = settled
+            .entities
+            .iter()
+            .find(|entity| entity.key == worktree_key)
+            .and_then(|entity| entity.state.settled())
+            .cloned();
+        assert!(
+            matches!(
+                state,
+                Some(Settled::Known {
+                    value: WorktreeState::Active,
+                    ..
+                })
+            ),
+            "expected an Outstanding entity with no shared history to settle Active via the \
+             bypass, got {state:?}"
+        );
+        assert_eq!(
+            core.patch_identity_reads_for_test(),
+            0,
+            "the bypass must settle without ever running the shared scan"
         );
     }
 }
