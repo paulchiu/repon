@@ -185,14 +185,10 @@ pub struct Core {
     /// changing is a config reload, which re-derives a whole new `Core` rather
     /// than mutating this one in place.
     set: SetSpec,
-    /// Set once discovery abandons a walk (thirty seconds against a misconfigured
-    /// root), and never cleared for the life of this `Core`: it takes the Set out
-    /// of the automatic refresh path, per
-    /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#discovery-bounds),
-    /// because re-running a thirty-second walk at the head of every Generation is
-    /// not a degraded mode. `refresh` checks this before re-running discovery;
-    /// nothing in this crate clears it, since the only way `roots` or globs
-    /// change today is a fresh `Core::start`, which always begins Automatic.
+    /// Set once discovery abandons a walk, and never cleared for the life of this
+    /// `Core`: it takes the Set out of the automatic refresh path, since
+    /// re-running a thirty-second walk at the head of every Generation is not a
+    /// degraded mode worth paying for.
     discovery_manual: Arc<AtomicBool>,
     /// How long a re-run discovery walk may run before the still-walking warning
     /// fires; real value is one second outside a test.
@@ -372,34 +368,14 @@ impl Core {
         let repos_cache: HashMap<EntityKey, Arc<gix::ThreadSafeRepository>> =
             self.table.read().unwrap().repos.clone();
 
-        let progress = Arc::new(AtomicUsize::new(0));
-        let finished = Arc::new(AtomicBool::new(false));
-        let warning_slot = Arc::clone(&self.discovery_warning);
-        let roots = self.set.roots.clone();
-        let warn_after = self.discovery_warn_after;
-        thread::spawn({
-            let progress = Arc::clone(&progress);
-            let finished = Arc::clone(&finished);
-            move || {
-                if let Some(message) =
-                    watch_for_slow_discovery(progress, finished, roots, warn_after)
-                {
-                    *warning_slot.lock().unwrap() = Some(message);
-                }
-            }
-        });
-
-        let discovery = discovery::discover_watched_with_deadline(
+        let (discovery, _watcher) = run_watched_discovery(
             &self.set,
-            Arc::clone(&progress),
+            &self.discovery_warning,
+            self.discovery_warn_after,
             self.discovery_abandon_after,
         );
-        finished.store(true, Ordering::Release);
-
         if discovery.abandoned {
             self.discovery_manual.store(true, Ordering::Release);
-            *self.discovery_warning.lock().unwrap() =
-                Some(abandoned_discovery_message(discovery.directories_visited));
         }
 
         let (discovered, gitmodules_failures) =
@@ -693,6 +669,47 @@ impl Core {
     }
 }
 
+/// Runs one discovery boundary walk against `set`, watched by a background
+/// thread that leaves the still-walking warning behind in `discovery_warning`
+/// if the walk outruns `warn_after`, and the abandoned-discovery warning there
+/// instead if the walk itself abandons past `abandon_after`. Shared by
+/// `start_internal`'s first walk and `rerun_discovery`'s later ones, so a
+/// refresh-triggered abandon runs the same wiring `start`'s own walk does,
+/// never a parallel copy of it. The watcher thread's handle comes back too,
+/// since `start_internal`'s test double joins it to make an assertion
+/// deterministic; `rerun_discovery` lets it run detached, as it always has.
+fn run_watched_discovery(
+    set: &SetSpec,
+    discovery_warning: &Arc<Mutex<Option<String>>>,
+    warn_after: Duration,
+    abandon_after: Duration,
+) -> (discovery::Discovery, JoinHandle<()>) {
+    let progress = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let roots = set.roots.clone();
+    let watcher = thread::spawn({
+        let progress = Arc::clone(&progress);
+        let finished = Arc::clone(&finished);
+        let warning_slot = Arc::clone(discovery_warning);
+        move || {
+            if let Some(message) = watch_for_slow_discovery(progress, finished, roots, warn_after) {
+                *warning_slot.lock().unwrap() = Some(message);
+            }
+        }
+    });
+
+    let discovery =
+        discovery::discover_watched_with_deadline(set, Arc::clone(&progress), abandon_after);
+    finished.store(true, Ordering::Release);
+
+    if discovery.abandoned {
+        *discovery_warning.lock().unwrap() =
+            Some(abandoned_discovery_message(discovery.directories_visited));
+    }
+
+    (discovery, watcher)
+}
+
 /// Shared body of `start` and `start_for_test`: runs discovery once, builds the
 /// table, and spawns the dedicated thread.
 fn start_internal(
@@ -702,33 +719,14 @@ fn start_internal(
     ticks: Receiver<Instant>,
     alive: Arc<AtomicBool>,
 ) -> StartForTest {
-    let progress = Arc::new(AtomicUsize::new(0));
-    let finished = Arc::new(AtomicBool::new(false));
     let discovery_warning = Arc::new(Mutex::new(None));
-
-    let discovery_watcher = {
-        let progress = Arc::clone(&progress);
-        let finished = Arc::clone(&finished);
-        let roots = spec.set.roots.clone();
-        let warning_slot = Arc::clone(&discovery_warning);
-        thread::spawn(move || {
-            if let Some(message) = watch_for_slow_discovery(progress, finished, roots, warn_after) {
-                *warning_slot.lock().unwrap() = Some(message);
-            }
-        })
-    };
-
-    let discovery = discovery::discover_watched_with_deadline(
+    let (discovery, discovery_watcher) = run_watched_discovery(
         &spec.set,
-        Arc::clone(&progress),
+        &discovery_warning,
+        warn_after,
         discovery_abandon_after,
     );
-    finished.store(true, Ordering::Release);
     let discovery_manual = Arc::new(AtomicBool::new(discovery.abandoned));
-    if discovery.abandoned {
-        *discovery_warning.lock().unwrap() =
-            Some(abandoned_discovery_message(discovery.directories_visited));
-    }
 
     // Discovery's second half: every boundary the walk just found becomes a Repo
     // or a Worktree, and each one's own `.gitmodules` (never recursed into) names
@@ -1070,19 +1068,11 @@ fn apply_probe_outcome(
     complete_one(settle_gate);
 }
 
-/// Reconciles one discovery result into `table`: a boundary or Submodule
-/// discovery just found is inserted (new) or marked Present again (already
-/// known, including a previously Vanished one); an already-known entity
-/// discovery no longer finds is marked Vanished via [`EntityState::mark_vanished`],
-/// which keeps its last values and forces every cell stale. One code path for
-/// both halves of discovery, since the combined entity list they return never
-/// records which half produced a given entry: a Repo and a Submodule vanish and
-/// reappear by the exact same rule.
-///
-/// Returns how many previously in-flight probes were cancelled because their
-/// entity just vanished, which the caller signals `settle_gate` for; `start`'s
-/// own first build always returns zero, since a fresh table has nothing in
-/// flight yet.
+/// Reconciles one discovery result into `table`: a found entity is inserted or
+/// marked Present again, even if it was Vanished, and one no longer found is
+/// marked Vanished via [`EntityState::mark_vanished`]. Returns how many
+/// in-flight probes were cancelled by a newly Vanished entity, for the caller
+/// to signal `settle_gate`.
 fn merge_discovery(
     table: &mut Table,
     overrides: &[ResolvedOverride],
@@ -1641,6 +1631,45 @@ mod tests {
         assert_eq!(new_entity.key.path(), moved_path);
     }
 
+    /// Reappearance is vanishing's mirror: an entity discovery stops finding, and
+    /// then finds again, must come back Present rather than staying stuck
+    /// Vanished forever.
+    #[test]
+    fn a_vanished_repo_recreated_on_disk_reads_present_on_the_next_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        fs::remove_dir_all(&repo).expect("remove the repo from disk");
+        core.refresh(&[]);
+        let vanished = core.settle(Duration::from_millis(500));
+        assert_eq!(
+            vanished.entities[0].presence,
+            crate::entity::Presence::Vanished,
+            "the repo must read Vanished once removed from disk"
+        );
+
+        init_repo_with_a_commit(&repo);
+        core.refresh(&[]);
+        let recreated = core.settle(Duration::from_millis(500));
+
+        let entity = recreated
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("the recreated repo must still resolve to the same entity key");
+        assert_eq!(
+            entity.presence,
+            crate::entity::Presence::Present,
+            "an entity discovery finds again after it vanished must read Present, \
+             not stay stuck Vanished forever"
+        );
+    }
+
     /// Discovery riding the refresh is what lets a brand new entity appear
     /// without a fresh `Core::start`: a repo created after `start` is picked up
     /// by the very next `refresh`, even though the caller's `order` cannot yet
@@ -1662,6 +1691,29 @@ mod tests {
             after.entities.len(),
             2,
             "a new repo created after start must be found by the next refresh's own discovery"
+        );
+
+        // The entity is usable, not merely counted: a refresh that names its key
+        // actually probes it and settles a real cell.
+        let new_key = after
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "second")
+            .expect("the newly discovered repo must be named by the walk")
+            .key
+            .clone();
+        core.refresh(std::slice::from_ref(&new_key));
+        let probed = core.settle(Duration::from_millis(500));
+        let new_entity = probed
+            .entities
+            .iter()
+            .find(|entity| entity.key == new_key)
+            .expect("the newly discovered repo must still be present");
+        assert!(
+            matches!(new_entity.branch.settled(), Some(Settled::Known { .. })),
+            "a refresh naming the newly discovered repo's key must actually probe \
+             it and settle its branch cell, got {:?}",
+            new_entity.branch.settled()
         );
     }
 
@@ -1718,6 +1770,61 @@ mod tests {
             "once discovery has abandoned, a later refresh must not re-run it, so a \
              repo created afterward, on a tree that would now resolve quickly, \
              must still never appear"
+        );
+    }
+
+    /// `rerun_discovery`'s own abandon handling, exercised by a walk that only
+    /// abandons on a later `refresh`, never on `start`'s: the first walk, over a
+    /// tree small enough to finish comfortably inside the deadline, must leave
+    /// the Set automatic, and only the second walk, once the same tree has grown
+    /// a wide fan of decoys, may flip the manual flag and leave the abandoned
+    /// warning. Both existing abandon tests force the abandon inside `start`'s
+    /// own walk, which can never reach this block: `refresh` gates
+    /// `rerun_discovery` behind the manual flag `start` already set.
+    #[test]
+    fn a_refresh_triggered_discovery_abandon_sets_manual_and_warns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("first"));
+        let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+
+        let started = Core::start_for_test_with_discovery_abandon(
+            spec(vec![root.clone()]),
+            Duration::from_secs(3600),
+            Duration::from_micros(500),
+            tick_rx,
+        );
+        let core = started.core;
+        assert!(
+            !core.discovery_manual_for_test(),
+            "the first discovery walk, over a two-directory tree, must finish well \
+             inside a 500 microsecond deadline and leave the Set automatic"
+        );
+
+        // Grown only after `start` has already returned, so this fan of decoys is
+        // invisible to the first walk and can only be reached by a walk `refresh`
+        // triggers itself.
+        let decoys = root.join("decoys");
+        for i in 0..4_000 {
+            fs::create_dir(decoys.join(format!("decoy-{i}")))
+                .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
+                .expect("create decoy dir");
+        }
+
+        core.refresh(&[]);
+
+        assert!(
+            core.discovery_manual_for_test(),
+            "refresh's own rerun_discovery must abandon against the newly-grown \
+             tree and take the Set manual, the same as an abandon at start does"
+        );
+        let warning = core.discovery_warning_for_test();
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|message| message.starts_with("discovery: stopped at")),
+            "refresh's rerun_discovery must leave the abandoned-discovery warning \
+             behind, not merely flip the manual flag: got {warning:?}"
         );
     }
 

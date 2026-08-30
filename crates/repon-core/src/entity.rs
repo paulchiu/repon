@@ -248,14 +248,33 @@ impl EntityState {
     /// values, and every Cell's `Known` value is forced stale rather than
     /// blanked. The same call for a Repo, a Worktree or a Submodule alike; a
     /// Cell already `NotApplicable`, `Unknown` or `Failed` is untouched.
+    ///
+    /// Destructures `self` exhaustively so a Cell added to `EntityState` later
+    /// fails to compile here rather than silently never going stale.
     pub(crate) fn mark_vanished(&mut self) {
         self.presence = Presence::Vanished;
-        self.branch.force_stale();
-        self.sync.force_stale();
-        self.base.force_stale();
-        self.dirty.force_stale();
-        self.state.force_stale();
-        self.default_branch.force_stale();
+        let EntityState {
+            key: _,
+            name: _,
+            common_dir: _,
+            kind: _,
+            branch,
+            sync,
+            base,
+            dirty,
+            state,
+            default_branch,
+            diagnostics: _,
+            last_action: _,
+            presence: _,
+            excluded: _,
+        } = self;
+        branch.force_stale();
+        sync.force_stale();
+        base.force_stale();
+        dirty.force_stale();
+        state.force_stale();
+        default_branch.force_stale();
     }
 }
 

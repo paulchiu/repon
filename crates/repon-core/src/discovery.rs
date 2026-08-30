@@ -145,33 +145,40 @@ pub(crate) fn resolve_with_cache(
 
     for key in boundaries {
         let path = key.path();
-        let (kind, common_dir, submodules, repo) = if let Some(cached) = cache.get(key) {
-            let resolved = git::resolve_from_open(cached.to_thread_local());
-            (
-                resolved.kind,
-                resolved.common_dir,
-                resolved.submodules,
+        // A cache hit and a fresh open both end up with a real `Resolved`, just
+        // reached differently; both are folded into this one `Result`, carrying
+        // the cached handle alongside when there is one, so its fields are read
+        // out in the single match arm below, the one place a field added to
+        // `Resolved` would need to start being threaded through here.
+        let resolved = if let Some(cached) = cache.get(key) {
+            Ok((
+                git::resolve_from_open(cached.to_thread_local()),
                 Some(Arc::clone(cached)),
-            )
+            ))
         } else {
-            match git::resolve_boundary(path) {
-                Ok(resolved) => (
-                    resolved.kind,
-                    resolved.common_dir,
-                    resolved.submodules,
-                    Some(Arc::new(resolved.repo)),
-                ),
-                // A boundary the walk just found that will not even open is treated as
-                // an ordinary Repo with no Submodules rather than dropped: an opaque
-                // git-open failure surfaces later, on the branch probe that already
-                // reports it, not by discovery silently shrinking its own result.
-                Err(_) => (
-                    Kind::Repo,
-                    Arc::from(path.join(".git")),
-                    Ok(Vec::new()),
-                    None,
-                ),
+            git::resolve_boundary(path).map(|resolved| (resolved, None))
+        };
+        let (kind, common_dir, submodules, repo) = match resolved {
+            Ok((resolved, cached_repo)) => {
+                let git::Resolved {
+                    kind,
+                    common_dir,
+                    submodules,
+                    repo,
+                } = resolved;
+                let repo = cached_repo.or_else(|| Some(Arc::new(repo)));
+                (kind, common_dir, submodules, repo)
             }
+            // A boundary the walk just found that will not even open is treated as
+            // an ordinary Repo with no Submodules rather than dropped: an opaque
+            // git-open failure surfaces later, on the branch probe that already
+            // reports it, not by discovery silently shrinking its own result.
+            Err(_) => (
+                Kind::Repo,
+                Arc::from(path.join(".git")),
+                Ok(Vec::new()),
+                None,
+            ),
         };
 
         entities.push(DiscoveredEntity {
