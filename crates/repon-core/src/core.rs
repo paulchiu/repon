@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -194,9 +194,11 @@ pub struct Core {
     /// How long a re-run discovery walk may run before the still-walking warning
     /// fires; real value is one second outside a test.
     discovery_warn_after: Duration,
-    /// How long a re-run discovery walk may run before it is abandoned; real
-    /// value is [`discovery::ABANDON_AFTER`] outside a test.
-    discovery_abandon_after: Duration,
+    /// How long a re-run discovery walk may run before it is abandoned, in nanoseconds;
+    /// real value is [`discovery::ABANDON_AFTER`] outside a test. Shared and atomic so a
+    /// test can tighten it after `start`, rather than racing one deadline against both a
+    /// walk that must survive and a walk that must not.
+    discovery_abandon_after: Arc<AtomicU64>,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
@@ -390,7 +392,7 @@ impl Core {
             &self.set,
             &self.discovery_warning,
             self.discovery_warn_after,
-            self.discovery_abandon_after,
+            Duration::from_nanos(self.discovery_abandon_after.load(Ordering::Acquire)),
         );
         if discovery.abandoned {
             self.discovery_manual.store(true, Ordering::Release);
@@ -622,6 +624,15 @@ impl Core {
     /// Whether an abandoned discovery has already taken this `Core` out of the
     /// automatic refresh path, so a test can assert the precondition explicitly
     /// rather than infer it from a later refresh's behaviour alone.
+    /// Tightens the abandon deadline after `start`, so a test can let the first walk
+    /// finish under a deadline it cannot lose against and still force a later walk to
+    /// abandon.
+    #[cfg(test)]
+    pub(crate) fn set_discovery_abandon_after_for_test(&self, after: Duration) {
+        self.discovery_abandon_after
+            .store(after.as_nanos() as u64, Ordering::Release);
+    }
+
     pub(crate) fn discovery_manual_for_test(&self) -> bool {
         self.discovery_manual.load(Ordering::Acquire)
     }
@@ -812,7 +823,9 @@ fn start_internal(
             set: spec.set,
             discovery_manual,
             discovery_warn_after: warn_after,
-            discovery_abandon_after,
+            discovery_abandon_after: Arc::new(AtomicU64::new(
+                discovery_abandon_after.as_nanos() as u64
+            )),
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
@@ -1905,7 +1918,7 @@ mod tests {
         // could never distinguish a guarded `refresh` from an unguarded one that
         // simply keeps re-abandoning against the same still-huge tree).
         let decoys = root.join("decoys");
-        for i in 0..20_000 {
+        for i in 0..4_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
                 .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
                 .expect("create decoy dir");
@@ -1921,7 +1934,7 @@ mod tests {
         let core = started.core;
         assert!(
             core.discovery_manual_for_test(),
-            "walking 20,000 decoy directories against a 500 microsecond deadline \
+            "walking 4,000 decoy directories against a 500 microsecond deadline \
              must have abandoned and taken the Set manual"
         );
 
@@ -1961,33 +1974,33 @@ mod tests {
         init_repo_with_a_commit(&root.join("first"));
         let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
 
+        // The first walk runs under a deadline it cannot lose against, so this
+        // precondition is not a race. Tightening the deadline afterwards is what
+        // separates the walk that must survive from the walk that must abandon:
+        // one deadline serving both is a knife edge, and scheduling latency on a
+        // loaded machine erases any margin a wall-clock figure can buy.
         let started = Core::start_for_test_with_discovery_abandon(
             spec(vec![root.clone()]),
             Duration::from_secs(3600),
-            Duration::from_millis(5),
+            Duration::from_secs(3600),
             tick_rx,
         );
         let core = started.core;
         assert!(
             !core.discovery_manual_for_test(),
-            "the first discovery walk, over a two-directory tree, must finish well \
-             inside a 5 millisecond deadline and leave the Set automatic"
+            "an hour-long deadline must leave the first walk automatic"
         );
 
         // Grown only after `start` has already returned, so this fan of decoys is
         // invisible to the first walk and can only be reached by a walk `refresh`
-        // triggers itself. The count and the deadline are a matched pair: at the
-        // ~1.4us per entry this project measures, 20,000 entries overshoot 5ms
-        // several times over while a two-directory tree comes in orders of
-        // magnitude under it, so neither side of the comparison is a knife edge on
-        // a loaded machine. A 500us deadline against 4,000 decoys failed twice in
-        // six runs under parallel load.
+        // triggers itself.
         let decoys = root.join("decoys");
-        for i in 0..20_000 {
+        for i in 0..4_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
                 .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
                 .expect("create decoy dir");
         }
+        core.set_discovery_abandon_after_for_test(Duration::from_micros(500));
 
         core.refresh(&[]);
 
