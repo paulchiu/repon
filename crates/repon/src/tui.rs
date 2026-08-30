@@ -245,9 +245,10 @@ fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     )
 }
 
-/// The mirror image of [`write_enter_sequence`], innermost-claimed-first: focus reporting,
-/// bracketed paste, alternate screen, then the cursor shown again. Disabling raw mode is the
-/// caller's separate final step, matching [`write_enter_sequence`].
+/// Releases what [`write_enter_sequence`] claimed: focus reporting, bracketed paste, alternate
+/// screen, then the cursor shown again last, after the screen mode is fully restored rather
+/// than in claim-reversed order. Disabling raw mode is the caller's separate final step,
+/// matching [`write_enter_sequence`].
 fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
@@ -287,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn the_restore_sequence_is_the_enter_sequences_mirror_image() {
+    fn the_restore_sequence_releases_focus_paste_and_alt_screen_then_shows_the_cursor_last() {
         let mut out = Vec::new();
         write_restore_sequence(&mut out).expect("write restore sequence");
 

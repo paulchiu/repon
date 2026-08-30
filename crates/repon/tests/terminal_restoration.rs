@@ -1,17 +1,8 @@
 //! Proves the five pieces of terminal state are claimed on entry and restored
-//! symmetrically even when the process panics mid-TUI, by running the real binary
-//! against a pseudo-terminal and reading back what it actually wrote.
-//!
-//! A `TestBackend` cannot prove this: raw mode is a real `termios` call against a real
-//! terminal device, and the panic path only matters if it survives a real panic unwind
-//! rather than a description of one. `--panic-after-tui-enter` (hidden, see `cli.rs`)
-//! makes the real binary claim the terminal and panic immediately, before the event loop
-//! starts, so this test observes a real process's real panic rather than simulating one.
-//!
-//! No crate on the dependency allowlist opens a pseudo-terminal, so this reaches three
-//! POSIX functions directly via `extern "C"`: every Rust binary already links libc on a
-//! Unix target ([`lib.rs`](../../repon-core/src/lib.rs) requires one), so this needs no
-//! new dependency to declare their signatures itself.
+//! symmetrically, even across a real panic, by running the real binary against a
+//! pseudo-terminal and reading back what it wrote. A `TestBackend` cannot exercise a real
+//! `termios` call or a real panic unwind, and no crate on the dependency allowlist opens a
+//! pty, so this reaches three POSIX functions directly via `extern "C"`.
 
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
@@ -22,6 +13,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+// Safety contract: every call site below passes a valid, currently-open fd and, for
+// `ptsname_r`, a buffer at least as long as the `buflen` it also passes.
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
@@ -89,10 +82,8 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     let (mut master, slave_path) = open_pty();
     let mut child = spawn_attached_to_pty(&slave_path);
 
-    // Drains the pty concurrently with the child's own short lifetime, rather than
-    // waiting for it to exit first: once every slave-side file description has closed,
-    // a read against the master can return end-of-file and discard whatever was still
-    // buffered, so reading only after `wait()` would race the very bytes this test needs.
+    // Drains the pty concurrently with the child rather than after `wait()`, which would
+    // race the master's end-of-file against bytes still buffered when every slave fd closes.
     let (output_tx, output_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
@@ -106,8 +97,7 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         let _ = output_tx.send(output);
     });
 
-    // Bounded, so a process that never exits fails this test loudly in five seconds
-    // rather than hanging the suite the way a previous run of the real TUI once did.
+    // Bounded, so a process that never exits fails this test loudly rather than hanging it.
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll child status") {
@@ -129,9 +119,8 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         "the panic hook exits 1 once it has restored the terminal"
     );
 
-    // The child has exited, closing its slave-side descriptors, so the reader thread's
-    // next read returns end-of-file and it sends its result almost immediately; the
-    // timeout here is a final safety net, not the expected path.
+    // The exited child has closed its slave descriptors, so the reader reports back almost
+    // immediately; this timeout is a final safety net, not the expected path.
     let output = output_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("pty reader thread did not report back after the child exited");
@@ -146,10 +135,8 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     let disable_paste = ansi(crossterm::event::DisableBracketedPaste);
     let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
 
-    // Raw mode is the fifth piece and the one with no ANSI trace: `Tui::enter` calls
-    // `crossterm::terminal::enable_raw_mode()?` before writing anything, so finding the
-    // alternate-screen sequence below at all is itself the proof that call succeeded
-    // against this pty rather than short-circuiting the whole claim on an error.
+    // Raw mode is the fifth piece and leaves no ANSI trace; finding the alternate-screen
+    // sequence below at all is what proves `enable_raw_mode()` succeeded ahead of it.
     let enter_at = output
         .find(&enter_alt)
         .unwrap_or_else(|| panic!("expected EnterAlternateScreen in: {output:?}"));

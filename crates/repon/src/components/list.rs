@@ -42,9 +42,11 @@ const STATE_X: u16 = DIRTY_X + DIRTY_WIDTH + GAP;
 const HEADER_ROW: u16 = 0;
 const FIRST_ENTITY_ROW: u16 = HEADER_ROW + 1;
 
-/// The border colour a panel draws while it holds focus. The list is the only panel this
-/// ticket draws, so it is always focused; a Detail pane sharing this scheme is later work.
-const FOCUSED_BORDER: Color = Color::Cyan;
+/// The border colour a panel draws while it holds focus, matching
+/// [theming.md](../../../../docs/spec/theming.md)'s documented `border_focused` default. The
+/// list is the only panel this ticket draws, so it is always focused; the nine-role theme
+/// system, and a Detail pane sharing this scheme, are later work.
+const FOCUSED_BORDER: Color = Color::LightBlue;
 
 /// The repos panel. Holds no row data of its own: every draw reads the [`Snapshot`] the
 /// caller hands it, cloned once from the Core for that render tick.
@@ -80,6 +82,7 @@ impl List {
         let block = Block::bordered()
             .border_set(border_set)
             .border_style(Style::new().fg(FOCUSED_BORDER))
+            // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
         let interior = block.inner(area);
         frame.render_widget(block, area);
@@ -259,7 +262,7 @@ fn draw_row(
         interior.x + STATE_X,
         y,
         STATE_WIDTH,
-        format_state(&entity.state),
+        &format_state(&entity.state),
         style,
     );
 }
@@ -278,69 +281,75 @@ fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
     }
 }
 
-/// A Known HEAD's display text; every other Settled shape (loading, not applicable, failed,
-/// unknown) renders the blank cell the provenance contract already commits to.
-fn format_head(cell: &Cell<Head>) -> String {
+/// The shared shape behind every cell formatter: a Known value renders through `format`,
+/// every other Settled shape (loading, not applicable, failed, unknown) renders the blank
+/// cell the provenance contract already commits to.
+fn format_known<T>(cell: &Cell<T>, format: impl FnOnce(&T) -> String) -> String {
     match cell.settled() {
-        Some(Settled::Known { value, .. }) => match value {
-            Head::Branch(name) | Head::Unborn(name) => name.to_string(),
-            Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
-        },
+        Some(Settled::Known { value, .. }) => format(value),
         _ => String::new(),
     }
+}
+
+fn format_head(cell: &Cell<Head>) -> String {
+    format_known(cell, |value| match value {
+        Head::Branch(name) | Head::Unborn(name) => name.to_string(),
+        Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
+    })
 }
 
 /// `sync`'s glyph: `≡` level, `↑n`/`↓n` otherwise, per
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
 /// glyphs for real values".
 fn format_ahead_behind(cell: &Cell<AheadBehind>, glyphs: &'static GlyphSet) -> String {
-    match cell.settled() {
-        Some(Settled::Known { value, .. }) if value.ahead == 0 && value.behind == 0 => {
-            glyphs.in_sync.to_string()
+    format_known(cell, |value| {
+        if value.ahead == 0 && value.behind == 0 {
+            return glyphs.in_sync.to_string();
         }
-        Some(Settled::Known { value, .. }) => {
-            let mut parts = Vec::new();
-            if value.ahead > 0 {
-                parts.push(format!("{}{}", glyphs.ahead, value.ahead));
-            }
-            if value.behind > 0 {
-                parts.push(format!("{}{}", glyphs.behind, value.behind));
-            }
-            parts.join(" ")
+        let mut parts = Vec::new();
+        if value.ahead > 0 {
+            parts.push(format!("{}{}", glyphs.ahead, value.ahead));
         }
-        _ => String::new(),
-    }
+        if value.behind > 0 {
+            parts.push(format!("{}{}", glyphs.behind, value.behind));
+        }
+        parts.join(" ")
+    })
 }
 
 /// `base`'s glyph: `≡` level, `↓n` behind. No ahead-of-default glyph exists, per
 /// [default-branch.md](../../../../docs/spec/default-branch.md).
 fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    match cell.settled() {
-        Some(Settled::Known { value, .. }) if *value == 0 => glyphs.in_sync.to_string(),
-        Some(Settled::Known { value, .. }) => format!("{}{}", glyphs.behind, value),
-        _ => String::new(),
-    }
+    format_known(cell, |value| {
+        if *value == 0 {
+            glyphs.in_sync.to_string()
+        } else {
+            format!("{}{}", glyphs.behind, value)
+        }
+    })
 }
 
 /// `dirty`'s glyph: `·` clean, `●n` changed.
 fn format_dirty(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    match cell.settled() {
-        Some(Settled::Known { value, .. }) if *value == 0 => glyphs.clean.to_string(),
-        Some(Settled::Known { value, .. }) => format!("{}{}", glyphs.changed, value),
-        _ => String::new(),
-    }
+    format_known(cell, |value| {
+        if *value == 0 {
+            glyphs.clean.to_string()
+        } else {
+            format!("{}{}", glyphs.changed, value)
+        }
+    })
 }
 
-fn format_state(cell: &Cell<WorktreeState>) -> &'static str {
-    match cell.settled() {
-        Some(Settled::Known { value, .. }) => match value {
+fn format_state(cell: &Cell<WorktreeState>) -> String {
+    format_known(cell, |value| {
+        match value {
             WorktreeState::Merged => "merged",
             WorktreeState::Gone => "gone",
             WorktreeState::LocalOnly => "local only",
             WorktreeState::Active => "active",
-        },
-        _ => "",
-    }
+        }
+        .to_string()
+    })
 }
 
 #[cfg(test)]
@@ -390,13 +399,10 @@ mod tests {
             .collect()
     }
 
-    /// Column starts, hand-summed from
-    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
-    /// list" (name 28, branch 24, sync 9, base 6, dirty 6, state 10, a one-character
-    /// gutter, single-space gaps between every column): gutter 1, name 1+1+1=3, branch
-    /// 3+28+1=32, sync 32+24+1=57, base 57+9+1=67, dirty 67+6+1=74, state 74+6+1=81. These
-    /// are literal, independent of the production constants above: a mutation to `NAME_X`
-    /// et al. must move where this test looks, not the other way around.
+    /// Column starts (name 3, branch 32, sync 57, base 67, dirty 74, state 81), hand-summed
+    /// from [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
+    /// list". Literal and independent of the production constants above: a mutation to
+    /// `NAME_X` et al. must move where this test looks, not the other way around.
     #[test]
     fn the_header_row_places_every_column_name_at_its_literal_spec_offset() {
         let terminal = render(140, 24, &snapshot(vec![]));
@@ -472,8 +478,8 @@ mod tests {
         assert_eq!(cell_text(buf, 139, 23, 1), "╯");
         assert_eq!(
             buf[(0, 0)].fg,
-            Color::Cyan,
-            "the border must show the focused colour"
+            Color::LightBlue,
+            "the border must show theming.md's documented border_focused default, light-blue"
         );
     }
 

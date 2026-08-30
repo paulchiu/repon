@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -174,10 +174,7 @@ impl App {
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
     /// [`Snapshot`](repon_core::Snapshot) is cloned here, and every panel this tick draws
-    /// shares that same clone. There is no second channel and no channel-select anywhere in
-    /// [`Self::handle_events`] or this method: `tui::Event::Render` already arrives on the
-    /// one event channel the terminal thread owns, and `core.snapshot()` is a direct,
-    /// synchronous read, not a message a background thread pushes.
+    /// shares that same clone.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
         let snapshot = self.core.snapshot();
         let mut error = None;
@@ -207,7 +204,11 @@ fn core_spec(document: &Document) -> CoreSpec {
     CoreSpec {
         set: SetSpec {
             name: set.name.get_ref().clone(),
-            roots: set.roots.iter().map(|root| expand_home(root)).collect(),
+            roots: set
+                .roots
+                .iter()
+                .map(|root| document::expand_home(root))
+                .collect(),
             include: set.include.clone().unwrap_or_default(),
             exclude: set.exclude.clone().unwrap_or_default(),
         },
@@ -218,19 +219,95 @@ fn core_spec(document: &Document) -> CoreSpec {
     }
 }
 
-/// `~`-expands a Set root the same way `config::document` expands every other path in the
-/// file; duplicated here in miniature because that expansion is private to the module that
-/// owns the file format, and a Set root crosses to the core as an already-resolved
-/// `PathBuf`.
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = etcetera::home_dir() {
-            return home.join(rest);
+#[cfg(test)]
+mod tests {
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_dir() {
+                files.extend(rust_source_files(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
         }
-    } else if path == "~"
-        && let Ok(home) = etcetera::home_dir()
-    {
-        return home;
+        files
     }
-    PathBuf::from(path)
+
+    /// `render`'s one already-scheduled `Snapshot` read (issue #34's "no second channel and
+    /// no channel-select in the event loop") only holds if nothing in this crate ever races
+    /// it with a `select!` over multiple channels. Built from two pieces, as `repon-core`'s
+    /// own `gix_interrupt_is_interrupted_is_never_used` is, so this check's own line is never
+    /// a self-match.
+    #[test]
+    fn no_select_macro_is_used_anywhere_in_this_crates_source() {
+        let banned = format!("{}{}", "select", "!");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&banned) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "a channel-select must never appear outside a comment, found at: {offending_locations:?}"
+        );
+    }
+
+    /// The same criterion's other half: exactly two channels legitimately exist, the app's
+    /// `Message` bus (`app.rs`) and `Tui`'s event channel (`tui.rs`, constructed once as a
+    /// placeholder and again on every start). A third channel anywhere would be the second
+    /// channel the criterion refuses, so every construction site is enumerated by file rather
+    /// than merely counted.
+    #[test]
+    fn channel_construction_is_confined_to_the_apps_message_bus_and_the_tuis_event_channel() {
+        let needle = format!("{}{}", "unbounded", "()");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        let mut by_file: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            let file_name = path
+                .file_name()
+                .expect("a source file has a name")
+                .to_string_lossy()
+                .into_owned();
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    *by_file.entry(file_name.clone()).or_default() += 1;
+                    if file_name != "app.rs" && file_name != "tui.rs" {
+                        offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "a channel must be constructed only in app.rs (the Message bus) or tui.rs (the \
+             event channel), found elsewhere at: {offending_locations:?}"
+        );
+        assert_eq!(
+            by_file.get("app.rs").copied().unwrap_or(0),
+            1,
+            "expected exactly one construction site for the app's Message bus"
+        );
+        assert_eq!(
+            by_file.get("tui.rs").copied().unwrap_or(0),
+            2,
+            "expected exactly two construction sites for the Tui event channel: the \
+             placeholder in `Tui::new` and the real one in `Tui::start`"
+        );
+    }
 }

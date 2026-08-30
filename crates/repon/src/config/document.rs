@@ -94,14 +94,9 @@ pub struct SetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
     pub path: toml::Spanned<String>,
-    // Read only by `repo_overrides` until `Core::start`'s `CoreSpec` assembly lands
-    // in `app.rs`, outside this ticket's owned paths; exercised directly by this
-    // module's own tests in the meantime.
     #[serde(default)]
-    #[allow(dead_code)]
     pub default_branch: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub exclude: bool,
 }
 
@@ -110,10 +105,6 @@ pub struct RepoConfig {
 /// `path` the same way every other path in this file is expanded. The core resolves each
 /// `path` to its own git common dir itself, since opening a repository is its own work, not
 /// this crate's.
-///
-/// No caller until `app.rs` assembles a `CoreSpec` from a chosen Set and this document; that
-/// wiring sits outside this ticket's owned paths. Exercised directly by this module's tests.
-#[allow(dead_code)]
 pub fn repo_overrides(document: &Document) -> Vec<repon_core::RepoOverride> {
     document
         .repos
@@ -441,7 +432,7 @@ fn cross_key_warnings(document: &Document) -> Vec<Warning> {
 
 /// `~` expansion, matching [config.md](../../../../docs/spec/config.md#sets)'s `roots` and
 /// `[[repo]]`'s `path`.
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = etcetera::home_dir() {
             return home.join(rest);

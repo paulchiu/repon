@@ -20,6 +20,7 @@ mod tui;
 fn main() -> color_eyre::Result<()> {
     let args = Cli::parse();
 
+    #[cfg(debug_assertions)]
     if args.panic_after_tui_enter {
         return panic_after_tui_enter();
     }
@@ -38,6 +39,7 @@ fn main() -> color_eyre::Result<()> {
 /// read back what it wrote across a genuine panic unwind, rather than trusting a
 /// description of the restore path. Bypasses `Config` and the event loop: nothing here
 /// needs either.
+#[cfg(debug_assertions)]
 fn panic_after_tui_enter() -> color_eyre::Result<()> {
     errors::init()?;
     let mut tui = tui::Tui::new()?;
