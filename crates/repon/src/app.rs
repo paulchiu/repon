@@ -5,9 +5,9 @@ use ratatui::layout::Rect;
 use tracing::debug;
 
 use crate::{
-    action::Action,
     components::{Component, home::Home},
     config::Config,
+    message::Message,
     tui::{Event, Tui},
 };
 
@@ -20,13 +20,13 @@ pub struct App {
     should_suspend: bool,
     /// Cloned by anything that needs to reach the loop, including worker threads, which
     /// is why the channel is crossbeam rather than std.
-    action_tx: Sender<Action>,
-    action_rx: Receiver<Action>,
+    message_tx: Sender<Message>,
+    message_rx: Receiver<Message>,
 }
 
 impl App {
     pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
-        let (action_tx, action_rx) = unbounded();
+        let (message_tx, message_rx) = unbounded();
         Ok(Self {
             config: Config::new()?,
             tick_rate,
@@ -34,8 +34,8 @@ impl App {
             components: vec![Box::new(Home)],
             should_quit: false,
             should_suspend: false,
-            action_tx,
-            action_rx,
+            message_tx,
+            message_rx,
         })
     }
 
@@ -46,18 +46,18 @@ impl App {
         tui.enter()?;
 
         for component in &mut self.components {
-            component.register_action_handler(self.action_tx.clone())?;
+            component.register_message_handler(self.message_tx.clone())?;
             component.register_config_handler(self.config.clone())?;
             component.init(tui.size()?)?;
         }
 
         loop {
             self.handle_events(&tui)?;
-            self.handle_actions(&mut tui)?;
+            self.handle_messages(&mut tui)?;
             if self.should_suspend {
                 tui.suspend()?;
-                self.action_tx.send(Action::Resume)?;
-                self.action_tx.send(Action::ClearScreen)?;
+                self.message_tx.send(Message::Resume)?;
+                self.message_tx.send(Message::ClearScreen)?;
                 tui.enter()?;
             } else if self.should_quit {
                 tui.stop();
@@ -74,18 +74,20 @@ impl App {
             return Ok(());
         };
         match event {
-            Event::Tick => self.action_tx.send(Action::Tick)?,
-            Event::Render => self.action_tx.send(Action::Render)?,
-            Event::Resize(columns, rows) => self.action_tx.send(Action::Resize(columns, rows))?,
+            Event::Tick => self.message_tx.send(Message::Tick)?,
+            Event::Render => self.message_tx.send(Message::Render)?,
+            Event::Resize(columns, rows) => {
+                self.message_tx.send(Message::Resize(columns, rows))?;
+            }
             Event::Key(key) => self.handle_key_event(key)?,
             Event::Error => self
-                .action_tx
-                .send(Action::Error("could not read a terminal event".into()))?,
+                .message_tx
+                .send(Message::Error("could not read a terminal event".into()))?,
             _ => {}
         }
         for component in &mut self.components {
-            if let Some(action) = component.handle_events(Some(event.clone()))? {
-                self.action_tx.send(action)?;
+            if let Some(message) = component.handle_events(Some(event.clone()))? {
+                self.message_tx.send(message)?;
             }
         }
         Ok(())
@@ -94,36 +96,36 @@ impl App {
     /// Placeholder bindings. The real map is decided in "Decide the keybinding map" and
     /// will be configurable rather than matched here.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
-        let action = match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Action::Quit),
-            (KeyCode::Char('c' | 'C'), KeyModifiers::CONTROL) => Some(Action::Quit),
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::CONTROL) => Some(Action::Suspend),
+        let message = match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Message::Quit),
+            (KeyCode::Char('c' | 'C'), KeyModifiers::CONTROL) => Some(Message::Quit),
+            (KeyCode::Char('z' | 'Z'), KeyModifiers::CONTROL) => Some(Message::Suspend),
             _ => None,
         };
-        if let Some(action) = action {
-            self.action_tx.send(action)?;
+        if let Some(message) = message {
+            self.message_tx.send(message)?;
         }
         Ok(())
     }
 
-    fn handle_actions(&mut self, tui: &mut Tui) -> Result<()> {
-        while let Ok(action) = self.action_rx.try_recv() {
-            if action != Action::Tick && action != Action::Render {
-                debug!("{action:?}");
+    fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
+        while let Ok(message) = self.message_rx.try_recv() {
+            if message != Message::Tick && message != Message::Render {
+                debug!("{message:?}");
             }
-            match action {
-                Action::Quit => self.should_quit = true,
-                Action::Suspend => self.should_suspend = true,
-                Action::Resume => self.should_suspend = false,
-                Action::ClearScreen => tui.terminal.clear()?,
-                Action::Resize(columns, rows) => self.resize(tui, columns, rows)?,
-                Action::Render => self.render(tui)?,
-                Action::Error(ref message) => tracing::error!(message),
-                Action::Tick => {}
+            match message {
+                Message::Quit => self.should_quit = true,
+                Message::Suspend => self.should_suspend = true,
+                Message::Resume => self.should_suspend = false,
+                Message::ClearScreen => tui.terminal.clear()?,
+                Message::Resize(columns, rows) => self.resize(tui, columns, rows)?,
+                Message::Render => self.render(tui)?,
+                Message::Error(ref text) => tracing::error!(message = text),
+                Message::Tick => {}
             }
             for component in &mut self.components {
-                if let Some(action) = component.update(action.clone())? {
-                    self.action_tx.send(action)?;
+                if let Some(message) = component.update(message.clone())? {
+                    self.message_tx.send(message)?;
                 }
             }
         }
@@ -140,8 +142,8 @@ impl App {
             for component in &mut self.components {
                 if let Err(err) = component.draw(frame, frame.area()) {
                     let _ = self
-                        .action_tx
-                        .send(Action::Error(format!("could not draw: {err:?}")));
+                        .message_tx
+                        .send(Message::Error(format!("could not draw: {err:?}")));
                 }
             }
         })?;

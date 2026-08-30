@@ -6,16 +6,16 @@ use ratatui::{
     layout::{Rect, Size},
 };
 
-use crate::{action::Action, config::Config, tui::Event};
+use crate::{config::Config, message::Message, tui::Event};
 
 pub mod home;
 
-/// A visual, interactive piece of the interface. Components receive events, fold actions
+/// A visual, interactive piece of the interface. Components receive events, fold messages
 /// into their own state, and draw; they never talk to each other directly, only by
-/// sending actions back to the application loop.
+/// sending messages back to the application loop.
 pub trait Component {
-    /// Hands the component a sender so it can raise actions of its own.
-    fn register_action_handler(&mut self, tx: Sender<Action>) -> Result<()> {
+    /// Hands the component a sender so it can raise messages of its own.
+    fn register_message_handler(&mut self, tx: Sender<Message>) -> Result<()> {
         let _ = tx;
         Ok(())
     }
@@ -32,22 +32,22 @@ pub trait Component {
         Ok(())
     }
 
-    /// Turns an incoming event into an action, if the component wants one.
-    fn handle_events(&mut self, event: Option<Event>) -> Result<Option<Action>> {
+    /// Turns an incoming event into a message, if the component wants one.
+    fn handle_events(&mut self, event: Option<Event>) -> Result<Option<Message>> {
         match event {
             Some(Event::Key(key)) => self.handle_key_event(key),
             _ => Ok(None),
         }
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Message>> {
         let _ = key;
         Ok(None)
     }
 
-    /// Folds an action into the component's state, optionally raising another.
-    fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        let _ = action;
+    /// Folds a message into the component's state, optionally raising another.
+    fn update(&mut self, message: Message) -> Result<Option<Message>> {
+        let _ = message;
         Ok(None)
     }
 

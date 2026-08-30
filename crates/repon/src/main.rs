@@ -2,13 +2,13 @@ use clap::Parser;
 
 use crate::{app::App, cli::Cli};
 
-mod action;
 mod app;
 mod cli;
 mod components;
 mod config;
 mod errors;
 mod logging;
+mod message;
 mod tui;
 
 fn main() -> color_eyre::Result<()> {
