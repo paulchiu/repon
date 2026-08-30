@@ -1,22 +1,34 @@
+use std::{path::PathBuf, time::Duration};
+
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+use repon_core::{Core, CoreSpec, EntityKey, SetSpec};
 use tracing::debug;
 
 use crate::{
-    components::{Component, home::Home},
-    config::Config,
+    components::{Component, list::List},
+    config::{
+        Config,
+        document::{self, Document},
+    },
     glyphs::GlyphSet,
     message::Message,
     tui::{Event, Tui},
 };
 
+/// The dedicated thread's metadata-poll-and-deadline cadence has no config key yet
+/// ([core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
+/// own doc comment fixes it at thirty seconds); this is that same figure, named here rather
+/// than left as a bare literal at the one call site that needs it.
+const GENERATION_DEADLINE: Duration = Duration::from_secs(30);
+
 pub struct App {
-    config: Config,
     tick_rate: f64,
     frame_rate: f64,
-    components: Vec<Box<dyn Component>>,
+    core: Core,
+    list: List,
     should_quit: bool,
     should_suspend: bool,
     /// Cloned by anything that needs to reach the loop, including worker threads, which
@@ -40,11 +52,27 @@ impl App {
             warnings = config.warnings.len(),
             "config loaded",
         );
+
+        let core = Core::start(core_spec(&config.document));
+        // Discovery already ran inside `Core::start`; dispatch the identity probe for
+        // every row it found so the list fills in progressively rather than sitting on
+        // blank branch cells until something else asks for a refresh.
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+
+        let mut list = List::default();
+        list.register_config_handler(config.clone())?;
+
         Ok(Self {
-            config,
             tick_rate,
             frame_rate,
-            components: vec![Box::new(Home)],
+            core,
+            list,
             should_quit: false,
             should_suspend: false,
             message_tx,
@@ -58,11 +86,9 @@ impl App {
             .frame_rate(self.frame_rate);
         tui.enter()?;
 
-        for component in &mut self.components {
-            component.register_message_handler(self.message_tx.clone())?;
-            component.register_config_handler(self.config.clone())?;
-            component.init(tui.size()?)?;
-        }
+        self.list
+            .register_message_handler(self.message_tx.clone())?;
+        self.list.init(tui.size()?)?;
 
         loop {
             self.handle_events(&tui)?;
@@ -98,10 +124,8 @@ impl App {
                 .send(Message::Error("could not read a terminal event".into()))?,
             _ => {}
         }
-        for component in &mut self.components {
-            if let Some(message) = component.handle_events(Some(event.clone()))? {
-                self.message_tx.send(message)?;
-            }
+        if let Some(message) = self.list.handle_events(Some(event))? {
+            self.message_tx.send(message)?;
         }
         Ok(())
     }
@@ -136,10 +160,8 @@ impl App {
                 Message::Error(ref text) => tracing::error!(message = text),
                 Message::Tick => {}
             }
-            for component in &mut self.components {
-                if let Some(message) = component.update(message.clone())? {
-                    self.message_tx.send(message)?;
-                }
+            if let Some(message) = self.list.update(message)? {
+                self.message_tx.send(message)?;
             }
         }
         Ok(())
@@ -150,16 +172,65 @@ impl App {
         self.render(tui)
     }
 
+    /// The already-scheduled render tick's one read of the Core's table: exactly one
+    /// [`Snapshot`](repon_core::Snapshot) is cloned here, and every panel this tick draws
+    /// shares that same clone. There is no second channel and no channel-select anywhere in
+    /// [`Self::handle_events`] or this method: `tui::Event::Render` already arrives on the
+    /// one event channel the terminal thread owns, and `core.snapshot()` is a direct,
+    /// synchronous read, not a message a background thread pushes.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        let snapshot = self.core.snapshot();
+        let mut error = None;
         tui.draw(|frame| {
-            for component in &mut self.components {
-                if let Err(err) = component.draw(frame, frame.area()) {
-                    let _ = self
-                        .message_tx
-                        .send(Message::Error(format!("could not draw: {err:?}")));
-                }
+            let area = frame.area();
+            if let Err(err) = self.list.draw(frame, area, &snapshot) {
+                error = Some(err);
             }
         })?;
+        if let Some(err) = error {
+            self.message_tx
+                .send(Message::Error(format!("could not draw: {err:?}")))?;
+        }
         Ok(())
     }
+}
+
+/// Builds the Core's own crossing type from the loaded config: the active Set (the first
+/// declared, or the implicit `all` Set `Document::load` always adds), the `[[repo]]`
+/// overrides, and the refresh cadence. Set switching (`1` to `9`, the Set picker) is later
+/// work, so only the first Set is ever active today.
+fn core_spec(document: &Document) -> CoreSpec {
+    let set = document
+        .sets
+        .first()
+        .expect("Document::load always leaves at least one Set, `all` if none was declared");
+    CoreSpec {
+        set: SetSpec {
+            name: set.name.get_ref().clone(),
+            roots: set.roots.iter().map(|root| expand_home(root)).collect(),
+            include: set.include.clone().unwrap_or_default(),
+            exclude: set.exclude.clone().unwrap_or_default(),
+        },
+        overrides: document::repo_overrides(document),
+        poll_interval: document.refresh.poll_interval,
+        status_stale_after: document.refresh.status_stale_after,
+        generation_deadline: GENERATION_DEADLINE,
+    }
+}
+
+/// `~`-expands a Set root the same way `config::document` expands every other path in the
+/// file; duplicated here in miniature because that expansion is private to the module that
+/// owns the file format, and a Set root crosses to the core as an already-resolved
+/// `PathBuf`.
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = etcetera::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~"
+        && let Ok(home) = etcetera::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path)
 }

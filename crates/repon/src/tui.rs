@@ -19,7 +19,10 @@ use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     cursor,
-    event::{Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read},
+    event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read,
+    },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend as Backend;
@@ -76,9 +79,12 @@ impl Tui {
         self
     }
 
+    /// Claims the five pieces of terminal state [keybindings.md](../../../docs/spec/keybindings.md#terminal-state)
+    /// fixes: raw mode on, alternate screen on, bracketed paste on, mouse capture off
+    /// (explicit, against an inherited enabled state), focus reporting on.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen, cursor::Hide)?;
+        write_enter_sequence(&mut stdout())?;
         self.start();
         Ok(())
     }
@@ -148,12 +154,13 @@ impl Drop for Tui {
     }
 }
 
-/// Puts the terminal back the way it was found. Safe to call more than once, and safe to
-/// call from a panic hook, which is why it takes nothing.
+/// Puts the terminal back the way it was found: the mirror image of [`Tui::enter`]'s
+/// five pieces. Safe to call more than once, and safe to call from a panic hook, which is
+/// why it takes nothing.
 pub fn restore() -> std::io::Result<()> {
-    // Both steps are attempted. A failed write must not skip disabling raw mode, which
-    // is the half the shell inherits.
-    let left = crossterm::execute!(stdout(), LeaveAlternateScreen, cursor::Show);
+    // Every step is attempted regardless of an earlier one's outcome. A failed write must
+    // not skip disabling raw mode, which is the half the shell inherits.
+    let left = write_restore_sequence(&mut stdout());
     let raw = crossterm::terminal::disable_raw_mode();
     left.and(raw)
 }
@@ -220,4 +227,76 @@ fn translate(event: CrosstermEvent) -> Option<Event> {
         CrosstermEvent::FocusLost => Event::FocusLost,
         _ => return None,
     })
+}
+
+/// The four write-based pieces [`Tui::enter`] claims, in order: alternate screen, bracketed
+/// paste, mouse capture (explicitly off), focus reporting, then the cursor hidden. Raw mode
+/// is the fifth piece and is not a write; it is a separate `termios` call the caller makes
+/// before this. Generic over the writer so a test can assert the exact byte sequence against
+/// a `Vec<u8>` without a real terminal.
+fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::execute!(
+        w,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        DisableMouseCapture,
+        EnableFocusChange,
+        cursor::Hide,
+    )
+}
+
+/// The mirror image of [`write_enter_sequence`], innermost-claimed-first: focus reporting,
+/// bracketed paste, alternate screen, then the cursor shown again. Disabling raw mode is the
+/// caller's separate final step, matching [`write_enter_sequence`].
+fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::execute!(
+        w,
+        DisableFocusChange,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        cursor::Show,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
+    /// an expectation here comes from crossterm's own encoding rather than a hand-copied
+    /// escape sequence that could silently drift from what a future crossterm version emits.
+    fn ansi_bytes(command: impl crossterm::Command) -> Vec<u8> {
+        let mut buf = String::new();
+        command.write_ansi(&mut buf).expect("encode ansi command");
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn the_enter_sequence_claims_all_four_write_based_pieces_in_order() {
+        let mut out = Vec::new();
+        write_enter_sequence(&mut out).expect("write enter sequence");
+
+        let mut expected = Vec::new();
+        expected.extend(ansi_bytes(EnterAlternateScreen));
+        expected.extend(ansi_bytes(EnableBracketedPaste));
+        expected.extend(ansi_bytes(DisableMouseCapture));
+        expected.extend(ansi_bytes(EnableFocusChange));
+        expected.extend(ansi_bytes(cursor::Hide));
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn the_restore_sequence_is_the_enter_sequences_mirror_image() {
+        let mut out = Vec::new();
+        write_restore_sequence(&mut out).expect("write restore sequence");
+
+        let mut expected = Vec::new();
+        expected.extend(ansi_bytes(DisableFocusChange));
+        expected.extend(ansi_bytes(DisableBracketedPaste));
+        expected.extend(ansi_bytes(LeaveAlternateScreen));
+        expected.extend(ansi_bytes(cursor::Show));
+
+        assert_eq!(out, expected);
+    }
 }

@@ -5,10 +5,11 @@ use ratatui::{
     Frame,
     layout::{Rect, Size},
 };
+use repon_core::Snapshot;
 
 use crate::{config::Config, message::Message, tui::Event};
 
-pub mod home;
+pub mod list;
 
 /// A visual, interactive piece of the interface. Components receive events, fold messages
 /// into their own state, and draw; they never talk to each other directly, only by
@@ -51,6 +52,7 @@ pub trait Component {
         Ok(None)
     }
 
-    /// Draws the component into its area.
-    fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()>;
+    /// Draws the component into its area against one already-cloned read of the Core's
+    /// table, the same [`Snapshot`] every panel drawn this tick shares.
+    fn draw(&mut self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) -> Result<()>;
 }

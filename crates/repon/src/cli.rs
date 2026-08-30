@@ -20,6 +20,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Claims the terminal, then panics immediately, before the event loop starts.
+    /// Hidden: exists so a test can observe panic-time terminal restoration in a real
+    /// process rather than describing it.
+    #[arg(long, hide = true)]
+    pub panic_after_tui_enter: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

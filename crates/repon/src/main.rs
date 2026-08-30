@@ -20,6 +20,10 @@ mod tui;
 fn main() -> color_eyre::Result<()> {
     let args = Cli::parse();
 
+    if args.panic_after_tui_enter {
+        return panic_after_tui_enter();
+    }
+
     if let Some(command) = &args.command {
         return run_command(command, args.config);
     }
@@ -28,6 +32,17 @@ fn main() -> color_eyre::Result<()> {
     logging::init()?;
     config::init(args.config);
     App::new(args.tick_rate, args.frame_rate)?.run()
+}
+
+/// Claims the terminal then panics, so a test can attach to a real process over a pty and
+/// read back what it wrote across a genuine panic unwind, rather than trusting a
+/// description of the restore path. Bypasses `Config` and the event loop: nothing here
+/// needs either.
+fn panic_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    panic!("repon: test-triggered panic after claiming the terminal");
 }
 
 /// Runs a subcommand and exits without claiming the terminal or writing to the data
