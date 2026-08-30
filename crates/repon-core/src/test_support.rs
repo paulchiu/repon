@@ -3,6 +3,7 @@
 //! byte-identical copy of both functions before this module existed, each
 //! carrying a doc comment admitting it matched the others.
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -33,4 +34,26 @@ pub(crate) fn head_sha(path: &Path) -> String {
         .expect("utf8 sha")
         .trim()
         .to_string()
+}
+
+/// Counts loose object files under `repo`'s `.git/objects`, excluding the `pack`
+/// and `info` housekeeping directories, so a test can assert a probe left the
+/// object database exactly as it found it.
+pub(crate) fn loose_object_count(repo: &Path) -> usize {
+    let objects = repo.join(".git").join("objects");
+    let mut count = 0;
+    for fan_out in fs::read_dir(&objects).expect("read objects dir") {
+        let fan_out = fan_out.expect("dir entry");
+        if !fan_out.file_type().expect("file type").is_dir() {
+            continue;
+        }
+        let name = fan_out.file_name();
+        if name == "pack" || name == "info" {
+            continue;
+        }
+        count += fs::read_dir(fan_out.path())
+            .expect("read fan-out dir")
+            .count();
+    }
+    count
 }

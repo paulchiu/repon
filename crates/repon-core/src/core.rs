@@ -41,9 +41,10 @@ use crossbeam_channel::{Receiver, Sender, select};
 use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
-use crate::entity::{DefaultBranch, EntityKey, EntityState, Head, Kind, Presence};
+use crate::entity::{DefaultBranch, EntityKey, EntityState, Head, Kind, Presence, WorktreeState};
 use crate::git;
 use crate::landing;
+use crate::patch_equivalence;
 use crate::snapshot::Snapshot;
 
 /// One Repo's config-level override, crossing from the consumer as plain data: no
@@ -222,6 +223,16 @@ pub struct Core {
     /// coincidence.
     #[allow(dead_code)] // read only by default_branch_chain_reads_for_test
     default_branch_chain_reads: Arc<AtomicUsize>,
+    /// The same counter as `default_branch_chain_reads`, for patch equivalence's
+    /// own expensive half ([`patch_equivalence::scan_default_branch`]) instead of
+    /// the default-branch chain's: reset to zero at the start of every `refresh`,
+    /// incremented once per distinct common dir whose default-branch commit
+    /// history is actually scanned, as opposed to reused from another entity
+    /// sharing the same common dir this Generation. Never persisted across
+    /// Generations, per [ADR 0006](https://github.com/paulchiu/repon/blob/main/docs/adr/0006-no-git-state-cache-session-state-by-name.md).
+    /// Read only by `patch_identity_reads_for_test`.
+    #[allow(dead_code)] // read only by patch_identity_reads_for_test
+    patch_identity_reads: Arc<AtomicUsize>,
 }
 
 impl Core {
@@ -251,6 +262,7 @@ impl Core {
         // call, never carried over, never touched by the previous Generation's
         // still-finishing tasks holding their own clone of the old one.
         self.default_branch_chain_reads.store(0, Ordering::Release);
+        self.patch_identity_reads.store(0, Ordering::Release);
 
         // Both halves of discovery re-run at the head of every Generation, per
         // refresh.md and discovery.md: an entity no longer found becomes
@@ -325,6 +337,10 @@ impl Core {
         // this `Arc`, and once they all finish and drop it, the cache and every
         // `ChainFacts` it holds are freed. Nothing here outlives one Generation.
         let chain_cache: Arc<ChainFactsCache> = Arc::new(Mutex::new(HashMap::new()));
+        // Same lifetime as `chain_cache`, one dispatch's worth: patch
+        // equivalence's own per-common-dir memo, per default-branch.md's "Two
+        // passes on screen".
+        let patch_cache: Arc<PatchIdentityCache> = Arc::new(Mutex::new(HashMap::new()));
 
         for (((((key, cancel), repo), override_branch), common_dir), probes_state) in dispatched
             .into_iter()
@@ -338,6 +354,8 @@ impl Core {
             let settle_gate = Arc::clone(&self.settle_gate);
             let chain_cache = Arc::clone(&chain_cache);
             let chain_reads = Arc::clone(&self.default_branch_chain_reads);
+            let patch_cache = Arc::clone(&patch_cache);
+            let patch_reads = Arc::clone(&self.patch_identity_reads);
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
                 let default_branch_outcome = probe_default_branch_memoised(
@@ -354,7 +372,10 @@ impl Core {
                         &path,
                         repo.as_deref(),
                         default_branch_outcome.as_ref().map(|r| &r.settled),
+                        &common_dir,
                         &cancel,
+                        &patch_cache,
+                        &patch_reads,
                     )
                 } else {
                     None
@@ -447,11 +468,19 @@ impl Core {
             &never_cancelled,
         );
         let state_outcome = if probes_state {
+            // A single synchronous re-probe shares nothing with any Generation's
+            // dispatch, so a throwaway cache is exactly as much sharing as this
+            // one call needs.
+            let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
+            let patch_reads = AtomicUsize::new(0);
             probe_worktree_state(
                 key.path(),
                 cached_repo.as_deref(),
                 default_branch_outcome.as_ref().map(|r| &r.settled),
+                &common_dir_hint,
                 &never_cancelled,
+                &patch_cache,
+                &patch_reads,
             )
         } else {
             None
@@ -481,7 +510,7 @@ impl Core {
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
         }
-        if let Some(landing::Outcome::Settle(settled)) = state_outcome {
+        if let Some(settled) = state_outcome {
             table.entities[idx].state.settle(generation, settled);
         }
         table.entities[idx].clone()
@@ -584,6 +613,15 @@ impl Core {
     /// own, since two distinct common dirs can legitimately agree too.
     pub(crate) fn default_branch_chain_reads_for_test(&self) -> usize {
         self.default_branch_chain_reads.load(Ordering::Acquire)
+    }
+
+    /// How many times the most recent `refresh` actually scanned a common dir's
+    /// default-branch commit history for patch equivalence, as opposed to
+    /// reusing an already-computed scan for a common dir another dispatched
+    /// entity already paid for. The same proof `default_branch_chain_reads_for_test`
+    /// gives the default-branch chain, for patch equivalence's own memo.
+    pub(crate) fn patch_identity_reads_for_test(&self) -> usize {
+        self.patch_identity_reads.load(Ordering::Acquire)
     }
 
     /// `start`, with the tick source and the discovery-slow warning's threshold
@@ -831,6 +869,7 @@ fn start_internal(
             clock_thread: Some(clock_thread),
             discovery_warning,
             default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
+            patch_identity_reads: Arc::new(AtomicUsize::new(0)),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1104,16 +1143,21 @@ fn probe_default_branch(
     ))
 }
 
-/// Runs Phase D's ancestry pass ([`landing::probe`]) for one Worktree entity:
-/// `None` if `cancel` was already set, or if `default_branch_settled` is itself
-/// `None` because the default-branch probe it depends on was cancelled first.
-/// `repo` follows the same cached-handle convention as [`probe_branch`].
+/// Runs both of Phase D's passes for one Worktree entity: `landing::probe`'s
+/// ancestry check, then, only when it answers `Outstanding`,
+/// [`probe_patch_equivalence`]'s content check. `None` if `cancel` was already
+/// set, or if `default_branch_settled` is itself `None` because the
+/// default-branch probe it depends on was cancelled first. `repo` follows the
+/// same cached-handle convention as [`probe_branch`].
 fn probe_worktree_state(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     default_branch_settled: Option<&Settled<DefaultBranch>>,
+    common_dir: &Arc<Path>,
     cancel: &AtomicBool,
-) -> Option<landing::Outcome> {
+    patch_cache: &PatchIdentityCache,
+    patch_reads: &AtomicUsize,
+) -> Option<Settled<WorktreeState>> {
     if cancel.load(Ordering::Acquire) {
         return None;
     }
@@ -1126,13 +1170,112 @@ fn probe_worktree_state(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(landing::Outcome::Settle(Settled::Failed(error))),
+            Err(error) => return Some(Settled::Failed(error)),
         },
     };
-    Some(landing::probe(
-        &repo.to_thread_local(),
-        default_branch_settled,
+    let local = repo.to_thread_local();
+    match landing::probe(&local, default_branch_settled) {
+        landing::Outcome::Settle(settled) => Some(settled),
+        landing::Outcome::Outstanding => probe_patch_equivalence(
+            &local,
+            default_branch_settled,
+            common_dir,
+            cancel,
+            patch_cache,
+            patch_reads,
+        ),
+    }
+}
+
+/// Phase D's expensive half, reached only when `landing::probe` answered
+/// `Outstanding`: this is the seam that keeps patch equivalence off every
+/// entity ancestry already settled. Re-derives the entity's own HEAD commit
+/// (an unborn HEAD has none yet, and stays `Outstanding` here too, for the same
+/// reason `landing::probe` leaves it there) and the default branch's own
+/// commit, then checks patch equivalence against `patch_cache`'s per-common-dir
+/// memo, per [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "Two passes on screen".
+fn probe_patch_equivalence(
+    repo: &gix::Repository,
+    default_branch_settled: &Settled<DefaultBranch>,
+    common_dir: &Arc<Path>,
+    cancel: &AtomicBool,
+    patch_cache: &PatchIdentityCache,
+    patch_reads: &AtomicUsize,
+) -> Option<Settled<WorktreeState>> {
+    let Settled::Known { value, .. } = default_branch_settled else {
+        // `landing::probe` only returns `Outstanding` once the default branch
+        // resolved; reached only if that invariant breaks.
+        return None;
+    };
+    let Ok(head) = repo.head() else {
+        return None;
+    };
+    let Some(entity_tip) = head.id().map(|id| id.detach()) else {
+        // Unborn: no commit exists yet, so there is nothing to diff. Left
+        // Outstanding, matching `landing::probe`'s own unborn-HEAD case.
+        return None;
+    };
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let default_tip = match landing::resolve_ref_commit(repo, value.name()) {
+        Ok(id) => id,
+        Err(error) => return Some(Settled::Failed(error)),
+    };
+    let shared = match patch_identities_for(patch_cache, common_dir, patch_reads, || {
+        patch_equivalence::scan_default_branch(repo, default_tip)
+    }) {
+        Ok(shared) => shared,
+        Err(error) => return Some(Settled::Failed(error)),
+    };
+    Some(patch_equivalence::probe(
+        repo,
+        entity_tip,
+        default_tip,
+        &shared,
     ))
+}
+
+/// One Generation's patch-equivalence memo: at most one
+/// [`patch_equivalence::PatchIdentitySet`] per common dir, shared by every
+/// dispatched entity `landing::probe` answered `Outstanding` for. Built fresh
+/// in [`Core::refresh`] and dropped once every task from that dispatch has
+/// finished, the same lifetime `ChainFactsCache` has. The computed `Result` is
+/// itself cached, since a common dir a scan fails against fails identically
+/// for every entity sharing it this Generation.
+type PatchIdentityCache = Mutex<
+    HashMap<Arc<Path>, Arc<OnceLock<Result<patch_equivalence::PatchIdentitySet, git::ProbeError>>>>,
+>;
+
+/// The per-common-dir half of [`probe_patch_equivalence`]: returns the
+/// already-computed scan for `common_dir` if another entity in this
+/// Generation's dispatch already ran it, blocking until that computation
+/// finishes if it is still running; otherwise runs `compute` itself, caches the
+/// result, and increments `reads` exactly once for the common dir this call is
+/// the first to reach. Structurally identical to [`chain_facts_for`]; kept
+/// separate rather than made generic over it, since the two caches are keyed by
+/// different Generations' worth of dispatch and sharing one would blur which
+/// pass a given read counted for.
+fn patch_identities_for(
+    cache: &PatchIdentityCache,
+    common_dir: &Arc<Path>,
+    reads: &AtomicUsize,
+    compute: impl FnOnce() -> Result<patch_equivalence::PatchIdentitySet, git::ProbeError>,
+) -> Result<patch_equivalence::PatchIdentitySet, git::ProbeError> {
+    let cell = {
+        let mut cache = cache.lock().unwrap();
+        Arc::clone(
+            cache
+                .entry(Arc::clone(common_dir))
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    };
+    cell.get_or_init(|| {
+        reads.fetch_add(1, Ordering::Relaxed);
+        compute()
+    })
+    .clone()
 }
 
 /// One Generation's default-branch chain memo: at most one [`default_branch::ChainFacts`]
@@ -1210,7 +1353,7 @@ fn probe_default_branch_memoised(
 struct ProbeOutcomes {
     branch: Option<Settled<Head>>,
     default_branch: Option<default_branch::Resolution>,
-    state: Option<landing::Outcome>,
+    state: Option<Settled<WorktreeState>>,
 }
 
 /// Lands one probe's combined outcome for `key` at `generation`: writes the
@@ -1221,10 +1364,11 @@ struct ProbeOutcomes {
 /// dispatched probe's result and a test's simulated late result both go through,
 /// so a test can land a result out of order without duplicating this bookkeeping.
 ///
-/// `outcomes.state`'s `Outstanding` case writes nothing at all: the `state`
-/// cell is left exactly as unsettled as `begin_probe` alone leaves it, which is
-/// the whole of the "stays outstanding between the two passes" contract. There
-/// is no second pass here to hand the entity off to; that pass is not built yet.
+/// `outcomes.state` being `None` writes nothing at all: the `state` cell is
+/// left exactly as unsettled as `begin_probe` alone leaves it, which is what an
+/// entity `landing::probe` and then `probe_patch_equivalence` both leave
+/// `Outstanding` (an unborn HEAD, still with no commit to prove anything from)
+/// still shows.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
     settle_gate: &Arc<(Mutex<usize>, Condvar)>,
@@ -1245,7 +1389,7 @@ fn apply_probe_outcome(
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
         }
-        if let Some(landing::Outcome::Settle(settled)) = state_outcome {
+        if let Some(settled) = state_outcome {
             table.entities[idx].state.settle(generation, settled);
         }
     }
@@ -1413,7 +1557,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{DefaultBranchStopped, WorktreeState};
-    use crate::test_support::{git, head_sha};
+    use crate::test_support::{git, head_sha, loose_object_count};
 
     fn init_repo_with_a_commit(path: &Path) {
         fs::create_dir_all(path).expect("create repo dir");
@@ -2632,17 +2776,274 @@ mod tests {
         );
     }
 
-    /// With `Gone` and `Local only` now constructible, this is the test that
-    /// would fail if a diverged attached branch with a live upstream settled
-    /// `Gone` instead of staying outstanding, proven through the real dispatch
-    /// path rather than `landing::probe` in isolation: a Worktree whose branch
-    /// has both diverged from the default branch and a live upstream of its own
-    /// stays outstanding (`settled() == None`, still `is_in_flight()`) after a
-    /// real Generation completes. `settle` returning at all proves the
-    /// Generation's dispatch finished; the state cell is what must still show
-    /// nothing.
+    /// The squash merge this whole ticket is named for, proven end to end
+    /// through a real `refresh`: `feature`'s two commits are squashed into one
+    /// commit on the default branch, so ancestry cannot see it (`feature`'s tip
+    /// never becomes an ancestor), and only patch equivalence can. Its upstream
+    /// tracking ref still resolves, matching the moment right after a squash
+    /// merge and before the next prune removes it, which is what routes this
+    /// entity through `Outstanding` into the second pass rather than settling
+    /// `Gone` at the first.
     #[test]
-    fn a_diverged_worktree_with_a_live_upstream_stays_outstanding_after_a_refresh_rather_than_reading_gone()
+    fn a_squash_merged_worktree_branch_reads_merged_after_a_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(worktree_path.join("a.txt"), "one\n").expect("write a.txt");
+        git(&worktree_path, &["add", "a.txt"]);
+        git(&worktree_path, &["commit", "-m", "add a"]);
+        fs::write(worktree_path.join("b.txt"), "two\n").expect("write b.txt");
+        git(&worktree_path, &["add", "b.txt"]);
+        git(&worktree_path, &["commit", "-m", "add b"]);
+        let feature_sha = head_sha(&worktree_path);
+
+        // Squashed into the parent's own checkout, which is what the default
+        // branch resolves against.
+        git(&parent, &["merge", "--squash", "feature"]);
+        git(&parent, &["commit", "-m", "squashed feature"]);
+        let main_sha = head_sha(&parent);
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &main_sha],
+        );
+
+        // `feature`'s own upstream, still resolving: the moment before a prune
+        // removes it.
+        git(&parent, &["config", "branch.feature.remote", "origin"]);
+        git(
+            &parent,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Merged,
+                    ..
+                })
+            ),
+            "expected a squash-merged worktree branch to read Merged, got {:?}",
+            worktree_entity.state.settled()
+        );
+    }
+
+    /// Proves the negative the state cell alone cannot: patch equivalence's
+    /// expensive scan must never even start for an entity ancestry already
+    /// settled. A Worktree whose branch is an ancestor of the default branch
+    /// settles `Merged` at the first pass, so the only common dir in this test
+    /// must show zero scans; a `state`-only assertion would still pass an
+    /// implementation that ran the second pass over every entity and discarded
+    /// whichever answer ancestry had already provided.
+    #[test]
+    fn patch_equivalence_never_runs_for_an_entity_ancestry_already_settled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(&parent);
+        git(&parent, &["update-ref", "refs/remotes/origin/main", &sha]);
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Merged,
+                    ..
+                })
+            ),
+            "expected ancestry alone to settle Merged here, got {:?}",
+            worktree_entity.state.settled()
+        );
+        assert_eq!(
+            core.patch_identity_reads_for_test(),
+            0,
+            "ancestry already settled this entity, so patch equivalence's shared \
+             scan must never run for its common dir at all"
+        );
+    }
+
+    /// [`patch_equivalence`]'s own unit test proves the module itself writes no
+    /// loose object; this proves the same through the real dispatch path a
+    /// user's refresh actually runs, so a write introduced in `core.rs`'s glue
+    /// rather than in the module would be caught too. Reuses the squash-merge
+    /// fixture that routes a real `Core::refresh` into patch equivalence's
+    /// second pass, and counts loose objects in the parent repository, since a
+    /// linked Worktree shares its object database with its common dir.
+    #[test]
+    fn a_full_refresh_reaching_patch_equivalence_writes_no_loose_objects() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(worktree_path.join("a.txt"), "one\n").expect("write a.txt");
+        git(&worktree_path, &["add", "a.txt"]);
+        git(&worktree_path, &["commit", "-m", "add a"]);
+        fs::write(worktree_path.join("b.txt"), "two\n").expect("write b.txt");
+        git(&worktree_path, &["add", "b.txt"]);
+        git(&worktree_path, &["commit", "-m", "add b"]);
+        let feature_sha = head_sha(&worktree_path);
+
+        git(&parent, &["merge", "--squash", "feature"]);
+        git(&parent, &["commit", "-m", "squashed feature"]);
+        let main_sha = head_sha(&parent);
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &main_sha],
+        );
+        git(&parent, &["config", "branch.feature.remote", "origin"]);
+        git(
+            &parent,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        let before = loose_object_count(&parent);
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+        let after = loose_object_count(&parent);
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Merged,
+                    ..
+                })
+            ),
+            "expected this refresh to actually reach patch equivalence and settle \
+             Merged, got {:?}",
+            worktree_entity.state.settled()
+        );
+        assert_eq!(
+            before, after,
+            "a full refresh reaching patch equivalence must never write a loose \
+             object to the repository"
+        );
+    }
+
+    /// With patch equivalence now built, a diverged attached branch with a live
+    /// upstream no longer stays outstanding forever: once ancestry says no,
+    /// the second pass gets a real answer, and genuinely unmerged work (a real
+    /// file change with no counterpart on the default branch, not merely an
+    /// empty marker commit) settles `Active` rather than `Gone` or `Merged`,
+    /// proven through the real dispatch path rather than either pass in
+    /// isolation.
+    #[test]
+    fn a_diverged_worktree_with_a_live_upstream_and_genuinely_unmerged_work_settles_active_after_a_refresh()
      {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
@@ -2673,11 +3074,11 @@ mod tests {
                 worktree_path.to_str().expect("utf8 path"),
             ],
         );
-        // Unmerged work: feature now has a commit main (and origin/main) do not.
-        git(
-            &worktree_path,
-            &["commit", "--allow-empty", "-m", "unmerged"],
-        );
+        // Unmerged work: a real file change feature has that main (and
+        // origin/main) do not, and that main never gains by any other means.
+        fs::write(worktree_path.join("feature.txt"), "unmerged work\n").expect("write feature.txt");
+        git(&worktree_path, &["add", "feature.txt"]);
+        git(&worktree_path, &["commit", "-m", "unmerged"]);
         let feature_sha = head_sha(&worktree_path);
         // `feature`'s own upstream, live: the common dir's shared config and refs
         // make this visible from the worktree's own probe too.
@@ -2708,13 +3109,15 @@ mod tests {
             .find(|entity| matches!(entity.kind, Kind::Worktree))
             .expect("worktree entity present");
         assert!(
-            worktree_entity.state.settled().is_none(),
-            "expected the diverged worktree's state to stay outstanding, got {:?}",
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Active,
+                    ..
+                })
+            ),
+            "expected genuinely unmerged work with a live upstream to settle Active, got {:?}",
             worktree_entity.state.settled()
-        );
-        assert!(
-            worktree_entity.state.is_in_flight(),
-            "an outstanding state cell must still read as in-flight, matching a cell nothing has settled yet"
         );
     }
 
@@ -3611,6 +4014,182 @@ mod tests {
         core.settle(Duration::from_millis(500));
         assert_eq!(
             core.default_branch_chain_reads_for_test(),
+            2,
+            "the memo lives inside one Generation's dispatch; the next Generation \
+             recomputes rather than inheriting it"
+        );
+    }
+
+    /// The same proof as `the_default_branch_chain_is_memoised_once_per_common_dir_per_generation`,
+    /// for patch equivalence's own expensive half: two sibling Worktrees, each
+    /// with a live upstream and unmerged work of its own, share one common dir
+    /// and must scan its default-branch history once between them, not twice;
+    /// an unrelated Repo's own Worktree, in its own common dir, pays for a
+    /// second scan. Both entities settling (`Active`, since neither's work
+    /// actually landed) is what proves the second pass ran for both rather than
+    /// one being cancelled or skipped, which would otherwise let a
+    /// once-per-entity implementation coincidentally also read 2.
+    #[test]
+    fn patch_equivalence_is_memoised_once_per_common_dir_per_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let base_sha = head_sha(&parent);
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &base_sha],
+        );
+        for name in ["feature-x", "feature-y"] {
+            let worktree = root.join(name);
+            git(
+                &parent,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    name,
+                    worktree.to_str().expect("utf8 path"),
+                ],
+            );
+            fs::write(worktree.join(format!("{name}.txt")), "unmerged\n")
+                .expect("write worktree file");
+            git(&worktree, &["add", "."]);
+            git(&worktree, &["commit", "-m", "unmerged work"]);
+            let tip_sha = head_sha(&worktree);
+            git(
+                &parent,
+                &["config", &format!("branch.{name}.remote"), "origin"],
+            );
+            git(
+                &parent,
+                &[
+                    "config",
+                    &format!("branch.{name}.merge"),
+                    &format!("refs/heads/{name}"),
+                ],
+            );
+            git(
+                &parent,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/{name}"),
+                    &tip_sha,
+                ],
+            );
+        }
+
+        let other_parent = root.join("other");
+        init_repo_with_a_commit(&other_parent);
+        git(
+            &other_parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/other.git",
+            ],
+        );
+        let other_base_sha = head_sha(&other_parent);
+        git(
+            &other_parent,
+            &["update-ref", "refs/remotes/origin/main", &other_base_sha],
+        );
+        let other_worktree = root.join("other-feature");
+        git(
+            &other_parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "other-feature",
+                other_worktree.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(other_worktree.join("other.txt"), "unmerged\n").expect("write worktree file");
+        git(&other_worktree, &["add", "."]);
+        git(&other_worktree, &["commit", "-m", "unmerged work"]);
+        let other_tip_sha = head_sha(&other_worktree);
+        git(
+            &other_parent,
+            &["config", "branch.other-feature.remote", "origin"],
+        );
+        git(
+            &other_parent,
+            &[
+                "config",
+                "branch.other-feature.merge",
+                "refs/heads/other-feature",
+            ],
+        );
+        git(
+            &other_parent,
+            &[
+                "update-ref",
+                "refs/remotes/origin/other-feature",
+                &other_tip_sha,
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            5,
+            "expected two parents plus their three worktrees"
+        );
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+
+        let worktree_states: Vec<_> = settled
+            .entities
+            .iter()
+            .filter(|entity| matches!(entity.kind, Kind::Worktree))
+            .map(|entity| entity.state.settled())
+            .collect();
+        assert_eq!(worktree_states.len(), 3, "expected three worktree rows");
+        for settled_state in &worktree_states {
+            assert!(
+                matches!(
+                    settled_state,
+                    Some(Settled::Known {
+                        value: WorktreeState::Active,
+                        ..
+                    })
+                ),
+                "expected every worktree's genuinely unmerged work to settle Active, got {settled_state:?}"
+            );
+        }
+
+        assert_eq!(
+            core.patch_identity_reads_for_test(),
+            2,
+            "two worktrees share one common dir and must scan its default-branch \
+             history once between them, not once per entity; the unrelated repo's \
+             own worktree pays for a second scan"
+        );
+
+        // A second Generation pays for the same two scans again: a cache hoisted
+        // onto `Core` would answer this refresh for free and read 0.
+        core.refresh(&keys);
+        core.settle(Duration::from_millis(500));
+        assert_eq!(
+            core.patch_identity_reads_for_test(),
             2,
             "the memo lives inside one Generation's dispatch; the next Generation \
              recomputes rather than inheriting it"
