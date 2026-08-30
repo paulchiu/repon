@@ -15,9 +15,11 @@ use crate::unwind::UnwindLevel;
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Selection {
     selected: HashSet<EntityKey>,
-    /// The visible-list index `v` dropped a range anchor at, extended by `j`/`k`. Cancelling
-    /// this is the one Escape-unwind level this ticket builds; see [`crate::unwind`].
-    range_anchor: Option<usize>,
+    /// The row `v` dropped a range anchor on, extended by `j` and `k` alone. Stored as the
+    /// row's own key rather than a visible-list index, so a Filter or reorder between
+    /// anchoring and extending cannot point the anchor at a different row. Cancelling this
+    /// is the one Escape-unwind level this ticket builds; see [`crate::unwind`].
+    range_anchor: Option<EntityKey>,
 }
 
 impl Selection {
@@ -54,10 +56,9 @@ impl Selection {
         }
     }
 
-    /// Drops a range anchor at `cursor`, the index into the visible list `extend_range` and
-    /// `select_all_visible` both read.
-    pub(crate) fn anchor_range(&mut self, cursor: usize) {
-        self.range_anchor = Some(cursor);
+    /// Drops a range anchor on `row`.
+    pub(crate) fn anchor_range(&mut self, row: EntityKey) {
+        self.range_anchor = Some(row);
     }
 
     pub(crate) fn has_range_anchor(&self) -> bool {
@@ -65,10 +66,16 @@ impl Selection {
     }
 
     /// Extends the Selection to cover every visible row between the anchor and `cursor`,
-    /// inclusive, called as the movement keys move the cursor while a range anchor is live.
-    /// A no-op with no anchor dropped.
+    /// inclusive, called as `j` and `k` move the cursor while a range anchor is live. A
+    /// no-op with no anchor dropped. Resolves the anchor's current position by searching
+    /// `visible` on every call rather than trusting a remembered index, so a Filter or
+    /// reorder between anchoring and extending cannot point the anchor at the wrong row; if
+    /// the anchored row is no longer visible, this adds no rows but leaves the anchor live.
     pub(crate) fn extend_range(&mut self, cursor: usize, visible: &[EntityKey]) {
-        let Some(anchor) = self.range_anchor else {
+        let Some(anchor_key) = &self.range_anchor else {
+            return;
+        };
+        let Some(anchor) = visible.iter().position(|key| key == anchor_key) else {
             return;
         };
         let (low, high) = if anchor <= cursor {
@@ -216,49 +223,47 @@ mod tests {
         assert_eq!(selection.count(), 2);
     }
 
+    /// This file's own production source, up to its test module: reused by the scan below so
+    /// it states one absence claim rather than re-reading the file.
+    fn production_source() -> &'static str {
+        include_str!("selection.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file has a test module")
+    }
+
     /// The sharpest criterion in the ticket: a Selection made under a Filter must not change
-    /// what an operation touches once the Filter clears and more rows become visible. This
-    /// establishes a Selection over a narrow `visible` list (standing in for a Filter's
-    /// bound), then computes `targets` against a *wider* `visible` list (standing in for the
-    /// Filter clearing), and asserts the target set is unchanged. A test that only counted
-    /// selected rows before and after would pass a recompute-from-visibility bug; this reads
-    /// the actual target set both times.
+    /// what an operation touches once the Filter clears and more rows become visible. `targets`
+    /// takes no visibility argument, so two calls to it are identical by construction and no
+    /// behavioural test can tell a compliant implementation from a defective one that
+    /// recomputes from current visibility; the honest form of this criterion is that
+    /// `targets`'s signature structurally cannot read visibility. A scan rather than a
+    /// behavioural test, the same as this crate's other absence claims.
     #[test]
-    fn clearing_a_filter_cannot_change_an_operations_blast_radius_between_keystrokes() {
+    fn targets_signature_takes_no_parameter_shaped_like_a_visible_row_list() {
+        let signature = production_source()
+            .lines()
+            .find(|line| line.contains("fn targets"))
+            .expect("targets must still exist");
+
+        assert!(
+            signature.contains("(&self, cursor: &EntityKey)"),
+            "targets must take exactly &self and the cursor key, found: {signature:?}"
+        );
+    }
+
+    /// The behavioural half of the same criterion: a Selection made over a narrow visible set
+    /// yields exactly that set, regardless of what else exists.
+    #[test]
+    fn targets_over_a_selection_made_under_a_narrow_visible_set_returns_exactly_that_set() {
         let mut selection = Selection::new();
         let under_filter = [key("repo-a"), key("repo-b"), key("repo-c")];
         selection.select_all_visible(&under_filter);
         let cursor = key("repo-a");
-        let expected: HashSet<EntityKey> = under_filter.iter().cloned().collect();
 
-        let targets_under_filter: HashSet<EntityKey> =
-            selection.targets(&cursor).into_iter().collect();
-        assert_eq!(targets_under_filter, expected);
+        let targets: HashSet<EntityKey> = selection.targets(&cursor).into_iter().collect();
 
-        // The Filter clears between keystrokes: two more rows are now visible, but nobody
-        // re-selected, so the committed Selection made under the Filter is what must still
-        // decide the blast radius.
-        let after_filter_clears = [
-            key("repo-a"),
-            key("repo-b"),
-            key("repo-c"),
-            key("repo-d"),
-            key("repo-e"),
-        ];
-
-        let targets_after_filter_clears: HashSet<EntityKey> =
-            selection.targets(&cursor).into_iter().collect();
-
-        assert_eq!(
-            targets_after_filter_clears, expected,
-            "the target set must survive the Filter clearing unchanged"
-        );
-        assert_ne!(
-            targets_after_filter_clears,
-            after_filter_clears.iter().cloned().collect::<HashSet<_>>(),
-            "a defective implementation that recomputes the target set from current \
-             visibility would touch every now-visible row instead of only the checked ones"
-        );
+        assert_eq!(targets, under_filter.iter().cloned().collect());
     }
 
     #[test]
@@ -266,7 +271,7 @@ mod tests {
         let mut selection = Selection::new();
         let visible = [key("row-0"), key("row-1"), key("row-2"), key("row-3")];
 
-        selection.anchor_range(1);
+        selection.anchor_range(visible[1].clone());
         selection.extend_range(3, &visible);
 
         assert!(!selection.contains(&visible[0]));
@@ -280,7 +285,7 @@ mod tests {
         let mut selection = Selection::new();
         let visible = [key("row-0"), key("row-1"), key("row-2"), key("row-3")];
 
-        selection.anchor_range(3);
+        selection.anchor_range(visible[3].clone());
         selection.extend_range(1, &visible);
 
         assert!(!selection.contains(&visible[0]));
@@ -299,11 +304,68 @@ mod tests {
         assert!(selection.is_empty());
     }
 
+    /// The anchor must track its row through a reorder, not the index it happened to sit at
+    /// when dropped. `repo-b` anchors at index 1; by the time the cursor moves the visible
+    /// list has reordered so `repo-b` sits at index 3. A stale-index implementation would
+    /// sweep indices 0..=1 of the new order (`repo-c`, `repo-d`) instead of the row-correct
+    /// span between `repo-b` and the cursor.
+    #[test]
+    fn extending_a_range_after_a_reorder_spans_the_anchored_row_not_its_original_index() {
+        let mut selection = Selection::new();
+        let repo_a = key("repo-a");
+        let repo_b = key("repo-b");
+        let repo_c = key("repo-c");
+        let repo_d = key("repo-d");
+        let repo_e = key("repo-e");
+
+        // repo-b anchors here; at this moment it sits at index 1 in the visible list.
+        selection.anchor_range(repo_b.clone());
+
+        // The list reorders before the cursor moves again: repo-b now sits at index 3, and
+        // the cursor lands on repo-c at index 4.
+        let reordered = [
+            repo_d.clone(),
+            repo_e.clone(),
+            repo_a.clone(),
+            repo_b.clone(),
+            repo_c.clone(),
+        ];
+        selection.extend_range(4, &reordered);
+
+        assert!(selection.contains(&repo_b));
+        assert!(selection.contains(&repo_c));
+        assert!(
+            !selection.contains(&repo_a),
+            "the span must run from repo-b's current index (3) to the cursor (4), not from \
+             its stale original index (1)"
+        );
+        assert!(
+            !selection.contains(&repo_e),
+            "the span must run from repo-b's current index (3) to the cursor (4), not from \
+             its stale original index (1)"
+        );
+        assert!(!selection.contains(&repo_d));
+    }
+
+    #[test]
+    fn extending_a_range_when_the_anchored_row_is_no_longer_visible_adds_no_rows_but_keeps_the_anchor_live()
+     {
+        let mut selection = Selection::new();
+        let anchored = key("filtered-out-row");
+        let visible = [key("row-0"), key("row-1")];
+
+        selection.anchor_range(anchored);
+        selection.extend_range(1, &visible);
+
+        assert!(selection.is_empty());
+        assert!(selection.has_range_anchor());
+    }
+
     #[test]
     fn clear_empties_the_checked_rows_and_drops_a_live_range_anchor() {
         let mut selection = Selection::new();
         selection.toggle(key("some-row"));
-        selection.anchor_range(0);
+        selection.anchor_range(key("some-row"));
 
         selection.clear();
 
@@ -312,19 +374,19 @@ mod tests {
     }
 
     #[test]
-    fn cancel_range_anchor_reports_whether_it_cancelled_one() {
+    fn cancelling_a_range_anchor_reports_true_only_when_one_was_live() {
         let mut selection = Selection::new();
         assert!(!selection.cancel_range_anchor());
 
-        selection.anchor_range(2);
+        selection.anchor_range(key("anchored-row"));
         assert!(selection.cancel_range_anchor());
         assert!(!selection.has_range_anchor());
     }
 
     #[test]
-    fn selections_unwind_level_impl_cancels_the_anchor_and_reports_it_via_the_trait() {
+    fn escape_cancels_a_live_range_anchor_and_a_second_press_finds_nothing_left_to_cancel() {
         let mut selection = Selection::new();
-        selection.anchor_range(0);
+        selection.anchor_range(key("anchored-row"));
 
         let level: &mut dyn UnwindLevel = &mut selection;
         assert!(level.unwind());
@@ -340,7 +402,7 @@ mod tests {
         let mut selection = Selection::new();
         let checked = key("already-checked");
         selection.toggle(checked.clone());
-        selection.anchor_range(0);
+        selection.anchor_range(key("anchored-row"));
 
         selection.cancel_range_anchor();
 

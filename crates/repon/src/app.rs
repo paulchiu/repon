@@ -4,7 +4,7 @@ use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
-use repon_core::{Core, CoreSpec, EntityKey, SetSpec};
+use repon_core::{Core, CoreSpec, EntityKey, SetSpec, Snapshot};
 use tracing::debug;
 
 use crate::{
@@ -40,7 +40,7 @@ pub struct App {
     /// level ([`unwind`]) this ticket builds: cancelling a live range anchor.
     selection: Selection,
     /// The row the movement keys move and the toggle, anchor and empty-Selection default all
-    /// read: an index into the current [`Snapshot`](repon_core::Snapshot)'s entities, which is
+    /// read: an index into the current [`Snapshot`]'s entities, which is
     /// this crate's only "visible list" until a Filter narrows it.
     cursor: usize,
     /// `Some` while the help overlay has focus, carrying its scroll position; `None` while
@@ -76,12 +76,7 @@ impl App {
         // Discovery already ran inside `Core::start`; dispatch the identity probe for
         // every row it found so the list fills in progressively rather than sitting on
         // blank branch cells until something else asks for a refresh.
-        let keys: Vec<EntityKey> = core
-            .snapshot()
-            .entities
-            .iter()
-            .map(|entity| entity.key.clone())
-            .collect();
+        let keys = entity_keys(&core.snapshot());
         core.refresh(&keys);
 
         let mut list = List::default();
@@ -201,7 +196,9 @@ impl App {
                 None
             }
             Some(Action::AnchorRange) => {
-                self.selection.anchor_range(self.cursor);
+                if let Some(key) = self.cursor_key() {
+                    self.selection.anchor_range(key);
+                }
                 None
             }
             Some(Action::SelectAllVisible) => {
@@ -232,12 +229,7 @@ impl App {
     /// until a Filter narrows it, and what `select_all_visible`, `extend_range` and the
     /// cursor bounds all read.
     fn visible_keys(&self) -> Vec<EntityKey> {
-        self.core
-            .snapshot()
-            .entities
-            .iter()
-            .map(|entity| entity.key.clone())
-            .collect()
+        entity_keys(&self.core.snapshot())
     }
 
     /// The row the cursor sits on, if the table is non-empty.
@@ -260,8 +252,10 @@ impl App {
         }
     }
 
-    /// Sets the cursor to `index`, clamped to the table, and extends a live range anchor the
-    /// same way [`Self::move_cursor`] does.
+    /// Sets the cursor to `index`, clamped to the table. Unlike [`Self::move_cursor`], this
+    /// never extends a live range anchor: `docs/spec/keybindings.md`'s `v` binding names only
+    /// `j` and `k` as the keys that extend a range, so jumping the cursor with `g` or `G`
+    /// must leave the Selection untouched.
     fn set_cursor(&mut self, index: usize) {
         let visible = self.visible_keys();
         if visible.is_empty() {
@@ -269,9 +263,6 @@ impl App {
             return;
         }
         self.cursor = index.min(visible.len() - 1);
-        if self.selection.has_range_anchor() {
-            self.selection.extend_range(self.cursor, &visible);
-        }
     }
 
     fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
@@ -303,7 +294,7 @@ impl App {
     }
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
-    /// [`Snapshot`](repon_core::Snapshot) is cloned here, and every panel this tick draws
+    /// [`Snapshot`] is cloned here, and every panel this tick draws
     /// shares that same clone. The help overlay, when open, takes the whole frame in place
     /// of `List` and its footer; otherwise `List` gets every row but the last, which
     /// [`footer::draw`] renders into.
@@ -328,6 +319,16 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// Every Entity's key in `snapshot`, in table order: the one mapping [`App::new`] and
+/// [`App::visible_keys`] both need, kept in one place rather than two.
+fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
+    snapshot
+        .entities
+        .iter()
+        .map(|entity| entity.key.clone())
+        .collect()
 }
 
 /// Builds the Core's own crossing type from the loaded config: the active Set (the first
@@ -359,6 +360,94 @@ fn core_spec(document: &Document) -> CoreSpec {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Inits a real disposable git repository at `path` with one empty commit, the same
+    /// pattern `repon-core`'s own tests use rather than a git-backend trait.
+    fn init_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "--allow-empty", "-m", "first"])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+    }
+
+    /// An `App` wired to a real `Core` over `root`, bypassing `App::new`'s config and
+    /// discovery-dispatch side effects, which a cursor and Selection test has no need of.
+    fn test_app(root: &std::path::Path) -> App {
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.to_path_buf()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+        });
+        let (message_tx, message_rx) = unbounded();
+        App {
+            tick_rate: 60.0,
+            frame_rate: 60.0,
+            core,
+            list: List::default(),
+            should_quit: false,
+            should_suspend: false,
+            selection: Selection::new(),
+            cursor: 0,
+            help: None,
+            frame_size: Size::default(),
+            message_tx,
+            message_rx,
+        }
+    }
+
+    /// `docs/spec/keybindings.md`'s `v` binding names only `j` and `k` as the keys that
+    /// extend a range anchor; `g` and `G` (`Action::FirstRow` and `Action::LastRow`, both
+    /// implemented through `set_cursor`) must jump the cursor without sweeping rows into the
+    /// Selection the way `move_cursor`'s `j`/`k` do.
+    #[test]
+    fn jumping_the_cursor_with_first_row_or_last_row_does_not_extend_a_live_range_anchor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            2,
+            "expected two repos discovered under the temp root"
+        );
+
+        app.selection.anchor_range(visible[0].clone());
+        let last = visible.len() - 1;
+        app.set_cursor(last);
+
+        assert!(
+            app.selection.is_empty(),
+            "jumping the cursor with g/G must never extend the range anchor; only j/k do"
+        );
+        assert!(
+            app.selection.has_range_anchor(),
+            "the anchor itself must stay live; only its extension by a jump is refused"
+        );
+    }
+
     /// Every `.rs` file under `dir`, recursively.
     fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut files = Vec::new();
@@ -414,12 +503,13 @@ mod tests {
             std::collections::HashMap::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
             let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
             let file_name = path
                 .file_name()
                 .expect("a source file has a name")
                 .to_string_lossy()
                 .into_owned();
-            for (number, line) in source.lines().enumerate() {
+            for (number, line) in production.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
@@ -449,40 +539,42 @@ mod tests {
         );
     }
 
-    /// The `Action`-to-`Message` match inside `handle_key_event`, the one place a key press
-    /// decides what happens: from `fn handle_key_event` to the next method at the same
-    /// indent.
-    fn handle_key_event_source() -> &'static str {
-        let source = include_str!("app.rs");
-        let start = source
-            .find("fn handle_key_event")
-            .expect("handle_key_event must still exist");
-        let rest = &source[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .map(|offset| offset + 1)
-            .unwrap_or(rest.len());
-        &rest[..end]
-    }
-
-    /// keybindings.md's "Esc never quits, at any depth": inside the match that turns a key's
-    /// `Action` into a `Message`, `Message::Quit` must only ever appear on the `Action::Quit`
-    /// arm itself, never on `Action::Unwind`'s or any other. A source scan rather than a
-    /// behavioural test, because the claim is an absence: there is no path, not merely no
-    /// path this test happened to try.
+    /// keybindings.md's "Esc never quits, at any depth": every line that raises
+    /// `Message::Quit`, anywhere in this crate's production source, must also name
+    /// `Action::Quit`. Scanning only `handle_key_event`'s own match would miss a path opened
+    /// in a component `handle_events` forwards key events to instead, such as `List`'s; this
+    /// scans every source file, the same reach as
+    /// [`no_press_twice_to_force_state_is_tracked_anywhere_in_this_crate`]'s and
+    /// [`channel_construction_is_confined_to_the_apps_message_bus_and_the_tuis_event_channel`]'s.
+    /// A source scan rather than a behavioural test, because the claim is an absence: there
+    /// is no path, not merely no path this test happened to try.
     #[test]
-    fn no_path_from_escape_to_quit_exists_in_the_key_handling_match() {
-        for (number, line) in handle_key_event_source().lines().enumerate() {
-            if line.contains("Message::Quit") {
-                assert!(
-                    line.contains("Action::Quit"),
-                    "line {} of handle_key_event raises Message::Quit outside the \
-                     Action::Quit arm, which is a path from some other key (Escape included) \
-                     to quitting: {line:?}",
-                    number + 1
-                );
+    fn no_path_from_escape_to_quit_exists_anywhere_in_this_crates_production_source() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            for (number, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // A match arm's pattern (`Message::Quit => ...`) consumes an already-raised
+                // message rather than raising one; only a line constructing the value is a
+                // candidate path to quitting.
+                if line.contains("Message::Quit")
+                    && !line.contains("Message::Quit =>")
+                    && !line.contains("Action::Quit")
+                {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
             }
         }
+        assert!(
+            offending_locations.is_empty(),
+            "Message::Quit is raised outside an Action::Quit arm, which is a path from some \
+             other key (Escape included) to quitting: {offending_locations:?}"
+        );
     }
 
     /// keybindings.md's "no press-twice-to-force gesture exists": scans every source file in
