@@ -57,7 +57,7 @@ One Repo's config-level correction, crossing into the core as plain data: its co
 ### Discovery
 
 **Discovery**:
-The boundary-stop walk that turns a Set's roots into the list of Repo boundaries the core builds Entities from. Stops at each boundary rather than descending into it, follows a directory symlink only when its target is itself a boundary, and re-runs from scratch on every Generation.
+Two halves returning one Entity list. The boundary-stop walk turns a Set's roots into the list of Repo boundaries, stopping at each boundary rather than descending into it and following a directory symlink only when its target is itself a boundary. A second pass resolves each boundary's own Kind (Repo or Worktree) and reads its `.gitmodules`, one level deep with no recursion, to add its Submodules. Re-runs from scratch on every Generation.
 _Avoid_: Scan, crawl, index
 
 ### Acting
@@ -113,7 +113,7 @@ Exactly three shapes, one to one with git's own: attached to a branch with a com
 An Entity's ahead behind pair of commit counts against its upstream.
 
 **Diagnostics**:
-Per-Entity facts that are not Cells: which rung of the default branch chain answered, and whether rung 2 and rung 3 disagreed. Reaches the detail pane, never the list.
+Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2 and rung 3 disagreed, and why an entity's own `.gitmodules` failed to read or parse, if it did. Reaches the detail pane, never the list.
 
 **Presence**:
 Whether an Entity is Present or Vanished from the Refresh that just ran.

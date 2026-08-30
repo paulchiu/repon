@@ -1,9 +1,13 @@
-//! The boundary-stop walk: a Set's roots in, the bounded list of Repo boundaries out.
+//! Discovery's two halves: the boundary-stop walk, and turning what it found into
+//! typed entities.
 //!
 //! See [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)
 //! and [ADR 0017](https://github.com/paulchiu/repon/blob/main/docs/adr/0017-discovery-stops-at-the-repo-boundary.md).
-//! Turning a boundary into a Repo, a Worktree or a Submodule, and reading `.gitmodules`,
-//! is later work; this module only finds the boundaries and bounds them by a Set's globs.
+//! [`discover`] finds Repo boundaries and bounds them by a Set's globs; [`resolve`]
+//! turns each boundary into a Repo or a Worktree and reads its `.gitmodules` one
+//! level deep to add its Submodules, testing each Submodule's own path against the
+//! same globs. Discovery returns one combined entity list either way: nothing
+//! records which half produced a given entry.
 
 use std::collections::HashSet;
 use std::fs;
@@ -12,7 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::entity::EntityKey;
+use crate::entity::{EntityKey, Kind};
+use crate::git;
 
 /// A Set's bounding specification, handed to the core as plain data: no TOML type, no file
 /// path, no `~` expansion left to do. [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)
@@ -73,6 +78,83 @@ pub(crate) fn discover_watched(spec: &SetSpec, progress: Arc<AtomicUsize>) -> Di
 /// error, so there is no `DiscoveryError` for this to return.
 pub fn count(spec: &SetSpec) -> usize {
     discover(spec).entities.len()
+}
+
+/// One Repo or Worktree boundary [`discover`] found, or a Submodule named by one
+/// of their own `.gitmodules` files: discovery's two halves return one list built
+/// from entries shaped like this, with nothing recording which half produced a
+/// given entry.
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredEntity {
+    pub key: EntityKey,
+    pub kind: Kind,
+    pub common_dir: Arc<Path>,
+}
+
+/// Discovery's second half: resolves every boundary's own Kind (Repo or Worktree)
+/// and common dir, then reads its `.gitmodules` one level deep, never recursing,
+/// to add its Submodules. Each Submodule's own absolute path is tested against
+/// `spec`'s globs exactly as a walked path is
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#sets)),
+/// even though it reaches the Set from `.gitmodules` rather than from the walk.
+///
+/// A boundary whose `.gitmodules` exists but will not read or parse contributes no
+/// Submodule rows for it and is named in the second, returned list, keyed by its
+/// own key with the failure message; that boundary's own entity is still returned
+/// untouched; the sole authority for what is a Submodule stays the file, never a
+/// gitlink read from the index.
+pub(crate) fn resolve(
+    spec: &SetSpec,
+    boundaries: &[EntityKey],
+) -> (Vec<DiscoveredEntity>, Vec<(EntityKey, String)>) {
+    let globs = Globs::compile(&spec.include, &spec.exclude);
+    let mut entities = Vec::with_capacity(boundaries.len());
+    let mut failures = Vec::new();
+
+    for key in boundaries {
+        let path = key.path();
+        let (kind, common_dir, submodules) = match git::resolve_boundary(path) {
+            Ok(resolved) => (resolved.kind, resolved.common_dir, resolved.submodules),
+            // A boundary the walk just found that will not even open is treated as
+            // an ordinary Repo with no Submodules rather than dropped: an opaque
+            // git-open failure surfaces later, on the branch probe that already
+            // reports it, not by discovery silently shrinking its own result.
+            Err(_) => (Kind::Repo, Arc::from(path.join(".git")), Ok(Vec::new())),
+        };
+
+        entities.push(DiscoveredEntity {
+            key: key.clone(),
+            kind,
+            common_dir: Arc::clone(&common_dir),
+        });
+
+        match submodules {
+            Ok(submodules) => {
+                for submodule in submodules {
+                    let submodule_path = path.join(&submodule.relative_path);
+                    let submodule_path =
+                        fs::canonicalize(&submodule_path).unwrap_or(submodule_path);
+                    if !globs.admits(&submodule_path) {
+                        continue;
+                    }
+                    // A Submodule's own git dir, once initialised, lives at
+                    // `<parent common dir>/modules/<name>`
+                    // ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)),
+                    // never the parent's own common dir.
+                    let submodule_common_dir =
+                        common_dir.join("modules").join(submodule.name.as_ref());
+                    entities.push(DiscoveredEntity {
+                        key: EntityKey::new(Arc::from(submodule_path.as_path())),
+                        kind: Kind::Submodule,
+                        common_dir: Arc::from(submodule_common_dir),
+                    });
+                }
+            }
+            Err(error) => failures.push((key.clone(), error.to_string())),
+        }
+    }
+
+    (entities, failures)
 }
 
 /// A directory is a boundary when it holds a `.git` entry, file or directory form alike.
@@ -550,5 +632,168 @@ mod tests {
 
         assert!(paths(&discovery).is_empty());
         assert!(!discovery.abandoned);
+    }
+
+    /// Hand-writes a `.gitmodules` file naming one submodule, rather than running
+    /// `git submodule add` against a real remote, so the fixture stays hermetic.
+    fn write_gitmodules(repo: &Path, name: &str, path: &str) {
+        fs::write(
+            repo.join(".gitmodules"),
+            format!(
+                "[submodule \"{name}\"]\n\tpath = {path}\n\turl = https://example.com/{name}.git\n"
+            ),
+        )
+        .expect("write .gitmodules");
+    }
+
+    fn resolved_paths(entities: &[DiscoveredEntity]) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = entities
+            .iter()
+            .map(|entity| entity.key.path().to_path_buf())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// The defining behaviour: a Submodule is found by reading its parent's
+    /// `.gitmodules`, never by the walk descending into the parent's working tree.
+    /// The submodule's own directory holds decoy subdirectories the walk would
+    /// have visited had it ever looked, so a low `directories_visited` count and
+    /// the Submodule entity still turning up together prove reading rather than
+    /// walking, rather than merely asserting the final entity count.
+    #[test]
+    fn a_submodule_is_found_by_reading_gitmodules_with_the_walk_never_descending_to_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        write_gitmodules(&outer, "lib", "vendor/lib");
+
+        let submodule_dir = outer.join("vendor").join("lib");
+        for i in 0..50 {
+            let leaf = submodule_dir.join(format!("dir-{i}")).join("a").join("b");
+            fs::create_dir_all(&leaf).expect("create decoy tree inside the submodule");
+        }
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+
+        // Only the temp root and `outer` itself are ever visited: the walk stops
+        // the instant it sees `outer`'s `.git` and never looks inside its working
+        // tree, so the 50 decoy directories under the submodule's own path are
+        // never touched.
+        assert!(
+            discovery.directories_visited <= 2,
+            "expected the walk to stop at the outer boundary without looking inside \
+             the submodule's directory, visited {} directories",
+            discovery.directories_visited
+        );
+
+        let (entities, failures) = resolve(&set, &discovery.entities);
+
+        assert!(failures.is_empty());
+        let submodule_path = fs::canonicalize(&submodule_dir).expect("submodule dir exists");
+        assert_eq!(resolved_paths(&entities), {
+            let mut expected = vec![outer.clone(), submodule_path.clone()];
+            expected.sort();
+            expected
+        });
+        let submodule = entities
+            .iter()
+            .find(|entity| entity.key.path() == submodule_path)
+            .expect("submodule entity present");
+        assert!(matches!(submodule.kind, Kind::Submodule));
+        let parent = entities
+            .iter()
+            .find(|entity| entity.key.path() == outer)
+            .expect("parent entity present");
+        assert!(matches!(parent.kind, Kind::Repo));
+    }
+
+    /// Submodules are hidden by default in the TUI (ADR 0009), but this crate has
+    /// no notion of "shown" at all: `resolve` takes no flag that could suppress a
+    /// Submodule, so one it finds is always part of the returned entity list.
+    /// Hiding is a consumer-only display concern layered on top of what this
+    /// crate always discovers ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md#showing-submodules)).
+    #[test]
+    fn a_submodule_is_always_returned_even_though_nothing_here_can_hide_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        write_gitmodules(&outer, "lib", "vendor/lib");
+        fs::create_dir_all(outer.join("vendor").join("lib")).expect("create submodule dir");
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+        let (entities, _) = resolve(&set, &discovery.entities);
+
+        assert!(
+            entities
+                .iter()
+                .any(|entity| matches!(entity.kind, Kind::Submodule)),
+            "a discovered Submodule must be present in the returned list with no way to suppress it"
+        );
+    }
+
+    /// A Submodule's own absolute path is tested against a Set's globs the same
+    /// way a walked path is, even though it reaches the Set from `.gitmodules`
+    /// rather than from the walk ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#sets)).
+    #[test]
+    fn an_exclude_glob_covering_a_submodules_path_excludes_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        write_gitmodules(&outer, "lib", "vendor/lib");
+        fs::create_dir_all(outer.join("vendor").join("lib")).expect("create submodule dir");
+
+        let mut set = spec(vec![root_dir.clone()]);
+        set.exclude = vec!["**/vendor/**".to_string()];
+        let discovery = discover(&set);
+
+        let (entities, failures) = resolve(&set, &discovery.entities);
+
+        assert!(failures.is_empty());
+        assert!(
+            !entities
+                .iter()
+                .any(|entity| matches!(entity.kind, Kind::Submodule)),
+            "an exclude glob covering the submodule's own path must keep it out of the result"
+        );
+        assert!(
+            entities.iter().any(|entity| entity.key.path() == outer),
+            "the exclude glob targets only the submodule's path, not its parent"
+        );
+    }
+
+    /// A `.gitmodules` that will not parse marks its parent as failed and yields
+    /// no Submodule rows for it, without dropping the parent's own entity.
+    #[test]
+    fn an_unparseable_gitmodules_file_is_reported_as_a_failure_with_no_submodule_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        // An unterminated section header: not valid git-config syntax.
+        fs::write(
+            outer.join(".gitmodules"),
+            "[submodule \"lib\"\n\tpath = lib\n",
+        )
+        .expect("write malformed .gitmodules");
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+
+        let (entities, failures) = resolve(&set, &discovery.entities);
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0.path(), outer);
+        assert!(
+            !entities
+                .iter()
+                .any(|entity| matches!(entity.kind, Kind::Submodule))
+        );
+        assert!(entities.iter().any(|entity| entity.key.path() == outer));
     }
 }

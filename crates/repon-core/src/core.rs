@@ -364,16 +364,28 @@ fn start_internal(
     let discovery = discovery::discover_watched(&spec.set, Arc::clone(&progress));
     finished.store(true, Ordering::Release);
 
-    let mut entities = Vec::with_capacity(discovery.entities.len());
-    let mut index = HashMap::with_capacity(discovery.entities.len());
-    for key in discovery.entities {
-        let name = display_name(key.path());
-        // A per-Worktree common dir needs discovery's second half (linked
-        // Worktrees and Submodules), which is later work; every entity here is
-        // assumed a plain Repo, so its own `.git` is its common dir.
-        let common_dir: Arc<Path> = Arc::from(key.path().join(".git"));
-        index.insert(key.clone(), entities.len());
-        entities.push(EntityState::new(key, name, common_dir, Kind::Repo));
+    // Discovery's second half: every boundary the walk just found becomes a Repo
+    // or a Worktree, and each one's own `.gitmodules` (never recursed into) names
+    // its Submodules. One combined list, with nothing recording which half
+    // produced a given entry.
+    let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
+
+    let mut entities = Vec::with_capacity(discovered.len());
+    let mut index = HashMap::with_capacity(discovered.len());
+    for discovered in discovered {
+        let name = display_name(discovered.key.path());
+        index.insert(discovered.key.clone(), entities.len());
+        entities.push(EntityState::new(
+            discovered.key,
+            name,
+            discovered.common_dir,
+            discovered.kind,
+        ));
+    }
+    for (key, message) in gitmodules_failures {
+        if let Some(&idx) = index.get(&key) {
+            entities[idx].diagnostics.gitmodules_failed = Some(Arc::from(message.as_str()));
+        }
     }
 
     let table = Arc::new(RwLock::new(Table {
@@ -810,6 +822,125 @@ mod tests {
         );
         assert!(settled.entities[0].branch.is_in_flight());
         drop(tick_tx);
+    }
+
+    /// The defining behaviour: a linked Worktree shares its parent's object store
+    /// and remotes, but `Core` must still surface it as its own row rather than
+    /// folding it into the Repo it is attached to. A real `git worktree add` is run
+    /// against a genuine parent so the proof covers git's actual on-disk shape, not
+    /// a hand-built stand-in for it.
+    #[test]
+    fn a_linked_worktree_is_its_own_entity_and_never_doubles_as_a_repo() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree_path = root.join("feature-worktree");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&parent)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ])
+            .status()
+            .expect("run git worktree add");
+        assert!(status.success());
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "expected the parent plus one Worktree, not two Repos"
+        );
+        let repo_count = snapshot
+            .entities
+            .iter()
+            .filter(|entity| matches!(entity.kind, Kind::Repo))
+            .count();
+        let worktree_count = snapshot
+            .entities
+            .iter()
+            .filter(|entity| matches!(entity.kind, Kind::Worktree))
+            .count();
+        assert_eq!(
+            repo_count, 1,
+            "the parent must be counted as exactly one Repo"
+        );
+        assert_eq!(
+            worktree_count, 1,
+            "the linked worktree must be counted as exactly one Worktree"
+        );
+
+        let worktree_entity = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        let repo_entity = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Repo))
+            .expect("repo entity present");
+        assert_eq!(worktree_entity.common_dir, repo_entity.common_dir);
+
+        // Each carries its own branch: the parent stayed on its default branch and
+        // the worktree checked out `feature`.
+        let repo_branch = core.probe_now(&repo_entity.key);
+        let worktree_branch = core.probe_now(&worktree_entity.key);
+        match (
+            repo_branch.branch.settled(),
+            worktree_branch.branch.settled(),
+        ) {
+            (
+                Some(Settled::Known {
+                    value: Head::Branch(repo_name),
+                    ..
+                }),
+                Some(Settled::Known {
+                    value: Head::Branch(worktree_name),
+                    ..
+                }),
+            ) => {
+                assert_ne!(repo_name, worktree_name);
+                assert_eq!(&**worktree_name, "feature");
+            }
+            other => panic!("expected both entities to read an attached branch, got {other:?}"),
+        }
+    }
+
+    /// Submodules are hidden by default in the TUI (ADR 0009), but `Core` has no
+    /// preference to read and no flag anywhere on `CoreSpec` that could suppress
+    /// one: a discovered Submodule is always part of the snapshot `Core::start`
+    /// builds, whether or not anything downstream chooses to show it.
+    #[test]
+    fn a_submodule_is_in_the_snapshot_even_though_core_has_no_way_to_hide_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+
+        assert!(
+            snapshot
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.kind, Kind::Submodule)),
+            "a discovered Submodule must be in the snapshot with nothing able to hide it"
+        );
     }
 
     #[test]

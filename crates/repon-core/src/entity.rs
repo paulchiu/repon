@@ -103,6 +103,9 @@ pub struct Diagnostics {
     pub default_branch_rung: Option<u8>,
     /// Whether rung 2's answer disagreed with rung 3's.
     pub default_branch_rung_disagreement: bool,
+    /// Why this entity's own `.gitmodules` would not read or parse, if it has one
+    /// and it failed; `None` covers both "no `.gitmodules`" and "read cleanly".
+    pub gitmodules_failed: Option<Arc<str>>,
 }
 
 /// The most recent Action run against this Entity.
