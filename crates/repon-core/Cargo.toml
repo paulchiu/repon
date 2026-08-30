@@ -19,6 +19,9 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [dependencies]
 crossbeam-channel.workspace = true
+# Matched against a Set's roots case-sensitively, per docs/spec/config.md; discovery's
+# boundary walk is the sole consumer.
+globset = "0.4.20"
 # Read-only surface by choice: gix's defaults would pull in mutation, merge, blame,
 # archive and credentials, none of which this crate is allowed to do.
 gix = { version = "0.87.1", default-features = false, features = [

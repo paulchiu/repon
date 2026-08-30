@@ -32,11 +32,21 @@ The work done across many Repos: seeing their combined state, and acting on many
 A named, saved predicate over Repos, defined in config and selectable by flag or environment variable. Seeded from directory structure so Repon is useful with no config at all.
 _Avoid_: Group, workspace, project
 
+**Set spec**:
+A Set's bounding specification as the core receives it: roots, include and exclude globs, plain data with no TOML type and no file path.
+_Avoid_: SetConfig (that names the consumer's parsed TOML shape, not the core's)
+
 **Filter**:
 A transient predicate that narrows the visible rows. A Filter never mutates the Selection.
 
 **Selection**:
 The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.
+
+### Discovery
+
+**Discovery**:
+The boundary-stop walk that turns a Set's roots into the list of Repo boundaries the core builds Entities from. Stops at each boundary rather than descending into it, follows a directory symlink only when its target is itself a boundary, and re-runs from scratch on every Generation.
+_Avoid_: Scan, crawl, index
 
 ### Acting
 

@@ -40,8 +40,7 @@ docs:
 # it is allowed, and the comparison set is derived from that pairing, so a crate
 # cannot be added here without recording why.
 #
-# Three later additions are already known and belong here when they land:
-#   - glob matching, for Set globs
+# Two later additions are already known and belong here when they land:
 #   - the PTY child, for setsid(2) and openpty(3)
 #   - the wire format, for the settled document on stdout
 # The terminal and rendering crates never belong here.
@@ -50,6 +49,7 @@ check-core-isolation:
     set -euo pipefail
     allowed_with_reasons=(
         "crossbeam-channel:the fan-out result channel between rayon workers and the core"
+        "globset:Set include/exclude glob matching in the discovery walk"
         "gix:the git backend this crate wraps"
         "rayon:the probe phases' worker pool"
     )
