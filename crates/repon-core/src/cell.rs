@@ -17,8 +17,7 @@ use crate::git::ProbeError;
 pub struct Generation(u64);
 
 impl Generation {
-    /// Wraps a raw counter value.
-    #[allow(dead_code)] // no minter until Core::refresh drives a real counter
+    /// Wraps a raw counter value. `Core::refresh` is the one minter of a real one.
     pub(crate) fn new(value: u64) -> Self {
         Generation(value)
     }
@@ -158,7 +157,6 @@ impl<T> Cell<T> {
     }
 
     /// Marks a probe as started, leaving any previous settled value untouched.
-    #[allow(dead_code)] // no caller until Core::refresh drives real probes
     pub(crate) fn begin_probe(&mut self) {
         self.in_flight = true;
     }
@@ -166,7 +164,6 @@ impl<T> Cell<T> {
     /// Records one probe's result for `generation`; dropped without effect if a
     /// later Generation has already written this cell, which is the write-time half
     /// of supersession.
-    #[allow(dead_code)] // no caller until Core::refresh drives real probes
     pub(crate) fn settle(&mut self, generation: Generation, settled: Settled<T>) {
         if generation < self.generation {
             return;

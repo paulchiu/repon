@@ -179,15 +179,7 @@ impl Core {
             let settle_gate = Arc::clone(&self.settle_gate);
             rayon::spawn(move || {
                 let outcome = probe_branch(&path, repo.as_deref(), &cancel);
-                let mut table = table_handle.write().unwrap();
-                if let Some(settled) = outcome
-                    && let Some(&idx) = table.index.get(&key)
-                {
-                    table.entities[idx].branch.settle(generation, settled);
-                }
-                table.in_flight.remove(&key);
-                drop(table);
-                complete_one(&settle_gate);
+                apply_probe_outcome(&table_handle, &settle_gate, key, generation, outcome);
             });
         }
 
@@ -359,6 +351,59 @@ impl Core {
         let (lock, _cvar) = &*self.settle_gate;
         *lock.lock().unwrap() += 1;
         cancel
+    }
+
+    /// Puts several already-known entities into the in-flight state of one shared
+    /// Generation, without spawning anything to complete them and without
+    /// touching the settle gate, so a test can drive per-entity supersession
+    /// directly: which keys a later real `refresh` does and does not cover, and
+    /// what happens to each one's own cancel flag and eventual result.
+    pub(crate) fn begin_shared_generation_for_test(
+        &self,
+        keys: &[EntityKey],
+    ) -> HashMap<EntityKey, Arc<AtomicBool>> {
+        let mut table = self.table.write().unwrap();
+        table.generation += 1;
+        let generation_number = table.generation;
+        table
+            .generation_started_at
+            .insert(generation_number, Instant::now());
+        let mut cancels = HashMap::new();
+        for key in keys {
+            if let Some(&idx) = table.index.get(key) {
+                table.entities[idx].branch.begin_probe();
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            table.in_flight.insert(
+                key.clone(),
+                InFlight {
+                    generation: generation_number,
+                    cancel: Arc::clone(&cancel),
+                },
+            );
+            cancels.insert(key.clone(), cancel);
+        }
+        cancels
+    }
+
+    /// Lands one probe result for `key` at `generation` through the exact same
+    /// path a real dispatched probe's completion takes
+    /// ([`apply_probe_outcome`]), so a test can simulate a result arriving late,
+    /// out of Generation order, without a second, weaker implementation of the
+    /// write-time supersession check.
+    pub(crate) fn apply_probe_result_for_test(
+        &self,
+        key: &EntityKey,
+        generation: Generation,
+        settled: Settled<Head>,
+    ) {
+        apply_probe_outcome(
+            &self.table,
+            &self.settle_gate,
+            key.clone(),
+            generation,
+            Some(settled),
+        );
     }
 }
 
@@ -601,6 +646,30 @@ fn probe_branch(
         },
         Err(error) => Settled::Failed(error),
     })
+}
+
+/// Lands one probe's outcome for `key` at `generation`: writes it to the branch
+/// cell subject to the per-cell supersession `Cell::settle` already enforces,
+/// clears `key` from the table's in-flight set and signals `settle_gate`. The one
+/// place a dispatched probe's result and a test's simulated late result both go
+/// through, so a test can land a result out of order without duplicating this
+/// bookkeeping.
+fn apply_probe_outcome(
+    table: &Arc<RwLock<Table>>,
+    settle_gate: &Arc<(Mutex<usize>, Condvar)>,
+    key: EntityKey,
+    generation: Generation,
+    outcome: Option<Settled<Head>>,
+) {
+    let mut table = table.write().unwrap();
+    if let Some(settled) = outcome
+        && let Some(&idx) = table.index.get(&key)
+    {
+        table.entities[idx].branch.settle(generation, settled);
+    }
+    table.in_flight.remove(&key);
+    drop(table);
+    complete_one(settle_gate);
 }
 
 /// A basename read from the entity's own resolved path. A real display name has
@@ -962,6 +1031,254 @@ mod tests {
         );
         assert!(settled.entities[0].branch.is_in_flight());
         drop(tick_tx);
+    }
+
+    /// Per-entity supersession, not global. Generation 1 covers two entities, A
+    /// and B, both simulated as still in flight. A Selection-scoped Generation 2
+    /// covers only A: A's own Generation-1 interrupt flag must be set, and B's
+    /// must not, since Generation 2 never mentions B. Once Generation 2 has
+    /// written A's cell, A's slow Generation-1 result finally arrives and must be
+    /// dropped there; B's own Generation-1 result, arriving after everything
+    /// else, must still be accepted, because Generation 2 never superseded it.
+    ///
+    /// This is exactly the distinction a global-current-Generation comparison
+    /// would get wrong: such a check compares every write against the table's one
+    /// counter (2, after this test's second `refresh`), so B's Generation-1
+    /// result (1 < 2) would be wrongly dropped even though nothing ever
+    /// superseded B specifically. Before `Cell::settle`'s comparison was wired
+    /// against the cell's own recorded Generation this test failed exactly there:
+    /// B's late result was rejected, which is precisely the "cannot strand the
+    /// rows it never spoke for" defect the ticket names.
+    #[test]
+    fn a_selection_scoped_refresh_supersedes_only_the_entity_it_covers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("a"));
+        init_repo_with_a_commit(&root.join("b"));
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let key_a = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "a")
+            .expect("entity a discovered")
+            .key
+            .clone();
+        let key_b = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "b")
+            .expect("entity b discovered")
+            .key
+            .clone();
+
+        // Generation 1, simulated: both A and B are mid-flight, with nothing
+        // spawned to complete either one, so the test controls exactly when each
+        // one's result lands.
+        let gen1_cancels = core.begin_shared_generation_for_test(&[key_a.clone(), key_b.clone()]);
+
+        // A Selection-scoped refresh over A alone: Generation 2.
+        let generation_2 = core.refresh(std::slice::from_ref(&key_a));
+        assert_eq!(generation_2, Generation::new(2));
+        let after_refresh = core.settle(Duration::from_millis(500));
+
+        assert!(
+            gen1_cancels[&key_a].load(Ordering::Acquire),
+            "the entity the new Generation covers must have its old interrupt flag set"
+        );
+        assert!(
+            !gen1_cancels[&key_b].load(Ordering::Acquire),
+            "an entity the new Generation does not cover must be left running, untouched"
+        );
+
+        let a_after_gen2 = after_refresh
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_a)
+            .expect("entity a present");
+        assert!(
+            matches!(
+                a_after_gen2.branch.settled(),
+                Some(Settled::Known {
+                    value: Head::Branch(_),
+                    ..
+                })
+            ),
+            "Generation 2's real probe should have written A's cell by now"
+        );
+
+        // A's slow Generation-1 result finally arrives, after Generation 2 has
+        // already written the cell: dropped, since 1 is lower than the
+        // Generation already recorded there.
+        core.apply_probe_result_for_test(
+            &key_a,
+            Generation::new(1),
+            Settled::Known {
+                value: Head::Branch(Arc::from("stale-from-generation-one")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        let after_stale_write = core.snapshot();
+        let a_final = after_stale_write
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_a)
+            .expect("entity a present");
+        match a_final.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => assert_ne!(
+                &**name, "stale-from-generation-one",
+                "a lower-Generation result must be dropped at the cell it would write"
+            ),
+            other => panic!("expected A to still hold Generation 2's value, got {other:?}"),
+        }
+
+        // B's own Generation-1 result, landing last of all, is still accepted:
+        // Generation 2 never covered B, so nothing superseded it.
+        core.apply_probe_result_for_test(
+            &key_b,
+            Generation::new(1),
+            Settled::Known {
+                value: Head::Branch(Arc::from("b-generation-one-result")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        let final_snapshot = core.snapshot();
+        let b_final = final_snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_b)
+            .expect("entity b present");
+        match b_final.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => assert_eq!(
+                &**name, "b-generation-one-result",
+                "an entity the new Generation never covered must still accept its own result"
+            ),
+            other => panic!(
+                "expected B's un-superseded Generation-1 result to be accepted, got {other:?}"
+            ),
+        }
+    }
+
+    /// The deadline sweep abandons only what is still Loading when it fires. An
+    /// entity already settled by the time the deadline sweep runs keeps its value
+    /// untouched, blanking nothing, while a different entity still mid-flight in
+    /// the same sweep becomes Unknown with the timed-out reason.
+    #[test]
+    fn the_deadline_sweep_keeps_already_settled_cells_and_only_times_out_what_is_still_loading() {
+        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("a"));
+        init_repo_with_a_commit(&root.join("b"));
+
+        let mut spec = spec(vec![root]);
+        spec.generation_deadline = Duration::ZERO;
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let core = started.core;
+        let snapshot = core.snapshot();
+        let key_a = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "a")
+            .expect("entity a discovered")
+            .key
+            .clone();
+        let key_b = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "b")
+            .expect("entity b discovered")
+            .key
+            .clone();
+
+        // A is already settled, synchronously, before the deadline ever has a
+        // chance to fire.
+        let a_settled = core.probe_now(&key_a);
+        let a_value_before = match a_settled.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => Arc::clone(name),
+            other => panic!("expected A's synchronous probe to settle a branch, got {other:?}"),
+        };
+
+        // B is left mid-flight, in a Generation whose (zero) deadline has already
+        // elapsed in real time, but the sweep has not run yet: no tick has been
+        // sent.
+        let cancel_b = core.begin_untracked_probe_for_test(&key_b);
+        let before_tick = core.snapshot();
+        let b_before = before_tick
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_b)
+            .expect("entity b present");
+        assert!(b_before.branch.settled().is_none());
+        assert!(b_before.branch.is_in_flight());
+
+        tick_tx.send(Instant::now()).expect("send one tick");
+        let after_sweep = core.settle(Duration::from_millis(500));
+
+        let a_after = after_sweep
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_a)
+            .expect("entity a present");
+        match a_after.branch.settled() {
+            Some(Settled::Known {
+                value: Head::Branch(name),
+                ..
+            }) => assert_eq!(
+                name, &a_value_before,
+                "an already-settled cell must keep its value when the deadline sweep runs, not be blanked"
+            ),
+            other => panic!("expected A's settled value to survive the sweep, got {other:?}"),
+        }
+
+        let b_after = after_sweep
+            .entities
+            .iter()
+            .find(|entity| entity.key == key_b)
+            .expect("entity b present");
+        assert!(matches!(
+            b_after.branch.settled(),
+            Some(Settled::Unknown(Unknown::TimedOut))
+        ));
+        assert!(
+            !cancel_b.load(Ordering::Acquire),
+            "the deadline sweep marks a cell Unknown; it never sets the entity's own \
+             cancel flag, since the underlying probe (nonexistent here) is left to keep running"
+        );
+    }
+
+    /// Cancellation observed before a probe's very first read stops it from ever
+    /// opening the repository at all, proven behaviourally rather than by
+    /// re-reading the flag: a path that does not exist would settle as
+    /// `Failed(Open(_))` if the open call actually ran, so getting `None` back
+    /// instead is only possible if the read never started. This is the honest
+    /// limit of what phase A can prove: `git::head_shape` is one syscall with no
+    /// interruption point mid-read, so cancellation here stops work that has not
+    /// started rather than work already running; a genuinely interruptible phase
+    /// (gix `status`, taking `should_interrupt` directly) is later work.
+    #[test]
+    fn a_cancelled_probe_never_opens_the_repository_at_all() {
+        let cancel = AtomicBool::new(true);
+
+        let outcome = probe_branch(Path::new("/nonexistent/nowhere-at-all"), None, &cancel);
+
+        assert!(
+            outcome.is_none(),
+            "a probe observing cancellation before its first read must do no work \
+             at all, not attempt the read and fail having tried it"
+        );
     }
 
     /// The defining behaviour: a linked Worktree shares its parent's object store

@@ -200,4 +200,49 @@ mod tests {
             );
         }
     }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_dir() {
+                files.extend(rust_source_files(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// `gix::interrupt::IS_INTERRUPTED` is a process-global static wired to
+    /// SIGINT; using it would cancel every entity's probe at once, defeating the
+    /// one `Arc<AtomicBool>` per in-flight entity [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Cancellation" requires. Scans every source file under `src`, not just
+    /// `core.rs`, so a future module reaching for it is caught too. A line only
+    /// counts as real usage when it is not a comment, which is what lets doc
+    /// comments (this crate's own, explaining the ban) keep naming it.
+    #[test]
+    fn gix_interrupt_is_interrupted_is_never_used() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Built from two pieces rather than written as one path literal, so this
+        // check's own source line is never itself a match for what it scans for.
+        let banned = format!("interrupt::{}", "IS_INTERRUPTED");
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&banned) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "gix's process-global interrupt static must never be used outside a comment, found at: {offending_locations:?}"
+        );
+    }
 }
