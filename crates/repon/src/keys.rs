@@ -172,12 +172,10 @@ const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 
 /// Ctrl+I, Ctrl+M and Ctrl+[, permanently unbindable per
 /// [keybindings.md](../../../../docs/spec/keybindings.md#modifiers-and-matching) and
-/// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md): a terminal
-/// speaking the fixterms/CSI-u convention delivers them as `Char` plus CONTROL, while every
-/// other terminal delivers them as `Tab`, `Enter` and `Esc` with no CONTROL at all, so the
-/// same binding would mean two different keys depending on the user's terminal. This is the
-/// one place the three are named; a future user-configurable map should reject a candidate
-/// binding against this list rather than restating it.
+/// [ADR 0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md): a
+/// fixterms/CSI-u terminal delivers them as `Char` plus CONTROL, while every other terminal
+/// delivers `Tab`, `Enter` and `Esc` with no CONTROL, so the same binding would mean two
+/// different keys depending on the terminal.
 pub(crate) const PERMANENTLY_UNBINDABLE: [(KeyCode, KeyModifiers); 3] = [
     (KeyCode::Char('i'), CTRL),
     (KeyCode::Char('m'), CTRL),
@@ -446,6 +444,41 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Confirm, KeyCode::Esc, NONE, Action::Decline),
 ];
 
+/// `const fn` equality for the one shape [`PERMANENTLY_UNBINDABLE`] ever names, a `Char`; a
+/// non-`Char` code can never collide with a banned chord and short-circuits to `false`.
+const fn is_the_same_char_code(a: KeyCode, b: KeyCode) -> bool {
+    matches!((a, b), (KeyCode::Char(x), KeyCode::Char(y)) if x as u32 == y as u32)
+}
+
+/// `const fn` proof that no row in [`BINDINGS`] names a [`PERMANENTLY_UNBINDABLE`] chord,
+/// asserted below at build time rather than by a test, since both tables are `const` and the
+/// question is decidable at compile time.
+const fn any_binding_is_permanently_unbindable(bindings: &[Binding]) -> bool {
+    let mut i = 0;
+    while i < bindings.len() {
+        let (_, code, modifiers, _) = bindings[i];
+        let mut j = 0;
+        while j < PERMANENTLY_UNBINDABLE.len() {
+            let (banned_code, banned_modifiers) = PERMANENTLY_UNBINDABLE[j];
+            if is_the_same_char_code(code, banned_code)
+                && modifiers.bits() == banned_modifiers.bits()
+            {
+                return true;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+const _: () = {
+    assert!(
+        !any_binding_is_permanently_unbindable(BINDINGS),
+        "the default map binds a permanently unbindable chord"
+    );
+};
+
 /// The one place a key event becomes an [`Action`]: a pure function of the focused
 /// [`Context`] and the event, so routing is testable with no terminal and no running app.
 ///
@@ -462,28 +495,15 @@ pub(crate) fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
     }
 }
 
-/// Refuses [`PERMANENTLY_UNBINDABLE`] before consulting [`BINDINGS`], so the guarantee holds
-/// even if a future edit to the table adds one of the three by mistake, not only when this
-/// module's own property test happens to be run.
+/// Consults [`BINDINGS`] alone: [`PERMANENTLY_UNBINDABLE`] is refused for every row at build
+/// time (see the `const _` assertion above), so no row here can ever name one.
 fn lookup(context: Context, key: KeyEvent) -> Option<Action> {
-    if is_permanently_unbindable(key.code, key.modifiers) {
-        return None;
-    }
     BINDINGS
         .iter()
         .find(|(row_context, code, modifiers, _)| {
             *row_context == context && *code == key.code && *modifiers == key.modifiers
         })
         .map(|(_, _, _, action)| *action)
-}
-
-/// Whether `code`/`modifiers` names one of the three [`PERMANENTLY_UNBINDABLE`] chords.
-fn is_permanently_unbindable(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    PERMANENTLY_UNBINDABLE
-        .iter()
-        .any(|(banned_code, banned_modifiers)| {
-            *banned_code == code && *banned_modifiers == modifiers
-        })
 }
 
 /// A character an input field can hold: printable, and typed with at most the modifier an
@@ -608,31 +628,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_default_map_binds_none_of_the_permanently_unbindable_chords() {
-        for (_, code, modifiers, _) in BINDINGS {
-            for (banned_code, banned_modifiers) in PERMANENTLY_UNBINDABLE {
-                assert!(
-                    !(*code == banned_code && *modifiers == banned_modifiers),
-                    "the default map binds {code:?} with {modifiers:?}, which is permanently \
-                     unbindable"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn is_permanently_unbindable_matches_exactly_the_three_named_chords() {
-        for (code, modifiers) in PERMANENTLY_UNBINDABLE {
-            assert!(is_permanently_unbindable(code, modifiers));
-        }
-        // A bound chord, and the bare keys these three arrive as on every terminal but the
-        // ones speaking fixterms/CSI-u, must not be caught by the same guard.
-        assert!(!is_permanently_unbindable(KeyCode::Char('q'), NONE));
-        assert!(!is_permanently_unbindable(KeyCode::Tab, NONE));
-        assert!(!is_permanently_unbindable(KeyCode::Enter, NONE));
-        assert!(!is_permanently_unbindable(KeyCode::Esc, NONE));
-    }
+    // `BINDINGS` never naming a `PERMANENTLY_UNBINDABLE` chord is proven at compile time by
+    // the `const _` assertion beside `any_binding_is_permanently_unbindable`, not by a test.
 
     // --- context gating: the negative tests the brief calls out by name ---
 
@@ -853,28 +850,52 @@ mod tests {
         files
     }
 
+    /// A file's production half only: everything before the line that is exactly the
+    /// `#[cfg(test)]` attribute directly ahead of `mod tests`. Cuts at the trailing tests
+    /// module rather than the first `#[cfg(test)]`, since a doc comment can name the
+    /// attribute in prose or a lone item can be test-gated ahead of the module; a file with
+    /// no such module is scanned whole.
+    fn production_source(path: &std::path::Path) -> String {
+        let source = std::fs::read_to_string(path).expect("read a crate source file");
+        let lines: Vec<&str> = source.lines().collect();
+        let tests_module = lines.iter().enumerate().position(|(index, line)| {
+            line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+        });
+        let mut production = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if Some(index) == tests_module {
+                break;
+            }
+            production.push_str(line);
+            production.push('\n');
+        }
+        production
+    }
+
     /// This module is the only place a `KeyCode` or `KeyModifiers` literal may appear as
     /// part of a binding; everywhere a binding is meant, code must go through [`dispatch`].
-    /// Scans every source file under `src` except this one, so a binding restated in
-    /// `app.rs` or a future component is caught the same way `app.rs`'s own
+    /// Scans every source file's production half under `src` except this one, so a binding
+    /// restated in `app.rs` or a future component is caught the same way `app.rs`'s own
     /// `no_select_macro_is_used_anywhere_in_this_crates_source` catches a banned pattern.
     /// Built from two pieces, as that test's `banned` string is, so this line is never a
-    /// self-match once this file is excluded from the scan. `tui.rs` is also exempted: its
-    /// own test constructs a raw `KeyEvent` to check crossterm's event-*kind* filtering
-    /// (press versus repeat versus release), which is about event delivery, not a binding.
+    /// self-match once this file is excluded from the scan. Scanning only the production
+    /// half (rather than exempting a whole file) is what lets `tui.rs` keep its own test,
+    /// which constructs a raw `KeyEvent` to check crossterm's event-*kind* filtering (press
+    /// versus repeat versus release, which is about event delivery, not a binding), while
+    /// still catching a binding written into `tui.rs`'s production code.
     #[test]
     fn no_key_literal_is_written_outside_this_table() {
         let banned = [format!("{}::", "KeyCode"), format!("{}::", "KeyModifiers")];
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            if path
-                .file_name()
-                .is_some_and(|name| name == "keys.rs" || name == "tui.rs")
-            {
+            if path.file_name().is_some_and(|name| name == "keys.rs") {
                 continue;
             }
-            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            let source = production_source(&path);
             for (number, line) in source.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;

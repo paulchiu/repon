@@ -14,13 +14,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 // Safety contract: every call site below passes a valid, currently-open fd and, for
-// `ptsname_r`, a buffer at least as long as the `buflen` it also passes.
+// `ptsname_r`, a buffer at least as long as the `buflen` it also passes. `waitpid`'s contract
+// is the same as its libc signature: `pid` names a still-live child of this process and
+// `status` is a valid out-pointer for the duration of the call.
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
     fn unlockpt(fd: c_int) -> c_int;
     fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
+
+/// POSIX-standard on both macOS and Linux: also report a stopped child, not only an exited
+/// one.
+const WUNTRACED: c_int = 2;
 
 const O_RDWR: c_int = 2;
 #[cfg(target_os = "macos")]
@@ -48,9 +55,9 @@ fn open_pty() -> (File, String) {
     (master, slave_path)
 }
 
-/// Spawns `repon --panic-after-tui-enter` with the pty slave wired to all three standard
-/// streams, the same shape a real terminal session gives it.
-fn spawn_attached_to_pty(slave_path: &str) -> std::process::Child {
+/// Spawns `repon <flag>` with the pty slave wired to all three standard streams, the same
+/// shape a real terminal session gives it.
+fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
     let stdin = OpenOptions::new()
         .read(true)
         .write(true)
@@ -60,12 +67,12 @@ fn spawn_attached_to_pty(slave_path: &str) -> std::process::Child {
     let stderr = stdin.try_clone().expect("clone pty slave for stderr");
 
     Command::new(env!("CARGO_BIN_EXE_repon"))
-        .arg("--panic-after-tui-enter")
+        .arg(flag)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("spawn repon --panic-after-tui-enter")
+        .unwrap_or_else(|error| panic!("spawn repon {flag}: {error}"))
 }
 
 /// The ANSI bytes crossterm itself would emit for `command`, so an expectation here comes
@@ -77,10 +84,16 @@ fn ansi(command: impl crossterm::Command) -> String {
     buf
 }
 
+/// Whether a `waitpid` status reports the child stopped (`WIFSTOPPED`), the same test macro
+/// on both macOS and Linux.
+fn wifstopped(status: c_int) -> bool {
+    (status & 0xff) == 0x7f
+}
+
 #[test]
 fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_panics() {
     let (mut master, slave_path) = open_pty();
-    let mut child = spawn_attached_to_pty(&slave_path);
+    let mut child = spawn_attached_to_pty(&slave_path, "--panic-after-tui-enter");
 
     // Drains the pty concurrently with the child rather than after `wait()`, which would
     // race the master's end-of-file against bytes still buffered when every slave fd closes.
@@ -170,6 +183,81 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     assert!(
         focus_off_at < paste_off_at && paste_off_at < leave_at,
         "the panic-time restore must be the enter sequence's mirror image, focus first: \
+         {output:?}"
+    );
+}
+
+/// `Tui::suspend` must restore the terminal *before* raising `SIGTSTP`: raw mode clears the
+/// signal-generating flag, so a process that stops first leaves the user's terminal broken
+/// until it is resumed. Proves the ordering by watching a real process stop (`waitpid` with
+/// `WUNTRACED`, since the child never receives a `SIGCONT` here) and checking the restore
+/// sequence already reached the pty by the time it does.
+#[test]
+fn suspend_restores_the_terminal_before_the_process_actually_stops() {
+    let (mut master, slave_path) = open_pty();
+    let mut child = spawn_attached_to_pty(&slave_path, "--suspend-after-tui-enter");
+    let pid = child.id() as c_int;
+
+    // Drains the pty concurrently, the same reason the panic test above does: reading only
+    // after the child stops would race the pty buffer against this thread's own timeout.
+    let (output_tx, output_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = output_tx.send(output);
+    });
+
+    // `waitpid` blocks, so it runs on its own thread and reports back over a channel, giving
+    // this test a bounded wait instead of a risk of hanging on a child that never stops.
+    let (stop_tx, stop_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut status: c_int = 0;
+        // Safety: `pid` is the child spawned above and is still alive; `status` is a valid
+        // local out-pointer for the duration of this call.
+        let rc = unsafe { waitpid(pid, &mut status, WUNTRACED) };
+        let _ = stop_tx.send((rc, status));
+    });
+
+    let (rc, status) = stop_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            let _ = child.kill();
+            panic!(
+                "waitpid did not report a state change within 5s; the child may never have \
+             stopped"
+            )
+        });
+    assert_eq!(
+        rc, pid,
+        "waitpid must report on the child this test spawned"
+    );
+    assert!(
+        wifstopped(status),
+        "expected the child to be stopped (WIFSTOPPED), got status {status:#x}"
+    );
+
+    // The child is confirmed stopped, not exited: SIGKILL terminates it outright without
+    // resuming it first, so the test does not depend on ever sending SIGCONT.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pty reader thread did not report back after the child was killed");
+    let _ = reader.join();
+    let output = String::from_utf8_lossy(&output);
+
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    assert!(
+        output.contains(&leave_alt),
+        "the terminal must be restored before the process stops, but no \
+         LeaveAlternateScreen appeared in the output collected while it was stopped: \
          {output:?}"
     );
 }
