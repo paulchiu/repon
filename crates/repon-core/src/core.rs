@@ -233,6 +233,14 @@ pub struct Core {
     /// Read only by `patch_identity_reads_for_test`.
     #[allow(dead_code)] // read only by patch_identity_reads_for_test
     patch_identity_reads: Arc<AtomicUsize>,
+    /// The bound each actually-run [`patch_equivalence::scan_default_branch`] call
+    /// this Generation was passed, one entry per common dir it ran for, in the
+    /// order those scans ran; cleared at the start of every `refresh`. Recorded
+    /// from inside `patch_identities_for`'s `compute` closure, so this is the value
+    /// the production call site used, not a value a test recomputes independently.
+    /// Read only by `patch_scan_bounds_for_test`.
+    #[allow(dead_code)] // read only by patch_scan_bounds_for_test
+    patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
 }
 
 impl Core {
@@ -263,6 +271,7 @@ impl Core {
         // still-finishing tasks holding their own clone of the old one.
         self.default_branch_chain_reads.store(0, Ordering::Release);
         self.patch_identity_reads.store(0, Ordering::Release);
+        self.patch_scan_bounds.lock().unwrap().clear();
 
         // Both halves of discovery re-run at the head of every Generation, per
         // refresh.md and discovery.md: an entity no longer found becomes
@@ -372,6 +381,7 @@ impl Core {
             let chain_reads = Arc::clone(&self.default_branch_chain_reads);
             let patch_cache = Arc::clone(&patch_cache);
             let patch_reads = Arc::clone(&self.patch_identity_reads);
+            let patch_scan_bounds = Arc::clone(&self.patch_scan_bounds);
             let bound_gates = Arc::clone(&bound_gates);
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
@@ -392,6 +402,7 @@ impl Core {
                     let memo = PatchEquivalenceMemo {
                         cache: &patch_cache,
                         reads: &patch_reads,
+                        scan_bounds: &patch_scan_bounds,
                     };
                     probe_worktree_state(
                         &path,
@@ -499,11 +510,13 @@ impl Core {
             // from: itself, so it never actually waits.
             let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
             let patch_reads = AtomicUsize::new(0);
+            let patch_scan_bounds = Mutex::new(Vec::new());
             let gate = BoundGate::new(1);
             let mut report = GateReport::new(&gate);
             let memo = PatchEquivalenceMemo {
                 cache: &patch_cache,
                 reads: &patch_reads,
+                scan_bounds: &patch_scan_bounds,
             };
             probe_worktree_state(
                 key.path(),
@@ -654,6 +667,16 @@ impl Core {
     /// gives the default-branch chain, for patch equivalence's own memo.
     pub(crate) fn patch_identity_reads_for_test(&self) -> usize {
         self.patch_identity_reads.load(Ordering::Acquire)
+    }
+
+    /// The bound each actually-run `scan_default_branch` call this Generation
+    /// used, one entry per common dir it ran for, in run order. Unlike
+    /// `patch_identity_reads_for_test`, which only proves a scan ran once per
+    /// common dir, this proves *what* it was bounded by: the deepest merge base
+    /// among the dispatched siblings, per `BoundGate::deepest`, rather than
+    /// whichever entity's own merge base happened to reach the scan first.
+    pub(crate) fn patch_scan_bounds_for_test(&self) -> Vec<Option<gix::ObjectId>> {
+        self.patch_scan_bounds.lock().unwrap().clone()
     }
 
     /// `start`, with the tick source and the discovery-slow warning's threshold
@@ -902,6 +925,7 @@ fn start_internal(
             discovery_warning,
             default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
             patch_identity_reads: Arc::new(AtomicUsize::new(0)),
+            patch_scan_bounds: Arc::new(Mutex::new(Vec::new())),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1327,10 +1351,13 @@ impl Drop for GateReport<'_> {
 
 /// The per-common-dir patch-equivalence memo plumbing, bundled into one
 /// argument so [`probe_worktree_state`] and [`probe_patch_equivalence`] each
-/// take it as a single parameter rather than two loose ones.
+/// take it as a single parameter rather than three loose ones.
 struct PatchEquivalenceMemo<'a> {
     cache: &'a PatchIdentityCache,
     reads: &'a AtomicUsize,
+    /// Where [`probe_patch_equivalence`] records the bound it actually passed to
+    /// [`patch_equivalence::scan_default_branch`], for `Core::patch_scan_bounds_for_test`.
+    scan_bounds: &'a Mutex<Vec<Option<gix::ObjectId>>>,
 }
 
 /// Runs both of Phase D's passes for one Worktree entity: `landing::probe`'s
@@ -1442,6 +1469,11 @@ fn probe_patch_equivalence(
     report.report_now(Some(merge_base));
     let bound = report.gate.deepest(repo);
     let shared = match patch_identities_for(memo.cache, common_dir, memo.reads, || {
+        // Recorded here, inside the closure that only ever runs for whichever
+        // entity's task is first to reach `patch_identities_for` for this common
+        // dir, so this is the bound the one real `scan_default_branch` call for
+        // it actually used, not a value a test recomputes independently.
+        memo.scan_bounds.lock().unwrap().push(bound);
         patch_equivalence::scan_default_branch(repo, default_tip, bound)
     }) {
         Ok(shared) => shared,
@@ -4609,6 +4641,12 @@ mod tests {
             "both worktrees share one common dir and must still scan its default-branch \
              history once between them, not once per entity"
         );
+        assert_eq!(
+            core.patch_scan_bounds_for_test(),
+            vec![Some(id(&deep_fork_sha))],
+            "the one shared scan that ran must have been bounded by the deepest sibling's own \
+             merge base, not the shallower one's"
+        );
     }
 
     fn id(sha: &str) -> gix::ObjectId {
@@ -4641,6 +4679,96 @@ mod tests {
             gate.deepest(&repo),
             Some(deep_sha),
             "the deepest candidate must win even though the shallower one reported first"
+        );
+    }
+
+    /// Deterministic proof that [`probe_patch_equivalence`] itself consults
+    /// [`BoundGate::deepest`] for the bound it hands to
+    /// [`patch_equivalence::scan_default_branch`], rather than reaching for its
+    /// own entity's merge base. Unlike
+    /// `bound_gate_deepest_folds_every_candidate_regardless_of_report_order`,
+    /// which proves `BoundGate` and `deepest_merge_base` correct in isolation,
+    /// this drives `probe_patch_equivalence` itself and inspects what it
+    /// actually recorded into `memo.scan_bounds`. `deep_sha`'s contribution is
+    /// pre-reported by hand, standing in for a sibling entity that already ran
+    /// this Generation; the one entity this test drives through the real
+    /// function is detached at `shallow_sha`, so its own merge base against
+    /// `default_tip` is `shallow_sha`, strictly shallower than `deep_sha`. A
+    /// regression that bounds the scan by the arriving entity's own merge base
+    /// instead of the gate's answer would record `shallow_sha` here, and would
+    /// do so every single run: unlike the integration smoke test below, there
+    /// is no rayon dispatch order here to sometimes get it right by accident.
+    #[test]
+    fn probe_patch_equivalence_bounds_the_scan_by_the_gates_deepest_not_its_own_merge_base() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo_path = root_of(&dir).join("repo");
+        init_repo_with_a_commit(&repo_path);
+        let deep_sha = id(&head_sha(&repo_path));
+        fs::write(repo_path.join("child.txt"), "child\n").expect("write child.txt");
+        git(&repo_path, &["add", "."]);
+        git(&repo_path, &["commit", "-m", "child of deep"]);
+        let shallow_sha_hex = head_sha(&repo_path);
+        let shallow_sha = id(&shallow_sha_hex);
+        fs::write(repo_path.join("tip.txt"), "tip\n").expect("write tip.txt");
+        git(&repo_path, &["add", "."]);
+        git(&repo_path, &["commit", "-m", "default tip"]);
+        let default_tip_hex = head_sha(&repo_path);
+
+        git(&repo_path, &["branch", "-M", "main"]);
+        git(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/main", &default_tip_hex],
+        );
+        // Detached at `shallow`, standing in for a Worktree entity whose own
+        // tip is not main's actual tip.
+        git(&repo_path, &["checkout", &shallow_sha_hex]);
+
+        let repo = gix::open(&repo_path).expect("open repo");
+        let default_branch_settled = Settled::Known {
+            value: DefaultBranch::new("origin/main".into()),
+            at: Timestamp::now(),
+            stale: false,
+        };
+        let common_dir: Arc<Path> = Arc::from(repo_path.join(".git"));
+        let cancel = AtomicBool::new(false);
+        let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
+        let patch_reads = AtomicUsize::new(0);
+        let patch_scan_bounds: Mutex<Vec<Option<gix::ObjectId>>> = Mutex::new(Vec::new());
+        let memo = PatchEquivalenceMemo {
+            cache: &patch_cache,
+            reads: &patch_reads,
+            scan_bounds: &patch_scan_bounds,
+        };
+        // Two entities share this common dir this Generation: `deep_sha` stands
+        // in for a sibling that already reported its own, deeper merge base;
+        // `shallow` is the one entity driven through the real function below.
+        let gate = BoundGate::new(2);
+        gate.report(Some(deep_sha));
+        let mut report = GateReport::new(&gate);
+
+        probe_patch_equivalence(
+            &repo,
+            &default_branch_settled,
+            &common_dir,
+            &cancel,
+            &memo,
+            &mut report,
+        );
+
+        assert_eq!(
+            patch_scan_bounds.lock().unwrap().as_slice(),
+            [Some(deep_sha)],
+            "the scan must be bounded by the deepest sibling's merge base, not shallow's own \
+             ({shallow_sha:?})"
         );
     }
 
