@@ -70,6 +70,92 @@ pub(crate) fn checked_merge_base(
     }
 }
 
+/// One of the ten shapes an in-progress git operation can take, one to one with
+/// gix's own `state::InProgress`
+/// ([ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)).
+/// Read from `Repository::state()`, which stats the per-worktree git dir's own
+/// marker files rather than any Cell this crate probes, so it carries no
+/// provenance of its own: it is a fact of the moment it was read, not a value
+/// that can go stale or fail to resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgressOperation {
+    ApplyMailbox,
+    ApplyMailboxRebase,
+    Bisect,
+    CherryPick,
+    CherryPickSequence,
+    Merge,
+    Rebase,
+    RebaseInteractive,
+    Revert,
+    RevertSequence,
+}
+
+/// Reads `repo`'s in-progress operation, or `None` while none is running.
+/// Measured in [ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
+/// at 6.55ms across 403 entities, so this rides along with the rest of Phase A
+/// rather than getting its own probe phase.
+pub(crate) fn in_progress_operation(repo: &gix::Repository) -> Option<InProgressOperation> {
+    match repo.state()? {
+        gix::state::InProgress::ApplyMailbox => Some(InProgressOperation::ApplyMailbox),
+        gix::state::InProgress::ApplyMailboxRebase => Some(InProgressOperation::ApplyMailboxRebase),
+        gix::state::InProgress::Bisect => Some(InProgressOperation::Bisect),
+        gix::state::InProgress::CherryPick => Some(InProgressOperation::CherryPick),
+        gix::state::InProgress::CherryPickSequence => Some(InProgressOperation::CherryPickSequence),
+        gix::state::InProgress::Merge => Some(InProgressOperation::Merge),
+        gix::state::InProgress::Rebase => Some(InProgressOperation::Rebase),
+        gix::state::InProgress::RebaseInteractive => Some(InProgressOperation::RebaseInteractive),
+        gix::state::InProgress::Revert => Some(InProgressOperation::Revert),
+        gix::state::InProgress::RevertSequence => Some(InProgressOperation::RevertSequence),
+    }
+}
+
+/// One commit in an entity's recent history: its seven-character abbreviated id
+/// and its message's first line. Carries no provenance of its own, the same
+/// reasoning as [`InProgressOperation`]: it is read fresh alongside `branch`
+/// rather than tracked as a Cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentCommit {
+    pub short_id: Arc<str>,
+    pub summary: Arc<str>,
+}
+
+/// Up to `limit` commits reachable from `repo`'s current HEAD, most recent
+/// first. Empty on an unborn HEAD, which has no commit to walk from, and empty
+/// (rather than an error) on any other read failure: this is supplementary
+/// context for the detail pane, not a Cell whose provenance a caller needs to
+/// read.
+pub(crate) fn recent_commits(repo: &gix::Repository, limit: usize) -> Vec<RecentCommit> {
+    let Ok(head_commit) = repo.head_commit() else {
+        return Vec::new();
+    };
+    let Ok(walk) = head_commit.id().ancestors().all() else {
+        return Vec::new();
+    };
+
+    let mut commits = Vec::new();
+    for info in walk.take(limit) {
+        let Ok(info) = info else { break };
+        let short_id = info.id.to_string().chars().take(7).collect::<String>();
+        let summary = repo
+            .find_object(info.id)
+            .ok()
+            .and_then(|object| object.try_into_commit().ok())
+            .and_then(|commit| {
+                commit
+                    .message()
+                    .ok()
+                    .map(|message| message.summary().to_string())
+            })
+            .unwrap_or_default();
+        commits.push(RecentCommit {
+            short_id: Arc::from(short_id),
+            summary: Arc::from(summary),
+        });
+    }
+    commits
+}
+
 /// One name and working-tree-relative path an entity's own `.gitmodules` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubmoduleEntry {
@@ -343,6 +429,97 @@ mod tests {
                 .expect("read HEAD");
             assert!(matches!(head, Head::Branch { .. }));
         }
+    }
+
+    #[test]
+    fn a_repository_with_no_operation_in_progress_reads_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+
+        let repo = open_thread_safe(dir.path()).expect("open repo");
+        assert_eq!(in_progress_operation(&repo.to_thread_local()), None);
+    }
+
+    /// The defining behaviour: a merge stopped on conflict must read as `Merge`,
+    /// proven against a real conflicted merge rather than a hand-written marker
+    /// file, so a change to git's own marker layout would show up here too.
+    #[test]
+    fn a_conflicted_merge_reads_as_an_in_progress_merge_operation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        std::fs::write(dir.path().join("file.txt"), "base\n").expect("write file");
+        git(dir.path(), &["add", "file.txt"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+        git(dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(dir.path().join("file.txt"), "feature\n").expect("write file");
+        git(dir.path(), &["commit", "-am", "feature change"]);
+        git(dir.path(), &["checkout", "-"]);
+        std::fs::write(dir.path().join("file.txt"), "main\n").expect("write file");
+        git(dir.path(), &["commit", "-am", "main change"]);
+        // Expected to exit non-zero on conflict; the point of this fixture is the
+        // marker file it leaves behind, not the exit code.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["merge", "feature"])
+            .status();
+
+        let repo = open_thread_safe(dir.path()).expect("open repo");
+
+        assert_eq!(
+            in_progress_operation(&repo.to_thread_local()),
+            Some(InProgressOperation::Merge)
+        );
+    }
+
+    #[test]
+    fn recent_commits_is_empty_on_an_unborn_head() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+
+        let repo = open_thread_safe(dir.path()).expect("open repo");
+
+        assert_eq!(recent_commits(&repo.to_thread_local(), 5), Vec::new());
+    }
+
+    #[test]
+    fn recent_commits_reads_the_most_recent_first_with_its_message_summary() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "first commit"],
+        );
+        git(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "second commit"],
+        );
+
+        let repo = open_thread_safe(dir.path()).expect("open repo");
+        let commits = recent_commits(&repo.to_thread_local(), 5);
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(&*commits[0].summary, "second commit");
+        assert_eq!(&*commits[1].summary, "first commit");
+        assert_eq!(commits[0].short_id.len(), 7);
+    }
+
+    #[test]
+    fn recent_commits_is_capped_at_the_given_limit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        for n in 0..5 {
+            git(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("commit {n}")],
+            );
+        }
+
+        let repo = open_thread_safe(dir.path()).expect("open repo");
+        let commits = recent_commits(&repo.to_thread_local(), 2);
+
+        assert_eq!(commits.len(), 2);
     }
 
     #[test]
