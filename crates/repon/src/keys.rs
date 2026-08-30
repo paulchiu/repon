@@ -170,6 +170,20 @@ const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 /// A Ctrl chord arrives as the lowercase letter with CONTROL set, per the same section.
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 
+/// Ctrl+I, Ctrl+M and Ctrl+[, permanently unbindable per
+/// [keybindings.md](../../../../docs/spec/keybindings.md#modifiers-and-matching) and
+/// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md): a terminal
+/// speaking the fixterms/CSI-u convention delivers them as `Char` plus CONTROL, while every
+/// other terminal delivers them as `Tab`, `Enter` and `Esc` with no CONTROL at all, so the
+/// same binding would mean two different keys depending on the user's terminal. This is the
+/// one place the three are named; a future user-configurable map should reject a candidate
+/// binding against this list rather than restating it.
+pub(crate) const PERMANENTLY_UNBINDABLE: [(KeyCode, KeyModifiers); 3] = [
+    (KeyCode::Char('i'), CTRL),
+    (KeyCode::Char('m'), CTRL),
+    (KeyCode::Char('['), CTRL),
+];
+
 /// The compiled-in default map, transcribed row for row from
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-default-map). A cell binding two
 /// keys to one action (`` `j`, `Down` ``) becomes two rows here, one per key; this module's
@@ -448,13 +462,28 @@ pub(crate) fn dispatch(context: Context, key: KeyEvent) -> Option<Action> {
     }
 }
 
+/// Refuses [`PERMANENTLY_UNBINDABLE`] before consulting [`BINDINGS`], so the guarantee holds
+/// even if a future edit to the table adds one of the three by mistake, not only when this
+/// module's own property test happens to be run.
 fn lookup(context: Context, key: KeyEvent) -> Option<Action> {
+    if is_permanently_unbindable(key.code, key.modifiers) {
+        return None;
+    }
     BINDINGS
         .iter()
         .find(|(row_context, code, modifiers, _)| {
             *row_context == context && *code == key.code && *modifiers == key.modifiers
         })
         .map(|(_, _, _, action)| *action)
+}
+
+/// Whether `code`/`modifiers` names one of the three [`PERMANENTLY_UNBINDABLE`] chords.
+fn is_permanently_unbindable(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    PERMANENTLY_UNBINDABLE
+        .iter()
+        .any(|(banned_code, banned_modifiers)| {
+            *banned_code == code && *banned_modifiers == modifiers
+        })
 }
 
 /// A character an input field can hold: printable, and typed with at most the modifier an
@@ -518,6 +547,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn global_quit_and_suspend_only_fire_with_their_control_modifier() {
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('c'), CTRL)),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('z'), CTRL)),
+            Some(Action::Suspend)
+        );
+        // crossterm delivers a Ctrl chord as the lowercase char with CONTROL set, never as
+        // the bare char alone; a lookup that ignored modifiers would fire on these too.
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('c'), NONE)),
+            None
+        );
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('z'), NONE)),
+            None
+        );
+    }
+
     /// The spec collapses `1` through `9` into one shared description ("Switch to the Nth
     /// declared Set"), so [`compiled_table_matches_the_spec_default_map_row_for_row`] cannot
     /// tell a permuted digit apart from a correct one: it only ever compares descriptions.
@@ -542,6 +593,45 @@ mod tests {
             dispatch(Context::Detail, press(KeyCode::Esc, NONE)),
             Some(Action::ClosePane)
         );
+    }
+
+    // --- properties over the whole table, not spot checks on one row ---
+
+    #[test]
+    fn no_binding_combines_control_and_shift() {
+        for (_, code, modifiers, _) in BINDINGS {
+            assert!(
+                !(modifiers.contains(CTRL) && modifiers.contains(SHIFT)),
+                "{code:?} is bound with both control and shift, a form most terminals cannot \
+                 distinguish from control alone"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_map_binds_none_of_the_permanently_unbindable_chords() {
+        for (_, code, modifiers, _) in BINDINGS {
+            for (banned_code, banned_modifiers) in PERMANENTLY_UNBINDABLE {
+                assert!(
+                    !(*code == banned_code && *modifiers == banned_modifiers),
+                    "the default map binds {code:?} with {modifiers:?}, which is permanently \
+                     unbindable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_permanently_unbindable_matches_exactly_the_three_named_chords() {
+        for (code, modifiers) in PERMANENTLY_UNBINDABLE {
+            assert!(is_permanently_unbindable(code, modifiers));
+        }
+        // A bound chord, and the bare keys these three arrive as on every terminal but the
+        // ones speaking fixterms/CSI-u, must not be caught by the same guard.
+        assert!(!is_permanently_unbindable(KeyCode::Char('q'), NONE));
+        assert!(!is_permanently_unbindable(KeyCode::Tab, NONE));
+        assert!(!is_permanently_unbindable(KeyCode::Enter, NONE));
+        assert!(!is_permanently_unbindable(KeyCode::Esc, NONE));
     }
 
     // --- context gating: the negative tests the brief calls out by name ---
@@ -763,19 +853,25 @@ mod tests {
         files
     }
 
-    /// This module is the only place a `KeyCode` or `KeyModifiers` literal may appear;
-    /// everywhere else must go through [`dispatch`]. Scans every source file under `src`
-    /// except this one, so a binding restated in `app.rs` or a future component is caught
-    /// the same way `app.rs`'s own `no_select_macro_is_used_anywhere_in_this_crates_source`
-    /// catches a banned pattern. Built from two pieces, as that test's `banned` string is,
-    /// so this line is never a self-match once this file is excluded from the scan.
+    /// This module is the only place a `KeyCode` or `KeyModifiers` literal may appear as
+    /// part of a binding; everywhere a binding is meant, code must go through [`dispatch`].
+    /// Scans every source file under `src` except this one, so a binding restated in
+    /// `app.rs` or a future component is caught the same way `app.rs`'s own
+    /// `no_select_macro_is_used_anywhere_in_this_crates_source` catches a banned pattern.
+    /// Built from two pieces, as that test's `banned` string is, so this line is never a
+    /// self-match once this file is excluded from the scan. `tui.rs` is also exempted: its
+    /// own test constructs a raw `KeyEvent` to check crossterm's event-*kind* filtering
+    /// (press versus repeat versus release), which is about event delivery, not a binding.
     #[test]
     fn no_key_literal_is_written_outside_this_table() {
         let banned = [format!("{}::", "KeyCode"), format!("{}::", "KeyModifiers")];
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            if path.file_name().is_some_and(|name| name == "keys.rs") {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "keys.rs" || name == "tui.rs")
+            {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read a crate source file");
