@@ -1,10 +1,6 @@
-//! Proves the four pieces of terminal state `write_enter_sequence`/`write_restore_sequence`
-//! actually write (raw mode is a fifth, separate `termios` call with no ANSI trace to read
-//! back here) are claimed on entry and restored symmetrically, even across a real panic, by
-//! running the real binary against a pseudo-terminal and reading back what it wrote. Mouse
-//! capture is deliberately not one of the four: see `write_enter_sequence`'s doc comment in
-//! `src/tui.rs` for why, and `tui::tests::the_enter_and_restore_sequences_account_for_every_piece_the_spec_names`
-//! for where that choice is pinned against the spec. A `TestBackend` cannot exercise a real
+//! Proves the five pieces of terminal state are claimed on entry and restored
+//! symmetrically, even across a real panic, by running the real binary against a
+//! pseudo-terminal and reading back what it wrote. A `TestBackend` cannot exercise a real
 //! `termios` call or a real panic unwind, and no crate on the dependency allowlist opens a
 //! pty, so this reaches three POSIX functions directly via `extern "C"`.
 
@@ -229,12 +225,11 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
 
     let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
     let enable_paste = ansi(crossterm::event::EnableBracketedPaste);
+    let disable_mouse = ansi(crossterm::event::DisableMouseCapture);
     let enable_focus = ansi(crossterm::event::EnableFocusChange);
     let disable_focus = ansi(crossterm::event::DisableFocusChange);
     let disable_paste = ansi(crossterm::event::DisableBracketedPaste);
     let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
-    let enable_mouse = ansi(crossterm::event::EnableMouseCapture);
-    let disable_mouse = ansi(crossterm::event::DisableMouseCapture);
 
     // Raw mode is the fifth piece and leaves no ANSI trace; finding the alternate-screen
     // sequence below at all is what proves `enable_raw_mode()` succeeded ahead of it.
@@ -244,6 +239,9 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     let paste_at = output
         .find(&enable_paste)
         .unwrap_or_else(|| panic!("expected EnableBracketedPaste in: {output:?}"));
+    let mouse_at = output
+        .find(&disable_mouse)
+        .unwrap_or_else(|| panic!("expected DisableMouseCapture in: {output:?}"));
     let focus_on_at = output
         .find(&enable_focus)
         .unwrap_or_else(|| panic!("expected EnableFocusChange in: {output:?}"));
@@ -258,8 +256,8 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         .unwrap_or_else(|| panic!("expected LeaveAlternateScreen in: {output:?}"));
 
     assert!(
-        enter_at < paste_at && paste_at < focus_on_at,
-        "the three claimed pieces must appear in enter's own order: {output:?}"
+        enter_at < paste_at && paste_at < mouse_at && mouse_at < focus_on_at,
+        "the four claimed pieces must appear in enter's own order: {output:?}"
     );
     assert!(
         focus_on_at < focus_off_at,
@@ -269,13 +267,6 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         focus_off_at < paste_off_at && paste_off_at < leave_at,
         "the panic-time restore must be the enter sequence's mirror image, focus first: \
          {output:?}"
-    );
-
-    // Mouse capture is deliberately never written by either the enter or the panic-time
-    // restore path; see `write_enter_sequence`'s doc comment in `src/tui.rs` for why.
-    assert!(
-        !output.contains(&enable_mouse) && !output.contains(&disable_mouse),
-        "mouse capture must never be claimed or released, in either direction: {output:?}"
     );
 }
 

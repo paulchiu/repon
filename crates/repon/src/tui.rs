@@ -20,8 +20,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     cursor,
     event::{
-        DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-        Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, Event as CrosstermEvent, KeyEvent, KeyEventKind, poll, read,
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -79,11 +79,9 @@ impl Tui {
         self
     }
 
-    /// Claims four of the five pieces of terminal state
-    /// [keybindings.md](../../../docs/spec/keybindings.md#terminal-state) fixes: raw mode on,
-    /// alternate screen on, bracketed paste on, focus reporting on. Mouse capture is the
-    /// fifth and is deliberately left exactly as found rather than fixed; see
-    /// [`write_enter_sequence`]'s doc comment for why.
+    /// Claims the five pieces of terminal state [keybindings.md](../../../docs/spec/keybindings.md#terminal-state)
+    /// fixes: raw mode on, alternate screen on, bracketed paste on, mouse capture off
+    /// (explicit, against an inherited enabled state), focus reporting on.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         write_enter_sequence(&mut stdout())?;
@@ -255,26 +253,17 @@ fn translate(event: CrosstermEvent) -> Option<Event> {
     })
 }
 
-/// The three write-based pieces [`Tui::enter`] claims, in order: alternate screen, bracketed
-/// paste, focus reporting, then the cursor hidden. Raw mode is the fourth piece and is not a
-/// write; it is a separate `termios` call the caller makes before this.
-///
-/// Mouse capture, [config.md](../../../docs/spec/config.md#launchers)'s fifth piece, is
-/// deliberately never written here. crossterm cannot report whether a terminal already had
-/// mouse capture on, so there is no way to tell "off" and "restore to what was there" apart
-/// at this call site; the choice is between never touching it (perfect for the terminal that
-/// never had it on, the overwhelming common case, and a no-op restoration for one that did)
-/// and unconditionally pairing an enable at [`write_restore_sequence`] with this disable
-/// (correct only for a terminal that already had it on, and a regression, on every single
-/// run, for the far more common terminal that did not). Leaving it untouched is the only one
-/// of the two that leaves *every* terminal exactly as found rather than only some of them.
-/// Generic over the writer so a test can assert the exact byte sequence against a `Vec<u8>`
-/// without a real terminal.
+/// The four write-based pieces [`Tui::enter`] claims, in order: alternate screen, bracketed
+/// paste, mouse capture (explicitly off), focus reporting, then the cursor hidden. Raw mode
+/// is the fifth piece and is not a write; it is a separate `termios` call the caller makes
+/// before this. Generic over the writer so a test can assert the exact byte sequence against
+/// a `Vec<u8>` without a real terminal.
 fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        DisableMouseCapture,
         EnableFocusChange,
         cursor::Hide,
     )
@@ -283,8 +272,15 @@ fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 /// Releases what [`write_enter_sequence`] claimed: focus reporting, bracketed paste, alternate
 /// screen, then the cursor shown again last, after the screen mode is fully restored rather
 /// than in claim-reversed order. Disabling raw mode is the caller's separate final step,
-/// matching [`write_enter_sequence`]. Mouse capture is never written here either, for the
-/// same reason [`write_enter_sequence`] never claims it.
+/// matching [`write_enter_sequence`].
+///
+/// Mouse capture is the one piece [`write_enter_sequence`] claims that this does not release.
+/// [keybindings.md](../../../docs/spec/keybindings.md#terminal-state) requires it off for the
+/// whole time Repon is running, which is why entry disables it unconditionally; but crossterm
+/// cannot report whether the terminal had it on beforehand, so there is no way to restore
+/// "what was there" rather than either always leaving it off or always turning it back on.
+/// This is a known, deliberate gap against [config.md](../../../docs/spec/config.md#launchers)'s
+/// "all five restored" line, not an oversight.
 fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(
         w,
@@ -312,13 +308,14 @@ mod tests {
     }
 
     #[test]
-    fn the_enter_sequence_claims_all_three_write_based_pieces_in_order() {
+    fn the_enter_sequence_claims_all_four_write_based_pieces_in_order() {
         let mut out = Vec::new();
         write_enter_sequence(&mut out).expect("write enter sequence");
 
         let mut expected = Vec::new();
         expected.extend(ansi_bytes(EnterAlternateScreen));
         expected.extend(ansi_bytes(EnableBracketedPaste));
+        expected.extend(ansi_bytes(DisableMouseCapture));
         expected.extend(ansi_bytes(EnableFocusChange));
         expected.extend(ansi_bytes(cursor::Hide));
 
@@ -444,16 +441,20 @@ mod tests {
             );
         }
 
-        // Mouse capture is deliberately never written in either direction; see
-        // write_enter_sequence's doc comment for why.
+        // Mouse capture is the one piece of the five that is not restored: claimed (disabled)
+        // on enter, per keybindings.md's "off" requirement, and left alone on restore because
+        // crossterm cannot report whether the terminal had it on beforehand. See
+        // write_restore_sequence's doc comment for why this is a deliberate exception rather
+        // than a bug; if a second piece ever goes asymmetric, the loop above already fails,
+        // since it requires every other piece to appear on both sides.
+        assert!(
+            bytes_contain(&enter, &ansi_bytes(crossterm::event::DisableMouseCapture)),
+            "expected mouse capture to be disabled in the enter sequence"
+        );
         for mouse_bytes in [
             ansi_bytes(crossterm::event::EnableMouseCapture),
             ansi_bytes(crossterm::event::DisableMouseCapture),
         ] {
-            assert!(
-                !bytes_contain(&enter, &mouse_bytes),
-                "mouse capture must never be written on enter: found {mouse_bytes:?}"
-            );
             assert!(
                 !bytes_contain(&restore, &mouse_bytes),
                 "mouse capture must never be written on restore: found {mouse_bytes:?}"
