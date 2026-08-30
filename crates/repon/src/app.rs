@@ -16,7 +16,9 @@ use crate::{
     glyphs::GlyphSet,
     keys::{self, Action, Context},
     message::Message,
+    selection::Selection,
     tui::{Event, Tui},
+    unwind,
 };
 
 /// The dedicated thread's metadata-poll-and-deadline cadence has no config key yet
@@ -32,6 +34,13 @@ pub struct App {
     list: List,
     should_quit: bool,
     should_suspend: bool,
+    /// The rows this session's Actions and Launchers will act on, and the one Escape-unwind
+    /// level ([`unwind`]) this ticket builds: cancelling a live range anchor.
+    selection: Selection,
+    /// The row the movement keys move and the toggle, anchor and empty-Selection default all
+    /// read: an index into the current [`Snapshot`](repon_core::Snapshot)'s entities, which is
+    /// this crate's only "visible list" until a Filter narrows it.
+    cursor: usize,
     /// Cloned by anything that needs to reach the loop, including worker threads, which
     /// is why the channel is crossbeam rather than std.
     message_tx: Sender<Message>,
@@ -76,6 +85,8 @@ impl App {
             list,
             should_quit: false,
             should_suspend: false,
+            selection: Selection::new(),
+            cursor: 0,
             message_tx,
             message_rx,
         })
@@ -131,19 +142,106 @@ impl App {
         Ok(())
     }
 
-    /// Routes the key through [`keys::dispatch`] and turns the two actions already wired to a
-    /// [`Message`] (`Quit`, `Suspend`); every other action dispatches correctly but has
-    /// nothing to do yet, since `List` is this app's only real focus target today.
+    /// Routes the key through [`keys::dispatch`] and turns the actions already wired to
+    /// something into effect: `Quit` and `Suspend` raise a [`Message`], the movement and
+    /// Selection actions mutate `cursor` and `selection` directly, and `Unwind` reaches
+    /// [`unwind::unwind_one`]. Every other action dispatches correctly but has nothing to do
+    /// yet, since `List` is this app's only real focus target today.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         let message = match keys::dispatch(Context::List, key) {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
+            Some(Action::MoveDown) => {
+                self.move_cursor(1);
+                None
+            }
+            Some(Action::MoveUp) => {
+                self.move_cursor(-1);
+                None
+            }
+            Some(Action::FirstRow) => {
+                self.set_cursor(0);
+                None
+            }
+            Some(Action::LastRow) => {
+                let last = self.visible_keys().len().saturating_sub(1);
+                self.set_cursor(last);
+                None
+            }
+            Some(Action::ToggleSelection) => {
+                if let Some(key) = self.cursor_key() {
+                    self.selection.toggle(key);
+                }
+                None
+            }
+            Some(Action::AnchorRange) => {
+                self.selection.anchor_range(self.cursor);
+                None
+            }
+            Some(Action::SelectAllVisible) => {
+                self.selection.select_all_visible(&self.visible_keys());
+                None
+            }
+            Some(Action::ClearSelection) => {
+                self.selection.clear();
+                None
+            }
+            Some(Action::Unwind) => {
+                unwind::unwind_one(&mut [&mut self.selection]);
+                None
+            }
             _ => None,
         };
         if let Some(message) = message {
             self.message_tx.send(message)?;
         }
         Ok(())
+    }
+
+    /// Every currently known Entity's key, in table order: this crate's whole "visible list"
+    /// until a Filter narrows it, and what `select_all_visible`, `extend_range` and the
+    /// cursor bounds all read.
+    fn visible_keys(&self) -> Vec<EntityKey> {
+        self.core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect()
+    }
+
+    /// The row the cursor sits on, if the table is non-empty.
+    fn cursor_key(&self) -> Option<EntityKey> {
+        self.visible_keys().get(self.cursor).cloned()
+    }
+
+    /// Moves the cursor by `delta`, clamped to the table, and extends a live range anchor to
+    /// cover the rows the cursor just crossed.
+    fn move_cursor(&mut self, delta: i32) {
+        let visible = self.visible_keys();
+        if visible.is_empty() {
+            return;
+        }
+        let last = visible.len() - 1;
+        let moved = self.cursor as i32 + delta;
+        self.cursor = moved.clamp(0, last as i32) as usize;
+        if self.selection.has_range_anchor() {
+            self.selection.extend_range(self.cursor, &visible);
+        }
+    }
+
+    /// Sets the cursor to `index`, clamped to the table, and extends a live range anchor the
+    /// same way [`Self::move_cursor`] does.
+    fn set_cursor(&mut self, index: usize) {
+        let visible = self.visible_keys();
+        if visible.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = index.min(visible.len() - 1);
+        if self.selection.has_range_anchor() {
+            self.selection.extend_range(self.cursor, &visible);
+        }
     }
 
     fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
@@ -309,6 +407,92 @@ mod tests {
             2,
             "expected exactly two construction sites for the Tui event channel: the \
              placeholder in `Tui::new` and the real one in `Tui::start`"
+        );
+    }
+
+    /// The `Action`-to-`Message` match inside `handle_key_event`, the one place a key press
+    /// decides what happens: from `fn handle_key_event` to the next method at the same
+    /// indent.
+    fn handle_key_event_source() -> &'static str {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("fn handle_key_event")
+            .expect("handle_key_event must still exist");
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// keybindings.md's "Esc never quits, at any depth": inside the match that turns a key's
+    /// `Action` into a `Message`, `Message::Quit` must only ever appear on the `Action::Quit`
+    /// arm itself, never on `Action::Unwind`'s or any other. A source scan rather than a
+    /// behavioural test, because the claim is an absence: there is no path, not merely no
+    /// path this test happened to try.
+    #[test]
+    fn no_path_from_escape_to_quit_exists_in_the_key_handling_match() {
+        for (number, line) in handle_key_event_source().lines().enumerate() {
+            if line.contains("Message::Quit") {
+                assert!(
+                    line.contains("Action::Quit"),
+                    "line {} of handle_key_event raises Message::Quit outside the \
+                     Action::Quit arm, which is a path from some other key (Escape included) \
+                     to quitting: {line:?}",
+                    number + 1
+                );
+            }
+        }
+    }
+
+    /// keybindings.md's "no press-twice-to-force gesture exists": scans every source file in
+    /// this crate for the vocabulary such a gesture would need (a count or a timestamp of a
+    /// previous Escape press). An absence claim, so a scan is the honest form, the same as
+    /// [`no_select_macro_is_used_anywhere_in_this_crates_source`] above.
+    #[test]
+    fn no_press_twice_to_force_state_is_tracked_anywhere_in_this_crate() {
+        // Built as fragments rather than whole words, and matched against each file's
+        // production source only (never its own `#[cfg(test)]` module), so this test's own
+        // banned list is never a self-match the way this crate's other absence scans avoid.
+        let banned: Vec<String> = [
+            ("esc", "_count"),
+            ("escape", "_count"),
+            ("second", "_press"),
+            ("double", "_press"),
+            ("press", "_count"),
+            ("last", "_escape"),
+            ("pending", "_force"),
+            ("force", "_quit"),
+            ("double", "_esc"),
+        ]
+        .into_iter()
+        .map(|(a, b)| format!("{a}{b}"))
+        .collect();
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            // `str::split` always yields at least one item, so this is the whole file when a
+            // source has no test module, and just its production half when it does.
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            for (number, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let lowered = line.to_lowercase();
+                if banned
+                    .iter()
+                    .any(|needle| lowered.contains(needle.as_str()))
+                {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "found state that suggests a press-twice-to-force gesture, which \
+             keybindings.md's \"Esc\" section refuses: {offending_locations:?}"
         );
     }
 }
