@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use repon_core::{Core, CoreSpec, EntityKey, SetSpec};
 use tracing::debug;
@@ -14,6 +14,7 @@ use crate::{
         document::{self, Document},
     },
     glyphs::GlyphSet,
+    keys::{self, Action, Context},
     message::Message,
     tui::{Event, Tui},
 };
@@ -130,13 +131,17 @@ impl App {
         Ok(())
     }
 
-    /// Placeholder bindings. The real map is decided in "Decide the keybinding map" and
-    /// will be configurable rather than matched here.
+    /// Routes the key through [`keys::dispatch`], the one place a chord becomes an
+    /// [`Action`]. The list is this app's only focus target today, so `Context::List` is
+    /// fixed here rather than tracked; a Detail pane, and the Input, Overlay and Confirm
+    /// contexts, are later tickets, and only the two actions those tickets' predecessors
+    /// already wired (`Quit`, `Suspend`) are turned into a [`Message`] here. Every other
+    /// action dispatches correctly but has nothing to do yet, which is this ticket's scope:
+    /// the table and the routing, not the features the bindings will go on to invoke.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
-        let message = match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Message::Quit),
-            (KeyCode::Char('c' | 'C'), KeyModifiers::CONTROL) => Some(Message::Quit),
-            (KeyCode::Char('z' | 'Z'), KeyModifiers::CONTROL) => Some(Message::Suspend),
+        let message = match keys::dispatch(Context::List, key) {
+            Some(Action::Quit) => Some(Message::Quit),
+            Some(Action::Suspend) => Some(Message::Suspend),
             _ => None,
         };
         if let Some(message) = message {
