@@ -12,8 +12,10 @@ jobs:
   quality-check:
     name: Format, Lint, Test & Build
     # Repon is a Unix program: Actions put each step in a new session with
-    # setsid(2) and read it back over a PTY, so there is no Windows leg to add.
-    # Both Unix runners are free on a public repository.
+    # setsid(2) and read it back over a PTY. The Windows leg is the
+    # windows-target-guard job below, which proves the guard fires rather than
+    # testing a platform Repon ships. Both Unix runners are free on a public
+    # repository.
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +42,40 @@ jobs:
       # and build. Duplicating the steps here would let the two drift apart.
       - name: Format, Lint, Test & Build
         run: just ci
+
+  windows-target-guard:
+    name: Windows guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # cargo check never reaches the linker, so the compile_error! guard fires
+      # on ubuntu-latest without a Windows runner. The job fails unless the
+      # build fails, and fails with the guard's own message.
+      - name: Prove the Unix guard fires on a Windows target
+        run: |
+          set +e
+          output=$(cargo check --workspace --target x86_64-pc-windows-msvc --locked 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "expected cargo check to fail on the Windows target, but it succeeded" >&2
+            exit 1
+          fi
+          if ! grep -q "repon-core requires a Unix target" <<< "$output"; then
+            echo "build failed, but not with the compile_error! guard's message" >&2
+            exit 1
+          fi
 
   msrv:
     name: MSRV
@@ -93,7 +129,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [quality-check, msrv, publish-check]
+    needs: [quality-check, windows-target-guard, msrv, publish-check]
     runs-on: ubuntu-latest
     steps:
       - run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'

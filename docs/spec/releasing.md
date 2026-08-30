@@ -41,18 +41,19 @@ Enforcement is `just msrv`, which reads the number out of `cargo metadata` rathe
 
 ## What CI does
 
-`.github/workflows/ci.yml` is four jobs:
+`.github/workflows/ci.yml` is five jobs:
 
 | job | runs | on |
 | --- | --- | --- |
 | `quality-check` | `just ci` | a matrix of `ubuntu-latest` and `macos-latest` |
+| `windows-target-guard` | `cargo check` against `x86_64-pc-windows-msvc`, asserting it fails with the guard's message | `ubuntu-latest` |
 | `msrv` | `just msrv` | `ubuntu-latest` |
 | `publish-check` | `just publish-check` | `ubuntu-latest` |
 | `ci` | asserts every job above succeeded | `ubuntu-latest` |
 
 The justfile owns what CI means. Each job's only step of substance is `just <recipe>`, so a green local run is a green pipeline and the definition of passing cannot drift between the two. `just ci` composes `fmt-check lint test docs check-core-isolation build`: rustfmt in check mode, clippy with warnings as errors across all targets, the workspace tests, rustdoc with warnings as errors (which is what catches a broken intra-doc link), the isolation check below, and a debug build, everything `--locked`. All of these passed on the untouched tree before any of this was added, so the gates started green; nothing was relaxed to obtain a first passing run.
 
-There are two OS legs because standard GitHub runners are free on public repositories, macOS included. macOS is the primary development platform and Linux the other supported one, so both are proven on every push, and the matrix sets `fail-fast: false` so a failure on one still reports the other. There is no Windows leg to add, per the section above.
+There are two OS legs in `quality-check` because standard GitHub runners are free on public repositories, macOS included. macOS is the primary development platform and Linux the other supported one, so both are proven on every push, and the matrix sets `fail-fast: false` so a failure on one still reports the other. A separate `windows-target-guard` job proves the platform claim above rather than contradicting it: `cargo check` never reaches the linker, so it adds the `x86_64-pc-windows-msvc` target on `ubuntu-latest`, no Windows runner needed, and runs `cargo check --workspace` against it. The job fails unless the build fails, and fails again unless the failure carries the guard's own message, so it proves the refusal rather than merely running something green.
 
 `check-core-isolation` is where [0015](../adr/0015-the-core-owns-the-table.md)'s enforcement finally lands. It reads `cargo tree -p repon-core --edges normal --depth 1` and fails unless the direct dependency set is exactly `crossbeam-channel gix rayon`. It is an allowlist rather than the denylist 0015 described, and deliberately so: a denylist bans ratatui and crossterm by name, and a rendering crate nobody thought to ban walks straight past it, while an allowlist makes every new core dependency a deliberate edit to the recipe with the boundary argument in front of whoever makes it.
 
@@ -75,7 +76,7 @@ It packages and verifies both crates and exits 0, because `--workspace` resolves
 
 So the workspace form is the only form that rehearses before the first publish, and it is also what the tag pipeline will run without `--dry-run`: cargo orders the publishes itself, library first, and waits for the index between them.
 
-The packaged artefacts, measured: `repon-core` is 8 files, 48.3 KiB, 14.9 KiB compressed; `repon` is 15 files, 108.8 KiB, 31.2 KiB compressed. Both sit far under crates.io's 10 MB limit, so archive size never enters the release checklist.
+The packaged artefacts, measured: `repon-core` is 9 files, 50.7 KiB, 15.9 KiB compressed; `repon` is 17 files, 116.4 KiB, 33.6 KiB compressed. Both counts moved since the first measurement: cargo now packages `Cargo.lock` into both archives, and `repon` also gained `src/message.rs`. Both archives still sit far under crates.io's 10 MB limit, so archive size never enters the release checklist.
 
 ## Crate metadata
 
@@ -114,7 +115,7 @@ Done already:
 
 - the `version` on the `repon-core` path dependency, `rust-version`, `readme`, `homepage`, `authors`, `keywords`, `categories` and the symlinked `LICENSE`, all of which `just publish-check` rehearses on every push
 - the docs.rs target override in both crates, which nothing local can prove because only docs.rs builds those targets
-- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc`, which fails with the guard's own sentence and no other diagnostic; CI never builds that target, so nothing proves this on a push either
+- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc` and now proved on every push by the `windows-target-guard` job, which fails with the guard's own sentence and no other diagnostic
 - CI itself: every recipe passes locally, and the workflow has not yet run on GitHub because this is the commit that adds it
 
 ## What the tag pipeline must do

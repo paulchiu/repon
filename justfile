@@ -36,18 +36,44 @@ docs:
 #
 # An allowlist rather than a denylist: every dependency the core takes on has to
 # be added here deliberately, so a terminal or rendering crate cannot reach it by
-# being one nobody thought to ban.
+# being one nobody thought to ban. Each entry below pairs a crate with the reason
+# it is allowed, and the comparison set is derived from that pairing, so a crate
+# cannot be added here without recording why.
+#
+# Three later additions are already known and belong here when they land:
+#   - glob matching, for Set globs
+#   - the PTY child, for setsid(2) and openpty(3)
+#   - the wire format, for the settled document on stdout
+# The terminal and rendering crates never belong here.
 check-core-isolation:
     #!/usr/bin/env bash
     set -euo pipefail
-    allowed="crossbeam-channel gix rayon"
+    allowed_with_reasons=(
+        "crossbeam-channel:the fan-out result channel between rayon workers and the core"
+        "gix:the git backend this crate wraps"
+        "rayon:the probe phases' worker pool"
+    )
+    allowed_names=()
+    for entry in "${allowed_with_reasons[@]}"; do
+        name="${entry%%:*}"
+        reason="${entry#*:}"
+        if [ -z "$name" ] || [ "$name" = "$entry" ] || [ -z "$reason" ]; then
+            echo "malformed allowlist entry: '$entry' (expected 'crate:reason')" >&2
+            exit 1
+        fi
+        allowed_names+=("$name")
+    done
+    allowed=$(printf '%s\n' "${allowed_names[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//')
     actual=$(cargo tree -p repon-core --edges normal --depth 1 --prefix none \
         | awk 'NR > 1 && NF { print $1 }' | sort -u | tr '\n' ' ' | sed 's/ $//')
     if [ "$actual" != "$allowed" ]; then
         echo "repon-core's direct dependencies changed" >&2
-        echo "  allowed: $allowed" >&2
-        echo "  actual:  $actual" >&2
-        echo "Add the new crate here only if it belongs in a crate no frontend can avoid" >&2
+        echo "allowed, with reasons:" >&2
+        for entry in "${allowed_with_reasons[@]}"; do
+            echo "  ${entry%%:*}: ${entry#*:}" >&2
+        done
+        echo "actual: $actual" >&2
+        echo "an undeclared crate was added or removed; add it above with its reason, or remove it" >&2
         exit 1
     fi
     echo "repon-core depends on nothing beyond: $allowed"
