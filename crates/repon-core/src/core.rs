@@ -43,6 +43,7 @@ use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{EntityKey, EntityState, Head, Kind, Presence};
 use crate::git;
+use crate::landing;
 use crate::snapshot::Snapshot;
 
 /// One Repo's config-level override, crossing from the consumer as plain data: no
@@ -289,6 +290,13 @@ impl Core {
             );
             table.entities[idx].branch.begin_probe();
             table.entities[idx].default_branch.begin_probe();
+            // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's
+            // is `NotApplicable` from construction and touching `begin_probe` on
+            // it here would leave it in-flight forever, since nothing would ever
+            // call `settle` to clear the flag again.
+            if matches!(table.entities[idx].kind, Kind::Worktree) {
+                table.entities[idx].state.begin_probe();
+            }
             dispatched.push((key.clone(), cancel));
         }
 
@@ -317,6 +325,10 @@ impl Core {
             .iter()
             .map(|(key, _)| Arc::clone(&table.entities[table.index[key]].common_dir))
             .collect();
+        let kinds: Vec<Kind> = dispatched
+            .iter()
+            .map(|(key, _)| table.entities[table.index[key]].kind)
+            .collect();
         drop(table);
 
         // Scoped to this dispatch alone: every task below gets its own clone of
@@ -324,11 +336,12 @@ impl Core {
         // `ChainFacts` it holds are freed. Nothing here outlives one Generation.
         let chain_cache: Arc<ChainFactsCache> = Arc::new(Mutex::new(HashMap::new()));
 
-        for ((((key, cancel), repo), override_branch), common_dir) in dispatched
+        for (((((key, cancel), repo), override_branch), common_dir), kind) in dispatched
             .into_iter()
             .zip(repos)
             .zip(override_branches)
             .zip(common_dirs)
+            .zip(kinds)
         {
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
@@ -346,6 +359,16 @@ impl Core {
                     &chain_cache,
                     &chain_reads,
                 );
+                let state_outcome = if matches!(kind, Kind::Worktree) {
+                    probe_worktree_state(
+                        &path,
+                        repo.as_deref(),
+                        default_branch_outcome.as_ref().map(|r| &r.settled),
+                        &cancel,
+                    )
+                } else {
+                    None
+                };
                 apply_probe_outcome(
                     &table_handle,
                     &settle_gate,
@@ -353,6 +376,7 @@ impl Core {
                     generation,
                     branch_outcome,
                     default_branch_outcome,
+                    state_outcome,
                 );
             });
         }
@@ -421,16 +445,21 @@ impl Core {
     /// caller can otherwise only reach this with a key `snapshot` just handed it.
     pub fn probe_now(&self, key: &EntityKey) -> EntityState {
         let never_cancelled = AtomicBool::new(false);
-        let (cached_repo, common_dir_hint) = {
+        let (cached_repo, common_dir_hint, kind) = {
             let table = self.table.read().unwrap();
             let repo = table.repos.get(key).cloned();
             let common_dir = table
                 .index
                 .get(key)
                 .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
-            (repo, common_dir)
+            let kind = table.index.get(key).map(|&idx| table.entities[idx].kind);
+            (repo, common_dir, kind)
         };
         let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
+        // An unknown key falls back to `Kind::Repo`, matching the fallback insert
+        // below: `state` is never probed for it, since a Repo's is `NotApplicable`
+        // from construction.
+        let kind = kind.unwrap_or(Kind::Repo);
         let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
         let override_branch = matched.and_then(|entry| entry.default_branch.clone());
         let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
@@ -442,6 +471,16 @@ impl Core {
             override_branch.as_deref(),
             &never_cancelled,
         );
+        let state_outcome = if matches!(kind, Kind::Worktree) {
+            probe_worktree_state(
+                key.path(),
+                cached_repo.as_deref(),
+                default_branch_outcome.as_ref().map(|r| &r.settled),
+                &never_cancelled,
+            )
+        } else {
+            None
+        };
 
         let mut table = self.table.write().unwrap();
         let generation = Generation::new(table.generation);
@@ -466,6 +505,9 @@ impl Core {
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
+        }
+        if let Some(landing::Outcome::Settle(settled)) = state_outcome {
+            table.entities[idx].state.settle(generation, settled);
         }
         table.entities[idx].clone()
     }
@@ -624,6 +666,9 @@ impl Core {
             .insert(generation_number, Instant::now());
         if let Some(&idx) = table.index.get(key) {
             table.entities[idx].branch.begin_probe();
+            if matches!(table.entities[idx].kind, Kind::Worktree) {
+                table.entities[idx].state.begin_probe();
+            }
         }
         let cancel = Arc::new(AtomicBool::new(false));
         table.in_flight.insert(
@@ -688,6 +733,7 @@ impl Core {
             key.clone(),
             generation,
             Some(settled),
+            None,
             None,
         );
     }
@@ -872,6 +918,14 @@ fn sweep_deadline(
             table.entities[idx]
                 .default_branch
                 .settle(*generation, Settled::Unknown(Unknown::TimedOut));
+            // Only a Worktree's `state` is ever in flight (see `Core::refresh`'s
+            // own `begin_probe` gate); settling it here for a Repo or Submodule
+            // would overwrite its construction-time `NotApplicable` with a lie.
+            if matches!(table.entities[idx].kind, Kind::Worktree) {
+                table.entities[idx]
+                    .state
+                    .settle(*generation, Settled::Unknown(Unknown::TimedOut));
+            }
         }
         table.in_flight.remove(key);
     }
@@ -972,6 +1026,43 @@ fn probe_default_branch(
     ))
 }
 
+/// Runs the ancestry-only first pass ([`landing::probe`]) for one Worktree
+/// entity: `None` if `cancel` was already set, or if `default_branch_settled` is
+/// itself `None` (the default-branch probe it depends on was cancelled first).
+/// Only ever called for a Worktree; a Repo or Submodule's `state` is
+/// `NotApplicable` from construction and this function is never reached for one.
+///
+/// `repo` follows the same cached-handle convention as [`probe_branch`] and
+/// [`probe_default_branch`]: `None` falls back to opening fresh, which is where
+/// an unreadable repository surfaces as a settled `Failed` rather than being
+/// read twice.
+fn probe_worktree_state(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    default_branch_settled: Option<&Settled<crate::entity::DefaultBranch>>,
+    cancel: &AtomicBool,
+) -> Option<landing::Outcome> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let default_branch_settled = default_branch_settled?;
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(landing::Outcome::Settle(Settled::Failed(error))),
+        },
+    };
+    Some(landing::probe(
+        &repo.to_thread_local(),
+        default_branch_settled,
+    ))
+}
+
 /// One Generation's default-branch chain memo: at most one [`default_branch::ChainFacts`]
 /// per common dir, shared by every dispatched entity that names it. Built fresh in
 /// [`Core::refresh`] and dropped once every task from that dispatch has finished.
@@ -1041,13 +1132,18 @@ fn probe_default_branch_memoised(
     Some(default_branch::resolve_with_facts(&facts, override_branch))
 }
 
-/// Lands one probe's combined outcome for `key` at `generation`: writes the branch
-/// and default-branch cells subject to the per-cell supersession `Cell::settle`
-/// already enforces, records the default-branch diagnostics only on the write that
-/// actually won, clears `key` from the table's in-flight set and signals
-/// `settle_gate` once for the whole entity. The one place a dispatched probe's
-/// result and a test's simulated late result both go through, so a test can land a
-/// result out of order without duplicating this bookkeeping.
+/// Lands one probe's combined outcome for `key` at `generation`: writes the
+/// branch, default-branch and `state` cells subject to the per-cell supersession
+/// `Cell::settle` already enforces, records the default-branch diagnostics only
+/// on the write that actually won, clears `key` from the table's in-flight set
+/// and signals `settle_gate` once for the whole entity. The one place a
+/// dispatched probe's result and a test's simulated late result both go through,
+/// so a test can land a result out of order without duplicating this bookkeeping.
+///
+/// `state_outcome`'s `Outstanding` case writes nothing at all: the `state` cell
+/// is left exactly as unsettled as `begin_probe` alone leaves it, which is the
+/// whole of the "stays outstanding between the two passes" contract. There is no
+/// second pass here to hand the entity off to; that pass is not built yet.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
     settle_gate: &Arc<(Mutex<usize>, Condvar)>,
@@ -1055,6 +1151,7 @@ fn apply_probe_outcome(
     generation: Generation,
     branch_outcome: Option<Settled<Head>>,
     default_branch_outcome: Option<default_branch::Resolution>,
+    state_outcome: Option<landing::Outcome>,
 ) {
     let mut table = table.write().unwrap();
     if let Some(&idx) = table.index.get(&key) {
@@ -1063,6 +1160,9 @@ fn apply_probe_outcome(
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
+        }
+        if let Some(landing::Outcome::Settle(settled)) = state_outcome {
+            table.entities[idx].state.settle(generation, settled);
         }
     }
     table.in_flight.remove(&key);
@@ -1236,7 +1336,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::entity::DefaultBranchStopped;
+    use crate::entity::{DefaultBranchStopped, WorktreeState};
     use crate::test_support::{git, head_sha};
 
     fn init_repo_with_a_commit(path: &Path) {
@@ -2077,6 +2177,90 @@ mod tests {
         );
     }
 
+    /// The deadline sweep must reach a Worktree's outstanding `state` cell the
+    /// same way it already reaches `branch` and `default_branch`: asking and
+    /// getting nothing back is Unknown, not a cell stuck in-flight forever once
+    /// the Generation that would have answered it is gone. A Repo's `state`,
+    /// `NotApplicable` from construction and never in flight, must survive the
+    /// same sweep untouched, proving the sweep is gated by kind rather than
+    /// blanket-settling every entity's `state` cell.
+    #[test]
+    fn the_deadline_sweep_times_out_a_worktrees_outstanding_state_but_leaves_a_repos_not_applicable_one_alone()
+     {
+        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let mut spec = spec(vec![root]);
+        spec.generation_deadline = Duration::ZERO;
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let core = started.core;
+        let snapshot = core.snapshot();
+        let repo_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Repo))
+            .expect("repo entity present")
+            .key
+            .clone();
+        let worktree_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present")
+            .key
+            .clone();
+
+        // Both left mid-flight in a Generation whose (zero) deadline has already
+        // elapsed, with no tick sent yet, mirroring how `Core::refresh` begins a
+        // Worktree's `state` probe alongside `branch`. The Repo is in flight too
+        // (on `branch` only, per the same gate), so the sweep actually reaches
+        // it and the guard has something real to prove.
+        core.begin_untracked_probe_for_test(&repo_key);
+        core.begin_untracked_probe_for_test(&worktree_key);
+
+        tick_tx.send(Instant::now()).expect("send one tick");
+        let after_sweep = core.settle(Duration::from_millis(500));
+
+        let worktree_after = after_sweep
+            .entities
+            .iter()
+            .find(|entity| entity.key == worktree_key)
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_after.state.settled(),
+                Some(Settled::Unknown(Unknown::TimedOut))
+            ),
+            "expected the outstanding state cell to time out, got {:?}",
+            worktree_after.state.settled()
+        );
+
+        let repo_after = after_sweep
+            .entities
+            .iter()
+            .find(|entity| entity.key == repo_key)
+            .expect("repo entity present");
+        assert!(
+            matches!(repo_after.state.settled(), Some(Settled::NotApplicable)),
+            "a Repo's Not applicable state must survive the sweep untouched, got {:?}",
+            repo_after.state.settled()
+        );
+    }
+
     /// Cancellation observed before a probe's very first read stops it from ever
     /// opening the repository at all, proven behaviourally rather than by
     /// re-reading the flag: a path that does not exist would settle as
@@ -2187,6 +2371,138 @@ mod tests {
             }
             other => panic!("expected both entities to read an attached branch, got {other:?}"),
         }
+    }
+
+    /// End-to-end proof that `state` is actually wired into a real Generation:
+    /// a linked Worktree whose branch is an ancestor of the default branch reads
+    /// `Merged` after a real `refresh`, not merely in `landing`'s own unit tests.
+    #[test]
+    fn a_worktrees_branch_that_is_an_ancestor_of_the_default_branch_reads_merged_after_a_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(&parent);
+        git(&parent, &["update-ref", "refs/remotes/origin/main", &sha]);
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            matches!(
+                worktree_entity.state.settled(),
+                Some(Settled::Known {
+                    value: WorktreeState::Merged,
+                    ..
+                })
+            ),
+            "expected the worktree, at the same commit as the default branch, to read Merged, got {:?}",
+            worktree_entity.state.settled()
+        );
+    }
+
+    /// The criterion this whole ticket turns on, proven through the real
+    /// dispatch path rather than `landing::probe` in isolation: a Worktree whose
+    /// branch has diverged from the default branch stays outstanding
+    /// (`settled() == None`, still `is_in_flight()`) after a real Generation
+    /// completes, rather than settling to `Gone` (or anything else) the moment
+    /// ancestry answers no. `settle` returning at all proves the Generation's
+    /// dispatch finished; the state cell is what must still show nothing.
+    #[test]
+    fn a_diverged_worktree_stays_outstanding_after_a_refresh_rather_than_reading_gone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let base_sha = head_sha(&parent);
+        git(
+            &parent,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/main", &base_sha],
+        );
+        let worktree_path = root.join("feature-worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+        // Unmerged work: feature now has a commit main (and origin/main) do not.
+        git(
+            &worktree_path,
+            &["commit", "--allow-empty", "-m", "unmerged"],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_millis(500));
+
+        let worktree_entity = settled
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree entity present");
+        assert!(
+            worktree_entity.state.settled().is_none(),
+            "expected the diverged worktree's state to stay outstanding, got {:?}",
+            worktree_entity.state.settled()
+        );
+        assert!(
+            worktree_entity.state.is_in_flight(),
+            "an outstanding state cell must still read as in-flight, matching a cell nothing has settled yet"
+        );
     }
 
     /// Submodules are hidden by default in the TUI (ADR 0009), but `Core` has no

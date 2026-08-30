@@ -18,6 +18,9 @@ pub enum ProbeError {
     Read(Arc<str>),
     /// A `.gitmodules` file existed but would not read or parse.
     Submodules(Arc<str>),
+    /// The ancestry check between a branch and the default branch could not run:
+    /// a missing or corrupt commit, never a stand-in for "not an ancestor".
+    Ancestry(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -26,6 +29,7 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Open(message) => write!(f, "failed to open git repository: {message}"),
             ProbeError::Read(message) => write!(f, "failed to read HEAD: {message}"),
             ProbeError::Submodules(message) => write!(f, "failed to read .gitmodules: {message}"),
+            ProbeError::Ancestry(message) => write!(f, "failed to check ancestry: {message}"),
         }
     }
 }
@@ -284,10 +288,12 @@ mod tests {
         let open = ProbeError::Open(Arc::from("boom"));
         let read = ProbeError::Read(Arc::from("boom"));
         let submodules = ProbeError::Submodules(Arc::from("boom"));
+        let ancestry = ProbeError::Ancestry(Arc::from("boom"));
 
         assert_eq!(open.clone().to_string(), open.to_string());
         assert_eq!(read.clone().to_string(), read.to_string());
         assert_eq!(submodules.clone().to_string(), submodules.to_string());
+        assert_eq!(ancestry.clone().to_string(), ancestry.to_string());
     }
 
     fn init_repo_with_a_commit(path: &Path) {
