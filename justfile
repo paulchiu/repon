@@ -109,5 +109,69 @@ ci: fmt-check lint test docs check-core-isolation build
 # `-L dependency=<target>/debug/deps`: sharing that directory with the workspace
 # build lets the packaged binary resolve the workspace's own repon-core rather
 # than the packaged one, and the rehearsal stops rehearsing what it claims to.
+#
+# The same class of leak sits one level further out, in a directory this recipe
+# does not own at all. To verify `repon` against the just-packaged `repon-core`,
+# cargo routes it through a local registry and extracts it into
+# `~/.cargo/registry/src/<hash>/repon-core-<version>/`, then never re-extracts
+# into a directory that already exists. The hash comes from this checkout's local
+# registry path, so it is the same on every run: left alone, a second run
+# verifies `repon` against whatever `repon-core` source the first run left there,
+# not the one just packaged, and can pass silently against a stale-but-compatible
+# copy. So this recipe clears any such extraction of a workspace crate before
+# rehearsing (only a crate another workspace crate depends on is ever routed this
+# way; `repon` itself, with no in-workspace consumer, builds straight from its own
+# package directory and is never at risk), then diffs what the rehearsal actually
+# extracted against the source on disk, so a rehearsal that verifies a stale copy
+# again fails loudly instead of quietly passing.
 publish-check:
-    CARGO_TARGET_DIR=target/publish-check cargo publish --workspace --dry-run --locked
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR=target/publish-check
+
+    metadata=$(cargo metadata --no-deps --format-version 1)
+    registry_src="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+
+    # A workspace crate is only ever extracted into the local registry above if some
+    # other workspace crate names it as a path dependency; derived here rather than
+    # named, so a crate added later is covered without editing this recipe.
+    at_risk=$(jq -r '[.packages[].dependencies[] | select(.path != null) | .name] | unique[]' <<< "$metadata")
+
+    package_field() {
+        jq -r --arg name "$1" --arg field "$2" '.packages[] | select(.name == $name) | .[$field]' <<< "$metadata"
+    }
+    extraction_dirs() {
+        local name="$1" version="$2"
+        find "$registry_src" -mindepth 2 -maxdepth 2 -type d -name "$name-$version" 2>/dev/null
+    }
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        version=$(package_field "$name" version)
+        while IFS= read -r stale; do
+            [ -z "$stale" ] && continue
+            rm -rf "$stale"
+        done <<< "$(extraction_dirs "$name" "$version")"
+    done <<< "$at_risk"
+
+    cargo publish --workspace --dry-run --locked
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        version=$(package_field "$name" version)
+        manifest_path=$(package_field "$name" manifest_path)
+        src_dir="$(dirname "$manifest_path")/src"
+        extracted="$(extraction_dirs "$name" "$version")"
+        if [ -z "$extracted" ]; then
+            echo "publish-check never extracted $name-$version during the rehearsal it just ran" >&2
+            exit 1
+        fi
+        while IFS= read -r extracted_dir; do
+            [ -z "$extracted_dir" ] && continue
+            if ! diff -rq "$src_dir" "$extracted_dir/src" > /dev/null; then
+                echo "publish-check verified $name-$version from $extracted_dir, whose src no longer matches $src_dir" >&2
+                diff -rq "$src_dir" "$extracted_dir/src" >&2 || true
+                exit 1
+            fi
+        done <<< "$extracted"
+    done <<< "$at_risk"
