@@ -134,3 +134,178 @@ fn print_config_paths() {
 fn existence(path: &Path) -> &'static str {
     if path.exists() { "exists" } else { "missing" }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{production_source_at, rust_source_files};
+
+    /// The name of every `pub fn` in `source` (a `production_source_at` read) whose own doc
+    /// comment names `test` or `tests` as a whole word and which is not already gated behind
+    /// `cfg(test)` or `feature = "test-util"`: the two facts `Timestamp::at` carried together
+    /// before #83, one in prose and one missing in code.
+    fn undocumented_test_only_pub_fns(source: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut names = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(rest) = line.trim_start().strip_prefix("pub fn ") else {
+                continue;
+            };
+            if is_test_gated_above(&lines, index) || !doc_comment_names_test_above(&lines, index) {
+                continue;
+            }
+            let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+        names
+    }
+
+    /// True if a `#[cfg(...)]` attribute mentioning `test` sits directly above `index`, doc
+    /// comment lines skipped, the same attribute-stack walk a real gate would need to be found by.
+    fn is_test_gated_above(lines: &[&str], index: usize) -> bool {
+        let mut cursor = index;
+        while cursor > 0 {
+            cursor -= 1;
+            let above = lines[cursor].trim();
+            if above.starts_with("///") {
+                continue;
+            }
+            if above.starts_with("#[") {
+                if above.contains("cfg(") && above.contains("test") {
+                    return true;
+                }
+                continue;
+            }
+            break;
+        }
+        false
+    }
+
+    /// True if the contiguous `///` doc comment directly above `index` (attribute lines
+    /// skipped, so a `#[cfg]` between the doc and the item does not hide it) names `test` or
+    /// `tests` as a whole word, the shape `Timestamp::at`'s own doc took: "this exists so a
+    /// consumer's **test** can build...".
+    fn doc_comment_names_test_above(lines: &[&str], index: usize) -> bool {
+        let mut cursor = index;
+        let mut doc = String::new();
+        while cursor > 0 {
+            cursor -= 1;
+            let above = lines[cursor].trim();
+            if let Some(rest) = above.strip_prefix("///") {
+                doc.push_str(rest);
+                doc.push(' ');
+                continue;
+            }
+            if above.starts_with("#[") {
+                continue;
+            }
+            break;
+        }
+        doc.split(|c: char| !c.is_alphanumeric())
+            .any(|word| word.eq_ignore_ascii_case("test") || word.eq_ignore_ascii_case("tests"))
+    }
+
+    /// True if `name` reads as called somewhere in `source`, either as a method (`.name(`) or
+    /// through a path (`::name(`), the two textual shapes a real call site of a `pub fn` takes.
+    fn is_called_in(source: &str, name: &str) -> bool {
+        source.contains(&format!(".{name}(")) || source.contains(&format!("::{name}("))
+    }
+
+    /// The criterion #83 asks for beyond its one fix: a check that fails if another test-only
+    /// constructor reaches `repon-core`'s default surface the same way `Timestamp::at` did.
+    /// What actually characterised that hazard is two facts holding together: the function's
+    /// own doc comment says it exists for a test, and nothing outside a test module anywhere
+    /// in the workspace ever calls it. Either fact alone is common in this codebase (production
+    /// API built ahead of the UI code that will consume it also has no non-test caller yet;
+    /// `probe_now`, `dismiss` and `resume` on `Core` all do today); both at once is what marks
+    /// an item that only ever needed to exist for a test. Both crates' production source is
+    /// read through [`rust_source_files`] and [`production_source_at`], the pair this crate's
+    /// every other scan already shares, so the cut can never quietly stop at a file's first
+    /// `#[cfg(test)]`.
+    ///
+    /// What this catches: an ungated `pub fn` whose own doc comment names `test`/`tests` and
+    /// whose only real callers, if any, would read textually as `.name(` or `::name(`, with
+    /// none outside a test module in either crate. What it misses: the same hazard on an item
+    /// whose doc comment does not say why it exists (this project's own convention is to say
+    /// why, but nothing enforces it), a call reached only through a macro or a trait object, and
+    /// a name collision with an unrelated function elsewhere in the workspace that would mask a
+    /// real hazard by supplying a false call site. It is a canary tuned to this defect's actual
+    /// shape, not a proof that no test-only item ships.
+    #[test]
+    fn every_pub_fn_documented_as_test_only_is_either_gated_or_has_a_production_call_site() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let core_src = manifest_dir.join("../repon-core/src");
+        let repon_src = manifest_dir.join("src");
+
+        let mut all_production = String::new();
+        for path in rust_source_files(&core_src)
+            .into_iter()
+            .chain(rust_source_files(&repon_src))
+        {
+            all_production.push_str(&production_source_at(&path));
+            all_production.push('\n');
+        }
+
+        let mut unguarded = Vec::new();
+        for path in rust_source_files(&core_src) {
+            for name in undocumented_test_only_pub_fns(&production_source_at(&path)) {
+                if !is_called_in(&all_production, &name) {
+                    unguarded.push(format!("{}: {name}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            unguarded.is_empty(),
+            "found a public repon-core function whose own doc comment names a test as its \
+             reason to exist, with no production call site anywhere in the workspace, and no \
+             `cfg(test)` or `feature = \"test-util\"` gate keeping it off the default build: \
+             {unguarded:?}"
+        );
+    }
+
+    /// This crate's own manifest, not a copy: the wiring [#83] asks for is `repon-core`'s
+    /// `test-util` feature reaching this crate through `[dev-dependencies]` only, so this
+    /// crate's tests keep constructing a `Timestamp::at` while its production build never
+    /// requests the feature that would carry it.
+    #[test]
+    fn repon_core_dependency_enables_test_util_from_dev_dependencies_only() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+            .expect("read this crate's own Cargo.toml");
+
+        let dependencies_section = manifest
+            .split("\n[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("manifest must have a [dependencies] section");
+        let repon_core_dependency_line = dependencies_section
+            .lines()
+            .find(|line| line.trim_start().starts_with("repon-core"))
+            .expect("[dependencies] must declare repon-core");
+        assert!(
+            !repon_core_dependency_line.contains("test-util"),
+            "the production [dependencies] entry for repon-core must never request \
+             `test-util`, or a default build would carry it: {repon_core_dependency_line}"
+        );
+
+        let dev_dependencies_section = manifest
+            .split("\n[dev-dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("manifest must have a [dev-dependencies] section");
+        let repon_core_dev_dependency_line = dev_dependencies_section
+            .lines()
+            .find(|line| line.trim_start().starts_with("repon-core"))
+            .expect(
+                "[dev-dependencies] must declare repon-core with test-util, or this crate's \
+                 own tests could not call Timestamp::at",
+            );
+        assert!(
+            repon_core_dev_dependency_line.contains("test-util"),
+            "the [dev-dependencies] entry for repon-core must request `test-util`: \
+             {repon_core_dev_dependency_line}"
+        );
+    }
+}

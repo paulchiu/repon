@@ -40,6 +40,11 @@ impl Timestamp {
     /// Wraps an arbitrary point in time. `now` is every real caller's constructor;
     /// this exists so a consumer's test can build a `Timestamp` in the future, the
     /// only way to exercise a backward clock jump deterministically.
+    ///
+    /// Gated behind `test-util` (on by default under `cfg(test)` for this crate's own
+    /// tests) so a test-only affordance never ships on the default published surface,
+    /// per [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn at(instant: SystemTime) -> Self {
         Timestamp(instant)
     }
