@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  quality-check:
+    name: Format, Lint, Test & Build
+    # Repon is a Unix program: Actions put each step in a new session with
+    # setsid(2) and read it back over a PTY, so there is no Windows leg to add.
+    # Both Unix runners are free on a public repository.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # The justfile owns what CI means: format, lint, test, docs, core isolation
+      # and build. Duplicating the steps here would let the two drift apart.
+      - name: Format, Lint, Test & Build
+        run: just ci
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # The recipe reads the floor out of the manifest, so the version Cargo
+      # promises and the version this job proves cannot drift apart.
+      - name: Build and test against the declared floor
+        run: just msrv
+
+  publish-check:
+    name: Publish rehearsal
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Nothing is published until beta, but the command that will publish is
+      # rehearsed on every change, so the first real release is not the first
+      # time it runs.
+      - name: Package and verify both crates
+        run: just publish-check
+
+  # One required status check, so branch protection needs no editing when a job
+  # is added above.
+  ci:
+    name: CI
+    if: always()
+    needs: [quality-check, msrv, publish-check]
+    runs-on: ubuntu-latest
+    steps:
+      - run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'

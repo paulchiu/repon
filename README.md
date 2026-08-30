@@ -10,12 +10,27 @@ Repon owns the outer loop: the combined state of many Repos, and acting on many 
 
 Pre-alpha. The skeleton compiles and runs: it starts, draws a frame and exits, with the git backend and the worker model wired underneath but no features on top of them. The design decisions needed to build those features are being recorded as ADRs in [docs/adr/](docs/adr/) and specifications in [docs/spec/](docs/spec/), backed by the research in [docs/research/](docs/research/).
 
+## Installing
+
+Repon runs on macOS and Linux. It is not portable to Windows and will not be: an Action puts each step in a new session with `setsid(2)` and reads it back over a PTY, and Windows has neither.
+
+Nothing is published to crates.io yet, so install from the repository:
+
+```sh
+cargo install --git https://github.com/paulchiu/repon --locked repon
+```
+
+That needs a Rust toolchain and takes about a minute. If your git configuration rewrites GitHub HTTPS URLs to SSH, cargo's own git client cannot authenticate against it; prefix the command with `CARGO_NET_GIT_FETCH_WITH_CLI=true` to fetch through the git CLI instead.
+
+The release story, including what has to be true before the first crates.io publish, is [ADR 0021](docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) and [docs/spec/releasing.md](docs/spec/releasing.md).
+
 ## Building
 
-Needs a Rust toolchain that supports edition 2024.
+Needs a Rust toolchain that supports edition 2024, and [just](https://github.com/casey/just) for the task recipes.
 
 ```sh
 cargo run -p repon
+just ci        # what the GitHub workflow runs: format, lint, test, docs, isolation, build
 ```
 
 The workspace is two crates. `crates/repon-core` computes state and knows nothing about rendering; `crates/repon` is the terminal interface and, for now, its only consumer. The boundary between them is [ADR 0005](docs/adr/0005-rendering-agnostic-core.md), and it exists so that a second consumer can never become a second interface stack.
@@ -30,15 +45,15 @@ Repon is useful pointed at a directory with no configuration at all. Configurati
 
 One keystroke reaches lazygit, an editor, or a shell in the Repo under the cursor, and the terminal comes back exactly as it was found.
 
-## Prior art
+## Influences
 
-Repon's problem statement comes from mrx, a multi-repo tool I forked, extended, and still use daily. mrx established that the outer loop is worth a tool of its own, and its recorded rough edges are the direct source of Repon's design principles: a screen whose columns disagreed with each other, mode changes that never announced themselves, and absent values that rendered as zero. Those became per-cell provenance and the feedback rules. mrx carries no licence and is entangled with work configuration, so Repon takes only the problem from it. Its source is not consulted while building, and every solution here is re-derived (see [the mrx research](<docs/research/2026-08-28 mrx history and requirements (clean room).md>) and [ADR 0003](docs/adr/0003-clean-room-from-mrx.md)).
+The problem statement comes from mrx, a private multi-repo tool I use daily. It established that the outer loop is worth a tool of its own, and the rough edges I hit using it are the direct source of Repon's design principles: columns that disagreed with each other, mode changes that never announced themselves, and absent values that rendered as zero. Those became per-cell provenance and the feedback rules. Repon takes the problem and none of the code, which is [ADR 0003](docs/adr/0003-clean-room-from-mrx.md).
 
-Repon takes its visual language from [superfile](https://github.com/yorukot/superfile): bordered panels, restrained colour, calm spacing, and the philosophy of picking a narrow lane and polishing it (see [the superfile research](<docs/research/2026-08-28 superfile design philosophy.md>)).
+The visual language comes from [superfile](https://github.com/yorukot/superfile): bordered panels, restrained colour, calm spacing, and the philosophy of picking a narrow lane and polishing it.
 
-It takes its interaction structure from [lazygit](https://github.com/jesseduffield/lazygit): context-sensitive keybindings, an always-visible footer, and a Selection that drives a detail pane (see [the lazygit research](<docs/research/2026-08-28 lazygit workflow UX and the multi-repo gap.md>)).
+The interaction structure comes from [lazygit](https://github.com/jesseduffield/lazygit): context-sensitive keybindings, an always-visible footer, and a Selection that drives a detail pane.
 
-superfile and lazygit are both MIT licensed. Repon takes ideas from all three, and code from none.
+Both are MIT licensed.
 
 ## Documents
 

@@ -5,12 +5,23 @@ members = ["crates/repon", "crates/repon-core"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# The floor twelve lockfile packages already set, and the number `cargo update`
+# resolves against: undeclared, it resolves against whatever toolchain is installed.
+rust-version = "1.88"
 license = "MIT"
+authors = ["Paul Chiu"]
 repository = "https://github.com/paulchiu/repon"
+homepage = "https://github.com/paulchiu/repon"
+# Resolved from the workspace root, so both crates ship the one README.
+readme = "README.md"
+keywords = ["git", "tui", "worktree", "monorepo", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 crossbeam-channel = "0.5.16"
-repon-core = { path = "crates/repon-core" }
+# The version is what makes the workspace publishable at all, and `cargo
+# set-version --workspace` rewrites it with the rest on a bump.
+repon-core = { path = "crates/repon-core", version = "0.1.0" }
 
 # Read the optimization guideline for more details:
 # https://ratatui.rs/recipes/apps/release-your-app/#optimizations
