@@ -305,7 +305,8 @@ mod tests {
 
     /// crossterm's `KeyEventKind` has three variants, not two: a physical key held down
     /// generates `Repeat` events between the `Press` and the eventual `Release`. Only `Press`
-    /// may reach [`dispatch`](crate::keys::dispatch), or every bound key would fire twice.
+    /// may reach [`BindingTable::dispatch`](crate::keys::BindingTable::dispatch), or every
+    /// bound key would fire twice.
     #[test]
     fn translate_passes_through_a_press_and_filters_every_other_key_event_kind() {
         let press = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);

@@ -288,9 +288,11 @@ args = ["rm", "-rf", "node_modules"]
 args = ["pnpm", "install"]
 
 # Only what changes. Everything else keeps the default map.
+[keys.global]
+refresh_all = "f5"         # move one binding
+
 [keys.list]
-refresh = "F5"             # move one binding
-dismiss = ""               # unbind it entirely
+dismiss_vanished = ""      # unbind it entirely
 ```
 
 ## What this spec does not own
