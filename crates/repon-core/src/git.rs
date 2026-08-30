@@ -207,7 +207,10 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
                     "attached HEAD resolved no commit".to_string().into(),
                 ));
             };
-            Head::Branch(Arc::from(reference.name.shorten().to_string()), commit)
+            Head::Branch {
+                name: Arc::from(reference.name.shorten().to_string()),
+                commit,
+            }
         }
         gix::head::Kind::Unborn(name) => Head::Unborn(Arc::from(name.shorten().to_string())),
         gix::head::Kind::Detached { target, peeled } => Head::Detached(peeled.unwrap_or(target)),
@@ -247,7 +250,7 @@ mod tests {
         let head = head_shape_at(dir.path()).expect("read HEAD");
 
         match head {
-            Head::Branch(name, _) => assert!(!name.is_empty()),
+            Head::Branch { name, .. } => assert!(!name.is_empty()),
             other => panic!("expected an attached branch, got {other:?}"),
         }
     }
@@ -264,7 +267,7 @@ mod tests {
         let head = head_shape_at(dir.path()).expect("read HEAD");
 
         match head {
-            Head::Branch(_, commit) => assert_eq!(commit.to_string(), sha),
+            Head::Branch { commit, .. } => assert_eq!(commit.to_string(), sha),
             other => panic!("expected an attached branch, got {other:?}"),
         }
     }
@@ -338,7 +341,7 @@ mod tests {
                 .join()
                 .expect("reader thread panicked")
                 .expect("read HEAD");
-            assert!(matches!(head, Head::Branch(..)));
+            assert!(matches!(head, Head::Branch { .. }));
         }
     }
 

@@ -244,7 +244,7 @@ The core returns it as data and never spawns for a Launcher.
 pub fn environment(entity: &EntityState, action: Option<&str>) -> Vec<(String, Option<String>)>
 ```
 
-`Some` sets, `None` unsets. It covers the seven `REPON_` variables and the fifteen git variables [config.md](config.md) fixes, and it contains nothing about argv, shell mode or the terminal, because it is derived entirely from git facts the core already computed. The consumer asks for it, builds the argv, suspends, execs and restores.
+`Some` sets, `None` unsets. It covers the eight `REPON_` variables and the fifteen git variables [config.md](config.md) fixes, and it contains nothing about argv, shell mode or the terminal, because it is derived entirely from git facts the core already computed. The consumer asks for it, builds the argv, suspends, execs and restores.
 
 Action fan-out is the core's, because no terminal is involved. What an Action's output looks like, what a partial failure means and how a run's result persists belong to [Decide how an Action runs and what its output looks like](https://github.com/paulchiu/repon/issues/14); this spec places the seam only.
 

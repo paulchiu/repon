@@ -165,7 +165,7 @@ fn branch_and_head(settled: Option<&Settled<Head>>) -> (Option<String>, Option<S
     };
     match settled {
         Settled::Known { value, .. } => match value {
-            Head::Branch(name, commit) => (Some(name.to_string()), Some(commit.to_string())),
+            Head::Branch { name, commit } => (Some(name.to_string()), Some(commit.to_string())),
             Head::Detached(commit) => (None, Some(commit.to_string())),
             Head::Unborn(name) => (Some(name.to_string()), None),
         },
@@ -249,6 +249,81 @@ mod tests {
             .collect()
     }
 
+    /// `docs/spec/config.md`, read at test time from `CARGO_MANIFEST_DIR` rather
+    /// than with `include_str!`, matching the pattern `lib.rs`'s own
+    /// `public_surface_matches_glossary` test already uses for a file outside
+    /// this crate's own directory.
+    fn spec_config_md() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
+            .expect("read docs/spec/config.md")
+    }
+
+    /// Every backtick-quoted token on `line`, in order.
+    fn backtick_tokens(line: &str) -> Vec<&str> {
+        line.split('`').skip(1).step_by(2).collect()
+    }
+
+    /// The `REPON_` names `docs/spec/config.md`'s "The environment contract"
+    /// table lists, one per table row, read from the row's own first
+    /// backtick-quoted cell so a value column's own backtick-quoted text (a
+    /// `REPON_KIND` value, say) is never mistaken for a variable name.
+    fn spec_repon_variable_names(spec: &str) -> Vec<String> {
+        let section = spec
+            .split("## The environment contract")
+            .nth(1)
+            .expect("\"The environment contract\" section is present")
+            .split("\n## ")
+            .next()
+            .expect("a following heading or end of file");
+        section
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .filter_map(|line| backtick_tokens(line).first().copied())
+            .filter(|token| token.starts_with("REPON_"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The git local environment variable names `docs/spec/config.md` lists in
+    /// its own sentence naming them, read from that sentence rather than
+    /// transcribed a second time.
+    fn spec_git_local_env_var_names(spec: &str) -> Vec<String> {
+        let anchor =
+            "Repon unsets all fifteen of git's local environment variables from every child:";
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .expect("the git local env vars sentence is present");
+        let list = after.split('.').next().expect("a sentence terminator");
+        backtick_tokens(list)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Asserts `spec_names` and `array_names` name exactly the same set,
+    /// reporting the specific name either side lacks rather than only a count,
+    /// so a misspelling or a dropped entry fails with the offending name.
+    fn assert_names_match_the_spec(spec_names: &[String], array_names: &[String]) {
+        let missing_from_array: Vec<&String> = spec_names
+            .iter()
+            .filter(|name| !array_names.contains(name))
+            .collect();
+        let missing_from_spec: Vec<&String> = array_names
+            .iter()
+            .filter(|name| !spec_names.contains(name))
+            .collect();
+        assert!(
+            missing_from_array.is_empty(),
+            "named in docs/spec/config.md but missing from the array: {missing_from_array:?}"
+        );
+        assert!(
+            missing_from_spec.is_empty(),
+            "in the array but not named in docs/spec/config.md: {missing_from_spec:?}"
+        );
+    }
+
     // Criterion 2: the counts are the claim, asserted against the one list both
     // the production path and these tests read.
 
@@ -262,6 +337,35 @@ mod tests {
         assert_eq!(GIT_LOCAL_ENV_VARS.len(), 15);
     }
 
+    // The array-to-array tests above catch REPON_ENV_VAR_NAMES and
+    // GIT_LOCAL_ENV_VARS drifting from each other; they do nothing about both
+    // drifting together away from the design of record. These two read
+    // `docs/spec/config.md` itself as the independent source of truth.
+
+    #[test]
+    fn repon_env_var_names_match_the_spec_exactly() {
+        let spec = spec_config_md();
+        assert_names_match_the_spec(
+            &spec_repon_variable_names(&spec),
+            &REPON_ENV_VAR_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn git_local_env_var_names_match_the_spec_exactly() {
+        let spec = spec_config_md();
+        assert_names_match_the_spec(
+            &spec_git_local_env_var_names(&spec),
+            &GIT_LOCAL_ENV_VARS
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn every_declared_repon_variable_is_present_in_the_output() {
         let row = entity(
@@ -269,7 +373,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), commit("1")),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: commit("1"),
+            },
             known_default_branch("origin/main"),
         );
 
@@ -290,7 +397,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), commit("1")),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: commit("1"),
+            },
             known_default_branch("origin/main"),
         );
 
@@ -316,7 +426,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), commit("1")),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: commit("1"),
+            },
             known_default_branch("origin/main"),
         );
 
@@ -347,7 +460,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), head_commit),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: head_commit,
+            },
             known_default_branch("origin/main"),
         );
 
@@ -441,7 +557,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), commit("ddd")),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: commit("ddd"),
+            },
             Settled::Unknown(Unknown::NoDefaultBranch),
         );
 
@@ -463,7 +582,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/repo/.git",
-            Head::Branch(Arc::from("main"), commit("eee")),
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: commit("eee"),
+            },
             known_default_branch("origin/main"),
         );
         let unborn = entity(
@@ -495,7 +617,10 @@ mod tests {
             "/dev/repo",
             "repo",
             "/dev/parent/.git",
-            Head::Branch(Arc::from("feature"), head_commit),
+            Head::Branch {
+                name: Arc::from("feature"),
+                commit: head_commit,
+            },
             known_default_branch("origin/main"),
         );
 

@@ -52,7 +52,10 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Head {
     /// Attached to a branch, which points at a commit.
-    Branch(Arc<str>, gix::ObjectId),
+    Branch {
+        name: Arc<str>,
+        commit: gix::ObjectId,
+    },
     /// Detached at a commit, with no branch name.
     Detached(gix::ObjectId),
     /// A branch with no commit yet: `## No commits yet on <name>`.
@@ -403,7 +406,10 @@ mod tests {
         entity.branch.settle(
             generation,
             Settled::Known {
-                value: Head::Branch(Arc::from("main"), gix::hash::Kind::Sha1.null()),
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -457,7 +463,7 @@ mod tests {
         assert_eq!(entity.presence, Presence::Vanished);
         match entity.branch.settled() {
             Some(Settled::Known {
-                value: Head::Branch(name, _),
+                value: Head::Branch { name, .. },
                 stale: true,
                 ..
             }) => assert_eq!(&**name, "main"),

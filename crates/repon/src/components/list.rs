@@ -295,7 +295,7 @@ fn render_cell<T>(settled: Option<&Settled<T>>, format: impl FnOnce(&T) -> Strin
 
 fn format_head(cell: &Cell<Head>) -> String {
     render_cell(cell.settled(), |value| match value {
-        Head::Branch(name, _) | Head::Unborn(name) => name.to_string(),
+        Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
         Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
     })
 }
