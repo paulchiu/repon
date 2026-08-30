@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(
             buf[(3, 1)].fg,
             Color::DarkGray,
-            "the header must show theming.md's documented dim default, dark-gray, as a \
+            "the header must show theming.md's documented dim default, dark-grey, as a \
              foreground colour rather than the DIM text attribute"
         );
     }

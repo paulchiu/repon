@@ -1,55 +1,63 @@
 //! The nine theme roles from [`docs/spec/theming.md`](../../../docs/spec/theming.md) and
-//! [ADR 0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md): a theme
-//! corrects the terminal's own sixteen-colour palette rather than replacing it, so the
-//! compiled-in default names only those sixteen ANSI colours and `reset`.
+//! [ADR 0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md): [`Theme`] holds
+//! them plus the two selection keys, and [`Meaning`] is the fixed map from a domain fact to
+//! the role that colours it, so no theme file can reach into it.
 //!
-//! [`Theme`] holds the nine roles plus the two selection keys. [`Meaning`] is the map from
-//! a domain fact to the role that colours it; it lives here as a fixed function so no theme
-//! file can reach into it, per the spec's "no mechanism for a theme to override or extend
-//! it".
+//! Several items below are `#[allow(dead_code)]`: nothing outside `#[cfg(test)]` reads them
+//! yet, since their callers (a theme-file loader, a renderer keyed by domain meaning) are
+//! later work; each site names only which future caller that is.
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// One of the nine named roles a theme corrects, per theming.md's "Roles". `border_focused`
-/// and `dim` are already read by the repos list; the other seven are read outside
-/// `#[cfg(test)]` only once a call site for them exists (a selected row, a state colour, a
-/// palette border), which is later work than this ticket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub enum Role {
-    Text,
-    Dim,
-    Accent,
-    Ok,
-    Warn,
-    Danger,
-    Behind,
-    Border,
-    BorderFocused,
+/// Declares an enum together with its `ALL: [Self; N]` constant from one variant list, so a
+/// variant added to the enum necessarily grows `ALL` to match: nothing else names the variant
+/// list for the two to drift apart from.
+macro_rules! enum_with_all {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident { $($variant:ident),+ $(,)? }
+        $all_vis:vis const ALL;
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            /// Every variant, generated with the enum so a variant cannot be added without
+            /// this array growing to match: what a test iterates instead of matching with a
+            /// wildcard arm that would hide a new one.
+            #[allow(dead_code)]
+            $all_vis const ALL: [$name; crate::glyphs::count_idents!($($variant),+)] = [
+                $($name::$variant),+
+            ];
+        }
+    };
+}
+
+enum_with_all! {
+    /// One of the nine named roles a theme corrects, per theming.md's "Roles" table;
+    /// `border_focused` and `dim` already have a reader in the repos list, the rest do not
+    /// yet.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[allow(dead_code)]
+    pub enum Role {
+        Text,
+        Dim,
+        Accent,
+        Ok,
+        Warn,
+        Danger,
+        Behind,
+        Border,
+        BorderFocused,
+    }
+    pub const ALL;
 }
 
 impl Role {
-    /// Every role, for a test to iterate without a wildcard arm slipping a new one past it.
-    ///
-    /// Read outside `#[cfg(test)]` only once a theme-file loader exists to iterate every
-    /// role it can override; until then the tests below are its only caller.
-    #[allow(dead_code)]
-    pub const ALL: [Role; 9] = [
-        Role::Text,
-        Role::Dim,
-        Role::Accent,
-        Role::Ok,
-        Role::Warn,
-        Role::Danger,
-        Role::Behind,
-        Role::Border,
-        Role::BorderFocused,
-    ];
-
-    /// This role's key in a theme file and in theming.md's own default-theme table.
-    ///
-    /// Read outside `#[cfg(test)]` only once a theme-file loader exists to look a role up by
-    /// its TOML key; until then the tests below are its only caller.
+    /// This role's key in a theme file and in theming.md's own default-theme table; not read
+    /// outside tests until a theme-file loader exists to look a role up by it.
     #[allow(dead_code)]
     pub fn spec_key(self) -> &'static str {
         match self {
@@ -131,12 +139,9 @@ impl Theme {
         Style::new().fg(self.role_color(role))
     }
 
-    /// The selected row's style. While both selection keys are unset it renders reversed,
-    /// per theming.md; once a theme sets them, this is the single place a background is
-    /// set.
-    ///
-    /// Read outside `#[cfg(test)]` only once a component renders a selected row; until then
-    /// the tests below are its only caller.
+    /// The selected row's style: reversed video while both selection keys are unset, the two
+    /// colours once a theme sets them; not read outside tests until a component renders a
+    /// selected row.
     #[allow(dead_code)]
     pub fn selection_style(&self) -> Style {
         match (self.selection_fg, self.selection_bg) {
@@ -155,74 +160,42 @@ impl Theme {
     }
 }
 
-/// One domain fact a role colours. The map from meaning to role lives here as a fixed
-/// function, in code and in theming.md's "The map from meaning to role" table, and nowhere
-/// else: no theme file names a meaning, so nothing can override or extend this map.
-///
-/// Read outside `#[cfg(test)]` only once a component colours a cell by its domain meaning
-/// rather than a role picked by hand (as the repos list still does for its two wired-in
-/// roles); until then the tests below and the compile-time proof after this `impl` block
-/// are its only callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub enum Meaning {
-    FreshValue,
-    StaleOrUnknownGutterMark,
-    KnownZero,
-    MergedWorktree,
-    SubmoduleName,
-    Age,
-    ColumnHeader,
-    ActionStepNotRunOrCancelled,
-    LoadingSpinner,
-    WorktreeName,
-    ActiveWorktree,
-    FocusedBorder,
-    AheadCount,
-    SucceededActionStep,
-    Dirty,
-    LocalOnly,
-    ActionPaletteBorder,
-    ThemeWarningInStatusBar,
-    FailedProvenance,
-    GoneWorktree,
-    FailedActionStep,
-    BehindCount,
+enum_with_all! {
+    /// One domain fact a role colours, fixed here and in theming.md's "The map from meaning
+    /// to role" table so no theme file can reach it; not read outside tests until a
+    /// component colours a cell by domain meaning rather than a role picked by hand.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[allow(dead_code)]
+    pub enum Meaning {
+        FreshValue,
+        StaleOrUnknownGutterMark,
+        KnownZero,
+        MergedWorktree,
+        SubmoduleName,
+        Age,
+        ColumnHeader,
+        ActionStepNotRunOrCancelled,
+        LoadingSpinner,
+        WorktreeName,
+        ActiveWorktree,
+        FocusedBorder,
+        AheadCount,
+        SucceededActionStep,
+        Dirty,
+        LocalOnly,
+        ActionPaletteBorder,
+        ThemeWarningInStatusBar,
+        FailedProvenance,
+        GoneWorktree,
+        FailedActionStep,
+        BehindCount,
+    }
+    const ALL;
 }
 
 impl Meaning {
-    /// Every meaning, for the compile-time proof below that resolving all of them needs no
-    /// runtime data.
-    #[allow(dead_code)]
-    const ALL: [Meaning; 22] = [
-        Meaning::FreshValue,
-        Meaning::StaleOrUnknownGutterMark,
-        Meaning::KnownZero,
-        Meaning::MergedWorktree,
-        Meaning::SubmoduleName,
-        Meaning::Age,
-        Meaning::ColumnHeader,
-        Meaning::ActionStepNotRunOrCancelled,
-        Meaning::LoadingSpinner,
-        Meaning::WorktreeName,
-        Meaning::ActiveWorktree,
-        Meaning::FocusedBorder,
-        Meaning::AheadCount,
-        Meaning::SucceededActionStep,
-        Meaning::Dirty,
-        Meaning::LocalOnly,
-        Meaning::ActionPaletteBorder,
-        Meaning::ThemeWarningInStatusBar,
-        Meaning::FailedProvenance,
-        Meaning::GoneWorktree,
-        Meaning::FailedActionStep,
-        Meaning::BehindCount,
-    ];
-
-    /// The role this meaning colours, per theming.md's map. A `const fn`, so it can only
-    /// ever be a fixed function of its own argument: nothing loaded at runtime (a theme
-    /// file, a config value) can be threaded through a `const` evaluation, which is the
-    /// compile-time half of "no mechanism to override or extend it".
+    /// The role this meaning colours, per theming.md's map; a `const fn` so no runtime value
+    /// (a theme file, a config value) can ever be threaded through it.
     #[allow(dead_code)]
     pub const fn role(self) -> Role {
         match self {
@@ -251,10 +224,8 @@ impl Meaning {
     }
 }
 
-/// Evaluated entirely at compile time: every [`Meaning`] resolves to a [`Role`] with no
-/// value that could come from a theme file, since a `const` initialiser can only read
-/// other `const`s and fixed literals. This is what "no mechanism for a theme to override
-/// or extend the meaning-to-role map" means mechanically, not just by inspection.
+/// Proves every [`Meaning`] resolves to a [`Role`] using no value a theme file could supply,
+/// since a `const` initialiser can only ever read other `const`s and literals.
 const _MEANING_TO_ROLE_NEEDS_NO_RUNTIME_DATA: [Role; Meaning::ALL.len()] = {
     let mut roles = [Role::Text; Meaning::ALL.len()];
     let mut i = 0;
@@ -448,6 +419,143 @@ mod tests {
         );
     }
 
+    /// This role's variant, looked up by its `spec_key`, the reverse of [`Role::spec_key`].
+    fn role_by_spec_key(key: &str) -> Role {
+        Role::ALL
+            .into_iter()
+            .find(|role| role.spec_key() == key)
+            .unwrap_or_else(|| {
+                panic!("theming.md's meaning-to-role table names an unknown role `{key}`")
+            })
+    }
+
+    /// Every data row of theming.md's "The map from meaning to role" table, as raw
+    /// `| meanings | roles |` lines, header and separator dropped. Panics naming the file if
+    /// the heading or the table itself cannot be found.
+    fn extract_meaning_role_table_rows(spec: &str) -> Vec<String> {
+        const HEADING: &str = "### The map from meaning to role";
+        let after_heading = &spec[spec
+            .find(HEADING)
+            .expect("theming.md must contain the meaning-to-role heading")
+            + HEADING.len()..];
+        let table_lines: Vec<&str> = after_heading
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with('|'))
+            .take_while(|line| line.trim_start().starts_with('|'))
+            .map(str::trim)
+            .collect();
+        assert!(
+            table_lines.len() > 2,
+            "theming.md's meaning-to-role table has no data rows"
+        );
+        table_lines[2..]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// Converts a phrase from theming.md's meaning-to-role table, such as "an Action step
+    /// that did not run or was cancelled", into the `Meaning` variant name it names, such as
+    /// `ActionStepNotRunOrCancelled`: every word is kept and capitalised except the small set
+    /// of words the table's prose carries that a Rust identifier drops.
+    fn meaning_phrase_to_identifier(phrase: &str) -> String {
+        const DROPPED: [&str; 6] = ["a", "an", "the", "that", "did", "was"];
+        phrase
+            .split_whitespace()
+            .filter(|word| !DROPPED.contains(&word.to_lowercase().as_str()))
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// One row of theming.md's meaning-to-role table, split into its comma-separated meaning
+    /// phrases and its `/`-separated roles. A row shaped in any other way (not exactly two
+    /// cells, or naming a role `Role::spec_key` does not recognise) panics naming the row.
+    fn parse_meaning_role_row(row: &str) -> (Vec<String>, Vec<Role>) {
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let [meanings_cell, roles_cell] = cells.as_slice() else {
+            panic!("theming.md meaning-to-role row does not have exactly two cells: {row:?}");
+        };
+        let phrases = meanings_cell
+            .split(',')
+            .map(|phrase| phrase.trim().to_string())
+            .collect();
+        let roles = roles_cell
+            .split('/')
+            .map(|key| role_by_spec_key(key.trim().trim_matches('`')))
+            .collect();
+        (phrases, roles)
+    }
+
+    /// Parses theming.md's whole meaning-to-role table into a map from `Meaning` variant name
+    /// to the `Role` it names. A row naming `k` roles pairs its last `k - 1` phrases with the
+    /// last `k - 1` roles in order and every leading phrase with the first role, which is
+    /// theming.md's own convention for the one row that splits ("accent" / "border_focused"):
+    /// the trailing phrase is the one the trailing role singles out.
+    fn parse_meaning_role_table(spec: &str) -> HashMap<String, Role> {
+        let mut map = HashMap::new();
+        for row in extract_meaning_role_table_rows(spec) {
+            let (phrases, roles) = parse_meaning_role_row(&row);
+            assert!(
+                !roles.is_empty(),
+                "theming.md meaning-to-role row names no role: {row:?}"
+            );
+            let leading_count = phrases
+                .len()
+                .checked_sub(roles.len() - 1)
+                .unwrap_or_else(|| {
+                    panic!("theming.md meaning-to-role row lists more roles than meanings: {row:?}")
+                });
+            for (index, phrase) in phrases.iter().enumerate() {
+                let role = if index < leading_count {
+                    roles[0]
+                } else {
+                    roles[index - leading_count + 1]
+                };
+                let identifier = meaning_phrase_to_identifier(phrase);
+                assert!(
+                    map.insert(identifier.clone(), role).is_none(),
+                    "theming.md meaning-to-role table names `{identifier}` more than once"
+                );
+            }
+        }
+        map
+    }
+
+    /// Reads `docs/spec/theming.md`'s own meaning-to-role table at test time and compares it
+    /// against [`Meaning::role`] in both directions: a meaning the spec has and the code
+    /// lacks fails here, as does a meaning the code has and the spec's table does not name.
+    #[test]
+    fn every_meanings_role_matches_theming_mds_map_from_meaning_to_role_in_both_directions() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let mut spec_roles = parse_meaning_role_table(&spec);
+
+        for meaning in Meaning::ALL {
+            let identifier = format!("{meaning:?}");
+            let expected_role = spec_roles.remove(&identifier).unwrap_or_else(|| {
+                panic!("theming.md's meaning-to-role table has no entry for `{identifier}`")
+            });
+            assert_eq!(
+                meaning.role(),
+                expected_role,
+                "Meaning::{identifier}::role() does not match theming.md's meaning-to-role table"
+            );
+        }
+        assert!(
+            spec_roles.is_empty(),
+            "theming.md's meaning-to-role table names meanings Meaning::ALL does not: {spec_roles:?}"
+        );
+    }
+
     /// Every `.rs` file under `dir`, recursively.
     fn rust_source_files(dir: &Path) -> Vec<std::path::PathBuf> {
         let mut files = Vec::new();
@@ -470,8 +578,22 @@ mod tests {
     /// make the scan fail on itself; this is what the `gix_interrupt_is_interrupted_is_never_used`
     /// precedent in `repon-core` solves with string concatenation instead, which does not
     /// scale to a list of a dozen banned words here.
+    ///
+    /// Assumes the `#[cfg(test)]` line found is the one that starts the file's trailing
+    /// tests module, so nothing production follows it; enforced below rather than assumed.
     fn production_source(path: &Path) -> String {
         let source = std::fs::read_to_string(path).expect("read a crate source file");
+        let cfg_test_lines = source
+            .lines()
+            .filter(|line| line.trim() == "#[cfg(test)]")
+            .count();
+        assert!(
+            cfg_test_lines <= 1,
+            "{}: production_source assumes at most one `#[cfg(test)]` line, the one that \
+             starts the trailing tests module; found {cfg_test_lines}, so a real production \
+             item ahead of the tests module may have been silently dropped from the scan",
+            path.display()
+        );
         let mut production = String::new();
         for line in source.lines() {
             if line.trim() == "#[cfg(test)]" {
@@ -481,6 +603,22 @@ mod tests {
             production.push('\n');
         }
         production
+    }
+
+    /// A file with two `#[cfg(test)]`-gated items violates `production_source`'s one-cut-point
+    /// assumption; it must panic rather than silently scan only up to the first one.
+    #[test]
+    #[should_panic(expected = "production_source assumes at most one")]
+    fn production_source_panics_on_a_file_with_more_than_one_cfg_test_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("two_cfg_test_lines.rs");
+        std::fs::write(
+            &file,
+            "#[cfg(test)]\nfn only_built_for_tests() {}\n\n#[cfg(test)]\nmod tests {}\n",
+        )
+        .expect("write the fixture file");
+
+        production_source(&file);
     }
 
     /// theming.md and ADR 0011: no bundled third-party palette, and no paired light/dark

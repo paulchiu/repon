@@ -34,14 +34,16 @@ pub struct Border {
     pub vertical: char,
 }
 
-/// Counts the identifiers passed to it, for sizing a row-interior array without a
-/// hand-maintained number that could drift from `glyph_set!`'s own list.
+/// Counts the identifiers passed to it, for sizing an array without a hand-maintained number
+/// that could drift from the list it is generated from. Shared with `theme.rs`'s
+/// `enum_with_all!`.
 macro_rules! count_idents {
     () => { 0usize };
     ($head:ident $(, $tail:ident)* $(,)?) => {
-        1usize + count_idents!($($tail),*)
+        1usize + $crate::glyphs::count_idents!($($tail),*)
     };
 }
+pub(crate) use count_idents;
 
 /// Declares `GlyphSet`'s row-interior char fields, the [`Meaning`] enum and
 /// [`GlyphSet::row_interior`] from one meaning-to-field list, each entry marked `gutter` or
