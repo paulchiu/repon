@@ -106,6 +106,8 @@ pub fn summary(entity: &EntityState) -> RowSummary {
         last_action,
         presence: _,
         excluded: _,
+        in_progress_operation: _,
+        recent_commits: _,
     } = entity;
     let Diagnostics {
         default_branch_rung: _,
@@ -236,6 +238,21 @@ mod tests {
         let entity = fresh_entity("repo");
 
         assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    /// ADR 0019: an in-progress git operation is not a state and not a gutter mark, read by
+    /// the detail pane alone. A row stopped mid-rebase and the same row idle summarise
+    /// identically here, which is what "not a gutter mark" actually means: not merely that no
+    /// existing branch of `summary` happens to read the field, but that setting it never
+    /// changes the fold's answer at all.
+    #[test]
+    fn an_in_progress_git_operation_never_changes_the_row_summary() {
+        let idle = fresh_entity("repo-idle");
+        let mut rebasing = fresh_entity("repo-rebasing");
+        rebasing.in_progress_operation = Some(crate::git::InProgressOperation::Rebase);
+
+        assert_eq!(summary(&idle), summary(&rebasing));
+        assert_eq!(summary(&rebasing), RowSummary::Fresh);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::cell::{Cell, Generation, Settled};
 use crate::default_branch;
+use crate::git::{InProgressOperation, RecentCommit};
 
 /// An Entity's identity: a newtype over its own resolved absolute working
 /// directory.
@@ -193,6 +194,14 @@ pub struct EntityState {
     /// entirely: an excluded entity is still a row here, still selectable, and this
     /// is the fact a row count or a confirm gate subtracts it against.
     pub excluded: bool,
+    /// The in-progress git operation read from this entity's own repository
+    /// state, if any: not a Cell, not part of the row summary fold, and read by
+    /// the detail pane alone
+    /// ([ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)).
+    pub in_progress_operation: Option<InProgressOperation>,
+    /// Up to a fixed handful of this entity's most recent commits, most recent
+    /// first. Empty before the first probe, or when HEAD is unborn.
+    pub recent_commits: Vec<RecentCommit>,
 }
 
 impl EntityState {
@@ -223,6 +232,8 @@ impl EntityState {
             last_action: None,
             presence: Presence::default(),
             excluded: false,
+            in_progress_operation: None,
+            recent_commits: Vec::new(),
         };
 
         if matches!(entity.kind, Kind::Submodule | Kind::Repo) {
@@ -263,6 +274,28 @@ impl EntityState {
         }
     }
 
+    /// Settles `branch` onto this entity's `branch` cell for `generation`, and,
+    /// only if that write actually applied, records the in-progress operation
+    /// and recent commits read alongside it. The same supersession-gated pattern
+    /// as [`Self::apply_default_branch_resolution`]: neither of these two facts is
+    /// a Cell in its own right, so without this gate a probe result landing out
+    /// of Generation order could overwrite a newer branch read's own facts with
+    /// an older read's.
+    pub(crate) fn apply_branch_probe(
+        &mut self,
+        generation: Generation,
+        branch: Settled<Head>,
+        in_progress_operation: Option<InProgressOperation>,
+        recent_commits: Vec<RecentCommit>,
+    ) -> bool {
+        let applied = self.branch.settle(generation, branch);
+        if applied {
+            self.in_progress_operation = in_progress_operation;
+            self.recent_commits = recent_commits;
+        }
+        applied
+    }
+
     /// Whether this Entity's `state` cell is ever (re)probed: `false` once
     /// construction has settled it `NotApplicable` (a Repo or a Submodule),
     /// `true` for a Worktree. Reads the cell itself rather than re-deriving the
@@ -296,6 +329,8 @@ impl EntityState {
             last_action: _,
             presence: _,
             excluded: _,
+            in_progress_operation: _,
+            recent_commits: _,
         } = self;
         branch.force_stale();
         sync.force_stale();
@@ -537,6 +572,96 @@ mod tests {
             entity.base.settled(),
             Some(Settled::NotApplicable)
         ));
+    }
+
+    // --- apply_branch_probe: the pipe between a branch read and the pane's own facts ---
+
+    fn known_branch(name: &str) -> Settled<Head> {
+        Settled::Known {
+            value: Head::Branch {
+                name: Arc::from(name),
+                commit: gix::hash::Kind::Sha1.null(),
+            },
+            at: Timestamp::now(),
+            stale: false,
+        }
+    }
+
+    fn commit(short_id: &str, summary: &str) -> RecentCommit {
+        RecentCommit {
+            short_id: Arc::from(short_id),
+            summary: Arc::from(summary),
+        }
+    }
+
+    /// Half of [`EntityState::apply_branch_probe`]'s own doc comment: a write that applies
+    /// (nothing newer already recorded on `branch`) stores the in-progress operation and the
+    /// recent commits it was handed, not only the branch cell itself.
+    #[test]
+    fn a_branch_probe_that_applies_stores_its_in_progress_operation_and_recent_commits() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let commits = vec![commit("abc1234", "a commit")];
+
+        let applied = entity.apply_branch_probe(
+            Generation::default(),
+            known_branch("main"),
+            Some(InProgressOperation::Rebase),
+            commits.clone(),
+        );
+
+        assert!(applied);
+        assert_eq!(
+            entity.in_progress_operation,
+            Some(InProgressOperation::Rebase)
+        );
+        assert_eq!(entity.recent_commits, commits);
+    }
+
+    /// The other half: a probe superseded by Generation order (older than the branch cell's
+    /// own already-recorded Generation) applies neither fact, leaving the newer read's own
+    /// in-progress operation and commits exactly as they were.
+    #[test]
+    fn a_superseded_branch_probe_leaves_the_newer_reads_facts_intact() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let newer_commits = vec![commit("newer12", "the newer read")];
+        let applied_first = entity.apply_branch_probe(
+            Generation::new(5),
+            known_branch("main"),
+            Some(InProgressOperation::Merge),
+            newer_commits.clone(),
+        );
+        assert!(
+            applied_first,
+            "the first write, at Generation 5, must apply"
+        );
+
+        let older_commits = vec![commit("older12", "a stale read")];
+        let applied_second = entity.apply_branch_probe(
+            Generation::new(2),
+            known_branch("main"),
+            Some(InProgressOperation::Rebase),
+            older_commits,
+        );
+
+        assert!(
+            !applied_second,
+            "a write at an older Generation must not apply"
+        );
+        assert_eq!(
+            entity.in_progress_operation,
+            Some(InProgressOperation::Merge)
+        );
+        assert_eq!(entity.recent_commits, newer_commits);
     }
 
     #[test]

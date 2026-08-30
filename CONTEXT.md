@@ -115,7 +115,7 @@ _Avoid_: Row (that names the rendering, not the domain object)
 An Entity's identity: a newtype over its own resolved absolute working directory. Not its name, which collides across the population; not the git common dir, which a Repo shares with every Worktree attached to it.
 
 **Entity state**:
-The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action run and its Presence.
+The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action run, its Presence, its in progress operation and its recent commits.
 
 **HEAD**:
 Exactly three shapes, one to one with git's own: attached to a branch with a commit, detached at a commit with no branch, or unborn with a branch and no commit yet.
@@ -125,6 +125,12 @@ An Entity's ahead behind pair of commit counts against its upstream.
 
 **Diagnostics**:
 Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2 and rung 3 disagreed, and why an entity's own `.gitmodules` failed to read or parse, if it did. Reaches the detail pane, never the list.
+
+**In progress operation**:
+An Entity's in progress git operation (a rebase, a merge, a cherry-pick and the rest of git's own ten shapes), read fresh from the repository state alongside HEAD. Not a Cell, not a state and never a gutter mark: it carries no provenance of its own and is surfaced in the detail pane only, never as a gate refusing an Action.
+
+**Recent commit**:
+One commit in an Entity's recent history, read fresh alongside HEAD: its abbreviated id and its message's first line. Shown in the detail pane, most recent first.
 
 **Presence**:
 Whether an Entity is Present or Vanished from the Refresh that just ran.

@@ -9,6 +9,7 @@ use repon_core::Snapshot;
 
 use crate::{config::Config, message::Message, tui::Event};
 
+pub mod detail;
 pub mod list;
 
 /// A visual, interactive piece of the interface. Components receive events, fold messages

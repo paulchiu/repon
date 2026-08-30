@@ -36,6 +36,24 @@ impl Timestamp {
     pub fn now() -> Self {
         Timestamp(SystemTime::now())
     }
+
+    /// Wraps an arbitrary point in time. `now` is every real caller's constructor;
+    /// this exists so a consumer's test can build a `Timestamp` in the future, the
+    /// only way to exercise a backward clock jump deterministically.
+    pub fn at(instant: SystemTime) -> Self {
+        Timestamp(instant)
+    }
+
+    /// How long ago this timestamp was, against the wall clock right now.
+    ///
+    /// A future `self`, the shape a backward clock jump leaves behind, has no
+    /// negative `Duration` to report, so this reads zero rather than erring: a
+    /// reader sees "just now" with no defensive clamp layered on top.
+    pub fn elapsed(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(self.0)
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 impl std::fmt::Display for Timestamp {
@@ -338,6 +356,20 @@ mod tests {
             Some(Settled::Known { value, .. }) => assert_eq!(*value, 3),
             other => panic!("expected the clone to carry the same Known value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn elapsed_reads_zero_for_a_timestamp_in_the_future_rather_than_a_negative_duration() {
+        let future = Timestamp::at(SystemTime::now() + Duration::from_secs(3600));
+
+        assert_eq!(future.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn elapsed_reads_a_positive_duration_for_a_timestamp_in_the_past() {
+        let past = Timestamp::at(SystemTime::now() - Duration::from_secs(90));
+
+        assert!(past.elapsed() >= Duration::from_secs(90));
     }
 
     #[test]

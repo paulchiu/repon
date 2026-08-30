@@ -96,6 +96,8 @@ pub fn environment(entity: &EntityState, action: Option<&str>) -> Vec<(String, O
         last_action: _,
         presence: _,
         excluded: _,
+        in_progress_operation: _,
+        recent_commits: _,
     } = entity;
 
     let (repon_branch, repon_head) = branch_and_head(branch.settled());

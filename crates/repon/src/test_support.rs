@@ -80,7 +80,11 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let theme = manifest_dir.join("src").join("theme.rs");
         let whole = std::fs::read_to_string(&theme).expect("read theme.rs");
-        let naive = whole.split("#[cfg(test)]").next().unwrap_or(&whole);
+        // Fragmented rather than the literal `"#[cfg(test)]"` split call, so this
+        // comparison baseline is never itself a match for
+        // [`the_naive_cfg_test_cut_never_reappears_in_this_crates_source`]'s scan.
+        let cfg_test_attribute = format!("{}{}{}", "#[cfg(", "test", ")]");
+        let naive = whole.split(&cfg_test_attribute).next().unwrap_or(&whole);
 
         let production = production_source_at(&theme);
 
@@ -95,6 +99,66 @@ mod tests {
              against the naive cut's {}",
             production.lines().count(),
             naive.lines().count()
+        );
+    }
+
+    /// The literal cut this module exists to replace, fragmented so this scan's own source is
+    /// never a self-match: the concatenated value only ever exists at runtime, never as a
+    /// contiguous run of characters in this file.
+    fn naive_cfg_test_cut_needle() -> String {
+        format!("{}{}{}", "split(\"#[cfg(", "test", ")]\")")
+    }
+
+    /// Every line number in `source` containing the naive cut, comment lines excluded: the
+    /// mechanism [`the_naive_cfg_test_cut_never_reappears_in_this_crates_source`] runs over
+    /// every crate source file, proven here against a string this test controls.
+    fn lines_containing_the_naive_cfg_test_cut(source: &str) -> Vec<usize> {
+        let needle = naive_cfg_test_cut_needle();
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains(&needle))
+            .map(|(index, _)| index + 1)
+            .collect()
+    }
+
+    /// Proves the mechanism before trusting it over the crate: a source string built from
+    /// distinct fragments so the assembled needle appears only where a real reintroduction
+    /// would put it, once past a comment line naming it in prose.
+    #[test]
+    fn the_scan_would_catch_a_reintroduction_of_the_naive_cut() {
+        let comment = format!(
+            "// a comment naming {} is not a match",
+            "split(\"#[cfg(test)]\")"
+        );
+        let offender = format!(
+            "let production = source.{}.next().unwrap_or(&source);",
+            "split(\"#[cfg(test)]\")"
+        );
+        let source = format!("fn f() {{\n    {comment}\n    {offender}\n}}\n");
+
+        assert_eq!(lines_containing_the_naive_cfg_test_cut(&source), vec![3]);
+    }
+
+    /// The species this test closes: `app.rs` once cut its own source at the first
+    /// `#[cfg(test)]` textually rather than reading past it, blind to whichever file named the
+    /// attribute in a doc comment ahead of its tests module. Scans this crate's whole raw
+    /// source, tests included, since the offending line lived inside a test module itself and
+    /// [`production_source`]'s own cut would never see a reintroduction there.
+    #[test]
+    fn the_naive_cfg_test_cut_never_reappears_in_this_crates_source() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let whole = std::fs::read_to_string(&path).expect("read a crate source file");
+            for line_number in lines_containing_the_naive_cfg_test_cut(&whole) {
+                offending_locations.push(format!("{}:{}", path.display(), line_number));
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "found the naive `#[cfg(test)]` split this ticket replaced with \
+             `production_source_at`, at: {offending_locations:?}"
         );
     }
 }
