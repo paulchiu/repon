@@ -1,18 +1,21 @@
-//! Phase D's cheap half: the ancestry proof for the `state` cell.
+//! Phase D's cheap half: the ancestry proof for the `state` cell, plus the
+//! upstream-config check that settles `Local only` and `Gone` without it.
 //!
 //! See [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
 //! "Phase D, landing", [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
-//! "Merged" and "Two passes on screen", and [ADR 0009](https://github.com/paulchiu/repon/blob/main/docs/adr/0009-worktree-state-model.md)
+//! "Merged", "Gone" and "Two passes on screen", and [ADR 0009](https://github.com/paulchiu/repon/blob/main/docs/adr/0009-worktree-state-model.md)
 //! amended by [0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)
 //! and [0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md).
 //!
-//! Ancestry is the whole of this module: `merge-base --is-ancestor`'s three-way
-//! exit contract (ancestor, not an ancestor, error), reached through
+//! Ancestry is checked first: `merge-base --is-ancestor`'s three-way exit
+//! contract (ancestor, not an ancestor, error), reached through
 //! [`gix::Repository::merge_base`] rather than a shelled-out git process. Where
-//! ancestry answers no and HEAD is attached to a branch, [`Outcome::Outstanding`]
-//! leaves the `state` cell exactly as unsettled as a Cell nothing has probed yet:
-//! this is the seam a second pass, comparing patch identities against the merge
-//! base, settles later. That pass is not built here.
+//! ancestry answers no and HEAD is attached to a branch, the branch's own
+//! upstream configuration settles `Local only` (none configured) or `Gone`
+//! (configured, but its remote-tracking ref no longer resolves); only a branch
+//! with a live upstream ancestry still could not clear leaves
+//! [`Outcome::Outstanding`], the seam a second pass, comparing patch identities
+//! against the merge base, settles later. That pass is not built here.
 //!
 //! Only ever called for a Worktree entity. A Repo or Submodule's `state` is
 //! [`Settled::NotApplicable`] from construction ([`crate::entity::EntityState::new`])
@@ -22,28 +25,29 @@ use crate::cell::{Settled, Timestamp};
 use crate::entity::{DefaultBranch, WorktreeState};
 use crate::git::ProbeError;
 
-/// One entity's ancestry-pass verdict. `Outstanding` is not a fifth
-/// [`WorktreeState`] and not a [`Settled`] variant: it means "leave the cell
-/// exactly as unsettled as it already is", which is what lets a re-probed cell
-/// that stays Outstanding keep showing its previous value rather than blanking,
-/// the same rule [`crate::cell::Cell`] already gives every cell nothing has
-/// settled this Generation.
+/// One entity's Phase D verdict: settle the `state` cell now, or leave it
+/// exactly as unsettled as it already is (`Outstanding`), which is what lets a
+/// re-probed cell that stays Outstanding keep showing its previous value
+/// rather than blanking, the same rule [`crate::cell::Cell`] gives every cell
+/// nothing has settled this Generation.
 pub(crate) enum Outcome {
     /// The cell should settle to this value now.
     Settle(Settled<WorktreeState>),
-    /// Ancestry answered no on an attached branch: not provably Merged, and none
-    /// of Gone, Local only or Active can be told apart without the still-unbuilt
-    /// second pass. The cell is left untouched.
+    /// An attached branch with a live upstream that ancestry could not prove
+    /// landed: only the still-unbuilt patch-equivalence pass can tell a
+    /// squash-merged `Merged` from a genuinely `Active` branch here. The cell
+    /// is left untouched.
     Outstanding,
 }
 
 /// The ancestry-only first pass: `Merged` when the entity's own commit is an
-/// ancestor of `default_branch`'s, `NotApplicable` when it is not and HEAD is
-/// detached (the only state a detached HEAD can prove), and [`Outcome::Outstanding`]
-/// when it is not and HEAD is attached, leaving the classification a second,
-/// unbuilt proof needs to complete for. A non-`Known` `default_branch` (`Unknown`,
-/// `Failed` or `NotApplicable`) propagates onto `state` unchanged, since every
-/// value derived from an unresolved default branch is exactly as unresolved.
+/// ancestor of `default_branch`'s; `NotApplicable` when it is not and HEAD is
+/// detached, the only state a detached HEAD can prove; and, when it is not and
+/// HEAD is attached, whichever of `Local only`, `Gone` or [`Outcome::Outstanding`]
+/// the branch's own upstream settles (see [`classify_unmerged_branch`]). A
+/// non-`Known` `default_branch` (`Unknown`, `Failed` or `NotApplicable`)
+/// propagates onto `state` unchanged, since every value derived from an
+/// unresolved default branch is exactly as unresolved.
 pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBranch>) -> Outcome {
     let default_branch = match default_branch {
         Settled::Known { value, .. } => value,
@@ -72,24 +76,74 @@ pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBran
     };
 
     match is_ancestor(repo, commit, default_commit) {
-        Ok(true) => Outcome::Settle(Settled::Known {
-            value: WorktreeState::Merged,
-            at: Timestamp::now(),
-            stale: false,
-        }),
+        Ok(true) => settle_known(WorktreeState::Merged),
         Ok(false) if head.is_detached() => Outcome::Settle(Settled::NotApplicable),
-        Ok(false) => Outcome::Outstanding,
+        Ok(false) => classify_unmerged_branch(repo, head),
         Err(error) => Outcome::Settle(Settled::Failed(error)),
     }
+}
+
+/// Classifies an attached branch ancestry could not prove landed, by its own
+/// upstream configuration rather than the default branch's: `Local only` when
+/// [`gix::Reference::remote_ref_name`] reports none configured, `Gone` when one
+/// is configured but its remote-tracking ref no longer resolves, and
+/// [`Outcome::Outstanding`] when that ref still resolves.
+///
+/// A `Gone` read here can lag a real deletion upstream, since the local
+/// remote-tracking ref only disappears once a fetch with prune removes it; see
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The periodic fetch" and [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "Gone".
+fn classify_unmerged_branch(repo: &gix::Repository, head: gix::Head) -> Outcome {
+    let Some(reference) = head.try_into_referent() else {
+        // An attached, born HEAD always has a referent to peel; reached only if
+        // that invariant breaks.
+        return Outcome::Outstanding;
+    };
+    match reference.remote_ref_name(gix::remote::Direction::Fetch) {
+        None => settle_known(WorktreeState::LocalOnly),
+        Some(Err(error)) => Outcome::Settle(Settled::Failed(ProbeError::Ancestry(
+            error.to_string().into(),
+        ))),
+        Some(Ok(_)) => match reference.remote_tracking_ref_name(gix::remote::Direction::Fetch) {
+            // No remote fetch refspec maps this upstream to a local tracking
+            // ref at all, which reads the same as one that vanished: nothing
+            // live backs this branch either way.
+            None => settle_known(WorktreeState::Gone),
+            Some(Err(error)) => Outcome::Settle(Settled::Failed(ProbeError::Ancestry(
+                error.to_string().into(),
+            ))),
+            Some(Ok(tracking_name)) => {
+                match repo.try_find_reference(tracking_name.to_string().as_str()) {
+                    Ok(Some(_)) => Outcome::Outstanding,
+                    Ok(None) => settle_known(WorktreeState::Gone),
+                    Err(error) => Outcome::Settle(Settled::Failed(ProbeError::Ancestry(
+                        error.to_string().into(),
+                    ))),
+                }
+            }
+        },
+    }
+}
+
+/// Wraps `value` as a freshly settled [`Outcome::Settle`], the shape every
+/// `WorktreeState` produced outside the ancestry proof itself shares.
+fn settle_known(value: WorktreeState) -> Outcome {
+    Outcome::Settle(Settled::Known {
+        value,
+        at: Timestamp::now(),
+        stale: false,
+    })
 }
 
 /// Whether `commit` is an ancestor of `ancestor_of`, `git merge-base
 /// --is-ancestor`'s own three-way contract: `Ok(true)` for an ancestor,
 /// `Ok(false)` for a real negative answer (including two commits with no shared
-/// history at all, which is `gix`'s own `NotFound`), and `Err` for anything else,
-/// a missing or unreadable commit object. Collapsing the last case into `Ok(false)`
-/// is exactly the defect this function exists to rule out: every broken
-/// repository would otherwise render as unmerged rather than failed.
+/// history at all), and `Err` for anything else. `gix::Repository::merge_base`
+/// folds a missing commit object into the exact same `NotFound` it uses for
+/// unrelated histories, so both objects' existence is checked first: skipping
+/// that check is exactly the defect this function exists to rule out, every
+/// broken repository would otherwise render as unmerged rather than failed.
 fn is_ancestor(
     repo: &gix::Repository,
     commit: gix::ObjectId,
@@ -97,6 +151,13 @@ fn is_ancestor(
 ) -> Result<bool, ProbeError> {
     if commit == ancestor_of {
         return Ok(true);
+    }
+    for id in [commit, ancestor_of] {
+        if !repo.has_object(id) {
+            return Err(ProbeError::Ancestry(
+                format!("commit object not found: {id}").into(),
+            ));
+        }
     }
     match repo.merge_base(commit, ancestor_of) {
         Ok(base) => Ok(base.detach() == commit),
@@ -158,6 +219,33 @@ mod tests {
         git(path, &["update-ref", "refs/remotes/origin/main", sha]);
     }
 
+    /// Configures `branch`'s upstream as `origin/<branch>` via git config
+    /// directly, since real `git branch --set-upstream-to` refuses when the
+    /// tracking ref does not exist yet, which the `Gone` scenario needs.
+    fn configure_upstream(path: &Path, branch: &str) {
+        git(
+            path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        git(
+            path,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        git(
+            path,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+    }
+
     #[test]
     fn a_branch_at_the_same_commit_as_the_default_branch_settles_merged() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -206,12 +294,13 @@ mod tests {
         }
     }
 
-    /// The criterion the whole design turns on: unmerged, attached, pushed work
-    /// never settles to `Gone` (or anything else) the moment ancestry says no. It
-    /// stays exactly as unsettled as before, because only the still-unbuilt
-    /// second pass can tell Gone, Local only and Active apart.
+    /// An attached branch with a live upstream ancestry could not clear must
+    /// stay Outstanding rather than settling to `Gone` (or anything else): only
+    /// the still-unbuilt patch-equivalence pass can tell Merged, Gone, Local
+    /// only and Active apart once a live upstream rules out the other two.
     #[test]
-    fn a_diverged_attached_branch_stays_outstanding_rather_than_settling_gone() {
+    fn a_diverged_attached_branch_with_a_live_upstream_stays_outstanding_rather_than_settling_gone()
+    {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = dir.path().join("repo");
         init_repo_with_a_commit(&repo);
@@ -220,13 +309,69 @@ mod tests {
         git(&repo, &["checkout", "-b", "feature"]);
         // feature now has a commit main does not: not an ancestor of main.
         git(&repo, &["commit", "--allow-empty", "-m", "unmerged work"]);
+        let feature_sha = head_sha(&repo);
+        configure_upstream(&repo, "feature");
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
+        );
 
         let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
 
         assert!(
             matches!(outcome, Outcome::Outstanding),
-            "an attached branch ancestry says no for must stay Outstanding, never settle"
+            "an attached branch with a live upstream ancestry says no for must stay Outstanding, never settle"
         );
+    }
+
+    /// `Local only`'s defining case: an attached branch ancestry could not
+    /// clear, with no upstream configured for it at all.
+    #[test]
+    fn an_attached_branch_with_no_upstream_settles_local_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        let base_sha = head_sha(&repo);
+        set_default_branch_ref(&repo, &base_sha);
+        git(&repo, &["checkout", "-b", "feature"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "unmerged work"]);
+
+        let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
+
+        match outcome {
+            Outcome::Settle(Settled::Known {
+                value: WorktreeState::LocalOnly,
+                ..
+            }) => {}
+            _ => panic!("expected a branch with no upstream at all to settle Local only"),
+        }
+    }
+
+    /// `Gone`'s defining case: an upstream was configured for the branch, but
+    /// its remote-tracking ref does not resolve, exactly what a prune leaves
+    /// behind once the upstream branch is deleted.
+    #[test]
+    fn an_attached_branch_whose_upstream_no_longer_resolves_settles_gone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        let base_sha = head_sha(&repo);
+        set_default_branch_ref(&repo, &base_sha);
+        git(&repo, &["checkout", "-b", "feature"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "unmerged work"]);
+        configure_upstream(&repo, "feature");
+        // No `refs/remotes/origin/feature` ref is created: the upstream never
+        // synced, or a prune already removed it.
+
+        let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
+
+        match outcome {
+            Outcome::Settle(Settled::Known {
+                value: WorktreeState::Gone,
+                ..
+            }) => {}
+            _ => panic!("expected a configured but unresolved upstream to settle Gone"),
+        }
     }
 
     /// Two tests, not one, per the detached-HEAD criterion: this is the "not an
@@ -347,11 +492,10 @@ mod tests {
         assert!(matches!(result, Ok(false)));
     }
 
-    /// The line the whole ticket turns on: a genuine failure (here, a commit
-    /// object that exists on disk but will not decode) must be `Err`, never
-    /// folded into `Ok(false)`. An implementation written as
-    /// `.unwrap_or(false)` passes every other test in this module and fails only
-    /// this one.
+    /// A genuine failure (here, a commit object that exists on disk but will
+    /// not decode) must be `Err`, never folded into `Ok(false)`: an
+    /// implementation written as `.unwrap_or(false)` passes every other test in
+    /// this module and fails only this one.
     #[test]
     fn a_corrupt_commit_object_is_a_real_failure_not_a_confident_no() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -374,10 +518,75 @@ mod tests {
         );
     }
 
+    /// A commit object that is simply missing (never written, or deleted) must
+    /// be `Err` too: `gix::Repository::merge_base` reports the exact same
+    /// `NotFound` for this as it does for two commits with no shared history at
+    /// all, which is the defect the existence check in `is_ancestor` exists to
+    /// catch.
+    #[test]
+    fn a_deleted_commit_object_is_a_real_failure_not_a_confident_no() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        let base_sha = head_sha(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+        let tip_sha = head_sha(&repo);
+        delete_loose_object(&repo, &tip_sha);
+
+        let result = is_ancestor(
+            &open(&repo),
+            gix::ObjectId::from_hex(tip_sha.as_bytes()).expect("parse sha"),
+            gix::ObjectId::from_hex(base_sha.as_bytes()).expect("parse sha"),
+        );
+
+        assert!(
+            matches!(result, Err(ProbeError::Ancestry(_))),
+            "a deleted commit object must be an error, got {result:?}"
+        );
+    }
+
+    /// A `repo.head()` that cannot even be read (here, a `HEAD` file that will
+    /// not parse) must settle `Failed` rather than any `WorktreeState`.
+    #[test]
+    fn an_unreadable_head_settles_failed_rather_than_a_worktree_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        set_default_branch_ref(&repo, &head_sha(&repo));
+        fs::write(
+            repo.join(".git").join("HEAD"),
+            "not a ref or an object id\n",
+        )
+        .expect("corrupt HEAD");
+
+        let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
+
+        match outcome {
+            Outcome::Settle(Settled::Failed(ProbeError::Read(_))) => {}
+            _ => panic!("expected an unreadable HEAD to settle Failed"),
+        }
+    }
+
+    /// `resolve_ref_commit`'s last rung: a name that resolves neither as a
+    /// remote-tracking ref nor as itself must be `Err`, never read as any
+    /// particular commit.
+    #[test]
+    fn a_default_branch_name_that_resolves_to_no_ref_at_all_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let result = resolve_ref_commit(&open(&repo), "origin/does-not-exist");
+
+        assert!(
+            matches!(result, Err(ProbeError::Ancestry(_))),
+            "a name with no matching ref at all must be an error, got {result:?}"
+        );
+    }
+
     /// Overwrites a loose object's file with bytes that will never inflate as
     /// zlib, so a lookup of `sha` finds the file but fails to decode it: the
-    /// "unreadable or corrupt repository" case, distinct from a missing object,
-    /// which `gix` treats as a legitimate absence rather than an error.
+    /// "unreadable or corrupt repository" case.
     fn corrupt_loose_object(repo: &Path, sha: &str) {
         let (dir, file) = sha.split_at(2);
         let path = repo.join(".git").join("objects").join(dir).join(file);
@@ -390,5 +599,14 @@ mod tests {
         permissions.set_readonly(false);
         fs::set_permissions(&path, permissions).expect("make loose object writable");
         fs::write(&path, b"not a valid zlib stream").expect("corrupt loose object");
+    }
+
+    /// Deletes a loose object's file outright, leaving `sha` a genuinely
+    /// missing object rather than a corrupt one.
+    fn delete_loose_object(repo: &Path, sha: &str) {
+        let (dir, file) = sha.split_at(2);
+        let path = repo.join(".git").join("objects").join(dir).join(file);
+        assert!(path.exists(), "expected a loose object at {path:?}");
+        fs::remove_file(&path).expect("delete loose object");
     }
 }

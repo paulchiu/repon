@@ -38,10 +38,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, select};
 
-use crate::cell::{Generation, Settled, Timestamp, Unknown};
+use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
-use crate::entity::{EntityKey, EntityState, Head, Kind, Presence};
+use crate::entity::{DefaultBranch, EntityKey, EntityState, Head, Kind, Presence};
 use crate::git;
 use crate::landing;
 use crate::snapshot::Snapshot;
@@ -288,15 +288,7 @@ impl Core {
                     cancel: Arc::clone(&cancel),
                 },
             );
-            table.entities[idx].branch.begin_probe();
-            table.entities[idx].default_branch.begin_probe();
-            // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's
-            // is `NotApplicable` from construction and touching `begin_probe` on
-            // it here would leave it in-flight forever, since nothing would ever
-            // call `settle` to clear the flag again.
-            if matches!(table.entities[idx].kind, Kind::Worktree) {
-                table.entities[idx].state.begin_probe();
-            }
+            begin_probes(&mut table.entities[idx]);
             dispatched.push((key.clone(), cancel));
         }
 
@@ -325,9 +317,9 @@ impl Core {
             .iter()
             .map(|(key, _)| Arc::clone(&table.entities[table.index[key]].common_dir))
             .collect();
-        let kinds: Vec<Kind> = dispatched
+        let probes_state: Vec<bool> = dispatched
             .iter()
-            .map(|(key, _)| table.entities[table.index[key]].kind)
+            .map(|(key, _)| table.entities[table.index[key]].probes_state())
             .collect();
         drop(table);
 
@@ -336,12 +328,12 @@ impl Core {
         // `ChainFacts` it holds are freed. Nothing here outlives one Generation.
         let chain_cache: Arc<ChainFactsCache> = Arc::new(Mutex::new(HashMap::new()));
 
-        for (((((key, cancel), repo), override_branch), common_dir), kind) in dispatched
+        for (((((key, cancel), repo), override_branch), common_dir), probes_state) in dispatched
             .into_iter()
             .zip(repos)
             .zip(override_branches)
             .zip(common_dirs)
-            .zip(kinds)
+            .zip(probes_state)
         {
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
@@ -359,7 +351,7 @@ impl Core {
                     &chain_cache,
                     &chain_reads,
                 );
-                let state_outcome = if matches!(kind, Kind::Worktree) {
+                let state_outcome = if probes_state {
                     probe_worktree_state(
                         &path,
                         repo.as_deref(),
@@ -374,9 +366,11 @@ impl Core {
                     &settle_gate,
                     key,
                     generation,
-                    branch_outcome,
-                    default_branch_outcome,
-                    state_outcome,
+                    ProbeOutcomes {
+                        branch: branch_outcome,
+                        default_branch: default_branch_outcome,
+                        state: state_outcome,
+                    },
                 );
             });
         }
@@ -445,21 +439,24 @@ impl Core {
     /// caller can otherwise only reach this with a key `snapshot` just handed it.
     pub fn probe_now(&self, key: &EntityKey) -> EntityState {
         let never_cancelled = AtomicBool::new(false);
-        let (cached_repo, common_dir_hint, kind) = {
+        let (cached_repo, common_dir_hint, probes_state) = {
             let table = self.table.read().unwrap();
             let repo = table.repos.get(key).cloned();
             let common_dir = table
                 .index
                 .get(key)
                 .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
-            let kind = table.index.get(key).map(|&idx| table.entities[idx].kind);
-            (repo, common_dir, kind)
+            // An unknown key has no entity yet to ask, and falls back to `false`,
+            // matching the fallback insert below: a freshly inserted `Kind::Repo`
+            // entity's `state` is `NotApplicable` from construction too.
+            let probes_state = table
+                .index
+                .get(key)
+                .map(|&idx| table.entities[idx].probes_state())
+                .unwrap_or(false);
+            (repo, common_dir, probes_state)
         };
         let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
-        // An unknown key falls back to `Kind::Repo`, matching the fallback insert
-        // below: `state` is never probed for it, since a Repo's is `NotApplicable`
-        // from construction.
-        let kind = kind.unwrap_or(Kind::Repo);
         let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
         let override_branch = matched.and_then(|entry| entry.default_branch.clone());
         let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
@@ -471,7 +468,7 @@ impl Core {
             override_branch.as_deref(),
             &never_cancelled,
         );
-        let state_outcome = if matches!(kind, Kind::Worktree) {
+        let state_outcome = if probes_state {
             probe_worktree_state(
                 key.path(),
                 cached_repo.as_deref(),
@@ -665,10 +662,7 @@ impl Core {
             .generation_started_at
             .insert(generation_number, Instant::now());
         if let Some(&idx) = table.index.get(key) {
-            table.entities[idx].branch.begin_probe();
-            if matches!(table.entities[idx].kind, Kind::Worktree) {
-                table.entities[idx].state.begin_probe();
-            }
+            begin_probes(&mut table.entities[idx]);
         }
         let cancel = Arc::new(AtomicBool::new(false));
         table.in_flight.insert(
@@ -732,9 +726,11 @@ impl Core {
             &self.settle_gate,
             key.clone(),
             generation,
-            Some(settled),
-            None,
-            None,
+            ProbeOutcomes {
+                branch: Some(settled),
+                default_branch: None,
+                state: None,
+            },
         );
     }
 }
@@ -888,6 +884,28 @@ fn cancel_in_flight(table: &Arc<RwLock<Table>>, settle_gate: &Arc<(Mutex<usize>,
     }
 }
 
+/// A `Cell<T>`'s in-flight and timeout behaviour, uniform across every payload
+/// type `EntityState` carries, so [`sweep_deadline`] can sweep every cell
+/// through one array rather than one hand-written branch per cell: a cell only
+/// ever times out if it was actually marked in flight, which is what lets the
+/// sweep apply to all of them without asking what `Kind` owns them.
+trait TimeoutableCell {
+    fn is_in_flight(&self) -> bool;
+    /// Settles this cell `Unknown(TimedOut)` for `generation`, subject to the
+    /// same supersession `Cell::settle` already enforces.
+    fn time_out(&mut self, generation: Generation);
+}
+
+impl<T> TimeoutableCell for Cell<T> {
+    fn is_in_flight(&self) -> bool {
+        Cell::is_in_flight(self)
+    }
+
+    fn time_out(&mut self, generation: Generation) {
+        self.settle(generation, Settled::Unknown(Unknown::TimedOut));
+    }
+}
+
 /// Marks every cell still in flight past its own Generation's deadline `Unknown`,
 /// per [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md):
 /// there is no per-cell timeout, only this sweep, and it never interrupts the
@@ -912,19 +930,34 @@ fn sweep_deadline(
     }
     for (key, generation) in &timed_out {
         if let Some(&idx) = table.index.get(key) {
-            table.entities[idx]
-                .branch
-                .settle(*generation, Settled::Unknown(Unknown::TimedOut));
-            table.entities[idx]
-                .default_branch
-                .settle(*generation, Settled::Unknown(Unknown::TimedOut));
-            // Only a Worktree's `state` is ever in flight (see `Core::refresh`'s
-            // own `begin_probe` gate); settling it here for a Repo or Submodule
-            // would overwrite its construction-time `NotApplicable` with a lie.
-            if matches!(table.entities[idx].kind, Kind::Worktree) {
-                table.entities[idx]
-                    .state
-                    .settle(*generation, Settled::Unknown(Unknown::TimedOut));
+            // Exhaustive: a Cell added to `EntityState` later must be named here
+            // or this fails to compile, so it cannot silently time out never.
+            let EntityState {
+                key: _,
+                name: _,
+                common_dir: _,
+                kind: _,
+                branch,
+                sync,
+                base,
+                dirty,
+                state,
+                default_branch,
+                diagnostics: _,
+                last_action: _,
+                presence: _,
+                excluded: _,
+            } = &mut table.entities[idx];
+            let cells: [&mut dyn TimeoutableCell; 6] =
+                [branch, sync, base, dirty, state, default_branch];
+            for cell in cells {
+                // Only a cell actually marked in flight times out: a Repo or
+                // Submodule's `state` (`NotApplicable`, never probed) and any
+                // cell no probe yet reaches (`sync`, `base`, `dirty`) are never
+                // in flight, so this never overwrites them with a lie.
+                if cell.is_in_flight() {
+                    cell.time_out(*generation);
+                }
             }
         }
         table.in_flight.remove(key);
@@ -937,6 +970,40 @@ fn sweep_deadline(
     drop(table);
     if !timed_out.is_empty() {
         complete_many(settle_gate, timed_out.len());
+    }
+}
+
+/// Marks the cells this Generation's dispatch is about to probe as in flight,
+/// via an exhaustive destructure of `EntityState`'s cells: a cell added later
+/// must be named here (`_` if it is not yet probed) or this fails to compile,
+/// which is what stops a cell [`apply_probe_outcome`] settles from going
+/// in-flight silently forgotten, and reading wrong on `is_in_flight` for the
+/// whole dispatch.
+fn begin_probes(entity: &mut EntityState) {
+    let probes_state = entity.probes_state();
+    let EntityState {
+        key: _,
+        name: _,
+        common_dir: _,
+        kind: _,
+        branch,
+        sync: _,
+        base: _,
+        dirty: _,
+        state,
+        default_branch,
+        diagnostics: _,
+        last_action: _,
+        presence: _,
+        excluded: _,
+    } = entity;
+    branch.begin_probe();
+    default_branch.begin_probe();
+    // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's is
+    // `NotApplicable` from construction, and marking it in flight here would
+    // leave it in-flight forever, since nothing would ever call `settle` on it.
+    if probes_state {
+        state.begin_probe();
     }
 }
 
@@ -1026,20 +1093,14 @@ fn probe_default_branch(
     ))
 }
 
-/// Runs the ancestry-only first pass ([`landing::probe`]) for one Worktree
-/// entity: `None` if `cancel` was already set, or if `default_branch_settled` is
-/// itself `None` (the default-branch probe it depends on was cancelled first).
-/// Only ever called for a Worktree; a Repo or Submodule's `state` is
-/// `NotApplicable` from construction and this function is never reached for one.
-///
-/// `repo` follows the same cached-handle convention as [`probe_branch`] and
-/// [`probe_default_branch`]: `None` falls back to opening fresh, which is where
-/// an unreadable repository surfaces as a settled `Failed` rather than being
-/// read twice.
+/// Runs Phase D's ancestry pass ([`landing::probe`]) for one Worktree entity:
+/// `None` if `cancel` was already set, or if `default_branch_settled` is itself
+/// `None` because the default-branch probe it depends on was cancelled first.
+/// `repo` follows the same cached-handle convention as [`probe_branch`].
 fn probe_worktree_state(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
-    default_branch_settled: Option<&Settled<crate::entity::DefaultBranch>>,
+    default_branch_settled: Option<&Settled<DefaultBranch>>,
     cancel: &AtomicBool,
 ) -> Option<landing::Outcome> {
     if cancel.load(Ordering::Acquire) {
@@ -1132,6 +1193,15 @@ fn probe_default_branch_memoised(
     Some(default_branch::resolve_with_facts(&facts, override_branch))
 }
 
+/// One dispatched probe's per-cell outcomes, named rather than positional so a
+/// transposed pair of trailing `None`s cannot compile silently into the wrong
+/// cell.
+struct ProbeOutcomes {
+    branch: Option<Settled<Head>>,
+    default_branch: Option<default_branch::Resolution>,
+    state: Option<landing::Outcome>,
+}
+
 /// Lands one probe's combined outcome for `key` at `generation`: writes the
 /// branch, default-branch and `state` cells subject to the per-cell supersession
 /// `Cell::settle` already enforces, records the default-branch diagnostics only
@@ -1140,19 +1210,22 @@ fn probe_default_branch_memoised(
 /// dispatched probe's result and a test's simulated late result both go through,
 /// so a test can land a result out of order without duplicating this bookkeeping.
 ///
-/// `state_outcome`'s `Outstanding` case writes nothing at all: the `state` cell
-/// is left exactly as unsettled as `begin_probe` alone leaves it, which is the
-/// whole of the "stays outstanding between the two passes" contract. There is no
-/// second pass here to hand the entity off to; that pass is not built yet.
+/// `outcomes.state`'s `Outstanding` case writes nothing at all: the `state`
+/// cell is left exactly as unsettled as `begin_probe` alone leaves it, which is
+/// the whole of the "stays outstanding between the two passes" contract. There
+/// is no second pass here to hand the entity off to; that pass is not built yet.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
     settle_gate: &Arc<(Mutex<usize>, Condvar)>,
     key: EntityKey,
     generation: Generation,
-    branch_outcome: Option<Settled<Head>>,
-    default_branch_outcome: Option<default_branch::Resolution>,
-    state_outcome: Option<landing::Outcome>,
+    outcomes: ProbeOutcomes,
 ) {
+    let ProbeOutcomes {
+        branch: branch_outcome,
+        default_branch: default_branch_outcome,
+        state: state_outcome,
+    } = outcomes;
     let mut table = table.write().unwrap();
     if let Some(&idx) = table.index.get(&key) {
         if let Some(settled) = branch_outcome {
@@ -2182,8 +2255,8 @@ mod tests {
     /// getting nothing back is Unknown, not a cell stuck in-flight forever once
     /// the Generation that would have answered it is gone. A Repo's `state`,
     /// `NotApplicable` from construction and never in flight, must survive the
-    /// same sweep untouched, proving the sweep is gated by kind rather than
-    /// blanket-settling every entity's `state` cell.
+    /// same sweep untouched, proving the sweep only times out a cell actually
+    /// marked in flight rather than blanket-settling every entity's `state` cell.
     #[test]
     fn the_deadline_sweep_times_out_a_worktrees_outstanding_state_but_leaves_a_repos_not_applicable_one_alone()
      {
@@ -2434,15 +2507,18 @@ mod tests {
         );
     }
 
-    /// The criterion this whole ticket turns on, proven through the real
-    /// dispatch path rather than `landing::probe` in isolation: a Worktree whose
-    /// branch has diverged from the default branch stays outstanding
-    /// (`settled() == None`, still `is_in_flight()`) after a real Generation
-    /// completes, rather than settling to `Gone` (or anything else) the moment
-    /// ancestry answers no. `settle` returning at all proves the Generation's
-    /// dispatch finished; the state cell is what must still show nothing.
+    /// With `Gone` and `Local only` now constructible, this is the test that
+    /// would fail if a diverged attached branch with a live upstream settled
+    /// `Gone` instead of staying outstanding, proven through the real dispatch
+    /// path rather than `landing::probe` in isolation: a Worktree whose branch
+    /// has both diverged from the default branch and a live upstream of its own
+    /// stays outstanding (`settled() == None`, still `is_in_flight()`) after a
+    /// real Generation completes. `settle` returning at all proves the
+    /// Generation's dispatch finished; the state cell is what must still show
+    /// nothing.
     #[test]
-    fn a_diverged_worktree_stays_outstanding_after_a_refresh_rather_than_reading_gone() {
+    fn a_diverged_worktree_with_a_live_upstream_stays_outstanding_after_a_refresh_rather_than_reading_gone()
+     {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let parent = root.join("parent");
@@ -2476,6 +2552,18 @@ mod tests {
         git(
             &worktree_path,
             &["commit", "--allow-empty", "-m", "unmerged"],
+        );
+        let feature_sha = head_sha(&worktree_path);
+        // `feature`'s own upstream, live: the common dir's shared config and refs
+        // make this visible from the worktree's own probe too.
+        git(&parent, &["config", "branch.feature.remote", "origin"]);
+        git(
+            &parent,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+        git(
+            &parent,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
         );
 
         let core = Core::start(spec(vec![root]));

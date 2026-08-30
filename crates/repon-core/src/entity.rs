@@ -252,6 +252,15 @@ impl EntityState {
         }
     }
 
+    /// Whether this Entity's `state` cell is ever (re)probed: `false` once
+    /// construction has settled it `NotApplicable` (a Repo or a Submodule),
+    /// `true` for a Worktree. Reads the cell itself rather than re-deriving the
+    /// rule from `kind`, so [`EntityState::new`] stays the one place that
+    /// decides it.
+    pub(crate) fn probes_state(&self) -> bool {
+        !matches!(self.state.settled(), Some(Settled::NotApplicable))
+    }
+
     /// Marks this Entity Vanished: it stays in the table with its last known
     /// values, and every Cell's `Known` value is forced stale rather than
     /// blanked. The same call for a Repo, a Worktree or a Submodule alike; a
