@@ -21,12 +21,12 @@
 //! changed path's blob object id rather than diff text, so it does not treat a
 //! whitespace-only rewrite as equivalent; it shares patch-id's blind spot
 //! though, since a conflict resolved during the squash changes the resulting
-//! blobs and reads as not equivalent. [`scan_default_branch`] also does not
-//! bound its walk to the deepest merge base among sibling entities the way
-//! [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)
-//! describes as the perf-optimal shape; it walks the default branch's full
-//! first-parent history instead, which stays correct under any per-entity
-//! merge base but costs more on a very deep history.
+//! blobs and reads as not equivalent.
+//!
+//! [`scan_default_branch`] is bounded below by `bound`, [`crate::core`]'s
+//! deepest merge base among the entities sharing this common dir this
+//! Generation, per [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+//! "depends only on the common dir and the deepest merge base under it".
 
 use std::collections::HashSet;
 
@@ -116,18 +116,27 @@ fn settle(value: WorktreeState) -> Settled<WorktreeState> {
 }
 
 /// The expensive half: every commit reachable from `tip` along its first-parent
-/// chain, each diffed against its own first parent (an empty tree for a root
-/// commit), collected into the set [`probe`] checks membership against.
-/// Depends only on `tip`, which is why [`crate::core`] memoises it per git
-/// common dir per Generation rather than once per entity: every Worktree
-/// attached to the same Repo shares the same default branch tip.
+/// chain, back to (but not including) `bound` when one is given, each diffed
+/// against its own first parent (an empty tree for a root commit), collected
+/// into the set [`probe`] checks membership against. `bound` is the deepest
+/// merge base among the entities sharing this common dir this Generation, per
+/// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "depends only on the common dir and the deepest merge base under it";
+/// `None` walks to the root, which [`crate::core`] uses when no bound could be
+/// collected. Depends only on `tip` and `bound`, which is why [`crate::core`]
+/// memoises it per git common dir per Generation rather than once per entity:
+/// every Worktree attached to the same Repo shares the same default branch tip.
 pub(crate) fn scan_default_branch(
     repo: &gix::Repository,
     tip: gix::ObjectId,
+    bound: Option<gix::ObjectId>,
 ) -> Result<PatchIdentitySet, ProbeError> {
     let mut identities = HashSet::new();
     let mut current = tip;
     loop {
+        if Some(current) == bound {
+            break;
+        }
         let parent = first_parent(repo, current)?;
         identities.insert(diff_identity(repo, parent, current)?);
         match parent {
@@ -204,7 +213,11 @@ fn to_entry(change: gix::object::tree::diff::ChangeDetached) -> Option<PatchEntr
 /// `commit`'s ancestor common with `other`, via [`git::checked_merge_base`].
 /// `Ok(None)` is the real "no shared history at all" answer (two orphan
 /// roots), not a failure; `Err` is reserved for an actual read error.
-fn merge_base(
+///
+/// `pub(crate)`: [`crate::core`] calls this directly to collect an Outstanding
+/// entity's own merge base before the shared scan runs, the same computation
+/// [`probe`] repeats afterwards to diff the entity's own range.
+pub(crate) fn merge_base(
     repo: &gix::Repository,
     commit: gix::ObjectId,
     other: gix::ObjectId,
@@ -259,7 +272,8 @@ mod tests {
         let main_sha = head_sha(&repo);
 
         let opened = open(&repo);
-        let shared = scan_default_branch(&opened, id(&main_sha)).expect("scan default branch");
+        let shared =
+            scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
         let outcome = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
 
         assert!(
@@ -295,7 +309,8 @@ mod tests {
         let main_sha = head_sha(&repo);
 
         let opened = open(&repo);
-        let shared = scan_default_branch(&opened, id(&main_sha)).expect("scan default branch");
+        let shared =
+            scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
         let outcome = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
 
         assert!(
@@ -333,13 +348,56 @@ mod tests {
 
         let before = loose_object_count(&repo);
         let opened = open(&repo);
-        let shared = scan_default_branch(&opened, id(&main_sha)).expect("scan default branch");
+        let shared =
+            scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
         let _ = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
         let after = loose_object_count(&repo);
 
         assert_eq!(
             before, after,
             "patch equivalence must never write a loose object to the repository"
+        );
+    }
+
+    /// The truncation half of the bound: a commit older than the deepest merge
+    /// base must never be diffed, proven by observation of the scan's own
+    /// output rather than by comparing to the unbounded walk (which would pass
+    /// this assertion whether or not the bound did anything at all). `poison`
+    /// touches a file no commit after the bound ever names, so its presence in
+    /// any returned identity would mean history before the bound was walked.
+    #[test]
+    fn scanning_with_a_bound_never_diffs_a_commit_at_or_before_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        fs::write(repo.join("poison.txt"), "never scanned\n").expect("write poison.txt");
+        git(&repo, &["add", "poison.txt"]);
+        git(&repo, &["commit", "-m", "poison, older than the bound"]);
+        let bound_sha = head_sha(&repo);
+        fs::write(repo.join("a.txt"), "one\n").expect("write a.txt");
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-m", "since the bound, one"]);
+        fs::write(repo.join("b.txt"), "two\n").expect("write b.txt");
+        git(&repo, &["add", "b.txt"]);
+        git(&repo, &["commit", "-m", "since the bound, two"]);
+        let tip_sha = head_sha(&repo);
+
+        let opened = open(&repo);
+        let identities = scan_default_branch(&opened, id(&tip_sha), Some(id(&bound_sha)))
+            .expect("scan default branch");
+
+        assert_eq!(
+            identities.len(),
+            2,
+            "expected exactly the two commits since (not including) the bound"
+        );
+        assert!(
+            identities
+                .iter()
+                .flat_map(|identity| identity.0.iter())
+                .all(|entry| entry.path() != "poison.txt"),
+            "a commit at or before the bound must never be diffed, but poison.txt appeared \
+             in a returned identity"
         );
     }
 
@@ -356,7 +414,7 @@ mod tests {
         let two = head_sha(&repo);
 
         let opened = open(&repo);
-        let shared = scan_default_branch(&opened, id(&one)).expect("scan default branch");
+        let shared = scan_default_branch(&opened, id(&one), None).expect("scan default branch");
         let outcome = probe(&opened, id(&two), id(&one), &shared);
 
         assert!(
@@ -401,6 +459,133 @@ mod tests {
         assert!(
             matches!(outcome, Settled::Failed(ProbeError::PatchEquivalence(_))),
             "expected a missing commit object to settle Failed, got {outcome:?}"
+        );
+    }
+
+    /// Builds `depth` linear commits on `main` after `from_sha`, each touching
+    /// `changing.txt` with content unique to that commit, via `git fast-import`
+    /// rather than `depth` separate `git commit` processes: the fixture
+    /// criterion 4 needs is deep enough that a per-process fork/exec cost
+    /// would dominate the measurement it is there to take. Distinct content
+    /// per commit matters: an empty-tree filler commit would diff identically
+    /// to every other one, and [`scan_default_branch`]'s returned set (a
+    /// `HashSet`) would collapse them all, hiding how many commits the walk
+    /// actually visited behind the visible count. Returns the last commit's
+    /// sha, the bound the deep-history benchmark below scans down to.
+    fn build_deep_history(repo: &Path, depth: usize, from_sha: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["fast-import", "--quiet"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn git fast-import");
+        {
+            let stdin = child.stdin.as_mut().expect("fast-import stdin");
+            for i in 1..=depth {
+                let message = format!("filler commit {i}");
+                let content = format!("content {i}\n");
+                write!(
+                    stdin,
+                    "commit refs/heads/main\n\
+                     mark :{mark}\n\
+                     committer Test <test@example.com> {when} +0000\n\
+                     data {mlen}\n\
+                     {message}\n",
+                    mark = i,
+                    when = 1_700_000_000 + i,
+                    mlen = message.len() + 1,
+                )
+                .expect("write commit header");
+                if i == 1 {
+                    // Every later commit chains onto the previous mark
+                    // automatically; only the first needs to be told where
+                    // this fixture's own history starts.
+                    writeln!(stdin, "from {from_sha}").expect("write from");
+                }
+                write!(
+                    stdin,
+                    "M 100644 inline changing.txt\ndata {clen}\n",
+                    clen = content.len(),
+                )
+                .expect("write file-change header");
+                stdin
+                    .write_all(content.as_bytes())
+                    .expect("write inline content");
+            }
+        }
+        let status = child.wait().expect("wait for fast-import");
+        assert!(status.success(), "git fast-import failed");
+        head_sha(repo)
+    }
+
+    /// Criterion 4: measures `scan_default_branch` unbounded against the same
+    /// scan bounded by a merge base `depth` commits below the tip, on a
+    /// fixture built deep enough that the difference cannot read as noise.
+    /// Never run by `just ci`, per this project's convention of recording
+    /// hand-run figures with the fixture's own depth rather than asserting a
+    /// timing budget in a committed test. Run it with:
+    /// `cargo test -p repon-core --release -- --ignored --nocapture bounding_the_scan`
+    #[test]
+    #[ignore = "hand-run measurement; see the ticket's report for recorded figures"]
+    fn bounding_the_scan_measurably_shortens_a_deep_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        // Named explicitly: `git init`'s own default branch name is not
+        // guaranteed, and `build_deep_history` writes to `refs/heads/main`.
+        git(&repo, &["checkout", "-B", "main"]);
+        let from_sha = head_sha(&repo);
+
+        let depth = 5_000;
+        let bound_sha = build_deep_history(&repo, depth, &from_sha);
+        // `fast-import` moves the ref directly and never touches the working
+        // tree or index, so the checkout below is what makes the ordinary
+        // `git add`/`git commit` calls after it see the fixture's real tree.
+        git(&repo, &["checkout", "-f", "main"]);
+        // A couple of ordinary commits after the bound, so both scans still
+        // have something real to walk and to return.
+        fs::write(repo.join("after-a.txt"), "one\n").expect("write after-a.txt");
+        git(&repo, &["add", "after-a.txt"]);
+        git(&repo, &["commit", "-m", "since the bound, one"]);
+        fs::write(repo.join("after-b.txt"), "two\n").expect("write after-b.txt");
+        git(&repo, &["add", "after-b.txt"]);
+        git(&repo, &["commit", "-m", "since the bound, two"]);
+        let tip_sha = head_sha(&repo);
+
+        let opened = open(&repo);
+
+        let unbounded_started = std::time::Instant::now();
+        let unbounded = scan_default_branch(&opened, id(&tip_sha), None).expect("unbounded scan");
+        let unbounded_elapsed = unbounded_started.elapsed();
+
+        let bounded_started = std::time::Instant::now();
+        let bounded =
+            scan_default_branch(&opened, id(&tip_sha), Some(id(&bound_sha))).expect("bounded scan");
+        let bounded_elapsed = bounded_started.elapsed();
+
+        println!("fixture depth (filler commits before the bound): {depth}");
+        println!(
+            "unbounded scan: {unbounded_elapsed:?} over {} commits",
+            unbounded.len()
+        );
+        println!(
+            "bounded scan:   {bounded_elapsed:?} over {} commits",
+            bounded.len()
+        );
+
+        assert_eq!(
+            bounded.len(),
+            2,
+            "the bounded scan must visit only the two commits since the bound"
+        );
+        assert!(
+            unbounded.len() > bounded.len(),
+            "the fixture must be deep enough for the unbounded walk to visit strictly more \
+             commits than the bounded one"
         );
     }
 }
