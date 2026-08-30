@@ -59,6 +59,7 @@ mod discovery;
 mod entity;
 mod fanout;
 mod git;
+mod landing;
 mod snapshot;
 #[cfg(test)]
 mod test_support;

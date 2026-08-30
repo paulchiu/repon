@@ -195,6 +195,12 @@ impl EntityState {
     /// A Submodule is constructed with `state` and `base` already
     /// [`Settled::NotApplicable`], because its default branch is known-wrong with
     /// no local detector, so a proof computed against it would be a confident lie.
+    /// A Repo is constructed with `state` already `NotApplicable` too: the four
+    /// Worktree states describe a Worktree's own branch, and a Repo row has none
+    /// to describe, by kind rather than by HEAD's shape. Leaving `state` unset
+    /// instead would fold the row to Unknown rather than excluding the cell, which
+    /// is what would put a question mark in the gutter of every Repo row on
+    /// screen.
     pub fn new(key: EntityKey, name: Arc<str>, common_dir: Arc<Path>, kind: Kind) -> Self {
         let mut entity = EntityState {
             key,
@@ -213,10 +219,12 @@ impl EntityState {
             excluded: false,
         };
 
-        if matches!(entity.kind, Kind::Submodule) {
+        if matches!(entity.kind, Kind::Submodule | Kind::Repo) {
             entity
                 .state
                 .settle(Generation::default(), Settled::NotApplicable);
+        }
+        if matches!(entity.kind, Kind::Submodule) {
             entity
                 .base
                 .settle(Generation::default(), Settled::NotApplicable);
@@ -247,6 +255,15 @@ impl EntityState {
             self.diagnostics.default_branch_rung_two_stale = stale_remote_head;
             self.diagnostics.default_branch_stopped = stopped;
         }
+    }
+
+    /// Whether this Entity's `state` cell is ever (re)probed: `false` once
+    /// construction has settled it `NotApplicable` (a Repo or a Submodule),
+    /// `true` for a Worktree. Reads the cell itself rather than re-deriving the
+    /// rule from `kind`, so [`EntityState::new`] stays the one place that
+    /// decides it.
+    pub(crate) fn probes_state(&self) -> bool {
+        !matches!(self.state.settled(), Some(Settled::NotApplicable))
     }
 
     /// Marks this Entity Vanished: it stays in the table with its last known
@@ -311,8 +328,13 @@ mod tests {
         ));
     }
 
+    /// The third named producer of `NotApplicable`, alongside the Submodule rule
+    /// and the two `base` exemptions: Worktree state describes a Worktree's own
+    /// branch, and a Repo row has none, by kind rather than by HEAD's shape. Left
+    /// unset instead, the cell would fold to Unknown rather than being excluded,
+    /// putting a question mark in the gutter of every Repo row on screen.
     #[test]
-    fn a_repo_is_constructed_with_state_and_base_unset() {
+    fn a_repo_rows_worktree_state_is_not_applicable_so_no_parent_row_carries_a_question_mark() {
         let entity = EntityState::new(
             key("/repo"),
             Arc::from("repo"),
@@ -320,8 +342,31 @@ mod tests {
             Kind::Repo,
         );
 
-        assert!(entity.state.settled().is_none());
+        assert!(matches!(
+            entity.state.settled(),
+            Some(Settled::NotApplicable)
+        ));
         assert!(entity.base.settled().is_none());
+    }
+
+    /// Absence claim: the four Worktree states are the whole set. This match has
+    /// no wildcard arm, so a fifth variant added to `WorktreeState` fails to
+    /// compile here rather than silently falling through an `_`.
+    #[test]
+    fn worktree_state_is_exactly_four_mutually_exclusive_variants() {
+        fn name(state: WorktreeState) -> &'static str {
+            match state {
+                WorktreeState::Merged => "merged",
+                WorktreeState::Gone => "gone",
+                WorktreeState::LocalOnly => "local_only",
+                WorktreeState::Active => "active",
+            }
+        }
+
+        assert_eq!(name(WorktreeState::Merged), "merged");
+        assert_eq!(name(WorktreeState::Gone), "gone");
+        assert_eq!(name(WorktreeState::LocalOnly), "local_only");
+        assert_eq!(name(WorktreeState::Active), "active");
     }
 
     #[test]

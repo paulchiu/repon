@@ -289,6 +289,70 @@ mod tests {
         assert_eq!(summary(&entity), RowSummary::Fresh);
     }
 
+    /// A freshly constructed Repo's `state` cell is `NotApplicable` rather than
+    /// merely never probed, so it is excluded from the fold rather than dragging
+    /// the row to Unknown. Every other cell is made Fresh here so this only tells
+    /// a correct fold from a naive one once nothing else is outstanding, matching
+    /// the "every parent row carries a question mark in the gutter" defect this
+    /// fixes: an unset `state` cell folds as Unknown, per `settledness`'s own
+    /// `None => Unknown` arm above.
+    #[test]
+    fn a_repo_rows_worktree_state_is_excluded_so_the_gutter_never_shows_a_question_mark() {
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("/repo"))),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Repo,
+        );
+        let generation = Generation::new(1);
+        entity.branch.settle(
+            generation,
+            Settled::Known {
+                value: Head::Branch(Arc::from("main")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.sync.settle(
+            generation,
+            Settled::Known {
+                value: AheadBehind {
+                    ahead: 0,
+                    behind: 0,
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.base.settle(
+            generation,
+            Settled::Known {
+                value: 0,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: 0,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.default_branch.settle(
+            generation,
+            Settled::Known {
+                value: DefaultBranch::new(Arc::from("main")),
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        // `state` is left exactly as construction set it: never settled again here.
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
     #[test]
     fn one_failed_cell_outranks_every_other_fresh_cell() {
         let mut entity = fresh_entity("repo");
