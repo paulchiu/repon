@@ -100,10 +100,10 @@ const fn binding(
     (context, code, modifiers, action)
 }
 
-/// The spec's own words for an action, used only by this module's spec-conformance test.
-/// Deriving it from the [`Action`] rather than storing it per row means a mislabelled
-/// binding permutes its description too, so the conformance test cannot pass on one.
-#[cfg(test)]
+/// The spec's own words for an action, read by [`describe`] for the help overlay and by
+/// this module's own spec-conformance test. Deriving it from the [`Action`] rather than
+/// storing it per row means a mislabelled binding permutes its description too, so neither
+/// reader can be fed a stale string.
 fn description(action: Action) -> &'static str {
     match action {
         Action::OpenHelp => "Open the help overlay",
@@ -467,6 +467,73 @@ fn printable(key: KeyEvent) -> Option<char> {
     }
 }
 
+/// The chord text a human reads for one row, e.g. `"ctrl-r"` or `"?"` or `"enter"`. The one
+/// place a [`KeyCode`]/[`KeyModifiers`] pair turns into a word, so the footer and the help
+/// overlay agree on spelling without either hardcoding a chord.
+pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
+    let base = match code {
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        other => format!("{other:?}"),
+    };
+    if modifiers.contains(CTRL) {
+        format!("ctrl-{base}")
+    } else {
+        base
+    }
+}
+
+/// The first chord [`BINDINGS`] binds `action` to in `context`, in table order. Table order
+/// lists a letter before its arrow-key alternate ([`dispatch`]'s own preference), which is
+/// why the footer reads this rather than every key an action answers to.
+pub(crate) fn primary_chord(context: Context, action: Action) -> Option<(KeyCode, KeyModifiers)> {
+    BINDINGS
+        .iter()
+        .find(|(row_context, _, _, row_action)| *row_context == context && *row_action == action)
+        .map(|(_, code, modifiers, _)| (*code, *modifiers))
+}
+
+/// Every distinct action live in `context`, as `(keys, description)`, current context first
+/// then `global` where it is live alongside it ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)).
+/// A row bound to more than one key (`` `j`, `Down` ``) collapses to one entry, its keys
+/// joined with `, ` in table order, because the help overlay shows one line per action, not
+/// per key. The help overlay's only source of content: nothing here is transcribed.
+pub(crate) fn describe(context: Context) -> Vec<(String, &'static str)> {
+    let mut contexts = vec![context];
+    if matches!(context, Context::List | Context::Detail) {
+        contexts.push(Context::Global);
+    }
+
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
+    for ctx in contexts {
+        for &(row_context, code, modifiers, action) in BINDINGS {
+            if row_context != ctx {
+                continue;
+            }
+            let desc = description(action);
+            let keys = keys_by_description.entry(desc).or_insert_with(|| {
+                order.push(desc);
+                Vec::new()
+            });
+            keys.push(chord_label(code, modifiers));
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|desc| (keys_by_description[desc].join(", "), desc))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +859,122 @@ mod tests {
             offending_locations.is_empty(),
             "a key or modifier literal must appear only in keys.rs, found at: {offending_locations:?}"
         );
+    }
+
+    // --- no per-binding disabled-reason mechanism exists ---
+
+    /// [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md) rejects
+    /// the mechanism lazygit calls `Get` + `DisabledReason`: a way to hide a binding at
+    /// runtime is what makes `?` vanish from a popup context in the tool this is modelled
+    /// on. Scans every file's production source (this test's own name included, which is
+    /// why only the part before `#[cfg(test)]` counts), not just this file, since the
+    /// mechanism this proves absent is exactly the kind a later change could add anywhere
+    /// and have the footer or the help overlay quietly obey.
+    #[test]
+    fn no_per_binding_disabled_reason_mechanism_exists_anywhere_in_the_crate() {
+        // Built from two pieces each, as `app.rs`'s own `banned` string is, so this line is
+        // never a self-match.
+        let banned = [
+            format!("{}_{}", "disabled", "reason"),
+            format!("{}{}", "Disabled", "Reason"),
+        ];
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            let production_source = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split always yields at least one piece");
+            for (number, line) in production_source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if banned.iter().any(|needle| line.contains(needle.as_str())) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "a per-binding disabled-reason mechanism must never exist, found at: \
+             {offending_locations:?}"
+        );
+    }
+
+    // --- chord_label, primary_chord and describe: what the footer and help overlay read ---
+
+    #[test]
+    fn chord_label_formats_a_plain_letter_a_space_and_a_ctrl_chord() {
+        assert_eq!(chord_label(KeyCode::Char('j'), NONE), "j");
+        assert_eq!(chord_label(KeyCode::Char(' '), NONE), "space");
+        assert_eq!(chord_label(KeyCode::Char('r'), CTRL), "ctrl-r");
+        assert_eq!(chord_label(KeyCode::Enter, NONE), "enter");
+    }
+
+    #[test]
+    fn primary_chord_prefers_the_letter_over_its_arrow_key_alternate() {
+        // MoveDown's row order in BINDINGS lists `j` before `Down`; primary_chord must
+        // return the table's first row, not merely any row that matches.
+        assert_eq!(
+            primary_chord(Context::List, Action::MoveDown),
+            Some((KeyCode::Char('j'), NONE))
+        );
+    }
+
+    #[test]
+    fn primary_chord_is_none_for_an_action_not_bound_in_that_context() {
+        // ToggleSelection is a List action; Detail never binds it.
+        assert_eq!(
+            primary_chord(Context::Detail, Action::ToggleSelection),
+            None
+        );
+    }
+
+    #[test]
+    fn describe_collapses_a_multi_key_action_into_one_entry() {
+        let rows = describe(Context::List);
+        let move_down = rows
+            .iter()
+            .find(|(_, description)| *description == "Move down")
+            .expect("Move down must be described");
+        assert_eq!(move_down.0, "j, down");
+    }
+
+    #[test]
+    fn describe_lists_the_current_contexts_own_actions_before_globals() {
+        let rows = describe(Context::List);
+        let own = rows
+            .iter()
+            .position(|(_, description)| *description == "Move down")
+            .expect("List's own Move down must appear");
+        let global = rows
+            .iter()
+            .position(|(_, description)| *description == "Quit")
+            .expect("Global's Quit must appear alongside List");
+        assert!(
+            own < global,
+            "expected the current context's own actions before global's, got order {rows:?}"
+        );
+    }
+
+    #[test]
+    fn describe_never_pulls_in_global_for_a_context_where_global_is_suspended() {
+        let rows = describe(Context::Confirm);
+        assert_eq!(
+            rows,
+            vec![("y".to_string(), "Run"), ("n, esc".to_string(), "Decline"),]
+        );
+    }
+
+    #[test]
+    fn describe_of_global_itself_does_not_duplicate_its_own_rows() {
+        let rows = describe(Context::Global);
+        let quit_entries = rows
+            .iter()
+            .filter(|(_, description)| *description == "Quit")
+            .count();
+        assert_eq!(quit_entries, 1);
     }
 
     // --- the compiled table matches the spec, row for row, in both directions ---

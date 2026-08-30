@@ -175,7 +175,18 @@ Four rules produce it:
 
 ratatui does none of this. `Buffer::set_stringn` (ratatui-core 0.1.2, src/buffer/buffer.rs:336) truncates silently at a grapheme boundary and neither wraps nor panics, so left alone it cuts a binding in half, and a half-rendered hint still reads as an instruction.
 
-The detail context's footer is 61 columns at full width and follows the same rules. The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+The detail context's footer is 61 columns at full width and follows the same rules: `r refresh` drops first, `j/k scroll` second (the arrow keys are bound there too), then `/ filter`, then the launcher/action pair, and `? help` is pinned. It degrades like this:
+
+```
+ 61  j/k scroll  / filter  ! launcher  ; action  r refresh  ? help
+ 54  j/k scroll  / filter  ! launcher  ; action  ? help ...
+ 42  / filter  ! launcher  ; action  ? help ...
+ 32  ! launcher  ; action  ? help ...
+ 10  ? help ...
+  6  ? help
+```
+
+The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
 
 ## The help overlay
 
