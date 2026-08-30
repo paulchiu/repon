@@ -60,6 +60,7 @@ mod entity;
 mod fanout;
 mod git;
 mod landing;
+mod patch_equivalence;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
