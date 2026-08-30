@@ -1732,7 +1732,7 @@ mod tests {
         // could never distinguish a guarded `refresh` from an unguarded one that
         // simply keeps re-abandoning against the same still-huge tree).
         let decoys = root.join("decoys");
-        for i in 0..4_000 {
+        for i in 0..20_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
                 .or_else(|_| fs::create_dir_all(decoys.join(format!("decoy-{i}"))))
                 .expect("create decoy dir");
@@ -1791,19 +1791,24 @@ mod tests {
         let started = Core::start_for_test_with_discovery_abandon(
             spec(vec![root.clone()]),
             Duration::from_secs(3600),
-            Duration::from_micros(500),
+            Duration::from_millis(5),
             tick_rx,
         );
         let core = started.core;
         assert!(
             !core.discovery_manual_for_test(),
             "the first discovery walk, over a two-directory tree, must finish well \
-             inside a 500 microsecond deadline and leave the Set automatic"
+             inside a 5 millisecond deadline and leave the Set automatic"
         );
 
         // Grown only after `start` has already returned, so this fan of decoys is
         // invisible to the first walk and can only be reached by a walk `refresh`
-        // triggers itself.
+        // triggers itself. The count and the deadline are a matched pair: at the
+        // ~1.4us per entry this project measures, 20,000 entries overshoot 5ms
+        // several times over while a two-directory tree comes in orders of
+        // magnitude under it, so neither side of the comparison is a knife edge on
+        // a loaded machine. A 500us deadline against 4,000 decoys failed twice in
+        // six runs under parallel load.
         let decoys = root.join("decoys");
         for i in 0..4_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
