@@ -8,7 +8,7 @@
 //! against a 16.7 millisecond frame.
 
 use crate::cell::{Cell, Generation, Settled, Timestamp};
-use crate::entity::{ActionRun, Diagnostics, EntityState};
+use crate::entity::{ActionReceipt, Diagnostics, EntityState};
 
 /// The one state a row's Cells fold into, for the gutter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,11 +124,8 @@ pub fn summary(entity: &EntityState) -> RowSummary {
         return RowSummary::InFlight;
     }
 
-    let derivation_failed = gitmodules_failed.is_some()
-        || last_action.as_ref().is_some_and(|run| {
-            let ActionRun { failed } = run;
-            *failed
-        });
+    let derivation_failed =
+        gitmodules_failed.is_some() || last_action.as_ref().is_some_and(ActionReceipt::failed);
 
     let worst = cells
         .iter()
@@ -166,7 +163,30 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::entity::{AheadBehind, DefaultBranch, EntityKey, Head, Kind, WorktreeState};
+    use crate::entity::{
+        AheadBehind, DefaultBranch, EntityKey, Head, Kind, StepOutcome, StepResult, WorktreeState,
+    };
+
+    /// One receipt, one step per outcome given, in order: enough for the fold's own tests,
+    /// which only ever ask whether *some* step failed, never which one or what it printed.
+    fn receipt_with_steps(outcomes: Vec<StepOutcome>) -> ActionReceipt {
+        let steps = outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| StepResult {
+                label: Arc::from(format!("step {index}")),
+                outcome,
+                output: Arc::from(&b""[..]),
+                elapsed: std::time::Duration::from_millis(1),
+            })
+            .collect::<Vec<_>>();
+        ActionReceipt {
+            label: Arc::from("action"),
+            steps: Arc::from(steps),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+        }
+    }
 
     fn fresh_entity(name: &str) -> EntityState {
         let mut entity = EntityState::new(
@@ -547,10 +567,22 @@ mod tests {
         assert_eq!(summary(&entity), RowSummary::Failed);
     }
 
+    /// Criterion 8's whole point, not merely that the fold reacts to `failed`: every Cell
+    /// here is fine (`fresh_entity` settles all six), and the mark comes from the receipt
+    /// alone. A worthless version of this test would also fail a Cell, which would pass even
+    /// if the receipt were never read.
     #[test]
     fn a_failed_last_action_drives_the_row_to_failed_even_though_every_cell_is_fine() {
         let mut entity = fresh_entity("repo");
-        entity.last_action = Some(crate::entity::ActionRun { failed: true });
+        assert_eq!(
+            summary(&entity),
+            RowSummary::Fresh,
+            "sanity check: every cell must already read fine before the receipt is added"
+        );
+        entity.last_action = Some(receipt_with_steps(vec![
+            StepOutcome::Ok,
+            StepOutcome::Failed(1),
+        ]));
 
         assert_eq!(summary(&entity), RowSummary::Failed);
     }
@@ -558,9 +590,44 @@ mod tests {
     #[test]
     fn a_successful_last_action_does_not_drag_an_otherwise_fresh_row_down() {
         let mut entity = fresh_entity("repo");
-        entity.last_action = Some(crate::entity::ActionRun { failed: false });
+        entity.last_action = Some(receipt_with_steps(vec![StepOutcome::Ok, StepOutcome::Ok]));
 
         assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    /// `Cancelled` is not a failure ([`docs/spec/actions.md`]'s "Step outcomes"), and that
+    /// classification has to hold inside the fold too, not just on `StepOutcome::is_failure`
+    /// in isolation: a cancelled run must never turn an otherwise-fine row `!`.
+    #[test]
+    fn a_cancelled_last_action_does_not_drive_the_row_to_failed() {
+        let mut entity = fresh_entity("repo");
+        entity.last_action = Some(receipt_with_steps(vec![
+            StepOutcome::Ok,
+            StepOutcome::Cancelled,
+        ]));
+
+        assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    /// Reinforces criterion 1's exclusion from the Cell machinery: `FoldableCell` is a
+    /// per-cell mechanism, private to this module and implemented exactly once, generically,
+    /// for `Cell<T>` alone; `EntityState::last_action` is a plain `Option<ActionReceipt>`,
+    /// never a `Cell<ActionReceipt>`, so it cannot become `&dyn FoldableCell` and cannot join
+    /// `summary`'s six-element `cells` array. What that guarantee predicts, and what this
+    /// test actually drives: the fold's verdict on a failed receipt reads only
+    /// `ActionReceipt::failed`'s single bool, never the receipt's own step count or shape.
+    #[test]
+    fn the_folds_verdict_on_a_failed_receipt_does_not_depend_on_how_many_steps_it_has() {
+        let mut one_step = fresh_entity("repo-one");
+        one_step.last_action = Some(receipt_with_steps(vec![StepOutcome::Failed(1)]));
+
+        let mut many_steps = fresh_entity("repo-many");
+        let mut outcomes = vec![StepOutcome::Ok; 20];
+        outcomes.push(StepOutcome::Failed(1));
+        many_steps.last_action = Some(receipt_with_steps(outcomes));
+
+        assert_eq!(summary(&one_step), RowSummary::Failed);
+        assert_eq!(summary(&one_step), summary(&many_steps));
     }
 
     #[test]
