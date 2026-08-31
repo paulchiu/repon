@@ -408,6 +408,64 @@ mod tests {
         }
     }
 
+    /// [`production_lines_containing`] without the comment exclusion, for an absence claim
+    /// that is explicitly about comments too, not only executable code: the claim covers
+    /// the code and its comments, so a comment repeating a stale gloss must trip this scan
+    /// the same as a live line would.
+    fn production_lines_containing_including_comments(needle: &str) -> Vec<String> {
+        let mut offending = Vec::new();
+        for dir in workspace_crate_src_dirs() {
+            for path in rust_source_files(&dir) {
+                let production = production_source_at(&path);
+                for (number, line) in production.lines().enumerate() {
+                    if line.contains(needle) {
+                        offending.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+        offending
+    }
+
+    /// [ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
+    /// removed `Unknown::NoUpstream` and `Unknown::NoRemote` from the closed `Unknown`
+    /// reason set, since a branch with no upstream and a Repo with no remote are both
+    /// settled values (`-` and `∅`) rather than missing ones. The needle is the qualified
+    /// variant path, not the bare word: `SyncState::NoUpstream` and `SyncState::NoRemote`
+    /// are this same ticket's own legitimate new variants and must not trip this scan.
+    #[test]
+    fn the_removed_no_upstream_and_no_remote_unknown_reasons_exist_nowhere_in_the_code() {
+        for needle in [
+            format!("Unknown::{}", "NoUpstream"),
+            format!("Unknown::{}", "NoRemote"),
+        ] {
+            let offending = production_lines_containing(&needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; ADR 0019 removed both reasons from the closed `Unknown` \
+                 set, at: {offending:?}"
+            );
+        }
+    }
+
+    /// The corrected gloss from ADR 0019, false for a
+    /// detached HEAD and for every Submodule row already carrying `-`. Comment lines are not
+    /// excluded here, unlike every other scan in this module: the criterion names comments
+    /// explicitly, and a doc comment repeating the old, false gloss is exactly the defect
+    /// this test exists to catch.
+    #[test]
+    fn the_stale_no_upstream_gloss_appears_nowhere_in_the_code_or_comments() {
+        let needle = format!("you could {} and have not", "push");
+
+        let offending = production_lines_containing_including_comments(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found the stale gloss `{needle}`, corrected by ADR 0019 (false for a detached \
+             HEAD and for every Submodule row already carrying `-`), at: {offending:?}"
+        );
+    }
+
     /// Criterion 8's absence half: there is no per-step timeout, configurable or fixed. The
     /// needle is the `wait-timeout` crate's own method name with its call parenthesis, which
     /// is specific enough to miss `repon-core`'s own, unrelated

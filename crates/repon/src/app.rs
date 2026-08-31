@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     components::{Component, detail::Detail, list::List},
-    config::{self, Config},
+    config::{self, Config, Document},
     footer,
     glyphs::GlyphSet,
     help::HelpOverlay,
@@ -162,18 +162,30 @@ pub struct App {
     /// `HelpOverlay::draw` all see a rebind on the very next frame with no code change of
     /// their own.
     bindings: BindingTable,
-    /// The Set `self.core` is currently running over, tracked so `Action::ReloadConfig` can
-    /// tell whether it changed. Set switching (`1` to `9`, the Set picker) is later work, so
-    /// this is fixed at startup to the first declared Set and only ever moves on reload's own
-    /// fallback rule.
+    /// The Set `self.core` is currently running over, tracked so `Action::ReloadConfig` and
+    /// `Action::SwitchToSet` can tell whether it changed. Resolved at startup by
+    /// [`reload::resolve_startup_set`] (`--set`/`-s`, then `REPON_SET`, then the first
+    /// declared Set), and only ever moved afterwards by a reload's own fallback rule or by a
+    /// `1`-to-`9` Set switch.
     active_set: ActiveSet,
+    /// The whole parsed document from the last load, kept so `Action::SwitchToSet` can look
+    /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
+    /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
+    document: Document,
 }
 
 impl App {
     /// `flag_theme` is `--theme`, which beats `theme` in `config.toml` and, unlike it, exits
     /// non-zero on a missing name: since this runs before [`App::run`] ever constructs a
-    /// [`Tui`], that exit happens before the terminal is claimed.
-    pub fn new(tick_rate: f64, frame_rate: f64, flag_theme: Option<String>) -> Result<Self> {
+    /// [`Tui`], that exit happens before the terminal is claimed. `flag_set` is `--set`/`-s`,
+    /// resolved against `REPON_SET` and the declared Sets by
+    /// [`reload::resolve_startup_set`], per config.md's "Selection order".
+    pub fn new(
+        tick_rate: f64,
+        frame_rate: f64,
+        flag_theme: Option<String>,
+        flag_set: Option<String>,
+    ) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
         let glyph_set = GlyphSet::for_config(config.document.glyphs);
@@ -206,10 +218,12 @@ impl App {
             "config loaded",
         );
 
-        let active_set_config =
-            config.document.sets.first().expect(
-                "Document::load always leaves at least one Set, `all` if none was declared",
-            );
+        let env_set = std::env::var("REPON_SET").ok();
+        let active_set_config = reload::resolve_startup_set(
+            &config.document.sets,
+            flag_set.as_deref(),
+            env_set.as_deref(),
+        );
         let active_set = ActiveSet::from_config(active_set_config);
 
         let core = Core::start(reload::core_spec(&config.document, &active_set));
@@ -252,6 +266,7 @@ impl App {
             themes_dir,
             bindings,
             active_set,
+            document: config.document,
         })
     }
 
@@ -342,8 +357,13 @@ impl App {
     /// pane, `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two
     /// without touching what the pane shows, `OpenHelp` opens the help overlay,
     /// `ExpandWarning` opens the warning overlay when there is something outstanding to show,
-    /// `ReloadConfig` reaches [`Self::reload_config`] and `Unwind` reaches
-    /// [`unwind::unwind_one`] over the range anchor then the pane.
+    /// `ReloadConfig` reaches [`Self::reload_config`], `SwitchToSet` reaches
+    /// [`Self::switch_to_set`] and `Unwind` reaches [`unwind::unwind_one`] over the range
+    /// anchor then the pane.
+    ///
+    /// `OpenSetPicker` (`s`) is bound in [`keys`] per
+    /// [keybindings.md](../../../docs/spec/keybindings.md) and has its own arm below, doing
+    /// nothing until the overlay exists. `1` to `9` (`SwitchToSet`) do not depend on it.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
@@ -469,8 +489,15 @@ impl App {
                 }
                 None
             }
+            Some(Action::SwitchToSet(nth)) => {
+                self.switch_to_set(nth);
+                None
+            }
+            // TODO(#94): the picker overlay does not exist yet. Named here rather than left
+            // to the catch-all, which would absorb the gap silently.
+            Some(Action::OpenSetPicker) => None,
             Some(Action::OpenLauncher) => {
-                // TODO(#97): route through the Launcher palette; `around_entity_handoff`
+                // TODO(#98): route through the Launcher palette; `around_entity_handoff`
                 // is the seam it will call into.
                 None
             }
@@ -803,6 +830,16 @@ mod tests {
                 roots: vec![root.to_string_lossy().into_owned()],
                 include: None,
                 exclude: None,
+            },
+            document: {
+                let mut document = config::Document::default();
+                document.sets.push(document::SetConfig {
+                    name: toml::Spanned::new(0..0, "test".to_string()),
+                    roots: vec![root.to_string_lossy().into_owned()],
+                    include: None,
+                    exclude: None,
+                });
+                document
             },
         }
     }

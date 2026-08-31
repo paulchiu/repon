@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    AheadBehind, Cell, EntityState, Head, RowSummary, Settled, Snapshot, WorktreeState, summary,
+    Cell, EntityState, Head, RowSummary, Settled, Snapshot, SyncState, WorktreeState, summary,
 };
 
 use super::Component;
@@ -291,7 +291,7 @@ fn draw_row(
         interior.x + SYNC_X,
         y,
         SYNC_WIDTH,
-        &format_ahead_behind(&entity.sync, glyphs, cell_loading_glyph),
+        &format_sync(&entity.sync, glyphs, cell_loading_glyph),
         style,
     );
     write_cell(
@@ -428,29 +428,39 @@ fn format_head(cell: &Cell<Head>, loading_glyph: Option<char>) -> String {
     )
 }
 
-/// `sync`'s glyph: `≡` level, `↑n`/`↓n` otherwise, per
+/// `sync`'s glyph: `∅` no remote at all, `-` no branch or no upstream, `≡` level, `↑n`/`↓n`
+/// otherwise, per
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
-/// glyphs for real values".
-fn format_ahead_behind(
-    cell: &Cell<AheadBehind>,
+/// glyphs for real values". Exhaustive over [`SyncState`], so a variant added there later
+/// fails to compile here instead of silently rendering blank.
+fn sync_glyph(value: &SyncState, glyphs: &'static GlyphSet) -> String {
+    match value {
+        SyncState::NoRemote => glyphs.no_remote.to_string(),
+        SyncState::NoUpstream => glyphs.no_upstream.to_string(),
+        SyncState::Tracking(counts) if counts.ahead == 0 && counts.behind == 0 => {
+            glyphs.in_sync.to_string()
+        }
+        SyncState::Tracking(counts) => {
+            let mut parts = Vec::new();
+            if counts.ahead > 0 {
+                parts.push(format!("{}{}", glyphs.ahead, counts.ahead));
+            }
+            if counts.behind > 0 {
+                parts.push(format!("{}{}", glyphs.behind, counts.behind));
+            }
+            parts.join(" ")
+        }
+    }
+}
+
+fn format_sync(
+    cell: &Cell<SyncState>,
     glyphs: &'static GlyphSet,
     loading_glyph: Option<char>,
 ) -> String {
     render_cell(
         cell.settled(),
-        |value| {
-            if value.ahead == 0 && value.behind == 0 {
-                return glyphs.in_sync.to_string();
-            }
-            let mut parts = Vec::new();
-            if value.ahead > 0 {
-                parts.push(format!("{}{}", glyphs.ahead, value.ahead));
-            }
-            if value.behind > 0 {
-                parts.push(format!("{}{}", glyphs.behind, value.behind));
-            }
-            parts.join(" ")
-        },
+        |value| sync_glyph(value, glyphs),
         loading_glyph,
     )
 }
@@ -516,8 +526,8 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use repon_core::{
-        EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot, Timestamp,
-        Unknown,
+        AheadBehind, EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot,
+        Timestamp, Unknown,
     };
 
     use crate::app::SIDEBAR_WIDTH;
@@ -730,9 +740,10 @@ mod tests {
     // --- Criteria 1 and 2: the cheap columns land while the outstanding ones spin ---
 
     /// Criterion 1 and criterion 2's "partial" case together, on a real probed row: the name
-    /// and branch (the cheap columns) already show through, and `sync`, `base` and `dirty`
-    /// (the columns no probe has reached, in this codebase's current scope) show the loading
-    /// mark rather than sitting blank or reading a raw zero. The gutter shows the row's
+    /// and branch (the cheap columns) already show through, `sync` shows its settled value,
+    /// and `base` and `dirty` (the columns no probe has reached, in this codebase's current
+    /// scope) show the loading mark rather than sitting blank or reading a raw zero. The
+    /// gutter shows the row's
     /// least-settled *settled* state (Fresh, a blank space) rather than `?`: the sanity check
     /// above rules out a version of this test that would pass merely because `default_branch`
     /// happened to read Unknown for an unrelated reason (no remote to resolve rung 2/3
@@ -763,9 +774,9 @@ mod tests {
         assert_eq!(cell_text(buf, 32, 2, 4), "main");
         assert_eq!(
             cell_text(buf, 57, 2, 1),
-            frame,
-            "sync has no probe wired to it in this codebase yet and must show the loading \
-             mark rather than sitting blank"
+            glyphs.no_remote.to_string(),
+            "sync is probed, and this fixture has no remote, so it must show its settled \
+             value rather than a loading mark"
         );
         assert_eq!(
             cell_text(buf, 67, 2, 1),
@@ -829,12 +840,12 @@ mod tests {
 
         // Row 1 (y=2): holds nothing, so the gutter alone spins and every cell is blank.
         assert_eq!(cell_text(buf, 1, 2, 1), frame);
-        assert_eq!(cell_text(buf, 57, 2, 1), " ");
+        assert_eq!(cell_text(buf, 67, 2, 1), " ");
 
         // Row 2 (y=3): holds values, so the gutter is blank (Fresh) and the outstanding
-        // `sync` column spins instead.
+        // `base` column spins instead.
         assert_eq!(cell_text(buf, 1, 3, 1), " ");
-        assert_eq!(cell_text(buf, 57, 3, 1), frame);
+        assert_eq!(cell_text(buf, 67, 3, 1), frame);
     }
 
     // --- Criteria 4 and 5: the mark moves, including on an already-populated row ---
@@ -912,7 +923,7 @@ mod tests {
     /// This starts from a row that already shows its name, its branch and its default branch
     /// (everything this codebase's `Core::refresh` probes today, "a fully-populated table" in
     /// its current scope) rather than a freshly discovered one, and proves the still-outstanding
-    /// `sync` column animates across two ticks of the *same* row, the shape the predecessor's
+    /// `base` column animates across two ticks of the *same* row, the shape the predecessor's
     /// recorded defect describes: "a measured 4.02 second refresh sampled 55 times with not
     /// one spinner frame on any row". No sleeping: `started_at` moves by arithmetic, not by
     /// waiting, so this cannot flake on a loaded runner.
@@ -932,19 +943,19 @@ mod tests {
             ..List::default()
         };
         let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
-        let sync_first = cell_text(first_tick.backend().buffer(), 57, 2, 1);
+        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
 
         let mut later = List {
             started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
             ..List::default()
         };
         let second_tick = render_with_list(&mut later, 140, 24, &snap);
-        let sync_second = cell_text(second_tick.backend().buffer(), 57, 2, 1);
+        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
 
-        assert_eq!(sync_first, glyphs.loading[0].to_string());
-        assert_eq!(sync_second, glyphs.loading[5].to_string());
+        assert_eq!(base_first, glyphs.loading[0].to_string());
+        assert_eq!(base_second, glyphs.loading[5].to_string());
         assert_ne!(
-            sync_first, sync_second,
+            base_first, base_second,
             "an already-populated row's outstanding cell must show moving spinner frames on \
              refresh, never a static screen"
         );
@@ -1209,12 +1220,12 @@ mod tests {
     fn no_numeric_bearing_cell_ever_renders_a_raw_default_instead_of_blank() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         let unset: Cell<u32> = Cell::default();
-        let unset_sync: Cell<AheadBehind> = Cell::default();
+        let unset_sync: Cell<SyncState> = Cell::default();
 
         for text in [
             format_base(&unset, glyphs, None),
             format_dirty(&unset, glyphs, None),
-            format_ahead_behind(&unset_sync, glyphs, None),
+            format_sync(&unset_sync, glyphs, None),
         ] {
             assert_eq!(
                 text, "",
@@ -1230,7 +1241,7 @@ mod tests {
         for text in [
             format_base(&unset, glyphs, Some('⠋')),
             format_dirty(&unset, glyphs, Some('⠋')),
-            format_ahead_behind(&unset_sync, glyphs, Some('⠋')),
+            format_sync(&unset_sync, glyphs, Some('⠋')),
         ] {
             assert_eq!(
                 text, "⠋",
@@ -1238,6 +1249,89 @@ mod tests {
                  rather than a raw zero"
             );
         }
+    }
+
+    /// Criterion 4's own vocabulary, one variant at a time: every [`SyncState`] shape
+    /// renders through its own named glyph field rather than a shared fallback, so a
+    /// mistake wiring one variant to another value's field shows up here rather than
+    /// only in a hand-eyeballed screenshot.
+    #[test]
+    fn sync_glyph_renders_each_sync_state_through_its_own_named_glyph() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(sync_glyph(&SyncState::NoRemote, glyphs), "∅");
+        assert_eq!(sync_glyph(&SyncState::NoUpstream, glyphs), "-");
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            "≡"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 3,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            "↑3"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 5
+                }),
+                glyphs
+            ),
+            "↓5"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 2,
+                    behind: 4
+                }),
+                glyphs
+            ),
+            "↑2 ↓4",
+            "diverged both ways must show both counts, ahead before behind"
+        );
+    }
+
+    /// The ascii table's own glyphs for the same six shapes, so a table selected by
+    /// `glyphs = "ascii"` is exercised too, not only the default `full` table.
+    #[test]
+    fn sync_glyph_renders_each_sync_state_through_the_ascii_table_too() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+
+        assert_eq!(sync_glyph(&SyncState::NoRemote, glyphs), "x");
+        assert_eq!(sync_glyph(&SyncState::NoUpstream, glyphs), "-");
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 1,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            ">1"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 1
+                }),
+                glyphs
+            ),
+            "<1"
+        );
     }
 
     #[test]
