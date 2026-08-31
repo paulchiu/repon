@@ -23,6 +23,7 @@ use crate::{
     keys::{self, Action, BindingTable, Context},
     launcher::{self, Launcher},
     launcher_palette::LauncherPalette,
+    list_viewport::{half_page_cursor, offset_following_cursor},
     message::Message,
     notice,
     selection::Selection,
@@ -163,6 +164,12 @@ pub struct App {
     /// read: an index into the current [`Snapshot`]'s entities, which is
     /// this crate's only "visible list" until a Filter narrows it.
     cursor: usize,
+    /// The repo list's own scroll window, an index into `visible_keys()` naming its first
+    /// drawn row: the smallest offset that keeps `cursor` inside `list_viewport_rows()` rows,
+    /// recomputed by [`Self::follow_cursor`] on every write to `cursor` and everywhere the
+    /// visible row set can shrink under a standing one. Handed to `list` fresh every frame
+    /// ([`Self::render`]), never read back from it: `List` owns no viewport state of its own.
+    list_offset: usize,
     /// `Some` while the detail pane is open, carrying the Entity it shows: opening it never
     /// touches `cursor` or reorders anything, since the pane is an overlay onto the same
     /// table the list already reads. The unwind stack's second level closes it
@@ -420,6 +427,7 @@ impl App {
             should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
+            list_offset: 0,
             pane: None,
             focus: Context::List,
             help: None,
@@ -627,6 +635,45 @@ impl App {
             Layout3::SideBySide => self.frame_size.width.saturating_sub(SIDEBAR_WIDTH),
             Layout3::DetailOnly | Layout3::ListOnly => self.frame_size.width,
         }
+    }
+
+    /// The list's own interior height in rows at the current frame size, mirroring exactly
+    /// what `Self::render`'s own `Layout::vertical` split and `List::render`'s own
+    /// `Block::bordered` hand it, the same reason [`Self::detail_pane_width`] mirrors the
+    /// detail pane's own split: frame height minus the status row, minus the filter row while
+    /// `self.filter_line` is open, minus the footer, minus the list block's two border rows,
+    /// minus the one header row `List::render` draws in `Layout3::ListOnly` (the compact
+    /// sidebar `Layout3::SideBySide` draws instead has none). Saturating throughout, so a
+    /// frame too short for even the chrome gives `0` rather than panicking.
+    fn list_viewport_rows(&self) -> usize {
+        let filter_row_height = u16::from(self.filter_line.is_some());
+        const STATUS_ROW: u16 = 1;
+        const FOOTER_ROW: u16 = 1;
+        const LIST_BLOCK_BORDERS: u16 = 2;
+        let content_height = self
+            .frame_size
+            .height
+            .saturating_sub(STATUS_ROW)
+            .saturating_sub(filter_row_height)
+            .saturating_sub(FOOTER_ROW);
+        let interior_height = content_height.saturating_sub(LIST_BLOCK_BORDERS);
+        let header_rows = match layout_state(self.frame_size.width, self.pane_entity().is_some()) {
+            Layout3::ListOnly => 1,
+            Layout3::SideBySide | Layout3::DetailOnly => 0,
+        };
+        interior_height.saturating_sub(header_rows) as usize
+    }
+
+    /// Recomputes `self.list_offset` from `self.cursor` and the current visible row count
+    /// ([`crate::list_viewport::offset_following_cursor`]). Called after every write to `self.cursor`
+    /// (`Self::move_cursor`, `Self::set_cursor`, which `Self::jump_cursor_to_failed_row` goes
+    /// through) and everywhere else the visible row set can shrink under a standing cursor: a
+    /// Filter committed or cleared, a Set switch, a config reload.
+    fn follow_cursor(&mut self) {
+        let row_count = self.visible_keys().len();
+        let viewport_rows = self.list_viewport_rows();
+        self.list_offset =
+            offset_following_cursor(self.list_offset, self.cursor, viewport_rows, row_count);
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -867,6 +914,10 @@ impl App {
             Some(Action::ClosePane) => {
                 self.pane = None;
                 self.focus = Context::List;
+                // Closing the pane reverts to `Layout3::ListOnly`, which claims a header row
+                // `SideBySide`/`DetailOnly` don't, shrinking `list_viewport_rows()` by one; the
+                // same reason `Action::Unwind`'s own `ClosePaneOnUnwind` level calls this.
+                self.follow_cursor();
                 None
             }
             Some(Action::ReturnFocusToList) => {
@@ -898,6 +949,17 @@ impl App {
                     .apply(action, content_len, self.frame_size.height);
                 None
             }
+            // The guarded arm above already claims `HalfPageDown`/`HalfPageUp` while
+            // `Context::Detail` has focus; reaching here means `Context::List` does. Moves
+            // the cursor itself, unlike the detail pane's own half page, which moves a scroll
+            // offset over content the cursor plays no part in.
+            Some(action @ (Action::HalfPageDown | Action::HalfPageUp)) => {
+                let viewport_rows = self.list_viewport_rows();
+                let row_count = self.visible_keys().len();
+                let cursor = half_page_cursor(self.cursor, action, viewport_rows, row_count);
+                self.set_cursor(cursor);
+                None
+            }
             Some(Action::Unwind) => {
                 let mut cancel_action = CancelActionOnUnwind { core: &self.core };
                 let mut close_pane = ClosePaneOnUnwind {
@@ -913,6 +975,10 @@ impl App {
                     &mut close_pane,
                     &mut clear_filter,
                 ]);
+                // Clearing a committed Filter is one of the unwind levels above, and can grow
+                // the visible row set under a standing cursor just as narrowing one can
+                // shrink it; harmless to call when a different level fired instead.
+                self.follow_cursor();
                 None
             }
             Some(Action::OpenHelp) => {
@@ -969,6 +1035,9 @@ impl App {
             }
             Some(Action::EnterFilter) => {
                 self.filter_line = Some(FilterLine::new(&self.filter));
+                // Opening the filter line claims a row from `list_viewport_rows()`, which can
+                // strand a standing cursor past the now-shorter window.
+                self.follow_cursor();
                 None
             }
             Some(Action::NextFailed) => {
@@ -985,17 +1054,15 @@ impl App {
                 }
                 None
             }
-            // `DismissVanished` and the List-only half of `HalfPageDown`/`HalfPageUp` are
-            // still unbuilt (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch`
-            // never returns an unbuilt action ([`keys::lookup`]'s own doc comment), so
-            // `self.bindings.dispatch(self.focus, key)` above can never produce one of these;
-            // this arm exists only because the match itself has to name every `Action`
-            // variant, the same proof-made-loud shape the `unreachable!` arm just below
-            // already uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
-            Some(Action::DismissVanished | Action::HalfPageDown | Action::HalfPageUp) => {
-                unreachable!(
-                    "these actions are all unbuilt; dispatch never returns an unbuilt action"
-                )
+            // `DismissVanished` is still unbuilt (keybindings.md's "Not built yet").
+            // `keys::BindingTable::dispatch` never returns an unbuilt action
+            // ([`keys::lookup`]'s own doc comment), so `self.bindings.dispatch(self.focus,
+            // key)` above can never produce one; this arm exists only because the match
+            // itself has to name every `Action` variant, the same proof-made-loud shape the
+            // `unreachable!` arm just below already uses for
+            // `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
+            Some(Action::DismissVanished) => {
+                unreachable!("DismissVanished is unbuilt; dispatch never returns an unbuilt action")
             }
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
@@ -1214,6 +1281,7 @@ impl App {
             Some(Action::Apply) => {
                 if let Some(line) = self.filter_line.take() {
                     self.filter = line.live_filter();
+                    self.follow_cursor();
                 }
             }
             Some(Action::Text(c)) => {
@@ -1480,15 +1548,15 @@ impl App {
     /// cover the rows the cursor just crossed.
     fn move_cursor(&mut self, delta: i32) {
         let visible = self.visible_keys();
-        if visible.is_empty() {
-            return;
+        if !visible.is_empty() {
+            let last = visible.len() - 1;
+            let moved = self.cursor as i32 + delta;
+            self.cursor = moved.clamp(0, last as i32) as usize;
+            if self.selection.has_range_anchor() {
+                self.selection.extend_range(self.cursor, &visible);
+            }
         }
-        let last = visible.len() - 1;
-        let moved = self.cursor as i32 + delta;
-        self.cursor = moved.clamp(0, last as i32) as usize;
-        if self.selection.has_range_anchor() {
-            self.selection.extend_range(self.cursor, &visible);
-        }
+        self.follow_cursor();
     }
 
     /// Sets the cursor to `index`, clamped to the table. Unlike [`Self::move_cursor`], this
@@ -1497,11 +1565,12 @@ impl App {
     /// must leave the Selection untouched.
     fn set_cursor(&mut self, index: usize) {
         let visible = self.visible_keys();
-        if visible.is_empty() {
-            self.cursor = 0;
-            return;
-        }
-        self.cursor = index.min(visible.len() - 1);
+        self.cursor = if visible.is_empty() {
+            0
+        } else {
+            index.min(visible.len() - 1)
+        };
+        self.follow_cursor();
     }
 
     /// Every currently visible row's failed state, in the same order [`Self::visible_keys`]
@@ -1721,6 +1790,9 @@ impl App {
     fn resize(&mut self, tui: &mut Tui, columns: u16, rows: u16) -> Result<()> {
         tui.resize(Rect::new(0, 0, columns, rows))?;
         self.frame_size = Size::new(columns, rows);
+        // A resize can shrink `list_viewport_rows()` under a standing cursor, same as a
+        // Filter or Set change; re-derive the offset before the new geometry is drawn.
+        self.follow_cursor();
         self.render(tui)
     }
 
@@ -1804,11 +1876,13 @@ impl App {
             // its own draw methods runs below.
             let filter = self.active_filter();
             self.list.set_filter(filter);
-            // The cursor's own offset and the loaded theme, handed to `self.list` the same
-            // per-frame way as `filter` above, so the cursor row's highlight
-            // ([`theme::Theme::selection_style`]) always reflects this tick's cursor and
-            // this run's resolved theme rather than whatever `List` was constructed with.
+            // The cursor, its viewport offset and the loaded theme, handed to `self.list`
+            // the same per-frame way as `filter` above, so the cursor row's highlight
+            // ([`theme::Theme::selection_style`]) and the window it is drawn in always
+            // reflect this tick's cursor and this run's resolved theme rather than whatever
+            // `List` was constructed with.
             self.list.set_cursor(self.cursor);
+            self.list.set_offset(self.list_offset);
             self.list.set_theme(self.theme);
             // A row for the Filter line takes real height only while it is open, shifting
             // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
@@ -2081,6 +2155,7 @@ mod tests {
             should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
+            list_offset: 0,
             pane: None,
             focus: Context::List,
             help: None,
@@ -2137,7 +2212,7 @@ mod tests {
         }
     }
 
-    fn write_gitmodules(parent: &std::path::Path, name: &str, relative_path: &str) {
+    pub(crate) fn write_gitmodules(parent: &std::path::Path, name: &str, relative_path: &str) {
         std::fs::write(
             parent.join(".gitmodules"),
             format!(
@@ -2235,6 +2310,153 @@ mod tests {
         assert!(
             app.selection.has_range_anchor(),
             "the anchor itself must stay live; only its extension by a jump is refused"
+        );
+    }
+
+    /// The repo list's own viewport, wired end to end: `G` on a table taller than the frame
+    /// must land the last row inside the drawn window, and `g` must return that window to the
+    /// top, both through `Self::follow_cursor`'s call to
+    /// `list_viewport::offset_following_cursor` at the real geometry `Self::list_viewport_rows`
+    /// computes.
+    #[test]
+    fn last_row_and_first_row_move_the_viewport_to_the_tables_own_ends() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..20 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        assert_eq!(
+            app.visible_keys().len(),
+            20,
+            "expected twenty repos discovered under the temp root"
+        );
+        // Five visible rows: a height-10 frame minus the status row, the footer, the list
+        // block's two border rows and its one header row.
+        app.frame_size = Size::new(140, 10);
+        assert_eq!(app.list_viewport_rows(), 5);
+
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        assert_eq!(
+            app.cursor, 19,
+            "G must move the cursor to the table's own last row"
+        );
+        assert_eq!(
+            app.list_offset, 15,
+            "row 19 must land inside a 5-row window: [15, 20)"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('g'), KeyModifiers::NONE))
+            .expect("dispatch g");
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.list_offset, 0, "g must return the viewport to the top");
+    }
+
+    /// The viewport holds still while the cursor moves inside the window it already drew: a
+    /// `j` press that keeps the cursor inside a 5-row window must not recompute `list_offset`
+    /// away from `0`, the property that makes this a viewport rather than a recentring jump on
+    /// every move.
+    #[test]
+    fn the_viewport_holds_still_while_the_cursor_moves_inside_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..20 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(140, 10);
+
+        for _ in 0..3 {
+            app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("dispatch j");
+        }
+
+        assert_eq!(
+            app.cursor, 3,
+            "three j presses must move the cursor to row 3"
+        );
+        assert_eq!(
+            app.list_offset, 0,
+            "row 3 is still inside the initial [0, 5) window, so the viewport must hold still"
+        );
+    }
+
+    /// The `list` context's own `Ctrl+D`/`Ctrl+U` move the cursor by half a page and take the
+    /// viewport with it (`list_viewport::half_page_cursor` through `Self::set_cursor`), unlike
+    /// the detail pane's own half page, which moves a scroll offset instead.
+    #[test]
+    fn half_page_down_then_half_page_up_returns_the_cursor_near_the_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..20 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        // Ten visible rows, so `half_page_cursor`'s own `half` is 5.
+        app.frame_size = Size::new(140, 15);
+        assert_eq!(app.list_viewport_rows(), 10);
+
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("dispatch Ctrl+D");
+        assert_eq!(
+            app.cursor, 5,
+            "half page down from row 0 must land on row 5"
+        );
+        assert_eq!(
+            app.list_offset, 0,
+            "row 5 is still inside the initial [0, 10) window"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("dispatch Ctrl+U");
+        assert_eq!(
+            app.cursor, 0,
+            "half page up from row 5 must return to row 0"
+        );
+        assert_eq!(app.list_offset, 0);
+    }
+
+    /// A Filter committed while the cursor sits past the newly narrowed table's own end must
+    /// leave `list_offset` describing a real window rather than one the table has outgrown:
+    /// `Self::handle_filter_line_key`'s own `Apply` arm calls `Self::follow_cursor` right after
+    /// committing the Filter, which is what this pins.
+    #[test]
+    fn the_viewport_stays_valid_when_a_filter_shrinks_the_table_under_a_standing_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..20 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(140, 10);
+        assert_eq!(app.list_viewport_rows(), 5);
+
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        assert_eq!(app.cursor, 19);
+        assert_eq!(app.list_offset, 15);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("dispatch / to open the filter line");
+        for c in "repo-1".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("dispatch a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("dispatch Enter to commit the filter");
+
+        let narrowed = app.visible_keys().len();
+        assert_eq!(
+            narrowed, 10,
+            "\"repo-1\" must match only repo-10 through repo-19"
+        );
+
+        assert_eq!(
+            app.list_offset, 5,
+            "the standing cursor (19) is now past the narrowed table's own end (10 rows); \
+             the offset must clamp to the largest window that still describes real rows: \
+             [5, 10)"
         );
     }
 

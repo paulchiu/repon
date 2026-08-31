@@ -126,7 +126,6 @@ The bindings below are reserved and specified but not built: `crates/repon/src/k
 Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, and still answers on press with a "not implemented" warning rather than the silence [Built and available](#built-and-available) promises; wiring the footer, the help overlay and `dispatch` to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
 - `d` dismiss a Vanished row
-- `Ctrl+D`, `PageDown`, `Ctrl+U` and `PageUp` in `list` only; the same chords in `detail` and `overlay` are built
 
 ## Why these keys and not others
 

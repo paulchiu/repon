@@ -98,6 +98,13 @@ pub struct List {
     filter: Filter,
     /// The cursor's offset into `row_order`, handed in every frame ([`Self::set_cursor`]).
     cursor: usize,
+    /// How many leading rows of `row_order` this draw skips, handed in every frame by
+    /// [`crate::app::App::render`] ([`Self::set_offset`]) the same way `filter` is: `App`
+    /// owns the viewport math ([`crate::list_viewport::offset_following_cursor`]); this
+    /// component only draws the window it is told. Clamped against the real row count inside
+    /// [`Self::render`], never trusted as-is, so a stale offset (a filter narrowing the table
+    /// after the last recompute) can never blank the list.
+    offset: usize,
     /// The theme [`Theme::selection_style`] highlights the cursor row from, handed in every
     /// frame ([`Self::set_theme`]).
     theme: Theme,
@@ -112,6 +119,7 @@ impl Default for List {
             show_submodules: false,
             filter: Filter::default(),
             cursor: 0,
+            offset: 0,
             theme: Theme::default(),
         }
     }
@@ -171,8 +179,15 @@ impl List {
             self.show_submodules,
             &self.filter,
         );
+        // Clamped against the real row count rather than trusted as-is: a stale `self.offset`
+        // (computed against a wider table, before a filter narrowed this one) must never
+        // blank the list, so this stops one row short of `row_order.len()` rather than at it,
+        // leaving at least the last row drawn whenever there is any row at all.
+        let skip = row_order.len().saturating_sub(1).min(self.offset);
+        let cursor_screen_row = self.cursor_screen_row(skip);
         for (screen_row, entity) in row_order
             .into_iter()
+            .skip(skip)
             .map(|index| &snapshot.entities[index])
             .enumerate()
         {
@@ -195,7 +210,7 @@ impl List {
             // replaces, so `Theme::selection_style`'s reverse-video default layers onto each
             // cell's own role colour and its explicit colours override them, matching
             // theming.md's two directions either way.
-            if screen_row == self.cursor_screen_row() {
+            if Some(screen_row) == cursor_screen_row {
                 buf.set_style(
                     Rect::new(interior.x, y, interior.width, 1),
                     self.theme.selection_style(),
@@ -204,11 +219,11 @@ impl List {
         }
     }
 
-    /// `self.cursor` translated into `render`'s own screen-row coordinate space: the identity
-    /// today, and the one spot a future viewport must change once scrolling makes the two
-    /// differ.
-    fn cursor_screen_row(&self) -> usize {
-        self.cursor
+    /// `self.cursor` translated into `render`'s own screen-row coordinate space by the window
+    /// starting at `skip`. `None` when the cursor sits above the window, which draws no
+    /// highlight at all rather than marking the first drawn row as one the cursor is not on.
+    fn cursor_screen_row(&self, skip: usize) -> Option<usize> {
+        self.cursor.checked_sub(skip)
     }
 }
 
@@ -254,6 +269,13 @@ impl List {
     /// frame the same way [`Self::set_filter`] is.
     pub(crate) fn set_cursor(&mut self, cursor: usize) {
         self.cursor = cursor;
+    }
+
+    /// Hands this draw the viewport offset [`crate::app::App::render`] computed for this
+    /// frame from [`crate::list_viewport::offset_following_cursor`], the same per-frame
+    /// handoff `set_filter` already uses.
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
     }
 
     /// Hands this draw the theme the cursor row's highlight takes
@@ -1771,6 +1793,50 @@ mod tests {
             cell_text(buf, 3, 1, 17),
             "acquiring-gateway",
             "with no header row, the first entity must render one row below the border"
+        );
+    }
+
+    /// [`List::set_offset`] skips exactly that many leading rows: the smallest possible
+    /// change from the un-offset draw, which is the whole point of a viewport rather than a
+    /// recentring jump.
+    #[test]
+    fn set_offset_skips_that_many_leading_rows() {
+        let mut list = List::default();
+        list.set_offset(1);
+        let snap = snapshot(vec![
+            entity("repo-one"),
+            entity("repo-two"),
+            entity("repo-three"),
+        ]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 8),
+            "repo-two",
+            "an offset of 1 must skip the first row and start drawing from the second"
+        );
+    }
+
+    /// `render`'s own defensive clamp: an offset the table has outgrown (set for a wider
+    /// table, before a filter narrowed this one, and never yet recomputed) must never blank
+    /// the list, so it stops one row short of the real row count rather than at or past it.
+    #[test]
+    fn a_stale_offset_past_the_row_count_is_clamped_rather_than_blanking_the_list() {
+        let mut list = List::default();
+        list.set_offset(100);
+        let snap = snapshot(vec![
+            entity("repo-one"),
+            entity("repo-two"),
+            entity("repo-three"),
+        ]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 10),
+            "repo-three",
+            "a wildly stale offset must still leave the table's own last row drawn"
         );
     }
 
@@ -4012,6 +4078,67 @@ mod tests {
         assert_eq!(
             highlighted_rows, 1,
             "exactly one row must carry the cursor highlight, got {highlighted_rows}"
+        );
+    }
+
+    /// The seam between the cursor row's highlight and the viewport's own offset: with a
+    /// window that has scrolled, the cursor's index into `row_order` and its screen row are
+    /// different numbers, and the highlight must follow the screen row. A highlight still
+    /// keyed to `self.cursor` alone would mark "gamma" here, one row below the cursor's own.
+    #[test]
+    fn the_cursor_highlight_follows_the_screen_row_once_the_viewport_has_scrolled() {
+        let snap = snapshot(vec![
+            entity("alpha"),
+            entity("beta"),
+            entity("gamma"),
+            entity("delta"),
+        ]);
+        let mut list = List::default();
+        list.set_offset(1);
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, absolute_x(NAME_X), entity_row_y(0), 4),
+            "beta",
+            "an offset of 1 must put the cursor's own row, `beta`, on screen row 0"
+        );
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "the cursor row must carry the highlight at its screen row, not at its row_order index"
+        );
+        assert!(
+            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "`gamma` is not the cursor row and must carry no highlight"
+        );
+    }
+
+    /// A cursor above the window draws no highlight at all. `checked_sub` returning `None` is
+    /// what keeps this honest: a `saturating_sub` would collapse to screen row 0 and mark the
+    /// window's first row as one the cursor is not on.
+    #[test]
+    fn a_cursor_above_the_window_highlights_no_row_rather_than_the_windows_first() {
+        let snap = snapshot(vec![
+            entity("alpha"),
+            entity("beta"),
+            entity("gamma"),
+            entity("delta"),
+        ]);
+        let mut list = List::default();
+        list.set_offset(2);
+        list.set_cursor(0);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        let highlighted_rows = (0..2)
+            .filter(|&row| is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)))
+            .count();
+
+        assert_eq!(
+            highlighted_rows, 0,
+            "a cursor above the window must leave every drawn row unhighlighted, got \
+             {highlighted_rows}"
         );
     }
 

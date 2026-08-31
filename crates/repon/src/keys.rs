@@ -358,15 +358,15 @@ const BINDINGS: &[Binding] = &[
     binding(Context::List, KeyCode::Up, NONE, Action::MoveUp),
     binding(Context::List, KeyCode::Char('g'), NONE, Action::FirstRow),
     binding(Context::List, KeyCode::Char('G'), SHIFT, Action::LastRow),
-    binding_not_built(
+    binding(
         Context::List,
         KeyCode::Char('d'),
         CTRL,
         Action::HalfPageDown,
     ),
-    binding_not_built(Context::List, KeyCode::PageDown, NONE, Action::HalfPageDown),
-    binding_not_built(Context::List, KeyCode::Char('u'), CTRL, Action::HalfPageUp),
-    binding_not_built(Context::List, KeyCode::PageUp, NONE, Action::HalfPageUp),
+    binding(Context::List, KeyCode::PageDown, NONE, Action::HalfPageDown),
+    binding(Context::List, KeyCode::Char('u'), CTRL, Action::HalfPageUp),
+    binding(Context::List, KeyCode::PageUp, NONE, Action::HalfPageUp),
     binding(
         Context::List,
         KeyCode::Char(' '),
@@ -1123,6 +1123,26 @@ mod tests {
         assert_eq!(
             dispatch(Context::List, press(KeyCode::Char('G'), NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn list_half_page_down_and_up_bind_both_the_control_chord_and_the_page_key() {
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('d'), CTRL)),
+            Some(Action::HalfPageDown)
+        );
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::PageDown, NONE)),
+            Some(Action::HalfPageDown)
+        );
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('u'), CTRL)),
+            Some(Action::HalfPageUp)
+        );
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::PageUp, NONE)),
+            Some(Action::HalfPageUp)
         );
     }
 

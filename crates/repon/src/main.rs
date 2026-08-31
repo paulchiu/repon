@@ -23,6 +23,7 @@ mod help;
 mod keys;
 mod launcher;
 mod launcher_palette;
+mod list_viewport;
 mod logging;
 mod message;
 mod notice;

@@ -207,6 +207,10 @@ impl App {
         // outright, since the fresh `Core` already started with this same reading from
         // `core_spec`.
         self.core.set_show_submodules(self.document.show_submodules);
+        // Toggling `show_submodules` can itself shrink or grow the visible row set under a
+        // standing cursor, after `reload_active_set`'s own call already ran, so this needs a
+        // second call rather than relying on that one.
+        self.follow_cursor();
     }
 
     /// config.md's Reload section, the other half `reload_config` delegates to: resolves the
@@ -315,6 +319,10 @@ impl App {
             // old one already logged must not suppress logging a fresh one from this one.
             self.discovery_warning_logged = false;
         }
+        // Only the branch above can change the visible row count (an unchanged bounds
+        // rebuilds nothing), but calling this unconditionally costs nothing and keeps this
+        // function from silently growing a second row-count-changing branch this misses.
+        self.follow_cursor();
     }
 }
 
@@ -357,10 +365,11 @@ mod tests {
     use std::path::Path;
 
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::layout::Size;
 
     use super::*;
     use crate::{
-        app::tests::{init_repo, press, test_app},
+        app::tests::{init_repo, press, test_app, write_gitmodules},
         keys::Context,
         test_support::capture_tracing,
     };
@@ -433,6 +442,56 @@ mod tests {
         assert!(
             !after.contains("? help"),
             "the old help hint must not still render once it has been rebound, got: {after:?}"
+        );
+    }
+
+    /// `apply_reloaded_config`'s own `follow_cursor` call (right after the live
+    /// `set_show_submodules` toggle) is what this pins: `apply_active_set`'s call runs first,
+    /// while `self.document` (and so `self.core`'s live submodule flag) still reads the
+    /// pre-reload value, so it is a no-op here. Only the later call, made after both
+    /// `self.document` and `self.core`'s live flag have moved to the reloaded value, sees the
+    /// narrowed row set and can re-derive a window that still describes real rows.
+    #[test]
+    fn toggling_show_submodules_through_reload_reflows_the_viewport_under_a_standing_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo(&parent);
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        std::fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+        for i in 0..4 {
+            init_repo(&root.join(format!("repo-{i}")));
+        }
+
+        let mut app = test_app(&root);
+        app.document.show_submodules = true;
+        app.core.set_show_submodules(true);
+        // Six visible rows (parent, repo-0..repo-3, the submodule) at a three-row viewport.
+        app.frame_size = Size::new(140, 8);
+        assert_eq!(app.list_viewport_rows(), 3);
+        assert_eq!(app.visible_keys().len(), 6);
+
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        assert_eq!(app.cursor, 5);
+        assert_eq!(app.list_offset, 3);
+
+        let mut document = Document {
+            show_submodules: false,
+            ..Document::default()
+        };
+        document.sets.push(matching_set_config(&root));
+        app.apply_reloaded_config(config_with_document(document));
+
+        assert_eq!(
+            app.visible_keys().len(),
+            5,
+            "the submodule must be hidden again once the reload turns show_submodules off"
+        );
+        assert_eq!(
+            app.list_offset, 2,
+            "the standing cursor (5) is now past the narrowed table's own end (5 rows); the \
+             offset must clamp to the largest window that still describes real rows: [2, 5)"
         );
     }
 
