@@ -1884,6 +1884,9 @@ impl App {
             self.list.set_cursor(self.cursor);
             self.list.set_offset(self.list_offset);
             self.list.set_theme(self.theme);
+            // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
+            // `self.list` the same per-frame way as the cursor and the Filter above.
+            self.list.set_selection(self.selection.clone());
             // A row for the Filter line takes real height only while it is open, shifting
             // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
             // screen: a change on a mode switch takes a real row").
