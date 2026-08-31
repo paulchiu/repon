@@ -839,12 +839,14 @@ mod tests {
     /// The device `fd` refers to, or `None` if it is closed. A descriptor *number* says
     /// nothing on its own once freed, since a concurrent test can be handed the same one
     /// immediately; the device tells a reused number apart from the original.
-    fn fd_device(fd: std::os::fd::RawFd) -> Option<u64> {
+    fn fd_device(fd: std::os::fd::RawFd) -> Option<libc::dev_t> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `fstat` writes one `libc::stat` through the pointer and reads nothing else.
         let ok = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0;
+        // Returned as `dev_t` rather than widened: the type is signed on Darwin and
+        // unsigned on Linux, and a cast that suits one is a lint error on the other.
         // SAFETY: `fstat` returning 0 means it initialised the whole struct.
-        ok.then(|| unsafe { stat.assume_init() }.st_rdev as u64)
+        ok.then(|| unsafe { stat.assume_init() }.st_rdev)
     }
 
     /// `keepalive` (`run_step`'s spare slave-side descriptor, held for the whole of
