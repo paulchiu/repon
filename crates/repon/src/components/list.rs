@@ -5,12 +5,20 @@
 //! branch 24, sync 9, base 6, dirty 6, state 10, left-packed behind a one-character gutter,
 //! single-space gaps, ninety columns before the filler column that absorbs the slack.
 
+use std::time::{Duration, Instant};
+
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
-use repon_core::{Cell, EntityState, Head, Settled, Snapshot, SyncState, WorktreeState, summary};
+use repon_core::{
+    Cell, EntityState, Head, RowSummary, Settled, Snapshot, SyncState, WorktreeState, summary,
+};
 
 use super::Component;
-use crate::{config::Config, glyphs::GlyphSet, theme};
+use crate::{
+    config::Config,
+    glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
+    theme,
+};
 
 const GUTTER_WIDTH: u16 = 1;
 const NAME_WIDTH: u16 = 28;
@@ -37,9 +45,22 @@ const FIRST_ENTITY_ROW: u16 = HEADER_ROW + 1;
 
 /// The repos panel. Holds no row data of its own: every draw reads the [`Snapshot`] the
 /// caller hands it, cloned once from the Core for that render tick.
-#[derive(Default)]
 pub struct List {
     glyphs: Option<&'static GlyphSet>,
+    /// When this component's own loading animation began, so [`spinner_frame`] can turn
+    /// elapsed real time into a frame index instead of freezing on the first one forever,
+    /// the predecessor's recorded defect
+    /// (`docs/spec/refresh.md`'s "What the gutter and the cells show").
+    started_at: Instant,
+}
+
+impl Default for List {
+    fn default() -> Self {
+        List {
+            glyphs: None,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 impl List {
@@ -52,6 +73,15 @@ impl List {
 
     fn render(&self, frame: &mut Frame, area: Rect, snapshot: &Snapshot, compact: bool) {
         let glyphs = self.glyphs();
+        // One clock read per draw, shared by every row this tick: still "one moving
+        // character per row" (`docs/spec/refresh.md`), since each row's own gutter and cells
+        // are computed independently below and merely share the same tick's frame index,
+        // the same way every row in a real terminal shares one wall clock.
+        let loading_frame = spinner_frame(
+            glyphs.loading,
+            FULL_SPINNER_INTERVAL,
+            self.started_at.elapsed(),
+        );
         let border = glyphs.border;
         let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
             [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
@@ -91,9 +121,9 @@ impl List {
                 break;
             }
             if compact {
-                draw_row_compact(buf, interior, y, entity, glyphs);
+                draw_row_compact(buf, interior, y, entity, glyphs, loading_frame);
             } else {
-                draw_row(buf, interior, y, entity, glyphs);
+                draw_row(buf, interior, y, entity, glyphs, loading_frame);
             }
         }
     }
@@ -215,8 +245,18 @@ fn draw_row(
     y: u16,
     entity: &EntityState,
     glyphs: &'static GlyphSet,
+    loading_frame: char,
 ) {
-    let gutter = gutter_glyph(entity, glyphs).to_string();
+    let row_summary = summary(entity);
+    let gutter = gutter_glyph_for(row_summary, glyphs, loading_frame).to_string();
+    // While the row holds no value at all, its one spinner already lives in the gutter
+    // above; showing the same mark again in every cell would be a second, per-cell
+    // spinner on top of it, which is exactly the "never one global spinner... one moving
+    // character per row" rule this would otherwise double
+    // (`docs/spec/refresh.md`'s "What the gutter and the cells show"). Once the row holds
+    // some value elsewhere, an outstanding cell (one nothing has settled yet) shows this
+    // same frame in its own place instead of sitting blank.
+    let cell_loading_glyph = (row_summary != RowSummary::InFlight).then_some(loading_frame);
     let style = Style::new();
     write_cell(
         buf,
@@ -242,7 +282,7 @@ fn draw_row(
         interior.x + BRANCH_X,
         y,
         BRANCH_WIDTH,
-        &format_head(&entity.branch),
+        &format_head(&entity.branch, cell_loading_glyph),
         style,
     );
     write_cell(
@@ -251,7 +291,7 @@ fn draw_row(
         interior.x + SYNC_X,
         y,
         SYNC_WIDTH,
-        &format_sync(&entity.sync, glyphs),
+        &format_sync(&entity.sync, glyphs, cell_loading_glyph),
         style,
     );
     write_cell(
@@ -260,7 +300,7 @@ fn draw_row(
         interior.x + BASE_X,
         y,
         BASE_WIDTH,
-        &format_base(&entity.base, glyphs),
+        &format_base(&entity.base, glyphs, cell_loading_glyph),
         style,
     );
     write_cell(
@@ -269,7 +309,7 @@ fn draw_row(
         interior.x + DIRTY_X,
         y,
         DIRTY_WIDTH,
-        &format_dirty(&entity.dirty, glyphs),
+        &format_dirty(&entity.dirty, glyphs, cell_loading_glyph),
         style,
     );
     write_cell(
@@ -278,7 +318,7 @@ fn draw_row(
         interior.x + STATE_X,
         y,
         STATE_WIDTH,
-        &format_state(&entity.state),
+        &format_state(&entity.state, cell_loading_glyph),
         style,
     );
 }
@@ -292,8 +332,9 @@ fn draw_row_compact(
     y: u16,
     entity: &EntityState,
     glyphs: &'static GlyphSet,
+    loading_frame: char,
 ) {
-    let gutter = gutter_glyph(entity, glyphs).to_string();
+    let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
     let style = Style::new();
     write_cell(
         buf,
@@ -315,48 +356,76 @@ fn draw_row_compact(
     );
 }
 
-/// Maps one row's [`RowSummary`](repon_core::RowSummary) fold to the active table's gutter
+/// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
+/// instead of freezing on its first frame forever, the predecessor's recorded defect: "a
+/// measured 4.02 second refresh sampled 55 times with not one spinner frame on any row"
+/// (`docs/spec/refresh.md`'s "What the gutter and the cells show"). Wraps rather than
+/// stopping at the last frame, since a probe with no fixed end must keep moving until it
+/// settles or the Generation deadline turns it Unknown.
+fn spinner_frame(loading: &'static [char], interval: Duration, elapsed: Duration) -> char {
+    let millis_per_frame = interval.as_millis().max(1);
+    let step = (elapsed.as_millis() / millis_per_frame) as usize;
+    loading[step % loading.len()]
+}
+
+/// Maps one row's [`RowSummary`] fold to the active table's gutter
 /// glyph, the consumer-side job
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) reserves for
-/// here rather than the core. In-flight always shows the loading table's first frame;
-/// animating the spinner is [refresh.md]'s progressive-fill concern, not this one's.
-fn gutter_glyph_for(row_summary: repon_core::RowSummary, glyphs: &'static GlyphSet) -> char {
-    use repon_core::RowSummary;
+/// here rather than the core. `loading_frame` is whichever frame [`spinner_frame`] selected
+/// for this tick; in-flight shows it verbatim rather than always the table's first frame, so
+/// the gutter's own loading mark moves too.
+fn gutter_glyph_for(
+    row_summary: RowSummary,
+    glyphs: &'static GlyphSet,
+    loading_frame: char,
+) -> char {
     match row_summary {
         RowSummary::Fresh => glyphs.fresh,
         RowSummary::Stale => glyphs.stale,
         RowSummary::Unknown => glyphs.unknown,
         RowSummary::Failed => glyphs.failed,
-        RowSummary::InFlight => glyphs.loading[0],
+        RowSummary::InFlight => loading_frame,
     }
 }
 
 /// The row's gutter mark: its [`summary`] fold, mapped through [`gutter_glyph_for`].
-fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet) -> char {
-    gutter_glyph_for(summary(entity), glyphs)
+fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet, loading_frame: char) -> char {
+    gutter_glyph_for(summary(entity), glyphs, loading_frame)
 }
 
 /// The one function every column widget renders a cell's text through: a Known value renders
-/// through `format`, every other shape renders the blank cell
+/// through `format`, every other settled shape renders the blank cell
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The mapping
-/// is exactly" table commits to. Exhaustive over `Option<&Settled<T>>` with no wildcard arm,
+/// is exactly" table commits to. A Cell nothing has settled yet (`None`) renders
+/// `loading_glyph` when the caller supplies one, which `draw_row` withholds exactly while the
+/// whole row holds no value at all, so the row's one spinner stays in the gutter rather than
+/// also appearing here (criterion 3: "loading rather than unknown, keyed specifically to
+/// there being no prior state"). Exhaustive over `Option<&Settled<T>>` with no wildcard arm,
 /// so a state added to `Settled` later fails to compile here instead of silently falling
 /// through into a raw value or a raw default.
-fn render_cell<T>(settled: Option<&Settled<T>>, format: impl FnOnce(&T) -> String) -> String {
+fn render_cell<T>(
+    settled: Option<&Settled<T>>,
+    format: impl FnOnce(&T) -> String,
+    loading_glyph: Option<char>,
+) -> String {
     match settled {
         Some(Settled::Known { value, .. }) => format(value),
         Some(Settled::Unknown(_)) => String::new(),
         Some(Settled::Failed(_)) => String::new(),
         Some(Settled::NotApplicable) => String::new(),
-        None => String::new(),
+        None => loading_glyph.map(String::from).unwrap_or_default(),
     }
 }
 
-fn format_head(cell: &Cell<Head>) -> String {
-    render_cell(cell.settled(), |value| match value {
-        Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
-        Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
-    })
+fn format_head(cell: &Cell<Head>, loading_glyph: Option<char>) -> String {
+    render_cell(
+        cell.settled(),
+        |value| match value {
+            Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
+            Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
+        },
+        loading_glyph,
+    )
 }
 
 /// `sync`'s glyph: `∅` no remote at all, `-` no branch or no upstream, `≡` level, `↑n`/`↓n`
@@ -384,31 +453,51 @@ fn sync_glyph(value: &SyncState, glyphs: &'static GlyphSet) -> String {
     }
 }
 
-fn format_sync(cell: &Cell<SyncState>, glyphs: &'static GlyphSet) -> String {
-    render_cell(cell.settled(), |value| sync_glyph(value, glyphs))
+fn format_sync(
+    cell: &Cell<SyncState>,
+    glyphs: &'static GlyphSet,
+    loading_glyph: Option<char>,
+) -> String {
+    render_cell(
+        cell.settled(),
+        |value| sync_glyph(value, glyphs),
+        loading_glyph,
+    )
 }
 
 /// `base`'s glyph: `≡` level, `↓n` behind. No ahead-of-default glyph exists, per
 /// [default-branch.md](../../../../docs/spec/default-branch.md).
-fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    render_cell(cell.settled(), |value| {
-        if *value == 0 {
-            glyphs.in_sync.to_string()
-        } else {
-            format!("{}{}", glyphs.behind, value)
-        }
-    })
+fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet, loading_glyph: Option<char>) -> String {
+    render_cell(
+        cell.settled(),
+        |value| {
+            if *value == 0 {
+                glyphs.in_sync.to_string()
+            } else {
+                format!("{}{}", glyphs.behind, value)
+            }
+        },
+        loading_glyph,
+    )
 }
 
 /// `dirty`'s glyph: `·` clean, `●n` changed.
-fn format_dirty(cell: &Cell<u32>, glyphs: &'static GlyphSet) -> String {
-    render_cell(cell.settled(), |value| {
-        if *value == 0 {
-            glyphs.clean.to_string()
-        } else {
-            format!("{}{}", glyphs.changed, value)
-        }
-    })
+fn format_dirty(
+    cell: &Cell<u32>,
+    glyphs: &'static GlyphSet,
+    loading_glyph: Option<char>,
+) -> String {
+    render_cell(
+        cell.settled(),
+        |value| {
+            if *value == 0 {
+                glyphs.clean.to_string()
+            } else {
+                format!("{}{}", glyphs.changed, value)
+            }
+        },
+        loading_glyph,
+    )
 }
 
 /// The word for one of the four Worktree states, shared with the detail pane's own
@@ -423,10 +512,12 @@ pub(crate) fn worktree_state_word(value: &WorktreeState) -> &'static str {
     }
 }
 
-fn format_state(cell: &Cell<WorktreeState>) -> String {
-    render_cell(cell.settled(), |value| {
-        worktree_state_word(value).to_string()
-    })
+fn format_state(cell: &Cell<WorktreeState>, loading_glyph: Option<char>) -> String {
+    render_cell(
+        cell.settled(),
+        |value| worktree_state_word(value).to_string(),
+        loading_glyph,
+    )
 }
 
 #[cfg(test)]
@@ -460,12 +551,19 @@ mod tests {
         }
     }
 
-    /// Renders an empty-config `List` (the `full` glyph table) against a fresh
-    /// `TestBackend`, and hands back the terminal so a test can read its buffer.
-    fn render(width: u16, height: u16, snapshot: &Snapshot) -> Terminal<TestBackend> {
+    /// Draws `list` (already built, so a caller can set its `started_at` first) against a
+    /// fresh `TestBackend`, and hands back the terminal so a test can read its buffer. The
+    /// shared engine behind [`render`] and [`render_sidebar`] below, and behind any test that
+    /// needs to control the loading animation's own clock rather than accept whatever
+    /// `List::default` picked at construction.
+    fn render_with_list(
+        list: &mut List,
+        width: u16,
+        height: u16,
+        snapshot: &Snapshot,
+    ) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut list = List::default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -473,6 +571,12 @@ mod tests {
             })
             .expect("draw the frame");
         terminal
+    }
+
+    /// Renders an empty-config `List` (the `full` glyph table) against a fresh
+    /// `TestBackend`, and hands back the terminal so a test can read its buffer.
+    fn render(width: u16, height: u16, snapshot: &Snapshot) -> Terminal<TestBackend> {
+        render_with_list(&mut List::default(), width, height, snapshot)
     }
 
     /// Renders `List::draw_sidebar` against a fresh `TestBackend`, the compact counterpart to
@@ -562,6 +666,47 @@ mod tests {
         core.settle(Duration::from_secs(5))
     }
 
+    /// A real, settled `Snapshot` off a real disposable repo whose `default_branch` also
+    /// settles `Known`, via a rung-1 `RepoOverride` rather than a remote (this repo has
+    /// none). `branch`, `default_branch` and `state` are the only cells this codebase's
+    /// `Core::refresh` dispatches a probe for today; `sync`, `base` and `dirty` have no
+    /// probe wired to them at all, so they stay `None` forever, which is exactly the
+    /// "outstanding cell beside settled ones" shape these tests exercise: a row that holds
+    /// some values while others are still to come.
+    fn settled_snapshot_with_a_resolvable_default_branch(branch: &str) -> repon_core::Snapshot {
+        use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_on_branch(&root, branch);
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.clone()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: vec![RepoOverride {
+                path: root,
+                default_branch: Some(branch.to_string()),
+                excluded: false,
+            }],
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_secs(5))
+    }
+
     /// The defining behaviour of criterion 1: the sidebar shows only the gutter and the name,
     /// never the columns the full list draws. A mutation that kept `branch` in the compact row
     /// would make this fail, since a real branch value is exactly what the full list would
@@ -589,6 +734,230 @@ mod tests {
             cell_text(compact.backend().buffer(), 32, 1, 1),
             " ",
             "the sidebar must never draw the branch column, even for a row that has one"
+        );
+    }
+
+    // --- Criteria 1 and 2: the cheap columns land while the outstanding ones spin ---
+
+    /// Criterion 1 and criterion 2's "partial" case together, on a real probed row: the name
+    /// and branch (the cheap columns) already show through, `sync` shows its settled value,
+    /// and `base` and `dirty` (the columns no probe has reached, in this codebase's current
+    /// scope) show the loading mark rather than sitting blank or reading a raw zero. The
+    /// gutter shows the row's
+    /// least-settled *settled* state (Fresh, a blank space) rather than `?`: the sanity check
+    /// above rules out a version of this test that would pass merely because `default_branch`
+    /// happened to read Unknown for an unrelated reason (no remote to resolve rung 2/3
+    /// against).
+    #[test]
+    fn an_outstanding_status_cell_shows_the_loading_mark_once_the_row_holds_other_values() {
+        let snapshot = settled_snapshot_with_a_resolvable_default_branch("main");
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+        assert_eq!(
+            repon_core::summary(&snapshot.entities[0]),
+            RowSummary::Fresh,
+            "sanity check: branch and default_branch must both have settled Known already"
+        );
+        let name = snapshot.entities[0].name.to_string();
+
+        let terminal = render(140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let frame = glyphs.loading[0].to_string();
+
+        assert_eq!(
+            cell_text(buf, 1, 2, 1),
+            " ",
+            "the gutter must show the row's least-settled settled state, not the outstanding \
+             cells' own loading mark"
+        );
+        assert_eq!(cell_text(buf, 3, 2, name.len() as u16), name);
+        assert_eq!(cell_text(buf, 32, 2, 4), "main");
+        assert_eq!(
+            cell_text(buf, 57, 2, 1),
+            glyphs.no_remote.to_string(),
+            "sync is probed, and this fixture has no remote, so it must show its settled \
+             value rather than a loading mark"
+        );
+        assert_eq!(
+            cell_text(buf, 67, 2, 1),
+            frame,
+            "base must show the loading mark for the same reason"
+        );
+        assert_eq!(
+            cell_text(buf, 74, 2, 1),
+            frame,
+            "dirty must show the loading mark for the same reason"
+        );
+        assert_ne!(
+            cell_text(buf, 74, 2, 1),
+            "0",
+            "an outstanding numeric-bearing cell must never read a raw zero"
+        );
+    }
+
+    /// Criterion 2's other half, the case a test covering only the partial row above cannot
+    /// prove: while the row holds no value at all, none of its cells shows the loading mark
+    /// individually. The one spinner for such a row lives in the gutter alone
+    /// (`docs/spec/refresh.md`'s "one moving character per row"); a version of `draw_row` that
+    /// handed every cell the loading glyph regardless of the row's own state would draw a
+    /// second, redundant spinner in every column here.
+    #[test]
+    fn a_row_that_holds_no_value_at_all_shows_its_one_spinner_in_the_gutter_and_every_cell_blank() {
+        let terminal = render(140, 24, &snapshot(vec![entity("never-probed")]));
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(cell_text(buf, 1, 2, 1), glyphs.loading[0].to_string());
+        for x in [32, 57, 67, 74, 81] {
+            assert_eq!(
+                cell_text(buf, x, 2, 1),
+                " ",
+                "column at x={x} must stay blank while the row holds no value at all"
+            );
+        }
+    }
+
+    /// The transition itself, criterion 2's substance: one render, two rows, each computed
+    /// independently. The first holds no value at all (gutter spinner, blank cells); the
+    /// second already holds values with one column still outstanding (blank gutter, that
+    /// column's own spinner). Proving both shapes in the same frame is what rules out a
+    /// single, row-independent "the table is busy" flag: each row's gutter and cells answer
+    /// from that row's own summary, not from whether *some* row somewhere is still loading.
+    #[test]
+    fn two_rows_in_one_render_show_the_spinner_in_different_places_never_a_single_shared_one() {
+        let never_probed = entity("never-probed");
+        let settled = settled_snapshot_with_a_resolvable_default_branch("main")
+            .entities
+            .into_iter()
+            .next()
+            .expect("expected one discovered repo");
+        assert_eq!(repon_core::summary(&settled), RowSummary::Fresh);
+
+        let terminal = render(140, 24, &snapshot(vec![never_probed, settled]));
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let frame = glyphs.loading[0].to_string();
+
+        // Row 1 (y=2): holds nothing, so the gutter alone spins and every cell is blank.
+        assert_eq!(cell_text(buf, 1, 2, 1), frame);
+        assert_eq!(cell_text(buf, 67, 2, 1), " ");
+
+        // Row 2 (y=3): holds values, so the gutter is blank (Fresh) and the outstanding
+        // `base` column spins instead.
+        assert_eq!(cell_text(buf, 1, 3, 1), " ");
+        assert_eq!(cell_text(buf, 67, 3, 1), frame);
+    }
+
+    // --- Criteria 4 and 5: the mark moves, including on an already-populated row ---
+
+    /// Criterion 4's mandatory-movement claim, proven as a pure function over synthetic
+    /// `Duration`s rather than any real elapsed time: no sleeping, so this cannot flake on a
+    /// loaded runner. Covers both a step forward and the wraparound a probe with no fixed end
+    /// needs, and would fail a spinner that returned the same frame regardless of `elapsed`.
+    #[test]
+    fn spinner_frame_advances_a_step_every_interval_and_wraps_around() {
+        let loading = &['a', 'b', 'c'];
+        let interval = Duration::from_millis(80);
+
+        assert_eq!(
+            spinner_frame(loading, interval, Duration::from_millis(0)),
+            'a'
+        );
+        assert_eq!(
+            spinner_frame(loading, interval, Duration::from_millis(79)),
+            'a'
+        );
+        assert_eq!(
+            spinner_frame(loading, interval, Duration::from_millis(80)),
+            'b'
+        );
+        assert_eq!(
+            spinner_frame(loading, interval, Duration::from_millis(160)),
+            'c'
+        );
+        assert_eq!(
+            spinner_frame(loading, interval, Duration::from_millis(240)),
+            'a',
+            "must wrap around rather than stopping at the last frame"
+        );
+    }
+
+    /// Criterion 4/5's integration proof: the pure function above is correctly wired into the
+    /// actual render path, so a `List` whose clock has moved forward draws a different gutter
+    /// frame, with no sleeping involved. `started_at` is set directly (this module is a
+    /// descendant of `list`'s own, so its private field is reachable) to a known offset in the
+    /// past, which is arithmetic on an `Instant`, not a wait: this cannot flake regardless of
+    /// runner load. A spinner that always returned `loading[0]` would pass every unit test on
+    /// `spinner_frame` above yet fail this one, which is the "a spinner that returns the same
+    /// frame every time would pass a naive test" trap the ticket names.
+    #[test]
+    fn the_gutters_loading_frame_advances_as_the_components_own_clock_moves_forward() {
+        let snap = snapshot(vec![entity("never-probed")]);
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        let mut at_zero = List {
+            started_at: Instant::now(),
+            ..List::default()
+        };
+        let terminal_zero = render_with_list(&mut at_zero, 140, 24, &snap);
+        let frame_zero = cell_text(terminal_zero.backend().buffer(), 1, 2, 1);
+
+        // Two full steps of the ten-frame `full` spinner later.
+        let mut two_steps_later = List {
+            started_at: Instant::now() - FULL_SPINNER_INTERVAL * 2,
+            ..List::default()
+        };
+        let terminal_later = render_with_list(&mut two_steps_later, 140, 24, &snap);
+        let frame_later = cell_text(terminal_later.backend().buffer(), 1, 2, 1);
+
+        assert_eq!(frame_zero, glyphs.loading[0].to_string());
+        assert_eq!(frame_later, glyphs.loading[2].to_string());
+        assert_ne!(
+            frame_zero, frame_later,
+            "the gutter's loading mark must move rather than freezing on its first frame"
+        );
+    }
+
+    /// Criterion 5, the criterion the whole ticket exists for, and its own stated trap: a
+    /// worthless version would start from an empty table, where anything looks like progress.
+    /// This starts from a row that already shows its name, its branch and its default branch
+    /// (everything this codebase's `Core::refresh` probes today, "a fully-populated table" in
+    /// its current scope) rather than a freshly discovered one, and proves the still-outstanding
+    /// `base` column animates across two ticks of the *same* row, the shape the predecessor's
+    /// recorded defect describes: "a measured 4.02 second refresh sampled 55 times with not
+    /// one spinner frame on any row". No sleeping: `started_at` moves by arithmetic, not by
+    /// waiting, so this cannot flake on a loaded runner.
+    #[test]
+    fn a_row_that_already_shows_its_cheap_columns_still_animates_its_outstanding_cell_on_refresh() {
+        let snap = settled_snapshot_with_a_resolvable_default_branch("main");
+        assert_eq!(
+            repon_core::summary(&snap.entities[0]),
+            RowSummary::Fresh,
+            "sanity check: this row must already be fully populated in this codebase's \
+             current scope before the real claim below means anything"
+        );
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        let mut at_zero = List {
+            started_at: Instant::now(),
+            ..List::default()
+        };
+        let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
+        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
+
+        let mut later = List {
+            started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
+            ..List::default()
+        };
+        let second_tick = render_with_list(&mut later, 140, 24, &snap);
+        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
+
+        assert_eq!(base_first, glyphs.loading[0].to_string());
+        assert_eq!(base_second, glyphs.loading[5].to_string());
+        assert_ne!(
+            base_first, base_second,
+            "an already-populated row's outstanding cell must show moving spinner frames on \
+             refresh, never a static screen"
         );
     }
 
@@ -651,9 +1020,13 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![entity("acquiring-gateway")]));
         let buf = terminal.backend().buffer();
 
-        // Never probed (`EntityState::new` leaves every Cell unset), so every Cell folds
-        // to Unknown and the gutter shows `?`.
-        assert_eq!(cell_text(buf, 1, 2, 1), "?");
+        // Never probed (`EntityState::new` leaves every Cell unset) and no probe
+        // dispatched either, so the row holds no value at all: criterion 3's "no prior
+        // state", which reads Loading rather than Unknown. `render`'s `List` is freshly
+        // constructed immediately before this draw, so its loading clock has barely moved
+        // and shows the table's own first frame.
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(cell_text(buf, 1, 2, 1), glyphs.loading[0].to_string());
         assert_eq!(cell_text(buf, 3, 2, 17), "acquiring-gateway");
     }
 
@@ -763,7 +1136,11 @@ mod tests {
             stale: false,
         };
 
-        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "5");
+        assert_eq!(
+            render_cell(Some(&settled), |value| value.to_string(), Some('⠋')),
+            "5",
+            "a Known value must render even when the caller supplies a loading glyph"
+        );
     }
 
     #[test]
@@ -776,38 +1153,67 @@ mod tests {
             stale: true,
         };
 
-        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "5");
+        assert_eq!(
+            render_cell(Some(&settled), |value| value.to_string(), None),
+            "5"
+        );
     }
 
     #[test]
-    fn render_cell_renders_unknown_as_blank() {
+    fn render_cell_renders_unknown_as_blank_even_with_a_loading_glyph_supplied() {
         let settled: Settled<u32> = Settled::Unknown(Unknown::TimedOut);
 
-        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+        assert_eq!(
+            render_cell(Some(&settled), |value| value.to_string(), Some('⠋')),
+            "",
+            "Unknown is a settled fact, distinct from Loading, and must never show the \
+             loading mark"
+        );
     }
 
     #[test]
-    fn render_cell_renders_failed_as_blank() {
+    fn render_cell_renders_failed_as_blank_even_with_a_loading_glyph_supplied() {
         let settled: Settled<u32> = Settled::Failed(ProbeError::Read(Arc::from("boom")));
 
-        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+        assert_eq!(
+            render_cell(Some(&settled), |value| value.to_string(), Some('⠋')),
+            ""
+        );
     }
 
     #[test]
-    fn render_cell_renders_not_applicable_as_blank() {
+    fn render_cell_renders_not_applicable_as_blank_even_with_a_loading_glyph_supplied() {
         let settled: Settled<u32> = Settled::NotApplicable;
 
-        assert_eq!(render_cell(Some(&settled), |value| value.to_string()), "");
+        assert_eq!(
+            render_cell(Some(&settled), |value| value.to_string(), Some('⠋')),
+            ""
+        );
     }
 
     #[test]
-    fn render_cell_renders_nothing_settled_as_blank() {
+    fn render_cell_renders_nothing_settled_as_blank_when_no_loading_glyph_is_supplied() {
         // Covers both a cell nothing has probed yet and one currently in flight: neither
         // carries a value, and `render_cell` never looks at `is_in_flight` to decide the
-        // text, only `gutter_glyph_for` does, on the row's summary.
+        // text, only `draw_row`'s choice of `loading_glyph` does, from the row's summary.
         let settled: Option<&Settled<u32>> = None;
 
-        assert_eq!(render_cell(settled, |value| value.to_string()), "");
+        assert_eq!(render_cell(settled, |value| value.to_string(), None), "");
+    }
+
+    /// Criterion 3, at the one function every column funnels through: an empty Cell
+    /// (`None`, "no prior state") shows the caller-supplied loading mark rather than
+    /// sitting blank, the opposite of every other blank-rendering shape above, which stays
+    /// blank even when a loading glyph is offered. This is the difference a version that
+    /// merely blanked `None` the same as `Unknown` would fail to draw at all.
+    #[test]
+    fn render_cell_renders_nothing_settled_as_the_loading_glyph_when_one_is_supplied() {
+        let settled: Option<&Settled<u32>> = None;
+
+        assert_eq!(
+            render_cell(settled, |value| value.to_string(), Some('⠋')),
+            "⠋"
+        );
     }
 
     #[test]
@@ -817,17 +1223,30 @@ mod tests {
         let unset_sync: Cell<SyncState> = Cell::default();
 
         for text in [
-            format_base(&unset, glyphs),
-            format_dirty(&unset, glyphs),
-            format_sync(&unset_sync, glyphs),
+            format_base(&unset, glyphs, None),
+            format_dirty(&unset, glyphs, None),
+            format_sync(&unset_sync, glyphs, None),
         ] {
             assert_eq!(
                 text, "",
-                "an uncomputed numeric-bearing cell must render blank"
+                "an uncomputed numeric-bearing cell must render blank when withheld a \
+                 loading glyph"
             );
             assert_ne!(
                 text, "0",
                 "an uncomputed numeric-bearing cell must never render a raw zero default"
+            );
+        }
+
+        for text in [
+            format_base(&unset, glyphs, Some('⠋')),
+            format_dirty(&unset, glyphs, Some('⠋')),
+            format_sync(&unset_sync, glyphs, Some('⠋')),
+        ] {
+            assert_eq!(
+                text, "⠋",
+                "an uncomputed numeric-bearing cell offered a loading glyph must show it \
+                 rather than a raw zero"
             );
         }
     }
@@ -918,18 +1337,30 @@ mod tests {
     #[test]
     fn gutter_glyph_for_maps_every_row_summary_to_its_own_glyph() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        // An arbitrary non-first frame, so InFlight returning it back verbatim proves the
+        // frame is threaded through rather than hardcoded to `loading[0]`.
+        let frame = glyphs.loading[3];
 
-        assert_eq!(gutter_glyph_for(RowSummary::Fresh, glyphs), glyphs.fresh);
-        assert_eq!(gutter_glyph_for(RowSummary::Stale, glyphs), glyphs.stale);
         assert_eq!(
-            gutter_glyph_for(RowSummary::Unknown, glyphs),
+            gutter_glyph_for(RowSummary::Fresh, glyphs, frame),
+            glyphs.fresh
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Stale, glyphs, frame),
+            glyphs.stale
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Unknown, glyphs, frame),
             glyphs.unknown
         );
-        assert_eq!(gutter_glyph_for(RowSummary::Failed, glyphs), glyphs.failed);
         assert_eq!(
-            gutter_glyph_for(RowSummary::InFlight, glyphs),
-            glyphs.loading[0],
-            "nothing settled while in flight shows the loading mark in the gutter"
+            gutter_glyph_for(RowSummary::Failed, glyphs, frame),
+            glyphs.failed
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::InFlight, glyphs, frame),
+            frame,
+            "in flight shows whichever frame the caller selected, not a fixed one"
         );
     }
 
@@ -940,17 +1371,27 @@ mod tests {
         // correctly threaded glyph set apart from four hardcoded literals; the
         // spinner assertion below is what a hardcode would actually fail.
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+        let frame = glyphs.loading[1];
 
-        assert_eq!(gutter_glyph_for(RowSummary::Fresh, glyphs), glyphs.fresh);
-        assert_eq!(gutter_glyph_for(RowSummary::Stale, glyphs), glyphs.stale);
         assert_eq!(
-            gutter_glyph_for(RowSummary::Unknown, glyphs),
+            gutter_glyph_for(RowSummary::Fresh, glyphs, frame),
+            glyphs.fresh
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Stale, glyphs, frame),
+            glyphs.stale
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::Unknown, glyphs, frame),
             glyphs.unknown
         );
-        assert_eq!(gutter_glyph_for(RowSummary::Failed, glyphs), glyphs.failed);
         assert_eq!(
-            gutter_glyph_for(RowSummary::InFlight, glyphs),
-            glyphs.loading[0],
+            gutter_glyph_for(RowSummary::Failed, glyphs, frame),
+            glyphs.failed
+        );
+        assert_eq!(
+            gutter_glyph_for(RowSummary::InFlight, glyphs, frame),
+            frame,
             "the ascii set's own three-frame spinner, distinct from the full set's ten-frame \
              one"
         );
