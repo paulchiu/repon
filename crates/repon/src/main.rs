@@ -15,6 +15,7 @@ mod config;
 mod degrade;
 mod editor;
 mod errors;
+mod filter_line;
 mod footer;
 mod glyphs;
 mod header;

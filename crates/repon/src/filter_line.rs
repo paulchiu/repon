@@ -1,0 +1,118 @@
+//! The Filter line: `/` opens it ([keybindings.md](../../../docs/spec/keybindings.md)'s
+//! `Action::EnterFilter`), prefilled with the committed Filter, applying live on every
+//! keystroke ([filter.md](../../../docs/spec/filter.md)). `crate::app::App` is what decides
+//! when the live text becomes the committed [`repon_core::Filter`]; this module only owns the
+//! edit buffer and how it draws.
+//!
+//! Deferred rather than built here, and recorded so nobody mistakes the gap for an oversight:
+//! the colon-triggered completion list, `Tab`'s accept, the `?` unrecognised-term advisory
+//! slot, and the footer's placement one row above this one at every width the ladder
+//! documents. `PreviousEntry` and `NextEntry` (`Ctrl+K`/`Ctrl+J`, `Up`/`Down`) are no-ops here
+//! for the same reason: they move a completion highlight this module does not have yet.
+
+use ratatui::{Frame, buffer::Buffer, layout::Rect};
+use repon_core::Filter;
+
+use crate::theme::{Role, Theme};
+
+/// The Filter line's own edit buffer: append-only text, the same shape
+/// [`crate::action_palette::ActionPalette`]'s own query takes, since
+/// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context has no plain
+/// backspace, only `Ctrl+W` (delete the previous word) and `Ctrl+U` (clear the line).
+pub(crate) struct FilterLine {
+    input: String,
+}
+
+impl FilterLine {
+    /// Opens prefilled with `committed`'s own text and the cursor at the end
+    /// ([filter.md](../../../docs/spec/filter.md): "prefilled with the committed Filter",
+    /// "refining is the common case").
+    pub(crate) fn new(committed: &Filter) -> Self {
+        FilterLine {
+            input: committed.as_str().to_string(),
+        }
+    }
+
+    pub(crate) fn type_char(&mut self, c: char) {
+        self.input.push(c);
+    }
+
+    /// `Ctrl+W`: deletes one trailing whitespace-delimited word.
+    pub(crate) fn delete_previous_word(&mut self) {
+        let trimmed = self.input.trim_end();
+        let cut = trimmed
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.input.truncate(cut);
+    }
+
+    /// `Ctrl+U`: clears the line, the fastest way back to an unfiltered list while editing.
+    pub(crate) fn clear_line(&mut self) {
+        self.input.clear();
+    }
+
+    /// The live text, re-parsed on every read: cheap enough for a per-keystroke Filter and
+    /// what keeps this module holding no parsed state of its own to fall out of sync with
+    /// `self.input`.
+    pub(crate) fn live_filter(&self) -> Filter {
+        Filter::parse(&self.input)
+    }
+
+    /// Draws the line at `area`'s own row: a leading `/` marking the surface, then the typed
+    /// text, both in [`Role::Text`]. `area` is expected to be exactly one row tall
+    /// ([filter.md](../../../docs/spec/filter.md): "one real row directly above the footer").
+    pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let buf: &mut Buffer = frame.buffer_mut();
+        let line = format!("/ {}", self.input);
+        buf.set_stringn(
+            area.x,
+            area.y,
+            &line,
+            area.width as usize,
+            theme.style_for(Role::Text),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn committed(text: &str) -> Filter {
+        Filter::parse(text)
+    }
+
+    #[test]
+    fn opens_prefilled_with_the_committed_filters_own_text() {
+        let line = FilterLine::new(&committed("kind:worktree"));
+        assert_eq!(line.live_filter().as_str(), "kind:worktree");
+    }
+
+    #[test]
+    fn typing_appends_and_narrows_live() {
+        let mut line = FilterLine::new(&committed(""));
+        for c in "kind:worktree".chars() {
+            line.type_char(c);
+        }
+        assert_eq!(line.live_filter().as_str(), "kind:worktree");
+    }
+
+    #[test]
+    fn delete_previous_word_removes_one_trailing_whitespace_delimited_word() {
+        let mut line = FilterLine::new(&committed(""));
+        for c in "kind:worktree is:dirty".chars() {
+            line.type_char(c);
+        }
+        line.delete_previous_word();
+        assert_eq!(line.live_filter().as_str(), "kind:worktree ");
+    }
+
+    #[test]
+    fn clear_line_empties_the_buffer() {
+        let mut line = FilterLine::new(&committed("kind:worktree"));
+        line.clear_line();
+        assert_eq!(line.live_filter().as_str(), "");
+        assert!(!line.live_filter().is_active());
+    }
+}
