@@ -429,6 +429,17 @@ impl App {
         self.core.action_running()
     }
 
+    /// The detail pane's own outer area width at the current frame size, mirroring exactly
+    /// what the draw path's own `Layout::horizontal` split beside the sidebar hands
+    /// [`Detail::draw`], so the scroll clamp below and the real render can never disagree
+    /// about how much content fits.
+    fn detail_pane_width(&self) -> u16 {
+        match layout_state(self.frame_size.width, true) {
+            Layout3::SideBySide => self.frame_size.width.saturating_sub(SIDEBAR_WIDTH),
+            Layout3::DetailOnly | Layout3::ListOnly => self.frame_size.width,
+        }
+    }
+
     pub fn run(&mut self) -> Result<()> {
         let mut tui = Tui::new()?
             .tick_rate(self.tick_rate)
@@ -659,9 +670,10 @@ impl App {
                 | Action::HalfPageDown
                 | Action::HalfPageUp),
             ) if self.focus == Context::Detail => {
+                let detail_pane_width = self.detail_pane_width();
                 let content_len = self
                     .pane_entity()
-                    .map(|entity| Detail::content_len(&entity))
+                    .map(|entity| Detail::content_len(&entity, detail_pane_width, self.glyphs))
                     .unwrap_or(0);
                 self.detail
                     .apply(action, content_len, self.frame_size.height);

@@ -16,6 +16,17 @@ categories.workspace = true
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [dependencies]
+# Parses a captured Action step's raw ANSI SGR bytes into ratatui spans at render time
+# (`docs/spec/actions.md`'s "The run on screen"): ratatui-core itself drops every control
+# character rather than interpreting it, so an escape sequence fed straight into a `Span`
+# renders as literal digits and brackets. Chosen over hand-rolling a parser because the
+# subset needed (SGR colour and style codes, indexed and truecolor included) is exactly
+# this crate's own surface, is already used and verified against this project's own
+# ratatui version (ADR 0018), and its own dependency tree (nom, ratatui-core, simdutf8,
+# smallvec, thiserror) adds nothing this crate does not already need or a smaller
+# hand-rolled parser would not eventually grow into. Pinned exactly, matching this crate's
+# stated preference for a deliberate upgrade over a silent one.
+ansi-to-tui = "=8.0.1"
 clap = { version = "4.6.6", features = ["derive"] }
 color-eyre = "0.6.5"
 crossbeam-channel.workspace = true
