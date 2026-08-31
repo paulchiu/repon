@@ -28,7 +28,7 @@ This map lives in code and here. A theme file cannot reach into it, so Gone and 
 
 | Meaning | Role |
 | --- | --- |
-| Fresh value | `text` |
+| Fresh value, a Notice | `text` |
 | Stale or Unknown gutter mark, a known zero, a Merged Worktree, a Submodule name, an age, a column header, an Action step that did not run or was cancelled | `dim` |
 | Loading spinner, a Worktree name, an Active Worktree, the focused border | `accent` / `border_focused` |
 | Ahead count, a succeeded Action step | `ok` |
@@ -38,7 +38,7 @@ This map lives in code and here. A theme file cannot reach into it, so Gone and 
 
 ### Surfaces the nine roles cover
 
-Stated explicitly so a tenth role is added deliberately rather than discovered. The status bar is `dim` text above a `border`, with the theme warning indicator in `warn`. The detail pane's labels are `dim` and its values take whichever role their meaning already has, which is the point of naming roles for meaning. The help overlay's keys are `accent` and its descriptions are `dim`, and the footer takes the same pair ([keybindings.md](keybindings.md)).
+Stated explicitly so a tenth role is added deliberately rather than discovered. The status bar is `dim` text above a `border`, with the theme warning indicator in `warn` and a Notice in plain `text`, which makes it the brightest thing on the row through contrast that already exists rather than through a tenth role. The detail pane's labels are `dim` and its values take whichever role their meaning already has, which is the point of naming roles for meaning. The help overlay's keys are `accent` and its descriptions are `dim`, and the footer takes the same pair ([keybindings.md](keybindings.md)).
 
 ## Colour is never the only carrier
 
@@ -74,6 +74,16 @@ Merge the parsed keys over the compiled-in default, so a theme file names only w
 | `theme` in `config.toml` names a theme that does not exist | Warn and use the compiled default. A flag is a thing typed moments ago; a file is a thing you have to go and fix |
 
 Warnings are reported twice, because a TUI has taken the alternate screen and `eprintln!` goes nowhere a user will ever see. The detail goes to `repon.log`. The screen carries one persistent warning slot in the status bar until dismissed. That slot is shared: [the config spec](config.md) amends this to one slot showing the most severe outstanding condition, expanding to a list on a keystroke, because config warnings and an abandoned discovery would otherwise each want their own word. A theme that silently half-applied is the same class of quiet lie that per-cell provenance exists to prevent ([0001](../adr/0001-per-cell-provenance.md)).
+
+## The status row
+
+The warning slot carries **standing conditions of the session only**: a theme that half-applied, a config key that fell back, an abandoned discovery. Each is continuously true until something changes it, each is dismissible, and each puts something already on screen in doubt. That is what makes ranking them against each other meaningful and what makes expanding them into a list on `w` coherent. [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) fixes the rule after a fourth source, a bound-but-unbuilt key the user had just pressed, was ranked into the slot and was then invisible at the moment it fired.
+
+A **Notice** is the other thing that wants the row and is not a warning. It is a transient one-line message replying to a keystroke that could not act, it is the only thing on screen whose content the user caused, and it is gone in seconds. It never enters the warning slot, never appears in `w`'s expanded list, and never reaches `repon.log`, since the report-twice rule above is about warnings.
+
+The status row shows one thing at a time, in this order: a live Notice, then the most severe outstanding warning, then the header ([actions.md](actions.md)). A Notice takes the whole row rather than becoming an item in the header's own drop table, where at 85 columns of an 88-column narrow screen it would be the first thing to drop, which is the reply to a keystroke vanishing at exactly the width where the user can least go and check. How the warning slot and the header share the row between them, once the header exists, is not settled here.
+
+A Notice is cleared by its timeout, by a replacement, or by the next keypress, whichever comes first. The timeout is `notice_timeout` ([config.md](config.md)), three seconds by default, and `"0s"` turns the timer off rather than turning Notices off, which leaves the next keypress and a replacement to clear it. Each reason's static text is authored to fit 44 columns and a test asserts the budget, rather than the renderer truncating a sentence at a grapheme boundary.
 
 ## Selection and resolution
 
