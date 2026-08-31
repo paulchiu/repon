@@ -29,7 +29,7 @@ The work done across many Repos: seeing their combined state, and acting on many
 ### Selection and scoping
 
 **Set**:
-A named, saved predicate over Repos, defined in config and selectable by flag or environment variable. Seeded from directory structure so Repon is useful with no config at all.
+A named, saved predicate over Repos, defined in config and selectable by flag or environment variable. Seeded from directory structure so Repon is useful with no config at all. It bounds the work rather than the view, so a Set named at startup that does not exist is never substituted with another one.
 _Avoid_: Group, workspace, project
 
 **Set spec**:

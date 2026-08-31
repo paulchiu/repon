@@ -53,12 +53,12 @@ impl ActiveSet {
 /// [config.md](../../../../docs/spec/config.md#sets)'s "Selection order": `--set`/`-s`, then
 /// `REPON_SET`, then the first declared Set, which is already the implicit `all` Set when
 /// the file declared none (`document::load` leaves it there as `sets[0]`, so this function
-/// never special-cases "no Sets declared" itself). A name from the flag or the environment
-/// that matches no declared Set warns, naming its own source, and falls through to the next
-/// rung: the same graceful degrade [`App::reload_active_set`] gives a Set that vanishes on
-/// reload, rather than the exit-before-the-terminal-is-claimed grade `--theme <missing>`
-/// gets, since [config.md](../../../../docs/spec/config.md) draws that exit only for the
-/// theme flag.
+/// never special-cases "no Sets declared" itself).
+// TODO(#127): the fall-through below is now against the design of record. 0025 rules that a
+// name bounding the work is never substituted, so an unmatched `--set` or `REPON_SET` exits
+// non-zero before the terminal is claimed and this function becomes fallible. The reload
+// precedent it followed does not reach startup: `reload_config`'s own reason for that grade
+// is that the terminal is already claimed, which is not true here.
 pub(crate) fn resolve_startup_set<'a>(
     sets: &'a [document::SetConfig],
     flag: Option<&str>,
