@@ -9,8 +9,48 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 - Below 100 columns the detail pane takes the whole frame and the list is hidden.
 - There is no permanently pinned bottom output pane. Output from an Action fanned out across the Selection lives in the detail pane, per step, labelled, separately readable, and it survives the run. It wraps rather than truncates and keeps the colours the step emitted, settled in [actions.md](actions.md).
 - One footer line sits below the frame carrying the focused context's bindings, degrading by dropping whole bindings behind an ellipsis; it is specified in [keybindings.md](keybindings.md).
-- One status row sits above the frame. It shows one thing at a time, a live Notice first, then the most severe outstanding warning, then the header; [theming.md](theming.md) carries the rule and [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) the reasoning.
+- One status row sits above the frame, carrying a live Notice, any outstanding warning and the header; the rule for how they share it is the next section's.
 - Visual language follows superfile: rounded borders, the panel title inline in the top border rather than in a separate title row, focus communicated by border colour, panels tiled edge to edge.
+
+## The status row
+
+This document owns the row in full: what may appear on it, in what order, and what happens when they do not all fit. [theming.md](theming.md) owns what a Notice and a Warning are, [actions.md](actions.md) owns run progress as an item, and neither restates the composition, because a rule kept in two places is how the two came to disagree ([0026](../adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
+
+A live Notice takes the whole row, alone, and nothing else is drawn while one stands. It is the only thing on screen whose content the user caused and it is gone in seconds; [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) carries the reasoning and [theming.md](theming.md) the clearing rules.
+
+Otherwise the row is **one list of items**, degraded by one drop table, under the mechanics [keybindings.md](keybindings.md#the-footer)'s fourth footer rule fixes for every degrading line in Repon: the ` ...` ellipsis reserved inside the budget rather than appended after it, every item width-checked including the first, and the last surviving item dropping the ellipsis rather than itself. This row's separator is ` · `. A warning is an item in that list, not a surface competing with the header for the row.
+
+The **warning indicator** is `!` and the count of outstanding warnings, and it is reserved out of the budget before any item is laid out, so it is the one thing on this row that can never be dropped. It sits at the head of the row, before the first surviving item, and it is drawn whether or not the message below it survives; with nothing outstanding it is absent and costs no columns. `!` carries no provenance meaning here: [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) scopes the disjoint-glyph rule to the row interior, and this row is above the frame.
+
+Priority, after the indicator is reserved:
+
+| rank | item | source |
+| --- | --- | --- |
+| 1 | the entity count | [core-api.md](core-api.md) |
+| 2 | the most severe warning's message, plus `(+N more, w to expand)` while more stand | [theming.md](theming.md) |
+| 3 | run progress | [actions.md](actions.md) |
+| 4 | the Filter's match count | [filter.md](filter.md) |
+| 5 | the worktrees note | [config.md](config.md) |
+| 6 | timing | [actions.md](actions.md) |
+
+The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
+
+`w` **acknowledges**. Opening the expanded list marks every currently outstanding condition seen, and the row falls back to the indicator alone, freeing the message's columns for the items below it. A condition arriving that has not been seen expands the row again. Acknowledgement is not dismissal: the indicator keeps its full count either way, and a condition leaves the row only by ceasing to be true. It is session state and never persists ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)).
+
+One warning outstanding and unacknowledged, a run in flight, so every item is live:
+
+```
+158  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
+152  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
+118  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
+ 97  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
+ 86  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist ...
+ 25  !1 repon 403 entities ...
+ 21  !1 repon 403 entities
+  2  !1
+```
+
+Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted three columns by the reserved indicator: 97, 91, 57, 36, 25, 21, and the same 2-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
 
 ## The list
 
