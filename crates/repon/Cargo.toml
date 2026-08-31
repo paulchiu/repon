@@ -26,8 +26,10 @@ globset = "0.4.20"
 humantime-serde = "1.1.1"
 ratatui = "0.30"
 # `serde` turns on the settled document's wire format (ADR 0015), off by default in
-# repon-core itself: `repon status` is the one caller that needs it.
-repon-core = { workspace = true, features = ["serde"] }
+# repon-core itself: `repon status` is the one caller that needs it. `fetch` turns on
+# repon-core's own mutating path (its `[fetch]` config table), also off by default
+# there: this binary is the one consumer that lets a user opt into it.
+repon-core = { workspace = true, features = ["serde", "fetch"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1.14"
 # Encodes the settled document `repon status` prints: repon-core only derives `Serialize` on

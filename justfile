@@ -107,6 +107,14 @@ check-core-isolation:
     check_isolation "serde feature on, the settled document's wire format" serde \
         "${base_allowed_with_reasons[@]}" \
         "serde:the settled document's wire format on stdout, off by default (ADR 0015)"
+    # The periodic fetch's own blocking network client, HTTP transport (reqwest,
+    # rustls) and credential machinery resolve inside gix's own already-allowed
+    # subtree rather than as a new direct dependency of this crate, so the allowed
+    # set here is identical to the base build: that identity is itself the proof
+    # the mutating path stayed isolated behind gix rather than adding a crate of
+    # its own at this depth (ADR 0015's "The read-only invariant is scoped to the
+    # probe path").
+    check_isolation "fetch feature on, the periodic fetch" fetch "${base_allowed_with_reasons[@]}"
 
 # Build and test against the declared floor
 #

@@ -28,14 +28,26 @@ test-util = []
 # on gix's own `serde` feature (needed for `gix::ObjectId` on a settled `Head`) and serde's
 # `rc` feature, without which `Arc<str>` does not implement `Serialize` at all.
 serde = ["dep:serde", "gix/serde"]
+# Off by default, per ADR 0015: the one mutating path in this crate, isolated so a
+# consumer that never turns it on pulls in none of gix's blocking network client,
+# HTTP transport (reqwest, rustls and their own dependency trees) or credential
+# machinery. `check-core-isolation` proves these land inside gix's own already-allowed
+# subtree rather than surfacing as a new direct dependency of this crate.
+fetch = [
+    "gix/blocking-network-client",
+    "gix/blocking-http-transport-reqwest-rust-tls",
+    "gix/credentials",
+]
 
 [dependencies]
 crossbeam-channel.workspace = true
 # Matched against a Set's roots case-sensitively, per docs/spec/config.md; discovery's
 # boundary walk is the sole consumer.
 globset = "0.4.20"
-# Read-only surface by choice: gix's defaults would pull in mutation, merge, blame,
-# archive and credentials, none of which this crate is allowed to do.
+# Read-only surface by choice on the probe path: these defaults pull in none of gix's
+# mutation, merge, blame, archive or credentials machinery. The `fetch` feature below is
+# the one deliberate exception (ADR 0015's "The read-only invariant is scoped to the
+# probe path"), adding blocking network and transport features of its own.
 gix = { version = "0.87.1", default-features = false, features = [
     "max-performance-safe",
     "sha1",

@@ -331,6 +331,11 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
         status_stale_after: document.refresh.status_stale_after,
         generation_deadline: GENERATION_DEADLINE,
         show_submodules: document.show_submodules,
+        fetch: repon_core::FetchSpec {
+            enabled: document.fetch.enabled,
+            interval: document.fetch.interval,
+            concurrency: document.fetch.concurrency as usize,
+        },
     }
 }
 

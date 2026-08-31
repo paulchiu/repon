@@ -74,3 +74,68 @@ pub(crate) fn loose_object_count(repo: &Path) -> usize {
     }
     count
 }
+
+/// Initialises a bare repository at `path`: no working tree, so a commit into it
+/// must go through a throwaway checkout and a push, never a direct write. Shared
+/// by `fetch.rs` and `core.rs`'s own periodic-fetch fixtures, which both need
+/// exactly this shape: a "remote" the test itself creates, never a real one.
+#[cfg(feature = "fetch")]
+pub(crate) fn init_bare(path: &Path) {
+    let status = Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg("--initial-branch=main")
+        .arg(path)
+        .status()
+        .expect("run git init --bare");
+    assert!(status.success());
+}
+
+/// Writes `name` with `contents` into the working tree at `path` and commits it,
+/// with the fixed identity [`git`] already supplies.
+#[cfg(feature = "fetch")]
+pub(crate) fn commit_file(path: &Path, name: &str, contents: &str) {
+    fs::write(path.join(name), contents).expect("write fixture file");
+    git(path, &["add", name]);
+    git(path, &["commit", "-m", "add a file"]);
+}
+
+/// Adds a commit to `remote` (a bare repo, with no working tree of its own to
+/// commit into) by cloning it into a throwaway checkout, committing there, and
+/// pushing back: this is what stands in for "a collaborator pushed" in every
+/// fetch fixture.
+#[cfg(feature = "fetch")]
+pub(crate) fn push_new_commit(remote: &Path, name: &str, contents: &str) {
+    let contributor = tempfile::tempdir().expect("temp dir");
+    let status = Command::new("git")
+        .arg("clone")
+        .arg(remote)
+        .arg(contributor.path())
+        .status()
+        .expect("run git clone");
+    assert!(status.success());
+    commit_file(contributor.path(), name, contents);
+    git(contributor.path(), &["push", "origin", "main"]);
+}
+
+/// A bare "remote" this call itself creates, seeded with one commit, plus a real
+/// `git clone` of it into a second temp dir: the only shape a periodic-fetch
+/// fixture is allowed to take, per the standing constraint that this ticket's
+/// tests never fetch over the network or point at a real remote.
+#[cfg(feature = "fetch")]
+pub(crate) fn remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
+    let remote = tempfile::tempdir().expect("temp dir");
+    init_bare(remote.path());
+    push_new_commit(remote.path(), "README.md", "seed\n");
+
+    let clone = tempfile::tempdir().expect("temp dir");
+    let status = Command::new("git")
+        .arg("clone")
+        .arg(remote.path())
+        .arg(clone.path())
+        .status()
+        .expect("run git clone");
+    assert!(status.success());
+
+    (remote, clone)
+}

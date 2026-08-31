@@ -61,6 +61,8 @@ mod entity;
 mod environment;
 mod executor;
 mod fanout;
+#[cfg(feature = "fetch")]
+mod fetch;
 mod git;
 mod landing;
 mod patch_equivalence;
@@ -72,6 +74,8 @@ mod test_support;
 mod wire;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
+#[cfg(feature = "fetch")]
+pub use core::FetchSpec;
 pub use core::{ActionSpec, Core, CoreSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
