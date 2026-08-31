@@ -89,9 +89,11 @@ pub(crate) enum Action {
     Decline,
 }
 
-/// One row of the compiled table: a context, the chord that fires in it, and the action it
-/// fires.
-type Binding = (Context, KeyCode, KeyModifiers, Action);
+/// One row of the compiled table: a context, the chord that fires in it, the action it
+/// fires, and whether that chord is actually wired to the action yet ([ADR
+/// 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+/// **Built**, decided at compile time; see [`binding`] and [`binding_not_built`]).
+type Binding = (Context, KeyCode, KeyModifiers, Action, bool);
 
 const fn binding(
     context: Context,
@@ -99,7 +101,25 @@ const fn binding(
     modifiers: KeyModifiers,
     action: Action,
 ) -> Binding {
-    (context, code, modifiers, action)
+    (context, code, modifiers, action, true)
+}
+
+/// A row [keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet) lists under
+/// "Not built yet": its chord stays reserved in the table, so the load-time collision check
+/// and the debug-build assertion over the default map still see it, but nothing dispatches
+/// it to `action` yet. `spec_conformance` checks that list against every such row in both
+/// directions.
+///
+// TODO(#119): an unbuilt row is still shown in the footer and the help overlay and still
+// answers on press, because nothing yet filters on this flag; 0023 rules that it should be
+// offered nowhere.
+const fn binding_not_built(
+    context: Context,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    action: Action,
+) -> Binding {
+    (context, code, modifiers, action, false)
 }
 
 /// The spec's own words for an action, read by [`BindingTable::describe`] for the help overlay,
@@ -187,8 +207,11 @@ pub(crate) const PERMANENTLY_UNBINDABLE: [(KeyCode, KeyModifiers); 3] = [
 
 /// The compiled-in default map, transcribed row for row from
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-default-map). A cell binding two
-/// keys to one action (`` `j`, `Down` ``) becomes two rows here, one per key; this module's
-/// `spec_conformance` test reads the same document and asserts the two never drift apart.
+/// keys to one action (`` `j`, `Down` ``) becomes two rows here, one per key;
+/// `compiled_table_matches_the_spec_default_map_row_for_row` reads the same document and
+/// asserts the two never drift apart. Rows built with [`binding_not_built`] are transcribed
+/// the same way from [keybindings.md#not-built-yet](../../../../docs/spec/keybindings.md#not-built-yet);
+/// `spec_conformance` is what checks those against that list.
 const BINDINGS: &[Binding] = &[
     // global
     binding(Context::Global, KeyCode::Char('?'), NONE, Action::OpenHelp),
@@ -207,25 +230,25 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::OpenActionPalette,
     ),
-    binding(
+    binding_not_built(
         Context::Global,
         KeyCode::Char('/'),
         NONE,
         Action::EnterFilter,
     ),
-    binding(
+    binding_not_built(
         Context::Global,
         KeyCode::Char('r'),
         NONE,
         Action::RefreshAll,
     ),
-    binding(
+    binding_not_built(
         Context::Global,
         KeyCode::Char('R'),
         SHIFT,
         Action::RefreshSelection,
     ),
-    binding(
+    binding_not_built(
         Context::Global,
         KeyCode::Char('b'),
         NONE,
@@ -317,15 +340,15 @@ const BINDINGS: &[Binding] = &[
     binding(Context::List, KeyCode::Up, NONE, Action::MoveUp),
     binding(Context::List, KeyCode::Char('g'), NONE, Action::FirstRow),
     binding(Context::List, KeyCode::Char('G'), SHIFT, Action::LastRow),
-    binding(
+    binding_not_built(
         Context::List,
         KeyCode::Char('d'),
         CTRL,
         Action::HalfPageDown,
     ),
-    binding(Context::List, KeyCode::PageDown, NONE, Action::HalfPageDown),
-    binding(Context::List, KeyCode::Char('u'), CTRL, Action::HalfPageUp),
-    binding(Context::List, KeyCode::PageUp, NONE, Action::HalfPageUp),
+    binding_not_built(Context::List, KeyCode::PageDown, NONE, Action::HalfPageDown),
+    binding_not_built(Context::List, KeyCode::Char('u'), CTRL, Action::HalfPageUp),
+    binding_not_built(Context::List, KeyCode::PageUp, NONE, Action::HalfPageUp),
     binding(
         Context::List,
         KeyCode::Char(' '),
@@ -346,14 +369,14 @@ const BINDINGS: &[Binding] = &[
         Action::ClearSelection,
     ),
     binding(Context::List, KeyCode::Enter, NONE, Action::OpenDetail),
-    binding(
+    binding_not_built(
         Context::List,
         KeyCode::Char('d'),
         NONE,
         Action::DismissVanished,
     ),
-    binding(Context::List, KeyCode::Char('n'), NONE, Action::NextFailed),
-    binding(
+    binding_not_built(Context::List, KeyCode::Char('n'), NONE, Action::NextFailed),
+    binding_not_built(
         Context::List,
         KeyCode::Char('N'),
         SHIFT,
@@ -459,7 +482,7 @@ const fn is_the_same_char_code(a: KeyCode, b: KeyCode) -> bool {
 const fn any_binding_is_permanently_unbindable(bindings: &[Binding]) -> bool {
     let mut i = 0;
     while i < bindings.len() {
-        let (_, code, modifiers, _) = bindings[i];
+        let (_, code, modifiers, _, _) = bindings[i];
         let mut j = 0;
         while j < PERMANENTLY_UNBINDABLE.len() {
             let (banned_code, banned_modifiers) = PERMANENTLY_UNBINDABLE[j];
@@ -488,10 +511,10 @@ const _: () = {
 fn lookup(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Action> {
     bindings
         .iter()
-        .find(|(row_context, code, modifiers, _)| {
+        .find(|(row_context, code, modifiers, _, _)| {
             *row_context == context && *code == key.code && *modifiers == key.modifiers
         })
-        .map(|(_, _, _, action)| *action)
+        .map(|(_, _, _, action, _)| *action)
 }
 
 /// A character an input field can hold: printable, and typed with at most the modifier an
@@ -581,10 +604,10 @@ impl BindingTable {
     ) -> Option<(KeyCode, KeyModifiers)> {
         self.0
             .iter()
-            .find(|(row_context, _, _, row_action)| {
+            .find(|(row_context, _, _, row_action, _)| {
                 *row_context == context && *row_action == action
             })
-            .map(|(_, code, modifiers, _)| (*code, *modifiers))
+            .map(|(_, code, modifiers, _, _)| (*code, *modifiers))
     }
 
     /// Every distinct action live in `context`, as `(keys, description)`, current context
@@ -603,7 +626,7 @@ impl BindingTable {
         let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
             std::collections::HashMap::new();
         for ctx in contexts {
-            for &(row_context, code, modifiers, action) in &self.0 {
+            for &(row_context, code, modifiers, action, _) in &self.0 {
                 if row_context != ctx {
                     continue;
                 }
@@ -687,16 +710,18 @@ fn action_name(action: Action) -> Option<&'static str> {
     })
 }
 
-/// The action named `name` among [`BINDINGS`]'s own rows for `context`, the ground truth for
-/// which actions a `[keys.<context>]` table may name: looked up against the compiled table
-/// rather than a table already under construction, so which names are known never depends on
-/// what a merge has done so far.
-fn find_action_by_name(context: Context, name: &str) -> Option<Action> {
+/// The action named `name` among [`BINDINGS`]'s own rows for `context`, paired with whether
+/// that row is Built, the ground truth for which actions a `[keys.<context>]` table may name:
+/// looked up against the compiled table rather than a table already under construction, so
+/// which names are known never depends on what a merge has done so far. [`merge`] carries the
+/// Built flag onto the row it rebinds, so a merged table still marks an unbuilt action
+/// unbuilt.
+fn find_action_by_name(context: Context, name: &str) -> Option<(Action, bool)> {
     BINDINGS
         .iter()
-        .filter(|(row_context, _, _, _)| *row_context == context)
-        .map(|(_, _, _, action)| *action)
-        .find(|action| action_name(*action) == Some(name))
+        .filter(|(row_context, _, _, _, _)| *row_context == context)
+        .map(|(_, _, _, action, built)| (*action, *built))
+        .find(|(action, _)| action_name(*action) == Some(name))
 }
 
 /// This context's name in a `[keys.<context>]` table, the inverse of [`parse_context_name`].
@@ -822,7 +847,7 @@ impl std::fmt::Display for KeysWarning {
 /// against both tables is what keeps the two collision definitions from ever disagreeing.
 fn find_collisions(bindings: &[Binding]) -> Vec<(Context, KeyCode, KeyModifiers, Vec<Action>)> {
     let mut groups: Vec<(Context, KeyCode, KeyModifiers, Vec<Action>)> = Vec::new();
-    for &(context, code, modifiers, action) in bindings {
+    for &(context, code, modifiers, action, _) in bindings {
         match groups
             .iter_mut()
             .find(|(c, k, m, _)| *c == context && *k == code && *m == modifiers)
@@ -932,7 +957,7 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
             ));
         };
         for (action_name_text, key_value) in context_table {
-            let Some(action) = find_action_by_name(context, action_name_text) else {
+            let Some((action, built)) = find_action_by_name(context, action_name_text) else {
                 warnings.push(KeysWarning::UnknownAction {
                     context: context_name_text.clone(),
                     action: action_name_text.clone(),
@@ -945,7 +970,7 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
                 ));
             };
 
-            bindings.retain(|(row_context, _, _, row_action)| {
+            bindings.retain(|(row_context, _, _, row_action, _)| {
                 !(*row_context == context && *row_action == action)
             });
             if key_text.is_empty() {
@@ -956,7 +981,7 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
                     "keys.{context_name_text}.{action_name_text} names an unparseable key `{key_text}`"
                 ));
             };
-            bindings.push((context, code, modifiers, action));
+            bindings.push((context, code, modifiers, action, built));
         }
     }
 
@@ -1091,7 +1116,7 @@ mod tests {
 
     #[test]
     fn no_binding_combines_control_and_shift() {
-        for (_, code, modifiers, _) in BINDINGS {
+        for (_, code, modifiers, _, _) in BINDINGS {
             assert!(
                 !(modifiers.contains(CTRL) && modifiers.contains(SHIFT)),
                 "{code:?} is bound with both control and shift, a form most terminals cannot \
@@ -1608,7 +1633,7 @@ mod tests {
 
         let mut compiled: Vec<(&'static str, KeyCode, KeyModifiers, String)> = BINDINGS
             .iter()
-            .map(|(context, code, modifiers, action)| {
+            .map(|(context, code, modifiers, action, _)| {
                 (
                     context_name(*context),
                     *code,
@@ -1671,6 +1696,150 @@ mod tests {
         );
     }
 
+    // --- spec_conformance: the "Not built yet" list against BINDINGS's own Built flag ---
+
+    /// Every backtick-quoted span in `text`, in order, backticks stripped.
+    fn backtick_tokens(text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('`') else { break };
+            tokens.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        }
+        tokens
+    }
+
+    /// The one context [`BINDINGS`] binds `code`/`modifiers` in, for a "Not built yet"
+    /// bullet that names no context of its own. Panics if the chord binds in more than one
+    /// context, since a bullet silent about which one cannot be resolved by guessing; such a
+    /// bullet must spell out "in `<context>` only" instead, which [`split_context_clause`]
+    /// reads.
+    fn resolve_not_built_context(code: KeyCode, modifiers: KeyModifiers) -> Context {
+        let mut contexts: Vec<Context> = BINDINGS
+            .iter()
+            .filter(|(_, row_code, row_modifiers, _, _)| {
+                *row_code == code && *row_modifiers == modifiers
+            })
+            .map(|(context, _, _, _, _)| *context)
+            .collect();
+        contexts.dedup();
+        match contexts.as_slice() {
+            [context] => *context,
+            other => panic!(
+                "\"Not built yet\" names {code:?}/{modifiers:?} with no \"in `<context>` \
+                 only\" clause, but the compiled table binds it in {} contexts ({other:?}); \
+                 the bullet must say which one",
+                other.len()
+            ),
+        }
+    }
+
+    /// Splits a bullet's chord tokens from a trailing "in `<context>` only" clause, so
+    /// [`backtick_tokens`] is never asked to read the context name itself as a chord. Returns
+    /// the whole bullet as chords with no context when it carries no such clause.
+    fn split_context_clause(bullet: &str) -> (&str, Option<Context>) {
+        let Some(marker) = bullet.find(" in `") else {
+            return (bullet, None);
+        };
+        let (chords, rest) = bullet.split_at(marker);
+        let name = backtick_tokens(rest).into_iter().next().unwrap_or_else(|| {
+            panic!("malformed \"in `<context>` only\" clause in bullet: {bullet:?}")
+        });
+        let context = parse_context_name(&name)
+            .unwrap_or_else(|| panic!("\"Not built yet\" names unrecognised context {name:?}"));
+        (chords, Some(context))
+    }
+
+    /// The byte offset right after `heading`'s own line in `spec`, matched whole rather than
+    /// as a substring: a heading renamed to `"### Not built yet (draft)"` must miss this, not
+    /// satisfy it by prefix.
+    fn heading_end(spec: &str, heading: &str) -> Option<usize> {
+        let mut offset = 0;
+        for line in spec.split_inclusive('\n') {
+            offset += line.len();
+            if line.trim_end_matches('\n') == heading {
+                return Some(offset);
+            }
+        }
+        None
+    }
+
+    /// Reads "### Not built yet" from `spec` and returns the `(Context, KeyCode,
+    /// KeyModifiers)` triple each bullet names. Panics naming the heading if it cannot be
+    /// found, rather than returning an empty list: the list "shrinks to nothing as the
+    /// features land", so an empty list is its expected end state and must not read the same
+    /// as a renamed or deleted heading.
+    fn parse_not_built(spec: &str) -> Vec<(Context, KeyCode, KeyModifiers)> {
+        let heading = "### Not built yet";
+        let start = heading_end(spec, heading).unwrap_or_else(|| {
+            panic!("keybindings.md has no {heading:?} heading for spec_conformance to check")
+        });
+        let rest = &spec[start..];
+        let end = rest.find("\n## ").unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let mut entries = Vec::new();
+        for line in section.lines() {
+            let Some(bullet) = line.trim().strip_prefix("- ") else {
+                continue;
+            };
+            let (chords, explicit_context) = split_context_clause(bullet);
+            for token in backtick_tokens(chords) {
+                let (code, modifiers) = spec_key_to_chord(&token);
+                let context =
+                    explicit_context.unwrap_or_else(|| resolve_not_built_context(code, modifiers));
+                entries.push((context, code, modifiers));
+            }
+        }
+        entries
+    }
+
+    /// The check [keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet), [ADR
+    /// 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
+    /// and [`BINDINGS`]'s own doc comment name: the "Not built yet" list matches the compiled
+    /// table's Built flag exactly, in both directions, so a binding cannot go stale in either
+    /// place without failing here.
+    #[test]
+    fn spec_conformance() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read the keybinding spec");
+
+        // A positive signal the section itself was found, distinct from the list simply
+        // being empty: the empty list is this list's expected end state, and a parse broken
+        // by a renamed heading must not read the same as that state.
+        assert!(
+            spec.lines().any(|line| line == "### Not built yet"),
+            "keybindings.md's \"Not built yet\" heading is gone; spec_conformance cannot \
+             check a list it cannot find"
+        );
+
+        let listed = parse_not_built(&spec);
+        let unbuilt: Vec<(Context, KeyCode, KeyModifiers)> = BINDINGS
+            .iter()
+            .filter(|(_, _, _, _, built)| !*built)
+            .map(|(context, code, modifiers, _, _)| (*context, *code, *modifiers))
+            .collect();
+
+        for row in &listed {
+            assert!(
+                unbuilt.contains(row),
+                "\"Not built yet\" names {row:?}, but the compiled table marks it Built (or \
+                 does not carry that chord at all): either the binding is built now and \
+                 should be dropped from the list, or the table's Built flag is wrong"
+            );
+        }
+        for row in &unbuilt {
+            assert!(
+                listed.contains(row),
+                "the compiled table marks {row:?} unbuilt, but \"Not built yet\" does not \
+                 name it"
+            );
+        }
+    }
+
     // =====================================================================================
     // User-configurable rebinding: `merge`, `BindingTable`, `parse_chord`, collisions.
     // =====================================================================================
@@ -1698,7 +1867,7 @@ mod tests {
 
     #[test]
     fn parse_chord_is_the_inverse_of_chord_label_for_every_compiled_binding() {
-        for &(_, code, modifiers, _) in BINDINGS {
+        for &(_, code, modifiers, _, _) in BINDINGS {
             let label = chord_label(code, modifiers);
             assert_eq!(
                 parse_chord(&label),
@@ -1758,7 +1927,7 @@ mod tests {
 
     #[test]
     fn every_action_in_bindings_is_nameable_except_switch_to_set() {
-        for &(_, _, _, action) in BINDINGS {
+        for &(_, _, _, action, _) in BINDINGS {
             let name = action_name(action);
             if matches!(action, Action::SwitchToSet(_)) {
                 assert_eq!(name, None);
@@ -1966,8 +2135,20 @@ mod tests {
     #[test]
     fn find_collisions_detects_two_different_actions_sharing_one_key_in_one_context() {
         let synthetic: Vec<Binding> = vec![
-            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
-            (Context::List, KeyCode::Char('x'), NONE, Action::MoveUp),
+            (
+                Context::List,
+                KeyCode::Char('x'),
+                NONE,
+                Action::MoveDown,
+                true,
+            ),
+            (
+                Context::List,
+                KeyCode::Char('x'),
+                NONE,
+                Action::MoveUp,
+                true,
+            ),
         ];
         let collisions = find_collisions(&synthetic);
         assert_eq!(collisions.len(), 1, "expected exactly one colliding key");
@@ -1989,13 +2170,21 @@ mod tests {
                 KeyCode::Char('z'),
                 NONE,
                 Action::DismissVanished,
+                true,
             ),
-            (Context::List, KeyCode::Char('z'), NONE, Action::NextFailed),
+            (
+                Context::List,
+                KeyCode::Char('z'),
+                NONE,
+                Action::NextFailed,
+                true,
+            ),
             (
                 Context::List,
                 KeyCode::Char('z'),
                 NONE,
                 Action::PreviousFailed,
+                true,
             ),
         ];
         let collisions = find_collisions(&synthetic);
@@ -2019,20 +2208,29 @@ mod tests {
                 KeyCode::Char('y'),
                 NONE,
                 Action::SelectAllVisible,
+                true,
             ),
             (
                 Context::List,
                 KeyCode::Char('y'),
                 NONE,
                 Action::ClearSelection,
+                true,
             ),
             (
                 Context::List,
                 KeyCode::Char('z'),
                 NONE,
                 Action::DismissVanished,
+                true,
             ),
-            (Context::List, KeyCode::Char('z'), NONE, Action::NextFailed),
+            (
+                Context::List,
+                KeyCode::Char('z'),
+                NONE,
+                Action::NextFailed,
+                true,
+            ),
         ];
         let collisions = find_collisions(&synthetic);
         assert_eq!(
@@ -2056,8 +2254,20 @@ mod tests {
     fn find_collisions_ignores_the_same_action_bound_to_the_same_key_twice() {
         // Not a collision: it is a redundant duplicate row, not two different actions.
         let synthetic: Vec<Binding> = vec![
-            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
-            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
+            (
+                Context::List,
+                KeyCode::Char('x'),
+                NONE,
+                Action::MoveDown,
+                true,
+            ),
+            (
+                Context::List,
+                KeyCode::Char('x'),
+                NONE,
+                Action::MoveDown,
+                true,
+            ),
         ];
         assert!(find_collisions(&synthetic).is_empty());
     }
@@ -2065,8 +2275,20 @@ mod tests {
     #[test]
     fn find_collisions_ignores_the_same_key_in_two_different_contexts() {
         let synthetic: Vec<Binding> = vec![
-            (Context::List, KeyCode::Char('x'), NONE, Action::MoveDown),
-            (Context::Detail, KeyCode::Char('x'), NONE, Action::ScrollUp),
+            (
+                Context::List,
+                KeyCode::Char('x'),
+                NONE,
+                Action::MoveDown,
+                true,
+            ),
+            (
+                Context::Detail,
+                KeyCode::Char('x'),
+                NONE,
+                Action::ScrollUp,
+                true,
+            ),
         ];
         assert!(find_collisions(&synthetic).is_empty());
     }

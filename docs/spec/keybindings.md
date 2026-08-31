@@ -121,13 +121,15 @@ Four bindings are already conditional in this way. While an Action is fanning ou
 
 ### Not built yet
 
-The bindings below are reserved and specified but not built. Each is absent from the footer and the help overlay and inert on press. The list shrinks to nothing as the features land. Nothing checks it against the compiled table yet, so it can drift and has ([#125](https://github.com/paulchiu/repon/issues/125)); until that lands, a binding leaving this list is a manual step in the change that builds it.
+The bindings below are reserved and specified but not built: `crates/repon/src/keys.rs` marks each row's chord `built: false`, and `spec_conformance` reads this list at test time and asserts it matches that flag exactly, in both directions, so a row cannot go stale in either place without failing the build. The list shrinks to nothing as the features land.
+
+Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, and still answers on press with a "not implemented" warning rather than the silence [Built and available](#built-and-available) promises; wiring the footer, the help overlay and `dispatch` to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
 - `/` enter a Filter ([#63](https://github.com/paulchiu/repon/issues/63))
 - `r` refresh everything and `R` refresh the Selection ([#65](https://github.com/paulchiu/repon/issues/65))
 - `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
 - `d` dismiss a Vanished row
-- `n` and `N` walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78))
+- `n` and `N`, in `list` only, walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78)); `confirm` binds `n` to the unrelated Decline
 - `Ctrl+D`, `PageDown`, `Ctrl+U` and `PageUp` in `list` only; the same chords in `detail` and `overlay` are built
 
 ## Why these keys and not others
