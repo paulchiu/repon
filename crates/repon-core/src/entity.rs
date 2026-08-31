@@ -53,6 +53,12 @@ pub enum Kind {
 /// carries both, because an attached, born HEAD always has one: the environment
 /// contract's `REPON_HEAD` needs the resolved commit on this shape too, not only
 /// on `Detached`.
+///
+/// Deferred: on the wire, `gix::ObjectId`'s own `Serialize` impl writes a commit as a raw
+/// `{"Sha1":[..20 numbers..]}` array rather than a hex string, because gix does not offer a
+/// hex encoding and adding one here would mean either a hand-written `Serialize` impl or
+/// another crate on the allowlist for one field's cosmetics. Functionally complete, not
+/// pretty; nothing in this ticket's acceptance criteria asks for a particular encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Head {
