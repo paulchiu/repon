@@ -16,9 +16,9 @@ use repon_core::Filter;
 use crate::theme::{Role, Theme};
 
 /// The Filter line's own edit buffer: append-only text, the same shape
-/// [`crate::action_palette::ActionPalette`]'s own query takes, since
-/// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context has no plain
-/// backspace, only `Ctrl+W` (delete the previous word) and `Ctrl+U` (clear the line).
+/// [`crate::action_palette::ActionPalette`]'s own query takes. Editing is always at the end:
+/// `Backspace` deletes the last character, `Ctrl+W` the last word, and `Ctrl+U` the whole line
+/// ([keybindings.md](../../../docs/spec/keybindings.md)'s `input` context).
 pub(crate) struct FilterLine {
     input: String,
 }
@@ -35,6 +35,12 @@ impl FilterLine {
 
     pub(crate) fn type_char(&mut self, c: char) {
         self.input.push(c);
+    }
+
+    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
+    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    pub(crate) fn delete_previous_char(&mut self) {
+        self.input.pop();
     }
 
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word.
@@ -96,6 +102,28 @@ mod tests {
             line.type_char(c);
         }
         assert_eq!(line.live_filter().as_str(), "kind:worktree");
+    }
+
+    #[test]
+    fn delete_previous_char_removes_the_last_character() {
+        let mut line = FilterLine::new(&committed(""));
+        for c in "kind:worktree".chars() {
+            line.type_char(c);
+        }
+
+        line.delete_previous_char();
+
+        assert_eq!(line.live_filter().as_str(), "kind:worktre");
+    }
+
+    #[test]
+    fn delete_previous_char_on_an_empty_buffer_does_not_panic_and_leaves_it_empty() {
+        let mut line = FilterLine::new(&committed(""));
+
+        line.delete_previous_char();
+
+        assert_eq!(line.live_filter().as_str(), "");
+        assert!(!line.live_filter().is_active());
     }
 
     #[test]

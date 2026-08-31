@@ -235,6 +235,14 @@ impl ActionPalette {
         self.clamp_cursor(actions);
     }
 
+    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
+    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    pub(crate) fn delete_previous_char(&mut self, actions: &[ActionConfig]) {
+        self.query.pop();
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word, the same shape
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
@@ -771,6 +779,42 @@ mod tests {
     }
 
     // --- Query editing ---
+
+    #[test]
+    fn delete_previous_char_removes_the_last_character_and_re_narrows_the_match_list() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        for c in "reinstallx".chars() {
+            palette.type_char(c, &actions);
+        }
+        assert_eq!(
+            palette.matches(&actions).len(),
+            0,
+            "\"reinstallx\" must match no configured action"
+        );
+
+        palette.delete_previous_char(&actions);
+
+        assert_eq!(
+            palette.matches(&actions).len(),
+            1,
+            "removing the trailing \"x\" must restore the \"reinstall\" match"
+        );
+    }
+
+    #[test]
+    fn delete_previous_char_on_an_empty_query_does_not_panic_and_leaves_it_empty() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+
+        palette.delete_previous_char(&actions);
+
+        assert_eq!(
+            palette.matches(&actions).len(),
+            1,
+            "an empty query still matches everything"
+        );
+    }
 
     #[test]
     fn delete_previous_word_removes_one_trailing_whitespace_delimited_word() {
