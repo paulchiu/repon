@@ -18,9 +18,10 @@
 //! than taking this module's own entity-count-only rank 1. [`render`] itself stays
 //! `#[allow(dead_code)]`, kept for this module's own tests against
 //! [actions.md](../../../../docs/spec/actions.md#the-run-on-screen)'s published ladder: `App`
-//! still has no in-flight Action progress counter, no live Filter and no elapsed timer, so
-//! `run_progress`, `filter_match_count` and `elapsed` are always `None` in production for
-//! now, the same "absent costs nothing" rule this ladder already encodes.
+//! still has no in-flight Action progress counter or elapsed timer, so `run_progress` and
+//! `elapsed` are always `None` in production for now, the same "absent costs nothing" rule
+//! this ladder already encodes. `filter_match_count` and `worktrees_note` are live
+//! (`crate::app::App::status_row_content`).
 
 use std::time::Duration;
 

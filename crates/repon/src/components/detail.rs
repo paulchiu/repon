@@ -4,23 +4,40 @@
 //! "The detail pane" fixes what this shows; [ADR 0019](../../../../docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
 //! fixes the in-progress operation's home here and nowhere else: not a state, not a gutter
 //! mark, and never a gate refusing an Action the user typed.
+//!
+//! A step's own captured output is parsed from raw ANSI bytes into styled spans here, in
+//! this crate, and nowhere in `repon-core`: `docs/spec/actions.md`'s "The run on screen"
+//! puts the parse "in the consumer, never in repon-core", since the parser produces ratatui
+//! types the core's own dependency allowlist cannot carry. Those spans take the child's own
+//! literal colour, never a theme [`Role`], because that output is a quotation of another
+//! program's screen; [`ContentLine::Raw`] is the one place in this module a real
+//! [`ratatui::style::Style`] reaches the buffer instead of a role resolved against the
+//! live theme.
 
+use std::time::Duration;
+
+use ansi_to_tui::IntoText;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
     ActionReceipt, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts, EntityState,
-    Head, InProgressOperation, Kind, Settled, SyncState, Timestamp, Unknown,
+    Head, InProgressOperation, Kind, RunningStep, Settled, StepOutcome, StepResult, SyncState,
+    Timestamp, Unknown,
 };
 
 use super::list::{
-    base_meaning, dirty_meaning, name_cell_meaning, state_meaning, worktree_state_word,
-    write_cell_runs,
+    base_meaning, dirty_meaning, name_cell_meaning, spinner_frame, state_meaning,
+    worktree_state_word, write_cell_runs,
 };
 use crate::{
-    glyphs::GlyphSet,
+    glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
     keys::Action,
     scroll::scroll_after,
     theme::{Meaning, Role, Theme},
 };
+
+/// Columns eaten by the pane's own border, subtracted from an area's width to get the
+/// interior [`Block::inner`] draws into: one column of `│` on each side.
+const BORDER_WIDTH: u16 = 2;
 
 /// The pane's own scroll position. Owns no content of its own: [`content_lines`] derives it
 /// fresh from the entity on every call, the same shape [`crate::help::HelpOverlay`] takes.
@@ -35,10 +52,14 @@ impl Detail {
         self.scroll = scroll_after(self.scroll, action, content_len, viewport_height);
     }
 
-    /// How many lines [`content_lines`] would produce for `entity`, without building any of
-    /// them: the scroll clamp only ever needs the count.
-    pub fn content_len(entity: &EntityState) -> usize {
-        content_lines(entity).len()
+    /// How many lines [`content_lines`] would produce for `entity` at `area_width` (the same
+    /// outer area [`Detail::draw`] is given, border included), without building any of them:
+    /// the scroll clamp only ever needs the count. Takes the width and the glyph set because
+    /// a captured Action step's output wraps to the pane's own interior and a still-running
+    /// step's own line carries a glyph set's own spinner character, so either changing
+    /// changes how many screen rows, or which characters, the same content fills.
+    pub fn content_len(entity: &EntityState, area_width: u16, glyphs: &'static GlyphSet) -> usize {
+        content_lines(entity, interior_width(area_width), glyphs).len()
     }
 
     /// Draws the pane's border and content into `area`. `focused` picks the border role,
@@ -87,11 +108,19 @@ impl Detail {
         draw_lines(
             buf,
             interior,
-            &styled_content_lines(entity),
+            &styled_content_lines(entity, interior.width, glyphs),
             self.scroll,
             theme,
         );
     }
+}
+
+/// `area_width` (the outer, bordered area) minus the one-column border on each side, the
+/// same subtraction [`Block::inner`] performs; kept as its own function so
+/// [`Detail::content_len`]'s clamp and [`Detail::draw`]'s own `block.inner(area)` can never
+/// disagree about how wide the interior actually is.
+fn interior_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(BORDER_WIDTH)
 }
 
 /// One piece of a content line's text paired with the theme role it paints in:
@@ -104,6 +133,40 @@ type Span = (String, Role);
 /// with. [`content_lines`] flattens the same lines to plain text for every caller that only
 /// wants the words.
 type StyledLine = Vec<Span>;
+
+/// One row [`draw_lines`] paints: almost every row takes its colour from a theme [`Role`]
+/// ([`Styled`](ContentLine::Styled)), except a captured Action step's own output, which
+/// takes the child's own literal [`Style`] instead ([`Raw`](ContentLine::Raw)), per this
+/// module's own top-level doc comment. [`content_lines`] flattens either shape to plain text.
+#[derive(Debug)]
+enum ContentLine {
+    Styled(StyledLine),
+    Raw(Vec<(String, Style)>),
+}
+
+impl ContentLine {
+    /// The spans of a `Styled` line. Every call site in this module's own test suite that
+    /// indexes a line by position built it as `Styled` itself, so a `Raw` line here is a
+    /// test bug, not a shape this needs to render around.
+    #[cfg(test)]
+    fn spans(&self) -> &StyledLine {
+        match self {
+            ContentLine::Styled(spans) => spans,
+            ContentLine::Raw(_) => panic!("expected a Styled content line, got {self:?}"),
+        }
+    }
+
+    /// The first run's own text, regardless of which shape this line is: what a test scanning
+    /// for a line by its opening word needs, without caring whether that line is `Styled` or
+    /// `Raw`.
+    #[cfg(test)]
+    fn first_text(&self) -> Option<&str> {
+        match self {
+            ContentLine::Styled(spans) => spans.first().map(|(text, _)| text.as_str()),
+            ContentLine::Raw(runs) => runs.first().map(|(text, _)| text.as_str()),
+        }
+    }
+}
 
 /// A line with no styled distinction of its own: theming.md names no meaning for it, so it
 /// takes `text`, the map's own default for a value named nowhere else.
@@ -122,17 +185,20 @@ fn labelled(label: &str, value: StyledLine) -> StyledLine {
 /// spans painted left to right sharing one width budget the way [`super::list::write_cell_runs`]
 /// already paints the list's own multi-role `sync` cell, rather than a second answer for the
 /// same "more than one role in one string" shape.
-fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[StyledLine], scroll: u16, theme: &Theme) {
+fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[ContentLine], scroll: u16, theme: &Theme) {
     for (row, line) in lines
         .iter()
         .skip(scroll as usize)
         .take(area.height as usize)
         .enumerate()
     {
-        let runs: Vec<(String, Style)> = line
-            .iter()
-            .map(|(text, role)| (text.clone(), theme.style_for(*role)))
-            .collect();
+        let runs: Vec<(String, Style)> = match line {
+            ContentLine::Styled(spans) => spans
+                .iter()
+                .map(|(text, role)| (text.clone(), theme.style_for(*role)))
+                .collect(),
+            ContentLine::Raw(runs) => runs.clone(),
+        };
         write_cell_runs(buf, area, area.x, area.y + row as u16, area.width, &runs);
     }
 }
@@ -146,7 +212,17 @@ fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[StyledLine], scroll: u16, t
 /// Destructures `EntityState` exhaustively rather than naming six cells by hand: a Cell or
 /// fact added to the struct later fails to compile here instead of quietly never reaching the
 /// pane, the project's own recurring defect this ticket was asked to watch for.
-fn styled_content_lines(entity: &EntityState) -> Vec<StyledLine> {
+///
+/// `interior_width` is the pane's own interior column count and `glyphs` the resolved glyph
+/// set, the two things a captured Action step's own section needs and every other line here
+/// ignores: `interior_width` is what a long captured line wraps to rather than truncating,
+/// and `glyphs` names the spinner a still-running step's own line carries
+/// (`docs/spec/actions.md`'s "The run on screen").
+fn styled_content_lines(
+    entity: &EntityState,
+    interior_width: u16,
+    glyphs: &'static GlyphSet,
+) -> Vec<ContentLine> {
     let EntityState {
         key,
         name,
@@ -166,83 +242,109 @@ fn styled_content_lines(entity: &EntityState) -> Vec<StyledLine> {
         recent_commits,
     } = entity;
 
-    let mut lines = Vec::new();
-    lines.push(vec![
+    let mut lines: Vec<ContentLine> = Vec::new();
+    lines.push(ContentLine::Styled(vec![
         (name.to_string(), name_cell_meaning(*kind).role()),
         (format!("  {}", kind_word(*kind)), Role::Dim),
-    ]);
-    lines.push(plain(key.path().display().to_string()));
-    lines.push(plain(String::new()));
+    ]));
+    lines.push(ContentLine::Styled(plain(key.path().display().to_string())));
+    lines.push(ContentLine::Styled(plain(String::new())));
 
-    lines.push(labelled(
+    lines.push(ContentLine::Styled(labelled(
         "branch          ",
         describe_cell_spans(branch.settled(), head_word, |_| Meaning::FreshValue),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(ContentLine::Styled(labelled(
         "sync            ",
         describe_cell_spans(sync.settled(), sync_word, sync_meaning),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(ContentLine::Styled(labelled(
         "base            ",
         describe_cell_spans(base.settled(), base_word, base_meaning),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(ContentLine::Styled(labelled(
         "dirty           ",
         describe_cell_spans(dirty.settled(), dirty_word, dirty_meaning),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(ContentLine::Styled(labelled(
         "state           ",
         describe_cell_spans(
             state.settled(),
             |value| worktree_state_word(value).to_string(),
             state_meaning,
         ),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(ContentLine::Styled(labelled(
         "default branch  ",
         describe_cell_spans(default_branch.settled(), default_branch_word, |_| {
             Meaning::FreshValue
         }),
-    ));
+    )));
     for diagnostic_line in default_branch_diagnostics_lines(diagnostics) {
-        lines.push(plain(format!("                {diagnostic_line}")));
+        lines.push(ContentLine::Styled(plain(format!(
+            "                {diagnostic_line}"
+        ))));
     }
 
     if let Some(reason) = row_level_failure(diagnostics, last_action) {
-        lines.push(plain(String::new()));
-        lines.push(vec![(reason, Meaning::FailedProvenance.role())]);
+        lines.push(ContentLine::Styled(plain(String::new())));
+        lines.push(ContentLine::Styled(vec![(
+            reason,
+            Meaning::FailedProvenance.role(),
+        )]));
     }
 
     if let Some(operation) = in_progress_operation {
-        lines.push(plain(String::new()));
-        lines.push(plain(format!(
+        lines.push(ContentLine::Styled(plain(String::new())));
+        lines.push(ContentLine::Styled(plain(format!(
             "in progress: {}",
             in_progress_word(*operation)
-        )));
+        ))));
     }
 
-    lines.push(plain(String::new()));
-    lines.push(vec![("recent".to_string(), Meaning::ColumnHeader.role())]);
+    lines.push(ContentLine::Styled(plain(String::new())));
+    lines.push(ContentLine::Styled(vec![(
+        "recent".to_string(),
+        Meaning::ColumnHeader.role(),
+    )]));
     if recent_commits.is_empty() {
-        lines.push(plain("  no commits read yet".to_string()));
+        lines.push(ContentLine::Styled(plain(
+            "  no commits read yet".to_string(),
+        )));
     } else {
         for commit in recent_commits {
-            lines.push(plain(format!("  {}  {}", commit.short_id, commit.summary)));
+            lines.push(ContentLine::Styled(plain(format!(
+                "  {}  {}",
+                commit.short_id, commit.summary
+            ))));
         }
     }
 
-    lines.push(plain(String::new()));
-    lines.push(labelled("last action   ", last_action_spans(last_action)));
+    lines.push(ContentLine::Styled(plain(String::new())));
+    lines.push(ContentLine::Styled(labelled(
+        "last action   ",
+        last_action_spans(last_action),
+    )));
+    if let Some(receipt) = last_action {
+        lines.extend(action_run_lines(receipt, interior_width, glyphs));
+    }
 
     lines
 }
 
 /// [`styled_content_lines`] flattened to plain text: every caller that only cares about the
 /// words, including this pane's own scroll-length count and its own test suite.
-fn content_lines(entity: &EntityState) -> Vec<String> {
-    styled_content_lines(entity)
+fn content_lines(
+    entity: &EntityState,
+    interior_width: u16,
+    glyphs: &'static GlyphSet,
+) -> Vec<String> {
+    styled_content_lines(entity, interior_width, glyphs)
         .into_iter()
-        .map(|line| line.into_iter().map(|(text, _)| text).collect())
+        .map(|line| match line {
+            ContentLine::Styled(spans) => spans.into_iter().map(|(text, _)| text).collect(),
+            ContentLine::Raw(runs) => runs.into_iter().map(|(text, _)| text).collect(),
+        })
         .collect()
 }
 
@@ -262,6 +364,197 @@ fn last_action_spans(last_action: &Option<ActionReceipt>) -> StyledLine {
             "none yet".to_string(),
             Meaning::ActionStepNotRunOrCancelled.role(),
         )],
+    }
+}
+
+/// Every line the last Action's own run adds beyond the one-word summary
+/// [`last_action_spans`] already gives: each finished step's own header line and (if it
+/// wrote any) its captured output, then the step now executing, if the run has not yet
+/// finished (`docs/spec/actions.md`'s "The run on screen"). Nothing here for a step that
+/// produced no output: `rm -rf node_modules` succeeding has nothing further to show, and a
+/// `NotRun` step's own output is always empty, so this needs no separate case for either.
+fn action_run_lines(
+    receipt: &ActionReceipt,
+    interior_width: u16,
+    glyphs: &'static GlyphSet,
+) -> Vec<ContentLine> {
+    let mut lines = Vec::new();
+    for (index, step) in receipt.steps.iter().enumerate() {
+        lines.push(finished_step_line(index, step));
+        lines.extend(captured_output_lines(&step.output, interior_width));
+    }
+    if let Some(running) = &receipt.running {
+        lines.push(running_step_line(receipt.steps.len(), running, glyphs));
+    }
+    lines
+}
+
+/// A step's own elapsed time: one decimal place under a minute, minutes and seconds beyond
+/// it. `docs/spec/actions.md`'s "the pane carries per-step elapsed time", what makes a
+/// stuck step visible in the absence of a timeout.
+fn format_step_elapsed(elapsed: Duration) -> String {
+    let whole_secs = elapsed.as_secs();
+    if whole_secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}m{:02}s", whole_secs / 60, whole_secs % 60)
+    }
+}
+
+/// A finished step's own outcome word. Exhaustive over [`StepOutcome`]'s closed four, the
+/// same discipline [`sync_word`] and [`stopped_word`] hold over their own closed sets, so a
+/// fifth variant fails to compile here rather than falling through a default word.
+fn step_outcome_word(outcome: StepOutcome) -> String {
+    match outcome {
+        StepOutcome::Ok => "ok".to_string(),
+        StepOutcome::Failed(code) => format!("failed exit {code}"),
+        StepOutcome::NotRun => "not run".to_string(),
+        StepOutcome::Cancelled => "cancelled".to_string(),
+    }
+}
+
+/// [`step_outcome_word`]'s own role: the same three meanings [`last_action_spans`] already
+/// gives an Action's overall outcome, over the same closed four `StepOutcome` variants.
+fn step_outcome_meaning(outcome: StepOutcome) -> Meaning {
+    match outcome {
+        StepOutcome::Ok => Meaning::SucceededActionStep,
+        StepOutcome::Failed(_) => Meaning::FailedActionStep,
+        StepOutcome::NotRun | StepOutcome::Cancelled => Meaning::ActionStepNotRunOrCancelled,
+    }
+}
+
+/// One finished step's own header line: its number, its outcome, its label and its elapsed
+/// time.
+fn finished_step_line(index: usize, step: &StepResult) -> ContentLine {
+    ContentLine::Styled(vec![
+        (format!("  step {}  ", index + 1), Role::Dim),
+        (
+            step_outcome_word(step.outcome),
+            step_outcome_meaning(step.outcome).role(),
+        ),
+        (
+            format!("   {}   {}", step.label, format_step_elapsed(step.elapsed)),
+            Role::Dim,
+        ),
+    ])
+}
+
+/// The step executing right now's own header line: a spinner glyph in the position a
+/// finished step's own outcome word occupies
+/// (`docs/spec/actions.md`'s "a running step carries the spinner in the same position the
+/// step number's outcome will occupy"), its label and its live elapsed time. Both the
+/// spinner's own frame and the elapsed text are computed fresh from `running.started_at` on
+/// every draw, so nothing here goes stale between two draws without this function running
+/// again.
+fn running_step_line(
+    index: usize,
+    running: &RunningStep,
+    glyphs: &'static GlyphSet,
+) -> ContentLine {
+    let elapsed = running.started_at.elapsed();
+    let frame = spinner_frame(glyphs.loading, FULL_SPINNER_INTERVAL, elapsed);
+    ContentLine::Styled(vec![
+        (
+            format!("{frame} step {}  ", index + 1),
+            Meaning::LoadingSpinner.role(),
+        ),
+        ("running".to_string(), Meaning::LoadingSpinner.role()),
+        (
+            format!("   {}   {}", running.label, format_step_elapsed(elapsed)),
+            Role::Dim,
+        ),
+    ])
+}
+
+/// Indentation a step's own captured output sits under its header line at, plain text with
+/// no styling of its own.
+const CAPTURED_OUTPUT_INDENT: &str = "    ";
+
+/// Parses `output`'s raw ANSI SGR bytes into wrapped, styled lines at `interior_width`
+/// columns, indented under the step header they belong to. `output.into_text()` fails only
+/// on invalid UTF-8, never observed from a real step's own capture; that fallback reads the
+/// bytes lossily as plain, unstyled text instead, so a parse failure loses no content, only
+/// its colour.
+fn captured_output_lines(output: &[u8], interior_width: u16) -> Vec<ContentLine> {
+    if output.is_empty() {
+        return Vec::new();
+    }
+    let wrap_width = (interior_width as usize).saturating_sub(CAPTURED_OUTPUT_INDENT.len());
+    let mut lines = Vec::new();
+    for line in parse_output_lines(output) {
+        for row in wrap_output_line(&line, wrap_width) {
+            let mut runs = vec![(CAPTURED_OUTPUT_INDENT.to_string(), Style::default())];
+            runs.extend(row);
+            lines.push(ContentLine::Raw(runs));
+        }
+    }
+    lines
+}
+
+/// `output` parsed into ratatui lines carrying the child's own real colour
+/// ([ADR 0018](../../../../docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+/// "Captured colours are rendered rather than stripped"). Falls back to one unstyled line
+/// per `\n`-separated line of a lossy decode on the one input `ansi_to_tui` rejects, invalid
+/// UTF-8, so a step's own output is never silently dropped.
+fn parse_output_lines(output: &[u8]) -> Vec<ratatui::text::Line<'static>> {
+    match output.into_text() {
+        Ok(text) => text.lines,
+        Err(_) => String::from_utf8_lossy(output)
+            .lines()
+            .map(|line| ratatui::text::Line::raw(line.to_string()))
+            .collect(),
+    }
+}
+
+/// Wraps one already-styled `line` to `width` columns, splitting on grapheme boundaries
+/// (never a raw byte offset, so a multi-byte character is never cut in half) and carrying
+/// each grapheme's own style into whichever wrapped row it lands on. A row only ever starts
+/// fresh once it already holds something: a single grapheme wider than `width` still lands
+/// on its own row rather than looping forever trying to make it fit.
+fn wrap_output_line(
+    line: &ratatui::text::Line<'static>,
+    width: usize,
+) -> Vec<Vec<(String, Style)>> {
+    let mut rows: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    let mut row_width = 0usize;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let symbol_width = ratatui::text::Span::raw(grapheme.symbol).width();
+        if row_width > 0 && row_width + symbol_width > width {
+            rows.push(Vec::new());
+            row_width = 0;
+        }
+        let style = strip_colour_if_disabled(grapheme.style);
+        let row = rows.last_mut().expect("rows always holds at least one row");
+        match row.last_mut() {
+            Some((text, existing)) if *existing == style => text.push_str(grapheme.symbol),
+            _ => row.push((grapheme.symbol.to_string(), style)),
+        }
+        row_width += symbol_width;
+    }
+    rows
+}
+
+/// Strips a captured span's own colour when colour is disabled for this run, leaving every
+/// other attribute (bold, italic, underline, ...) untouched: `NO_COLOR` is a statement about
+/// colour specifically (`docs/spec/actions.md`'s "that setting is a statement about the
+/// whole screen"), not about styling in general. Consults crossterm's own memoised answer
+/// (`crossterm::style::Colored::ansi_color_disabled_memoized`) rather than reading the
+/// variable a second time: a second implementation of the check would risk disagreeing with
+/// crossterm's own, the class of defect [theming.md](../../../../docs/spec/theming.md)'s
+/// "Colour is never the only carrier" rule exists to keep out. This is the one place in the
+/// pane that needs the answer at all: every other line takes its colour from a theme `Role`,
+/// and crossterm strips those the same way at the point it actually writes them, with no
+/// code of this crate's own involved.
+fn strip_colour_if_disabled(style: Style) -> Style {
+    if crossterm::style::Colored::ansi_color_disabled_memoized() {
+        Style {
+            fg: None,
+            bg: None,
+            underline_color: None,
+            ..style
+        }
+    } else {
+        style
     }
 }
 
@@ -507,6 +800,19 @@ mod tests {
         )
     }
 
+    /// A generous interior width for every test that is not itself exercising wrapping:
+    /// the full frame's own 104-column interior (`docs/spec/actions.md`'s "The run on
+    /// screen"), wide enough that nothing this module's own fixtures write wraps by
+    /// accident.
+    const WIDE: u16 = 104;
+
+    /// The full glyph set, for every test that does not care which one is in force: the
+    /// same fallback [`crate::components::list::List::glyphs`] gives an unconfigured
+    /// component.
+    fn full_glyphs() -> &'static GlyphSet {
+        GlyphSet::for_config(crate::config::document::Glyphs::default())
+    }
+
     /// A receipt with one step, whose outcome is `Ok` or `Failed`: this module only ever
     /// needs to distinguish the two words the pane shows, never a step's own label or output.
     fn receipt(outcome: StepOutcome) -> ActionReceipt {
@@ -520,8 +826,43 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         }
     }
+
+    fn step_result(
+        label: &str,
+        outcome: StepOutcome,
+        output: &[u8],
+        elapsed: Duration,
+    ) -> StepResult {
+        StepResult {
+            label: Arc::from(label),
+            outcome,
+            output: Arc::from(output),
+            elapsed,
+        }
+    }
+
+    fn action_receipt(
+        label: &str,
+        steps: Vec<StepResult>,
+        running: Option<RunningStep>,
+    ) -> ActionReceipt {
+        ActionReceipt {
+            label: Arc::from(label),
+            steps: Arc::from(steps),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+            running,
+        }
+    }
+
+    /// Serialises every test in this module that touches crossterm's own process-global
+    /// colour capability flag (`crossterm::style::force_color_output`) or asserts a captured
+    /// Action step's own colour reaches the buffer: `cargo test`'s default parallelism runs
+    /// this module's tests concurrently, and that flag is shared by the whole test binary.
+    static COLOUR_CAPABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Criterion 2's "never written to disk" claim, the one absence a source scan is the
     /// honest form of: no file in either crate that mentions an Action receipt also performs
@@ -933,7 +1274,7 @@ mod tests {
         core.refresh(&keys);
         let settled = core.settle(Duration::from_secs(5));
 
-        let lines = content_lines(&settled.entities[0]);
+        let lines = content_lines(&settled.entities[0], WIDE, full_glyphs());
         let branch_line = line_labelled(&lines, "branch");
 
         assert!(
@@ -946,7 +1287,7 @@ mod tests {
 
     #[test]
     fn content_lines_opens_with_the_entitys_name_kind_and_path() {
-        let lines = content_lines(&entity("acquiring-gateway"));
+        let lines = content_lines(&entity("acquiring-gateway"), WIDE, full_glyphs());
 
         assert!(lines[0].contains("acquiring-gateway"));
         assert!(lines[0].contains("worktree"));
@@ -955,7 +1296,7 @@ mod tests {
 
     #[test]
     fn content_lines_carries_one_line_per_cell_even_before_any_probe() {
-        let lines = content_lines(&entity("a")).join("\n");
+        let lines = content_lines(&entity("a"), WIDE, full_glyphs()).join("\n");
 
         for label in ["branch", "sync", "base", "dirty", "state", "default branch"] {
             assert!(
@@ -976,7 +1317,7 @@ mod tests {
             .diagnostics
             .default_branch_rung_disagreement = true;
 
-        let lines = content_lines(&disagreeing_at_rung_three).join("\n");
+        let lines = content_lines(&disagreeing_at_rung_three, WIDE, full_glyphs()).join("\n");
 
         assert!(lines.contains("name list"), "got {lines:?}");
         assert!(lines.contains("disagree"), "got {lines:?}");
@@ -986,12 +1327,12 @@ mod tests {
     fn content_lines_shows_the_in_progress_operation_only_when_one_is_set() {
         let mut idle = entity("a");
         idle.in_progress_operation = None;
-        let idle_lines = content_lines(&idle).join("\n");
+        let idle_lines = content_lines(&idle, WIDE, full_glyphs()).join("\n");
         assert!(!idle_lines.contains("in progress"));
 
         let mut rebasing = entity("b");
         rebasing.in_progress_operation = Some(InProgressOperation::Rebase);
-        let rebasing_lines = content_lines(&rebasing).join("\n");
+        let rebasing_lines = content_lines(&rebasing, WIDE, full_glyphs()).join("\n");
         assert!(rebasing_lines.contains("in progress: rebasing"));
     }
 
@@ -1009,7 +1350,7 @@ mod tests {
             },
         ];
 
-        let lines = content_lines(&with_commits);
+        let lines = content_lines(&with_commits, WIDE, full_glyphs());
         let second_index = lines
             .iter()
             .position(|line| line.contains("second commit"))
@@ -1027,7 +1368,7 @@ mod tests {
         let mut ok_run = entity("a");
         ok_run.last_action = Some(receipt(StepOutcome::Ok));
         assert!(
-            content_lines(&ok_run)
+            content_lines(&ok_run, WIDE, full_glyphs())
                 .join("\n")
                 .contains("last action   ok")
         );
@@ -1035,7 +1376,7 @@ mod tests {
         let mut failed_run = entity("b");
         failed_run.last_action = Some(receipt(StepOutcome::Failed(1)));
         assert!(
-            content_lines(&failed_run)
+            content_lines(&failed_run, WIDE, full_glyphs())
                 .join("\n")
                 .contains("last action   failed")
         );
@@ -1043,7 +1384,7 @@ mod tests {
         let mut no_run = entity("c");
         no_run.last_action = None;
         assert!(
-            content_lines(&no_run)
+            content_lines(&no_run, WIDE, full_glyphs())
                 .join("\n")
                 .contains("last action   none yet")
         );
@@ -1189,7 +1530,7 @@ mod tests {
             .find(|entity| matches!(entity.kind, Kind::Submodule))
             .expect("submodule entity present");
 
-        let lines = content_lines(submodule);
+        let lines = content_lines(submodule, WIDE, full_glyphs());
 
         let branch_line = line_labelled(&lines, "branch");
         let sync_line = line_labelled(&lines, "sync");
@@ -1330,7 +1671,7 @@ mod tests {
 
     #[test]
     fn styled_content_lines_gives_every_labels_own_span_the_dim_role() {
-        let lines = styled_content_lines(&entity("a"));
+        let lines = styled_content_lines(&entity("a"), WIDE, full_glyphs());
 
         // Every per-cell line pushed through `labelled` opens with a `(label, Role::Dim)`
         // span; the header, path and blank lines are not labelled and are excluded by their
@@ -1338,7 +1679,7 @@ mod tests {
         let labelled_lines = [3, 4, 5, 6, 7, 8];
         for index in labelled_lines {
             assert_eq!(
-                lines[index][0].1,
+                lines[index].spans()[0].1,
                 Role::Dim,
                 "line {index} {:?} must open with a dim label",
                 lines[index]
@@ -1356,35 +1697,39 @@ mod tests {
         );
         let worktree = entity("wt");
 
-        let repo_header = &styled_content_lines(&repo)[0];
-        let worktree_header = &styled_content_lines(&worktree)[0];
+        let repo_header = &styled_content_lines(&repo, WIDE, full_glyphs())[0];
+        let worktree_header = &styled_content_lines(&worktree, WIDE, full_glyphs())[0];
 
-        assert_eq!(repo_header[0].1, Meaning::FreshValue.role());
-        assert_eq!(worktree_header[0].1, Meaning::WorktreeName.role());
-        assert_eq!(worktree_header[1].1, Role::Dim, "the kind word is dim");
+        assert_eq!(repo_header.spans()[0].1, Meaning::FreshValue.role());
+        assert_eq!(worktree_header.spans()[0].1, Meaning::WorktreeName.role());
+        assert_eq!(
+            worktree_header.spans()[1].1,
+            Role::Dim,
+            "the kind word is dim"
+        );
     }
 
     #[test]
     fn styled_content_lines_colours_the_recent_header_as_a_column_header_and_a_row_level_failure_danger()
      {
-        let lines = styled_content_lines(&entity("a"));
+        let lines = styled_content_lines(&entity("a"), WIDE, full_glyphs());
         let recent_line = lines
             .iter()
-            .find(|line| line.first().is_some_and(|(text, _)| text == "recent"))
+            .find(|line| line.first_text() == Some("recent"))
             .expect("expected a 'recent' section header line");
-        assert_eq!(recent_line[0].1, Meaning::ColumnHeader.role());
+        assert_eq!(recent_line.spans()[0].1, Meaning::ColumnHeader.role());
 
         let mut failing = entity("b");
         failing.diagnostics.gitmodules_failed = Some(Arc::from("bad syntax"));
-        let failing_lines = styled_content_lines(&failing);
+        let failing_lines = styled_content_lines(&failing, WIDE, full_glyphs());
         let failure_line = failing_lines
             .iter()
             .find(|line| {
-                line.first()
-                    .is_some_and(|(text, _)| text.contains(".gitmodules"))
+                line.first_text()
+                    .is_some_and(|text| text.contains(".gitmodules"))
             })
             .expect("expected the row-level failure line");
-        assert_eq!(failure_line[0].1, Meaning::FailedProvenance.role());
+        assert_eq!(failure_line.spans()[0].1, Meaning::FailedProvenance.role());
     }
 
     /// The border must take its role from the live theme handed to `draw`, not the compiled
@@ -1453,5 +1798,320 @@ mod tests {
             theme::DEFAULT.role_color(Meaning::WorktreeName.role()),
             "expected the Worktree name painted in its own meaning's role, not left uncoloured"
         );
+    }
+
+    // --- Criterion 1: labelled per-step output survives the run, with elapsed time ---
+
+    /// The first claim, separated from the other four the ticket's own risk analysis names:
+    /// a finished step's own label and its captured output are both still there after the
+    /// whole run has ended, read straight off the receipt with no run in flight at all.
+    #[test]
+    fn a_finished_steps_own_label_and_output_survive_the_run() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![
+                step_result(
+                    "rm -rf node_modules",
+                    StepOutcome::Ok,
+                    b"",
+                    Duration::from_millis(300),
+                ),
+                step_result(
+                    "pnpm install",
+                    StepOutcome::Ok,
+                    b"added 42 packages\n",
+                    Duration::from_secs(9),
+                ),
+            ],
+            None,
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        assert!(
+            lines.contains("rm -rf node_modules"),
+            "expected the first step's own label, got: {lines}"
+        );
+        assert!(
+            lines.contains("pnpm install"),
+            "expected the second step's own label, got: {lines}"
+        );
+        assert!(
+            lines.contains("added 42 packages"),
+            "expected the second step's own captured output, still present after the run, \
+             got: {lines}"
+        );
+    }
+
+    /// The third claim: per-step elapsed time, distinct from the step's own label or output.
+    #[test]
+    fn each_finished_steps_own_elapsed_time_is_shown() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![
+                step_result(
+                    "rm -rf node_modules",
+                    StepOutcome::Ok,
+                    b"",
+                    Duration::from_millis(300),
+                ),
+                step_result("pnpm test", StepOutcome::Ok, b"", Duration::from_secs(75)),
+            ],
+            None,
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        assert!(
+            lines.contains("0.3s"),
+            "expected the first step's own elapsed time, got: {lines}"
+        );
+        assert!(
+            lines.contains("1m15s"),
+            "expected the second step's own elapsed time past a minute, got: {lines}"
+        );
+    }
+
+    /// The fourth claim: a spinner in the outcome position for the step now running, and
+    /// only that step; a finished step's own line never carries one.
+    #[test]
+    fn a_running_step_carries_the_spinner_in_the_outcome_position_and_a_finished_step_never_does() {
+        let glyphs = full_glyphs();
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![step_result(
+                "rm -rf node_modules",
+                StepOutcome::Ok,
+                b"",
+                Duration::from_millis(300),
+            )],
+            Some(RunningStep {
+                label: Arc::from("pnpm install"),
+                started_at: Timestamp::now(),
+            }),
+        ));
+
+        let lines = styled_content_lines(&row, WIDE, glyphs);
+        let finished_line = lines
+            .iter()
+            .find(|line| {
+                line.first_text()
+                    .is_some_and(|text| text.contains("step 1"))
+            })
+            .expect("expected the finished step's own line");
+        let running_line = lines
+            .iter()
+            .find(|line| {
+                line.first_text()
+                    .is_some_and(|text| text.contains("step 2"))
+            })
+            .expect("expected the running step's own line");
+
+        assert_eq!(
+            finished_line.spans()[0].1,
+            Role::Dim,
+            "a finished step's own leading span must never carry the spinner's role"
+        );
+        assert_eq!(
+            running_line.spans()[0].1,
+            Meaning::LoadingSpinner.role(),
+            "the running step's own leading span must carry the spinner's role"
+        );
+        let running_text = running_line.first_text().expect("running line has text");
+        assert!(
+            glyphs
+                .loading
+                .iter()
+                .any(|frame| running_text.starts_with(*frame)),
+            "expected the running line to open with one of the glyph set's own spinner \
+             frames, got: {running_text:?}"
+        );
+    }
+
+    /// The fifth claim: a captured line longer than the pane wraps rather than truncating,
+    /// with no character lost. 300 characters against a 40-column area (36-column wrap width
+    /// once the 4-column indent is subtracted) forces several wrapped rows, not a boundary
+    /// that happens to land on a separator.
+    #[test]
+    fn captured_output_wraps_a_line_longer_than_the_pane_without_losing_any_character() {
+        let long_line: String = (0..300)
+            .map(|index| char::from(b'a' + (index % 26) as u8))
+            .collect();
+        let output = format!("{long_line}\n").into_bytes();
+        let area_width = 40u16;
+        let wrap_width = (interior_width(area_width) as usize) - CAPTURED_OUTPUT_INDENT.len();
+
+        let wrapped = captured_output_lines(&output, interior_width(area_width));
+
+        assert!(
+            wrapped.len() > 1,
+            "a 300-character line at a {wrap_width}-column wrap width must wrap into more \
+             than one row"
+        );
+        let mut reconstructed = String::new();
+        for line in &wrapped {
+            let ContentLine::Raw(runs) = line else {
+                panic!("expected every captured-output row to be Raw, got {line:?}");
+            };
+            assert_eq!(
+                runs[0].0, CAPTURED_OUTPUT_INDENT,
+                "expected every row to open with the captured-output indent"
+            );
+            let row_text: String = runs[1..].iter().map(|(text, _)| text.as_str()).collect();
+            assert!(
+                row_text.chars().count() <= wrap_width,
+                "expected row {row_text:?} to fit the {wrap_width}-column wrap width"
+            );
+            reconstructed.push_str(&row_text);
+        }
+        assert_eq!(
+            reconstructed, long_line,
+            "expected every character of the original line preserved across the wrap"
+        );
+    }
+
+    // --- Criterion 2: the child's own colour is parsed at render time, in this crate ---
+
+    /// Captured colour reaches the rendered buffer as the child's own real colour: the raw
+    /// bytes `\x1b[31mZEBRA\x1b[0m` render as an actual `Color::Red` cell, not the literal
+    /// escape digits ratatui-core would otherwise leave on screen (ADR 0018's own measured
+    /// defect, "`\x1b[1;31merror\x1b[0m[E0308]` renders as the literal `[1;31merror[0m[E0308]`").
+    #[test]
+    fn captured_output_colour_survives_into_the_rendered_buffer() {
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+        let _guard = COLOUR_CAPABILITY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crossterm::style::force_color_output(true);
+
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![step_result(
+                "pnpm install",
+                StepOutcome::Ok,
+                b"\x1b[31mZEBRA\x1b[0m",
+                Duration::from_millis(1),
+            )],
+            None,
+        ));
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(frame, frame.area(), &row, glyphs, true, &theme::DEFAULT);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let (x, y) = find_text(buf, buf.area, "ZEBRA")
+            .expect("expected to find the captured word ZEBRA rendered somewhere in the pane");
+        assert_eq!(
+            buf[(x, y)].fg,
+            Color::Red,
+            "expected the captured word's own literal colour, not left uncoloured or lost"
+        );
+    }
+
+    // --- Criterion 3: a global colour setting strips captured colour too ---
+
+    /// The real test the ticket's own risk analysis demands, a pair rather than one
+    /// monochrome render on its own: the very same captured bytes render with the child's
+    /// own colour when colour is on, and with none when it is off, and the two renders show
+    /// the identical text throughout, proving only the styling differs.
+    #[test]
+    fn captured_colour_renders_with_it_on_and_is_stripped_with_it_off_but_the_text_never_changes() {
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+        let _guard = COLOUR_CAPABILITY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![step_result(
+                "pnpm install",
+                StepOutcome::Ok,
+                b"\x1b[31mZEBRA\x1b[0m plain",
+                Duration::from_millis(1),
+            )],
+            None,
+        ));
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+
+        let render = || {
+            let backend = TestBackend::new(60, 20);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    detail.draw(frame, frame.area(), &row, glyphs, true, &theme::DEFAULT);
+                })
+                .expect("draw the frame");
+            terminal.backend().buffer().clone()
+        };
+
+        crossterm::style::force_color_output(true);
+        let coloured = render();
+        crossterm::style::force_color_output(false);
+        let monochrome = render();
+        // Restored before any assertion can panic and skip past it: a later test in this
+        // module must never inherit colour disabled from this one.
+        crossterm::style::force_color_output(true);
+
+        let area = coloured.area;
+        assert_eq!(area, monochrome.area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                assert_eq!(
+                    coloured[(x, y)].symbol(),
+                    monochrome[(x, y)].symbol(),
+                    "expected identical text at ({x}, {y}) regardless of colour capability"
+                );
+            }
+        }
+
+        let (x, y) = find_text(&coloured, area, "ZEBRA")
+            .expect("expected to find the captured word ZEBRA rendered somewhere in the pane");
+        assert_eq!(
+            coloured[(x, y)].fg,
+            Color::Red,
+            "expected the captured word's own colour with colour on"
+        );
+        assert_ne!(
+            monochrome[(x, y)].fg,
+            Color::Red,
+            "expected the captured word's own colour stripped with colour off"
+        );
+    }
+
+    /// Finds the top-left cell of the first occurrence of `text`, read left to right, top to
+    /// bottom, over every position `area` covers: what a test that does not know (or does not
+    /// want to hard-code) the exact row a line of dynamic content lands on needs instead.
+    fn find_text(buf: &Buffer, area: Rect, text: &str) -> Option<(u16, u16)> {
+        let needle: Vec<char> = text.chars().collect();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if x + needle.len() as u16 > area.right() {
+                    continue;
+                }
+                let found = needle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, ch)| buf[(x + offset as u16, y)].symbol() == ch.to_string());
+                if found {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
     }
 }

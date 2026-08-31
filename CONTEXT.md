@@ -89,14 +89,17 @@ _Avoid_: ActionConfig (that names the consumer's parsed TOML shape, not the core
 One command in an Action's ordered list, as the core receives it: its argv, already split rather than a shell string, and any per-step environment overrides already resolved. Distinct from a Step result, which is what running one produces.
 
 **Action receipt**:
-An Entity's most recent Action run: its label, its ordered Step results, whether the row was excluded and never operated on, and when it finished. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session.
+An Entity's most recent Action run: its label, the Step results finished so far, whether the row was excluded and never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes.
 _Avoid_: Action run, Action result (the receipt is the specific, settled word)
 
 **Step result**:
-One Step's own record inside an Action receipt: its label, its Step outcome, its captured output and its elapsed time.
+One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output and its elapsed time.
 
 **Step outcome**:
 A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.
+
+**Running step**:
+The Step an Action receipt is executing right now: its label and when it started, present on the receipt only until that Step finishes. Distinct from a Step result, which a Step earns only once it is done; the pane shows a spinner rather than a Step outcome for this one.
 
 **Environment contract**:
 The set-or-unset variable pairs a Launcher or an Action step's child receives, computed from an Entity's already-settled Cells as plain data. An Unknown or Not applicable value unsets its variable rather than setting it empty, and Repon exports none of its own Selection state.

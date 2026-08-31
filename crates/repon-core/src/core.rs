@@ -47,7 +47,7 @@ use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
     ActionReceipt, DefaultBranch, DirtyCounts, EntityKey, EntityState, Head, Kind, Presence,
-    StepOutcome, StepResult, SyncState, WorktreeState,
+    RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
@@ -785,6 +785,7 @@ impl Core {
                         steps: Arc::from(Vec::new()),
                         not_applicable: true,
                         finished_at,
+                        running: None,
                     });
                 }
             }
@@ -820,11 +821,14 @@ impl Core {
             let fan_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pool.install(|| {
                     included.into_par_iter().for_each(|entity| {
-                        let receipt = run_action_for_entity(&entity, &action);
-                        let mut table = table_handle.write().unwrap();
-                        if let Some(&idx) = table.index.get(&entity.key) {
-                            table.entities[idx].last_action = Some(receipt);
-                        }
+                        let write_receipt = |receipt: ActionReceipt| {
+                            let mut table = table_handle.write().unwrap();
+                            if let Some(&idx) = table.index.get(&entity.key) {
+                                table.entities[idx].last_action = Some(receipt);
+                            }
+                        };
+                        let receipt = run_action_for_entity(&entity, &action, &write_receipt);
+                        write_receipt(receipt);
                     });
                 });
             }));
@@ -1602,10 +1606,20 @@ impl Core {
 /// "Actions", `docs/spec/actions.md`'s "Step outcomes"). Never called for an excluded
 /// entity: [`Core::run_action`] gives those their `not_applicable` receipt itself and
 /// never reaches this function for them.
-fn run_action_for_entity(entity: &EntityState, action: &ActionSpec) -> ActionReceipt {
+///
+/// `report` is called once per step, immediately before that step starts, with a receipt
+/// whose `running` names it: the caller writes this straight onto the table, which is what
+/// lets a still-running step's own label and elapsed time reach a reader before the whole
+/// entity's run has finished (`docs/spec/actions.md`'s "The run on screen"). The final
+/// return value is the same shape with `running: None`, the caller's job to write once more.
+fn run_action_for_entity(
+    entity: &EntityState,
+    action: &ActionSpec,
+    report: &dyn Fn(ActionReceipt),
+) -> ActionReceipt {
     let base_env = environment::environment(entity, action.name.as_deref());
     let mut failed = false;
-    let mut results = Vec::with_capacity(action.steps.len());
+    let mut results: Vec<StepResult> = Vec::with_capacity(action.steps.len());
     for step in &action.steps {
         if failed {
             results.push(StepResult {
@@ -1616,6 +1630,17 @@ fn run_action_for_entity(entity: &EntityState, action: &ActionSpec) -> ActionRec
             });
             continue;
         }
+        let label: Arc<str> = Arc::from(step.argv.join(" "));
+        report(ActionReceipt {
+            label: Arc::clone(&action.label),
+            steps: Arc::from(results.clone()),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+            running: Some(RunningStep {
+                label: Arc::clone(&label),
+                started_at: Timestamp::now(),
+            }),
+        });
         // The step's own `env` table is applied after the environment contract's
         // set-or-unset pairs, so it overrides the guaranteed set exactly as a
         // Launcher's own `env` field already does (`docs/spec/config.md`'s
@@ -1635,6 +1660,7 @@ fn run_action_for_entity(entity: &EntityState, action: &ActionSpec) -> ActionRec
         steps: Arc::from(results),
         not_applicable: false,
         finished_at: Timestamp::now(),
+        running: None,
     }
 }
 
@@ -4143,9 +4169,7 @@ mod tests {
         let started = core.run_action(action("reinstall", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0].last_action.is_some()
-        });
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
         assert!(settled, "the fan-out must finish and write a receipt");
         let receipt = core.snapshot().entities[0]
             .last_action
@@ -4189,9 +4213,7 @@ mod tests {
         let started = core.run_action(action("ordering", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0].last_action.is_some()
-        });
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
         assert!(settled, "the fan-out must finish and write a receipt");
         let receipt = core.snapshot().entities[0]
             .last_action
@@ -4212,6 +4234,73 @@ mod tests {
              declaration order would produce a different digit sequence here even though \
              every step still succeeds"
         );
+    }
+
+    /// `docs/spec/actions.md`'s "The run on screen": a reader must see a step's own
+    /// finished output "as it arrives", not only once the whole entity's run has ended.
+    /// The second step sleeps long enough to give a poll a real window to observe the
+    /// receipt mid-run; a version of `run_action_for_entity` that only wrote once, at the
+    /// end, would never let this test observe `running: Some(_)` at all; it would either
+    /// see no receipt (before) or the whole finished one (after), never the state in
+    /// between where the first step is done and the second is still going.
+    #[test]
+    fn a_still_running_actions_finished_step_and_its_currently_executing_one_are_both_visible_before_the_whole_run_ends()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![step(&["true"]), step(&["sh", "-c", "sleep 0.5"])];
+
+        let started = core.run_action(action("reinstall", steps), std::slice::from_ref(&key));
+        assert!(started);
+
+        // Waits specifically for the *second* step's own running receipt, not merely any
+        // one: under a slow or busy machine the first step (`true`) can still be the one
+        // reported running the first time this poll checks, which would assert the wrong
+        // step's own shape below rather than a flaky pass.
+        let seen_mid_run = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0]
+                .last_action
+                .as_ref()
+                .and_then(|receipt| receipt.running.as_ref())
+                .is_some_and(|running| running.label.contains("sleep"))
+        });
+        assert!(
+            seen_mid_run,
+            "expected a receipt naming the second step running before the run finished"
+        );
+        let mid_run = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(
+            mid_run.steps.len(),
+            1,
+            "the first, already-finished step must already be in `steps`"
+        );
+        assert_eq!(mid_run.steps[0].outcome, StepOutcome::Ok);
+        let running = mid_run.running.expect("a step must be recorded running");
+        assert!(
+            running.label.contains("sleep"),
+            "expected the running step's own label, got {:?}",
+            running.label
+        );
+
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
+        assert!(settled, "the fan-out must finish");
+        let finished = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert!(
+            finished.running.is_none(),
+            "a finished receipt must carry no running step"
+        );
+        assert_eq!(finished.steps.len(), 2);
     }
 
     /// `Step::shell` must actually reach the child, end to end through `run_action`,
@@ -4236,9 +4325,7 @@ mod tests {
         let started = core.run_action(action("shell-step", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0].last_action.is_some()
-        });
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
         assert!(settled, "the fan-out must finish and write a receipt");
         let receipt = core.snapshot().entities[0]
             .last_action
@@ -4284,7 +4371,7 @@ mod tests {
         // Drain the fan-out and its completion refresh so this test's background
         // thread does not outlive it.
         assert!(wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0].last_action.is_some()
+            !core.action_running()
         }));
     }
 
@@ -4395,18 +4482,12 @@ mod tests {
         );
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || {
-            let snapshot = core.snapshot();
-            let has_receipt = |key: &EntityKey| {
-                snapshot
-                    .entities
-                    .iter()
-                    .find(|entity| entity.key == *key)
-                    .and_then(|entity| entity.last_action.as_ref())
-                    .is_some()
-            };
-            has_receipt(&excluded_key) && has_receipt(&normal_key)
-        });
+        // `!core.action_running()`, not merely "both entities have some receipt": a
+        // still-running entity now writes an intermediate receipt naming its currently
+        // executing step before it finishes (`docs/spec/actions.md`'s "The run on screen"),
+        // so `last_action.is_some()` alone can be true well before `normal_key`'s own step
+        // has actually run.
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
         assert!(settled);
 
         let after = core.snapshot();
@@ -4552,9 +4633,7 @@ mod tests {
             !second_started,
             "a second run_action call must be rejected while the first is still in flight"
         );
-        let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0].last_action.is_some()
-        });
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
         assert!(settled);
         let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
         assert_eq!(
@@ -4719,6 +4798,7 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         };
         core.set_last_action_for_test(&key, receipt.clone());
 
@@ -4757,6 +4837,7 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         };
         core.set_last_action_for_test(&key, receipt);
 
@@ -6037,6 +6118,7 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         };
         core.set_last_action_for_test(&key, receipt.clone());
 

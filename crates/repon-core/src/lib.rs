@@ -63,6 +63,7 @@ mod executor;
 mod fanout;
 #[cfg(feature = "fetch")]
 mod fetch;
+mod filter;
 mod git;
 mod landing;
 mod patch_equivalence;
@@ -89,11 +90,13 @@ pub use entity::EntityState;
 pub use entity::Head;
 pub use entity::Kind;
 pub use entity::Presence;
+pub use entity::RunningStep;
 pub use entity::StepOutcome;
 pub use entity::StepResult;
 pub use entity::SyncState;
 pub use entity::WorktreeState;
 pub use environment::environment;
+pub use filter::Filter;
 pub use git::{InProgressOperation, ProbeError, RecentCommit};
 pub use snapshot::{RowSummary, Snapshot, summary};
 #[cfg(feature = "serde")]
@@ -266,6 +269,40 @@ mod tests {
         assert!(
             offending_locations.is_empty(),
             "gix's process-global interrupt static must never be used outside a comment, found at: {offending_locations:?}"
+        );
+    }
+
+    /// `docs/spec/actions.md`'s "The run on screen": "the parse cannot live in
+    /// repon-core, because ansi-to-tui produces ratatui types and the core has a CI
+    /// line asserting its tree contains no ratatui". `just check-core-isolation`
+    /// proves the dependency is absent; this proves the same claim at the source
+    /// level, so a hand-rolled parser producing ratatui types some other way (not
+    /// through the `ansi-to-tui` dependency at all) is caught too. Scans every
+    /// source file under `src`, not just `executor.rs`, since a future module is as
+    /// capable of reaching for either name as that one.
+    #[test]
+    fn no_source_file_in_this_crate_names_the_rendering_crates_that_parse_ansi() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let banned = [
+            format!("{}{}", "rata", "tui"),
+            format!("{}_{}", "ansi", "to_tui"),
+        ];
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&path).expect("read a crate source file");
+            for (number, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if banned.iter().any(|needle| line.contains(needle)) {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "found a rendering crate named in repon-core's own source, which must stay raw \
+             bytes with no interpretation: {offending_locations:?}"
         );
     }
 

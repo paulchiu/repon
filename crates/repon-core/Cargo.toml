@@ -31,8 +31,9 @@ serde = ["dep:serde", "gix/serde"]
 # Off by default, per ADR 0015: the one mutating path in this crate, isolated so a
 # consumer that never turns it on pulls in none of gix's blocking network client,
 # HTTP transport (reqwest, rustls and their own dependency trees) or credential
-# machinery. `check-core-isolation` proves these land inside gix's own already-allowed
-# subtree rather than surfacing as a new direct dependency of this crate.
+# machinery. These resolve inside gix's own already-allowed subtree, so the direct-dependency
+# check cannot see them either way; `check-core-isolation`'s `check_network_stack_is_gated`
+# reads the whole transitive tree instead, and is what proves they are absent by default.
 fetch = [
     "gix/blocking-network-client",
     "gix/blocking-http-transport-reqwest-rust-tls",

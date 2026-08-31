@@ -142,18 +142,28 @@ mod tests {
     }
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
-    /// the help overlay carries only Built bindings. `EnterFilter` ('/') is currently unbuilt
-    /// ([keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet)); its own
-    /// description must never appear in Global's content.
+    /// the help overlay carries only Built bindings. Reads whichever Global action is
+    /// currently unbuilt off [`keys::unbuilt_bindings`]
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet)) rather than
+    /// naming one, so this keeps checking the real thing as bindings move from unbuilt to
+    /// built over time instead of drifting onto an action that has since shipped.
     #[test]
     fn content_excludes_a_currently_unbuilt_binding() {
+        let unbuilt_global_description = crate::keys::unbuilt_bindings()
+            .into_iter()
+            .find(|(context, ..)| *context == Context::Global)
+            .map(|(_, _, _, action)| crate::keys::description(action))
+            .expect(
+                "expected at least one currently-unbuilt Global action to test this criterion \
+                 against",
+            );
         let lines = HelpOverlay::content(&default_table(), Context::Global);
         assert!(
             !lines
                 .iter()
-                .any(|(_, description)| *description == "Enter a Filter"),
-            "expected EnterFilter, unbuilt today, to be absent from the help overlay, got: \
-             {lines:?}"
+                .any(|(_, description)| *description == unbuilt_global_description),
+            "expected {unbuilt_global_description:?}, unbuilt today, to be absent from the \
+             help overlay, got: {lines:?}"
         );
     }
 
