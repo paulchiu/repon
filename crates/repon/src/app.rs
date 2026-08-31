@@ -1310,7 +1310,7 @@ impl App {
         tui.draw(|frame| {
             let area = frame.area();
             if let Some(overlay) = &self.help {
-                overlay.draw(frame, area, self.focus, &self.bindings);
+                overlay.draw(frame, area, self.focus, &self.bindings, &self.theme);
                 return;
             }
             if self.warning_overlay_open {
@@ -1375,6 +1375,7 @@ impl App {
                             entity,
                             self.glyphs,
                             self.focus == Context::Detail,
+                            &self.theme,
                         );
                     }
                 }
@@ -1386,11 +1387,18 @@ impl App {
                             entity,
                             self.glyphs,
                             self.focus == Context::Detail,
+                            &self.theme,
                         );
                     }
                 }
             }
-            footer::draw(frame, areas[2], self.footer_context(), &self.bindings);
+            footer::draw(
+                frame,
+                areas[2],
+                self.footer_context(),
+                &self.bindings,
+                &self.theme,
+            );
         })?;
         if let Some(err) = error {
             self.message_tx

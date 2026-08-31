@@ -226,7 +226,7 @@ fn write_cell(
 /// lands exactly where it would have landed before any run was split out. `sync` is the one
 /// column that needs this, per theming.md's own reasoning for the `behind` role: an ahead count
 /// and a behind count "sit adjacent in the same cell".
-fn write_cell_runs(
+pub(crate) fn write_cell_runs(
     buf: &mut Buffer,
     interior: Rect,
     x: u16,
@@ -339,7 +339,7 @@ fn is_child_row(kind: Kind) -> bool {
 /// Submodule children necessarily resolve different roles for this same column, since a child
 /// row is always `Worktree` or `Submodule` and a parent row is always `Repo`
 /// ([`is_child_row`]).
-fn name_cell_meaning(kind: Kind) -> Meaning {
+pub(crate) fn name_cell_meaning(kind: Kind) -> Meaning {
     match kind {
         Kind::Repo => Meaning::FreshValue,
         Kind::Worktree => Meaning::WorktreeName,
@@ -819,7 +819,7 @@ fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet, loading_glyph: Optio
 
 /// `base`'s own role: a known zero is `Meaning::KnownZero`, any other count a behind count
 /// (`base` has no ahead-of-default glyph, so every nonzero value is one).
-fn base_meaning(value: &u32) -> Meaning {
+pub(crate) fn base_meaning(value: &u32) -> Meaning {
     if *value == 0 {
         Meaning::KnownZero
     } else {
@@ -851,7 +851,7 @@ fn format_dirty(
 }
 
 /// `dirty`'s own role: a known zero is `Meaning::KnownZero`, any other total `Meaning::Dirty`.
-fn dirty_meaning(value: &DirtyCounts) -> Meaning {
+pub(crate) fn dirty_meaning(value: &DirtyCounts) -> Meaning {
     if value.total() == 0 {
         Meaning::KnownZero
     } else {
@@ -883,7 +883,7 @@ fn format_state(cell: &Cell<WorktreeState>, loading_glyph: Option<char>) -> Stri
 /// "Colour is never the only carrier" section's "the four Worktree states have a text column".
 /// Exhaustive over [`WorktreeState`], so a fifth state fails to compile here rather than
 /// falling in on an existing role.
-fn state_meaning(value: &WorktreeState) -> Meaning {
+pub(crate) fn state_meaning(value: &WorktreeState) -> Meaning {
     match value {
         WorktreeState::Merged => Meaning::MergedWorktree,
         WorktreeState::Gone => Meaning::GoneWorktree,
@@ -2322,6 +2322,36 @@ mod tests {
         );
     }
 
+    /// Criterion 2: theming.md's "the four Worktree states have a text column" is
+    /// the claim that colour is never the only thing telling the four states apart, so this
+    /// checks the words themselves, independent of `state_meaning`'s own colour above. The
+    /// four variants named by hand mirror `state_meaning`'s own match, which has no wildcard
+    /// arm and so fails to compile on a fifth state; that is what keeps this list honest
+    /// rather than a scan of its own.
+    #[test]
+    fn every_worktree_state_reads_as_its_own_distinct_word() {
+        let states = [
+            WorktreeState::Merged,
+            WorktreeState::Gone,
+            WorktreeState::LocalOnly,
+            WorktreeState::Active,
+        ];
+        let words: Vec<&str> = states
+            .iter()
+            .map(|state| worktree_state_word(state))
+            .collect();
+        for (index, word) in words.iter().enumerate() {
+            for (other_index, other) in words.iter().enumerate() {
+                if index != other_index {
+                    assert_ne!(
+                        word, other,
+                        "got two Worktree states reading the same word: {words:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The name column's own role, one `Kind` at a time: a Worktree and a Submodule each take
     /// the meaning theming.md names for them, and a Repo, named nowhere in the map, takes the
     /// table's default.
@@ -3540,6 +3570,160 @@ mod tests {
             BRANCH_CELL_OBJECT_ID_WIDTH,
             number_word_to_digit(word),
             "the production constant must match head.md's own stated width"
+        );
+    }
+
+    // --- Criterion 2: every colour-carried pair theming.md names still reads
+    // distinct once colour is set aside. `NO_COLOR` strips colour only, never glyphs
+    // (theming.md's own "Colour is never the only carrier"), so the honest proof reads each
+    // pair's plain text (`cell_text`, which never looks at `.fg`) rather than swapping in a
+    // monochrome `Theme`: `List`'s own render path has no way to accept one yet, since
+    // `Component::draw` and `draw_sidebar` both still paint through `theme::DEFAULT`
+    // unconditionally rather than a theme `App` threads through, a pre-existing gap this
+    // ticket leaves for whichever ticket finishes wiring a live theme into this component.
+
+    #[test]
+    fn ahead_and_behind_read_as_distinct_counts_once_colour_is_set_aside() {
+        let snapshot = settled_snapshot_with_an_ahead_and_behind_sync();
+        let terminal = render(140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+
+        let ahead_text = cell_text(buf, absolute_x(SYNC_X), y, 2);
+        let behind_text = cell_text(buf, absolute_x(SYNC_X) + 3, y, 2);
+
+        assert_eq!(ahead_text.trim(), "↑1");
+        assert_eq!(behind_text.trim(), "↓1");
+        assert_ne!(
+            ahead_text.trim(),
+            behind_text.trim(),
+            "ahead and behind must read as distinct text with no colour, got {ahead_text:?} \
+             and {behind_text:?}"
+        );
+    }
+
+    #[test]
+    fn dirty_the_provenance_gutter_and_two_worktree_states_read_as_distinct_text_once_colour_is_set_aside()
+     {
+        let (snapshot, _ids) = settled_snapshot_for_the_head_shape_matrix();
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        // Dirty (`feature-worktree`, an untracked file) against a known zero (`pr-920`,
+        // clean): theming.md's own "Dirty carries its count" pair.
+        let (dirty_row, _) = find_entity_row(&snapshot, "feature-worktree");
+        let (clean_row, _) = find_entity_row(&snapshot, "pr-920");
+        let dirty_text = cell_text(
+            buf,
+            absolute_x(DIRTY_X),
+            entity_row_y(dirty_row),
+            DIRTY_WIDTH,
+        );
+        let clean_text = cell_text(
+            buf,
+            absolute_x(DIRTY_X),
+            entity_row_y(clean_row),
+            DIRTY_WIDTH,
+        );
+        assert_ne!(
+            dirty_text.trim(),
+            clean_text.trim(),
+            "Dirty and a known zero must read as distinct text with no colour, got \
+             {dirty_text:?} and {clean_text:?}"
+        );
+
+        // The provenance gutter (`vendor/lib`'s Unknown `?` against `manage`'s Fresh blank):
+        // theming.md's own "the provenance gutter is glyphs".
+        let (unknown_row, _) = find_entity_row(&snapshot, "vendor/lib");
+        let (fresh_row, _) = find_entity_row(&snapshot, "manage");
+        let unknown_gutter = cell_text(buf, absolute_x(GUTTER_X), entity_row_y(unknown_row), 1);
+        let fresh_gutter = cell_text(buf, absolute_x(GUTTER_X), entity_row_y(fresh_row), 1);
+        assert_ne!(
+            unknown_gutter, fresh_gutter,
+            "the provenance gutter's Unknown mark must read distinct from Fresh's blank with \
+             no colour, got {unknown_gutter:?} and {fresh_gutter:?}"
+        );
+
+        // Two of the four Worktree states this fixture reaches through real git
+        // (`feature-worktree` is LocalOnly, `pr-920` is Merged); the remaining two (Gone,
+        // Active) and the gutter's Stale and Failed marks are proven pairwise distinct as
+        // words by `every_worktree_state_reads_as_its_own_distinct_word` above and by
+        // `describe_unknown`'s and `glyphs.rs`'s own disjointness tests respectively, neither
+        // of which this hermetic fixture can reach.
+        let (local_only_row, _) = find_entity_row(&snapshot, "feature-worktree");
+        let (merged_row, _) = find_entity_row(&snapshot, "pr-920");
+        let local_only_text = cell_text(
+            buf,
+            absolute_x(STATE_X),
+            entity_row_y(local_only_row),
+            STATE_WIDTH,
+        );
+        let merged_text = cell_text(
+            buf,
+            absolute_x(STATE_X),
+            entity_row_y(merged_row),
+            STATE_WIDTH,
+        );
+        assert_eq!(local_only_text.trim(), "local only");
+        assert_eq!(merged_text.trim(), "merged");
+        assert_ne!(local_only_text.trim(), merged_text.trim());
+    }
+
+    /// The pair the ticket names by name: "loading and fresh stay distinguishable... because
+    /// the spinner still moves". Proven against a real sibling rather than asserted in the
+    /// abstract: the same row's `branch` cell is already Fresh (Known, settled) and renders
+    /// identically at both ticks, the static baseline `base`'s own Loading spinner is told
+    /// apart from by moving between the same two ticks
+    /// (`a_row_that_already_shows_its_cheap_columns_still_animates_its_outstanding_cell_on_refresh`
+    /// proves the motion half alone; this adds the static contrast).
+    #[test]
+    fn loading_and_fresh_stay_distinguishable_because_loading_moves_and_fresh_does_not() {
+        let mut snap = settled_snapshot_with_a_resolvable_default_branch("main");
+        snap.entities[0].base = repon_core::Cell::default();
+        assert!(
+            snap.entities[0].base.settled().is_none(),
+            "sanity check: base carries nothing settled yet"
+        );
+        assert!(
+            snap.entities[0].branch.settled().is_some(),
+            "sanity check: branch is already Fresh in the same row"
+        );
+
+        let mut at_zero = List {
+            started_at: Instant::now(),
+            ..List::default()
+        };
+        let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
+        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
+        let branch_first = cell_text(
+            first_tick.backend().buffer(),
+            absolute_x(BRANCH_X),
+            entity_row_y(0),
+            BRANCH_WIDTH,
+        );
+
+        let mut later = List {
+            started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
+            ..List::default()
+        };
+        let second_tick = render_with_list(&mut later, 140, 24, &snap);
+        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
+        let branch_second = cell_text(
+            second_tick.backend().buffer(),
+            absolute_x(BRANCH_X),
+            entity_row_y(0),
+            BRANCH_WIDTH,
+        );
+
+        assert_ne!(
+            base_first, base_second,
+            "Loading must keep moving between ticks"
+        );
+        assert_eq!(
+            branch_first, branch_second,
+            "a Fresh, already-settled cell must render identically across ticks: the static \
+             baseline Loading's motion is what tells the two apart with no colour"
         );
     }
 }
