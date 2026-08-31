@@ -209,6 +209,51 @@ mod tests {
         }
     }
 
+    /// The exemption is keyed off which ref the branch tracks, never off where that
+    /// ref points. A branch tracking its own remote ref that happens to sit on the
+    /// default branch's commit is not the default branch's own row, so it still gets
+    /// a real count, and that count is legitimately zero. An implementation comparing
+    /// resolved commits rather than ref names would exempt it and read Not-applicable.
+    #[test]
+    fn an_upstream_sitting_on_the_default_branchs_own_commit_is_still_not_the_default_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        add_remote(&repo, "origin");
+        git(&repo, &["checkout", "-b", "feature"]);
+        let tip_sha = head_sha(&repo);
+        configure_upstream(&repo, "feature", "feature");
+        // Both remote refs point at the same commit, so a commit-wise comparison
+        // cannot tell `origin/feature` from `origin/main`, while a name-wise one can.
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/feature", &tip_sha],
+        );
+        set_default_branch_ref(&repo, &tip_sha);
+        let head = Head::Branch {
+            name: "feature".into(),
+            commit: gix::ObjectId::from_hex(tip_sha.as_bytes()).expect("parse sha"),
+        };
+
+        let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
+
+        match outcome {
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(
+                value, 0,
+                "a branch level with the default branch is behind it by nothing, which is \
+                 a settled count rather than an exemption"
+            ),
+            other => panic!(
+                "expected a real count for a branch tracking its own ref, even one sitting \
+                 on the default branch's commit, got {other:?}"
+            ),
+        }
+    }
+
     /// Criterion: base settles Not-applicable on the row whose branch is itself
     /// the default branch, since it would otherwise duplicate `sync`. Keyed off
     /// the branch's own tracking configuration rather than its literal name, so
