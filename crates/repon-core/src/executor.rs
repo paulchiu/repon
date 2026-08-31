@@ -63,7 +63,15 @@ pub(crate) fn run_step(
 
     let (master, slave) = match open_pty(PTY_WIDTH) {
         Ok(fds) => fds,
-        Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
+        Err(failure) => {
+            return step_failure(
+                label,
+                cwd,
+                failure.code(),
+                failure.detail(),
+                start.elapsed(),
+            );
+        }
     };
     // The child's own copy for stderr, dup2'd onto its 2 during exec setup; marked
     // close-on-exec so this, the pre-dup2 descriptor, does not also survive into the
@@ -114,6 +122,83 @@ pub(crate) fn run_step(
     }
 }
 
+/// Attempts `open_pty` allows itself before giving up on the ENXIO race documented on
+/// [`PtyOpenFailure`]. Chosen generously rather than tuned to a measured attempt count:
+/// wrapping the single `openpty` call in even one extra layer of retry, with no delay at
+/// all, took the observed failure rate from several in thirty runs of this module's own
+/// suite to zero in sixty, which is evidence the window clears on the very next attempt
+/// almost always rather than evidence of exactly how many attempts a slow machine might
+/// need, so the bound leaves headroom above that single data point.
+const OPEN_PTY_MAX_ATTEMPTS: u32 = 5;
+
+/// Delay between `open_pty` retry attempts. Short enough that the whole bound
+/// (`OPEN_PTY_MAX_ATTEMPTS` - 1 delays) adds at most 8ms to a step that never reaches
+/// exec, which is well under anything a human would notice, while still giving the
+/// kernel a moment rather than spinning a CPU core hot against a still-exhausted table.
+const OPEN_PTY_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+/// Why [`open_pty`] finally gave up once its retries ran out. Both `TableExhausted` and
+/// `RaceUnresolved` carry the same errno (`ENXIO`) but want different words: one is the
+/// user's machine being full, the other is a platform bug that retried and gave up. See
+/// [`classify_pty_open_failure`] for how the two are told apart.
+#[derive(Debug)]
+enum PtyOpenFailure {
+    /// The system-wide pty table is actually full: the last attempt's errno was ENXIO
+    /// with its ordinary, positive sign.
+    TableExhausted(io::Error),
+    /// A transient allocation race inside macOS's own `openpty` did not clear inside the
+    /// retry budget: the last attempt's errno was ENXIO with the sign that race mangles.
+    RaceUnresolved(io::Error),
+    /// Anything else `openpty` or the close-on-exec `fcntl` can fail with; not retried,
+    /// since only the ENXIO shape above is known to be transient.
+    Other(io::Error),
+}
+
+impl PtyOpenFailure {
+    /// The code `run_step` puts into `StepOutcome::Failed`, mirroring `spawn_failure`'s
+    /// own `raw_os_error().unwrap_or(-1)` fallback but reading the code this type
+    /// already carries: `TableExhausted` and `RaceUnresolved` are always the normalised,
+    /// positive `ENXIO`, never `-1`, so a real errno can never collide with that field's
+    /// "no code" sentinel.
+    fn code(&self) -> i32 {
+        match self {
+            PtyOpenFailure::TableExhausted(error) | PtyOpenFailure::RaceUnresolved(error) => error
+                .raw_os_error()
+                .expect("constructed via io::Error::from_raw_os_error"),
+            PtyOpenFailure::Other(error) => error.raw_os_error().unwrap_or(-1),
+        }
+    }
+
+    /// The words a user sees in a step's captured output, naming which of the two ENXIO
+    /// cases this was rather than a shared, ambiguous message.
+    fn detail(&self) -> String {
+        match self {
+            PtyOpenFailure::TableExhausted(error) => {
+                format!("this machine's pty table appears to be full: {error}")
+            }
+            PtyOpenFailure::RaceUnresolved(error) => format!(
+                "openpty hit a transient allocation race and had not cleared after {OPEN_PTY_MAX_ATTEMPTS} attempts: {error}"
+            ),
+            PtyOpenFailure::Other(error) => error.to_string(),
+        }
+    }
+}
+
+/// Tells the two ENXIO cases apart by the sign `raw` carries: macOS's own `openpty`
+/// reports the transient allocation race with errno negated, reproduced here as
+/// `open a pty: Os { code: -6, ... }`, while a genuinely full pty table reports the
+/// same `ENXIO` the ordinary, positive way. `raw`'s magnitude is assumed already
+/// checked against `libc::ENXIO` by the caller. Either way the returned error is
+/// normalised to the positive code, so "Unknown error: -6" never reaches a user.
+fn classify_pty_open_failure(raw: i32) -> PtyOpenFailure {
+    let normalized = io::Error::from_raw_os_error(raw.unsigned_abs() as i32);
+    if raw.is_negative() {
+        PtyOpenFailure::RaceUnresolved(normalized)
+    } else {
+        PtyOpenFailure::TableExhausted(normalized)
+    }
+}
+
 /// Opens a PTY pair via `openpty(3)`, the platform primitive, rather than a portable
 /// wrapper crate: the wrapper pulls a second `nix` version, `anyhow`, `filedescriptor`
 /// and more that a crate with no terminal of its own has no other reason to carry
@@ -124,7 +209,40 @@ pub(crate) fn run_step(
 /// best-effort, since a step's own program inheriting either past its `exec` is the
 /// leak this module exists to prevent (only the dup2'd copies `build_command` wires
 /// onto the child's stdout and stderr are meant to reach it).
-fn open_pty(width: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+///
+/// Retries up to [`OPEN_PTY_MAX_ATTEMPTS`] times when the underlying `openpty` call
+/// fails with `ENXIO`: this project's own reproduction (`open a pty: Os { code: -6, ...
+/// }` under concurrent test runs, `errno=6` positive when the table is deliberately
+/// exhausted single-threaded) shows this errno covers two different situations, one of
+/// them a transient race inside macOS's `openpty` between `grantpt`/`unlockpt` and the
+/// slave-side `open`, worth retrying because it resolves within microseconds. A bounded
+/// retry cannot mask a genuine, permanent exhaustion: that fails identically on every
+/// attempt, so the bound is simply reached and the error reported, never spun on
+/// forever (proved by `exhausting_the_pty_table_still_fails_rather_than_spinning`).
+fn open_pty(width: u16) -> Result<(OwnedFd, OwnedFd), PtyOpenFailure> {
+    let mut last_enxio = None;
+    for attempt in 1..=OPEN_PTY_MAX_ATTEMPTS {
+        match open_pty_once(width) {
+            Ok(fds) => return Ok(fds),
+            Err(error) => {
+                let is_enxio = error.raw_os_error().map(|code| code.abs()) == Some(libc::ENXIO);
+                if !is_enxio {
+                    return Err(PtyOpenFailure::Other(error));
+                }
+                last_enxio = error.raw_os_error();
+                if attempt < OPEN_PTY_MAX_ATTEMPTS {
+                    thread::sleep(OPEN_PTY_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let raw = last_enxio.expect("the loop above only falls through after recording an ENXIO");
+    Err(classify_pty_open_failure(raw))
+}
+
+/// The single, unretried `openpty(3)` call: [`open_pty`] is the seam callers use, this
+/// is the primitive it retries.
+fn open_pty_once(width: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let winsize = libc::winsize {
         ws_row: 40,
         ws_col: width,
@@ -447,17 +565,37 @@ fn nonblocking_read(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
 /// when their Repo is gone is exactly the confusion `docs/spec/actions.md`'s "Failure"
 /// section exists to prevent.
 fn spawn_failure(label: Arc<str>, cwd: &Path, error: &io::Error, elapsed: Duration) -> StepResult {
+    step_failure(
+        label,
+        cwd,
+        error.raw_os_error().unwrap_or(-1),
+        error,
+        elapsed,
+    )
+}
+
+/// The shared tail of every step that never reached exec, once its code and message are
+/// already decided: [`spawn_failure`] decides both from a single `io::Error`, while
+/// `open_pty`'s own [`PtyOpenFailure`] decides them itself so the two ENXIO cases can
+/// read differently.
+fn step_failure(
+    label: Arc<str>,
+    cwd: &Path,
+    code: i32,
+    detail: impl std::fmt::Display,
+    elapsed: Duration,
+) -> StepResult {
     let output = if std::fs::metadata(cwd).is_err() {
         format!(
             "repon: could not run this step because its working directory no longer exists: {}\n",
             cwd.display()
         )
     } else {
-        format!("repon: could not start `{label}`: {error}\n")
+        format!("repon: could not start `{label}`: {detail}\n")
     };
     StepResult {
         label,
-        outcome: StepOutcome::Failed(error.raw_os_error().unwrap_or(-1)),
+        outcome: StepOutcome::Failed(code),
         output: Arc::from(output.into_bytes()),
         elapsed,
     }
@@ -771,12 +909,51 @@ mod tests {
     // is a pre-existing environmental fragility (this machine's PTY/session allocation
     // under heavy concurrent `setsid` forking) rather than a consequence of this change.
     // A hard-to-reproduce kernel race is not worth trading for a suite that is flaky for
-    // an unrelated reason, so the confirmation lives instead in a standalone, off-repo
+    // an unrelated reason, so the confirmation lived instead in a standalone, off-repo
     // reproduction (`openpty`/`fork` in C, no Rust or Cargo involved) and in a manual,
     // one-off swap of this module back to the old `drain_master` to confirm the same
-    // test fails against it; both are reported rather than checked in. What is checked in
-    // below is the coverage that does not carry this risk: no output lost for a child
-    // that outruns the pty's buffer, and no leaked descriptor on either return path.
+    // test fails against it, both reported rather than checked in, until `open_pty`
+    // grew its own bounded retry for that same errno (see `open_pty`'s doc comment):
+    // the destabilisation above and that retry's cause turned out to be the same ENXIO
+    // race, so the retry that makes concurrent spawning survive it also makes this test
+    // safe to land. Below is both the slow-drain regression this comment used to defer
+    // and the coverage that never carried the risk: no output lost for a child that
+    // outruns the pty's buffer, and no leaked descriptor on either return path.
+
+    /// The PTY capture race fixed above, reproduced deterministically rather than
+    /// trusted to the flaky CI report that first found it: a child that writes and exits
+    /// almost immediately, with `drain_until_exit` not called until 600ms later. Against
+    /// the pre-fix `drain_master`, this fails with the CI report's exact signature (`left:
+    /// []`, output lost); it passes here because `keepalive`, duplicated before the
+    /// child is even spawned, keeps the pty's slave side from seeing its last close for
+    /// as long as this function holds it, so the delay before draining starts cannot
+    /// matter. No wall-clock assertion: 600ms is a fixed input chosen to clear this
+    /// machine's own measured 500ms eviction window, not a budget the test times itself
+    /// against.
+    #[test]
+    fn a_slow_to_start_drain_does_not_lose_output_written_before_it_begins() {
+        let dir = tempdir();
+        let argv = vec!["echo".to_string(), "quick output".to_string()];
+
+        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
+        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
+        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+        let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
+        let child = command.spawn().expect("spawn the child");
+        drop(command);
+
+        // The child has almost certainly already written its line and exited by the
+        // time this returns; `drain_until_exit` is not called until well after.
+        thread::sleep(Duration::from_millis(600));
+
+        let (raw, status) = drain_until_exit(master, keepalive, child);
+
+        assert!(status.is_some_and(|status| status.success()));
+        // Raw, pre-normalisation bytes off the pty: ONLCR turns the child's `\n` into
+        // `\r\n`, which `run_step`'s own `normalize_carriage_returns` is what collapses
+        // in the real path; this test reads `drain_until_exit` directly, below that step.
+        assert_eq!(&raw, b"quick output\r\n");
+    }
 
     /// A child that writes more than the pty's own kernel buffer holds must not lose the
     /// excess, which only holds if the parent is reading continuously rather than waiting
@@ -1223,5 +1400,66 @@ print(1 if inherited else 0)"
     #[test]
     fn normalize_carriage_returns_leaves_plain_output_with_no_carriage_returns_untouched() {
         assert_eq!(normalize_carriage_returns(b"a\nb\nc"), b"a\nb\nc");
+    }
+
+    // --- The ENXIO race: retried and normalised, exhaustion retried and still reported ---
+
+    /// macOS's own `openpty` reports this project's reproduced race with errno negated;
+    /// `classify_pty_open_failure` must read that sign as the race, not exhaustion, and
+    /// hand back a normalised, positive code so `PtyOpenFailure::code` never falls back
+    /// to `spawn_failure`'s `-1` sentinel.
+    #[test]
+    fn a_negative_enxio_classifies_as_the_unresolved_race_with_a_normalised_positive_code() {
+        let failure = classify_pty_open_failure(-libc::ENXIO);
+
+        assert!(matches!(failure, PtyOpenFailure::RaceUnresolved(_)));
+        assert_eq!(failure.code(), libc::ENXIO);
+    }
+
+    /// The other sign: a genuinely full pty table reports ENXIO the ordinary, positive
+    /// way, and must classify as exhaustion, not the race.
+    #[test]
+    fn a_positive_enxio_classifies_as_table_exhaustion_with_its_code_unchanged() {
+        let failure = classify_pty_open_failure(libc::ENXIO);
+
+        assert!(matches!(failure, PtyOpenFailure::TableExhausted(_)));
+        assert_eq!(failure.code(), libc::ENXIO);
+    }
+
+    /// The two ENXIO cases must read differently, since one is the user's machine being
+    /// full and the other is a platform bug that retried and gave up.
+    #[test]
+    fn the_two_enxio_cases_produce_different_words() {
+        let exhausted = classify_pty_open_failure(libc::ENXIO).detail();
+        let race = classify_pty_open_failure(-libc::ENXIO).detail();
+
+        assert_ne!(exhausted, race);
+        assert!(exhausted.contains("full"));
+        assert!(race.contains("attempts"));
+    }
+
+    /// Deliberately exhausts this machine's whole, system-wide pty table, so it must run
+    /// alone: every other test in this file also opens a pty, and holding hundreds open
+    /// here starves them too, the same destabilisation the comment above this section's
+    /// slow-drain test records for a different cause. Proves the bounded retry's other
+    /// half, that a genuine, permanent exhaustion still fails rather than retrying
+    /// forever: run explicitly with `cargo test -p repon-core --lib exhausting_the_pty
+    /// -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "exhausts the machine's whole pty table; must run alone, not in the default suite"]
+    fn exhausting_the_pty_table_still_fails_as_exhaustion_rather_than_spinning() {
+        let mut held = Vec::new();
+        let failure = loop {
+            match open_pty(PTY_WIDTH) {
+                Ok(fds) => held.push(fds),
+                Err(failure) => break failure,
+            }
+        };
+
+        assert!(
+            matches!(failure, PtyOpenFailure::TableExhausted(_)),
+            "a genuinely exhausted pty table must fail as exhaustion, got {failure:?}"
+        );
+        assert_eq!(failure.code(), libc::ENXIO);
     }
 }
