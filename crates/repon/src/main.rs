@@ -29,6 +29,7 @@ mod scroll;
 mod selection;
 mod set_picker;
 mod sets;
+mod status_row;
 #[cfg(test)]
 mod test_support;
 mod theme;

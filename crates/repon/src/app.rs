@@ -16,6 +16,7 @@ use crate::{
     config::{self, Config, Document},
     footer,
     glyphs::GlyphSet,
+    header::HeaderContent,
     help::HelpOverlay,
     keys::{self, Action, BindingTable, Context},
     launcher::{self, Launcher},
@@ -24,6 +25,7 @@ use crate::{
     notice,
     selection::Selection,
     set_picker::SetPicker,
+    status_row::{self, StatusRowContent},
     theme::{self, Theme},
     tui::{Event, Tui},
     unwind::{self, UnwindLevel},
@@ -129,6 +131,14 @@ pub struct App {
     /// [`Self::current_warnings`] derives it fresh every frame the same way `help`'s content
     /// does.
     warning_overlay_open: bool,
+    /// Every warning `Action::ExpandWarning` has marked seen, replaced wholesale each time it
+    /// opens the overlay ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)'s
+    /// acknowledgement rule): [`Self::current_warnings`] compared against this is what decides
+    /// whether the status row's message item joins the row or falls back to the reserved
+    /// indicator alone, which keeps its own full count either way. Session state, matching
+    /// [0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md): never
+    /// persisted, and a condition arriving that is not in this list restores the message.
+    acknowledged_warnings: Vec<Warning>,
     /// `Some` while the Action palette has focus, opened by `Action::OpenActionPalette`
     /// (`;`) and closed by `Action::Cancel` from its own `Stage::Choosing`
     /// ([`ActionPalette::decline`] returns to `Choosing` instead of closing, from
@@ -190,10 +200,11 @@ pub struct App {
     message_tx: Sender<Message>,
     message_rx: Receiver<Message>,
     /// Resolved once at startup and again on every config reload (`Action::ReloadConfig`);
-    /// read by [`Self::render`] for the shared warning slot's `warn` role
-    /// ([`warnings::draw_slot`], [`warnings::draw_overlay`]), this field's first production
-    /// reader. Other components still colour themselves from the compiled
-    /// [`theme::DEFAULT`] directly rather than from this loaded copy.
+    /// read by [`Self::render`] for the status row's `warn` and `dim` roles
+    /// ([`status_row::draw`]) and the warning overlay's own `warn` role
+    /// ([`warnings::draw_overlay`]), this field's first production reader. Other components
+    /// still colour themselves from the compiled [`theme::DEFAULT`] directly rather than from
+    /// this loaded copy.
     theme: Theme,
     /// The theme name and source this run last resolved `self.theme` from (updated on a
     /// successful `Action::ReloadConfig`, per `apply_reloaded_config`), and the directory it
@@ -307,6 +318,7 @@ impl App {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            acknowledged_warnings: Vec::new(),
             action_palette: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
@@ -379,6 +391,33 @@ impl App {
             discovery_abandoned,
         }
         .into_warnings()
+    }
+
+    /// The status row's own content for this frame: the active Set's name, `snapshot`'s
+    /// entity count folded into the same rank-1 item, `warnings`, and every warning
+    /// [`Self::acknowledged_warnings`] has marked seen. The header's other four items
+    /// (`run_progress`, `filter_match_count`, `worktrees_note`, `elapsed`) stay `None`: `App`
+    /// has no in-flight Action progress counter, no live Filter and no elapsed timer yet
+    /// ([`crate::header`]'s own doc comment), so the ladder is over whichever subset already
+    /// exists, the same treatment [keybindings.md](../../../docs/spec/keybindings.md) gives
+    /// the footer.
+    fn status_row_content<'a>(
+        &'a self,
+        snapshot: &Snapshot,
+        warnings: &'a [Warning],
+    ) -> StatusRowContent<'a> {
+        StatusRowContent {
+            set_name: &self.active_set.name,
+            header: HeaderContent {
+                entity_count: snapshot.entities.len(),
+                run_progress: None,
+                filter_match_count: None,
+                worktrees_note: None,
+                elapsed: None,
+            },
+            warnings,
+            acknowledged: &self.acknowledged_warnings,
+        }
     }
 
     /// Whether one Action fan-out's steps are still running
@@ -641,7 +680,9 @@ impl App {
                 None
             }
             Some(Action::ExpandWarning) => {
-                if !self.current_warnings().is_empty() {
+                let warnings = self.current_warnings();
+                if !warnings.is_empty() {
+                    self.acknowledged_warnings = warnings;
                     self.warning_overlay_open = true;
                 }
                 None
@@ -1234,8 +1275,8 @@ impl App {
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
     /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
     /// priority, each take the whole frame in place of everything else when open; otherwise
-    /// the status bar row shows a live Notice ([`notice::draw`]) ahead of the shared warning
-    /// slot ([`warnings::draw_slot`]), or the slot alone with no Notice live,
+    /// the status bar row shows a live Notice ([`notice::draw`]) alone, or
+    /// [`status_row::draw`]'s own one list of items with no Notice live,
     /// [`layout_state`] decides between the three shapes
     /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
     /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
@@ -1305,11 +1346,12 @@ impl App {
             .split(area);
             let status_area = areas[0];
             let content_area = areas[1];
+            let status_row_content = self.status_row_content(&snapshot, &warnings);
             draw_status_row(
                 frame,
                 status_area,
                 self.notice(),
-                &warnings,
+                &status_row_content,
                 &self.bindings,
                 &self.theme,
             );
@@ -1376,6 +1418,27 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
         .collect()
 }
 
+/// The status row's whole content, exactly one of two shapes and never a mix
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)):
+/// a live Notice takes the row whole, alone, or with no Notice live
+/// [`status_row::draw`] lays out `content`'s one list of items under one drop table. A free
+/// function, not a method, so a test can drive it with a real
+/// [`ratatui::Terminal<ratatui::backend::TestBackend>`] and no [`crate::app::App`] or
+/// [`crate::tui::Tui`] at all.
+fn draw_status_row(
+    frame: &mut Frame,
+    area: Rect,
+    notice: Option<&str>,
+    content: &StatusRowContent,
+    bindings: &BindingTable,
+    theme: &Theme,
+) {
+    match notice {
+        Some(text) => notice::draw(frame, area, text, theme),
+        None => status_row::draw(frame, area, content, bindings, theme),
+    }
+}
+
 /// Phase C's dispatch order, [refresh.md](../../../../docs/spec/refresh.md)'s "Scope and
 /// order": the cursor row, then the remaining visible rows, then everything else in
 /// `discovery_order`. This is the consumer's computation to make, never `repon-core`'s
@@ -1394,27 +1457,6 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
 /// below carry only positions, never a size or a count, so there is nothing here for a cost
 /// comparator to read. The source scan in the test module only catches an inline mistake in
 /// this function's own text, not a sort hidden behind a helper call or a hand-rolled loop.
-/// The status row's whole content, exactly one of three shapes and never a mix
-/// ([theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices"): a live Notice
-/// takes the row whole, ahead of the shared warning slot; with no Notice live, the slot draws
-/// its own single most severe entry, or nothing at all once `warnings` is empty (today's
-/// stand-in for the header, which is not built yet). A free function, not a method, so a test
-/// can drive it with a real [`ratatui::Terminal<ratatui::backend::TestBackend>`] and no
-/// [`crate::app::App`] or [`crate::tui::Tui`] at all.
-fn draw_status_row(
-    frame: &mut Frame,
-    area: Rect,
-    notice: Option<&str>,
-    warnings: &[Warning],
-    bindings: &BindingTable,
-    theme: &Theme,
-) {
-    match notice {
-        Some(text) => notice::draw(frame, area, text, theme),
-        None => warnings::draw_slot(frame, area, warnings, bindings, theme),
-    }
-}
-
 fn dispatch_order(
     cursor: Option<&EntityKey>,
     visible: &[EntityKey],
@@ -1514,6 +1556,7 @@ mod tests {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            acknowledged_warnings: Vec::new(),
             action_palette: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
@@ -1718,56 +1761,84 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 6: the status row shows exactly one of a live Notice, the shared warning
-    // slot, or neither, never a mix. `draw_status_row` is a free function precisely so this
-    // can drive it with a real `ratatui::Terminal<TestBackend>` and no `App` or `Tui` at all.
+    // Criterion 5: a live Notice takes the whole row alone, and nothing else is drawn while
+    // one stands. `draw_status_row` is a free function precisely so this can drive it with a
+    // real `ratatui::Terminal<TestBackend>` and no `App` or `Tui` at all.
     // =====================================================================================
 
-    fn render_status_row(notice: Option<&str>, warnings: &[Warning]) -> String {
-        let backend = ratatui::backend::TestBackend::new(60, 1);
+    fn status_row_content_with_everything_live(warnings: &[Warning]) -> StatusRowContent<'_> {
+        StatusRowContent {
+            set_name: "work",
+            header: HeaderContent {
+                entity_count: 403,
+                run_progress: Some((7, 12)),
+                filter_match_count: Some(12),
+                worktrees_note: Some(161),
+                elapsed: Some(Duration::from_millis(12000)),
+            },
+            warnings,
+            acknowledged: &[],
+        }
+    }
+
+    fn render_status_row(notice: Option<&str>, content: &StatusRowContent) -> String {
+        let backend = ratatui::backend::TestBackend::new(160, 1);
         let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
         let bindings = BindingTable::compiled_default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_status_row(frame, area, notice, warnings, &bindings, &theme::DEFAULT);
+                draw_status_row(frame, area, notice, content, &bindings, &theme::DEFAULT);
             })
             .expect("draw the status row");
         let buf = terminal.backend().buffer().clone();
-        (0..60).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+        (0..160).map(|x| buf[(x, 0)].symbol().to_string()).collect()
     }
 
-    /// A live Notice with a warning outstanding shows the Notice, not the warning: proves the
-    /// Notice actually outranks the slot rather than merely being drawn when nothing else is.
+    /// A live Notice takes the row alone even with a warning, its message and every header
+    /// item all standing at once: proves the Notice pre-empts the whole list, not merely the
+    /// warning half of it, since a test asserting only the warning's own absence would not
+    /// have caught the indicator or an entity count still leaking through beside it.
     #[test]
-    fn a_live_notice_shows_over_an_outstanding_warning() {
+    fn a_live_notice_shows_alone_over_an_outstanding_warning_and_every_header_item() {
         let warnings = vec![Warning::Config(document::Warning::SetNamedAll)];
-        let row = render_status_row(Some("switched to `second`"), &warnings);
+        let content = status_row_content_with_everything_live(&warnings);
+        let row = render_status_row(Some("switched to `second`"), &content);
         assert_eq!(row.trim_end(), "switched to `second`");
         assert!(
-            !row.contains("shadowing the implicit Set"),
-            "the outstanding warning must not also show, got: {row:?}"
+            !row.contains("shadowing the implicit Set")
+                && !row.contains('!')
+                && !row.contains("entities")
+                && !row.contains("run 7/12"),
+            "nothing but the Notice may be drawn while one stands, got: {row:?}"
         );
     }
 
-    /// A warning with no Notice live shows the warning: proves the slot is not merely a
+    /// A warning with no Notice live shows the warning: proves the list is not merely a
     /// fallback drawn unconditionally beside an absent Notice.
     #[test]
     fn an_outstanding_warning_shows_with_no_notice_live() {
         let warnings = vec![Warning::Config(document::Warning::SetNamedAll)];
-        let row = render_status_row(None, &warnings);
+        let content = status_row_content_with_everything_live(&warnings);
+        let row = render_status_row(None, &content);
         assert!(
             row.contains("shadowing the implicit Set"),
             "expected the warning's own message on the row, got: {row:?}"
         );
     }
 
-    /// Neither a Notice nor a warning leaves the row blank (today's stand-in for the header,
-    /// which is not built yet): proves this is a real absence, not merely untested.
+    /// Neither a Notice nor a warning still shows rank 1, the active Set's name and entity
+    /// count, since that item is never absent: proves the row is real production content now,
+    /// not the blank placeholder it was before the header was folded in.
     #[test]
-    fn neither_a_notice_nor_a_warning_leaves_the_row_blank() {
-        let row = render_status_row(None, &[]);
-        assert_eq!(row.trim_end(), "");
+    fn neither_a_notice_nor_a_warning_still_shows_the_active_sets_name_and_entity_count() {
+        let content = status_row_content_with_everything_live(&[]);
+        let row = render_status_row(None, &content);
+        assert_eq!(
+            row.trim_end(),
+            "work 403 entities · run 7/12 · filter: 12 matches · worktrees: 161 (preference \
+             off) · 12000ms"
+        );
     }
 
     // =====================================================================================
@@ -2176,6 +2247,96 @@ mod tests {
         );
     }
 
+    // --- criterion 6: `w` acknowledges every currently outstanding condition ---
+
+    fn status_row_text(app: &mut App, width: u16) -> String {
+        let warnings = app.current_warnings();
+        let content = app.status_row_content(&app.core.snapshot(), &warnings);
+        status_row::render(&content, &app.bindings, width).to_string()
+    }
+
+    /// The discriminating pair: pressing `w` drops the message from the row while the
+    /// indicator keeps its own full count, never falling to zero or vanishing outright. A
+    /// test that only checked the message's own absence could not tell acknowledgement apart
+    /// from the condition itself having cleared.
+    #[test]
+    fn pressing_w_drops_the_message_but_the_indicator_keeps_its_full_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.theme_warnings = vec![theme::ThemeWarning::UnknownKey {
+            key: "x".to_string(),
+        }];
+
+        let before = status_row_text(&mut app, 150);
+        assert!(
+            before.contains("unknown theme key"),
+            "sanity: the message must show before acknowledgement, got {before:?}"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("press w to acknowledge");
+
+        let after = status_row_text(&mut app, 150);
+        assert!(
+            !after.contains("unknown theme key"),
+            "the message must leave the row once acknowledged, got {after:?}"
+        );
+        assert!(
+            before.starts_with("!1") && after.starts_with("!1"),
+            "the indicator must keep its own full count either way: before {before:?}, after \
+             {after:?}"
+        );
+    }
+
+    /// A condition that arrives after `w` has already run, and was never itself acknowledged,
+    /// restores the message: acknowledgement is a snapshot taken at the moment `w` opens the
+    /// list, not a standing exemption for every future condition.
+    #[test]
+    fn a_condition_arriving_after_w_has_run_restores_the_message() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.theme_warnings = vec![theme::ThemeWarning::UnknownKey {
+            key: "x".to_string(),
+        }];
+
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::NONE))
+            .expect("press w to acknowledge the one outstanding warning");
+        let acknowledged_only = status_row_text(&mut app, 150);
+        assert!(
+            acknowledged_only.starts_with("!1") && !acknowledged_only.contains("unknown"),
+            "sanity: the message must be gone once the only warning is acknowledged, got \
+             {acknowledged_only:?}"
+        );
+
+        app.config_warnings = vec![document::Warning::SetNamedAll];
+        let after = status_row_text(&mut app, 150);
+        assert!(
+            after.starts_with("!2"),
+            "the indicator must count both outstanding conditions, got {after:?}"
+        );
+        assert!(
+            after.contains("shadowing the implicit Set"),
+            "the message must reappear for the new, unacknowledged condition, got {after:?}"
+        );
+    }
+
+    /// Acknowledgement is session state, never persisted: a fresh `App` carries none of it.
+    #[test]
+    fn acknowledgement_is_never_persisted_a_fresh_app_starts_with_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let app = test_app(&root);
+        assert!(
+            app.acknowledged_warnings.is_empty(),
+            "a fresh App must start with nothing acknowledged"
+        );
+    }
+
     #[test]
     fn the_warning_overlay_closes_on_esc_the_same_as_the_help_overlay_does() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2436,17 +2597,21 @@ mod tests {
         );
     }
 
-    // --- the shared warning slot: exactly one slot, not one per subsystem ---
+    // --- the shared warning population: exactly one population, not one per subsystem ---
 
-    /// The "exactly one slot" half of the criterion is an absence claim, so a scan is the
-    /// honest form: a second call site drawing the slot or its expansion is exactly what a
-    /// per-subsystem indicator (a theme one, a config one, a discovery one) would need,
-    /// since [`warnings::WarningSources`] already forces every source through the one flat
-    /// list `warnings::draw_slot` and `warnings::draw_overlay` each read.
+    /// The "exactly one" half of the criterion is an absence claim, so a scan is the honest
+    /// form: a second call site reading the population's own collapsed text or drawing its
+    /// expansion is exactly what a per-subsystem indicator (a theme one, a config one, a
+    /// discovery one) would need, since [`warnings::WarningSources`] already forces every
+    /// source through the one flat list `warnings::slot_line` and `warnings::draw_overlay`
+    /// each read. `slot_line` rather than a `draw_slot` call, since criterion 1 turned
+    /// `warnings` into an item source: [`status_row::message_item`] is now the one place that
+    /// reads it into the row's own list.
     #[test]
-    fn the_shared_warning_slot_and_its_expansion_are_each_painted_from_exactly_one_place() {
+    fn the_shared_warning_populations_text_and_its_expansion_are_each_read_from_exactly_one_place()
+    {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut slot_calls = 0usize;
+        let mut slot_line_calls = 0usize;
         let mut overlay_calls = 0usize;
         for path in rust_source_files(&manifest_dir.join("src")) {
             let production = production_source_at(&path);
@@ -2454,8 +2619,8 @@ mod tests {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                if line.contains("warnings::draw_slot(") {
-                    slot_calls += 1;
+                if line.contains("warnings::slot_line(") {
+                    slot_line_calls += 1;
                 }
                 if line.contains("warnings::draw_overlay(") {
                     overlay_calls += 1;
@@ -2463,13 +2628,27 @@ mod tests {
             }
         }
         assert_eq!(
-            slot_calls, 1,
-            "expected exactly one call to warnings::draw_slot, found {slot_calls}: a second \
-             would mean a per-subsystem indicator alongside the shared one"
+            slot_line_calls, 1,
+            "expected exactly one call to warnings::slot_line, found {slot_line_calls}: a \
+             second would mean a per-subsystem indicator alongside the shared one"
         );
         assert_eq!(
             overlay_calls, 1,
             "expected exactly one call to warnings::draw_overlay, found {overlay_calls}"
+        );
+    }
+
+    // --- criterion 1: `warnings::draw_slot` no longer exists at all, since the module became
+    // an item source rather than a renderer ---
+
+    #[test]
+    fn warnings_no_longer_exposes_a_drawing_function_for_the_slot() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = production_source_at(&manifest_dir.join("src/warnings.rs"));
+        assert!(
+            !source.contains("fn draw_slot"),
+            "warnings::draw_slot must not exist: the module became an item source, not a \
+             renderer, per criterion 1"
         );
     }
 
