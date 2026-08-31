@@ -82,6 +82,23 @@ pub(crate) fn resolve_startup_set<'a>(
         .expect("Document::load always leaves at least one Set, `all` if none was declared")
 }
 
+/// The Notice [`App::switch_to_set`] raises on a successful switch, and `reload_active_set`
+/// raises for its own fallback, naming the Set fallen back to: the same wording either way,
+/// since both are "this is the Set you are on now" from the user's side of the keyboard.
+fn switched_to_notice(name: &str) -> String {
+    format!("switched to `{name}`")
+}
+
+/// The Notice [`App::switch_to_set`] raises for a digit past however many Sets are declared,
+/// naming the count and pointing at `s`
+/// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+/// unavailable case): the picker is the only way to reach a Set the digits themselves cannot
+/// name.
+fn no_such_set_notice(declared: usize) -> String {
+    let plural = if declared == 1 { "" } else { "s" };
+    format!("only {declared} Set{plural} declared; press s to pick one")
+}
+
 impl App {
     /// `Action::ReloadConfig`'s whole effect: re-reads `config.toml` from the same fixed path
     /// [`App::new`] read it from, re-merges `[keys]` into a fresh [`keys::BindingTable`] and
@@ -203,6 +220,7 @@ impl App {
                 self.active_set.name,
                 chosen.name.get_ref(),
             );
+            self.notice = Some(switched_to_notice(chosen.name.get_ref()));
         }
 
         self.apply_active_set(chosen, document);
@@ -210,20 +228,31 @@ impl App {
 
     /// `Action::SwitchToSet(nth)`'s whole effect
     /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s `1` to `9`): makes the
-    /// `nth` declared Set (one-indexed, file order) active. A no-op past however many Sets
-    /// are declared, since there is no such Set to switch to; `self.document` is cloned first
-    /// so the borrow it and its chosen Set hold never overlaps the `&mut self` this needs to
-    /// apply it.
+    /// `nth` declared Set (one-indexed, file order) active and raises a Notice naming it,
+    /// once per press, on both the paths that reach here: the positional digit and the Set
+    /// picker's own `Enter` ([`crate::set_picker::SetPicker::draw`] numbers its rows with
+    /// this same one-indexed `nth`). The Notice fires even when `nth` already names the
+    /// active Set, since [`Self::apply_active_set`] only skips the rebuild in that case, not
+    /// the answer to the keystroke. `self.document` is cloned first so the borrow it and its
+    /// chosen Set hold never overlaps the `&mut self` this needs to apply it.
     ///
-    /// TODO(#134): the switch raises a Notice naming the Set, and the out-of-range press
-    /// answers instead of doing nothing: `1` to `9` is advertised as a range, so it is
-    /// unavailable rather than unbuilt
-    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
+    /// A digit past however many Sets are declared is Built and unavailable rather than
+    /// unbuilt
+    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
+    /// the active Set is left untouched and the Notice instead names how many Sets are
+    /// declared and points at `s`, the picker being the only way to reach one past `9`
+    /// declared or past whatever the pressed digit named.
     pub(crate) fn switch_to_set(&mut self, nth: u8) {
         let document = self.document.clone();
         let index = usize::from(nth).wrapping_sub(1);
-        if let Some(chosen) = document.sets.get(index) {
-            self.apply_active_set(chosen, &document);
+        match document.sets.get(index) {
+            Some(chosen) => {
+                self.apply_active_set(chosen, &document);
+                self.notice = Some(switched_to_notice(chosen.name.get_ref()));
+            }
+            None => {
+                self.notice = Some(no_such_set_notice(document.sets.len()));
+            }
         }
     }
 
@@ -451,6 +480,12 @@ mod tests {
             before,
             "an unchanged Set must not rebuild Core or start a new Generation"
         );
+        assert_eq!(
+            app.notice(),
+            None,
+            "an ordinary reload that names the same Set must raise no Notice, unlike the \
+             vanished-Set fallback below"
+        );
     }
 
     /// Criterion 7's second half: a vanished active Set falls back to the first declared Set
@@ -482,6 +517,12 @@ mod tests {
         assert!(
             logs.contains("test") && logs.contains("renamed"),
             "expected the fallback announced naming both the vanished and the new Set, got: {logs:?}"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `renamed`"),
+            "expected the same Notice `switch_to_set` raises, naming the Set fallen back to, \
+             rather than only the log line above"
         );
     }
 
@@ -614,12 +655,20 @@ mod tests {
             !after_names.iter().any(|name| name == "repo-a"),
             "expected the first Set's discovery to be discarded, got {after_names:?}"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "expected a Notice naming the Set switched to"
+        );
     }
 
     /// The negative control: switching to the Set already active must not rebuild `self.core`
     /// at all, proven the same way
     /// [`reload_with_the_same_active_set_leaves_discovery_and_its_generation_untouched`] is,
-    /// by a Generation identity a rebuild could not preserve.
+    /// by a Generation identity a rebuild could not preserve. Criterion 4's own claim rides
+    /// along with it: the Notice still fires on exactly this no-rebuild path, since the
+    /// keystroke was pressed and answered even though `apply_active_set` found nothing to
+    /// rebuild.
     #[test]
     fn switching_to_the_already_active_set_leaves_discovery_and_its_generation_untouched() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -646,13 +695,21 @@ mod tests {
             before,
             "switching to the already-active Set must not rebuild Core or start a new Generation"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `test`"),
+            "expected a Notice naming the Set even though it was already active"
+        );
     }
 
     /// `1` to `9` name a position, not a guarantee: a document declaring fewer Sets than the
     /// pressed digit must leave the active Set exactly as it was, never panic on the missing
-    /// index.
+    /// index, and answer with a Notice naming how many Sets are declared and pointing at `s`
+    /// rather than doing nothing
+    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// unavailable case).
     #[test]
-    fn switching_past_the_last_declared_set_is_a_no_op() {
+    fn switching_past_the_last_declared_set_is_a_no_op_that_raises_a_notice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -664,5 +721,37 @@ mod tests {
         app.switch_to_set(9);
 
         assert_eq!(app.active_set, before);
+        assert_eq!(
+            app.notice(),
+            Some("only 1 Set declared; press s to pick one"),
+            "expected a Notice naming the declared count in the singular"
+        );
+    }
+
+    /// The plural half of the same Notice, against a document declaring more than one Set, so
+    /// this cannot pass on the singular wording the test above already covers.
+    #[test]
+    fn switching_past_the_last_declared_set_names_the_plural_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        app.document.sets = vec![
+            matching_set_config(&root),
+            document::SetConfig {
+                name: toml::Spanned::new(0..0, "second".to_string()),
+                roots: vec![root.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
+        ];
+
+        app.switch_to_set(9);
+
+        assert_eq!(
+            app.notice(),
+            Some("only 2 Sets declared; press s to pick one")
+        );
     }
 }

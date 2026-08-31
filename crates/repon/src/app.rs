@@ -18,6 +18,7 @@ use crate::{
     launcher::{self, Launcher},
     launcher_palette::LauncherPalette,
     message::Message,
+    notice,
     selection::Selection,
     set_picker::SetPicker,
     theme::{self, Theme},
@@ -152,6 +153,17 @@ pub struct App {
     /// positional `1`-`9` keys already take, so this can never become a second
     /// implementation of the same switch.
     set_picker: Option<SetPicker>,
+    /// The live Notice ([CONTEXT.md](../../../CONTEXT.md)'s glossary entry), if any: raised
+    /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
+    /// declared when the pressed digit names none) and by `reload.rs`'s own reload fallback
+    /// (naming the Set fallen back to). Replaced by the next such call; nothing else clears
+    /// it yet.
+    ///
+    // TODO(#119): the general Notice mechanism (its timeout, being cleared by the next
+    // keypress or a replacement, and the status row's full ordering ahead of a warning and
+    // the header) belongs to that ticket. This field only carries the two call sites #134
+    // needs.
+    notice: Option<String>,
     /// The description of the most recently pressed bound-but-unimplemented action
     /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
     /// action in the spec's own words. One of the four sources [`Self::current_warnings`]
@@ -306,6 +318,7 @@ impl App {
             launcher_palette: None,
             pending_launcher_handoff: None,
             set_picker: None,
+            notice: None,
             unimplemented_action_notice: None,
             theme_warnings,
             config_warnings,
@@ -333,6 +346,12 @@ impl App {
     /// just told the key does.
     fn notify_not_implemented(&mut self, action: Action) {
         self.unimplemented_action_notice = Some(keys::description(action));
+    }
+
+    /// The live Notice, if any: read by [`Self::render`] to draw it, and by tests in place of
+    /// reaching into the private field directly.
+    fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     /// The shared warning slot's whole current population, folded once from every source
@@ -1155,9 +1174,9 @@ impl App {
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
     /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
     /// priority, each take the whole frame in place of everything else when open; otherwise
-    /// the status bar
-    /// row shows the shared warning slot ([`warnings::draw_slot`]), [`layout_state`] decides
-    /// between the three shapes
+    /// the status bar row shows a live Notice ([`notice::draw`]) ahead of the shared warning
+    /// slot ([`warnings::draw_slot`]), or the slot alone with no Notice live,
+    /// [`layout_state`] decides between the three shapes
     /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
     /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
     /// There is no permanently pinned bottom output pane: an Action's own output, once
@@ -1226,7 +1245,12 @@ impl App {
             .split(area);
             let status_area = areas[0];
             let content_area = areas[1];
-            warnings::draw_slot(frame, status_area, &warnings, &self.bindings, &self.theme);
+            match self.notice() {
+                Some(text) => notice::draw(frame, status_area, text, &self.theme),
+                None => {
+                    warnings::draw_slot(frame, status_area, &warnings, &self.bindings, &self.theme)
+                }
+            }
             match layout_state(content_area.width, pane_entity.is_some()) {
                 Layout3::ListOnly => {
                     if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
@@ -1403,6 +1427,7 @@ mod tests {
             launcher_palette: None,
             pending_launcher_handoff: None,
             set_picker: None,
+            notice: None,
             unimplemented_action_notice: None,
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
@@ -3450,6 +3475,12 @@ mod tests {
             "choosing the already-active Set through the picker must not rebuild Core or \
              start a new Generation"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `test`"),
+            "the Notice must fire through the picker's own Enter too, even though nothing \
+             rebuilt"
+        );
     }
 
     /// Criterion 1's positive half: moving the cursor onto the second declared Set and
@@ -3498,6 +3529,52 @@ mod tests {
             !after_names.iter().any(|name| name == "repo-a"),
             "expected the first Set's discovery to be discarded, got {after_names:?}"
         );
+    }
+
+    /// Criterion 2's own claim, driven the way a user drives each path rather than by calling
+    /// `switch_to_set` twice and comparing the two calls to each other, which would prove
+    /// nothing about the two keys agreeing. Two separate `App`s (positional `2`, and the
+    /// picker's cursor moved onto the second row then `Enter`) both land on `second`, a known
+    /// name from the fixture rather than one run's own output, and criterion 3's Notice comes
+    /// along for free: both paths raise the same one, naming the same Set.
+    #[test]
+    fn the_positional_digit_and_the_pickers_enter_on_the_same_row_reach_the_same_set() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+        let sets = || vec![set_config("test", &root_a), set_config("second", &root_b)];
+
+        let mut via_digit = test_app(&root_a);
+        via_digit.document.sets = sets();
+        via_digit
+            .handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("press the positional digit");
+
+        let mut via_picker = test_app(&root_a);
+        via_picker.document.sets = sets();
+        via_picker
+            .handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        via_picker
+            .handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the cursor to the second row");
+        via_picker
+            .handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose it");
+
+        assert_eq!(via_digit.active_set.name, "second");
+        assert_eq!(via_picker.active_set.name, "second");
+        assert_eq!(via_digit.notice(), Some("switched to `second`"));
+        assert_eq!(via_picker.notice(), Some("switched to `second`"));
     }
 
     /// Criterion 2, both close keys: a test that only reads the active Set back is half a
