@@ -912,6 +912,22 @@ impl App {
     /// the same grade [`Self::reread_theme`] gives a failed reread, since a Launcher failing
     /// is not a reason to tear down the whole session.
     fn run_launcher_handoff(&mut self, tui: &mut Tui, entity_key: &EntityKey, chosen: &Launcher) {
+        self.run_handoff_over_entity(entity_key, chosen, |entity| {
+            launcher::run(tui, chosen, entity)
+        });
+    }
+
+    /// [`Self::run_launcher_handoff`] with the terminal-owning half passed in. `Tui::new`
+    /// asks the terminal for its size and fails with `EAGAIN` where there is no controlling
+    /// one, so a test that builds a real one passes on a developer's machine and cannot run
+    /// on CI at all; `launcher::run` under a real terminal is covered by the pty harness in
+    /// `tests/terminal_restoration.rs`, the one place allowed to drive one.
+    fn run_handoff_over_entity<T>(
+        &mut self,
+        entity_key: &EntityKey,
+        chosen: &Launcher,
+        handoff: impl FnOnce(&EntityState) -> Result<T>,
+    ) {
         let Some(entity) = self
             .core
             .snapshot()
@@ -921,7 +937,7 @@ impl App {
         else {
             return;
         };
-        let result = self.around_entity_handoff(entity_key, || launcher::run(tui, chosen, &entity));
+        let result = self.around_entity_handoff(entity_key, || handoff(&entity));
         if let Err(err) = result {
             tracing::error!("Launcher {:?} failed: {err:#}", chosen.name);
         }
@@ -2978,8 +2994,13 @@ mod tests {
             .pending_launcher_handoff
             .take()
             .expect("choosing must queue a handoff");
-        let mut tui = Tui::new().expect("construct a Tui for the queued handoff");
-        app.run_launcher_handoff(&mut tui, &entity_key, &chosen);
+        // `Tui::new` needs a controlling terminal, so the handoff runs through the seam that
+        // takes the terminal-owning half as a closure. The Launcher's own argv still reaches a
+        // real process; only the terminal suspend and reclaim are skipped, and those are what
+        // the pty harness in tests/terminal_restoration.rs covers.
+        app.run_handoff_over_entity(&entity_key, &chosen, |entity| {
+            Ok(launcher::build_command(&chosen, entity).status()?)
+        });
 
         assert_eq!(
             app.theme.text,
@@ -3026,8 +3047,13 @@ mod tests {
             .pending_launcher_handoff
             .take()
             .expect("choosing must queue a handoff");
-        let mut tui = Tui::new().expect("construct a Tui for the queued handoff");
-        app.run_launcher_handoff(&mut tui, &entity_key, &chosen);
+        // `Tui::new` needs a controlling terminal, so the handoff runs through the seam that
+        // takes the terminal-owning half as a closure. The Launcher's own argv still reaches a
+        // real process; only the terminal suspend and reclaim are skipped, and those are what
+        // the pty harness in tests/terminal_restoration.rs covers.
+        app.run_handoff_over_entity(&entity_key, &chosen, |entity| {
+            Ok(launcher::build_command(&chosen, entity).status()?)
+        });
 
         let snapshot = app.core.snapshot();
         let entity = snapshot

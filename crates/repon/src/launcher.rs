@@ -178,7 +178,9 @@ pub(crate) fn command_from_argv(argv: &[String]) -> Command {
     command
 }
 
-fn build_command(launcher: &Launcher, entity: &EntityState) -> Command {
+/// The `Command` a Launcher runs, before [`run`] hands it the terminal. Visible to the crate
+/// so an `App`-level test can drive a real handoff where `Tui::new` cannot be constructed.
+pub(crate) fn build_command(launcher: &Launcher, entity: &EntityState) -> Command {
     let argv = launcher
         .source
         .resolve_argv(|name| std::env::var(name).ok());
