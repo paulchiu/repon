@@ -3403,7 +3403,7 @@ mod tests {
         );
     }
 
-    // --- issue #119: an unbuilt action dispatches nothing and answers with silence, not the
+    // --- an unbuilt action dispatches nothing and answers with silence, not the
     // shared warning slot `Warning::NotImplemented` used to. See
     // `every_unbuilt_binding_produces_nothing_on_press` below for the replacement anchor.
 

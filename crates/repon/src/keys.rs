@@ -1902,7 +1902,7 @@ mod tests {
         }
     }
 
-    // --- issue #119: an unbuilt binding dispatches nothing and advertises nowhere ---
+    // --- an unbuilt binding dispatches nothing and advertises nowhere ---
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
     /// an unbuilt binding "does not dispatch". Every row `unbuilt_bindings` names, pressed at

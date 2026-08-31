@@ -666,7 +666,7 @@ mod tests {
         }
     }
 
-    // --- issue #119: the real footer, unlike the ladder above, carries only Built bindings ---
+    // --- the real footer, unlike the ladder above, carries only Built bindings ---
 
     /// The mutation this catches: deleting `drop_unbuilt_then_budget`'s
     /// `.filter(|item| item.built)` line. `footer_line` dispatches every real context to
