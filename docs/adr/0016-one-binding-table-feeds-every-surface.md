@@ -33,6 +33,10 @@ Two more constraints are keyboard decisions rather than footnotes. Bracketed pas
 
 The table is no longer a pure function of context. While an Action is fanning out, `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch that re-runs discovery and a config reload that can delete the running entry each invalidate the run underneath itself. The footer is derived and follows for free, but the help overlay and the load time collision check are both over the static table and now describe keys that a moment of runtime state can disable. This ADR rejected lazygit's `GetDisabledReason` for making the escape hatch vanish where a user is most lost, and the narrower version taken here is four keys in one state rather than a general mechanism. See [0018](0018-an-action-is-a-fanout-of-pty-backed-steps.md).
 
+## Amended by 0024
+
+"Mouse capture is not enabled at all" above reads as never touching it, and that is not what ships: entry writes `DisableMouseCapture` unconditionally, because an inherited enabled state would otherwise take select-and-copy away for exactly the reason this ADR gives for the setting. Repon holds it off for the whole run and never restores it, which makes it the one piece of terminal state Repon claims and does not release. See [0024](0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md), which also carries the reopening condition this ADR names.
+
 ## Consequences
 
 - The footer and the help overlay contain no literal binding strings; both render from the table and are tested against it, so neither can drift from what the keys do.
