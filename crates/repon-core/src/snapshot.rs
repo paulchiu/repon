@@ -34,7 +34,6 @@ enum Settledness {
 /// Reads a [`Cell<T>`]'s contribution to the fold, uniformly across every payload
 /// type `EntityState` carries, without a shared payload trait.
 trait FoldableCell {
-    fn is_in_flight(&self) -> bool;
     fn settledness(&self) -> Option<Settledness>;
     /// Whether this Cell has ever settled to a genuine value: `Known`, `Unknown`
     /// or `Failed`. Never-probed and `NotApplicable` both read `false`, since
@@ -44,10 +43,6 @@ trait FoldableCell {
 }
 
 impl<T> FoldableCell for Cell<T> {
-    fn is_in_flight(&self) -> bool {
-        Cell::is_in_flight(self)
-    }
-
     fn settledness(&self) -> Option<Settledness> {
         match self.settled() {
             Some(Settled::NotApplicable) => None,
@@ -55,10 +50,15 @@ impl<T> FoldableCell for Cell<T> {
             Some(Settled::Known { stale: true, .. }) => Some(Settledness::Stale),
             Some(Settled::Unknown(_)) => Some(Settledness::Unknown),
             Some(Settled::Failed(_)) => Some(Settledness::Failed),
-            // Nothing has looked at this cell yet, only reachable before the first
-            // Generation covers the entity; it carries no settled fact yet, which
-            // folds the same as Unknown.
-            None => Some(Settledness::Unknown),
+            // Nothing has settled this Cell yet, whether a probe is currently
+            // running against it or none has been dispatched at all: it carries
+            // no settled fact for the fold to weigh, the same exclusion
+            // `NotApplicable` gets, rather than the `Unknown` this used to read
+            // as. `docs/spec/refresh.md`'s "What the gutter and the cells show"
+            // is what this excludes for: once the row holds another value, an
+            // outstanding Cell shows its own loading mark rather than dragging
+            // the row's gutter to `?`.
+            None => None,
         }
     }
 
@@ -72,21 +72,26 @@ impl<T> FoldableCell for Cell<T> {
 
 /// Folds one Entity's Cells into the state its row's gutter shows.
 ///
-/// In-flight outranks the least-settled summary only while the row holds no
-/// values at all, its first probe; once any Cell has settled to something, the
-/// gutter falls back to the row's least-settled settled state instead and the
-/// spinner moves into whichever Cells are still outstanding
-/// (`docs/spec/refresh.md`'s "What the gutter and the cells show", amended by
-/// ADR 0013). A `NotApplicable` Cell counts as holding no value either, and is
-/// excluded from the fold entirely, which is what lets a Repo row (Worktree
-/// state Not applicable by kind) or a Submodule row (`state` and `base` both Not
-/// applicable) read Fresh, or still show the first-probe spinner, on cells that
-/// simply do not apply. Otherwise the row shows its least settled Cell, widened
-/// by two entity-level derivations that are not Cells at all: an unparseable
-/// `.gitmodules` and a failed last Action both drive the row to `Failed` even
-/// when every Cell reads fine. The default branch's rung and its disagreement
-/// stay out, being metadata about how a value was obtained rather than a value
-/// that can itself fail.
+/// In-flight outranks the least-settled summary while the row holds no values
+/// at all, its first probe, regardless of whether a probe happens to be
+/// dispatched against it yet: `docs/spec/core-api.md`'s `Cell` carries the same
+/// "nothing has looked at this yet" fact either way, and
+/// `docs/spec/refresh.md`'s "Startup is Generation 1 with an empty prior state"
+/// is what makes that fact Loading rather than Unknown. Once any Cell has
+/// settled to something, the gutter falls back to the row's least-settled
+/// *settled* state instead, and a Cell nothing has settled yet is excluded from
+/// that fold exactly like `NotApplicable`: its own loading mark, drawn by the
+/// consumer, is what says a value is still coming (`docs/spec/refresh.md`'s
+/// "What the gutter and the cells show", amended by ADR 0013). A `NotApplicable`
+/// Cell is excluded from the fold entirely too, which is what lets a Repo row
+/// (Worktree state Not applicable by kind) or a Submodule row (`state` and
+/// `base` both Not applicable) read Fresh, or still show the first-probe
+/// spinner, on cells that simply do not apply. Otherwise the row shows its
+/// least settled Cell, widened by two entity-level derivations that are not
+/// Cells at all: an unparseable `.gitmodules` and a failed last Action both
+/// drive the row to `Failed` even when every Cell reads fine. The default
+/// branch's rung and its disagreement stay out, being metadata about how a
+/// value was obtained rather than a value that can itself fail.
 pub fn summary(entity: &EntityState) -> RowSummary {
     // Exhaustive: a Cell or derivation source added to EntityState or Diagnostics
     // later must be named here or the pattern fails to compile, so it cannot be
@@ -119,8 +124,14 @@ pub fn summary(entity: &EntityState) -> RowSummary {
 
     let cells: [&dyn FoldableCell; 6] = [branch, sync, base, dirty, state, default_branch];
 
+    // No dependence on `is_in_flight` here, deliberately: "nothing has looked at
+    // this Cell yet" and "a probe is running against it right now" are the same
+    // "no prior state" fact from a reader's point of view, and both must read
+    // Loading rather than Unknown (criterion 3). A row a Generation has not
+    // reached yet and a row whose first probe is already running therefore fold
+    // identically.
     let holds_no_values = cells.iter().all(|cell| !cell.holds_a_value());
-    if holds_no_values && cells.iter().any(|cell| cell.is_in_flight()) {
+    if holds_no_values {
         return RowSummary::InFlight;
     }
 
@@ -335,10 +346,10 @@ mod tests {
     /// A freshly constructed Repo's `state` cell is `NotApplicable` rather than
     /// merely never probed, so it is excluded from the fold rather than dragging
     /// the row to Unknown. Every other cell is made Fresh here so this only tells
-    /// a correct fold from a naive one once nothing else is outstanding, matching
-    /// the "every parent row carries a question mark in the gutter" defect this
-    /// fixes: an unset `state` cell folds as Unknown, per `settledness`'s own
-    /// `None => Unknown` arm above.
+    /// a correct fold from a naive one once nothing else is outstanding: a
+    /// genuinely never-settled Cell (as opposed to `NotApplicable`) would also
+    /// be excluded now, per `a_cell_nothing_has_ever_settled_is_excluded_from_the_fold_once_the_row_holds_other_values`
+    /// below, but this test is about the `NotApplicable` producer specifically.
     #[test]
     fn a_repo_rows_worktree_state_is_excluded_so_the_gutter_never_shows_a_question_mark() {
         let mut entity = EntityState::new(
@@ -462,6 +473,106 @@ mod tests {
         entity.branch.begin_probe();
 
         assert_eq!(summary(&entity), RowSummary::InFlight);
+    }
+
+    /// Criterion 3's "no prior state" case, constructed so the two readings this ticket
+    /// exists to tell apart would actually differ: nothing has ever settled this row *and*
+    /// no probe has even been dispatched yet (no `begin_probe` call anywhere), which is
+    /// exactly the state `docs/spec/core-api.md`'s `Cell` doc says "only happens before the
+    /// first Generation covers it". A fold that required `is_in_flight` to read InFlight
+    /// would read Unknown here instead, since nothing is in flight; `docs/spec/refresh.md`'s
+    /// "Startup is Generation 1 with an empty prior state" is why that would be wrong.
+    #[test]
+    fn a_row_with_no_prior_state_at_all_reads_in_flight_even_before_any_probe_is_dispatched() {
+        let entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("repo"))),
+            Arc::from("repo"),
+            Arc::from(Path::new("repo")),
+            Kind::Repo,
+        );
+        assert!(
+            !entity.branch.is_in_flight(),
+            "sanity check: nothing must be in flight yet"
+        );
+
+        assert_eq!(summary(&entity), RowSummary::InFlight);
+    }
+
+    /// Criterion 2's outstanding-cell case: a Cell nothing has ever settled must not drag an
+    /// otherwise-settled row down to Unknown once another Cell already holds a value, or
+    /// every row would read `?` forever behind any column a probe has not reached (today,
+    /// `sync`, `base` and `dirty`), rather than showing that column's own loading mark and
+    /// leaving the gutter to read the row's least-settled *settled* state instead
+    /// (`docs/spec/refresh.md`'s "What the gutter and the cells show"). A version of this
+    /// fold that only excluded `NotApplicable` and still read a bare `None` as Unknown would
+    /// fail exactly this case.
+    #[test]
+    fn a_cell_nothing_has_ever_settled_is_excluded_from_the_fold_once_the_row_holds_other_values() {
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("repo"))),
+            Arc::from("repo"),
+            Arc::from(Path::new("repo")),
+            Kind::Repo,
+        );
+        entity.branch.settle(
+            Generation::new(1),
+            Settled::Known {
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        // `sync`, `base` and `dirty` are left exactly as construction left them: never
+        // settled, and no probe dispatched against them either.
+
+        assert_eq!(
+            summary(&entity),
+            RowSummary::Fresh,
+            "a Cell nothing has ever settled must not drag an otherwise-settled row to Unknown"
+        );
+    }
+
+    /// The "truly fully populated" counterpart to the render layer's own predecessor-defect
+    /// test (`crates/repon/src/components/list.rs`'s
+    /// `a_row_that_already_shows_its_cheap_columns_still_animates_its_outstanding_cell_on_refresh`),
+    /// exercised here because only this crate can settle every one of the six Cells
+    /// `docs/spec/core-api.md`'s `EntityState` carries: `Cell::begin_probe` and `Cell::settle`
+    /// are `pub(crate)`. A row where every Cell already holds a Known value, reprobed on every
+    /// Cell at once, must keep exactly the same fold: `docs/spec/refresh.md`'s "re-probing
+    /// keeps the previous value" means a Cell that already answered shows that answer, not a
+    /// spinner, until a *new* answer lands, so the gutter must not move either. This is the
+    /// mirror of the other tests above: there, an in-flight Cell that already held a value was
+    /// shown not to elevate the row past a Failed one; here, refreshing *every* Cell of an
+    /// all-Fresh row is shown not to move it at all.
+    #[test]
+    fn reprobing_every_cell_of_an_already_fully_settled_row_never_changes_its_summary() {
+        let entity = fresh_entity("repo");
+        let before = summary(&entity);
+        assert_eq!(
+            before,
+            RowSummary::Fresh,
+            "sanity check: fresh_entity settles every Cell"
+        );
+
+        let mut reprobing = entity.clone();
+        reprobing.branch.begin_probe();
+        reprobing.sync.begin_probe();
+        reprobing.base.begin_probe();
+        reprobing.dirty.begin_probe();
+        reprobing.default_branch.begin_probe();
+        // `state` is excluded from a Repo row's fold (`NotApplicable`), so `begin_probe`
+        // is deliberately not called on it here: nothing would ever `settle` it back.
+        assert!(reprobing.branch.is_in_flight());
+
+        assert_eq!(
+            summary(&reprobing),
+            before,
+            "reprobing every already-settled Cell must not move the row's summary until a \
+             new answer actually lands"
+        );
     }
 
     #[test]
