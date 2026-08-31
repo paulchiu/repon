@@ -255,7 +255,35 @@ pub struct Core {
     /// to answer. Read only by `dispatch_log_for_test`.
     #[allow(dead_code)] // read only by dispatch_log_for_test
     dispatch_log: Arc<Mutex<Vec<EntityKey>>>,
+    /// Test-only synchronisation points, keyed by entity, letting a test hold the
+    /// dispatch loop's state and dirty probes open after that same entity's cheap
+    /// outcomes (branch, sync, default branch) have already landed on the table,
+    /// so [`refresh`]'s two applies can be proven independent with a blocking wait
+    /// rather than a sleep. Always present and normally empty: the dispatch loop
+    /// checks it for every entity, and an entity never registered here finds
+    /// nothing and proceeds exactly as if this field did not exist. Registered and
+    /// read only by the `_for_test` methods below.
+    #[allow(dead_code)] // populated and read only by tests
+    phase_c_gates: Arc<Mutex<HashMap<EntityKey, PhaseCGateHandle>>>,
 }
+
+/// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
+/// alongside it in [`Core::phase_c_gates`].
+#[derive(Default)]
+struct PhaseCGate {
+    /// Set once this entity's cheap outcomes have been applied to the table.
+    cheap_landed: bool,
+    /// Set by a test once it has observed `cheap_landed` and wants phase C (and
+    /// D) to proceed.
+    may_proceed: bool,
+    /// Set once this entity's phase C/D outcomes have been applied to the table
+    /// and the settle gate decremented for it.
+    finished: bool,
+}
+
+/// A [`PhaseCGate`] shared between the dispatch loop and the `_for_test` methods
+/// that register, wait on and release it.
+type PhaseCGateHandle = Arc<(Mutex<PhaseCGate>, Condvar)>;
 
 impl Core {
     /// Spawns the dedicated thread, runs one discovery walk to build the initial
@@ -403,6 +431,7 @@ impl Core {
             let patch_reads = Arc::clone(&self.patch_identity_reads);
             let patch_scan_bounds = Arc::clone(&self.patch_scan_bounds);
             let bound_gates = Arc::clone(&bound_gates);
+            let phase_c_gates = Arc::clone(&self.phase_c_gates);
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
                 let sync_outcome = probe_sync(
@@ -420,6 +449,42 @@ impl Core {
                     &chain_cache,
                     &chain_reads,
                 );
+
+                // Phases A and B land the moment they answer, per refresh.md's "The
+                // first frame": every cheap column filled within 200ms, never gated
+                // on phase C or D's much slower answers below. `default_branch_outcome`
+                // is cloned here rather than moved, since phase D's landing probe
+                // below still needs to read it.
+                apply_cheap_probe_outcomes(
+                    &table_handle,
+                    &key,
+                    generation,
+                    CheapProbeOutcomes {
+                        branch: branch_outcome,
+                        sync: sync_outcome,
+                        default_branch: default_branch_outcome.clone(),
+                    },
+                );
+
+                // Test-only: let a test hold phase C and D open here, after the cheap
+                // outcomes above are already visible on the table, so the two applies'
+                // independence can be proven by blocking on a Condvar rather than by racing
+                // a sleep against a probe. The lookup is its own statement, not the
+                // scrutinee of the `if let` below: an `if let`'s scrutinee temporaries live
+                // for the whole arm, so folding the lock into the condition would hold
+                // `phase_c_gates`'s own mutex for as long as this block blocks on
+                // `may_proceed`, deadlocking `release_phase_c_for_test`'s later attempt to
+                // lock that same map.
+                let held_gate = phase_c_gates.lock().unwrap().get(&key).cloned();
+                if let Some(gate) = held_gate {
+                    let (lock, cvar) = &*gate;
+                    let mut state = lock.lock().unwrap();
+                    state.cheap_landed = true;
+                    cvar.notify_all();
+                    state = cvar.wait_while(state, |state| !state.may_proceed).unwrap();
+                    drop(state);
+                }
+
                 let state_outcome = if probes_state {
                     let gate = bound_gates
                         .get(&common_dir)
@@ -446,16 +511,21 @@ impl Core {
                 apply_probe_outcome(
                     &table_handle,
                     &settle_gate,
-                    key,
+                    &key,
                     generation,
                     ProbeOutcomes {
-                        branch: branch_outcome,
-                        sync: sync_outcome,
-                        default_branch: default_branch_outcome,
                         state: state_outcome,
                         dirty: dirty_outcome,
                     },
                 );
+
+                let held_gate = phase_c_gates.lock().unwrap().get(&key).cloned();
+                if let Some(gate) = held_gate {
+                    let (lock, cvar) = &*gate;
+                    let mut state = lock.lock().unwrap();
+                    state.finished = true;
+                    cvar.notify_all();
+                }
             });
         }
 
@@ -760,6 +830,72 @@ impl Core {
         self.dispatch_log.lock().unwrap().clone()
     }
 
+    /// Registers a closed phase C/D gate for `key`, so the next `refresh` that
+    /// dispatches it will land its cheap outcomes, then block before touching
+    /// phase C or D until [`Core::release_phase_c_for_test`] opens the gate.
+    /// Must be called before the dispatching `refresh`, since the dispatch loop
+    /// only consults this map once, right after the cheap outcomes are applied.
+    pub(crate) fn hold_phase_c_for_test(&self, key: &EntityKey) {
+        self.phase_c_gates.lock().unwrap().insert(
+            key.clone(),
+            Arc::new((Mutex::new(PhaseCGate::default()), Condvar::new())),
+        );
+    }
+
+    /// Blocks the calling thread, with no sleep or poll, until `key`'s cheap
+    /// outcomes have landed on the table. Panics if `key` has no gate
+    /// registered, since that means the test forgot [`Core::hold_phase_c_for_test`].
+    pub(crate) fn wait_phase_c_landed_for_test(&self, key: &EntityKey) {
+        let gate = self
+            .phase_c_gates
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .expect("hold_phase_c_for_test must be called before waiting on its gate");
+        let (lock, cvar) = &*gate;
+        let guard = lock.lock().unwrap();
+        drop(cvar.wait_while(guard, |state| !state.cheap_landed).unwrap());
+    }
+
+    /// Lets `key`'s held phase C and D proceed. Does not itself wait for them to
+    /// finish; pair with [`Core::wait_phase_c_finished_for_test`].
+    pub(crate) fn release_phase_c_for_test(&self, key: &EntityKey) {
+        let gate = self
+            .phase_c_gates
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .expect("hold_phase_c_for_test must be called before releasing its gate");
+        let (lock, cvar) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.may_proceed = true;
+        cvar.notify_all();
+    }
+
+    /// Blocks the calling thread, with no sleep or poll, until `key`'s phase C/D
+    /// outcome has been applied and the settle gate decremented for it.
+    pub(crate) fn wait_phase_c_finished_for_test(&self, key: &EntityKey) {
+        let gate = self
+            .phase_c_gates
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .expect("hold_phase_c_for_test must be called before waiting on its gate");
+        let (lock, cvar) = &*gate;
+        let guard = lock.lock().unwrap();
+        drop(cvar.wait_while(guard, |state| !state.finished).unwrap());
+    }
+
+    /// The settle gate's raw outstanding count, so a test can prove a single
+    /// dispatched entity's split write decrements it exactly once overall,
+    /// neither twice (an early `settle`) nor zero times (a `settle` that hangs).
+    pub(crate) fn settle_gate_count_for_test(&self) -> usize {
+        *self.settle_gate.0.lock().unwrap()
+    }
+
     /// `start`, with the tick source and the discovery-slow warning's threshold
     /// injected rather than real, so a test drives the dedicated thread's cadence
     /// through a channel it controls and never waits out a real second.
@@ -865,28 +1001,25 @@ impl Core {
         cancels
     }
 
-    /// Lands one probe result for `key` at `generation` through the exact same
-    /// path a real dispatched probe's completion takes
-    /// ([`apply_probe_outcome`]), so a test can simulate a result arriving late,
-    /// out of Generation order, without a second, weaker implementation of the
-    /// write-time supersession check.
+    /// Lands one branch probe result for `key` at `generation` through the exact
+    /// same path a real dispatched probe's cheap outcomes take
+    /// ([`apply_cheap_probe_outcomes`]), so a test can simulate a result arriving
+    /// late, out of Generation order, without a second, weaker implementation of
+    /// the write-time supersession check.
     pub(crate) fn apply_probe_result_for_test(
         &self,
         key: &EntityKey,
         generation: Generation,
         settled: Settled<Head>,
     ) {
-        apply_probe_outcome(
+        apply_cheap_probe_outcomes(
             &self.table,
-            &self.settle_gate,
-            key.clone(),
+            key,
             generation,
-            ProbeOutcomes {
+            CheapProbeOutcomes {
                 branch: Some((settled, None, Vec::new())),
                 sync: None,
                 default_branch: None,
-                state: None,
-                dirty: None,
             },
         );
     }
@@ -1018,6 +1151,7 @@ fn start_internal(
             patch_identity_reads: Arc::new(AtomicUsize::new(0)),
             patch_scan_bounds: Arc::new(Mutex::new(Vec::new())),
             dispatch_log: Arc::new(Mutex::new(Vec::new())),
+            phase_c_gates: Arc::new(Mutex::new(HashMap::new())),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1796,10 +1930,11 @@ fn probe_default_branch_memoised(
     Some(default_branch::resolve_with_facts(&facts, override_branch))
 }
 
-/// One dispatched probe's per-cell outcomes, named rather than positional so a
-/// transposed pair of trailing `None`s cannot compile silently into the wrong
-/// cell.
-struct ProbeOutcomes {
+/// Phase A and B's per-cell outcomes, landed as soon as they are computed via
+/// [`apply_cheap_probe_outcomes`], well before phase C or D answer. Named rather
+/// than positional so a transposed pair of trailing `None`s cannot compile
+/// silently into the wrong cell.
+struct CheapProbeOutcomes {
     branch: Option<(
         Settled<Head>,
         Option<git::InProgressOperation>,
@@ -1807,39 +1942,29 @@ struct ProbeOutcomes {
     )>,
     sync: Option<Settled<SyncState>>,
     default_branch: Option<default_branch::Resolution>,
-    state: Option<Settled<WorktreeState>>,
-    dirty: Option<Settled<DirtyCounts>>,
 }
 
-/// Lands one probe's combined outcome for `key` at `generation`: writes the
-/// branch, default-branch and `state` cells subject to the per-cell supersession
-/// `Cell::settle` already enforces, records the default-branch diagnostics only
-/// on the write that actually won, clears `key` from the table's in-flight set
-/// and signals `settle_gate` once for the whole entity. The one place a
-/// dispatched probe's result and a test's simulated late result both go through,
-/// so a test can land a result out of order without duplicating this bookkeeping.
-///
-/// `outcomes.state` being `None` writes nothing at all: the `state` cell is
-/// left exactly as unsettled as `begin_probe` alone leaves it, which is what an
-/// entity `landing::probe` and then `probe_patch_equivalence` both leave
-/// `Outstanding` (an unborn HEAD, still with no commit to prove anything from)
-/// still shows.
-fn apply_probe_outcome(
+/// Writes phase A and B's cells for `key` at `generation`, subject to the
+/// per-cell supersession `Cell::settle` already enforces, and records the
+/// default-branch diagnostics only on the write that actually won. Deliberately
+/// does not touch `in_flight` or `settle_gate`: those belong to whichever apply
+/// closes out the entity's dispatch, which per
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The first frame" is this call's whole point, since a slow phase C or D must
+/// never hold these cells off the table.
+fn apply_cheap_probe_outcomes(
     table: &Arc<RwLock<Table>>,
-    settle_gate: &Arc<(Mutex<usize>, Condvar)>,
-    key: EntityKey,
+    key: &EntityKey,
     generation: Generation,
-    outcomes: ProbeOutcomes,
+    outcomes: CheapProbeOutcomes,
 ) {
-    let ProbeOutcomes {
+    let CheapProbeOutcomes {
         branch: branch_outcome,
         sync: sync_outcome,
         default_branch: default_branch_outcome,
-        state: state_outcome,
-        dirty: dirty_outcome,
     } = outcomes;
     let mut table = table.write().unwrap();
-    if let Some(&idx) = table.index.get(&key) {
+    if let Some(&idx) = table.index.get(key) {
         if let Some((settled, in_progress, recent)) = branch_outcome {
             table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
         }
@@ -1849,6 +1974,43 @@ fn apply_probe_outcome(
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
         }
+    }
+}
+
+/// Phase C and D's per-cell outcomes, landed once they answer, via
+/// [`apply_probe_outcome`]: named rather than positional for the same reason as
+/// [`CheapProbeOutcomes`].
+struct ProbeOutcomes {
+    state: Option<Settled<WorktreeState>>,
+    dirty: Option<Settled<DirtyCounts>>,
+}
+
+/// Lands one probe's phase C/D outcome for `key` at `generation`: writes the
+/// `state` and `dirty` cells subject to the per-cell supersession `Cell::settle`
+/// already enforces, then clears `key` from the table's in-flight set and
+/// signals `settle_gate` once for the whole entity. This is the one write that
+/// closes out a dispatched entity, whether or not [`apply_cheap_probe_outcomes`]
+/// already landed that same entity's cheap cells; a test's simulated late result
+/// goes through the same path so it does not duplicate this bookkeeping.
+///
+/// `outcomes.state` being `None` writes nothing at all: the `state` cell is
+/// left exactly as unsettled as `begin_probe` alone leaves it, which is what an
+/// entity `landing::probe` and then `probe_patch_equivalence` both leave
+/// `Outstanding` (an unborn HEAD, still with no commit to prove anything from)
+/// still shows.
+fn apply_probe_outcome(
+    table: &Arc<RwLock<Table>>,
+    settle_gate: &Arc<(Mutex<usize>, Condvar)>,
+    key: &EntityKey,
+    generation: Generation,
+    outcomes: ProbeOutcomes,
+) {
+    let ProbeOutcomes {
+        state: state_outcome,
+        dirty: dirty_outcome,
+    } = outcomes;
+    let mut table = table.write().unwrap();
+    if let Some(&idx) = table.index.get(key) {
         if let Some(settled) = state_outcome {
             table.entities[idx].state.settle(generation, settled);
         }
@@ -1856,7 +2018,7 @@ fn apply_probe_outcome(
             table.entities[idx].dirty.settle(generation, settled);
         }
     }
-    table.in_flight.remove(&key);
+    table.in_flight.remove(key);
     drop(table);
     complete_one(settle_gate);
 }
@@ -2140,6 +2302,134 @@ mod tests {
                 entity.dirty.settled()
             );
         }
+    }
+
+    /// refresh.md's "The first frame" budget (cheap columns filled within 200ms) is
+    /// unreachable if the cheap outcomes wait behind phase C, so this proves the two
+    /// applies are independent with a blocking seam rather than a sleep or a wall-clock
+    /// deadline: `Core::hold_phase_c_for_test` holds phase C (and D) open after the cheap
+    /// outcomes have already landed, and the test observes `branch` settled while `dirty`
+    /// is still in flight. Run this against a version that bundles every outcome into one
+    /// apply placed after phase C computes (this ticket's regression) and it fails, since
+    /// nothing writes `branch` until that single bundled apply lands alongside `dirty`.
+    #[test]
+    fn cheap_outcomes_land_before_a_held_phase_c_settles() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.hold_phase_c_for_test(&key);
+        core.refresh(std::slice::from_ref(&key));
+        core.wait_phase_c_landed_for_test(&key);
+
+        let mid_flight = core.snapshot();
+        let entity = mid_flight
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("entity present");
+        assert!(
+            matches!(
+                entity.branch.settled(),
+                Some(Settled::Known {
+                    value: Head::Branch { .. },
+                    ..
+                })
+            ),
+            "the cheap branch cell must be readable while phase C is still held open, got {:?}",
+            entity.branch.settled()
+        );
+        assert!(
+            entity.dirty.settled().is_none() && entity.dirty.is_in_flight(),
+            "phase C is deliberately held open here; a bundled apply would already have \
+             written this cell alongside branch, got {:?}",
+            entity.dirty.settled()
+        );
+
+        core.release_phase_c_for_test(&key);
+        core.wait_phase_c_finished_for_test(&key);
+
+        let settled = core.snapshot();
+        let entity = settled
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("entity present");
+        assert!(
+            matches!(entity.dirty.settled(), Some(Settled::Known { .. })),
+            "phase C must settle once released, got {:?}",
+            entity.dirty.settled()
+        );
+    }
+
+    /// Splitting one dispatched entity's write into a cheap apply and a phase C/D apply
+    /// must still signal `settle_gate` exactly once per entity, or `settle` hangs (never
+    /// decremented enough) or returns early (decremented twice). Two entities held open
+    /// together prove the exact count at each step: a mutation that also decrements the
+    /// gate from the cheap apply leaves it at 0 instead of 2 after both entities' cheap
+    /// outcomes land, and a mutation that drops the decrement from the phase C/D apply
+    /// leaves it at 2, never 1, once only the first entity finishes.
+    #[test]
+    fn splitting_the_probe_write_signals_settle_gate_exactly_once_per_entity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("a"));
+        init_repo_with_a_commit(&root.join("b"));
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let key_a = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "a")
+            .expect("entity a present")
+            .key
+            .clone();
+        let key_b = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "b")
+            .expect("entity b present")
+            .key
+            .clone();
+
+        core.hold_phase_c_for_test(&key_a);
+        core.hold_phase_c_for_test(&key_b);
+        core.refresh(&[key_a.clone(), key_b.clone()]);
+        assert_eq!(
+            core.settle_gate_count_for_test(),
+            2,
+            "dispatching two entities must add exactly two to the settle gate"
+        );
+
+        core.wait_phase_c_landed_for_test(&key_a);
+        core.wait_phase_c_landed_for_test(&key_b);
+        assert_eq!(
+            core.settle_gate_count_for_test(),
+            2,
+            "the cheap apply must never touch the settle gate: both entities' cheap \
+             outcomes have landed and neither has finished phase C yet"
+        );
+
+        core.release_phase_c_for_test(&key_a);
+        core.wait_phase_c_finished_for_test(&key_a);
+        assert_eq!(
+            core.settle_gate_count_for_test(),
+            1,
+            "exactly one entity finished, so the gate must fall by exactly one, not two \
+             (double-counted) and not zero (left short)"
+        );
+
+        core.release_phase_c_for_test(&key_b);
+        core.wait_phase_c_finished_for_test(&key_b);
+        assert_eq!(
+            core.settle_gate_count_for_test(),
+            0,
+            "both entities finished, so the gate must be fully drained"
+        );
     }
 
     /// Criterion 5, the honest half: a concurrent pool's *completion* order is not

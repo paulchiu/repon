@@ -201,12 +201,16 @@ impl App {
         let active_set = ActiveSet::from_config(active_set_config);
 
         let core = Core::start(reload::core_spec(&config.document, &active_set));
-        // Discovery already ran inside `Core::start`; dispatch the identity probe for
-        // every row it found so the list fills in progressively rather than sitting on
-        // blank branch cells until something else asks for a refresh. The cursor starts on
-        // row zero and nothing has narrowed `visible` yet, so `dispatch_order` here is not
-        // a reordering, only the same three-tier computation every `refresh` call is meant
-        // to go through.
+        // Discovery already ran inside `Core::start`; dispatch the identity probe for every
+        // row it found so the list fills in progressively rather than sitting on blank branch
+        // cells until something else asks for a refresh. This is `dispatch_order`'s only
+        // production call site today, and it is a no-op here: before the first frame there is
+        // no rendered viewport to narrow `visible`, so cursor, visible and discovery order are
+        // all `keys` and the three-tier split returns its input unchanged. A call site with a
+        // real cursor and viewport would read them from `self.cursor_key()` and
+        // `self.visible_keys()`, which is what `Action::RefreshAll` and
+        // `Action::RefreshSelection` need once `handle_key_event` grows arms for them; today
+        // both fall through to that match's wildcard and never call `core.refresh` at all.
         let keys = entity_keys(&core.snapshot());
         core.refresh(&dispatch_order(keys.first(), &keys, &keys));
 
@@ -653,7 +657,10 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
 /// file count or any other predicted-cost signal, per `refresh.md`'s own reason why not
 /// (`.git` size does not predict cost, and the real predictor costs a full walk to learn),
 /// which is why that reasoning lives in the one place refresh.md states it rather than
-/// repeated in a comment here.
+/// repeated in a comment here. This signature is the real guarantee: the three parameters
+/// below carry only positions, never a size or a count, so there is nothing here for a cost
+/// comparator to read. The source scan in the test module only catches an inline mistake in
+/// this function's own text, not a sort hidden behind a helper call or a hand-rolled loop.
 fn dispatch_order(
     cursor: Option<&EntityKey>,
     visible: &[EntityKey],
@@ -1494,16 +1501,23 @@ mod tests {
         assert_eq!(order, vec![key("b"), key("a"), key("c")]);
     }
 
-    /// Criterion 3's absence half: `dispatch_order` never sorts, since a comparator is
-    /// exactly the shape a predicted-cost ordering would take (`.git` size, working-tree
-    /// file count, or anything else refresh.md's own reasoning rules out). Scoped to this
-    /// function's own source text rather than the whole file or crate, so an unrelated sort
-    /// elsewhere in this crate (there are several, none about dispatch order) cannot trip it;
-    /// `refresh_dispatches_phase_c_in_exactly_the_order_it_is_given` in `repon-core`'s own
-    /// `core.rs` is the sibling proof that `Core::refresh` does not introduce one either,
-    /// which is the other crate this ordering could live in.
+    /// A narrower claim than the name once made: this only proves `dispatch_order`'s own
+    /// lexical body contains no literal call to a sorting primitive and no literal `cost`
+    /// identifier. It does not, and cannot, prove the wider absence-of-cost-ordering claim,
+    /// because two evasions sit outside what a source scan can see: the sort could be
+    /// extracted into a helper `dispatch_order` calls, landing outside the scanned slice, or
+    /// it could be a hand-rolled insertion sort or a `binary_search_by`-based reordering,
+    /// which none of the four needles below name. `dispatch_order`'s own doc comment records
+    /// what actually rules those out: its signature carries no size or count for a cost
+    /// comparator to read in the first place, and
+    /// `dispatch_order_matches_pure_position_based_tiering_for_many_inputs` below proves the
+    /// observable behaviour matches that positional definition directly, rather than
+    /// inferring it from the absence of certain words. Scoped to this function's own source
+    /// text rather than the whole file or crate, so an unrelated sort elsewhere in this crate
+    /// (there are several, none about dispatch order) cannot trip it; renaming or moving
+    /// `dispatch_order` still fails loudly via the `.expect` below.
     #[test]
-    fn dispatch_order_never_sorts_by_any_computed_key() {
+    fn dispatch_order_body_contains_no_literal_sort_call_or_cost_identifier() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = production_source_at(&manifest_dir.join("src/app.rs"));
         let start = source
@@ -1537,6 +1551,79 @@ mod tests {
                 "found `{needle}` inside dispatch_order's own body; order must come from \
                  position alone, never a computed comparator: {function_source}"
             );
+        }
+    }
+
+    /// The behavioural half of criterion 3's absence claim: for a spread of cursor, visible
+    /// and discovery-order combinations, `dispatch_order`'s actual output is computed here
+    /// independently, by the definition `refresh.md`'s "Scope and order" states in words
+    /// (cursor, then the remaining visible rows, then the rest in discovery order, each key
+    /// once, at its earliest tier), and compared against the real function's output. Sharing
+    /// no code with `dispatch_order` itself, so this cannot pass merely by agreeing with its
+    /// implementation, only with the specification. `discovery_order` here is shuffled per
+    /// case specifically so a hidden sort keyed on discovery position (the one thing a source
+    /// scan cannot see if it lived behind a helper) would show up as a mismatch against the
+    /// independently computed reference.
+    #[test]
+    fn dispatch_order_matches_pure_position_based_tiering_for_many_inputs() {
+        /// The reference definition, independent of `dispatch_order`'s own code: walk
+        /// `cursor` then `visible` then `discovery_order`, keeping each key's first
+        /// appearance, dropping anything `discovery_order` does not itself contain.
+        fn reference_tiering(
+            cursor: Option<&EntityKey>,
+            visible: &[EntityKey],
+            discovery_order: &[EntityKey],
+        ) -> Vec<EntityKey> {
+            let population: std::collections::HashSet<&EntityKey> =
+                discovery_order.iter().collect();
+            let mut seen: std::collections::HashSet<EntityKey> = std::collections::HashSet::new();
+            let mut result = Vec::new();
+            for key in cursor.into_iter().chain(visible).chain(discovery_order) {
+                if population.contains(key) && seen.insert(key.clone()) {
+                    result.push(key.clone());
+                }
+            }
+            result
+        }
+
+        let keys: Vec<EntityKey> = (0..12).map(|index| key(&format!("k{index}"))).collect();
+
+        // Each case names a discovery order (deliberately not the keys' declaration order, so
+        // a scoping-by-declaration-order mistake would show up), a visible subset and a
+        // cursor, including cases with no cursor. The last discovery order is a strict subset
+        // of `keys`, which is what turns cursor `Some(9)` and visible index 9 below into a
+        // genuinely out-of-population entry for that case.
+        let discovery_orders: [&[usize]; 4] = [
+            &[7, 0, 11, 3, 5, 9, 1, 8, 2, 10, 4, 6],
+            &[4, 6, 8, 10, 0, 2, 5, 7, 9, 11, 1, 3],
+            &[11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            &[7, 0, 3, 5, 1, 8, 2, 4],
+        ];
+        let visible_index_sets: [&[usize]; 3] = [&[], &[9, 5, 3], &[0, 1, 2, 3, 4, 5]];
+        let cursors: [Option<usize>; 3] = [None, Some(5), Some(9)];
+
+        for discovery_indices in discovery_orders {
+            let discovery_order: Vec<EntityKey> = discovery_indices
+                .iter()
+                .map(|&index| keys[index].clone())
+                .collect();
+            for visible_indices in visible_index_sets {
+                let visible: Vec<EntityKey> = visible_indices
+                    .iter()
+                    .map(|&index| keys[index].clone())
+                    .collect();
+                for cursor_index in cursors {
+                    let cursor_key = cursor_index.map(|index| keys[index].clone());
+                    let expected =
+                        reference_tiering(cursor_key.as_ref(), &visible, &discovery_order);
+                    let actual = dispatch_order(cursor_key.as_ref(), &visible, &discovery_order);
+                    assert_eq!(
+                        actual, expected,
+                        "dispatch_order({cursor_key:?}, {visible:?}, {discovery_order:?}) must \
+                         equal the position-only reference tiering"
+                    );
+                }
+            }
         }
     }
 }
