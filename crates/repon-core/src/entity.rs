@@ -71,6 +71,23 @@ pub struct AheadBehind {
     pub behind: u32,
 }
 
+/// The `sync` cell's settled value: a live upstream's ahead/behind counts, or one of
+/// two facts that preclude a count. `NoRemote` outranks `NoUpstream`, since a Repo
+/// with no remote at all makes every one of its rows, branch or not, unable to have
+/// an upstream in the first place
+/// ([layout-and-provenance.md](https://github.com/paulchiu/repon/blob/main/docs/spec/layout-and-provenance.md)'s
+/// "Glyphs").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncState {
+    /// A live upstream: its ahead/behind counts.
+    Tracking(AheadBehind),
+    /// No branch at all, or a branch with no upstream configured.
+    NoUpstream,
+    /// The Repo has no remote at all, on this row and every one of its Worktree
+    /// rows.
+    NoRemote,
+}
+
 /// The four mutually exclusive Worktree states, proven by ancestry or patch
 /// equivalence. `Dirty` is a separate, orthogonal cell, not a fifth arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +283,7 @@ pub struct EntityState {
     pub common_dir: Arc<Path>,
     pub kind: Kind,
     pub branch: Cell<Head>,
-    pub sync: Cell<AheadBehind>,
+    pub sync: Cell<SyncState>,
     pub base: Cell<u32>,
     pub dirty: Cell<u32>,
     pub state: Cell<WorktreeState>,
@@ -496,6 +513,30 @@ mod tests {
         assert_eq!(name(WorktreeState::Active), "active");
     }
 
+    /// Absence claim: the three `SyncState` variants are the whole set. This match has no
+    /// wildcard arm, so a fourth variant added to `SyncState` (issue #44) fails to compile
+    /// here rather than silently falling through an `_`.
+    #[test]
+    fn sync_state_is_exactly_three_mutually_exclusive_variants() {
+        fn name(value: SyncState) -> &'static str {
+            match value {
+                SyncState::Tracking(_) => "tracking",
+                SyncState::NoUpstream => "no_upstream",
+                SyncState::NoRemote => "no_remote",
+            }
+        }
+
+        assert_eq!(
+            name(SyncState::Tracking(AheadBehind {
+                ahead: 0,
+                behind: 0
+            })),
+            "tracking"
+        );
+        assert_eq!(name(SyncState::NoUpstream), "no_upstream");
+        assert_eq!(name(SyncState::NoRemote), "no_remote");
+    }
+
     // --- StepOutcome / StepResult / ActionReceipt: the receipt widening, docs/spec/actions.md ---
 
     /// Absence claim: the four `StepOutcome` variants are the whole set. This match has no
@@ -652,10 +693,10 @@ mod tests {
         entity.sync.settle(
             generation,
             Settled::Known {
-                value: AheadBehind {
+                value: SyncState::Tracking(AheadBehind {
                     ahead: 1,
                     behind: 2,
-                },
+                }),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -706,7 +747,7 @@ mod tests {
         }
         match entity.sync.settled() {
             Some(Settled::Known {
-                value: AheadBehind { ahead, behind },
+                value: SyncState::Tracking(AheadBehind { ahead, behind }),
                 stale: true,
                 ..
             }) => {

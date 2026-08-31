@@ -164,7 +164,8 @@ mod tests {
 
     use super::*;
     use crate::entity::{
-        AheadBehind, DefaultBranch, EntityKey, Head, Kind, StepOutcome, StepResult, WorktreeState,
+        AheadBehind, DefaultBranch, EntityKey, Head, Kind, StepOutcome, StepResult, SyncState,
+        WorktreeState,
     };
 
     /// One receipt, one step per outcome given, in order: enough for the fold's own tests,
@@ -210,10 +211,10 @@ mod tests {
         entity.sync.settle(
             generation,
             Settled::Known {
-                value: AheadBehind {
+                value: SyncState::Tracking(AheadBehind {
                     ahead: 0,
                     behind: 0,
-                },
+                }),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -304,10 +305,10 @@ mod tests {
         entity.sync.settle(
             generation,
             Settled::Known {
-                value: AheadBehind {
+                value: SyncState::Tracking(AheadBehind {
                     ahead: 0,
                     behind: 0,
-                },
+                }),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -362,10 +363,10 @@ mod tests {
         entity.sync.settle(
             generation,
             Settled::Known {
-                value: AheadBehind {
+                value: SyncState::Tracking(AheadBehind {
                     ahead: 0,
                     behind: 0,
-                },
+                }),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -713,10 +714,10 @@ mod tests {
         entity.sync.settle(
             generation,
             Settled::Known {
-                value: AheadBehind {
+                value: SyncState::Tracking(AheadBehind {
                     ahead: 0,
                     behind: 0,
-                },
+                }),
                 at: Timestamp::now(),
                 stale: false,
             },

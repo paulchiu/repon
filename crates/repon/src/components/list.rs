@@ -7,7 +7,7 @@
 
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
-use repon_core::{AheadBehind, Cell, EntityState, Head, Settled, Snapshot, WorktreeState, summary};
+use repon_core::{Cell, EntityState, Head, Settled, Snapshot, SyncState, WorktreeState, summary};
 
 use super::Component;
 use crate::{config::Config, glyphs::GlyphSet, theme};
@@ -251,7 +251,7 @@ fn draw_row(
         interior.x + SYNC_X,
         y,
         SYNC_WIDTH,
-        &format_ahead_behind(&entity.sync, glyphs),
+        &format_sync(&entity.sync, glyphs),
         style,
     );
     write_cell(
@@ -359,23 +359,33 @@ fn format_head(cell: &Cell<Head>) -> String {
     })
 }
 
-/// `sync`'s glyph: `≡` level, `↑n`/`↓n` otherwise, per
+/// `sync`'s glyph: `∅` no remote at all, `-` no branch or no upstream, `≡` level, `↑n`/`↓n`
+/// otherwise, per
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
-/// glyphs for real values".
-fn format_ahead_behind(cell: &Cell<AheadBehind>, glyphs: &'static GlyphSet) -> String {
-    render_cell(cell.settled(), |value| {
-        if value.ahead == 0 && value.behind == 0 {
-            return glyphs.in_sync.to_string();
+/// glyphs for real values". Exhaustive over [`SyncState`], so a variant added there later
+/// fails to compile here instead of silently rendering blank.
+fn sync_glyph(value: &SyncState, glyphs: &'static GlyphSet) -> String {
+    match value {
+        SyncState::NoRemote => glyphs.no_remote.to_string(),
+        SyncState::NoUpstream => glyphs.no_upstream.to_string(),
+        SyncState::Tracking(counts) if counts.ahead == 0 && counts.behind == 0 => {
+            glyphs.in_sync.to_string()
         }
-        let mut parts = Vec::new();
-        if value.ahead > 0 {
-            parts.push(format!("{}{}", glyphs.ahead, value.ahead));
+        SyncState::Tracking(counts) => {
+            let mut parts = Vec::new();
+            if counts.ahead > 0 {
+                parts.push(format!("{}{}", glyphs.ahead, counts.ahead));
+            }
+            if counts.behind > 0 {
+                parts.push(format!("{}{}", glyphs.behind, counts.behind));
+            }
+            parts.join(" ")
         }
-        if value.behind > 0 {
-            parts.push(format!("{}{}", glyphs.behind, value.behind));
-        }
-        parts.join(" ")
-    })
+    }
+}
+
+fn format_sync(cell: &Cell<SyncState>, glyphs: &'static GlyphSet) -> String {
+    render_cell(cell.settled(), |value| sync_glyph(value, glyphs))
 }
 
 /// `base`'s glyph: `≡` level, `↓n` behind. No ahead-of-default glyph exists, per
@@ -425,8 +435,8 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend, style::Color};
     use repon_core::{
-        EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot, Timestamp,
-        Unknown,
+        AheadBehind, EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot,
+        Timestamp, Unknown,
     };
 
     use crate::app::SIDEBAR_WIDTH;
@@ -804,12 +814,12 @@ mod tests {
     fn no_numeric_bearing_cell_ever_renders_a_raw_default_instead_of_blank() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         let unset: Cell<u32> = Cell::default();
-        let unset_sync: Cell<AheadBehind> = Cell::default();
+        let unset_sync: Cell<SyncState> = Cell::default();
 
         for text in [
             format_base(&unset, glyphs),
             format_dirty(&unset, glyphs),
-            format_ahead_behind(&unset_sync, glyphs),
+            format_sync(&unset_sync, glyphs),
         ] {
             assert_eq!(
                 text, "",
@@ -820,6 +830,89 @@ mod tests {
                 "an uncomputed numeric-bearing cell must never render a raw zero default"
             );
         }
+    }
+
+    /// Criterion 4's own vocabulary, one variant at a time: every [`SyncState`] shape
+    /// renders through its own named glyph field rather than a shared fallback, so a
+    /// mistake wiring one variant to another value's field shows up here rather than
+    /// only in a hand-eyeballed screenshot.
+    #[test]
+    fn sync_glyph_renders_each_sync_state_through_its_own_named_glyph() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(sync_glyph(&SyncState::NoRemote, glyphs), "∅");
+        assert_eq!(sync_glyph(&SyncState::NoUpstream, glyphs), "-");
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            "≡"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 3,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            "↑3"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 5
+                }),
+                glyphs
+            ),
+            "↓5"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 2,
+                    behind: 4
+                }),
+                glyphs
+            ),
+            "↑2 ↓4",
+            "diverged both ways must show both counts, ahead before behind"
+        );
+    }
+
+    /// The ascii table's own glyphs for the same six shapes, so a table selected by
+    /// `glyphs = "ascii"` is exercised too, not only the default `full` table.
+    #[test]
+    fn sync_glyph_renders_each_sync_state_through_the_ascii_table_too() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+
+        assert_eq!(sync_glyph(&SyncState::NoRemote, glyphs), "x");
+        assert_eq!(sync_glyph(&SyncState::NoUpstream, glyphs), "-");
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 1,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            ">1"
+        );
+        assert_eq!(
+            sync_glyph(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 1
+                }),
+                glyphs
+            ),
+            "<1"
+        );
     }
 
     #[test]

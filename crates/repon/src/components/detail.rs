@@ -7,8 +7,8 @@
 
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    ActionReceipt, AheadBehind, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState,
-    Head, InProgressOperation, Kind, Settled, Timestamp, Unknown,
+    ActionReceipt, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState, Head,
+    InProgressOperation, Kind, Settled, SyncState, Timestamp, Unknown,
 };
 
 use super::list::worktree_state_word;
@@ -259,8 +259,15 @@ fn head_word(value: &Head) -> String {
     }
 }
 
-fn sync_word(value: &AheadBehind) -> String {
-    format!("{} ahead, {} behind", value.ahead, value.behind)
+/// Exhaustive over [`SyncState`], the same discipline [`stopped_word`] holds over
+/// [`DefaultBranchStopped`]: a variant added there later fails to compile here rather than
+/// silently falling through a wildcard arm.
+fn sync_word(value: &SyncState) -> String {
+    match value {
+        SyncState::Tracking(counts) => format!("{} ahead, {} behind", counts.ahead, counts.behind),
+        SyncState::NoUpstream => "no upstream configured".to_string(),
+        SyncState::NoRemote => "no remote configured".to_string(),
+    }
 }
 
 fn base_word(value: &u32) -> String {
@@ -905,10 +912,10 @@ mod tests {
     /// the one pair the type system does not guard, both `Cell<u32>`, so a wiring bug that
     /// reads one from the other compiles silently; every other pair has a distinct Cell type
     /// and could not compile if `content_lines` swapped them. A Kind::Submodule entity is
-    /// built from a real disposable repository (`branch` and `default_branch` are the only
-    /// two Cells this crate probes for real today) nested under a `.gitmodules` boundary,
-    /// which construction alone settles `state` and `base` to `NotApplicable` while `sync`
-    /// and `dirty` stay forever unprobed: exactly the combination that gives `base` and
+    /// built from a real disposable repository (`branch`, `default_branch` and `sync` are
+    /// the three Cells this crate probes for real today) nested under a `.gitmodules`
+    /// boundary, which construction alone settles `state` and `base` to `NotApplicable`
+    /// while `dirty` stays forever unprobed: exactly the combination that gives `base` and
     /// `dirty` distinct, non-`Known` text ("not applicable" against "loading") without a way
     /// to reach into a private `Cell` from this crate.
     #[test]
@@ -977,7 +984,11 @@ mod tests {
             default_branch_line.contains("origin/main") && default_branch_line.contains("fresh"),
             "got {default_branch_line:?}"
         );
-        assert!(sync_line.ends_with("loading"), "got {sync_line:?}");
+        assert!(
+            sync_line.contains("no upstream configured") && sync_line.contains("fresh"),
+            "the submodule's own branch has a remote but no upstream configured for it, got \
+             {sync_line:?}"
+        );
         assert!(dirty_line.ends_with("loading"), "got {dirty_line:?}");
         assert!(base_line.ends_with("not applicable"), "got {base_line:?}");
         assert!(state_line.ends_with("not applicable"), "got {state_line:?}");

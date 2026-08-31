@@ -285,7 +285,8 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
 
     use unicode_width::UnicodeWidthStr;
 
@@ -470,5 +471,141 @@ mod tests {
     fn for_config_selects_the_table_the_glyphs_key_names() {
         assert_eq!(GlyphSet::for_config(Glyphs::Full), &FULL);
         assert_eq!(GlyphSet::for_config(Glyphs::Ascii), &ASCII);
+    }
+
+    // --- pinning the in-cell value glyphs to layout-and-provenance.md (issue #44) ---
+
+    /// The rows of layout-and-provenance.md's "In-cell glyphs for real values" table,
+    /// each `| glyph | meaning |`, found by anchoring on that heading rather than the
+    /// generic `| glyph | meaning |` header shared with the gutter table just above it.
+    fn extract_value_glyph_table_rows(spec: &str) -> Vec<String> {
+        const HEADING: &str = "In-cell glyphs for real values:";
+        let after_heading = &spec[spec
+            .find(HEADING)
+            .expect("layout-and-provenance.md must contain the in-cell glyphs heading")
+            + HEADING.len()..];
+        let table_lines: Vec<&str> = after_heading
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with('|'))
+            .take_while(|line| line.trim_start().starts_with('|'))
+            .map(str::trim)
+            .collect();
+        assert!(
+            table_lines.len() > 2,
+            "layout-and-provenance.md's in-cell value glyph table has no data rows"
+        );
+        table_lines[2..]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// Maps one row's meaning phrase, written in prose rather than as a bare identifier, onto
+    /// the [`Meaning`] variant it names. Panics naming the phrase when none of the known
+    /// keywords match, so a phrase this function has not been taught yet fails loudly instead
+    /// of silently dropping out of the comparison below: this is the seam a seventh (or
+    /// eighth) in-cell value glyph added to the spec has to pass through before it can be
+    /// recognised as anything at all.
+    fn value_glyph_meaning(phrase: &str) -> Meaning {
+        let phrase = phrase.to_lowercase();
+        if phrase == "in sync" {
+            Meaning::InSync
+        } else if phrase == "clean" {
+            Meaning::Clean
+        } else if phrase == "no upstream" {
+            Meaning::NoUpstream
+        } else if phrase.contains("no remote") {
+            Meaning::NoRemote
+        } else if phrase.starts_with("ahead") {
+            Meaning::Ahead
+        } else if phrase.starts_with("behind") {
+            Meaning::Behind
+        } else if phrase.contains("changed") {
+            Meaning::Changed
+        } else {
+            panic!(
+                "layout-and-provenance.md's in-cell value glyph table names a meaning this \
+                 test does not recognise: {phrase:?}"
+            )
+        }
+    }
+
+    /// Reads `docs/spec/layout-and-provenance.md`'s own "In-cell glyphs for real values"
+    /// table at test time and compares it against the full glyph table in both directions:
+    /// a meaning the spec names and the code does not implement fails here, as does a value
+    /// meaning the code implements and the spec's table does not name, and a meaning both
+    /// sides name but render with a different character also fails here. `ChildRow` is
+    /// excluded on the code side: it marks a row's shape (a nested Worktree or Submodule
+    /// line), specified in its own paragraph, not an in-cell value this table covers.
+    ///
+    /// If the spec gains a seventh glyph, this test fails two different ways depending on
+    /// what the code does: an unrecognised meaning phrase panics inside
+    /// [`value_glyph_meaning`] naming the phrase, and a recognised phrase with no matching
+    /// field on [`GlyphSet`] fails the `code_meanings.get` assertion below, naming the
+    /// missing [`Meaning`]. Either way the test cannot pass by silently ignoring the new row.
+    #[test]
+    fn every_in_cell_value_glyph_matches_layout_and_provenance_mds_own_table_in_both_directions() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec =
+            std::fs::read_to_string(manifest_dir.join("../../docs/spec/layout-and-provenance.md"))
+                .expect("read the layout and provenance specification");
+
+        let mut spec_glyphs: HashMap<Meaning, char> = HashMap::new();
+        for row in extract_value_glyph_table_rows(&spec) {
+            let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+            let [glyph_cell, meaning_cell] = cells.as_slice() else {
+                panic!(
+                    "layout-and-provenance.md's value glyph row does not have exactly two \
+                     cells: {row:?}"
+                );
+            };
+            let meaning = value_glyph_meaning(meaning_cell);
+            let glyph = glyph_cell
+                .trim_matches('`')
+                .chars()
+                .next()
+                .unwrap_or_else(|| panic!("empty glyph cell in row: {row:?}"));
+            assert!(
+                spec_glyphs.insert(meaning, glyph).is_none(),
+                "layout-and-provenance.md's value glyph table names {meaning:?} more than once"
+            );
+        }
+
+        let code_meanings: HashMap<Meaning, char> = FULL
+            .row_interior()
+            .into_iter()
+            .filter(|(meaning, _)| {
+                !matches!(
+                    meaning,
+                    Meaning::Fresh
+                        | Meaning::Stale
+                        | Meaning::Unknown
+                        | Meaning::Failed
+                        | Meaning::Loading
+                        | Meaning::ChildRow
+                )
+            })
+            .collect();
+
+        for (meaning, glyph) in &spec_glyphs {
+            match code_meanings.get(meaning) {
+                Some(code_glyph) => assert_eq!(
+                    code_glyph, glyph,
+                    "{meaning:?}'s glyph disagrees between the full glyph table \
+                     ({code_glyph:?}) and layout-and-provenance.md ({glyph:?})"
+                ),
+                None => panic!(
+                    "layout-and-provenance.md's value glyph table names {meaning:?}, which \
+                     the full glyph table does not implement"
+                ),
+            }
+        }
+        for meaning in code_meanings.keys() {
+            assert!(
+                spec_glyphs.contains_key(meaning),
+                "the full glyph table implements {meaning:?}, which \
+                 layout-and-provenance.md's value glyph table does not name"
+            );
+        }
     }
 }
