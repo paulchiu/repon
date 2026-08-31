@@ -374,4 +374,56 @@ mod tests {
         assert!(!any_failed, "a clean repo must never report a failed probe");
         assert_eq!(document.snapshot.entities.len(), 1);
     }
+
+    /// `docs/spec/actions.md`'s "Exit codes" open item: a headless run verb is absent in v1,
+    /// so nothing prints this exit code today, but [`entity_probe_failed`] must still leave a
+    /// `Failed` Action step alone (a receipt is Repon's own report of what it did, never a
+    /// reading of the world) while [`StepOutcome::Failed`] keeps carrying the code that a
+    /// future consumer would need. No real repository or `Core` is needed: this is
+    /// [`entity_probe_failed`]'s own seam, a pure predicate over `EntityState`.
+    #[test]
+    fn a_failed_action_step_never_flips_the_probe_verdict_and_keeps_its_exit_code() {
+        use std::sync::Arc;
+
+        use repon_core::{ActionReceipt, Generation, Kind, StepOutcome, StepResult, Timestamp};
+
+        let mut entity = EntityState::new(
+            repon_core::EntityKey::new(Arc::from(std::path::Path::new("/repo"))),
+            Arc::from("repo"),
+            Arc::from(std::path::Path::new("/repo/.git")),
+            Kind::Repo,
+        );
+        entity.last_action = Some(ActionReceipt {
+            label: Arc::from("reinstall"),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from("pnpm install"),
+                outcome: StepOutcome::Failed(37),
+                output: Arc::from(&b"boom"[..]),
+                elapsed: Duration::from_millis(1),
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+            running: None,
+        });
+
+        let snapshot = Snapshot {
+            generation: Generation::default(),
+            discovered_at: Timestamp::now(),
+            entities: vec![entity],
+        };
+
+        assert!(
+            !any_probe_failed(&snapshot),
+            "a Failed Action step must never read as a probe failure"
+        );
+        let receipt = snapshot.entities[0]
+            .last_action
+            .as_ref()
+            .expect("the receipt must survive untouched");
+        assert_eq!(
+            receipt.steps[0].outcome,
+            StepOutcome::Failed(37),
+            "the per-entity exit code must still be there for a future headless consumer"
+        );
+    }
 }
