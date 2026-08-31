@@ -214,6 +214,21 @@ fn indices_of(haystack: &str, needle: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Reported intermittently red under load, passing on rerun. Checked for the same shape as
+/// a sibling fix elsewhere in this repository, where an assertion held a raw identifier a
+/// concurrent actor could legitimately reuse, standing in for the property that actually
+/// mattered: every assertion below is either the child's own exit code or a byte offset found
+/// by searching the fully pty-drained output, never a raw descriptor, a pid, or a race against
+/// wall-clock time, so that shape does not apply here. The seven ANSI sequences searched for
+/// are also pairwise non-overlapping (none is a substring of another for this crossterm
+/// version), which rules out a false match as well.
+///
+/// Not reproduced despite well over a thousand runs of this test alone under synthetic load:
+/// this development machine at full tilt, and a Linux container capped at one to two vCPUs,
+/// oversubscribed eight- to hundred-fold with concurrent `yes` jobs and a 1024 open-file
+/// limit. Left recorded here as genuinely environmental until a real failure's own output can
+/// be captured to investigate further; if it recurs, save the failing assertion's message and
+/// the full captured `output` alongside it rather than rerunning past it.
 #[test]
 fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_panics() {
     let (mut master, slave_path) = open_pty();
