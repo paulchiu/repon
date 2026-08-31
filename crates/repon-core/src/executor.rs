@@ -1589,6 +1589,29 @@ print(1 if inherited else 0)"
         assert_eq!(spec_pty_width_columns(&spec), PTY_WIDTH);
     }
 
+    fn spec_cancel_grace_ms(spec: &str) -> u64 {
+        let anchor = "The grace is ";
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .expect("the cancellation grace sentence is present");
+        after
+            .split("ms,")
+            .next()
+            .expect("a millisecond count")
+            .parse()
+            .expect("the grace is an integer number of milliseconds")
+    }
+
+    #[test]
+    fn cancel_grace_constant_matches_the_spec_of_record() {
+        let spec = spec_actions_md();
+        assert_eq!(
+            Duration::from_millis(spec_cancel_grace_ms(&spec)),
+            CANCEL_GRACE
+        );
+    }
+
     // --- Criterion 5: raw bytes, bounded head and tail, char-boundary safe ---
 
     #[test]
