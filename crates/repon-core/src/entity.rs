@@ -476,6 +476,67 @@ impl EntityState {
         state.force_stale();
         default_branch.force_stale();
     }
+
+    /// Marks `dirty` and `state`, the two cells with no cheap poll evidence, Stale
+    /// in place: the metadata poll's own writer, called the moment it sees gitdir
+    /// movement it re-runs branch and sync for rather than re-probing itself
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "The poll"). [`Self::age_status_cells`] writes the same two cells' `stale`
+    /// field on elapsed time instead, which is staleness's other writer
+    /// ([core-api.md](https://github.com/paulchiu/repon/blob/main/docs/spec/core-api.md)'s
+    /// "Staleness"). Destructures `self` exhaustively so a Cell added later is
+    /// named here, even as `_`, rather than silently never going stale on
+    /// movement.
+    pub(crate) fn force_stale_status_cells(&mut self) {
+        let EntityState {
+            key: _,
+            name: _,
+            common_dir: _,
+            kind: _,
+            branch: _,
+            sync: _,
+            base: _,
+            dirty,
+            state,
+            default_branch: _,
+            diagnostics: _,
+            last_action: _,
+            presence: _,
+            excluded: _,
+            in_progress_operation: _,
+            recent_commits: _,
+        } = self;
+        dirty.force_stale();
+        state.force_stale();
+    }
+
+    /// Marks `dirty` and `state` Stale once their last known value is at least
+    /// `threshold` old: the elapsed-age writer for the same field
+    /// [`Self::force_stale_status_cells`] writes on poll evidence, so a consumer
+    /// reading either cell never sees a threshold, only the one stored boolean
+    /// either writer produces. Exhaustive for the same reason.
+    pub(crate) fn age_status_cells(&mut self, threshold: Duration) {
+        let EntityState {
+            key: _,
+            name: _,
+            common_dir: _,
+            kind: _,
+            branch: _,
+            sync: _,
+            base: _,
+            dirty,
+            state,
+            default_branch: _,
+            diagnostics: _,
+            last_action: _,
+            presence: _,
+            excluded: _,
+            in_progress_operation: _,
+            recent_commits: _,
+        } = self;
+        dirty.age_into_stale(threshold);
+        state.age_into_stale(threshold);
+    }
 }
 
 #[cfg(test)]
@@ -858,6 +919,164 @@ mod tests {
             entity.base.settled(),
             Some(Settled::NotApplicable)
         ));
+    }
+
+    /// The metadata poll's own writer: on movement it force-stales `dirty` and
+    /// `state`, the two cells with no cheap detector, and touches nothing else.
+    /// The discriminator is `branch` and `sync` staying fresh, since those are
+    /// [`Self::apply_branch_probe`]/`sync.settle`'s own job to refresh, never this
+    /// method's.
+    #[test]
+    fn force_stale_status_cells_stales_only_dirty_and_state() {
+        let mut entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let generation = Generation::new(1);
+        entity.branch.settle(
+            generation,
+            Settled::Known {
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::ObjectId::null(gix::hash::Kind::Sha1),
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: DirtyCounts {
+                    modified: 1,
+                    untracked: 0,
+                    deleted: 0,
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+        entity.state.settle(
+            generation,
+            Settled::Known {
+                value: WorktreeState::Active,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        entity.force_stale_status_cells();
+
+        match entity.branch.settled() {
+            Some(Settled::Known {
+                stale: false,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected branch to stay fresh, got {other:?}"),
+        }
+        match entity.dirty.settled() {
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected dirty to go stale, got {other:?}"),
+        }
+        match entity.state.settled() {
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected state to go stale, got {other:?}"),
+        }
+    }
+
+    /// Staleness's other writer: elapsed age stales `dirty` and `state` once their
+    /// value is older than the threshold, and leaves a value settled moments ago
+    /// alone, both cells at once, matching `force_stale_status_cells`'s pair.
+    #[test]
+    fn age_status_cells_stales_dirty_and_state_once_old_enough() {
+        let mut old_entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        let generation = Generation::new(1);
+        let old_at = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(600));
+        old_entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: DirtyCounts {
+                    modified: 1,
+                    untracked: 0,
+                    deleted: 0,
+                },
+                at: old_at,
+                stale: false,
+            },
+        );
+        old_entity.state.settle(
+            generation,
+            Settled::Known {
+                value: WorktreeState::Active,
+                at: old_at,
+                stale: false,
+            },
+        );
+
+        old_entity.age_status_cells(Duration::from_secs(300));
+
+        match old_entity.dirty.settled() {
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected an old dirty value to age into stale, got {other:?}"),
+        }
+        match old_entity.state.settled() {
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected an old state value to age into stale, got {other:?}"),
+        }
+
+        let mut fresh_entity = EntityState::new(
+            key("/repo"),
+            Arc::from("repo"),
+            Arc::from(Path::new("/repo/.git")),
+            Kind::Worktree,
+        );
+        fresh_entity.dirty.settle(
+            generation,
+            Settled::Known {
+                value: DirtyCounts {
+                    modified: 1,
+                    untracked: 0,
+                    deleted: 0,
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        fresh_entity.age_status_cells(Duration::from_secs(300));
+
+        match fresh_entity.dirty.settled() {
+            Some(Settled::Known {
+                stale: false,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected a fresh dirty value to stay fresh, got {other:?}"),
+        }
     }
 
     /// The vanished-staleness path is one of `ActionReceipt`'s absence claims made
