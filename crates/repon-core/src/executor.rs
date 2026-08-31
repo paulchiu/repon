@@ -836,6 +836,17 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
     }
 
+    /// The device `fd` refers to, or `None` if it is closed. A descriptor *number* says
+    /// nothing on its own once freed, since a concurrent test can be handed the same one
+    /// immediately; the device tells a reused number apart from the original.
+    fn fd_device(fd: std::os::fd::RawFd) -> Option<u64> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes one `libc::stat` through the pointer and reads nothing else.
+        let ok = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0;
+        // SAFETY: `fstat` returning 0 means it initialised the whole struct.
+        ok.then(|| unsafe { stat.assume_init() }.st_rdev as u64)
+    }
+
     /// `keepalive` (`run_step`'s spare slave-side descriptor, held for the whole of
     /// [`drain_until_exit`]) must close once a step it survives finishes, or a fan-out of
     /// many steps would exhaust this process's descriptor table one at a time. Replicates
@@ -850,6 +861,7 @@ mod tests {
         let slave_dup = duplicate(&slave).expect("duplicate the slave for stderr");
         let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
         let keepalive_fd = keepalive.as_raw_fd();
+        let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the drain");
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
         let child = command.spawn().expect("spawn the child");
         drop(command);
@@ -857,9 +869,14 @@ mod tests {
         let (_raw, status) = drain_until_exit(master, keepalive, child);
 
         assert!(status.is_some_and(|status| status.success()));
-        assert!(
-            !fd_is_open(keepalive_fd),
-            "expected keepalive's descriptor {keepalive_fd} to be closed once draining finished"
+        // The claim is that no descriptor onto *this pty* survives, not that this number
+        // is unused: the tests run concurrently, so another one can be handed the freed
+        // number before this line runs, and that is not a leak.
+        assert_ne!(
+            fd_device(keepalive_fd),
+            Some(pty_device),
+            "expected no descriptor onto this pty to survive draining; number \
+             {keepalive_fd} still refers to it"
         );
     }
 
