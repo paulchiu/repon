@@ -1674,6 +1674,11 @@ impl App {
             (launchers, entity_name)
         });
         let mut error = None;
+        // TODO: `self.quit_confirm` has no draw branch here yet, so the dialog
+        // `handle_quit_confirm_key` gates on has no on-screen representation: the frame
+        // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
+        // `y`/`n`/Esc. The behaviour is complete and tested; a themed modal matching
+        // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
         tui.draw(|frame| {
             let area = frame.area();
             if let Some(overlay) = &self.help {
