@@ -661,6 +661,15 @@ impl Core {
         self.partition_operable(order).0.len()
     }
 
+    /// `true` while one Action fan-out's steps are still running, the consumer-facing read
+    /// of `action_running` ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// "One Action runs at a time"): what a TUI gates `;`, `s`, `1` to `9` and `Ctrl+R`
+    /// against while a run is in flight
+    /// ([ADR 0023](https://github.com/paulchiu/repon/blob/main/docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
+    pub fn action_running(&self) -> bool {
+        self.action_running.load(Ordering::Acquire)
+    }
+
     /// Runs `action` across every key in `order` that the table currently knows: each
     /// entity's own steps run in order and stop at that entity's first failure, exactly
     /// as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s

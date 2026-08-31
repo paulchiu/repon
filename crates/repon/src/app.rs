@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::KeyEvent;
-use ratatui::layout::{Constraint, Layout, Rect, Size};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Rect, Size},
+};
 use repon_core::{Core, EntityKey, EntityState, Snapshot};
 use tracing::debug;
 
@@ -29,7 +32,7 @@ use crate::{
 
 mod reload;
 
-use reload::ActiveSet;
+use reload::{ActiveSet, action_running_notice};
 
 /// Below this many columns, the detail pane takes the whole frame and the list is hidden
 /// entirely; at or above it, an open pane sits beside the list's own fixed sidebar
@@ -155,31 +158,23 @@ pub struct App {
     set_picker: Option<SetPicker>,
     /// The live Notice ([CONTEXT.md](../../../CONTEXT.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
-    /// declared when the pressed digit names none) and by `reload.rs`'s own reload fallback
-    /// (naming the Set fallen back to). Replaced by the next such call; nothing else clears
-    /// it yet.
-    ///
-    // TODO(#119): the general Notice mechanism (its timeout, and the status row's full
-    // ordering ahead of a warning and the header) belongs to that ticket. Clearing on the
-    // next press is not deferred with it: this Notice displaces the warning slot, so one
-    // that never expires hides every warning for the rest of the run.
+    /// declared when the pressed digit names none), by `reload.rs`'s own reload fallback
+    /// (naming the Set fallen back to), and by each of the four bindings ADR 0023 names
+    /// inert while an Action is fanning out. Cleared by [`Self::notice`]'s own timeout read,
+    /// by a replacement (any later call to [`Self::set_notice`]), or by the next keypress,
+    /// whichever comes first ([theming.md](../../../docs/spec/theming.md)'s "Warnings and
+    /// Notices").
     notice: Option<String>,
-    /// The description of the most recently pressed bound-but-unimplemented action
-    /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
-    /// action in the spec's own words. One of the four sources [`Self::current_warnings`]
-    /// folds into the shared warning slot ([`warnings::WarningSources`]). Replaced by the
-    /// next such press; nothing else clears it.
-    ///
-    // TODO(#119): this whole field is on its way out. 0023 rules that an unbuilt binding is
-    // not advertised and so has nothing to say, and that the warning slot carries standing
-    // conditions only, so `Warning::NotImplemented` is deleted rather than relocated.
-    unimplemented_action_notice: Option<&'static str>,
+    /// When [`Self::set_notice`] last replaced `notice`: paired with `document.notice_timeout`
+    /// by [`Self::notice`] to decide whether the live Notice has aged out. `None` exactly
+    /// when `notice` is `None`.
+    notice_set_at: Option<std::time::Instant>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
-    /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
+    /// `Action::ReloadConfig`. One of the three sources [`Self::current_warnings`] folds into
     /// the shared warning slot ([`warnings::WarningSources`]).
     theme_warnings: Vec<theme::ThemeWarning>,
     /// Config warnings raised at the last load, the same lifecycle as `theme_warnings` and
-    /// the third of the four sources.
+    /// the second of the three sources.
     config_warnings: Vec<config::document::Warning>,
     /// Whether the abandoned-discovery warning has already been logged to `repon.log` for
     /// `self.core`'s lifetime: `Core` never clears the warning once a walk abandons, so this
@@ -317,7 +312,7 @@ impl App {
             pending_launcher_handoff: None,
             set_picker: None,
             notice: None,
-            unimplemented_action_notice: None,
+            notice_set_at: None,
             theme_warnings,
             config_warnings,
             discovery_warning_logged: false,
@@ -334,32 +329,44 @@ impl App {
         })
     }
 
-    /// Records that `action` was pressed but has no implementation yet, so the shared
-    /// warning slot names it on the next frame rather than the key appearing broken
-    /// ([keybindings.md](../../../docs/spec/keybindings.md) and
-    /// [layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md) settle no
-    /// surface of their own for this, so it shares the slot the way a config or theme
-    /// warning already does). `keys::description` is the same text the footer and help
-    /// overlay already show for `action`, so the message never drifts from what the user was
-    /// just told the key does.
-    fn notify_not_implemented(&mut self, action: Action) {
-        self.unimplemented_action_notice = Some(keys::description(action));
+    /// Replaces the live Notice: read by every raiser
+    /// ([`Self::switch_to_set`], `reload.rs`'s reload fallback, and the four fan-out-inert
+    /// bindings) so the moment a Notice was raised is recorded in exactly one place, the
+    /// timestamp [`Self::notice`] measures its timeout from.
+    pub(crate) fn set_notice(&mut self, text: String) {
+        self.notice = Some(text);
+        self.notice_set_at = Some(std::time::Instant::now());
     }
 
     /// The live Notice, if any: read by [`Self::render`] to draw it, and by tests in place of
-    /// reaching into the private field directly.
+    /// reaching into the private field directly. `None` once `document.notice_timeout` has
+    /// elapsed since it was raised, `"0s"` ([config.md](../../../docs/spec/config.md)) meaning the
+    /// timer never runs, which leaves the next keypress and a replacement as the only ways to
+    /// clear it ([theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices").
     fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        let text = self.notice.as_deref()?;
+        if self.document.notice_timeout.is_zero() {
+            return Some(text);
+        }
+        let set_at = self
+            .notice_set_at
+            .expect("notice_set_at is Some whenever notice is Some");
+        if set_at.elapsed() >= self.document.notice_timeout {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// The shared warning slot's whole current population, folded once from every source
-    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the four sources by
+    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the three sources by
     /// hand. `self.core`'s own abandoned-discovery warning is read fresh here rather than
     /// cached, since it can turn from `None` to `Some` at any point in the run with no reload
     /// involved; the first time it does, this also logs it to `repon.log`
     /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
     /// reported twice" (the theme and config halves already log at the point their own load
-    /// raises them).
+    /// raises them). A live Notice is never folded in here: it is not a standing condition of
+    /// the session, and [theming.md](../../../docs/spec/theming.md) keeps the two apart.
     fn current_warnings(&mut self) -> Vec<Warning> {
         let discovery_abandoned = self.core.discovery_warning();
         warnings::log_discovery_warning_once(
@@ -367,12 +374,20 @@ impl App {
             &mut self.discovery_warning_logged,
         );
         WarningSources {
-            not_implemented: self.unimplemented_action_notice,
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             discovery_abandoned,
         }
         .into_warnings()
+    }
+
+    /// Whether one Action fan-out's steps are still running
+    /// ([`repon_core::Core::action_running`]): what gates `;`, `s`, `1` to `9` and `Ctrl+R`
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// confirming", [ADR 0023](../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// Available half).
+    fn action_running(&self) -> bool {
+        self.core.action_running()
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -467,10 +482,11 @@ impl App {
     /// [`Self::choose_highlighted_launcher`] and [`Self::run_launcher_handoff`].
     ///
     /// The match is exhaustive over every [`Action`] variant, with no catch-all: a variant
-    /// this crate binds but has not built yet still gets its own arm, doing nothing beyond
-    /// [`Self::notify_not_implemented`], so a later addition to [`Action`] fails to compile
-    /// here rather than silently joining a wildcard (issue #97). Two further groups round out
-    /// the exhaustiveness rather than naming a real gap: `ScrollDown`/`ScrollUp`/`Top`/`Bottom`
+    /// this crate binds but has not built yet still gets its own arm, an `unreachable!` one
+    /// ([ADR 0023](../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
+    /// `dispatch` never returns an unbuilt action), so a later addition to [`Action`] fails to
+    /// compile here rather than silently joining a wildcard (issue #97). Two further groups
+    /// round out the exhaustiveness rather than naming a real gap: `ScrollDown`/`ScrollUp`/`Top`/`Bottom`
     /// are bound only in `Detail`, where the guarded arm above already claims them, so falling
     /// through to their own arm cannot happen; and `Text`/`Apply`/`Cancel` and the rest of the
     /// `Input`, `Overlay` and `Confirm` vocabulary can never reach `self.focus`, which is
@@ -481,6 +497,7 @@ impl App {
         // A Notice takes the status row from the warning slot, so one that outlives the press
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
+        self.notice_set_at = None;
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
@@ -524,7 +541,11 @@ impl App {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
             Some(Action::ReloadConfig) => {
-                self.reload_config();
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Reload config"));
+                } else {
+                    self.reload_config();
+                }
                 None
             }
             Some(Action::MoveDown) => {
@@ -630,20 +651,23 @@ impl App {
                 None
             }
             Some(Action::OpenSetPicker) => {
-                self.set_picker = Some(SetPicker::new());
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Set picker"));
+                } else {
+                    self.set_picker = Some(SetPicker::new());
+                }
                 None
             }
             Some(Action::OpenLauncher) => {
                 self.launcher_palette = Some(LauncherPalette::new());
                 None
             }
-            // TODO(#63): the Filter line does not exist yet.
-            Some(Action::EnterFilter) => {
-                self.notify_not_implemented(Action::EnterFilter);
-                None
-            }
             Some(Action::OpenActionPalette) => {
-                self.action_palette = Some(ActionPalette::new());
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Action palette"));
+                } else {
+                    self.action_palette = Some(ActionPalette::new());
+                }
                 None
             }
             Some(Action::RefreshAll) => {
@@ -656,35 +680,25 @@ impl App {
                 }
                 None
             }
-            // TODO(#73): re-deriving default branches over the Selection is not wired up yet.
-            Some(Action::RederiveDefaultBranches) => {
-                self.notify_not_implemented(Action::RederiveDefaultBranches);
-                None
-            }
-            // TODO(#78): failure navigation does not exist yet.
-            Some(Action::NextFailed) => {
-                self.notify_not_implemented(Action::NextFailed);
-                None
-            }
-            // TODO(#78): failure navigation does not exist yet.
-            Some(Action::PreviousFailed) => {
-                self.notify_not_implemented(Action::PreviousFailed);
-                None
-            }
-            // No open issue tracks dismissing a Vanished row (#77 records the undo question
-            // as open, not the dismiss gesture itself); named here rather than guessed.
-            Some(Action::DismissVanished) => {
-                self.notify_not_implemented(Action::DismissVanished);
-                None
-            }
-            // List binds Ctrl+D/PageDown and Ctrl+U/PageUp to these too
-            // (keybindings.md's list row), but List has no half-page cursor movement built;
-            // no open issue tracks it. `Detail`'s own half-page scroll is the guarded arm
-            // above, so reaching here means `self.focus == Context::List`.
-            Some(action @ (Action::HalfPageDown | Action::HalfPageUp)) => {
-                self.notify_not_implemented(action);
-                None
-            }
+            // `EnterFilter`, `RederiveDefaultBranches`, `NextFailed`, `PreviousFailed`,
+            // `DismissVanished` and the List-only half of `HalfPageDown`/`HalfPageUp` are all
+            // unbuilt (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch`
+            // never returns an unbuilt action ([`keys::lookup`]'s own doc comment), so
+            // `self.bindings.dispatch(self.focus, key)` above can never produce one of these;
+            // this arm exists only because the match itself has to name every `Action`
+            // variant, the same proof-made-loud shape the `unreachable!` arm just below
+            // already uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
+            Some(
+                Action::EnterFilter
+                | Action::RederiveDefaultBranches
+                | Action::NextFailed
+                | Action::PreviousFailed
+                | Action::DismissVanished
+                | Action::HalfPageDown
+                | Action::HalfPageUp,
+            ) => unreachable!(
+                "these actions are all unbuilt; dispatch never returns an unbuilt action"
+            ),
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
             // when they fire; this arm exists only because a match guard does not count
@@ -1291,12 +1305,14 @@ impl App {
             .split(area);
             let status_area = areas[0];
             let content_area = areas[1];
-            match self.notice() {
-                Some(text) => notice::draw(frame, status_area, text, &self.theme),
-                None => {
-                    warnings::draw_slot(frame, status_area, &warnings, &self.bindings, &self.theme)
-                }
-            }
+            draw_status_row(
+                frame,
+                status_area,
+                self.notice(),
+                &warnings,
+                &self.bindings,
+                &self.theme,
+            );
             match layout_state(content_area.width, pane_entity.is_some()) {
                 Layout3::ListOnly => {
                     if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
@@ -1370,6 +1386,27 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
 /// below carry only positions, never a size or a count, so there is nothing here for a cost
 /// comparator to read. The source scan in the test module only catches an inline mistake in
 /// this function's own text, not a sort hidden behind a helper call or a hand-rolled loop.
+/// The status row's whole content, exactly one of three shapes and never a mix
+/// ([theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices"): a live Notice
+/// takes the row whole, ahead of the shared warning slot; with no Notice live, the slot draws
+/// its own single most severe entry, or nothing at all once `warnings` is empty (today's
+/// stand-in for the header, which is not built yet). A free function, not a method, so a test
+/// can drive it with a real [`ratatui::Terminal<ratatui::backend::TestBackend>`] and no
+/// [`crate::app::App`] or [`crate::tui::Tui`] at all.
+fn draw_status_row(
+    frame: &mut Frame,
+    area: Rect,
+    notice: Option<&str>,
+    warnings: &[Warning],
+    bindings: &BindingTable,
+    theme: &Theme,
+) {
+    match notice {
+        Some(text) => notice::draw(frame, area, text, theme),
+        None => warnings::draw_slot(frame, area, warnings, bindings, theme),
+    }
+}
+
 fn dispatch_order(
     cursor: Option<&EntityKey>,
     visible: &[EntityKey],
@@ -1403,7 +1440,7 @@ mod tests {
     use super::*;
     use crate::{
         config::document,
-        test_support::{production_source_at, rust_source_files, source_region},
+        test_support::{capture_tracing, production_source_at, rust_source_files, source_region},
     };
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
@@ -1474,7 +1511,7 @@ mod tests {
             pending_launcher_handoff: None,
             set_picker: None,
             notice: None,
-            unimplemented_action_notice: None,
+            notice_set_at: None,
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
             discovery_warning_logged: false,
@@ -1609,17 +1646,23 @@ mod tests {
         );
     }
 
-    /// Pins the table's `built` flag to what `App` actually does on press. `spec_conformance`
-    /// checks that flag against keybindings.md, so the two cannot drift from each other, and
-    /// until this test neither was pinned to the dispatch that decides the question: `r` and
-    /// `R` sat marked unbuilt, and listed as unbuilt, while both already had live arms, and
-    /// every check agreed. An unbuilt row must answer as not implemented; one that does real
-    /// work fails here.
+    /// Pins the table's `built` flag to what `App` actually does on press, the replacement
+    /// for the pre-0023 anchor that pinned the same flag to a "not implemented" warning:
+    /// 0023 deletes that mechanism, so an unbuilt row must now produce nothing at all rather
+    /// than answering with one. `spec_conformance` checks the flag against keybindings.md, so
+    /// the flag and the document cannot drift from each other, but that check alone would not
+    /// have caught `r`/`R` sitting marked unbuilt while both already had live arms; this test
+    /// is what pins the flag to what `App` actually does on press, not only to what the
+    /// document says.
     ///
-    /// The guard is the table's own size, not the unbuilt count: an empty unbuilt set is this
-    /// list's expected end state, and must not read the same as a table that was never loaded.
+    /// "Produces nothing" is checked on three surfaces: no `Message` reaches the channel
+    /// `handle_key_event`'s own dispatch would otherwise send one through, no Notice is
+    /// raised, and no warning is added to the shared slot (the slot's own count, read before
+    /// and after, is unchanged). The guard is the table's own size, not the unbuilt count: an
+    /// empty unbuilt set is this list's expected end state, and must not read the same as a
+    /// table that was never loaded.
     #[test]
-    fn every_unbuilt_binding_answers_on_press_as_not_implemented() {
+    fn every_unbuilt_binding_produces_nothing_on_press() {
         assert!(
             keys::compiled_binding_count() > 0,
             "read no bindings at all; this test would otherwise pass on an empty table"
@@ -1636,13 +1679,25 @@ mod tests {
                 keys::Context::Overlay => keys::Context::Overlay,
                 keys::Context::Confirm => keys::Context::Confirm,
             };
+            let warnings_before = app.current_warnings().len();
+
             app.handle_key_event(press(code, modifiers))
                 .expect("dispatch an unbuilt chord");
 
             assert!(
-                app.unimplemented_action_notice.is_some(),
-                "{action:?} is marked unbuilt in the compiled table, but pressing its chord \
-                 did real work instead of answering as not implemented"
+                app.message_rx.try_recv().is_err(),
+                "{action:?} is marked unbuilt, but pressing its chord queued a Message"
+            );
+            assert_eq!(
+                app.notice(),
+                None,
+                "{action:?} is marked unbuilt, but pressing its chord raised a Notice"
+            );
+            assert_eq!(
+                app.current_warnings().len(),
+                warnings_before,
+                "{action:?} is marked unbuilt, but pressing its chord changed the shared \
+                 warning slot's population"
             );
         }
     }
@@ -1652,6 +1707,259 @@ mod tests {
         modifiers: crossterm::event::KeyModifiers,
     ) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    // =====================================================================================
+    // Criterion 6: the status row shows exactly one of a live Notice, the shared warning
+    // slot, or neither, never a mix. `draw_status_row` is a free function precisely so this
+    // can drive it with a real `ratatui::Terminal<TestBackend>` and no `App` or `Tui` at all.
+    // =====================================================================================
+
+    fn render_status_row(notice: Option<&str>, warnings: &[Warning]) -> String {
+        let backend = ratatui::backend::TestBackend::new(60, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        let bindings = BindingTable::compiled_default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_status_row(frame, area, notice, warnings, &bindings, &theme::DEFAULT);
+            })
+            .expect("draw the status row");
+        let buf = terminal.backend().buffer().clone();
+        (0..60).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+    }
+
+    /// A live Notice with a warning outstanding shows the Notice, not the warning: proves the
+    /// Notice actually outranks the slot rather than merely being drawn when nothing else is.
+    #[test]
+    fn a_live_notice_shows_over_an_outstanding_warning() {
+        let warnings = vec![Warning::Config(document::Warning::SetNamedAll)];
+        let row = render_status_row(Some("switched to `second`"), &warnings);
+        assert_eq!(row.trim_end(), "switched to `second`");
+        assert!(
+            !row.contains("shadowing the implicit Set"),
+            "the outstanding warning must not also show, got: {row:?}"
+        );
+    }
+
+    /// A warning with no Notice live shows the warning: proves the slot is not merely a
+    /// fallback drawn unconditionally beside an absent Notice.
+    #[test]
+    fn an_outstanding_warning_shows_with_no_notice_live() {
+        let warnings = vec![Warning::Config(document::Warning::SetNamedAll)];
+        let row = render_status_row(None, &warnings);
+        assert!(
+            row.contains("shadowing the implicit Set"),
+            "expected the warning's own message on the row, got: {row:?}"
+        );
+    }
+
+    /// Neither a Notice nor a warning leaves the row blank (today's stand-in for the header,
+    /// which is not built yet): proves this is a real absence, not merely untested.
+    #[test]
+    fn neither_a_notice_nor_a_warning_leaves_the_row_blank() {
+        let row = render_status_row(None, &[]);
+        assert_eq!(row.trim_end(), "");
+    }
+
+    // =====================================================================================
+    // Criterion 7: a Notice never enters the warning slot, `w`'s expanded list, or
+    // `repon.log`. Three separate absence claims about three separate surfaces.
+    // =====================================================================================
+
+    /// [theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices": `current_warnings`
+    /// folds only the three standing sources, so a live Notice, even alongside a real
+    /// warning, never joins its population. `w`'s expanded list ([`warnings::draw_overlay`])
+    /// reads this exact same population, so this one assertion covers both the slot and the
+    /// expanded list.
+    #[test]
+    fn a_live_notice_never_joins_the_shared_warning_slots_population() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.theme_warnings = vec![theme::ThemeWarning::UnknownKey {
+            key: "x".to_string(),
+        }];
+        app.set_notice("switched to `second`".to_string());
+
+        let warnings = app.current_warnings();
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the real theme warning must be counted, got: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("switched to")),
+            "the live Notice must never appear in the warning slot's own population, got: \
+             {warnings:?}"
+        );
+    }
+
+    /// [theming.md](../../../docs/spec/theming.md): "a Notice never ... reaches
+    /// `repon.log`", since the report-twice rule is about warnings and a Notice is not one.
+    #[test]
+    fn a_live_notice_never_reaches_the_log() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets.push(document::SetConfig {
+            name: toml::Spanned::new(0..0, "second".to_string()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+        });
+
+        let logs = capture_tracing(|| {
+            app.switch_to_set(2);
+        });
+
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "sanity: the Notice must actually have been raised"
+        );
+        assert!(
+            !logs.contains("switched to"),
+            "a Notice must never reach repon.log, got: {logs:?}"
+        );
+    }
+
+    // =====================================================================================
+    // Criterion 9: `;`, `s` and `Ctrl+R` are three of the four bindings inert while an Action
+    // is fanning out (`1` to `9`'s own coverage lives in reload.rs, beside `switch_to_set`'s
+    // other tests). Each answers with a Notice instead of the silence it gives today.
+    // =====================================================================================
+
+    /// An Action whose one step sleeps long enough for a test to act on
+    /// `Core::run_action`'s own synchronous `action_running` flip before the fan-out settles.
+    fn slow_action(name: &str) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm: false,
+            concurrency: 1,
+        }
+    }
+
+    #[test]
+    fn action_palette_set_picker_and_reload_config_all_answer_with_a_notice_while_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.action_palette.is_none(),
+            "sanity: confirm = false must close the palette and start the run"
+        );
+        // `Core::run_action` flips `action_running` synchronously before it ever returns, so
+        // this is guaranteed live the instant the line above returns; no polling needed.
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("press ; while an Action is fanning out");
+        assert!(
+            app.action_palette.is_none(),
+            "; must not reopen the Action palette while an Action is running"
+        );
+        assert_eq!(app.notice(), Some("Action palette: Action already running"));
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("press s while an Action is fanning out");
+        assert!(
+            app.set_picker.is_none(),
+            "s must not open the Set picker while an Action is running"
+        );
+        assert_eq!(app.notice(), Some("Set picker: Action already running"));
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("press ctrl+r while an Action is fanning out");
+        assert_eq!(
+            app.notice(),
+            Some("Reload config: Action already running"),
+            "a missing gate calls reload_config() instead, which never raises a Notice, so \
+             this line is the discriminator"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !app.core.action_running()),
+            "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    // =====================================================================================
+    // Criterion 8: `notice_timeout` clears a live Notice once elapsed, and `"0s"` turns the
+    // timer off rather than turning Notices off. Driven through `notice_set_at` directly
+    // rather than a real sleep, the same seam `components::list`'s own spinner tests already
+    // use for elapsed time (backdating a stored `Instant` rather than waiting on the clock).
+    // `notice_timeout`'s reload-re-applies half lives in reload.rs, beside the rest of
+    // `apply_reloaded_config`'s own tests.
+    // =====================================================================================
+
+    #[test]
+    fn a_notice_stays_live_until_its_timeout_elapses_then_reads_as_gone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(
+            app.document.notice_timeout,
+            Duration::from_secs(3),
+            "sanity: the default this test's two elapsed times straddle"
+        );
+        app.set_notice("switched to `second`".to_string());
+
+        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_millis(2_900));
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "must still read as live just under the timeout"
+        );
+
+        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_millis(3_100));
+        assert_eq!(
+            app.notice(),
+            None,
+            "must read as gone once the timeout has elapsed"
+        );
+    }
+
+    /// The trap the criterion states by name: `"0s"` must not mean "no Notices", only "no
+    /// timer". An hour of elapsed time would clear any real timeout many times over; this
+    /// Notice must still be live regardless.
+    #[test]
+    fn a_zero_second_notice_timeout_turns_the_timer_off_rather_than_notices_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.notice_timeout = Duration::ZERO;
+        app.set_notice("switched to `second`".to_string());
+        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_secs(3600));
+
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "\"0s\" must leave the Notice live indefinitely rather than clearing it"
+        );
     }
 
     // --- criterion 1: three layout states, cursor and row order kept across opening ---
@@ -2745,135 +3053,9 @@ mod tests {
         );
     }
 
-    // --- issue #97: the dispatch match is exhaustive with no catch-all, every
-    // bound-but-unimplemented action gets its own arm with a TODO naming the real owning
-    // issue, and pressing one tells the user through the shared warning slot.
-
-    /// One vertical slice per bound-but-unimplemented action: press its real default-map
-    /// key ([keybindings.md](../../../docs/spec/keybindings.md)'s own chords, not a
-    /// synthetic one) and read the shared warning slot back through `current_warnings`, the
-    /// same seam `Action::ExpandWarning`'s own tests already use. The expected text is read
-    /// off `keys::description` rather than restated, so it can never drift from what the
-    /// footer and help overlay already show for the same action. The list was the nine
-    /// named in #97 plus List's own `Ctrl+D`/`Ctrl+U`, a gap this ticket's own exhaustiveness
-    /// requirement surfaced that no issue tracks; `OpenActionPalette` left this list once #64
-    /// gave it a real arm (its own tests live in `action_palette.rs` and below),
-    /// `OpenSetPicker` left it once #94 gave it one (its own tests live in `set_picker.rs`
-    /// and below), and `OpenLauncher` leaves it here for the same reason once this ticket
-    /// gave it one (its own tests live in `launcher_palette.rs` and below).
-    #[test]
-    fn every_bound_but_unimplemented_action_tells_the_user_through_the_shared_warning_slot() {
-        use crossterm::event::{KeyCode, KeyModifiers};
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        init_repo(&root.join("repo-a"));
-        let mut app = test_app(&root);
-
-        let cases = [
-            (KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterFilter),
-            (
-                KeyCode::Char('b'),
-                KeyModifiers::NONE,
-                Action::RederiveDefaultBranches,
-            ),
-            (
-                KeyCode::Char('d'),
-                KeyModifiers::NONE,
-                Action::DismissVanished,
-            ),
-            (KeyCode::Char('n'), KeyModifiers::NONE, Action::NextFailed),
-            (
-                KeyCode::Char('N'),
-                KeyModifiers::SHIFT,
-                Action::PreviousFailed,
-            ),
-            (
-                KeyCode::Char('d'),
-                KeyModifiers::CONTROL,
-                Action::HalfPageDown,
-            ),
-            (
-                KeyCode::Char('u'),
-                KeyModifiers::CONTROL,
-                Action::HalfPageUp,
-            ),
-        ];
-
-        for (code, modifiers, action) in cases {
-            app.handle_key_event(press(code, modifiers))
-                .unwrap_or_else(|_| panic!("handle {action:?}"));
-
-            let warnings = app.current_warnings();
-            let expected = format!("{} is not implemented yet", keys::description(action));
-            assert!(
-                warnings
-                    .iter()
-                    .any(|warning| warning.to_string() == expected),
-                "expected the shared warning slot to name {action:?} as \"{expected}\", got: \
-                 {warnings:?}"
-            );
-        }
-    }
-
-    /// Each bound-but-unimplemented action's arm carries a `TODO` citing the issue that will
-    /// build it, read from a small window of lines around the arm rather than assumed from
-    /// position, so reordering the match does not fool this. `DismissVanished` carries none:
-    /// #97's own list assigns it no owning issue (#77, the open-questions register, records
-    /// only the undo question as open, not the dismiss gesture itself), so this also proves
-    /// no issue number was guessed for it.
-    #[test]
-    fn each_unimplemented_actions_todo_names_its_real_owning_issue_or_none_at_all() {
-        let source = production_source_at(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
-        );
-        let lines: Vec<&str> = source.lines().collect();
-
-        // Two arm shapes carry an unimplemented action: its own `Some(Action::X) => {`, and
-        // the binding form `Some(action @ (Action::X | ...)) => {` a shared variant needs.
-        let arm_line = |variant: &str| {
-            let own = format!("Some(Action::{variant}) => {{");
-            let bound = format!("Some(action @ (Action::{variant}");
-            lines
-                .iter()
-                .position(|line| line.trim() == own || line.trim().starts_with(&bound))
-                .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
-        };
-
-        let cases: [(&str, Option<u32>); 6] = [
-            ("EnterFilter", Some(63)),
-            ("RederiveDefaultBranches", Some(73)),
-            ("NextFailed", Some(78)),
-            ("PreviousFailed", Some(78)),
-            ("DismissVanished", None),
-            // List's own half-page movement, reached when the guarded Detail arm above
-            // does not claim these: no open issue tracks it either.
-            ("HalfPageDown", None),
-        ];
-
-        for (variant, issue) in cases {
-            let line = arm_line(variant);
-            let window = &lines[line.saturating_sub(3)..(line + 4).min(lines.len())];
-            match issue {
-                Some(number) => {
-                    let needle = format!("TODO(#{number})");
-                    assert!(
-                        window.iter().any(|candidate| candidate.contains(&needle)),
-                        "expected Action::{variant}'s arm to carry `{needle}`, found around \
-                         it: {window:?}"
-                    );
-                }
-                None => {
-                    let needle = format!("{}(#", "TODO");
-                    assert!(
-                        !window.iter().any(|candidate| candidate.contains(&needle)),
-                        "expected Action::{variant} to cite no issue (none owns it), found a \
-                         TODO around it: {window:?}"
-                    );
-                }
-            }
-        }
-    }
+    // --- issue #119: an unbuilt action dispatches nothing and answers with silence, not the
+    // shared warning slot `Warning::NotImplemented` used to. See
+    // `every_unbuilt_binding_produces_nothing_on_press` below for the replacement anchor.
 
     /// The honest form of criterion 4: a reintroduced `_ => ...` compiles perfectly well, so
     /// nothing but a source scan catches its return. Reads only the marked region of

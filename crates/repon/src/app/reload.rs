@@ -102,6 +102,17 @@ fn no_such_set_notice(declared: usize) -> String {
     format!("only {declared} Set{plural} declared; press s to pick one")
 }
 
+/// The Notice each of the four bindings
+/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+/// confirming") raises while an Action is fanning out, in place of the silence they answer
+/// with today: `what` names the thing the press would otherwise have opened or done, read at
+/// the point of refusal rather than a table keyed on the action, so a later fifth inert
+/// binding costs one call site, not a new case in a lookup this function would otherwise
+/// need.
+pub(crate) fn action_running_notice(what: &str) -> String {
+    format!("{what}: Action already running")
+}
+
 impl App {
     /// `Action::ReloadConfig`'s whole effect: re-reads `config.toml` from the same fixed path
     /// [`App::new`] read it from, re-merges `[keys]` into a fresh [`keys::BindingTable`] and
@@ -223,7 +234,7 @@ impl App {
                 self.active_set.name,
                 chosen.name.get_ref(),
             );
-            self.notice = Some(switched_to_notice(chosen.name.get_ref()));
+            self.set_notice(switched_to_notice(chosen.name.get_ref()));
         }
 
         self.apply_active_set(chosen, document);
@@ -245,16 +256,29 @@ impl App {
     /// the active Set is left untouched and the Notice instead names how many Sets are
     /// declared and points at `s`, the picker being the only way to reach one past `9`
     /// declared or past whatever the pressed digit named.
+    ///
+    /// Checked first, ahead of either of those two reasons: `1` to `9` is one of the four
+    /// bindings inert while an Action is fanning out
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// confirming"), and a Set switch discards discovery and starts a fresh Generation, which
+    /// must never race a fan-out's own completion Generation. This is the same action
+    /// answering two different reasons with two different texts: refused for an out-of-range
+    /// digit reads differently from refused because a run is live, which is what proves the
+    /// reason is computed here rather than fixed for `SwitchToSet` as a whole.
     pub(crate) fn switch_to_set(&mut self, nth: u8) {
+        if self.action_running() {
+            self.set_notice(action_running_notice("Set switch"));
+            return;
+        }
         let document = self.document.clone();
         let index = usize::from(nth).wrapping_sub(1);
         match document.sets.get(index) {
             Some(chosen) => {
                 self.apply_active_set(chosen, &document);
-                self.notice = Some(switched_to_notice(chosen.name.get_ref()));
+                self.set_notice(switched_to_notice(chosen.name.get_ref()));
             }
             None => {
-                self.notice = Some(no_such_set_notice(document.sets.len()));
+                self.set_notice(no_such_set_notice(document.sets.len()));
             }
         }
     }
@@ -833,6 +857,229 @@ mod tests {
         assert_eq!(
             app.notice(),
             Some("only 2 Sets declared; press s to pick one")
+        );
+    }
+
+    // =====================================================================================
+    // Criterion 9: `1` to `9` is one of the four bindings inert while an Action is fanning
+    // out. Criterion 10: `SwitchToSet` refused for two different reasons (an out-of-range
+    // digit, or a live fan-out) must answer with two different texts, which is the
+    // discriminator that tells a computed reason from a fixed one.
+    // =====================================================================================
+
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An Action whose one step sleeps long enough for a test to observe
+    /// `Core::action_running() == true` and act on it before the fan-out settles.
+    fn slow_action_spec() -> repon_core::ActionSpec {
+        repon_core::ActionSpec {
+            label: std::sync::Arc::from("slow"),
+            name: Some(std::sync::Arc::from("slow")),
+            steps: vec![repon_core::Step {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                shell: false,
+                env: Vec::new(),
+            }],
+            concurrency: 1,
+        }
+    }
+
+    #[test]
+    fn switching_sets_while_an_action_is_fanning_out_answers_with_a_notice_and_leaves_the_active_set_untouched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![
+            matching_set_config(&root),
+            document::SetConfig {
+                name: toml::Spanned::new(0..0, "second".to_string()),
+                roots: vec![root.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
+        ];
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        // `Core::run_action` sets `action_running` synchronously, inside the
+        // `compare_exchange` at its own top, before this call ever returns; no polling is
+        // needed to observe the fan-out as live.
+        assert!(
+            app.core.run_action(slow_action_spec(), &keys),
+            "sanity: the fan-out must actually have started"
+        );
+        let active_before = app.active_set.clone();
+
+        app.switch_to_set(2);
+
+        assert_eq!(
+            app.active_set, active_before,
+            "an inert digit must never move the active Set while a fan-out is live"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("Set switch: Action already running"),
+            "expected a Notice naming the run in progress rather than silence or a real switch"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !app.core.action_running()),
+            "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    #[test]
+    fn switch_to_set_computes_its_refusal_reason_at_the_point_of_refusal_not_fixed_per_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![matching_set_config(&root)];
+
+        // Reason A: `SwitchToSet` refused because the pressed digit names no declared Set.
+        app.switch_to_set(9);
+        let reason_a = app
+            .notice()
+            .expect("expected a Notice for an out-of-range digit")
+            .to_string();
+
+        // Reason B: the same action, `SwitchToSet(1)`, a perfectly valid digit this time,
+        // refused instead because an Action is fanning out.
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert!(app.core.run_action(slow_action_spec(), &keys));
+        app.switch_to_set(1);
+        let reason_b = app
+            .notice()
+            .expect("expected a Notice for a live fan-out")
+            .to_string();
+
+        assert_ne!(
+            reason_a, reason_b,
+            "the same action refused for two different reasons must answer with two \
+             different texts, not one fixed string for SwitchToSet as a whole"
+        );
+
+        assert!(wait_until(Duration::from_secs(5), || !app
+            .core
+            .action_running()));
+    }
+
+    // =====================================================================================
+    // Criterion 10: every Notice reason's static text is authored to fit 44 columns, half
+    // the 88-column narrow screen (theming.md's "Warnings and Notices").
+    // =====================================================================================
+
+    /// `action_running_notice` backs a small, enumerable set of Notices: every real call
+    /// site in this crate, not a guessed representative, so a new fifth caller with a longer
+    /// `what` is caught the moment it is added here.
+    #[test]
+    fn every_action_running_notice_this_crate_actually_raises_fits_44_columns() {
+        for what in [
+            "Action palette",
+            "Set picker",
+            "Reload config",
+            "Set switch",
+        ] {
+            let text = action_running_notice(what);
+            assert!(
+                !text.is_empty(),
+                "expected a real reason, not an empty string"
+            );
+            assert!(
+                text.len() <= 44,
+                "{text:?} is {} columns, over the 44-column budget",
+                text.len()
+            );
+        }
+    }
+
+    /// A Set name is user-chosen and this schema puts no length limit on it, so this checks
+    /// a generously long but plausible name rather than an unbounded claim: 20 characters
+    /// still reads as a name, not a sentence.
+    #[test]
+    fn switched_to_notice_fits_44_columns_for_a_generously_long_set_name() {
+        let text = switched_to_notice(&"x".repeat(20));
+        assert!(
+            !text.is_empty(),
+            "expected a real reason, not an empty string"
+        );
+        assert!(
+            text.len() <= 44,
+            "{text:?} is {} columns, over the 44-column budget",
+            text.len()
+        );
+    }
+
+    /// The declared count is user-chosen too; 999 is a generous upper bound for a document
+    /// declaring that many Sets while still being one a person could plausibly write.
+    #[test]
+    fn no_such_set_notice_fits_44_columns_for_a_generously_large_declared_count() {
+        let text = no_such_set_notice(999);
+        assert!(
+            !text.is_empty(),
+            "expected a real reason, not an empty string"
+        );
+        assert!(
+            text.len() <= 44,
+            "{text:?} is {} columns, over the 44-column budget",
+            text.len()
+        );
+    }
+
+    /// Criterion 8's reload half: `notice_timeout` "re-applies immediately"
+    /// (config.md), so a shorter value from a reload must age out a Notice already on
+    /// screen with no new keypress, exactly as `theme`, `glyphs` and the other keys that
+    /// list names already do for their own state. Goes through the real
+    /// `apply_reloaded_config`, the same path `Action::ReloadConfig` takes, rather than
+    /// assigning `app.document` directly, so this proves the wiring, not only that `notice()`
+    /// reads whatever `document.notice_timeout` happens to hold.
+    #[test]
+    fn notice_timeout_re_applies_immediately_on_reload_with_no_new_press() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.notice_timeout = Duration::from_secs(3600);
+        app.set_notice("switched to `second`".to_string());
+        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_secs(10));
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "sanity: still live under the long timeout ten seconds in"
+        );
+
+        let mut reloaded_document = app.document.clone();
+        reloaded_document.notice_timeout = Duration::from_secs(1);
+        app.apply_reloaded_config(config_with_document(reloaded_document));
+
+        assert_eq!(
+            app.notice(),
+            None,
+            "the shorter reloaded timeout must age out the Notice already on screen, with no \
+             new press"
         );
     }
 }

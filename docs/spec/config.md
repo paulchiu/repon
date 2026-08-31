@@ -298,7 +298,7 @@ args = ["pnpm", "install"]
 refresh_all = "f5"         # move one binding
 
 [keys.list]
-dismiss_vanished = ""      # unbind it entirely
+anchor_range = ""          # unbind it entirely
 ```
 
 ## What this spec does not own

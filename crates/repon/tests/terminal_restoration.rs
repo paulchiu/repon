@@ -489,7 +489,7 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
     let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "[keys.list]\ndismiss_vanished = \"z\"\nnext_failed = \"z\"\n",
+        "[keys.list]\nanchor_range = \"z\"\ntoggle_selection = \"z\"\n",
     )
     .expect("write a config.toml with a keys collision");
     let mut child = spawn_attached_to_pty_with(
@@ -542,11 +542,11 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
     let output = String::from_utf8_lossy(&output);
 
     assert!(
-        output.contains("dismiss_vanished"),
+        output.contains("anchor_range"),
         "expected the first colliding action named, got: {output:?}"
     );
     assert!(
-        output.contains("next_failed"),
+        output.contains("toggle_selection"),
         "expected the second colliding action named, got: {output:?}"
     );
     assert!(
