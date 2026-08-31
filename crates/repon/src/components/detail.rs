@@ -247,16 +247,16 @@ fn format_age(at: Timestamp) -> String {
     }
 }
 
+/// The list's branch cell shows a fixed nine-character abbreviation of a detached
+/// HEAD's object id; this pane shows the full id instead, since nothing here needs a
+/// column to stay unragged and the pane is the one place that can disambiguate an id
+/// from a branch name of the same shape (ADR 0019's accepted cost: an object id is
+/// itself a legal branch name).
 fn head_word(value: &Head) -> String {
     match value {
         Head::Branch { name, .. } => name.to_string(),
         Head::Unborn(name) => format!("{name} (no commits yet)"),
-        Head::Detached(oid) => {
-            format!(
-                "detached at {}",
-                oid.to_string().chars().take(7).collect::<String>()
-            )
-        }
+        Head::Detached(oid) => format!("detached at {oid}"),
     }
 }
 
@@ -739,6 +739,79 @@ mod tests {
             offending_locations.is_empty(),
             "a default branch diagnostics field was read outside detail.rs, the one place \
              `default-branch.md` allows it, at: {offending_locations:?}"
+        );
+    }
+
+    // --- head_word: the pane's own words for HEAD's three shapes ---
+
+    /// Criterion 2's other half, proven through a real, settled detached row rather than a
+    /// hand-built `gix::ObjectId` (this crate does not depend on `gix` directly): the list
+    /// abbreviates a detached HEAD's object id to a fixed nine characters, but the detail
+    /// pane carries the full forty-character sha1 one, distinct from the list's own
+    /// abbreviation so a mutation that truncated this pane to the list's width would fail
+    /// this assertion rather than pass by coincidence.
+    #[test]
+    fn head_word_carries_a_detached_heads_full_object_id_not_the_lists_abbreviation() {
+        use repon_core::{Core, CoreSpec, SetSpec};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let status = Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", "main"])
+            .arg(&root)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        git(&root, &["commit", "--allow-empty", "-m", "first"]);
+        let sha_output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(sha_output.status.success());
+        let full_id = String::from_utf8(sha_output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+        assert_eq!(full_id.len(), 40, "expected a full sha1 hex id");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "--quiet", "--detach", &full_id])
+            .status()
+            .expect("run git checkout --detach");
+        assert!(status.success());
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_secs(5));
+
+        let lines = content_lines(&settled.entities[0]);
+        let branch_line = line_labelled(&lines, "branch");
+
+        assert!(
+            branch_line.contains(&full_id),
+            "expected the full forty-character id in the pane, got {branch_line:?}"
         );
     }
 

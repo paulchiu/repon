@@ -7,30 +7,31 @@
 //!
 //! `sync` and `base` are separate provenance cells that fail independently: a Repo
 //! can have a resolvable upstream and an Unknown default branch. `base` settles
-//! `NotApplicable` in exactly two cases, a row whose branch is itself the default
-//! branch (where it would duplicate `sync`) and a Repo with no remote at all, and
-//! otherwise computes for any HEAD shape that resolves to a commit, keyed off the
-//! commit rather than off branch presence.
+//! `NotApplicable` in exactly three cases, a row whose branch is itself the default
+//! branch (where it would duplicate `sync`), a Repo with no remote at all, and an
+//! unborn HEAD (there is no commit to compare from), and otherwise computes for any
+//! HEAD shape that resolves to a commit, keyed off the commit rather than off branch
+//! presence.
 
 use crate::cell::{Settled, Timestamp};
 use crate::entity::{DefaultBranch, Head};
 use crate::git::{self, ProbeError};
 use crate::landing;
 
-/// One entity's `base` verdict, or `None` to leave the cell exactly as unsettled
-/// as it already is: reached only for an unborn HEAD, which has no commit to
-/// count behind anything, the same "leave it Outstanding" contract
-/// [`crate::landing::probe`] uses for the same shape.
+/// One entity's `base` verdict. Always settles to something: there is no shape of
+/// `Head` this leaves unresolved
+/// ([head.md](https://github.com/paulchiu/repon/blob/main/docs/spec/head.md)'s "The
+/// unborn row").
 pub(crate) fn probe(
     repo: &gix::Repository,
     head: &Head,
     default_branch: &Settled<DefaultBranch>,
-) -> Option<Settled<u32>> {
+) -> Settled<u32> {
     if !git::has_any_remote(repo) {
         // A settled fact regardless of HEAD's shape or the default branch's own
         // resolution: none of this Repo's rows can have an upstream either way,
         // per `default-branch.md`'s "Not applicable".
-        return Some(Settled::NotApplicable);
+        return Settled::NotApplicable;
     }
 
     let default_branch = match default_branch {
@@ -39,34 +40,38 @@ pub(crate) fn probe(
             at: _,
             stale: _,
         } => value,
-        Settled::Unknown(reason) => return Some(Settled::Unknown(*reason)),
-        Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
-        Settled::NotApplicable => return Some(Settled::NotApplicable),
+        Settled::Unknown(reason) => return Settled::Unknown(*reason),
+        Settled::Failed(error) => return Settled::Failed(error.clone()),
+        Settled::NotApplicable => return Settled::NotApplicable,
     };
 
     let commit = match head {
         Head::Branch { name, commit } => {
             if branch_is_default_branchs_own_row(repo, name, default_branch) {
-                return Some(Settled::NotApplicable);
+                return Settled::NotApplicable;
             }
             *commit
         }
         Head::Detached(commit) => *commit,
-        Head::Unborn(_) => return None,
+        // No commit exists yet, so there is nothing to count behind anything: Not
+        // applicable rather than left unsettled, since no later Generation's probe
+        // of this same, still-unborn HEAD could ever answer it either
+        // (head.md's "The unborn row").
+        Head::Unborn(_) => return Settled::NotApplicable,
     };
 
     let default_commit = match landing::resolve_ref_commit(repo, default_branch.name()) {
         Ok(id) => id,
-        Err(error) => return Some(Settled::Failed(error)),
+        Err(error) => return Settled::Failed(error),
     };
 
     match git::commits_behind(repo, commit, default_commit) {
-        Ok(behind) => Some(Settled::Known {
+        Ok(behind) => Settled::Known {
             value: behind,
             at: Timestamp::now(),
             stale: false,
-        }),
-        Err(error) => Some(Settled::Failed(ProbeError::Base(error.into()))),
+        },
+        Err(error) => Settled::Failed(ProbeError::Base(error.into())),
     }
 }
 
@@ -165,7 +170,7 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         assert!(
-            matches!(outcome, Some(Settled::NotApplicable)),
+            matches!(outcome, Settled::NotApplicable),
             "expected a Repo with no remote to settle base Not applicable, got {outcome:?}"
         );
     }
@@ -205,11 +210,11 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         match outcome {
-            Some(Settled::Known {
+            Settled::Known {
                 value,
                 at: _,
                 stale: _,
-            }) => assert_eq!(value, 1),
+            } => assert_eq!(value, 1),
             other => panic!(
                 "expected a branch tracking something other than the default branch to \
                  compute a real count, got {other:?}"
@@ -246,11 +251,11 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         match outcome {
-            Some(Settled::Known {
+            Settled::Known {
                 value,
                 at: _,
                 stale: _,
-            }) => assert_eq!(
+            } => assert_eq!(
                 value, 0,
                 "a branch level with the default branch is behind it by nothing, which is \
                  a settled count rather than an exemption"
@@ -284,7 +289,7 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         assert!(
-            matches!(outcome, Some(Settled::NotApplicable)),
+            matches!(outcome, Settled::NotApplicable),
             "expected the default branch's own row to settle base Not applicable, got {outcome:?}"
         );
     }
@@ -308,11 +313,11 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         match outcome {
-            Some(Settled::Known {
+            Settled::Known {
                 value,
                 at: _,
                 stale: _,
-            }) => assert_eq!(value, 1),
+            } => assert_eq!(value, 1),
             other => panic!("expected a detached HEAD to get a live count, got {other:?}"),
         }
     }
@@ -347,7 +352,7 @@ mod tests {
         );
 
         assert!(
-            matches!(outcome, Some(Settled::Unknown(Unknown::NoDefaultBranch))),
+            matches!(outcome, Settled::Unknown(Unknown::NoDefaultBranch)),
             "expected an Unknown default branch to settle base Unknown independently of \
              sync's own success, got {outcome:?}"
         );
@@ -417,11 +422,11 @@ mod tests {
             other => panic!("expected feature's sync to be Tracking, got {other:?}"),
         };
         let feature_base_value = match feature_base {
-            Some(Settled::Known {
+            Settled::Known {
                 value,
                 at: _,
                 stale: _,
-            }) => value,
+            } => value,
             other => panic!("expected feature's base to be a real count, got {other:?}"),
         };
         assert_ne!(
@@ -447,17 +452,19 @@ mod tests {
             &known_default_branch("origin/main"),
         );
         assert!(
-            matches!(root_base, Some(Settled::NotApplicable)),
+            matches!(root_base, Settled::NotApplicable),
             "expected the default branch's own row to elide base rather than repeat sync's \
              own number, got {root_base:?}"
         );
     }
 
-    /// An unborn HEAD has no commit to count behind anything, so the cell stays
-    /// exactly as unsettled as it already is, the same contract
-    /// [`crate::landing::probe`] gives the same shape.
+    /// An unborn HEAD has no commit to count behind anything, so the cell settles
+    /// Not applicable rather than staying unsettled: no later Generation's probe of
+    /// this same, still-unborn HEAD could ever answer it either, which is what
+    /// distinguishes it from having no answer yet
+    /// (head.md's "The unborn row").
     #[test]
-    fn an_unborn_head_stays_outstanding() {
+    fn an_unborn_head_settles_base_not_applicable() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = dir.path().join("repo");
         fs::create_dir_all(&repo).expect("create repo dir");
@@ -470,7 +477,11 @@ mod tests {
             &known_default_branch("origin/main"),
         );
 
-        assert!(outcome.is_none());
+        assert!(
+            matches!(outcome, Settled::NotApplicable),
+            "expected an unborn HEAD to settle base Not applicable rather than stay \
+             unsettled, got {outcome:?}"
+        );
     }
 
     /// A `Failed` default branch propagates unchanged, the same rule
@@ -491,7 +502,7 @@ mod tests {
         );
 
         match outcome {
-            Some(Settled::Failed(ProbeError::Open(message))) => assert_eq!(&*message, "boom"),
+            Settled::Failed(ProbeError::Open(message)) => assert_eq!(&*message, "boom"),
             other => {
                 panic!("expected the default branch's own Failed error to propagate, got {other:?}")
             }
