@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::KeyEvent;
@@ -145,6 +147,15 @@ pub struct App {
     /// reader. Other components still colour themselves from the compiled
     /// [`theme::DEFAULT`] directly rather than from this loaded copy.
     theme: Theme,
+    /// The theme name and source this run last resolved `self.theme` from (updated on a
+    /// successful `Action::ReloadConfig`, per `apply_reloaded_config`), and the directory it
+    /// lives in: kept as fields, not re-derived, so [`Self::reread_theme`] can read the same
+    /// file again on every return from suspension without touching `Config` at all.
+    /// theming.md: "The theme is read at startup and read again on resume, both from a
+    /// Launcher returning and from SIGTSTP."
+    theme_name: String,
+    theme_source: theme::ThemeSource,
+    themes_dir: PathBuf,
     /// The live binding table the footer and the help overlay read every frame: the compiled
     /// default merged with `[keys]`, per [`keys::merge`]. Replaced wholesale on a config
     /// reload, never mutated in place, so `handle_key_event`, `footer::draw` and
@@ -178,7 +189,8 @@ impl App {
             theme::ThemeSource::Config
         };
         let theme_name = flag_theme.unwrap_or_else(|| config.document.theme.clone());
-        let loaded_theme = theme::load(&config::themes_dir(), &theme_name, theme_source)?;
+        let themes_dir = config::themes_dir();
+        let loaded_theme = theme::load(&themes_dir, &theme_name, theme_source)?;
         for warning in &loaded_theme.warnings {
             tracing::warn!("{warning}");
         }
@@ -235,6 +247,9 @@ impl App {
             message_tx,
             message_rx,
             theme: loaded_theme.theme,
+            theme_name,
+            theme_source,
+            themes_dir,
             bindings,
             active_set,
         })
@@ -278,10 +293,15 @@ impl App {
             self.handle_events(&tui)?;
             self.handle_messages(&mut tui)?;
             if self.should_suspend {
+                // refresh.md's "Suspension": all background work stops while the TUI is
+                // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
+                // Launcher's own handoff ([`Self::around_entity_handoff`]).
+                self.core.pause();
                 tui.suspend()?;
                 self.message_tx.send(Message::Resume)?;
                 self.message_tx.send(Message::ClearScreen)?;
                 tui.enter()?;
+                self.on_resume();
             } else if self.should_quit {
                 tui.stop();
                 break;
@@ -517,6 +537,65 @@ impl App {
         self.cursor = index.min(visible.len() - 1);
     }
 
+    /// Re-reads the theme file this run resolved to (`self.theme_name` under
+    /// `self.theme_source`, in `self.themes_dir`), updating `self.theme` and
+    /// `self.theme_warnings` in place. theming.md: "The theme is read at startup and read
+    /// again on resume, both from a Launcher returning and from SIGTSTP." A failure here is
+    /// logged and otherwise swallowed, the same grade `Self::apply_reloaded_config`'s own
+    /// theme reload gives a failure once the terminal is already claimed.
+    fn reread_theme(&mut self) {
+        match theme::load(&self.themes_dir, &self.theme_name, self.theme_source) {
+            Ok(loaded_theme) => {
+                for warning in &loaded_theme.warnings {
+                    tracing::warn!("{warning}");
+                }
+                self.theme = loaded_theme.theme;
+                self.theme_warnings = loaded_theme.warnings;
+            }
+            Err(err) => {
+                tracing::error!("could not re-read theme `{}`: {err:#}", self.theme_name);
+            }
+        }
+    }
+
+    /// Resumes background work and starts a normal Generation over every visible row, then
+    /// re-reads the theme file. Shared by every return from suspension: refresh.md's "On
+    /// resume ... a normal generation starts. Nothing is queued to fire on return," and
+    /// theming.md's theme-reread rule, both stated once for `SIGTSTP` and a Launcher's own
+    /// handoff alike.
+    fn on_resume(&mut self) {
+        self.core.resume();
+        let keys = self.visible_keys();
+        self.core.refresh(&keys);
+        self.reread_theme();
+    }
+
+    /// The lifecycle around any terminal handoff to one Entity, independent of what actually
+    /// runs in it: pauses background work first (refresh.md's "All background work stops
+    /// while the TUI is suspended"), then on return re-probes `entity_key` synchronously,
+    /// before background work resumes and a normal Generation starts
+    /// ([`Self::on_resume`]), per refresh.md's "the entity that was handed off is re-probed
+    /// first and synchronously, then a normal generation starts."
+    ///
+    /// The Launcher palette itself ([keybindings.md](../../../docs/spec/keybindings.md)'s
+    /// `!`) is later work; once it exists, its call to
+    /// [`crate::launcher::run`] is what `handoff` will wrap, as
+    /// `self.around_entity_handoff(&entity.key, || launcher::run(tui, launcher, entity))`.
+    /// `#[allow(dead_code)]` because nothing outside `#[cfg(test)]` calls this yet, the same
+    /// reason `theme.rs`'s own unread roles carry it: its future caller is that palette.
+    #[allow(dead_code)]
+    fn around_entity_handoff<T>(
+        &mut self,
+        entity_key: &EntityKey,
+        handoff: impl FnOnce() -> T,
+    ) -> T {
+        self.core.pause();
+        let result = handoff();
+        self.core.probe_now(entity_key);
+        self.on_resume();
+        result
+    }
+
     fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
         while let Ok(message) = self.message_rx.try_recv() {
             if message != Message::Tick && message != Message::Render {
@@ -707,6 +786,12 @@ mod tests {
             message_tx,
             message_rx,
             theme: theme::DEFAULT,
+            // `"default"` never reads `themes_dir` at all (`theme::load` short-circuits on
+            // the reserved name), so an empty, never-created path is a harmless placeholder
+            // here; a test exercising a real reread points `themes_dir` at a real tempdir.
+            theme_name: "default".to_string(),
+            theme_source: theme::ThemeSource::Config,
+            themes_dir: PathBuf::new(),
             bindings: BindingTable::compiled_default(),
             active_set: ActiveSet {
                 name: "test".to_string(),
@@ -1376,6 +1461,210 @@ mod tests {
         assert!(
             offending_locations.is_empty(),
             "the field must be read only by the detail pane, found also at: {offending_locations:?}"
+        );
+    }
+
+    // --- criterion 5: all background work stops while suspended; on return the handed-off
+    // entity is re-probed synchronously first and only then does a normal Generation start,
+    // with nothing queued to fire later; the theme file is re-read on return and on resume.
+
+    /// refresh.md's "All background work stops while the TUI is suspended": pausing for a
+    /// handoff must cancel a probe that was already in flight, not merely stop new ones.
+    /// `begin_untracked_probe_for_test` puts a real in-flight entry into the table the same
+    /// way a real `refresh` dispatch would, without spawning anything to complete it, so
+    /// nothing but `pause` itself can flip the returned cancel flag.
+    #[test]
+    fn returning_from_a_handoff_pauses_first_and_cancels_whatever_was_already_in_flight() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+
+        // `begin_untracked_probe_for_test` marks this entry in flight without spawning
+        // anything to complete it, so nothing but a real cancellation can ever release the
+        // one pending `settle` count it registers.
+        let cancel = app.core.begin_untracked_probe_for_test(&key);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+
+        app.around_entity_handoff(&key, || {});
+
+        // Pausing (which cancels it) has to happen for `settle` to ever return short of its
+        // own timeout: nothing else in this sequence releases that one leaked count, since
+        // `refresh`'s own per-key redispatch (`on_resume`, called right after) flips the same
+        // cancel flag too but never touches the settle gate, so that half of this assertion
+        // alone would still pass even with `pause` removed. The elapsed time is what actually
+        // distinguishes the two: a build that skips `pause` leaves this count stuck, and
+        // `settle` only ever returns here by running out its own 500ms timeout.
+        let started = std::time::Instant::now();
+        app.core.settle(Duration::from_millis(500));
+        let elapsed = started.elapsed();
+
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Acquire),
+            "the handoff must pause the core, which cancels whatever was already in flight"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "expected settle to return promptly once pause released the probe that was \
+             already in flight, rather than waiting out the full timeout for a leaked settle \
+             count; took {elapsed:?}"
+        );
+    }
+
+    /// The ordering claim's hardest half, "synchronously first": the handed-off entity's own
+    /// state must be correct the instant the handoff returns, with no sleep and no settling.
+    /// The mutation this catches is dropping the synchronous `probe_now` call and leaning on
+    /// the normal Generation's own async fan-out to eventually pick the change up instead:
+    /// checked with zero delay, that fan-out has not had time to run.
+    #[test]
+    fn returning_from_a_handoff_reprobes_the_entity_synchronously_before_returning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+
+        app.around_entity_handoff(&key, || {
+            // Simulates what the handed-off tool (lazygit, an editor) did to the repo while
+            // Repon was suspended: switched branches, entirely outside Repon's own view.
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["checkout", "-q", "-b", "feature-during-handoff"])
+                .status()
+                .expect("run git checkout");
+            assert!(status.success());
+        });
+
+        let snapshot = app.core.snapshot();
+        let entity = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("the handed-off entity is still in the table");
+        assert!(
+            matches!(
+                entity.branch.settled(),
+                Some(repon_core::Settled::Known {
+                    value: repon_core::Head::Branch { name, .. },
+                    ..
+                }) if &**name == "feature-during-handoff"
+            ),
+            "expected the branch switched during the handoff to already be visible with no \
+             sleep and no settle, got: {:?}",
+            entity.branch.settled()
+        );
+    }
+
+    /// "Only then does a normal Generation start... nothing is queued to fire on return": the
+    /// Generation counter must already have advanced, and nothing sits on the app's own
+    /// message bus waiting for a future tick to do the work instead.
+    #[test]
+    fn returning_from_a_handoff_starts_a_new_generation_synchronously_with_nothing_queued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+        let generation_before = app.core.snapshot().generation;
+
+        app.around_entity_handoff(&key, || {});
+
+        assert!(
+            app.core.snapshot().generation > generation_before,
+            "expected a new Generation to have started synchronously, with no further call \
+             needed to trigger it"
+        );
+        assert!(
+            app.message_rx.try_recv().is_err(),
+            "nothing should be queued on the message bus as a substitute for doing the \
+             refresh now"
+        );
+    }
+
+    /// theming.md: "read again on resume, both from a Launcher returning and from SIGTSTP."
+    /// `around_entity_handoff` is the Launcher-return half.
+    #[test]
+    fn returning_from_a_handoff_rereads_the_theme_file_from_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let themes_dir = tempfile::tempdir().expect("themes dir");
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"red\"\n")
+            .expect("write initial theme");
+
+        let mut app = test_app(&root);
+        app.theme_name = "custom".to_string();
+        app.theme_source = theme::ThemeSource::Config;
+        app.themes_dir = themes_dir.path().to_path_buf();
+        app.reread_theme();
+        assert_eq!(app.theme.text, ratatui::style::Color::Red);
+
+        // The file changes while Repon is suspended, e.g. the user opened it in $EDITOR.
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"blue\"\n")
+            .expect("rewrite theme");
+
+        let key = app.visible_keys()[0].clone();
+        app.around_entity_handoff(&key, || {});
+
+        assert_eq!(
+            app.theme.text,
+            ratatui::style::Color::Blue,
+            "expected the theme file re-read on return from the handoff"
+        );
+    }
+
+    /// theming.md's other half: the theme file is also re-read on a bare `SIGTSTP` resume,
+    /// which has no handed-off entity at all. `on_resume` is the shared tail
+    /// [`App::run`]'s `SIGTSTP` branch calls directly.
+    #[test]
+    fn on_resume_rereads_the_theme_file_from_disk_with_no_entity_involved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let themes_dir = tempfile::tempdir().expect("themes dir");
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"red\"\n")
+            .expect("write initial theme");
+
+        let mut app = test_app(&root);
+        app.theme_name = "custom".to_string();
+        app.theme_source = theme::ThemeSource::Config;
+        app.themes_dir = themes_dir.path().to_path_buf();
+        app.reread_theme();
+        assert_eq!(app.theme.text, ratatui::style::Color::Red);
+
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"blue\"\n")
+            .expect("rewrite theme");
+
+        app.on_resume();
+
+        assert_eq!(app.theme.text, ratatui::style::Color::Blue);
+    }
+
+    // --- criterion 4 and 5's absence halves: no filesystem watcher and no runtime theme
+    // command exist anywhere, so the only way the theme ever changes mid-session is a reread
+    // Repon itself triggers (a reload, a return from suspension).
+
+    #[test]
+    fn no_filesystem_watcher_and_no_runtime_theme_command_exist_anywhere_in_either_crate() {
+        for needle in ["notify::", "RecommendedWatcher", "INotify"] {
+            let offending = crate::test_support::production_lines_containing(needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; theming.md records no filesystem watch and no runtime \
+                 `:theme` command, at: {offending:?}"
+            );
+        }
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("read this crate's own Cargo.toml");
+        assert!(
+            !manifest.contains("notify"),
+            "expected no filesystem-watching dependency (e.g. the `notify` crate) in \
+             Cargo.toml"
         );
     }
 }

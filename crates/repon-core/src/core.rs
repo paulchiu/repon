@@ -666,6 +666,42 @@ pub(crate) struct StartForTest {
     pub discovery_watcher: JoinHandle<()>,
 }
 
+impl Core {
+    /// Puts one already-known entity into the in-flight state a real `refresh`
+    /// dispatch would, without spawning anything to complete it, so a test can
+    /// drive the deadline sweep through the tick channel alone and prove the sweep
+    /// runs on a tick rather than on a clock of its own, or prove that `pause`
+    /// cancels a real in-flight entry from outside this crate.
+    ///
+    /// Gated behind `test-util` (on by default under `cfg(test)` for this crate's own
+    /// tests) so a test-only affordance never ships on the default published surface,
+    /// per [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md),
+    /// the same reason `Timestamp::at` is gated.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn begin_untracked_probe_for_test(&self, key: &EntityKey) -> Arc<AtomicBool> {
+        let mut table = self.table.write().unwrap();
+        table.generation += 1;
+        let generation_number = table.generation;
+        table
+            .generation_started_at
+            .insert(generation_number, Instant::now());
+        if let Some(&idx) = table.index.get(key) {
+            begin_probes(&mut table.entities[idx]);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        table.in_flight.insert(
+            key.clone(),
+            InFlight {
+                generation: generation_number,
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let (lock, _cvar) = &*self.settle_gate;
+        *lock.lock().unwrap() += 1;
+        cancel
+    }
+}
+
 #[cfg(test)]
 impl Core {
     /// The cached thread-safe repository handle discovery left for `key`, if any,
@@ -751,33 +787,6 @@ impl Core {
 
     pub(crate) fn discovery_manual_for_test(&self) -> bool {
         self.discovery_manual.load(Ordering::Acquire)
-    }
-
-    /// Puts one already-known entity into the in-flight state a real `refresh`
-    /// dispatch would, without spawning anything to complete it, so a test can
-    /// drive the deadline sweep through the tick channel alone and prove the sweep
-    /// runs on a tick rather than on a clock of its own.
-    pub(crate) fn begin_untracked_probe_for_test(&self, key: &EntityKey) -> Arc<AtomicBool> {
-        let mut table = self.table.write().unwrap();
-        table.generation += 1;
-        let generation_number = table.generation;
-        table
-            .generation_started_at
-            .insert(generation_number, Instant::now());
-        if let Some(&idx) = table.index.get(key) {
-            begin_probes(&mut table.entities[idx]);
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        table.in_flight.insert(
-            key.clone(),
-            InFlight {
-                generation: generation_number,
-                cancel: Arc::clone(&cancel),
-            },
-        );
-        let (lock, _cvar) = &*self.settle_gate;
-        *lock.lock().unwrap() += 1;
-        cancel
     }
 
     /// Puts several already-known entities into the in-flight state of one shared

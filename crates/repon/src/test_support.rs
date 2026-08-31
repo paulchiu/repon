@@ -52,6 +52,40 @@ pub(crate) fn production_source_at(path: &Path) -> String {
     production_source(&std::fs::read_to_string(path).expect("read a crate source file"))
 }
 
+/// Every workspace crate's own `src` directory a source-scan absence claim must cover,
+/// derived from this crate's manifest dir rather than hard-coded twice, so a third
+/// workspace crate would need adding here once, not once per scan. Both a Launcher (this
+/// crate) and an Action step's executor (`repon-core`) spawn child processes, so a scan
+/// confined to one crate is exactly "a check that quietly stops checking".
+pub(crate) fn workspace_crate_src_dirs() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        manifest_dir.join("src"),
+        manifest_dir.join("../repon-core/src"),
+    ]
+}
+
+/// Every `path:line` across every workspace crate's `src` whose production source
+/// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
+/// naming the very pattern this scan bans does not trip it.
+pub(crate) fn production_lines_containing(needle: &str) -> Vec<String> {
+    let mut offending = Vec::new();
+    for dir in workspace_crate_src_dirs() {
+        for path in rust_source_files(&dir) {
+            let production = production_source_at(&path);
+            for (number, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(needle) {
+                    offending.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+    }
+    offending
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so
@@ -331,38 +365,6 @@ mod tests {
     // finding: "a check that quietly stops checking". Every line number reported below is
     // `production_source_at`'s output with its own `//` comment lines filtered out too, so a
     // doc comment explaining why a pattern must never appear can still name it.
-
-    /// Every workspace crate's own `src` directory a source-scan absence claim must cover,
-    /// derived from this crate's manifest dir rather than hard-coded twice, so a third
-    /// workspace crate would need adding here once, not once per scan.
-    fn workspace_crate_src_dirs() -> Vec<PathBuf> {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        vec![
-            manifest_dir.join("src"),
-            manifest_dir.join("../repon-core/src"),
-        ]
-    }
-
-    /// Every `path:line` across every workspace crate's `src` whose production source
-    /// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
-    /// naming the very pattern this scan bans does not trip it.
-    fn production_lines_containing(needle: &str) -> Vec<String> {
-        let mut offending = Vec::new();
-        for dir in workspace_crate_src_dirs() {
-            for path in rust_source_files(&dir) {
-                let production = production_source_at(&path);
-                for (number, line) in production.lines().enumerate() {
-                    if line.trim_start().starts_with("//") {
-                        continue;
-                    }
-                    if line.contains(needle) {
-                        offending.push(format!("{}:{}", path.display(), number + 1));
-                    }
-                }
-            }
-        }
-        offending
-    }
 
     /// Criterion 1's absence half: `setsid` and Rust's safe `CommandExt::process_group` are
     /// mutually exclusive (`setpgid` then `setsid` fails `EPERM`), so an Action step's child

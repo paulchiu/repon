@@ -285,6 +285,7 @@ fn parse(text: &str, path: &Path) -> Result<Loaded> {
     .map_err(|err| render_error(path, text, &err))?;
 
     reject_duplicate_names(&document, text, path)?;
+    reject_launchers_declaring_both_argv_forms(&document, text, path)?;
 
     let mut warnings: Vec<Warning> = unknown_paths.into_iter().map(Warning::UnknownKey).collect();
     warnings.extend(cross_key_warnings(&document));
@@ -385,6 +386,32 @@ fn reject_duplicate_names(document: &Document, input: &str, path: &Path) -> Resu
             &format!("duplicate action name `{value}`"),
             Some(span),
         ));
+    }
+    Ok(())
+}
+
+/// `args` and `from_env` are declared mutually exclusive
+/// ([config.md](../../../../docs/spec/config.md#launchers)): a `[[launcher]]` naming both is
+/// rejected at load rather than one silently winning, the same failure grade as a duplicate
+/// name above. Neither field carries its own span, so the error points at the entry's `name`,
+/// the nearest position this document keeps.
+fn reject_launchers_declaring_both_argv_forms(
+    document: &Document,
+    input: &str,
+    path: &Path,
+) -> Result<()> {
+    for launcher in &document.launchers {
+        if launcher.args.is_some() && launcher.from_env.is_some() {
+            return Err(parse_error(
+                path,
+                input,
+                &format!(
+                    "launcher `{}` declares both `args` and `from_env`, which are mutually exclusive",
+                    launcher.name.get_ref()
+                ),
+                Some(launcher.name.span()),
+            ));
+        }
     }
     Ok(())
 }
@@ -731,6 +758,73 @@ mod tests {
             "expected an unknown-key warning for the stray field, got: {:?}",
             loaded.warnings
         );
+    }
+
+    // Criterion 3: "there is no working-directory field" is an absence claim about the
+    // schema. `cwd` (or any other name) is not a field `LauncherConfig` knows, so a document
+    // naming one falls through to the same unknown-key warning as any other typo, exactly the
+    // way `an_appearance_key_is_not_part_of_the_schema_and_warns_as_unknown` proves the same
+    // shape of absence for the top-level `theme`/`appearance` case.
+    #[test]
+    fn a_working_directory_key_on_a_launcher_entry_is_not_part_of_the_schema_and_warns_as_unknown()
+    {
+        let text = "[[launcher]]\nname = \"lazygit\"\ncwd = \"/tmp\"\n";
+        let loaded = parse_ok(text);
+        assert!(
+            loaded.warnings.iter().any(|warning| matches!(
+                warning,
+                Warning::UnknownKey(path) if path.ends_with("cwd")
+            )),
+            "expected `cwd` to warn as an unknown key, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    /// Criterion 3's schema-shape half, the exhaustive-destructure guard this ticket's brief
+    /// warns about: hand-enumerating the fields a caller reads (`config.args`, `config.shell`,
+    /// ...) lets a new field, such as a working-directory one, compile silently. This
+    /// destructure names every field `LauncherConfig` has; one added under any name fails to
+    /// compile this test rather than landing unacknowledged, the same guard
+    /// `action_config_carries_no_pty_width_field_the_pty_is_a_fixed_constant_never_a_config_key`
+    /// already applies to `ActionConfig`.
+    #[test]
+    fn launcher_config_carries_no_working_directory_field_every_launcher_uses_its_entitys_own_cwd()
+    {
+        let loaded = parse_ok("[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n");
+        let LauncherConfig {
+            name: _,
+            args: _,
+            from_env: _,
+            shell: _,
+            env: _,
+            disabled: _,
+        } = loaded
+            .document
+            .launchers
+            .into_iter()
+            .next()
+            .expect("one parsed [[launcher]] entry");
+    }
+
+    // Criterion 3: `args` and `from_env` are mutually exclusive, so declaring both is an
+    // error rather than one silently winning over the other.
+    #[test]
+    fn a_launcher_declaring_both_args_and_from_env_is_rejected_at_load() {
+        let message =
+            parse_err("[[launcher]]\nname = \"editor\"\nargs = [\"vi\"]\nfrom_env = \"EDITOR\"\n");
+        assert!(
+            message.contains("editor") && message.contains("mutually exclusive"),
+            "expected a mutual-exclusion error naming the launcher, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_launcher_declaring_only_args_or_only_from_env_is_accepted() {
+        let with_args = parse_ok("[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n");
+        assert_eq!(with_args.document.launchers[0].from_env, None);
+
+        let with_from_env = parse_ok("[[launcher]]\nname = \"editor\"\nfrom_env = \"EDITOR\"\n");
+        assert_eq!(with_from_env.document.launchers[0].args, None);
     }
 
     // `[[repo]]`'s real schema: `default_branch` and `exclude` parse as typed fields, with

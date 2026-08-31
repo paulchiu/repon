@@ -12,7 +12,7 @@ use super::{App, entity_keys};
 use crate::{
     components::Component,
     config::{
-        self, Config,
+        Config,
         document::{self, Document},
     },
     keys, theme,
@@ -83,8 +83,8 @@ impl App {
 
     /// The state-mutating half of a reload, split out from [`Self::reload_config`] so a test
     /// can drive it with a hand-built [`Config`] and never touch the process-wide path
-    /// [`config::config_file`] resolves, which is fixed once for the whole process
-    /// ([`config::init`]) and cannot be pointed at a tempdir per test.
+    /// [`crate::config::config_file`] resolves, which is fixed once for the whole process
+    /// ([`crate::config::init`]) and cannot be pointed at a tempdir per test.
     fn apply_reloaded_config(&mut self, new_config: Config) {
         let (bindings, keys_warnings) = match keys::merge(&new_config.document.keys) {
             Ok(result) => result,
@@ -101,17 +101,20 @@ impl App {
         self.bindings = bindings;
 
         let theme_name = new_config.document.theme.clone();
-        match theme::load(
-            &config::themes_dir(),
-            &theme_name,
-            theme::ThemeSource::Config,
-        ) {
+        match theme::load(&self.themes_dir, &theme_name, theme::ThemeSource::Config) {
             Ok(loaded_theme) => {
                 for warning in &loaded_theme.warnings {
                     tracing::warn!("{warning}");
                 }
                 self.theme = loaded_theme.theme;
                 self.theme_warnings = loaded_theme.warnings;
+                // Keeps `self.theme_name`/`self.theme_source` in step with what actually
+                // just loaded, since a later return from suspension re-reads exactly these
+                // two fields ([`Self::reread_theme`]); leaving the pre-reload name behind
+                // here would make that reread silently revert a theme change on the very
+                // next resume.
+                self.theme_name = theme_name;
+                self.theme_source = theme::ThemeSource::Config;
             }
             Err(err) => {
                 tracing::error!("config reload failed to load theme `{theme_name}`: {err:#}");
