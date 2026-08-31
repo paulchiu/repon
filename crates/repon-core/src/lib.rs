@@ -75,9 +75,7 @@ mod test_support;
 mod wire;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
-#[cfg(feature = "fetch")]
-pub use core::FetchSpec;
-pub use core::{ActionSpec, Core, CoreSpec, RepoOverride, Step};
+pub use core::{ActionSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;

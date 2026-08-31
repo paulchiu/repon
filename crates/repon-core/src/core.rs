@@ -192,14 +192,15 @@ fn dispatches_kind(kind: Kind, show_submodules: bool) -> bool {
 
 /// The periodic fetch's own crossing data
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
-/// `[fetch]` table): whether it runs at all, its cadence, and how many run at
-/// once. Present only when this crate is built with the `fetch` cargo feature,
-/// which is the mutating path's own isolation boundary
-/// ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)):
-/// a consumer that never turns the feature on cannot even express "run the
-/// periodic fetch", the setting-nothing-reads shape a cargo feature closes off at
-/// compile time rather than at runtime.
-#[cfg(feature = "fetch")]
+/// `[fetch]` table): whether it runs at all, its cadence, and how many run at once.
+///
+/// Always present, regardless of the `fetch` cargo feature: this is plain bounding
+/// data, not the mutating mechanism, so a consumer can always express "run the
+/// periodic fetch" in `CoreSpec` without the feature's blocking network client, HTTP
+/// transport and credential machinery ever entering its dependency tree. Only
+/// `fetch.rs` and the scheduler's own dispatch of a real cycle are gated behind the
+/// feature ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)):
+/// without it, `enabled: true` here is inert and no cycle ever runs.
 #[derive(Debug, Clone)]
 pub struct FetchSpec {
     pub enabled: bool,
@@ -223,8 +224,8 @@ pub struct CoreSpec {
     /// Live-updatable afterwards through [`Core::set_show_submodules`], which is what lets
     /// toggling it skip a Core rebuild and the rediscovery that would come with one.
     pub show_submodules: bool,
-    /// The periodic fetch's own bounding data. See [`FetchSpec`].
-    #[cfg(feature = "fetch")]
+    /// The periodic fetch's own bounding data. See [`FetchSpec`]: always present,
+    /// inert without the `fetch` cargo feature.
     pub fetch: FetchSpec,
 }
 
@@ -431,12 +432,10 @@ impl Core {
         let interval = spec.poll_interval.max(Duration::from_nanos(1));
         let ticks = crossbeam_channel::tick(interval);
         let alive = Arc::new(AtomicBool::new(true));
-        // `spec.fetch` only exists when this crate is built with the `fetch` cargo
-        // feature (see `FetchSpec`'s own doc comment), so the two branches below
-        // are what let `start_internal`'s own signature stay the same either way:
-        // without the feature there is nothing to schedule, so fetch is always off
-        // and its tick channel never fires.
-        #[cfg(feature = "fetch")]
+        // `spec.fetch` is always present (see `FetchSpec`'s own doc comment), so this
+        // reads it unconditionally: without the `fetch` cargo feature, `run_fetch_cycle`
+        // is a no-op stub regardless of what this schedules, so there is no separate
+        // "feature off" branch to maintain here.
         let fetch_start = FetchStart {
             enabled: spec.fetch.enabled,
             concurrency: spec.fetch.concurrency.max(1),
@@ -445,12 +444,6 @@ impl Core {
             } else {
                 crossbeam_channel::never()
             },
-        };
-        #[cfg(not(feature = "fetch"))]
-        let fetch_start = FetchStart {
-            enabled: false,
-            concurrency: 1,
-            ticks: crossbeam_channel::never(),
         };
         start_internal(
             spec,
@@ -3384,7 +3377,6 @@ mod tests {
     /// A `FetchSpec` that never fires on its own: `enabled: false`, so every
     /// existing test that does not care about the periodic fetch keeps behaving
     /// exactly as it did before this field existed.
-    #[cfg(feature = "fetch")]
     fn fetch_spec_for_test() -> FetchSpec {
         FetchSpec {
             enabled: false,
@@ -3406,7 +3398,6 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
-            #[cfg(feature = "fetch")]
             fetch: fetch_spec_for_test(),
         }
     }
@@ -3430,8 +3421,7 @@ mod tests {
             status_stale_after: _,
             generation_deadline: _,
             show_submodules: _,
-            #[cfg(feature = "fetch")]
-                fetch: _,
+            fetch: _,
         } = spec(Vec::new());
     }
 
