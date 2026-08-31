@@ -105,8 +105,6 @@ impl Selection {
     /// is what keeps clearing a Filter unable to change an operation's blast radius between
     /// keystrokes: this reads only the checked set, never anything visibility-shaped.
     ///
-    /// Not read outside tests until an Action or a Launcher exists to call it.
-    #[allow(dead_code)]
     pub(crate) fn targets(&self, cursor: &EntityKey) -> Vec<EntityKey> {
         if self.selected.is_empty() {
             vec![cursor.clone()]
