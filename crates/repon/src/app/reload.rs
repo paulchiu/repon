@@ -292,6 +292,14 @@ impl App {
     /// [core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
     /// own doc comment. Leaves `self.core` untouched, with no rediscovery at all, when the
     /// chosen Set's bounds match the one already running.
+    ///
+    /// Deferred rather than built here: [filter.md](../../../../docs/spec/filter.md)'s
+    /// "Persistence and scope" records that a Set switch is startup in a different scope, so
+    /// it should write the outgoing Set's own `self.selection`/`self.filter` to `state.toml`
+    /// at the moment of the switch and load the incoming Set's own stored state the same way
+    /// `App::restore_session_state` does at startup. This neither writes nor loads either;
+    /// `self.selection` and `self.filter` carry straight across a switch today, and only a
+    /// quit persists the scope active at exit ([`App::persist_state`]).
     fn apply_active_set(&mut self, chosen: &document::SetConfig, document: &Document) {
         let resolved = ActiveSet::from_config(chosen);
         let bounds_changed = resolved.roots != self.active_set.roots
@@ -370,6 +378,7 @@ mod tests {
             data_dir: std::path::PathBuf::new(),
             document,
             warnings: Vec::new(),
+            zero_config: false,
         }
     }
 

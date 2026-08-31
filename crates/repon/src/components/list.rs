@@ -2809,6 +2809,7 @@ mod tests {
                 ..Default::default()
             },
             warnings: Vec::new(),
+            zero_config: false,
         })
         .expect("register config");
         list
@@ -2916,6 +2917,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                zero_config: false,
             })
             .expect("register config");
             let terminal = render_with_list(&mut list, 140, 24, &snapshot);

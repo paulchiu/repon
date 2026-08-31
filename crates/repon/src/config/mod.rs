@@ -26,6 +26,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub document: Document,
     pub warnings: Vec<Warning>,
+    /// [`document::Loaded::zero_config`], carried through unchanged: `state.toml`'s own
+    /// scope key reads this.
+    pub zero_config: bool,
 }
 
 impl Config {
@@ -49,6 +52,7 @@ impl Config {
             data_dir: data_dir(),
             document: loaded.document,
             warnings: loaded.warnings,
+            zero_config: loaded.zero_config,
         })
     }
 }

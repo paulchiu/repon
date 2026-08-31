@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use repon_core::EntityKey;
+use repon_core::{EntityKey, EntityState};
 
 use crate::unwind::UnwindLevel;
 
@@ -42,8 +42,6 @@ impl Selection {
         self.selected.is_empty()
     }
 
-    /// Not read outside tests until a component renders a checked row's mark.
-    #[allow(dead_code)]
     pub(crate) fn contains(&self, key: &EntityKey) -> bool {
         self.selected.contains(key)
     }
@@ -118,6 +116,37 @@ impl Selection {
     pub(crate) fn cancel_range_anchor(&mut self) -> bool {
         self.range_anchor.take().is_some()
     }
+
+    /// Rebuilds a Selection from stored display names against `entities`, freshly discovered
+    /// this session: restores by name, never by a remembered index, so a stored name matching
+    /// none of them is dropped silently
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    pub(crate) fn restore_by_name(names: &[String], entities: &[EntityState]) -> Self {
+        let mut selection = Self::new();
+        let restored: Vec<EntityKey> = names
+            .iter()
+            .filter_map(|name| {
+                entities
+                    .iter()
+                    .find(|entity| entity.name.as_ref() == name.as_str())
+                    .map(|entity| entity.key.clone())
+            })
+            .collect();
+        selection.select_all_visible(&restored);
+        selection
+    }
+
+    /// The display names of every currently checked row, matched against `entities` in their
+    /// own discovery order: what [`crate::app::App::persist_state`] writes into
+    /// `state.toml`'s own `selection` list, so what comes back out is a name rather than an
+    /// index into a list that can reorder between sessions.
+    pub(crate) fn names(&self, entities: &[EntityState]) -> Vec<String> {
+        entities
+            .iter()
+            .filter(|entity| self.contains(&entity.key))
+            .map(|entity| entity.name.to_string())
+            .collect()
+    }
 }
 
 /// The range anchor is the one Escape-unwind level built by this ticket; see
@@ -136,6 +165,19 @@ mod tests {
 
     fn key(name: &str) -> EntityKey {
         EntityKey::new(Arc::from(Path::new(name)))
+    }
+
+    /// A minimal `EntityState`, keyed and named after the same string: enough for
+    /// [`Selection::restore_by_name`] and [`Selection::names`] to match on, with nothing
+    /// else read by either.
+    fn entity_named(name: &str) -> EntityState {
+        let path: Arc<Path> = Arc::from(Path::new(name));
+        EntityState::new(
+            EntityKey::new(Arc::clone(&path)),
+            Arc::from(name),
+            path,
+            repon_core::Kind::Repo,
+        )
     }
 
     #[test]
@@ -407,5 +449,90 @@ mod tests {
             "the range anchor is a separate level from the checked-row set; cancelling one \
              must never clear the other"
         );
+    }
+
+    #[test]
+    fn restore_by_name_selects_the_matching_entities_and_drops_an_unknown_name_silently() {
+        let entities = vec![entity_named("repo-a"), entity_named("repo-b")];
+
+        let selection = Selection::restore_by_name(
+            &["repo-b".to_string(), "ghost-repo".to_string()],
+            &entities,
+        );
+
+        assert!(selection.contains(&entities[1].key));
+        assert!(!selection.contains(&entities[0].key));
+        assert_eq!(
+            selection.count(),
+            1,
+            "a stored name matching nothing must be dropped, not turned into an error or a \
+             placeholder row"
+        );
+    }
+
+    /// Criterion 3's sharpest test: a row discovered ahead of the stored one this run shifts
+    /// its index from 1 to 2, so an implementation that restored by remembered position
+    /// (rather than by searching `entities` for the name) would select `repo-new` instead.
+    #[test]
+    fn restore_by_name_survives_an_index_shift_from_a_row_discovered_earlier_this_run() {
+        let stored = vec!["repo-b".to_string()];
+        let reordered = vec![
+            entity_named("repo-new"),
+            entity_named("repo-a"),
+            entity_named("repo-b"),
+        ];
+
+        let selection = Selection::restore_by_name(&stored, &reordered);
+
+        assert!(
+            selection.contains(&reordered[2].key),
+            "expected repo-b, by name"
+        );
+        assert!(
+            !selection.contains(&reordered[0].key),
+            "a positional restore would wrongly select the row now sitting at index 0"
+        );
+        assert!(!selection.contains(&reordered[1].key));
+        assert_eq!(selection.count(), 1);
+    }
+
+    #[test]
+    fn restore_by_name_over_an_empty_list_of_names_selects_nothing() {
+        let entities = vec![entity_named("repo-a")];
+        let selection = Selection::restore_by_name(&[], &entities);
+        assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn names_reports_every_checked_rows_display_name_in_the_entities_own_order() {
+        let entities = vec![
+            entity_named("repo-a"),
+            entity_named("repo-b"),
+            entity_named("repo-c"),
+        ];
+        let mut selection = Selection::new();
+        selection.toggle(entities[2].key.clone());
+        selection.toggle(entities[0].key.clone());
+
+        assert_eq!(
+            selection.names(&entities),
+            vec!["repo-a".to_string(), "repo-c".to_string()],
+            "expected the checked rows' own names in discovery order, not toggle order"
+        );
+    }
+
+    /// `names` then `restore_by_name` is the exact round trip `App::persist_state` and
+    /// `App::restore_session_state` take: what comes back must be the same checked set.
+    #[test]
+    fn names_then_restore_by_name_round_trips_the_checked_set() {
+        let entities = vec![entity_named("repo-a"), entity_named("repo-b")];
+        let mut selection = Selection::new();
+        selection.toggle(entities[1].key.clone());
+
+        let names = selection.names(&entities);
+        let restored = Selection::restore_by_name(&names, &entities);
+
+        assert_eq!(restored.count(), 1);
+        assert!(restored.contains(&entities[1].key));
     }
 }

@@ -286,6 +286,16 @@ impl std::fmt::Display for Warning {
 pub struct Loaded {
     pub document: Document,
     pub warnings: Vec<Warning>,
+    /// `true` only when no file was read at all: the default path absent, or a
+    /// `REPON_CONFIG` directory holding no `config.toml`
+    /// ([config.md](../../../../docs/spec/config.md#reading-and-failing)'s "Zero config").
+    /// `state.toml` keys its scope by this: the active Set's name is `all` either way once a
+    /// zero-config document declares no Set of its own, so two different working
+    /// directories both running zero-config would otherwise restore each other's session
+    /// state ([0006](../../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    /// `false` for a file that exists but happens to declare no `[[set]]`, since that Set's
+    /// name still comes from a document a user can go and edit.
+    pub zero_config: bool,
 }
 
 /// The pasteable, annotated example config from `config.md`'s "An annotated example"
@@ -313,6 +323,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
             return Ok(Loaded {
                 document,
                 warnings: Vec::new(),
+                zero_config: true,
             });
         }
         Err(err) => {
@@ -342,10 +353,17 @@ fn parse(text: &str, path: &Path) -> Result<Loaded> {
         document.sets.push(implicit_all_set(working_directory()));
     }
 
-    Ok(Loaded { document, warnings })
+    Ok(Loaded {
+        document,
+        warnings,
+        zero_config: false,
+    })
 }
 
-fn working_directory() -> PathBuf {
+/// The resolved current working directory, or `.` when it cannot be read: the implicit
+/// `all` Set's own root, and the same value [`crate::app`] keys `state.toml`'s scope by when
+/// running with no config at all.
+pub(crate) fn working_directory() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
@@ -684,6 +702,26 @@ mod tests {
             vec![working_directory().to_string_lossy().into_owned()]
         );
         assert!(loaded.warnings.is_empty());
+        assert!(
+            loaded.zero_config,
+            "a missing file must report zero_config, since state.toml's own scope key reads \
+             this to decide between the active Set's name and the working directory"
+        );
+    }
+
+    /// The negative control for `zero_config`: a real file that happens to declare no
+    /// `[[set]]` still gets the same implicit `all` Set pushed for it, but it is not zero
+    /// config, since there is a document a user can go and edit. Distinguishes "no file was
+    /// read" from "a file was read and turned out to declare nothing".
+    #[test]
+    fn a_real_file_declaring_no_set_is_not_reported_as_zero_config() {
+        let loaded = parse_ok("");
+        assert_eq!(loaded.document.sets[0].name.get_ref(), "all");
+        assert!(
+            !loaded.zero_config,
+            "a file that was actually read must never report zero_config, even when it \
+             declares no [[set]] of its own"
+        );
     }
 
     // Malformed TOML exits non-zero (via Result::Err) reporting toml's own line and column.

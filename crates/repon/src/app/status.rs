@@ -179,6 +179,7 @@ mod tests {
             data_dir: std::path::PathBuf::new(),
             document,
             warnings: Vec::new(),
+            zero_config: false,
         }
     }
 
