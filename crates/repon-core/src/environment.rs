@@ -166,7 +166,11 @@ fn branch_and_head(settled: Option<&Settled<Head>>) -> (Option<String>, Option<S
         return (None, None);
     };
     match settled {
-        Settled::Known { value, .. } => match value {
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => match value {
             Head::Branch { name, commit } => (Some(name.to_string()), Some(commit.to_string())),
             Head::Detached(commit) => (None, Some(commit.to_string())),
             Head::Unborn(name) => (Some(name.to_string()), None),
@@ -181,7 +185,11 @@ fn branch_and_head(settled: Option<&Settled<Head>>) -> (Option<String>, Option<S
 /// `docs/spec/discovery.md` already records as known-wrong for a Submodule.
 fn default_branch_name(settled: Option<&Settled<DefaultBranch>>) -> Option<String> {
     match settled? {
-        Settled::Known { value, .. } => Some(value.name().to_string()),
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => Some(value.name().to_string()),
         Settled::Unknown(_) | Settled::Failed(_) | Settled::NotApplicable => None,
     }
 }

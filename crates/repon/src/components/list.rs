@@ -629,7 +629,11 @@ enum CellShape<'a, T> {
 /// being no prior state").
 fn cell_shape<T>(settled: Option<&Settled<T>>, loading_glyph: Option<char>) -> CellShape<'_, T> {
     match settled {
-        Some(Settled::Known { value, .. }) => CellShape::Known(value),
+        Some(Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        }) => CellShape::Known(value),
         Some(Settled::Unknown(_)) => CellShape::Blank,
         Some(Settled::Failed(_)) => CellShape::Blank,
         Some(Settled::NotApplicable) => CellShape::Blank,

@@ -1872,7 +1872,11 @@ fn probe_sync(
         return None;
     }
     let head = match branch_settled? {
-        Settled::Known { value, .. } => Some(value),
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => Some(value),
         Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
         Settled::Unknown(_) | Settled::NotApplicable => None,
     };
@@ -1921,7 +1925,11 @@ fn probe_base(
         return None;
     }
     let head = match branch_settled? {
-        Settled::Known { value, .. } => value,
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => value,
         Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
         Settled::Unknown(_) | Settled::NotApplicable => return None,
     };
@@ -2241,7 +2249,12 @@ fn probe_patch_equivalence(
     memo: &PatchEquivalenceMemo<'_>,
     report: &mut GateReport<'_>,
 ) -> Option<Settled<WorktreeState>> {
-    let Settled::Known { value, .. } = default_branch_settled else {
+    let Settled::Known {
+        value,
+        at: _,
+        stale: _,
+    } = default_branch_settled
+    else {
         // `landing::probe` only returns `Outstanding` once the default branch
         // resolved; reached only if that invariant breaks.
         return None;
@@ -2813,7 +2826,8 @@ mod tests {
         match entity.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { .. },
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected an attached branch, got {other:?}"),
         }
@@ -2892,7 +2906,14 @@ mod tests {
 
         for entity in &settled.entities {
             assert!(
-                matches!(entity.dirty.settled(), Some(Settled::Known { .. })),
+                matches!(
+                    entity.dirty.settled(),
+                    Some(Settled::Known {
+                        value: _,
+                        at: _,
+                        stale: _
+                    })
+                ),
                 "entity {:?} was left without a settled dirty cell, which is exactly what a \
                  visibility-scoped dispatch would leave behind on the entities it skipped: \
                  got {:?}",
@@ -2934,7 +2955,8 @@ mod tests {
                 entity.branch.settled(),
                 Some(Settled::Known {
                     value: Head::Branch { .. },
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "the cheap branch cell must be readable while phase C is still held open, got {:?}",
@@ -2957,7 +2979,14 @@ mod tests {
             .find(|entity| entity.key == key)
             .expect("entity present");
         assert!(
-            matches!(entity.dirty.settled(), Some(Settled::Known { .. })),
+            matches!(
+                entity.dirty.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
             "phase C must settle once released, got {:?}",
             entity.dirty.settled()
         );
@@ -3147,7 +3176,8 @@ mod tests {
             entity.branch.settled(),
             Some(Settled::Known {
                 value: Head::Branch { .. },
-                ..
+                at: _,
+                stale: _
             })
         ));
     }
@@ -3187,7 +3217,8 @@ mod tests {
                 entity.sync.settled(),
                 Some(Settled::Known {
                     value: SyncState::NoRemote,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected probe_now to settle sync, got {:?}",
@@ -3255,7 +3286,11 @@ mod tests {
         assert!(
             matches!(
                 settled.entities[0].base.settled(),
-                Some(Settled::Known { value: 1, .. })
+                Some(Settled::Known {
+                    value: 1,
+                    at: _,
+                    stale: _
+                })
             ),
             "expected a real refresh to settle base's live count against the resolved \
              default branch, got {:?}",
@@ -3290,7 +3325,8 @@ mod tests {
                         untracked: 1,
                         deleted: 0,
                     },
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected probe_now to settle dirty with the one untracked path, got {:?}",
@@ -3314,7 +3350,8 @@ mod tests {
             entity.branch.settled(),
             Some(Settled::Known {
                 value: Head::Branch { .. },
-                ..
+                at: _,
+                stale: _
             })
         ));
     }
@@ -3573,10 +3610,16 @@ mod tests {
 
         assert!(started);
         let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot()
-                .entities
-                .iter()
-                .all(|entity| matches!(entity.branch.settled(), Some(Settled::Known { .. })))
+            core.snapshot().entities.iter().all(|entity| {
+                matches!(
+                    entity.branch.settled(),
+                    Some(Settled::Known {
+                        value: _,
+                        at: _,
+                        stale: _
+                    })
+                )
+            })
         });
         assert!(
             settled,
@@ -3892,7 +3935,7 @@ mod tests {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
                 stale: true,
-                ..
+                at: _,
             }) => assert_eq!(
                 &**name, expected_branch,
                 "a Vanished entity must keep its last known branch value"
@@ -3922,7 +3965,8 @@ mod tests {
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => name.to_string(),
             other => panic!("expected the first refresh to settle a branch, got {other:?}"),
         };
@@ -4068,7 +4112,8 @@ mod tests {
         let branch_name = match submodule_before.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => name.to_string(),
             other => {
                 panic!("expected the submodule's first refresh to settle a branch, got {other:?}")
@@ -4141,7 +4186,8 @@ mod tests {
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => name.to_string(),
             other => panic!("expected the first refresh to settle a branch, got {other:?}"),
         };
@@ -4252,7 +4298,14 @@ mod tests {
             .find(|entity| entity.key == new_key)
             .expect("the newly discovered repo must still be present");
         assert!(
-            matches!(new_entity.branch.settled(), Some(Settled::Known { .. })),
+            matches!(
+                new_entity.branch.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
             "a refresh naming the newly discovered repo's key must actually probe \
              it and settle its branch cell, got {:?}",
             new_entity.branch.settled()
@@ -4574,7 +4627,8 @@ mod tests {
                 a_after_gen2.branch.settled(),
                 Some(Settled::Known {
                     value: Head::Branch { .. },
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "Generation 2's real probe should have written A's cell by now"
@@ -4604,7 +4658,8 @@ mod tests {
         match a_final.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => assert_ne!(
                 &**name, "stale-from-generation-one",
                 "a lower-Generation result must be dropped at the cell it would write"
@@ -4635,7 +4690,8 @@ mod tests {
         match b_final.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => assert_eq!(
                 &**name, "b-generation-one-result",
                 "an entity the new Generation never covered must still accept its own result"
@@ -4684,7 +4740,8 @@ mod tests {
         let a_value_before = match a_settled.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => Arc::clone(name),
             other => panic!("expected A's synchronous probe to settle a branch, got {other:?}"),
         };
@@ -4713,7 +4770,8 @@ mod tests {
         match a_after.branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
-                ..
+                at: _,
+                stale: _,
             }) => assert_eq!(
                 name, &a_value_before,
                 "an already-settled cell must keep its value when the deadline sweep runs, not be blanked"
@@ -5021,7 +5079,8 @@ mod tests {
                         Head::Branch {
                             name: repo_name, ..
                         },
-                    ..
+                    at: _,
+                    stale: _,
                 }),
                 Some(Settled::Known {
                     value:
@@ -5029,7 +5088,8 @@ mod tests {
                             name: worktree_name,
                             ..
                         },
-                    ..
+                    at: _,
+                    stale: _,
                 }),
             ) => {
                 assert_ne!(repo_name, worktree_name);
@@ -5092,7 +5152,8 @@ mod tests {
                 worktree_entity.state.settled(),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected the worktree, at the same commit as the default branch, to read Merged, got {:?}",
@@ -5185,7 +5246,8 @@ mod tests {
                 worktree_entity.state.settled(),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected a squash-merged worktree branch to read Merged, got {:?}",
@@ -5250,7 +5312,8 @@ mod tests {
                 worktree_entity.state.settled(),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected ancestry alone to settle Merged here, got {:?}",
@@ -5345,7 +5408,8 @@ mod tests {
                 worktree_entity.state.settled(),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected this refresh to actually reach patch equivalence and settle \
@@ -5437,7 +5501,8 @@ mod tests {
                 worktree_entity.state.settled(),
                 Some(Settled::Known {
                     value: WorktreeState::Active,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected genuinely unmerged work with a live upstream to settle Active, got {:?}",
@@ -5703,7 +5768,14 @@ mod tests {
             .find(|entity| entity.key == key)
             .expect("submodule entity");
         assert!(
-            matches!(shown_entity.branch.settled(), Some(Settled::Known { .. })),
+            matches!(
+                shown_entity.branch.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
             "expected the same Submodule's branch to settle a real value once shown, got {:?}",
             shown_entity.branch.settled()
         );
@@ -6174,7 +6246,11 @@ mod tests {
         let entity = &settled.entities[0];
 
         match entity.default_branch.settled() {
-            Some(Settled::Known { value, .. }) => assert_eq!(
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(
                 value.name(),
                 "origin/develop",
                 "the override must win even though origin/HEAD names a different branch"
@@ -6212,7 +6288,11 @@ mod tests {
 
         match entity.default_branch.settled() {
             // No remote at all: the override still answers, using the bare name.
-            Some(Settled::Known { value, .. }) => assert_eq!(value.name(), "release"),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(value.name(), "release"),
             other => panic!("expected the override's own answer, got {other:?}"),
         }
         assert_eq!(entity.diagnostics.default_branch_rung, Some(1));
@@ -6382,7 +6462,11 @@ mod tests {
         let entity = &settled.entities[0];
 
         match entity.default_branch.settled() {
-            Some(Settled::Known { value, .. }) => {
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => {
                 assert_eq!(value.name(), "origin/trunk")
             }
             other => panic!("expected the name list's answer, got {other:?}"),
@@ -6813,7 +6897,8 @@ mod tests {
                     settled_state,
                     Some(Settled::Known {
                         value: WorktreeState::Active,
-                        ..
+                        at: _,
+                        stale: _
                     })
                 ),
                 "expected every worktree's genuinely unmerged work to settle Active, got {settled_state:?}"
@@ -6994,7 +7079,8 @@ mod tests {
                 state_of(&deep_key),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected the deepest sibling's own squash commit to be found once the scan is \
@@ -7006,7 +7092,8 @@ mod tests {
                 state_of(&shallow_key),
                 Some(Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected the shallow sibling to settle Merged too, got {:?}",
@@ -7260,7 +7347,8 @@ mod tests {
                 state,
                 Some(Settled::Known {
                     value: WorktreeState::Active,
-                    ..
+                    at: _,
+                    stale: _
                 })
             ),
             "expected an Outstanding entity with no shared history to settle Active via the \
@@ -7357,7 +7445,8 @@ mod tests {
         match sync_of(&settled, &repo) {
             Some(Settled::Known {
                 value: SyncState::Tracking(AheadBehind { ahead, behind }),
-                ..
+                at: _,
+                stale: _,
             }) => {
                 assert_eq!(*ahead, 1);
                 assert_eq!(*behind, 0);
@@ -7387,7 +7476,8 @@ mod tests {
         match sync_of(&settled, &repo) {
             Some(Settled::Known {
                 value: SyncState::Tracking(AheadBehind { ahead, behind }),
-                ..
+                at: _,
+                stale: _,
             }) => {
                 assert_eq!(*ahead, 0);
                 assert_eq!(*behind, 1);
@@ -7417,7 +7507,8 @@ mod tests {
                         ahead: 0,
                         behind: 0,
                     }),
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected level with its upstream, got {other:?}"),
         }
@@ -7440,7 +7531,8 @@ mod tests {
         match sync_of(&settled, &repo) {
             Some(Settled::Known {
                 value: SyncState::NoUpstream,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected no upstream configured, got {other:?}"),
         }
@@ -7465,7 +7557,8 @@ mod tests {
         match sync_of(&settled, &repo) {
             Some(Settled::Known {
                 value: SyncState::NoUpstream,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected a detached row to read no upstream, got {other:?}"),
         }
@@ -7505,7 +7598,8 @@ mod tests {
             match sync_of(&settled, path) {
                 Some(Settled::Known {
                     value: SyncState::NoRemote,
-                    ..
+                    at: _,
+                    stale: _,
                 }) => {}
                 other => panic!(
                     "expected {} to read no remote at all, got {other:?}",
@@ -7575,7 +7669,8 @@ mod tests {
                         ahead: 1,
                         behind: 0,
                     }),
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected feature-ahead to read 1 ahead, got {other:?}"),
         }
@@ -7586,7 +7681,8 @@ mod tests {
                         ahead: 0,
                         behind: 1,
                     }),
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected feature-behind to read 1 behind, got {other:?}"),
         }
@@ -7616,7 +7712,8 @@ mod tests {
                         ahead: 0,
                         behind: 0,
                     }),
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!("expected the first Generation level with its upstream, got {other:?}"),
         }
@@ -7638,7 +7735,8 @@ mod tests {
                         ahead: 1,
                         behind: 0,
                     }),
-                ..
+                at: _,
+                stale: _,
             }) => {}
             other => panic!(
                 "expected the second Generation to recompute and read 1 ahead, got {other:?}"

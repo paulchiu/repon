@@ -210,7 +210,12 @@ impl<T> Cell<T> {
     /// value to mark old. This is what a Vanished Entity forces on every cell it
     /// holds, never blanking the last known values.
     pub(crate) fn force_stale(&mut self) {
-        if let Some(Settled::Known { stale, .. }) = &mut self.settled {
+        if let Some(Settled::Known {
+            stale,
+            value: _,
+            at: _,
+        }) = &mut self.settled
+        {
             *stale = true;
         }
     }
@@ -287,7 +292,11 @@ mod tests {
         cell.begin_probe();
 
         match cell.settled() {
-            Some(Settled::Known { value, .. }) => assert_eq!(*value, 7),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(*value, 7),
             other => {
                 panic!("expected the previous Known value to survive a re-probe, got {other:?}")
             }
@@ -328,7 +337,11 @@ mod tests {
         );
 
         match cell.settled() {
-            Some(Settled::Known { value, .. }) => assert_eq!(*value, 9),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(*value, 9),
             other => panic!("expected the higher Generation's value to survive, got {other:?}"),
         }
     }
@@ -375,7 +388,11 @@ mod tests {
         cell.force_stale();
 
         match cell.settled() {
-            Some(Settled::Known { value, stale, .. }) => {
+            Some(Settled::Known {
+                value,
+                stale,
+                at: _,
+            }) => {
                 assert_eq!(*value, 42, "the value must survive being forced stale");
                 assert!(*stale, "the cell must be marked stale");
             }
@@ -413,7 +430,11 @@ mod tests {
         let cloned = cell.clone();
 
         match cloned.settled() {
-            Some(Settled::Known { value, .. }) => assert_eq!(*value, 3),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(*value, 3),
             other => panic!("expected the clone to carry the same Known value, got {other:?}"),
         }
     }

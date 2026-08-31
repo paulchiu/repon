@@ -371,7 +371,11 @@ mod tests {
         let resolution = resolve(&open(&repo), None);
 
         match resolution.settled {
-            Settled::Known { value, .. } => assert_eq!(value.name(), "origin/trunk"),
+            Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            } => assert_eq!(value.name(), "origin/trunk"),
             other => panic!("expected a known default branch, got {other:?}"),
         }
         assert_eq!(
@@ -403,7 +407,11 @@ mod tests {
         let resolution = resolve(&open(&repo), None);
 
         match resolution.settled {
-            Settled::Known { value, .. } => assert_eq!(
+            Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            } => assert_eq!(
                 value.name(),
                 "origin/trunk",
                 "a stale rung 2 must fall through to rung 3's real answer, not the dead name"
@@ -433,7 +441,11 @@ mod tests {
         let resolution = resolve(&open(&repo), None);
 
         match resolution.settled {
-            Settled::Known { value, .. } => assert_eq!(value.name(), "origin/master"),
+            Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            } => assert_eq!(value.name(), "origin/master"),
             other => panic!("expected the name list's answer, got {other:?}"),
         }
         assert_eq!(resolution.rung, 3);
@@ -474,7 +486,11 @@ mod tests {
         let resolution = resolve(&open(&repo), Some("develop"));
 
         match resolution.settled {
-            Settled::Known { value, .. } => assert_eq!(value.name(), "origin/develop"),
+            Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            } => assert_eq!(value.name(), "origin/develop"),
             other => panic!("expected the override's own answer, got {other:?}"),
         }
         assert_eq!(
@@ -525,7 +541,11 @@ mod tests {
         let resolution = resolve(&open(&repo), None);
 
         match resolution.settled {
-            Settled::Known { value, .. } => assert_eq!(value.name(), "origin/develop"),
+            Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            } => assert_eq!(value.name(), "origin/develop"),
             other => panic!("expected rung 2's own answer to still win, got {other:?}"),
         }
         assert_eq!(resolution.rung, 2);

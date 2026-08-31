@@ -779,7 +779,7 @@ mod tests {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
                 stale: true,
-                ..
+                at: _,
             }) => assert_eq!(&**name, "main"),
             other => panic!("expected branch to keep its value and go stale, got {other:?}"),
         }
@@ -787,7 +787,7 @@ mod tests {
             Some(Settled::Known {
                 value: SyncState::Tracking(AheadBehind { ahead, behind }),
                 stale: true,
-                ..
+                at: _,
             }) => {
                 assert_eq!(*ahead, 1);
                 assert_eq!(*behind, 2);
@@ -798,7 +798,7 @@ mod tests {
             Some(Settled::Known {
                 value: 3,
                 stale: true,
-                ..
+                at: _,
             }) => {}
             other => panic!("expected base to keep its value and go stale, got {other:?}"),
         }
@@ -811,7 +811,7 @@ mod tests {
                         deleted: 2,
                     },
                 stale: true,
-                ..
+                at: _,
             }) => {}
             other => panic!("expected dirty to keep its value and go stale, got {other:?}"),
         }
@@ -819,13 +819,15 @@ mod tests {
             Some(Settled::Known {
                 value: WorktreeState::Active,
                 stale: true,
-                ..
+                at: _,
             }) => {}
             other => panic!("expected state to keep its value and go stale, got {other:?}"),
         }
         match entity.default_branch.settled() {
             Some(Settled::Known {
-                value, stale: true, ..
+                value,
+                stale: true,
+                at: _,
             }) => assert_eq!(value.name(), "main"),
             other => {
                 panic!("expected default_branch to keep its value and go stale, got {other:?}")

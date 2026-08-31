@@ -50,7 +50,11 @@ pub(crate) enum Outcome {
 /// unresolved default branch is exactly as unresolved.
 pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBranch>) -> Outcome {
     let default_branch = match default_branch {
-        Settled::Known { value, .. } => value,
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => value,
         Settled::Unknown(reason) => return Outcome::Settle(Settled::Unknown(*reason)),
         Settled::Failed(error) => return Outcome::Settle(Settled::Failed(error.clone())),
         Settled::NotApplicable => return Outcome::Settle(Settled::NotApplicable),
@@ -251,7 +255,8 @@ mod tests {
         match outcome {
             Outcome::Settle(Settled::Known {
                 value: WorktreeState::Merged,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             _ => panic!("expected the identical commit to settle Merged"),
         }
@@ -280,7 +285,8 @@ mod tests {
         match outcome {
             Outcome::Settle(Settled::Known {
                 value: WorktreeState::Merged,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             _ => panic!("expected an ancestor commit to settle Merged"),
         }
@@ -333,7 +339,8 @@ mod tests {
         match outcome {
             Outcome::Settle(Settled::Known {
                 value: WorktreeState::LocalOnly,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             _ => panic!("expected a branch with no upstream at all to settle Local only"),
         }
@@ -360,7 +367,8 @@ mod tests {
         match outcome {
             Outcome::Settle(Settled::Known {
                 value: WorktreeState::Gone,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             _ => panic!("expected a configured but unresolved upstream to settle Gone"),
         }
@@ -410,7 +418,8 @@ mod tests {
         match outcome {
             Outcome::Settle(Settled::Known {
                 value: WorktreeState::Merged,
-                ..
+                at: _,
+                stale: _,
             }) => {}
             _ => panic!("expected a detached HEAD that is an ancestor to settle Merged"),
         }
