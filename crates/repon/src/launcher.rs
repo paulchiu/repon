@@ -437,4 +437,264 @@ mod tests {
         let unset = Source::ShellFallback.resolve_argv(|_| None);
         assert_eq!(unset, vec!["/bin/sh".to_string()]);
     }
+
+    // Criterion 4: the editor chain's rungs, including the rung this brief calls out by
+    // name: an earlier rung set to an empty string is not the same as unset, and must still
+    // fall through rather than running a literal empty program.
+    #[test]
+    fn editor_chain_treats_an_empty_editor_value_as_unset_and_falls_through_to_the_vi_fallback() {
+        let editor_blank_visual_unset = Source::EditorChain.resolve_argv(|name| match name {
+            "EDITOR" => Some(String::new()),
+            _ => None,
+        });
+        assert_eq!(editor_blank_visual_unset, vec!["vi".to_string()]);
+    }
+
+    // Criterion 4's exclusion, the substance of the criterion per this ticket's brief:
+    // `GIT_EDITOR` and `core.editor` must appear nowhere in either crate's production
+    // source, since tooling commonly exports `GIT_EDITOR=true` to stop editors opening.
+    #[test]
+    fn git_editor_and_core_editor_appear_nowhere_in_either_crates_production_source() {
+        for needle in ["GIT_EDITOR", "core.editor"] {
+            let offending = crate::test_support::production_lines_containing(needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; the editor chain deliberately excludes git's own editor \
+                 variable and config key (docs/spec/config.md's \"Launchers\"), at: {offending:?}"
+            );
+        }
+    }
+
+    /// A bare `EntityState` at `path`, otherwise unprobed: enough for [`build_command`] to
+    /// resolve a working directory and an environment contract from.
+    fn entity_at(path: &std::path::Path) -> EntityState {
+        EntityState::new(
+            repon_core::EntityKey::new(std::sync::Arc::from(path)),
+            std::sync::Arc::from(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("entity"),
+            ),
+            std::sync::Arc::from(path),
+            repon_core::Kind::Repo,
+        )
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    // Criterion 1: shell metacharacters embedded in a single configured argv element must
+    // reach the child as one literal argument rather than being split or interpreted, which
+    // is what "executed without a shell" actually buys: `shell = false` here even though the
+    // string itself looks like shell syntax.
+    #[test]
+    fn shell_defaulting_off_never_splits_or_interprets_argv_that_looks_like_shell_syntax() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let entity = entity_at(dir.path());
+        let launcher = Launcher {
+            name: "test".to_string(),
+            source: Source::Args(vec!["echo".to_string(), "a && b; c | d`e`".to_string()]),
+            shell: false,
+            env: BTreeMap::new(),
+        };
+
+        let command = build_command(&launcher, &entity);
+
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("echo"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("a && b; c | d`e`")],
+            "the whole hostile string must arrive as one argument, never split or interpreted"
+        );
+    }
+
+    // Criterion 2: the zeroth-argument detail, precise and easy to get subtly wrong. Asserts
+    // the actual argv the child receives via `Command`'s own introspection, not what was
+    // passed to the builder.
+    #[test]
+    fn shell_mode_wraps_the_configured_command_in_the_users_shell_with_repon_as_its_zeroth_argument()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let entity = entity_at(dir.path());
+        let launcher = Launcher {
+            name: "log".to_string(),
+            source: Source::Args(vec!["git log --oneline -20 | less".to_string()]),
+            shell: true,
+            env: BTreeMap::new(),
+        };
+
+        let command = build_command(&launcher, &entity);
+
+        let expected_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        assert_eq!(command.get_program(), std::ffi::OsStr::new(&expected_shell));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("git log --oneline -20 | less"),
+                std::ffi::OsStr::new("repon"),
+            ],
+            "POSIX sh -c fills $0 from the first argument after the command string; `repon` \
+             must be that literal trailing argument, not the launched program's own name"
+        );
+    }
+
+    // Criterion 3: "a merged environment over the guaranteed set". A declared `env` override
+    // must win over the environment contract's own guaranteed pair for the same name, not
+    // merely sit alongside it.
+    #[test]
+    fn a_declared_env_override_wins_over_the_guaranteed_environment_contract_pair() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let entity = entity_at(dir.path());
+        let mut env = BTreeMap::new();
+        env.insert("REPON_REPO_NAME".to_string(), "overridden".to_string());
+        let launcher = Launcher {
+            name: "test".to_string(),
+            source: Source::Args(vec!["true".to_string()]),
+            shell: false,
+            env,
+        };
+
+        let command = build_command(&launcher, &entity);
+
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("REPON_REPO_NAME"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("overridden")),
+            "a declared env override must win over the guaranteed REPON_REPO_NAME pair"
+        );
+    }
+
+    // Criterion 1: repo context (a branch name, a repo path) reaches the child only through
+    // the environment, never through argv, and a value containing shell metacharacters
+    // (including a literal newline, which a path can carry even though a branch name cannot)
+    // cannot break out of its word because nothing here ever hands it to a shell. A real,
+    // disposable git repository, per this project's own testing convention: the "real
+    // interface" is a real repo on disk, not a git-backend trait.
+    #[test]
+    fn a_hostile_branch_and_path_reach_the_child_only_as_literal_environment_values() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        // No spaces (git's ref-format rejects them); the newline lives in the path instead,
+        // since a branch name cannot carry one.
+        let repo_name = "repo;$(touch__pwn_a)`touch__pwn_b`\n-tail";
+        let repo_path = root.join(repo_name);
+        std::fs::create_dir_all(&repo_path).expect("create a hostilely-named repo directory");
+        run_git(&repo_path, &["init", "-q", "."]);
+        run_git(
+            &repo_path,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "first",
+            ],
+        );
+        let hostile_branch = "feature/$(touch__pwn_c);`touch__pwn_d`";
+        run_git(&repo_path, &["checkout", "-q", "-b", hostile_branch]);
+
+        let core = repon_core::Core::start(repon_core::CoreSpec {
+            set: repon_core::SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.clone()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: std::time::Duration::from_secs(3600),
+            status_stale_after: std::time::Duration::from_secs(3600),
+            generation_deadline: std::time::Duration::from_secs(3600),
+        });
+        let key = core.snapshot().entities[0].key.clone();
+        let entity = core.probe_now(&key);
+
+        let launcher = Launcher {
+            name: "probe".to_string(),
+            source: Source::Args(vec!["printenv".to_string(), "REPON_BRANCH".to_string()]),
+            shell: false,
+            env: BTreeMap::new(),
+        };
+
+        // The argv itself never carries repo context: only the launcher's own literal,
+        // configured argv.
+        let command = build_command(&launcher, &entity);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("printenv"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("REPON_BRANCH")]
+        );
+        assert_eq!(command.get_current_dir(), Some(repo_path.as_path()));
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("REPON_BRANCH"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new(hostile_branch)),
+            "REPON_BRANCH must carry the hostile value byte-for-byte, as an environment value"
+        );
+
+        // End to end: a real child sees the value as one opaque string, never executed. The
+        // hostile value's own `$(...)` and backtick would, if ever handed to a shell, create
+        // marker files in the child's own working directory; their absence is the proof
+        // nothing here ever did that.
+        let mut executable = build_command(&launcher, &entity);
+        let output = executable.output().expect("run printenv");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            hostile_branch,
+            "the child must see the hostile branch name exactly, with nothing stripped or split"
+        );
+        for marker in [
+            "touch__pwn_a",
+            "touch__pwn_b",
+            "touch__pwn_c",
+            "touch__pwn_d",
+        ] {
+            assert!(
+                !repo_path.join(marker).exists(),
+                "found `{marker}`, which only exists if something executed the hostile value \
+                 rather than treating it as an opaque string"
+            );
+        }
+    }
+
+    // Criterion 1's second claim: "no template substitution into argv exists anywhere". The
+    // schema itself cannot express one (`launcher_config_carries_no_working_directory_field...`
+    // and this module's own exhaustive `Source` match are the structural half); this is the
+    // textual half, an absence scan for the concrete shape a template mechanism would take:
+    // a `str::replace` call standing in for a placeholder substitution. A bare `"{repo}"`-style
+    // needle is not used here, since Rust's own `format!`/`tracing` interpolation syntax
+    // shares that shape for unrelated reasons and would make this scan noisy rather than
+    // precise.
+    #[test]
+    fn no_placeholder_substitution_mechanism_exists_anywhere_in_either_crate() {
+        for needle in [
+            "replace(\"{",
+            "replace(\"$REPON",
+            "args_template",
+            "argv_template",
+        ] {
+            let offending = crate::test_support::production_lines_containing(needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; repo context reaches a Launcher only through the \
+                 environment, with no template substitution into argv anywhere, at: {offending:?}"
+            );
+        }
+    }
 }
