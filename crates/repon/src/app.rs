@@ -43,6 +43,11 @@ use reload::{ActiveSet, action_running_notice};
 /// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The frame").
 const NARROW_BREAKPOINT: u16 = 100;
 
+/// The Notice [`Action::NextFailed`]/[`Action::PreviousFailed`] raise when no visible row's
+/// gutter reads Failed, [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+/// unavailable case for a Built binding with nothing to do.
+const NO_FAILED_ROWS_NOTICE: &str = "no row has failed";
+
 /// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
 /// `pub(crate)` so `list.rs`'s own sidebar tests render at this constant rather than a
 /// hardcoded literal, per [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
@@ -800,18 +805,30 @@ impl App {
                 self.filter_line = Some(FilterLine::new(&self.filter));
                 None
             }
-            // `RederiveDefaultBranches`, `NextFailed`, `PreviousFailed`, `DismissVanished` and
-            // the List-only half of `HalfPageDown`/`HalfPageUp` are all unbuilt
-            // (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch` never returns
-            // an unbuilt action ([`keys::lookup`]'s own doc comment), so
-            // `self.bindings.dispatch(self.focus, key)` above can never produce one of these;
-            // this arm exists only because the match itself has to name every `Action`
-            // variant, the same proof-made-loud shape the `unreachable!` arm just below
-            // already uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
+            Some(Action::NextFailed) => {
+                match self.next_failed_index(1) {
+                    Some(index) => self.jump_cursor_to_failed_row(index),
+                    None => self.set_notice(NO_FAILED_ROWS_NOTICE.to_string()),
+                }
+                None
+            }
+            Some(Action::PreviousFailed) => {
+                match self.next_failed_index(-1) {
+                    Some(index) => self.jump_cursor_to_failed_row(index),
+                    None => self.set_notice(NO_FAILED_ROWS_NOTICE.to_string()),
+                }
+                None
+            }
+            // `RederiveDefaultBranches`, `DismissVanished` and the List-only half of
+            // `HalfPageDown`/`HalfPageUp` are all unbuilt (keybindings.md's "Not built yet").
+            // `keys::BindingTable::dispatch` never returns an unbuilt action
+            // ([`keys::lookup`]'s own doc comment), so `self.bindings.dispatch(self.focus,
+            // key)` above can never produce one of these; this arm exists only because the
+            // match itself has to name every `Action` variant, the same proof-made-loud shape
+            // the `unreachable!` arm just below already uses for
+            // `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
             Some(
                 Action::RederiveDefaultBranches
-                | Action::NextFailed
-                | Action::PreviousFailed
                 | Action::DismissVanished
                 | Action::HalfPageDown
                 | Action::HalfPageUp,
@@ -1282,6 +1299,54 @@ impl App {
             return;
         }
         self.cursor = index.min(visible.len() - 1);
+    }
+
+    /// Every currently visible row's failed state, in the same order [`Self::visible_keys`]
+    /// gives, read through [`repon_core::summary`], the same chokepoint the gutter's own
+    /// glyph and the detail pane's own disambiguation already share: a row reads failed here
+    /// on exactly the terms it reads `!` in the gutter, an unparseable `.gitmodules` and a
+    /// failed last Action alike.
+    fn visible_failed(&self) -> Vec<bool> {
+        let snapshot = self.core.snapshot();
+        let filter = self.active_filter();
+        crate::components::list::visible_row_order(
+            &snapshot.entities,
+            self.document.show_worktrees,
+            self.document.show_submodules,
+            &filter,
+        )
+        .into_iter()
+        .map(|index| {
+            repon_core::summary(&snapshot.entities[index]) == repon_core::RowSummary::Failed
+        })
+        .collect()
+    }
+
+    /// The visible index [`Action::NextFailed`] (`direction: 1`) or [`Action::PreviousFailed`]
+    /// (`direction: -1`) lands on: a circular scan from the cursor, landing back on the cursor
+    /// itself only if it is the sole failed row. `None` when the visible list is empty or
+    /// holds no failed row at all, the two bindings' own unavailable case
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#built-and-available)).
+    fn next_failed_index(&self, direction: i32) -> Option<usize> {
+        let failed = self.visible_failed();
+        if failed.is_empty() {
+            return None;
+        }
+        let len = failed.len() as i32;
+        (1..=len)
+            .map(|step| (self.cursor as i32 + direction * step).rem_euclid(len) as usize)
+            .find(|&index| failed[index])
+    }
+
+    /// Moves the cursor to `index` and, if the detail pane is open, moves it to the same row.
+    /// Opening the pane otherwise leaves it frozen at whatever row it was opened for
+    /// ([`Action::OpenDetail`]'s own arm above), but the whole point of walking to a failure is
+    /// to read it, which only works if the open pane comes along for the jump.
+    fn jump_cursor_to_failed_row(&mut self, index: usize) {
+        self.set_cursor(index);
+        if self.pane.is_some() {
+            self.pane = self.cursor_key();
+        }
     }
 
     /// Re-reads the theme file this run resolved to (`self.theme_name` under
@@ -2326,6 +2391,163 @@ mod tests {
 
         assert_eq!(app.pane, None);
         assert_eq!(app.focus, Context::List);
+    }
+
+    /// `n` and `N` walk to the row whose gutter reads Failed, through `repon_core::summary`,
+    /// the same route a failed last Action already drives the gutter mark through. Two failed
+    /// rows straddling the cursor, one on each side, is what makes
+    /// the two keys' opposite search directions distinguishable: a scan that ignored
+    /// direction entirely would still find *a* failed row and pass a single-failure fixture.
+    #[test]
+    fn next_failed_and_previous_failed_search_in_opposite_directions_from_the_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        init_repo(&root.join("repo-d"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            4,
+            "expected four repos discovered under the temp root"
+        );
+
+        run_failing_action_on(&mut app, 1);
+        run_failing_action_on(&mut app, 3);
+        let snapshot = app.core.snapshot();
+        for &index in &[1, 3] {
+            let entity = snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key == visible[index])
+                .expect("a row a failing Action just ran on");
+            assert_eq!(
+                repon_core::summary(entity),
+                repon_core::RowSummary::Failed,
+                "sanity check: row {index} must itself read Failed"
+            );
+        }
+
+        app.set_cursor(2);
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next failed");
+        assert_eq!(
+            app.cursor, 3,
+            "`n` from row 2 must land on the failed row ahead of it"
+        );
+
+        app.set_cursor(2);
+        app.handle_key_event(press(KeyCode::Char('N'), KeyModifiers::SHIFT))
+            .expect("previous failed");
+        assert_eq!(
+            app.cursor, 1,
+            "`N` from row 2 must land on the failed row behind it, not the one `n` finds"
+        );
+    }
+
+    /// The wraparound edge `next_failed_and_previous_failed_search_in_opposite_directions_from_the_cursor`
+    /// cannot exercise with two failures: a single failed row is itself both the next one and
+    /// the previous one, so pressing either key while sitting on it must land back on itself
+    /// rather than finding nothing or panicking on an empty scan.
+    #[test]
+    fn next_failed_from_the_sole_failed_row_lands_back_on_itself() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+
+        run_failing_action_on(&mut app, 1);
+
+        app.set_cursor(1);
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next failed");
+        assert_eq!(
+            app.cursor, 1,
+            "`n` from the sole failed row must land back on itself"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('N'), KeyModifiers::SHIFT))
+            .expect("previous failed");
+        assert_eq!(
+            app.cursor, 1,
+            "`N` from the sole failed row must also land back on itself"
+        );
+    }
+
+    /// Criterion 10's own budget (`app/reload.rs`'s "every Notice reason's static text is
+    /// authored to fit 44 columns"), pinned here since `NO_FAILED_ROWS_NOTICE` is a literal
+    /// rather than one of `app/reload.rs`'s own formatted Notices.
+    #[test]
+    fn no_failed_rows_notice_fits_44_columns() {
+        assert!(
+            !NO_FAILED_ROWS_NOTICE.is_empty(),
+            "expected a real reason, not an empty string"
+        );
+        assert!(
+            NO_FAILED_ROWS_NOTICE.len() <= 44,
+            "{NO_FAILED_ROWS_NOTICE:?} is {} columns, over the 44-column budget",
+            NO_FAILED_ROWS_NOTICE.len()
+        );
+    }
+
+    /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// unavailable case: `NextFailed` is Built but answers with a Notice, and leaves the
+    /// cursor alone, when nothing in the visible list has failed.
+    #[test]
+    fn next_failed_raises_a_notice_rather_than_moving_the_cursor_when_no_row_has_failed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next failed");
+
+        assert_eq!(
+            app.cursor, 0,
+            "no failed row exists anywhere, so the cursor must not move"
+        );
+        assert_eq!(app.notice(), Some(NO_FAILED_ROWS_NOTICE));
+    }
+
+    /// The open pane is otherwise frozen at whatever row opened it
+    /// (`opening_the_detail_pane_keeps_the_same_cursor_and_the_same_row_order` above), but
+    /// walking to a failure is pointless if the pane does not come along to show it.
+    #[test]
+    fn next_failed_moves_the_open_detail_panes_shown_row_along_with_the_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+
+        run_failing_action_on(&mut app, 2);
+
+        app.set_cursor(0);
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open the pane on row 0");
+        assert_eq!(app.pane, Some(visible[0].clone()));
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("return focus to the list, leaving the pane open");
+        assert_eq!(app.focus, Context::List);
+
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("next failed");
+
+        assert_eq!(app.cursor, 2);
+        assert_eq!(
+            app.pane,
+            Some(visible[2].clone()),
+            "the open pane must follow the cursor to the row `n` just landed on"
+        );
     }
 
     /// keybindings.md's fixed Esc order: a live range anchor unwinds before the pane does, so
@@ -3695,6 +3917,37 @@ mod tests {
             confirm,
             concurrency: 4,
         }
+    }
+
+    /// Like [`action_config`], but its one step exits non-zero: a real failing subprocess
+    /// rather than a hand-built receipt, so `NextFailed`/`PreviousFailed`'s own tests jump to
+    /// a row whose `last_action` is a genuine failure. `confirm: false` runs it the moment it
+    /// is chosen, with no `y` gate to wait through.
+    fn failing_action_config(name: &str) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm: false,
+            concurrency: 4,
+        }
+    }
+
+    /// Runs [`failing_action_config`] on the visible row at `index` and waits for the real
+    /// subprocess to finish, leaving that row's `last_action` a genuine failed receipt.
+    fn run_failing_action_on(app: &mut App, index: usize) {
+        app.set_cursor(index);
+        app.document.actions.push(failing_action_config("break"));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
+        assert!(finished, "expected the failing Action to actually finish");
     }
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {

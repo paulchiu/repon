@@ -56,8 +56,8 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `A` | Clear the Selection |
 | `Enter` | Open the detail pane |
 | `d` | Dismiss a Vanished row |
-| `n` | Next row whose last Action failed |
-| `N` | Previous row whose last Action failed |
+| `n` | Next failed row |
+| `N` | Previous failed row |
 
 ### detail
 
@@ -127,7 +127,6 @@ Advertising has not caught up with the flag yet. An unbuilt binding here still s
 
 - `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
 - `d` dismiss a Vanished row
-- `n` and `N`, in `list` only, walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78)); `confirm` binds `n` to the unrelated Decline
 - `Ctrl+D`, `PageDown`, `Ctrl+U` and `PageUp` in `list` only; the same chords in `detail` and `overlay` are built
 
 ## Why these keys and not others
