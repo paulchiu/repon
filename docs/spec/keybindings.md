@@ -123,7 +123,6 @@ Four bindings are already conditional in this way. While an Action is fanning ou
 
 The bindings below are reserved and specified but not built. Each is absent from the footer and the help overlay and inert on press. The list is checked by the `spec_conformance` test against the compiled table, so it cannot drift, and it shrinks to nothing as the features land.
 
-- `!` open the Launcher palette ([#98](https://github.com/paulchiu/repon/issues/98))
 - `/` enter a Filter ([#63](https://github.com/paulchiu/repon/issues/63))
 - `r` refresh everything and `R` refresh the Selection ([#65](https://github.com/paulchiu/repon/issues/65))
 - `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
