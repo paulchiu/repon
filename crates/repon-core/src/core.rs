@@ -213,9 +213,8 @@ enum ClockControl {
 ///
 /// Construction is `start`, never a plain constructor, because it spawns; `Drop`
 /// joins every thread it spawned. The public entry points are exactly `start`,
-/// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause`, `resume` and
-/// `discovery_warning` and `run_action`, the last a seam only (see its own doc
-/// comment).
+/// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause`, `resume`,
+/// `discovery_warning` and `run_action` (see its own doc comment).
 pub struct Core {
     table: Arc<RwLock<Table>>,
     /// Resolved once at `start` and never mutated afterwards: overrides only
@@ -3175,19 +3174,27 @@ mod tests {
     /// running it anyway, exactly the closed set of four outcomes
     /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
     /// "Actions" and `docs/spec/actions.md`'s "Step outcomes" both fix.
+    ///
+    /// The third step would succeed if it ran (`true` always exits zero), so its being
+    /// stopped is what this test observes, not an accident of a step that would have
+    /// failed anyway. It also writes a marker file rather than only exiting zero: a
+    /// receipt correctly labelled `NotRun` is not, by itself, proof the step never ran
+    /// (an implementation could execute a step and then paper over its result), so the
+    /// missing file is evidence the receipt cannot fake.
     #[test]
     fn an_entitys_steps_run_in_order_and_a_failure_marks_every_later_step_not_run() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
+        let marker = repo.join("step-three-ran");
 
         let core = Core::start(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let steps = vec![
             step(&["true"]),
             step(&["sh", "-c", "exit 7"]),
-            step(&["true"]),
+            step(&["touch", "step-three-ran"]),
         ];
 
         let started = core.run_action(action("reinstall", steps), std::slice::from_ref(&key));
@@ -3208,6 +3215,59 @@ mod tests {
             receipt.steps[2].outcome,
             StepOutcome::NotRun,
             "a step after a failure must be recorded NotRun, not silently dropped or run anyway"
+        );
+        assert!(
+            !marker.exists(),
+            "the third step's own `touch` must never have run: its marker file exists, so \
+             the step ran despite being recorded NotRun"
+        );
+    }
+
+    /// Independent of stopping at a failure: three always-succeeding steps each append
+    /// their own digit to the same file, so the file's final content pins the actual
+    /// execution order rather than trusting that a linear scan of `action.steps` runs
+    /// them in the sequence they were declared in.
+    #[test]
+    fn steps_run_in_the_order_theyre_declared_not_some_other_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let order_log = repo.join("order.log");
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![
+            step(&["sh", "-c", "printf 1 >> order.log"]),
+            step(&["sh", "-c", "printf 2 >> order.log"]),
+            step(&["sh", "-c", "printf 3 >> order.log"]),
+        ];
+
+        let started = core.run_action(action("ordering", steps), std::slice::from_ref(&key));
+
+        assert!(started);
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0].last_action.is_some()
+        });
+        assert!(settled, "the fan-out must finish and write a receipt");
+        let receipt = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps.len(), 3);
+        assert!(
+            receipt
+                .steps
+                .iter()
+                .all(|result| result.outcome == StepOutcome::Ok),
+            "every step here always exits zero; this test isolates ordering from gating"
+        );
+        let content = fs::read_to_string(&order_log).expect("order.log written by the steps");
+        assert_eq!(
+            content, "123",
+            "the file's content pins actual execution order; running the steps out of \
+             declaration order would produce a different digit sequence here even though \
+             every step still succeeds"
         );
     }
 

@@ -121,12 +121,23 @@ pub struct App {
     /// [`Self::current_warnings`] derives it fresh every frame the same way `help`'s content
     /// does.
     warning_overlay_open: bool,
+    /// The description of the most recently pressed bound-but-unimplemented action
+    /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
+    /// action in the spec's own words. One of the four sources [`Self::current_warnings`]
+    /// folds into the shared warning slot ([`warnings::WarningSources`]): neither
+    /// keybindings.md nor layout-and-provenance.md settles a surface of its own for this, so
+    /// it shares the slot rather than inventing one. Replaced by the next such press; nothing
+    /// else clears it.
+    ///
+    // TODO(#106): sharing the slot is this code's choice, not a documented rule. That
+    // ticket decides where the notice belongs.
+    unimplemented_action_notice: Option<&'static str>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
-    /// `Action::ReloadConfig`. One of the three sources [`Self::current_warnings`] folds into
+    /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
     /// the shared warning slot ([`warnings::WarningSources`]).
     theme_warnings: Vec<theme::ThemeWarning>,
     /// Config warnings raised at the last load, the same lifecycle as `theme_warnings` and
-    /// the second of the three sources.
+    /// the third of the four sources.
     config_warnings: Vec<config::document::Warning>,
     /// Whether the abandoned-discovery warning has already been logged to `repon.log` for
     /// `self.core`'s lifetime: `Core` never clears the warning once a walk abandons, so this
@@ -235,8 +246,8 @@ impl App {
         // all `keys` and the three-tier split returns its input unchanged. A call site with a
         // real cursor and viewport would read them from `self.cursor_key()` and
         // `self.visible_keys()`, which is what `Action::RefreshAll` and
-        // `Action::RefreshSelection` need once `handle_key_event` grows arms for them; today
-        // both fall through to that match's wildcard and never call `core.refresh` at all.
+        // `Action::RefreshSelection` need once their own arms in `handle_key_event` actually
+        // call `core.refresh`; today each has its own arm (TODO(#65)) that does nothing yet.
         let keys = entity_keys(&core.snapshot());
         core.refresh(&dispatch_order(keys.first(), &keys, &keys));
 
@@ -261,6 +272,7 @@ impl App {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            unimplemented_action_notice: None,
             theme_warnings,
             config_warnings,
             discovery_warning_logged: false,
@@ -277,8 +289,20 @@ impl App {
         })
     }
 
+    /// Records that `action` was pressed but has no implementation yet, so the shared
+    /// warning slot names it on the next frame rather than the key appearing broken
+    /// ([keybindings.md](../../../docs/spec/keybindings.md) and
+    /// [layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md) settle no
+    /// surface of their own for this, so it shares the slot the way a config or theme
+    /// warning already does). `keys::description` is the same text the footer and help
+    /// overlay already show for `action`, so the message never drifts from what the user was
+    /// just told the key does.
+    fn notify_not_implemented(&mut self, action: Action) {
+        self.unimplemented_action_notice = Some(keys::description(action));
+    }
+
     /// The shared warning slot's whole current population, folded once from every source
-    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the three sources by
+    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the four sources by
     /// hand. `self.core`'s own abandoned-discovery warning is read fresh here rather than
     /// cached, since it can turn from `None` to `Some` at any point in the run with no reload
     /// involved; the first time it does, this also logs it to `repon.log`
@@ -292,6 +316,7 @@ impl App {
             &mut self.discovery_warning_logged,
         );
         WarningSources {
+            not_implemented: self.unimplemented_action_notice,
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             discovery_abandoned,
@@ -371,6 +396,18 @@ impl App {
     /// `OpenSetPicker` (`s`) is bound in [`keys`] per
     /// [keybindings.md](../../../docs/spec/keybindings.md) and has its own arm below, doing
     /// nothing until the overlay exists. `1` to `9` (`SwitchToSet`) do not depend on it.
+    ///
+    /// The match is exhaustive over every [`Action`] variant, with no catch-all: a variant
+    /// this crate binds but has not built yet still gets its own arm, doing nothing beyond
+    /// [`Self::notify_not_implemented`], so a later addition to [`Action`] fails to compile
+    /// here rather than silently joining a wildcard (issue #97). Two further groups round out
+    /// the exhaustiveness rather than naming a real gap: `ScrollDown`/`ScrollUp`/`Top`/`Bottom`
+    /// are bound only in `Detail`, where the guarded arm above already claims them, so falling
+    /// through to their own arm cannot happen; and `Text`/`Apply`/`Cancel` and the rest of the
+    /// `Input`, `Overlay` and `Confirm` vocabulary can never reach `self.focus`, which is
+    /// always `List` or `Detail` ([`Self::focus`]'s own doc comment), through
+    /// `dispatch(List | Detail, key)` ([`keys::BindingTable::dispatch`] never consults those
+    /// three contexts for either).
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
@@ -391,6 +428,11 @@ impl App {
             return Ok(());
         }
 
+        // scan: key_event_dispatch begin -- criterion 4: this match's own exhaustiveness test
+        // (app.rs's own `handle_key_events_dispatch_match_carries_no_wildcard_arm`) reads only
+        // the lines between this pair, so a reintroduced wildcard fails it wherever this match
+        // ends up living, and a marker that moves or is renamed fails the test loudly rather
+        // than reading as "nothing found".
         let message = match self.bindings.dispatch(self.focus, key) {
             Some(Action::Quit) => Some(Message::Quit),
             Some(Action::Suspend) => Some(Message::Suspend),
@@ -502,14 +544,100 @@ impl App {
             }
             // TODO(#94): the picker overlay does not exist yet. Named here rather than left
             // to the catch-all, which would absorb the gap silently.
-            Some(Action::OpenSetPicker) => None,
+            Some(Action::OpenSetPicker) => {
+                self.notify_not_implemented(Action::OpenSetPicker);
+                None
+            }
             Some(Action::OpenLauncher) => {
                 // TODO(#98): route through the Launcher palette; `around_entity_handoff`
                 // is the seam it will call into.
+                self.notify_not_implemented(Action::OpenLauncher);
                 None
             }
-            _ => None,
+            // TODO(#63): the Filter line does not exist yet.
+            Some(Action::EnterFilter) => {
+                self.notify_not_implemented(Action::EnterFilter);
+                None
+            }
+            // TODO(#64): the Action palette does not exist yet.
+            Some(Action::OpenActionPalette) => {
+                self.notify_not_implemented(Action::OpenActionPalette);
+                None
+            }
+            // TODO(#65): RefreshAll does not call `core.refresh` yet.
+            Some(Action::RefreshAll) => {
+                self.notify_not_implemented(Action::RefreshAll);
+                None
+            }
+            // TODO(#65): RefreshSelection does not call `core.refresh` yet.
+            Some(Action::RefreshSelection) => {
+                self.notify_not_implemented(Action::RefreshSelection);
+                None
+            }
+            // TODO(#73): re-deriving default branches over the Selection is not wired up yet.
+            Some(Action::RederiveDefaultBranches) => {
+                self.notify_not_implemented(Action::RederiveDefaultBranches);
+                None
+            }
+            // TODO(#78): failure navigation does not exist yet.
+            Some(Action::NextFailed) => {
+                self.notify_not_implemented(Action::NextFailed);
+                None
+            }
+            // TODO(#78): failure navigation does not exist yet.
+            Some(Action::PreviousFailed) => {
+                self.notify_not_implemented(Action::PreviousFailed);
+                None
+            }
+            // No open issue tracks dismissing a Vanished row (#77 records the undo question
+            // as open, not the dismiss gesture itself); named here rather than guessed.
+            Some(Action::DismissVanished) => {
+                self.notify_not_implemented(Action::DismissVanished);
+                None
+            }
+            // List binds Ctrl+D/PageDown and Ctrl+U/PageUp to these too
+            // (keybindings.md's list row), but List has no half-page cursor movement built;
+            // no open issue tracks it. `Detail`'s own half-page scroll is the guarded arm
+            // above, so reaching here means `self.focus == Context::List`.
+            Some(action @ (Action::HalfPageDown | Action::HalfPageUp)) => {
+                self.notify_not_implemented(action);
+                None
+            }
+            // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
+            // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
+            // when they fire; this arm exists only because a match guard does not count
+            // towards exhaustiveness, not because this is reachable.
+            Some(Action::ScrollDown | Action::ScrollUp | Action::Top | Action::Bottom) => {
+                unreachable!(
+                    "ScrollDown/ScrollUp/Top/Bottom are Detail-only bindings, always claimed \
+                     by the guarded arm above"
+                )
+            }
+            // `Text`, `Apply`, `Cancel` and the rest of the `Input`, `Overlay` and `Confirm`
+            // vocabulary only ever come out of `dispatch` for those three contexts
+            // (`keys::BindingTable::dispatch`), and `self.focus` is always `List` or `Detail`
+            // (its own doc comment above), so `dispatch(self.focus, key)` can never produce
+            // one of these here.
+            Some(
+                Action::Text(_)
+                | Action::Apply
+                | Action::Cancel
+                | Action::PreviousEntry
+                | Action::NextEntry
+                | Action::AcceptCompletion
+                | Action::DeletePreviousWord
+                | Action::ClearLine
+                | Action::OpenInEditor
+                | Action::Choose
+                | Action::Close
+                | Action::Run
+                | Action::Decline,
+            ) => unreachable!(
+                "Input/Overlay/Confirm-only actions never reach the List/Detail dispatch"
+            ),
+            None => None,
         };
+        // scan: key_event_dispatch end
         if let Some(message) = message {
             self.message_tx.send(message)?;
         }
@@ -804,7 +932,7 @@ mod tests {
     use super::*;
     use crate::{
         config::document,
-        test_support::{production_source_at, rust_source_files},
+        test_support::{production_source_at, rust_source_files, source_region},
     };
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
@@ -859,6 +987,7 @@ mod tests {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            unimplemented_action_notice: None,
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
             discovery_warning_logged: false,
@@ -1759,9 +1888,9 @@ mod tests {
     // visible in the dispatch itself, not absorbed silently alongside implemented actions.
 
     /// `Action::OpenLauncher` is bound, has a footer hint and a help entry, but the palette
-    /// that would select a Launcher to hand off to is issue #97's, not this one's. Without
-    /// its own arm, pressing the bound key would fall into the wildcard next to every other
-    /// implemented action, indistinguishable from one that works.
+    /// that would select a Launcher to hand off to does not exist yet. Without its own arm,
+    /// pressing the bound key would fall into the wildcard next to every other implemented
+    /// action, indistinguishable from one that works.
     #[test]
     fn open_launcher_has_its_own_arm_in_handle_key_event_rather_than_the_catch_all() {
         let source = production_source_at(
@@ -1771,6 +1900,184 @@ mod tests {
             source.contains("Some(Action::OpenLauncher) => {"),
             "expected `OpenLauncher` to have its own explicit arm in `handle_key_event`, \
              not the wildcard `_ => None`"
+        );
+    }
+
+    // --- issue #97: the dispatch match is exhaustive with no catch-all, every
+    // bound-but-unimplemented action gets its own arm with a TODO naming the real owning
+    // issue, and pressing one tells the user through the shared warning slot.
+
+    /// One vertical slice per bound-but-unimplemented action: press its real default-map
+    /// key ([keybindings.md](../../../docs/spec/keybindings.md)'s own chords, not a
+    /// synthetic one) and read the shared warning slot back through `current_warnings`, the
+    /// same seam `Action::ExpandWarning`'s own tests already use. The expected text is read
+    /// off `keys::description` rather than restated, so it can never drift from what the
+    /// footer and help overlay already show for the same action. The list is the nine named
+    /// in #97 plus `OpenSetPicker` (already unimplemented before #97, given its own arm
+    /// while closing #56) and List's own `Ctrl+D`/`Ctrl+U`, a gap this ticket's own
+    /// exhaustiveness requirement surfaced that no issue tracks.
+    #[test]
+    fn every_bound_but_unimplemented_action_tells_the_user_through_the_shared_warning_slot() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let cases = [
+            (KeyCode::Char('!'), KeyModifiers::NONE, Action::OpenLauncher),
+            (
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+                Action::OpenSetPicker,
+            ),
+            (
+                KeyCode::Char(';'),
+                KeyModifiers::NONE,
+                Action::OpenActionPalette,
+            ),
+            (KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterFilter),
+            (KeyCode::Char('r'), KeyModifiers::NONE, Action::RefreshAll),
+            (
+                KeyCode::Char('R'),
+                KeyModifiers::SHIFT,
+                Action::RefreshSelection,
+            ),
+            (
+                KeyCode::Char('b'),
+                KeyModifiers::NONE,
+                Action::RederiveDefaultBranches,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                Action::DismissVanished,
+            ),
+            (KeyCode::Char('n'), KeyModifiers::NONE, Action::NextFailed),
+            (
+                KeyCode::Char('N'),
+                KeyModifiers::SHIFT,
+                Action::PreviousFailed,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                Action::HalfPageDown,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                Action::HalfPageUp,
+            ),
+        ];
+
+        for (code, modifiers, action) in cases {
+            app.handle_key_event(press(code, modifiers))
+                .unwrap_or_else(|_| panic!("handle {action:?}"));
+
+            let warnings = app.current_warnings();
+            let expected = format!("{} is not implemented yet", keys::description(action));
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.to_string() == expected),
+                "expected the shared warning slot to name {action:?} as \"{expected}\", got: \
+                 {warnings:?}"
+            );
+        }
+    }
+
+    /// Each bound-but-unimplemented action's arm carries a `TODO` citing the issue that will
+    /// build it, read from a small window of lines around the arm rather than assumed from
+    /// position, so reordering the match does not fool this. `DismissVanished` carries none:
+    /// #97's own list assigns it no owning issue (#77, the open-questions register, records
+    /// only the undo question as open, not the dismiss gesture itself), so this also proves
+    /// no issue number was guessed for it.
+    #[test]
+    fn each_unimplemented_actions_todo_names_its_real_owning_issue_or_none_at_all() {
+        let source = production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        );
+        let lines: Vec<&str> = source.lines().collect();
+
+        // Two arm shapes carry an unimplemented action: its own `Some(Action::X) => {`, and
+        // the binding form `Some(action @ (Action::X | ...)) => {` a shared variant needs.
+        let arm_line = |variant: &str| {
+            let own = format!("Some(Action::{variant}) => {{");
+            let bound = format!("Some(action @ (Action::{variant}");
+            lines
+                .iter()
+                .position(|line| line.trim() == own || line.trim().starts_with(&bound))
+                .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
+        };
+
+        let cases: [(&str, Option<u32>); 10] = [
+            ("EnterFilter", Some(63)),
+            ("OpenActionPalette", Some(64)),
+            ("RefreshAll", Some(65)),
+            ("RefreshSelection", Some(65)),
+            ("RederiveDefaultBranches", Some(73)),
+            ("NextFailed", Some(78)),
+            ("PreviousFailed", Some(78)),
+            ("OpenLauncher", Some(98)),
+            ("DismissVanished", None),
+            // List's own half-page movement, reached when the guarded Detail arm above
+            // does not claim these: no open issue tracks it either.
+            ("HalfPageDown", None),
+        ];
+
+        for (variant, issue) in cases {
+            let line = arm_line(variant);
+            let window = &lines[line.saturating_sub(3)..(line + 4).min(lines.len())];
+            match issue {
+                Some(number) => {
+                    let needle = format!("TODO(#{number})");
+                    assert!(
+                        window.iter().any(|candidate| candidate.contains(&needle)),
+                        "expected Action::{variant}'s arm to carry `{needle}`, found around \
+                         it: {window:?}"
+                    );
+                }
+                None => {
+                    let needle = format!("{}(#", "TODO");
+                    assert!(
+                        !window.iter().any(|candidate| candidate.contains(&needle)),
+                        "expected Action::{variant} to cite no issue (none owns it), found a \
+                         TODO around it: {window:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The honest form of criterion 4: a reintroduced `_ => ...` compiles perfectly well, so
+    /// nothing but a source scan catches its return. Reads only the marked region of
+    /// `handle_key_event`'s own dispatch match (`// scan: key_event_dispatch begin`/`end`),
+    /// so relocating or renaming the match inside this file does not silently stop this from
+    /// finding it: a missing or renamed marker pair fails this test outright via `expect`,
+    /// never reading as "no wildcard found".
+    #[test]
+    fn handle_key_events_dispatch_match_carries_no_wildcard_arm() {
+        let source = production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        );
+        let region = source_region(&source, "key_event_dispatch")
+            .expect("app.rs carries the key_event_dispatch scan markers");
+
+        let wildcard = format!("{} =>", "_");
+        let offending: Vec<&str> = region
+            .lines()
+            .filter(|line| {
+                !line.trim_start().starts_with("//") && line.trim().starts_with(&wildcard)
+            })
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "found a wildcard arm in handle_key_event's dispatch match, which a variant added \
+             to Action later would fall through silently rather than fail to compile, at: \
+             {offending:?}"
         );
     }
 
