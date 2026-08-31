@@ -42,6 +42,12 @@ pub enum Event {
     FocusGained,
     FocusLost,
     Key(KeyEvent),
+    /// A whole bracketed paste, delivered as one atomic string rather than the per-character
+    /// key events a terminal without bracketed paste would send
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#terminal-state)): the ad hoc
+    /// command field's own reason for enabling it, since a newline read as a key event would
+    /// be indistinguishable from Enter and run a pasted multi-line command halfway through.
+    Paste(String),
     Resize(u16, u16),
 }
 
@@ -249,6 +255,7 @@ fn translate(event: CrosstermEvent) -> Option<Event> {
         CrosstermEvent::Resize(columns, rows) => Event::Resize(columns, rows),
         CrosstermEvent::FocusGained => Event::FocusGained,
         CrosstermEvent::FocusLost => Event::FocusLost,
+        CrosstermEvent::Paste(text) => Event::Paste(text),
         _ => return None,
     })
 }
@@ -513,6 +520,18 @@ mod tests {
                 "a {kind:?} key event must not reach dispatch"
             );
         }
+    }
+
+    /// The ad hoc command field's own reason for enabling bracketed paste: a pasted
+    /// multi-line command must arrive as one atomic event, embedded newlines and all, never
+    /// decomposed into the per-character key events that would let a newline read as Enter.
+    #[test]
+    fn translate_passes_a_bracketed_paste_through_as_one_whole_string() {
+        let pasted = "first line\nsecond line".to_string();
+        assert!(matches!(
+            translate(CrosstermEvent::Paste(pasted.clone())),
+            Some(Event::Paste(text)) if text == pasted
+        ));
     }
 
     /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-suspending-confirming):

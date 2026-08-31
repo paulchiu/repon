@@ -14,6 +14,7 @@ use crate::{
     action_palette::{ActionPalette, Decision, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
+    editor,
     filter_line::FilterLine,
     footer,
     glyphs::GlyphSet,
@@ -207,6 +208,12 @@ pub struct App {
     /// `handle_key_event` itself never holds one. Taken (never merely read) the moment it is
     /// handed to [`Self::run_launcher_handoff`], so a handoff runs at most once per choice.
     pending_launcher_handoff: Option<(EntityKey, Launcher)>,
+    /// `true` between `Action::OpenInEditor` (`Ctrl+E`) firing inside the Action palette's
+    /// ad hoc field and [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, the
+    /// same reason `pending_launcher_handoff` is a flag rather than an immediate call:
+    /// `handle_key_event` never holds one. Cleared the moment it is handed to
+    /// [`Self::run_action_editor_handoff`], so a handoff runs at most once per press.
+    pending_action_editor_handoff: bool,
     /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s`) and
     /// closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
@@ -421,6 +428,7 @@ impl App {
             action_palette: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
+            pending_action_editor_handoff: false,
             set_picker: None,
             notice: None,
             notice_set_at: None,
@@ -643,6 +651,10 @@ impl App {
             if let Some((entity_key, launcher)) = self.pending_launcher_handoff.take() {
                 self.run_launcher_handoff(&mut tui, &entity_key, &launcher);
             }
+            if self.pending_action_editor_handoff {
+                self.pending_action_editor_handoff = false;
+                self.run_action_editor_handoff(&mut tui);
+            }
             if self.should_suspend {
                 // refresh.md's "Suspension": all background work stops while the TUI is
                 // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
@@ -680,6 +692,7 @@ impl App {
                 self.message_tx.send(Message::Resize(columns, rows))?;
             }
             Event::Key(key) => self.handle_key_event(key)?,
+            Event::Paste(ref text) => self.handle_paste_event(text),
             Event::FocusGained => self.on_focus_gained(),
             Event::Error => self
                 .message_tx
@@ -1021,6 +1034,20 @@ impl App {
         Ok(())
     }
 
+    /// A whole bracketed paste ([`crate::tui::Event::Paste`]), routed to whichever surface is
+    /// composing text and appended verbatim, embedded newlines included. Only the Action
+    /// palette's own ad hoc field reads one: pasting a multi-line command is the one way a
+    /// newline reaches typed text at all
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)). A
+    /// paste while nothing is composing, or while the Filter line or the Launcher palette
+    /// have focus instead, is silently dropped; neither of those two fields has a use for an
+    /// embedded newline, so this is scope rather than a gap.
+    fn handle_paste_event(&mut self, text: &str) {
+        if let Some(palette) = &mut self.action_palette {
+            palette.paste(text, &self.document.actions);
+        }
+    }
+
     /// Every key event while `self.quit_confirm` is `true`, dispatched through
     /// `Context::Confirm`, the same `y`/`n`/Esc vocabulary the Action palette's own confirm
     /// stage uses. `y` (`Action::Run`) sets `should_quit` directly rather than through
@@ -1053,9 +1080,13 @@ impl App {
     /// silently-absorbing wildcard, the same shape `Self::handle_key_event`'s own dispatch
     /// uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
     ///
-    /// `AcceptCompletion` (`Tab`) and `OpenInEditor` (`Ctrl+E`) belong to the ad hoc
-    /// command field issue #70 has not built yet (it is blocked by this ticket), so both
-    /// are inert here.
+    /// `OpenInEditor` (`Ctrl+E`) queues `self.pending_action_editor_handoff` for
+    /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
+    /// ([`Self::run_action_editor_handoff`]), the same pattern
+    /// `Self::choose_highlighted_launcher` already uses for its own handoff.
+    /// `AcceptCompletion` (`Tab`) stays inert here permanently, not merely until this ticket:
+    /// keybindings.md scopes `Tab`'s completion-accept to the Filter line alone, and this
+    /// palette has no completion list of its own.
     fn handle_action_palette_key(&mut self, key: KeyEvent) {
         let Some(palette) = &self.action_palette else {
             return;
@@ -1114,7 +1145,8 @@ impl App {
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_action(),
-            Some(Action::AcceptCompletion | Action::OpenInEditor) => {}
+            Some(Action::OpenInEditor) => self.pending_action_editor_handoff = true,
+            Some(Action::AcceptCompletion) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or \
@@ -1622,6 +1654,44 @@ impl App {
         result
     }
 
+    /// [`Self::around_entity_handoff`]'s own lifecycle, minus the entity to re-probe: pauses
+    /// background work for the whole suspension (refresh.md's "All background work stops
+    /// while the TUI is suspended", which governs any terminal handover, not only a
+    /// Launcher's), then resumes it. There is nothing to re-probe here, since editing free
+    /// text in `$EDITOR` touches no repository.
+    fn around_ad_hoc_editor_handoff<T>(&mut self, handoff: impl FnOnce() -> T) -> T {
+        self.core.pause();
+        let result = handoff();
+        self.on_resume();
+        result
+    }
+
+    /// Drains `self.pending_action_editor_handoff`: opens the Action palette's own typed
+    /// text in `$EDITOR` through [`editor::edit`], the same [`Tui::suspend_for_child`]
+    /// machinery [`Self::run_launcher_handoff`] hands a Launcher's own child
+    /// ([`crate::tui::Tui::suspend_for_child`]'s own doc comment names both callers). A
+    /// closed palette (cannot happen through `App`'s own dispatch, since the flag is only
+    /// ever set while one is open, but costs nothing to guard) is a no-op; a failed handoff
+    /// is logged rather than propagated, the same grade a failed Launcher handoff gets.
+    fn run_action_editor_handoff(&mut self, tui: &mut Tui) {
+        let Some(initial) = self
+            .action_palette
+            .as_ref()
+            .map(|palette| palette.text().to_string())
+        else {
+            return;
+        };
+        let edited = self.around_ad_hoc_editor_handoff(|| editor::edit(tui, &initial));
+        match edited {
+            Ok(text) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.set_text(text, &self.document.actions);
+                }
+            }
+            Err(err) => tracing::error!("ad hoc $EDITOR handoff failed: {err:#}"),
+        }
+    }
+
     fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
         while let Ok(message) = self.message_rx.try_recv() {
             if message != Message::Tick && message != Message::Render {
@@ -1993,6 +2063,7 @@ mod tests {
             action_palette: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
+            pending_action_editor_handoff: false,
             set_picker: None,
             notice: None,
             notice_set_at: None,
@@ -4996,6 +5067,247 @@ mod tests {
         assert!(
             ran,
             "expected the confirm = false Action to have run without a gate"
+        );
+    }
+
+    // =====================================================================================
+    // The ad hoc command field (issue #70): typed or pasted text that names no configured
+    // Action runs itself, gated through the identical `Core::run_action` path a configured
+    // Action already uses.
+    // =====================================================================================
+
+    /// Opens the Action palette, pastes `text` as one bracketed-paste event, presses Enter,
+    /// then waits for the real fan-out to finish. Panics if nothing was queued to run, so a
+    /// caller does not need to separately assert the palette actually dispatched something.
+    fn run_ad_hoc_command(app: &mut App, text: &str) {
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_paste_event(text);
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run the ad hoc command");
+        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
+        assert!(finished, "expected the ad hoc run to actually finish");
+        app.core.settle(Duration::from_secs(10));
+    }
+
+    /// Criterion 1, end to end, all three claims in one fixture because they interact: a
+    /// blank line contributes no step, a quoted argument survives as one argv element, and a
+    /// step after a failure never runs. `mkdir "a b"` is the quoting witness: split correctly
+    /// it creates one directory named `a b`; split on the internal space it would create two,
+    /// `a` and `b`, which the assertions below rule out explicitly rather than only checking
+    /// `a b`'s own presence. `false` then fails, so the final `touch never-created` must be
+    /// recorded `NotRun` and its own file must never appear.
+    #[test]
+    fn ad_hoc_text_with_a_blank_line_a_quoted_argument_and_a_failing_step_gates_like_configured_steps()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command(&mut app, "mkdir \"a b\"\n\nfalse\ntouch never-created");
+
+        let receipt = app.core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(
+            receipt.steps.len(),
+            3,
+            "the blank middle line must contribute no fourth step"
+        );
+        assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
+        assert_eq!(receipt.steps[1].outcome, repon_core::StepOutcome::Failed(1));
+        assert_eq!(receipt.steps[2].outcome, repon_core::StepOutcome::NotRun);
+        assert!(
+            repo.join("a b").is_dir(),
+            "the quoted argument must have reached mkdir as one word"
+        );
+        assert!(
+            !repo.join("a").exists() && !repo.join("b").exists(),
+            "a broken split would have created two directories, `a` and `b`, instead of one"
+        );
+        assert!(
+            !repo.join("never-created").exists(),
+            "the step after the failure must never have run"
+        );
+    }
+
+    /// Criterion 6: a two-line paste must survive as two steps, both run, neither swallowed
+    /// by the newline that a per-character key stream would have read as Enter.
+    #[test]
+    fn pasting_a_two_line_command_survives_as_two_steps() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command(&mut app, "touch first-line\ntouch second-line");
+
+        let receipt = app.core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps.len(), 2, "expected exactly two steps");
+        assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
+        assert_eq!(receipt.steps[1].outcome, repon_core::StepOutcome::Ok);
+        assert!(repo.join("first-line").exists());
+        assert!(repo.join("second-line").exists());
+    }
+
+    /// Criterion 2's first half, proven at the child rather than the construction site.
+    /// `$HOME` is not word-split into two arguments (`shell-words` only splits on quoting
+    /// and whitespace, never on `$`), so a well-behaved ad hoc step passes the literal two
+    /// bytes `$HOME` straight to `echo` through a direct, unwrapped `execve`. If it were ever
+    /// implicitly run with `shell = true` instead, `executor::run_step` would rejoin `argv`
+    /// into one string and hand it to `$SHELL -c`, and that shell would expand `$HOME` to a
+    /// real path before `echo` ever saw it, printing something other than the literal token.
+    #[test]
+    fn an_ad_hoc_command_never_gets_an_implicit_shell() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command(&mut app, "echo $HOME");
+
+        let receipt = app.core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
+        assert_eq!(
+            &*receipt.steps[0].output, b"$HOME\n",
+            "an implicit shell would have expanded $HOME to a real path instead of passing \
+             the literal token through"
+        );
+    }
+
+    /// Criterion 2's second half, proven at the child rather than the construction site: a
+    /// real subprocess reads back its own `REPON_ACTION`, and `printenv` exits nonzero with
+    /// no output when a variable is unset, which is what routes this to the `printf UNSET`
+    /// fallback rather than printing an empty or literal value.
+    #[test]
+    fn an_ad_hoc_run_leaves_repon_action_unset_at_the_real_child() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command(&mut app, "sh -c 'printenv REPON_ACTION || printf UNSET'");
+
+        let receipt = app.core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
+        assert_eq!(&*receipt.steps[0].output, b"UNSET");
+    }
+
+    /// Criterion 3: `Ctrl+E` must queue the same handoff `Self::run` drains with a live
+    /// `Tui`, never run one on the spot. `pending_action_editor_handoff` staying `false`
+    /// until that key is pressed, and the palette's own text staying untouched, is what
+    /// distinguishes "queued for later" from "already handled".
+    #[test]
+    fn ctrl_e_queues_the_editor_handoff_rather_than_running_it_inline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert!(!app.pending_action_editor_handoff);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        for c in "typed".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type some text");
+        }
+        app.handle_key_event(press(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .expect("press ctrl+e");
+
+        assert!(
+            app.pending_action_editor_handoff,
+            "Ctrl+E must queue the handoff for `run`'s own loop"
+        );
+        assert!(
+            app.action_palette.is_some(),
+            "queuing the handoff must not close the palette"
+        );
+        assert_eq!(
+            app.action_palette.as_ref().map(ActionPalette::text),
+            Some("typed"),
+            "queuing must not touch the typed text; only a completed handoff replaces it"
+        );
+    }
+
+    /// Criterion 3's reuse claim: the ad hoc `$EDITOR` handoff's own pause/resume lifecycle
+    /// must be [`App::around_entity_handoff`]'s own shape, not a second one that skips the
+    /// theme reread `Self::on_resume` gives every other return from suspension
+    /// (theming.md: "read again on resume, both from a Launcher returning and from
+    /// SIGTSTP"). No real `Tui` is needed to prove this half: only the terminal-owning
+    /// `editor::edit` call itself needs one, and that is what
+    /// `tests/terminal_restoration.rs`'s pty harness already proves for `editor::edit` as a
+    /// caller of `Tui::suspend_for_child` independent of a Launcher.
+    #[test]
+    fn the_ad_hoc_editor_handoffs_lifecycle_rereads_the_theme_through_the_shared_resume_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let themes_dir = tempfile::tempdir().expect("themes dir");
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"red\"\n")
+            .expect("write initial theme");
+        let mut app = test_app(&root);
+        app.theme_name = "custom".to_string();
+        app.theme_source = theme::ThemeSource::Config;
+        app.themes_dir = themes_dir.path().to_path_buf();
+        app.reread_theme();
+        assert_eq!(app.theme.text, ratatui::style::Color::Red);
+
+        // The file changes while Repon is notionally suspended, e.g. the user's editor
+        // process is itself what changed it.
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"blue\"\n")
+            .expect("rewrite theme");
+
+        app.around_ad_hoc_editor_handoff(|| ());
+
+        assert_eq!(
+            app.theme.text,
+            ratatui::style::Color::Blue,
+            "expected the theme file re-read through the same on_resume path a Launcher \
+             handoff and SIGTSTP both already take"
+        );
+    }
+
+    /// A future reader who sees `Action::OpenInEditor` handled here and wonders whether it
+    /// reaches `Tui::suspend_for_child` through a second implementation needs the answer
+    /// sitting in this file's own source, not only in this test's passing: exactly one call
+    /// to `editor::edit`, this file's own reuse of the Launcher's own handoff machinery, and
+    /// no direct call to `suspend_for_child` or a raw `Command` spawn attempting a second one.
+    #[test]
+    fn the_ad_hoc_editor_chord_calls_editor_edit_rather_than_a_second_terminal_handover() {
+        let source = crate::test_support::production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        );
+        let code_lines: Vec<&str> = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let edit_calls = code_lines
+            .iter()
+            .filter(|line| line.contains("editor::edit("))
+            .count();
+        assert_eq!(
+            edit_calls, 1,
+            "expected exactly one call to `editor::edit` in app.rs's own production code"
+        );
+        assert!(
+            !code_lines
+                .iter()
+                .any(|line| line.contains("suspend_for_child(")),
+            "app.rs must reach the terminal handover only through `editor::edit` and \
+             `launcher::run`, never by calling `Tui::suspend_for_child` a second, direct way"
         );
     }
 

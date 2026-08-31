@@ -12,8 +12,18 @@
 //! construction of its own function's parameter type, so a query typed into one has no path
 //! to an entry the other owns.
 //!
-//! The ad hoc typed-command field this palette will grow (issue #70, blocked by this one)
-//! does not exist yet: today the palette only ever lists named, configured Actions.
+//! The ad hoc command field: typed text that matches no configured Action's name is never
+//! silently dropped on `Enter`. Instead [`ActionPalette::choose`] falls through to
+//! [`ad_hoc_steps`], which reads the typed text itself as the command to run
+//! ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
+//! one step, split into argv with shell-words, and the lines gate exactly as config steps
+//! do"). There is no key that inserts a literal newline into that text: Shift+Enter and
+//! Ctrl+Enter do not exist without the kitty keyboard protocol, which this crate does not
+//! opt into, and Ctrl+J is the newline byte itself, indistinguishable from Enter on every
+//! terminal this crate targets. A multi-line command reaches this field only through a whole
+//! paste ([`ActionPalette::paste`]) or a round trip through `$EDITOR`
+//! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
+//! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
 use ratatui::{Frame, layout::Rect, style::Style, widgets::Block};
 
@@ -63,9 +73,9 @@ fn to_steps(steps: &[StepConfig]) -> Vec<Step> {
 }
 
 /// `config` turned into the plain data [`repon_core::Core::run_action`] receives. `name` is
-/// always `Some`: only an ad hoc run (issue #70, not built yet) ever leaves it unset, per
-/// [config.md](../../../docs/spec/config.md)'s "Actions" and the environment contract's
-/// `REPON_ACTION`.
+/// always `Some` here; an ad hoc run's own [`to_ad_hoc_action_spec`] is the one path that
+/// leaves it unset, per [config.md](../../../docs/spec/config.md)'s "Actions" and the
+/// environment contract's `REPON_ACTION`.
 pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
     let name: std::sync::Arc<str> = std::sync::Arc::from(config.name.get_ref().as_str());
     ActionSpec {
@@ -73,6 +83,50 @@ pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
         name: Some(name),
         steps: to_steps(&config.steps),
         concurrency: config.concurrency,
+    }
+}
+
+/// [config.md](../../../docs/spec/config.md)'s own documented default for a configured
+/// `[[action]]`'s `concurrency` field, reused here since an ad hoc run has no config entry to
+/// read one from.
+const AD_HOC_CONCURRENCY: u32 = 4;
+
+/// `text` split into the steps an ad hoc run executes, or `None` if any non-empty line fails
+/// to word-split (an unterminated quote): the whole command is refused rather than running a
+/// truncated version of what was typed. Each non-empty line becomes one step, split with
+/// `shell-words` rather than a shell string
+/// ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
+/// one step, split into argv with shell-words"); a blank line contributes no step at all.
+/// `shell` is always `false`: an ad hoc command has no config entry in which that flag could
+/// be made visible, so it is never implicitly given one
+/// ([0007](../../../docs/adr/0007-launchers-are-argv-vectors.md)), and `env` is always empty,
+/// since there is nowhere to type a per-step override either.
+fn ad_hoc_steps(text: &str) -> Option<Vec<Step>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            shell_words::split(line).map(|argv| Step {
+                argv,
+                shell: false,
+                env: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
+/// `text` and its already-split `steps` turned into the plain data
+/// [`repon_core::Core::run_action`] receives for an ad hoc run: `name` is `None`, exactly as
+/// for a Launcher, since a typed command has no name and `REPON_ACTION` is required and
+/// unique in the file
+/// ([actions.md](../../../docs/spec/actions.md)). `label` is the typed text itself, trimmed,
+/// which is what the pane names the run by.
+fn to_ad_hoc_action_spec(text: &str, steps: Vec<Step>) -> ActionSpec {
+    ActionSpec {
+        label: std::sync::Arc::from(text.trim()),
+        name: None,
+        steps,
+        concurrency: AD_HOC_CONCURRENCY,
     }
 }
 
@@ -105,9 +159,11 @@ pub(crate) enum Decision {
     NeedsConfirm,
 }
 
-/// The Action palette's own state: the typed query narrowing `Document::actions`, which of
-/// the (possibly narrowed) matches is highlighted, which [`Stage`] it is in, and a refusal
-/// message from the last time Enter found zero operable rows.
+/// The Action palette's own state: the typed text, which doubles as the query narrowing
+/// `Document::actions` and, once nothing is highlighted, as the ad hoc command itself
+/// ([`ad_hoc_steps`]); which of the (possibly narrowed) matches is highlighted; which
+/// [`Stage`] it is in; and a refusal message from the last time Enter found zero operable
+/// rows.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionPalette {
     query: String,
@@ -188,6 +244,33 @@ impl ActionPalette {
         self.clamp_cursor(actions);
     }
 
+    /// A whole bracketed paste, appended verbatim including any embedded newlines: the one
+    /// way a newline reaches this field, since typing has no key that inserts one (this
+    /// module's own doc comment). Arrives as a single atomic event rather than the
+    /// per-character key presses a terminal without bracketed paste would send, which is what
+    /// keeps a newline in the pasted text from being read as Enter and running the command
+    /// halfway through
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#terminal-state)).
+    pub(crate) fn paste(&mut self, text: &str, actions: &[ActionConfig]) {
+        self.query.push_str(text);
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
+    /// The raw typed text, embedded newlines included: what seeds the `$EDITOR` scratch file
+    /// on `Ctrl+E`.
+    pub(crate) fn text(&self) -> &str {
+        &self.query
+    }
+
+    /// Replaces the typed text wholesale with `$EDITOR`'s own returned content once the
+    /// editor exits, embedded newlines included, exactly as a multi-line paste would arrive.
+    pub(crate) fn set_text(&mut self, text: String, actions: &[ActionConfig]) {
+        self.query = text;
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
     /// `Up`/`Down` (`PreviousEntry`/`NextEntry`): clamps rather than wraps, the same
     /// convention `App::move_cursor` already uses for the list's own cursor.
     pub(crate) fn move_highlight(&mut self, delta: isize, actions: &[ActionConfig]) {
@@ -200,29 +283,61 @@ impl ActionPalette {
         self.cursor = moved.clamp(0, len as isize - 1) as usize;
     }
 
-    /// `Enter` (`Action::Apply`) on the highlighted entry, given `operable_count` (the
-    /// Selection's targets minus excluded rows, read from the identical computation
-    /// [`repon_core::Core::operable_count`] gives the confirm dialog). `None` with nothing
-    /// highlighted (an empty match list) leaves everything untouched.
+    /// `Enter` (`Action::Apply`), given `operable_count` (the Selection's targets minus
+    /// excluded rows, read from the identical computation
+    /// [`repon_core::Core::operable_count`] gives the confirm dialog).
+    ///
+    /// A highlighted named entry always wins: it is chosen exactly as before, gated behind
+    /// `Stage::Confirming` unless its own `confirm` is `false`. Only once nothing is
+    /// highlighted does the typed text become an ad hoc command in its own right
+    /// ([`ad_hoc_steps`]), which is what keeps a query that happens to match a configured
+    /// Action's name from ever running as a different, typed-out command instead. An ad hoc
+    /// command never enters `Stage::Confirming`: it runs the instant Enter is pressed, the
+    /// same as a Launcher hands off immediately
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field): "Enter
+    /// runs it"). `None` when there is nothing to run at all: no highlighted entry and no
+    /// non-empty typed line, or a line that failed to word-split.
     pub(crate) fn choose(
         &mut self,
         actions: &[ActionConfig],
         operable_count: usize,
     ) -> Option<Decision> {
-        let entry = self.highlighted(actions)?.clone();
-        if operable_count == 0 {
-            self.refusal = Some(format!(
-                "\"{}\" targets 0 repos and was not run",
-                entry.name.get_ref()
-            ));
-            return Some(Decision::Refused);
-        }
-        self.refusal = None;
-        if entry.confirm {
-            self.stage = Stage::Confirming(entry);
-            Some(Decision::NeedsConfirm)
-        } else {
-            Some(Decision::RunImmediately(to_action_spec(&entry)))
+        match self.highlighted(actions) {
+            Some(entry) => {
+                let entry = entry.clone();
+                if operable_count == 0 {
+                    self.refusal = Some(format!(
+                        "\"{}\" targets 0 repos and was not run",
+                        entry.name.get_ref()
+                    ));
+                    return Some(Decision::Refused);
+                }
+                self.refusal = None;
+                if entry.confirm {
+                    self.stage = Stage::Confirming(entry);
+                    Some(Decision::NeedsConfirm)
+                } else {
+                    Some(Decision::RunImmediately(to_action_spec(&entry)))
+                }
+            }
+            None => {
+                let steps = ad_hoc_steps(&self.query)?;
+                if steps.is_empty() {
+                    return None;
+                }
+                if operable_count == 0 {
+                    self.refusal = Some(format!(
+                        "\"{}\" targets 0 repos and was not run",
+                        self.query.trim()
+                    ));
+                    return Some(Decision::Refused);
+                }
+                self.refusal = None;
+                Some(Decision::RunImmediately(to_ad_hoc_action_spec(
+                    &self.query,
+                    steps,
+                )))
+            }
         }
     }
 
@@ -443,17 +558,154 @@ mod tests {
         }
     }
 
+    // --- Criterion 1: the ad hoc command field ---
+
+    /// The crux of this ticket's change to `choose`: text that names no configured Action
+    /// used to leave the palette untouched with nothing chosen; it now runs as an ad hoc
+    /// command in its own right, with `shell` off and no name, and never enters
+    /// `Stage::Confirming`.
     #[test]
-    fn choosing_with_no_match_at_all_returns_none_and_leaves_the_palette_untouched() {
+    fn choosing_text_that_matches_no_configured_action_runs_it_as_an_ad_hoc_command() {
         let actions = vec![action("reinstall", true)];
         let mut palette = ActionPalette::new();
-        palette.type_char('z', &actions);
-        palette.type_char('z', &actions);
+        for c in "zz".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let decision = palette.choose(&actions, 5);
+
+        match decision {
+            Some(Decision::RunImmediately(spec)) => {
+                assert_eq!(spec.steps.len(), 1);
+                assert_eq!(spec.steps[0].argv, vec!["zz".to_string()]);
+                assert!(
+                    !spec.steps[0].shell,
+                    "an ad hoc step must never get an implicit shell"
+                );
+                assert!(
+                    spec.name.is_none(),
+                    "REPON_ACTION must stay unset for an ad hoc run, exactly as for a Launcher"
+                );
+            }
+            other => panic!("expected an ad hoc RunImmediately decision, got {other:?}"),
+        }
+        assert!(
+            matches!(palette.stage(), Stage::Choosing),
+            "an ad hoc run never enters the confirm stage"
+        );
+    }
+
+    #[test]
+    fn choosing_blank_or_whitespace_only_text_with_no_match_does_nothing() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
 
         let decision = palette.choose(&actions, 5);
 
         assert!(decision.is_none());
         assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    /// The word-splitting and blank-line claims, pinned directly against
+    /// [`ad_hoc_steps`]'s own return value rather than through a real run: a blank line in
+    /// the middle contributes no step, and a quoted argument survives as one argv element
+    /// rather than being split on its own internal space.
+    #[test]
+    fn ad_hoc_steps_skips_blank_lines_and_respects_quoting_in_the_remaining_ones() {
+        let text = "false\n\necho \"a b\"";
+
+        let steps = ad_hoc_steps(text).expect("well-formed quoting must parse");
+
+        assert_eq!(
+            steps.len(),
+            2,
+            "the blank middle line must contribute no step"
+        );
+        assert_eq!(steps[0].argv, vec!["false".to_string()]);
+        assert!(!steps[0].shell);
+        assert_eq!(
+            steps[1].argv,
+            vec!["echo".to_string(), "a b".to_string()],
+            "the quoted argument must survive as one argv element, not split on its own space"
+        );
+        assert!(!steps[1].shell);
+    }
+
+    #[test]
+    fn a_line_that_fails_to_word_split_aborts_the_whole_ad_hoc_command() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            decision.is_none(),
+            "malformed quoting must refuse the whole command rather than run a truncated \
+             version of what was typed"
+        );
+    }
+
+    #[test]
+    fn an_ad_hoc_command_targeting_zero_repos_refuses_and_names_the_typed_command() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "echo hi".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let decision = palette.choose(&actions, 0);
+
+        assert!(matches!(decision, Some(Decision::Refused)));
+        let refusal = palette.refusal().expect("a refusal message");
+        assert!(refusal.contains("echo hi"), "got {refusal:?}");
+        assert!(refusal.contains('0'), "got {refusal:?}");
+    }
+
+    #[test]
+    fn paste_appends_the_whole_text_verbatim_including_embedded_newlines() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        palette.type_char('x', &actions);
+
+        palette.paste("first\nsecond", &actions);
+
+        assert_eq!(palette.text(), "xfirst\nsecond");
+    }
+
+    #[test]
+    fn set_text_replaces_the_buffer_wholesale_the_way_the_dollar_editor_round_trip_needs() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "stale".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.set_text("edited\ntext".to_string(), &actions);
+
+        assert_eq!(palette.text(), "edited\ntext");
+    }
+
+    /// A future reader who sees this module's own newline-key absence and thinks it looks
+    /// like an oversight needs the reason sitting right here beside the widget, not only in
+    /// keybindings.md.
+    #[test]
+    fn the_absence_of_an_inline_newline_key_and_its_reason_are_recorded_beside_the_widget() {
+        let source = crate::test_support::production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/action_palette.rs"),
+        );
+        assert!(
+            source.contains("kitty keyboard protocol"),
+            "expected the module doc to record why there is no inline-newline key"
+        );
+        assert!(
+            source.contains("Ctrl+J is the newline byte itself"),
+            "expected the module doc to name Ctrl+J as the obvious, unusable control chord"
+        );
     }
 
     #[test]
