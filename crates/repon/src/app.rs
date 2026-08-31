@@ -128,6 +128,9 @@ pub struct App {
     /// keybindings.md nor layout-and-provenance.md settles a surface of its own for this, so
     /// it shares the slot rather than inventing one. Replaced by the next such press; nothing
     /// else clears it.
+    ///
+    // TODO(#106): sharing the slot is this code's choice, not a documented rule. That
+    // ticket decides where the notice belongs.
     unimplemented_action_notice: Option<&'static str>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
     /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
@@ -1998,14 +2001,18 @@ mod tests {
         );
         let lines: Vec<&str> = source.lines().collect();
 
+        // Two arm shapes carry an unimplemented action: its own `Some(Action::X) => {`, and
+        // the binding form `Some(action @ (Action::X | ...)) => {` a shared variant needs.
         let arm_line = |variant: &str| {
+            let own = format!("Some(Action::{variant}) => {{");
+            let bound = format!("Some(action @ (Action::{variant}");
             lines
                 .iter()
-                .position(|line| line.trim() == format!("Some(Action::{variant}) => {{"))
+                .position(|line| line.trim() == own || line.trim().starts_with(&bound))
                 .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
         };
 
-        let cases: [(&str, Option<u32>); 9] = [
+        let cases: [(&str, Option<u32>); 10] = [
             ("EnterFilter", Some(63)),
             ("OpenActionPalette", Some(64)),
             ("RefreshAll", Some(65)),
@@ -2015,6 +2022,9 @@ mod tests {
             ("PreviousFailed", Some(78)),
             ("OpenLauncher", Some(98)),
             ("DismissVanished", None),
+            // List's own half-page movement, reached when the guarded Detail arm above
+            // does not claim these: no open issue tracks it either.
+            ("HalfPageDown", None),
         ];
 
         for (variant, issue) in cases {
