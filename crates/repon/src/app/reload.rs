@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use color_eyre::eyre::{Result, eyre};
 use repon_core::{Core, CoreSpec, SetSpec};
 
 use super::{App, entity_keys};
@@ -54,32 +55,51 @@ impl ActiveSet {
 /// `REPON_SET`, then the first declared Set, which is already the implicit `all` Set when
 /// the file declared none (`document::load` leaves it there as `sets[0]`, so this function
 /// never special-cases "no Sets declared" itself).
-// TODO(#127): the fall-through below is now against the design of record. 0025 rules that a
-// name bounding the work is never substituted, so an unmatched `--set` or `REPON_SET` exits
-// non-zero before the terminal is claimed and this function becomes fallible. The reload
-// precedent it followed does not reach startup: `reload_config`'s own reason for that grade
-// is that the terminal is already claimed, which is not true here.
+///
+/// A name at either of the first two rungs that matches no declared Set is never substituted
+/// with another one: a Set bounds the work rather than merely how it looks
+/// ([0025](../../../../docs/adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)), so
+/// this returns a failure the caller reports and exits non-zero on, before `App::run` ever
+/// constructs a `Tui`, the same shape [`document::load`] and [`keys::merge`] already give
+/// their own startup grades. Each message names its own source and value and points at
+/// `repon sets`, which needs no terminal and is not scoped by the selection that just failed.
 pub(crate) fn resolve_startup_set<'a>(
     sets: &'a [document::SetConfig],
     flag: Option<&str>,
     env: Option<&str>,
-) -> &'a document::SetConfig {
+) -> Result<&'a document::SetConfig> {
     if let Some(name) = flag {
-        match sets.iter().find(|set| set.name.get_ref() == name) {
-            Some(set) => return set,
-            None => tracing::warn!("--set `{name}` names no declared Set; trying REPON_SET"),
-        }
+        return sets
+            .iter()
+            .find(|set| set.name.get_ref() == name)
+            .ok_or_else(|| eyre!("--set `{name}` names no declared Set; see `repon sets`"));
     }
     if let Some(name) = env {
-        match sets.iter().find(|set| set.name.get_ref() == name) {
-            Some(set) => return set,
-            None => tracing::warn!(
-                "REPON_SET `{name}` names no declared Set; falling back to the first declared Set"
-            ),
-        }
+        return sets
+            .iter()
+            .find(|set| set.name.get_ref() == name)
+            .ok_or_else(|| eyre!("REPON_SET `{name}` names no declared Set; see `repon sets`"));
     }
-    sets.first()
-        .expect("Document::load always leaves at least one Set, `all` if none was declared")
+    Ok(sets
+        .first()
+        .expect("Document::load always leaves at least one Set, `all` if none was declared"))
+}
+
+/// The Notice [`App::switch_to_set`] raises on a successful switch, and `reload_active_set`
+/// raises for its own fallback, naming the Set fallen back to: the same wording either way,
+/// since both are "this is the Set you are on now" from the user's side of the keyboard.
+fn switched_to_notice(name: &str) -> String {
+    format!("switched to `{name}`")
+}
+
+/// The Notice [`App::switch_to_set`] raises for a digit past however many Sets are declared,
+/// naming the count and pointing at `s`
+/// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+/// unavailable case): the picker is the only way to reach a Set the digits themselves cannot
+/// name.
+fn no_such_set_notice(declared: usize) -> String {
+    let plural = if declared == 1 { "" } else { "s" };
+    format!("only {declared} Set{plural} declared; press s to pick one")
 }
 
 impl App {
@@ -203,6 +223,7 @@ impl App {
                 self.active_set.name,
                 chosen.name.get_ref(),
             );
+            self.notice = Some(switched_to_notice(chosen.name.get_ref()));
         }
 
         self.apply_active_set(chosen, document);
@@ -210,20 +231,31 @@ impl App {
 
     /// `Action::SwitchToSet(nth)`'s whole effect
     /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s `1` to `9`): makes the
-    /// `nth` declared Set (one-indexed, file order) active. A no-op past however many Sets
-    /// are declared, since there is no such Set to switch to; `self.document` is cloned first
-    /// so the borrow it and its chosen Set hold never overlaps the `&mut self` this needs to
-    /// apply it.
+    /// `nth` declared Set (one-indexed, file order) active and raises a Notice naming it,
+    /// once per press, on both the paths that reach here: the positional digit and the Set
+    /// picker's own `Enter` ([`crate::set_picker::SetPicker::draw`] numbers its rows with
+    /// this same one-indexed `nth`). The Notice fires even when `nth` already names the
+    /// active Set, since [`Self::apply_active_set`] only skips the rebuild in that case, not
+    /// the answer to the keystroke. `self.document` is cloned first so the borrow it and its
+    /// chosen Set hold never overlaps the `&mut self` this needs to apply it.
     ///
-    /// TODO(#134): the switch raises a Notice naming the Set, and the out-of-range press
-    /// answers instead of doing nothing: `1` to `9` is advertised as a range, so it is
-    /// unavailable rather than unbuilt
-    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
+    /// A digit past however many Sets are declared is Built and unavailable rather than
+    /// unbuilt
+    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
+    /// the active Set is left untouched and the Notice instead names how many Sets are
+    /// declared and points at `s`, the picker being the only way to reach one past `9`
+    /// declared or past whatever the pressed digit named.
     pub(crate) fn switch_to_set(&mut self, nth: u8) {
         let document = self.document.clone();
         let index = usize::from(nth).wrapping_sub(1);
-        if let Some(chosen) = document.sets.get(index) {
-            self.apply_active_set(chosen, &document);
+        match document.sets.get(index) {
+            Some(chosen) => {
+                self.apply_active_set(chosen, &document);
+                self.notice = Some(switched_to_notice(chosen.name.get_ref()));
+            }
+            None => {
+                self.notice = Some(no_such_set_notice(document.sets.len()));
+            }
         }
     }
 
@@ -280,9 +312,11 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
 mod tests {
     use std::path::Path;
 
+    use crossterm::event::{KeyCode, KeyModifiers};
+
     use super::*;
     use crate::{
-        app::tests::{init_repo, test_app},
+        app::tests::{init_repo, press, test_app},
         keys::Context,
         test_support::capture_tracing,
     };
@@ -451,6 +485,12 @@ mod tests {
             before,
             "an unchanged Set must not rebuild Core or start a new Generation"
         );
+        assert_eq!(
+            app.notice(),
+            None,
+            "an ordinary reload that names the same Set must raise no Notice, unlike the \
+             vanished-Set fallback below"
+        );
     }
 
     /// Criterion 7's second half: a vanished active Set falls back to the first declared Set
@@ -483,6 +523,12 @@ mod tests {
             logs.contains("test") && logs.contains("renamed"),
             "expected the fallback announced naming both the vanished and the new Set, got: {logs:?}"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `renamed`"),
+            "expected the same Notice `switch_to_set` raises, naming the Set fallen back to, \
+             rather than only the log line above"
+        );
     }
 
     // =====================================================================================
@@ -504,7 +550,7 @@ mod tests {
     #[test]
     fn the_flag_beats_a_real_environment_value_and_the_first_declared_set() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, Some("gamma"), Some("beta"));
+        let chosen = resolve_startup_set(&sets, Some("gamma"), Some("beta")).expect("gamma exists");
         assert_eq!(chosen.name.get_ref(), "gamma");
     }
 
@@ -514,7 +560,7 @@ mod tests {
     #[test]
     fn the_environment_variable_beats_the_first_declared_set_when_no_flag_is_given() {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let chosen = resolve_startup_set(&sets, None, Some("beta"));
+        let chosen = resolve_startup_set(&sets, None, Some("beta")).expect("beta exists");
         assert_eq!(chosen.name.get_ref(), "beta");
     }
 
@@ -524,7 +570,7 @@ mod tests {
     #[test]
     fn the_first_declared_set_wins_with_no_flag_and_no_environment_value() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, None, None);
+        let chosen = resolve_startup_set(&sets, None, None).expect("a Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "alpha");
     }
 
@@ -537,26 +583,54 @@ mod tests {
     fn the_implicit_set_wins_when_none_is_declared_and_neither_flag_nor_environment_is_given() {
         let loaded = document::load(Path::new("/does/not/exist/anywhere/repon-config.toml"))
             .expect("a missing file is not an error");
-        let chosen = resolve_startup_set(&loaded.document.sets, None, None);
+        let chosen = resolve_startup_set(&loaded.document.sets, None, None)
+            .expect("the implicit `all` Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "all");
     }
 
-    /// A flag naming no declared Set warns and falls through to a real environment value
-    /// rather than stopping the chain: config.md draws the flag-exits-non-zero rule only for
-    /// `--theme`, never for `--set`.
+    /// Criterion 2: a flag naming no declared Set is an error naming the flag and the value
+    /// given, and never falls through to a real environment value that would have resolved,
+    /// which is what proves this is "never substituted" rather than merely "warns first".
     #[test]
-    fn an_unmatched_flag_falls_through_to_the_environment_variable_and_warns() {
+    fn an_unmatched_flag_is_an_error_naming_the_flag_and_value_and_never_falls_through_to_a_real_environment_value()
+     {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let logs = capture_tracing(|| {
-            resolve_startup_set(&sets, Some("nonexistent"), Some("beta"));
-        });
-        // `resolve_startup_set` returns a borrow into `sets`, so it is re-read here rather
-        // than kept alive across `capture_tracing`'s closure.
-        let chosen = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"));
-        assert_eq!(chosen.name.get_ref(), "beta");
+        let err = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"))
+            .expect_err("an unmatched --set must be an error, not a fallback");
+        let message = err.to_string();
         assert!(
-            logs.contains("nonexistent"),
-            "expected the unmatched flag value named in the warning, got: {logs:?}"
+            message.contains("--set"),
+            "expected the flag named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("nonexistent"),
+            "expected the offending value named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("repon sets"),
+            "expected the message to point at `repon sets`, got: {message:?}"
+        );
+    }
+
+    /// Criterion 3: `REPON_SET` naming no declared Set is an error naming the variable and the
+    /// value given, with no flag present to have taken precedence.
+    #[test]
+    fn an_unmatched_environment_variable_is_an_error_naming_the_variable_and_value() {
+        let sets = vec![named_set("alpha"), named_set("beta")];
+        let err = resolve_startup_set(&sets, None, Some("nonexistent"))
+            .expect_err("an unmatched REPON_SET must be an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("REPON_SET"),
+            "expected the variable named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("nonexistent"),
+            "expected the offending value named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("repon sets"),
+            "expected the message to point at `repon sets`, got: {message:?}"
         );
     }
 
@@ -614,12 +688,68 @@ mod tests {
             !after_names.iter().any(|name| name == "repo-a"),
             "expected the first Set's discovery to be discarded, got {after_names:?}"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "expected a Notice naming the Set switched to"
+        );
+    }
+
+    /// A Notice takes the status row from the warning slot, so one that outlives the press it
+    /// answered hides every warning behind it for the rest of the run. It lasts until the next
+    /// press and no longer; the timeout that would also end it is not built yet.
+    #[test]
+    fn a_notice_lasts_until_the_next_press_so_it_cannot_hide_the_warning_slot_for_the_run() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+
+        let mut app = test_app(&root_a);
+        app.document.sets = vec![
+            matching_set_config(&root_a),
+            document::SetConfig {
+                name: toml::Spanned::new(0..0, "second".to_string()),
+                roots: vec![root_b.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
+        ];
+
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("switch to the second Set");
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "the press that switches Sets must answer with a Notice"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the cursor");
+        assert_eq!(
+            app.notice(),
+            None,
+            "a Notice that survives the next press displaces the warning slot for the rest of \
+             the run"
+        );
     }
 
     /// The negative control: switching to the Set already active must not rebuild `self.core`
     /// at all, proven the same way
     /// [`reload_with_the_same_active_set_leaves_discovery_and_its_generation_untouched`] is,
-    /// by a Generation identity a rebuild could not preserve.
+    /// by a Generation identity a rebuild could not preserve. Criterion 4's own claim rides
+    /// along with it: the Notice still fires on exactly this no-rebuild path, since the
+    /// keystroke was pressed and answered even though `apply_active_set` found nothing to
+    /// rebuild.
     #[test]
     fn switching_to_the_already_active_set_leaves_discovery_and_its_generation_untouched() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -646,13 +776,21 @@ mod tests {
             before,
             "switching to the already-active Set must not rebuild Core or start a new Generation"
         );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `test`"),
+            "expected a Notice naming the Set even though it was already active"
+        );
     }
 
     /// `1` to `9` name a position, not a guarantee: a document declaring fewer Sets than the
     /// pressed digit must leave the active Set exactly as it was, never panic on the missing
-    /// index.
+    /// index, and answer with a Notice naming how many Sets are declared and pointing at `s`
+    /// rather than doing nothing
+    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// unavailable case).
     #[test]
-    fn switching_past_the_last_declared_set_is_a_no_op() {
+    fn switching_past_the_last_declared_set_is_a_no_op_that_raises_a_notice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -664,5 +802,37 @@ mod tests {
         app.switch_to_set(9);
 
         assert_eq!(app.active_set, before);
+        assert_eq!(
+            app.notice(),
+            Some("only 1 Set declared; press s to pick one"),
+            "expected a Notice naming the declared count in the singular"
+        );
+    }
+
+    /// The plural half of the same Notice, against a document declaring more than one Set, so
+    /// this cannot pass on the singular wording the test above already covers.
+    #[test]
+    fn switching_past_the_last_declared_set_names_the_plural_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        app.document.sets = vec![
+            matching_set_config(&root),
+            document::SetConfig {
+                name: toml::Spanned::new(0..0, "second".to_string()),
+                roots: vec![root.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
+        ];
+
+        app.switch_to_set(9);
+
+        assert_eq!(
+            app.notice(),
+            Some("only 2 Sets declared; press s to pick one")
+        );
     }
 }

@@ -22,6 +22,7 @@ mod launcher;
 mod launcher_palette;
 mod logging;
 mod message;
+mod notice;
 mod scroll;
 mod selection;
 mod set_picker;
