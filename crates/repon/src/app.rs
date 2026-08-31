@@ -1811,6 +1811,12 @@ impl App {
             // its own draw methods runs below.
             let filter = self.active_filter();
             self.list.set_filter(filter);
+            // The cursor's own offset and the loaded theme, handed to `self.list` the same
+            // per-frame way as `filter` above, so the cursor row's highlight
+            // ([`theme::Theme::selection_style`]) always reflects this tick's cursor and
+            // this run's resolved theme rather than whatever `List` was constructed with.
+            self.list.set_cursor(self.cursor);
+            self.list.set_theme(self.theme);
             // A row for the Filter line takes real height only while it is open, shifting
             // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
             // screen: a change on a mode switch takes a real row").
