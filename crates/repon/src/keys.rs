@@ -2577,4 +2577,52 @@ mod tests {
             "expected the three-deep nesting exception recorded in exactly one place, found {occurrences}"
         );
     }
+
+    // --- the detail pane has no horizontal scroll key ---
+
+    /// `docs/spec/actions.md`'s "The run on screen": "there is no horizontal scroll key in
+    /// the `detail` context, and adding one would spend a binding to reach content vertical
+    /// scroll already reaches." Two absence claims, both checked here rather than only one:
+    /// no `Left`/`Right` chord is bound in `Context::Detail` at all, and the whole `Action`
+    /// vocabulary carries no horizontal-scroll variant for a future binding to reach for.
+    #[test]
+    fn the_detail_context_binds_no_horizontal_scroll_key() {
+        let offending: Vec<&Binding> = BINDINGS
+            .iter()
+            .filter(|(context, code, ..)| {
+                *context == Context::Detail
+                    && matches!(
+                        code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')
+                    )
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "expected no Left/Right/h/l binding in the detail context, found: {offending:?}"
+        );
+    }
+
+    /// The absence claim's other half: no `Action` variant exists for a horizontal scroll to
+    /// fire even if a future binding tried to reach for one. Scans this module's own source
+    /// for the two names a horizontal scroll action would plausibly take, built from
+    /// fragments so this line is never itself a match.
+    #[test]
+    fn no_horizontal_scroll_action_exists_in_the_whole_vocabulary() {
+        let banned = [format!("Scroll{}", "Left"), format!("Scroll{}", "Right")];
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offending = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            for (number, line) in source.lines().enumerate() {
+                if banned.iter().any(|needle| line.contains(needle)) {
+                    offending.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "found a horizontal scroll action named in source: {offending:?}"
+        );
+    }
 }

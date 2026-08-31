@@ -649,7 +649,11 @@ fn draw_row_compact(
 /// (`docs/spec/refresh.md`'s "What the gutter and the cells show"). Wraps rather than
 /// stopping at the last frame, since a probe with no fixed end must keep moving until it
 /// settles or the Generation deadline turns it Unknown.
-fn spinner_frame(loading: &'static [char], interval: Duration, elapsed: Duration) -> char {
+pub(crate) fn spinner_frame(
+    loading: &'static [char],
+    interval: Duration,
+    elapsed: Duration,
+) -> char {
     let millis_per_frame = interval.as_millis().max(1);
     let step = (elapsed.as_millis() / millis_per_frame) as usize;
     loading[step % loading.len()]

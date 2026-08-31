@@ -214,6 +214,7 @@ mod tests {
             steps: Arc::from(steps),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         }
     }
 

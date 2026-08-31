@@ -256,6 +256,23 @@ pub struct StepResult {
     pub elapsed: Duration,
 }
 
+/// The step an [`ActionReceipt`] is executing right now, present only while its run has not
+/// yet finished ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "The run on screen": "a running step carries the spinner in the same position the step
+/// number's outcome will occupy").
+///
+/// `started_at` is a real timestamp rather than a stored `Duration`, so a renderer computes
+/// live elapsed time with [`Timestamp::elapsed`] on every draw instead of this value being
+/// rewritten every frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RunningStep {
+    /// The step's argv, rendered for display, the same text [`StepResult::label`] carries
+    /// once this step finishes.
+    pub label: Arc<str>,
+    pub started_at: Timestamp,
+}
+
 /// The most recent Action run against this Entity: a receipt of something Repon did,
 /// not a reading of the world, read by the row summary fold
 /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md),
@@ -278,12 +295,30 @@ pub struct StepResult {
 pub struct ActionReceipt {
     /// The Action's name, or the typed command string.
     pub label: Arc<str>,
-    /// Empty when `not_applicable`.
+    /// The steps that have finished so far, in order. Empty when `not_applicable`, and not
+    /// yet the whole Action's step list while `running` is `Some`: a step neither finished
+    /// nor currently executing has no representation here at all
+    /// (`docs/spec/actions.md`'s "The run on screen").
     pub steps: Arc<[StepResult]>,
     /// An excluded row that was in the Selection: nothing failed and nothing was
     /// blocked, the row was simply never operated on.
     pub not_applicable: bool,
     pub finished_at: Timestamp,
+    /// The step executing right now, or `None` once every step has finished (or none ever
+    /// ran, as for a `not_applicable` receipt). `Core::run_action` writes this receipt to
+    /// the table once per step, so a reader sees it update as the run progresses rather
+    /// than only once at the very end.
+    ///
+    /// The grain is the step, not the byte: a running step's own captured output is not
+    /// here, because `executor::run_step` returns it only once the child has exited. A
+    /// reader sees a step's label, its spinner and its live elapsed time immediately, and
+    /// its output the instant that step ends, rather than mid-step. Streaming that would
+    /// mean `drain_until_exit` publishing incremental snapshots.
+    ///
+    /// `steps` therefore holds only finished steps while this is `Some`, which is what
+    /// keeps [`ActionReceipt::failed`] honest mid-run. Nothing may read this receipt's
+    /// presence as "the run is over"; read `running.is_none()` for that.
+    pub running: Option<RunningStep>,
 }
 
 impl ActionReceipt {
@@ -710,6 +745,7 @@ mod tests {
             steps: Arc::from(steps),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         }
     }
 
@@ -726,6 +762,7 @@ mod tests {
             steps,
             not_applicable,
             finished_at: _,
+            running: _,
         } = original;
         let StepResult {
             label: step_label,
@@ -1122,6 +1159,7 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         };
         entity.last_action = Some(original.clone());
 
