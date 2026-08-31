@@ -560,6 +560,33 @@ impl Core {
         }
     }
 
+    /// Resolves `order` against the table this instant and splits it into the entities
+    /// that will actually run and the ones a matching `[[repo]]` `exclude = true`
+    /// override sweeps in and skips
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)).
+    /// [`Self::run_action`] and [`Self::operable_count`] both call this rather than
+    /// each keeping its own copy of the `!entity.excluded` test, so a consumer's confirm
+    /// gate or palette border can never show a count a real run then contradicts
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate": "a wrong count would lie twice"). A key `order`
+    /// names that no longer resolves (already dismissed, or never discovered) is
+    /// silently dropped from both halves.
+    fn partition_operable(&self, order: &[EntityKey]) -> (Vec<EntityState>, Vec<EntityState>) {
+        let table = self.table.read().unwrap();
+        order
+            .iter()
+            .filter_map(|key| table.index.get(key).map(|&idx| table.entities[idx].clone()))
+            .partition(|entity| !entity.excluded)
+    }
+
+    /// How many of `order` an Action would actually operate on: [`Self::run_action`]'s own
+    /// first move is the identical partition this method itself calls, so this is the one
+    /// number a confirm gate and a palette border can both read without either ever
+    /// drifting from what a run really does.
+    pub fn operable_count(&self, order: &[EntityKey]) -> usize {
+        self.partition_operable(order).0.len()
+    }
+
     /// Runs `action` across every key in `order` that the table currently knows: each
     /// entity's own steps run in order and stop at that entity's first failure, exactly
     /// as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
@@ -611,13 +638,7 @@ impl Core {
         // outright, never sharing the machine with it.
         cancel_in_flight(&self.table, &self.settle_gate);
 
-        let (included, excluded): (Vec<EntityState>, Vec<EntityState>) = {
-            let table = self.table.read().unwrap();
-            order
-                .iter()
-                .filter_map(|key| table.index.get(key).map(|&idx| table.entities[idx].clone()))
-                .partition(|entity| !entity.excluded)
-        };
+        let (included, excluded) = self.partition_operable(order);
 
         if !excluded.is_empty() {
             let finished_at = Timestamp::now();
@@ -3541,6 +3562,101 @@ mod tests {
         );
         assert!(!normal_receipt.steps.is_empty());
         assert!(normal_receipt.failed());
+    }
+
+    /// Criterion 4: `operable_count` and `run_action`'s own partition must be one
+    /// computation, not two that happen to agree today. Proven against independent
+    /// evidence, the same way the test above does: run an Action over one excluded and
+    /// one normal entity, then check `operable_count`'s answer against how many of the
+    /// two actually got a real (not `not_applicable`) receipt, rather than against a
+    /// second hand-written copy of the exclusion rule.
+    #[test]
+    fn operable_count_matches_how_many_entities_run_action_actually_runs_a_step_against() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let excluded_repo = root.join("excluded");
+        let normal_repo = root.join("normal");
+        init_repo_with_a_commit(&excluded_repo);
+        init_repo_with_a_commit(&normal_repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: excluded_repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let snapshot = core.snapshot();
+        let find = |path: &Path| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == path)
+                .unwrap_or_else(|| panic!("entity at {path:?} present"))
+                .key
+                .clone()
+        };
+        let order = [find(&excluded_repo), find(&normal_repo)];
+
+        assert_eq!(
+            core.operable_count(&order),
+            1,
+            "one of the two rows is excluded, so exactly one is operable"
+        );
+
+        let started = core.run_action(action("reinstall", vec![step(&["true"])]), &order);
+        assert!(started);
+
+        let settled = wait_until(Duration::from_secs(5), || {
+            let snapshot = core.snapshot();
+            order.iter().all(|key| {
+                snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == *key)
+                    .and_then(|entity| entity.last_action.as_ref())
+                    .is_some()
+            })
+        });
+        assert!(settled);
+
+        let after = core.snapshot();
+        let actually_ran = after
+            .entities
+            .iter()
+            .filter(|entity| order.contains(&entity.key))
+            .filter(|entity| {
+                entity
+                    .last_action
+                    .as_ref()
+                    .is_some_and(|receipt| !receipt.not_applicable)
+            })
+            .count();
+
+        assert_eq!(
+            core.operable_count(&order),
+            actually_ran,
+            "operable_count must report exactly how many rows run_action actually ran a \
+             step against, not merely how many keys resolved"
+        );
+    }
+
+    /// An unknown key (already dismissed, or never discovered) is silently dropped from
+    /// the count, the same fallback `run_action` gives one: this is the half of
+    /// `partition_operable` no fixture above exercises, since every key there resolves.
+    #[test]
+    fn operable_count_silently_drops_a_key_that_no_longer_resolves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let real_key = core.snapshot().entities[0].key.clone();
+        let unknown_key = EntityKey::new(Arc::from(dir.path().join("never-discovered")));
+
+        assert_eq!(core.operable_count(&[real_key, unknown_key]), 1);
     }
 
     /// Criterion 6. The second call is rejected synchronously (`action_running`'s
