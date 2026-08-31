@@ -78,7 +78,7 @@ fn main() -> color_eyre::Result<()> {
     }
 
     if let Some(command) = &args.command {
-        return run_command(command, args.config, args.set);
+        return run_command(command, args.config, args.set, args.no_fetch);
     }
 
     errors::init()?;
@@ -90,6 +90,7 @@ fn main() -> color_eyre::Result<()> {
         args.theme,
         args.set,
         args.filter,
+        args.no_fetch,
     )?
     .run()
 }
@@ -245,6 +246,7 @@ fn run_command(
     command: &Command,
     flag_config_file: Option<PathBuf>,
     flag_set: Option<String>,
+    flag_no_fetch: bool,
 ) -> color_eyre::Result<()> {
     match command {
         Command::Config { example: true } => {
@@ -262,7 +264,7 @@ fn run_command(
         Command::Status => {
             config::init(flag_config_file);
             let config = config::Config::new()?;
-            status::run(&config, flag_set.as_deref())?;
+            status::run(&config, flag_set.as_deref(), flag_no_fetch)?;
         }
     }
     Ok(())

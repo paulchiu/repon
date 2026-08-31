@@ -168,8 +168,10 @@ pub(crate) fn tracking_ref_name(
 /// there is no upstream to compare against: no `branch.<name>.merge`/`.remote`
 /// configured, or a configured tracking ref that itself no longer resolves. Both
 /// causes settle to the same [`SyncState::NoUpstream`] at the call site, since
-/// neither has a count to show.
-fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
+/// neither has a count to show. `pub(crate)` rather than private: the auto-update
+/// needs the live commit itself, not only [`resolve_sync`]'s derived counts, to know
+/// what to fast-forward to.
+pub(crate) fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
     let tracking_ref_name = tracking_ref_name(repo, branch_name)?;
     let mut reference = repo.find_reference(tracking_ref_name.as_ref()).ok()?;
     reference.peel_to_id().ok().map(|id| id.detach())

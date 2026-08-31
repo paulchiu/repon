@@ -15,6 +15,11 @@ release:
 # Run all tests
 test:
     cargo test --workspace --locked
+    # The run above uses default features, so it never reaches a single test behind the
+    # `fetch` feature: the periodic fetch and the fast-forward-only update both live there,
+    # and without this second run their suites are written and then executed on nobody's
+    # machine but the author's.
+    cargo test -p repon-core --locked --features fetch
 
 # Format code with rustfmt
 fmt:
@@ -173,6 +178,7 @@ msrv:
     fi
     rustup toolchain install "$version" --profile minimal
     cargo "+$version" test --workspace --locked
+    cargo "+$version" test -p repon-core --locked --features fetch
 
 # The single definition of CI: the GitHub workflow runs this recipe, so a green
 # run here is a green pipeline

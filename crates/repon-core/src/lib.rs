@@ -52,6 +52,8 @@
 #[cfg(not(unix))]
 compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
+#[cfg(feature = "fetch")]
+mod auto_update;
 mod base;
 mod cell;
 mod core;
@@ -80,7 +82,7 @@ mod wire;
 pub const FETCH_AVAILABLE: bool = cfg!(feature = "fetch");
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
-pub use core::{ActionSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
+pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;

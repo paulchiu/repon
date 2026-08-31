@@ -308,7 +308,7 @@ impl App {
         self.active_set = resolved;
 
         if bounds_changed {
-            self.core = Core::start(core_spec(document, &self.active_set));
+            self.core = Core::start(core_spec(document, &self.active_set, self.no_fetch));
             let keys = entity_keys(&self.core.snapshot());
             self.core.refresh(&keys);
             // The new `Core` starts with no discovery warning of its own, so a warning the
@@ -321,8 +321,10 @@ impl App {
 /// Builds the Core's own crossing type from the loaded config and `active_set` (resolved by
 /// [`resolve_startup_set`] at startup, by [`App::reload_active_set`] on a reload, and by
 /// [`App::switch_to_set`] on a `1`-to-`9` Set switch), plus the `[[repo]]` overrides and the
-/// refresh cadence.
-pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec {
+/// refresh cadence. `no_fetch` is `--no-fetch`, per config.md's "The command line": it forces
+/// `fetch.enabled` off regardless of what `document` itself says, the same way a flag beats a
+/// config value everywhere else in this module.
+pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet, no_fetch: bool) -> CoreSpec {
     CoreSpec {
         set: SetSpec {
             name: active_set.name.clone(),
@@ -340,9 +342,12 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
         generation_deadline: GENERATION_DEADLINE,
         show_submodules: document.show_submodules,
         fetch: repon_core::FetchSpec {
-            enabled: document.fetch.enabled,
+            enabled: document.fetch.enabled && !no_fetch,
             interval: document.fetch.interval,
             concurrency: document.fetch.concurrency as usize,
+        },
+        auto_update: repon_core::AutoUpdateSpec {
+            enabled: document.auto_update.enabled,
         },
     }
 }
@@ -1096,6 +1101,47 @@ mod tests {
             None,
             "the shorter reloaded timeout must age out the Notice already on screen, with no \
              new press"
+        );
+    }
+
+    // =====================================================================================
+    // The fetch-disabling flag: `--no-fetch` forces `fetch.enabled` off regardless of what
+    // the document itself says. The same document is read both ways below, so nothing but
+    // the flag can explain the difference.
+    // =====================================================================================
+
+    fn active_set_for_fetch_test() -> ActiveSet {
+        ActiveSet {
+            name: "test".to_string(),
+            roots: vec!["/dev/null".to_string()],
+            include: None,
+            exclude: None,
+        }
+    }
+
+    /// `--no-fetch` forces `fetch.enabled` off even when `config.toml` itself turns it on.
+    #[test]
+    fn the_no_fetch_flag_forces_fetch_disabled_even_when_the_document_enables_it() {
+        let mut document = Document::default();
+        document.fetch.enabled = true;
+        let spec = core_spec(&document, &active_set_for_fetch_test(), true);
+        assert!(
+            !spec.fetch.enabled,
+            "expected --no-fetch to force fetch.enabled off"
+        );
+    }
+
+    /// The same document, with the flag absent: `fetch.enabled` passes through unchanged,
+    /// which is what proves the previous test's result comes from the flag rather than from
+    /// `core_spec` ignoring `document.fetch.enabled` altogether.
+    #[test]
+    fn fetch_enabled_in_the_document_passes_through_unchanged_when_no_fetch_is_absent() {
+        let mut document = Document::default();
+        document.fetch.enabled = true;
+        let spec = core_spec(&document, &active_set_for_fetch_test(), false);
+        assert!(
+            spec.fetch.enabled,
+            "expected fetch.enabled to pass through unchanged when --no-fetch is absent"
         );
     }
 }

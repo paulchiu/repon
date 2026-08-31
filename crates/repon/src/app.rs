@@ -311,6 +311,11 @@ pub struct App {
     /// overlay, since the list keeps narrowing live underneath it
     /// ([filter.md](../../../docs/spec/filter.md)).
     filter_line: Option<FilterLine>,
+    /// `--no-fetch`, per config.md's "The command line": forces `fetch.enabled` off for the
+    /// whole process. Fixed for the process the same way `--config` is, so a rebuilt `Core`
+    /// (a Set switch, [`reload::core_spec`]'s other call site) never re-reads a config
+    /// reload's own `fetch.enabled` back on.
+    no_fetch: bool,
     /// `true` while the quit confirm dialog has focus: `Action::Quit` raises this instead of
     /// `Message::Quit` directly whenever `Core::action_running` is true, because quitting
     /// mid-fan-out orphans the children ([keybindings.md](../../../docs/spec/keybindings.md)'s
@@ -327,13 +332,15 @@ impl App {
     /// resolved against `REPON_SET` and the declared Sets by
     /// [`reload::resolve_startup_set`], per config.md's "Selection order": a name at either
     /// rung that matches no declared Set exits non-zero the same way, before this function
-    /// ever returns.
+    /// ever returns. `flag_no_fetch` is `--no-fetch`, forcing `fetch.enabled` off for the
+    /// session regardless of `config.toml`.
     pub fn new(
         tick_rate: f64,
         frame_rate: f64,
         flag_theme: Option<String>,
         flag_set: Option<String>,
         flag_filter: Option<String>,
+        flag_no_fetch: bool,
     ) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
@@ -375,7 +382,11 @@ impl App {
         )?;
         let active_set = ActiveSet::from_config(active_set_config);
 
-        let core = Core::start(reload::core_spec(&config.document, &active_set));
+        let core = Core::start(reload::core_spec(
+            &config.document,
+            &active_set,
+            flag_no_fetch,
+        ));
         // Discovery already ran inside `Core::start`; dispatch the identity probe for every
         // row it found so the list fills in progressively rather than sitting on blank branch
         // cells until something else asks for a refresh (Generation 1, refresh.md's
@@ -431,6 +442,7 @@ impl App {
             cwd: config::document::working_directory(),
             filter: Filter::default(),
             filter_line: None,
+            no_fetch: flag_no_fetch,
             quit_confirm: false,
         };
         app.restore_session_state(flag_filter.as_deref());
@@ -1959,6 +1971,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let (message_tx, message_rx) = unbounded();
         App {
@@ -2022,6 +2035,7 @@ mod tests {
             cwd: PathBuf::new(),
             filter: Filter::default(),
             filter_line: None,
+            no_fetch: false,
             quit_confirm: false,
         }
     }
