@@ -2973,10 +2973,6 @@ mod tests {
     /// A second (or later) commit against an already-initialised repo at `path`,
     /// with the same explicit identity `init_repo_with_a_commit` supplies: never
     /// relying on a global git identity, which a machine running CI has none of.
-    fn commit_allow_empty(path: &Path, message: &str) {
-        commit(path, message, &["--allow-empty", "-m", message]);
-    }
-
     /// Commits a real change, which is what the poll's own user story is about and what an
     /// empty commit is not: `git add` rewrites `.git/index` unconditionally, while whether a
     /// commit with nothing staged rewrites it is left to git's racy-entry heuristic and
@@ -3033,7 +3029,7 @@ mod tests {
         )
     }
 
-    /// The shared tail of both commit helpers.
+    /// The shared tail of the commit helpers.
     fn commit(path: &Path, message: &str, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
