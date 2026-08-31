@@ -248,7 +248,7 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::OpenActionPalette,
     ),
-    binding_not_built(
+    binding(
         Context::Global,
         KeyCode::Char('/'),
         NONE,
@@ -1902,7 +1902,7 @@ mod tests {
         }
     }
 
-    // --- issue #119: an unbuilt binding dispatches nothing and advertises nowhere ---
+    // --- an unbuilt binding dispatches nothing and advertises nowhere ---
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
     /// an unbuilt binding "does not dispatch". Every row `unbuilt_bindings` names, pressed at
@@ -2188,14 +2188,28 @@ mod tests {
     /// yet" rather than "unknown" (the name is real, in this crate's own enum), and the
     /// binding is ignored outright, leaving the action's reserved chord exactly as
     /// unreachable as it was before this entry was ever read.
+    ///
+    /// Picks whichever Global action is currently unbuilt off [`unbuilt_bindings`] rather
+    /// than naming one, so this keeps checking the real thing as bindings move from unbuilt
+    /// to built over time instead of drifting onto an action that has since shipped.
     #[test]
     fn a_known_action_that_is_not_built_yet_warns_saying_so_rather_than_unknown_and_is_ignored() {
-        let (bindings, warnings) = merge_ok(&[("global", &[("enter_filter", "f5")])]);
+        let (unbuilt_context, unbuilt_code, unbuilt_modifiers, unbuilt_action) = unbuilt_bindings()
+            .into_iter()
+            .find(|(context, ..)| *context == Context::Global)
+            .expect(
+                "expected at least one currently-unbuilt Global action to test this \
+                     criterion against",
+            );
+        let action_name = action_name(unbuilt_action)
+            .expect("an unbuilt Global action must still have a config name");
+
+        let (bindings, warnings) = merge_ok(&[("global", &[(action_name, "f5")])]);
         assert_eq!(
             warnings,
             vec![KeysWarning::NotBuilt {
                 context: "global".to_string(),
-                action: "enter_filter".to_string(),
+                action: action_name.to_string(),
             }]
         );
         let message = warnings[0].to_string();
@@ -2213,7 +2227,7 @@ mod tests {
             "the ignored binding must never dispatch"
         );
         assert_eq!(
-            bindings.dispatch(Context::Global, press(KeyCode::Char('/'), NONE)),
+            bindings.dispatch(unbuilt_context, press(unbuilt_code, unbuilt_modifiers)),
             None,
             "the action's own reserved chord must stay unbuilt, not become reachable"
         );
