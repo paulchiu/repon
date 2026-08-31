@@ -96,6 +96,13 @@ pub struct List {
     /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
     /// every row) until one arrives, which is every unit test in this module.
     filter: Filter,
+    /// How many leading rows of `row_order` this draw skips, handed in every frame by
+    /// [`crate::app::App::render`] ([`Self::set_offset`]) the same way `filter` is: `App`
+    /// owns the viewport math ([`crate::list_viewport::offset_following_cursor`]); this
+    /// component only draws the window it is told. Clamped against the real row count inside
+    /// [`Self::render`], never trusted as-is, so a stale offset (a filter narrowing the table
+    /// after the last recompute) can never blank the list.
+    offset: usize,
 }
 
 impl Default for List {
@@ -106,6 +113,7 @@ impl Default for List {
             show_worktrees: true,
             show_submodules: false,
             filter: Filter::default(),
+            offset: 0,
         }
     }
 }
@@ -164,12 +172,21 @@ impl List {
             self.show_submodules,
             &self.filter,
         );
-        for (offset, entity) in row_order
+        // Clamped against the real row count rather than trusted as-is: a stale `self.offset`
+        // (computed against a wider table, before a filter narrowed this one) must never
+        // blank the list, so this stops one row short of `row_order.len()` rather than at it,
+        // leaving at least the last row drawn whenever there is any row at all.
+        let skip = row_order.len().saturating_sub(1).min(self.offset);
+        // Only which rows are drawn changes below; no row's own style does. A cursor
+        // highlight and a selection highlight are separate, not-yet-landed work; leaving
+        // every row's styling untouched here is deliberate, not an oversight.
+        for (position, entity) in row_order
             .into_iter()
+            .skip(skip)
             .map(|index| &snapshot.entities[index])
             .enumerate()
         {
-            let Some(y) = interior.y.checked_add(first_row + offset as u16) else {
+            let Some(y) = interior.y.checked_add(first_row + position as u16) else {
                 break;
             };
             if y >= interior.bottom() {
@@ -222,6 +239,13 @@ impl List {
     /// config handshake carries.
     pub(crate) fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
+    }
+
+    /// Hands this draw the viewport offset [`crate::app::App::render`] computed for this
+    /// frame from [`crate::list_viewport::offset_following_cursor`], the same per-frame
+    /// handoff `set_filter` already uses.
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
     }
 }
 
@@ -1728,6 +1752,50 @@ mod tests {
             cell_text(buf, 3, 1, 17),
             "acquiring-gateway",
             "with no header row, the first entity must render one row below the border"
+        );
+    }
+
+    /// [`List::set_offset`] skips exactly that many leading rows: the smallest possible
+    /// change from the un-offset draw, which is the whole point of a viewport rather than a
+    /// recentring jump.
+    #[test]
+    fn set_offset_skips_that_many_leading_rows() {
+        let mut list = List::default();
+        list.set_offset(1);
+        let snap = snapshot(vec![
+            entity("repo-one"),
+            entity("repo-two"),
+            entity("repo-three"),
+        ]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 8),
+            "repo-two",
+            "an offset of 1 must skip the first row and start drawing from the second"
+        );
+    }
+
+    /// `render`'s own defensive clamp: an offset the table has outgrown (set for a wider
+    /// table, before a filter narrowed this one, and never yet recomputed) must never blank
+    /// the list, so it stops one row short of the real row count rather than at or past it.
+    #[test]
+    fn a_stale_offset_past_the_row_count_is_clamped_rather_than_blanking_the_list() {
+        let mut list = List::default();
+        list.set_offset(100);
+        let snap = snapshot(vec![
+            entity("repo-one"),
+            entity("repo-two"),
+            entity("repo-three"),
+        ]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 10),
+            "repo-three",
+            "a wildly stale offset must still leave the table's own last row drawn"
         );
     }
 
