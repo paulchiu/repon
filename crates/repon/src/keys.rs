@@ -156,8 +156,8 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::ClearSelection => "Clear the Selection",
         Action::OpenDetail => "Open the detail pane",
         Action::DismissVanished => "Dismiss a Vanished row",
-        Action::NextFailed => "Next row whose last Action failed",
-        Action::PreviousFailed => "Previous row whose last Action failed",
+        Action::NextFailed => "Next failed row",
+        Action::PreviousFailed => "Previous failed row",
         Action::ScrollDown => "Scroll down",
         Action::ScrollUp => "Scroll up",
         Action::Top => "Top",
@@ -393,8 +393,8 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::DismissVanished,
     ),
-    binding_not_built(Context::List, KeyCode::Char('n'), NONE, Action::NextFailed),
-    binding_not_built(
+    binding(Context::List, KeyCode::Char('n'), NONE, Action::NextFailed),
+    binding(
         Context::List,
         KeyCode::Char('N'),
         SHIFT,
