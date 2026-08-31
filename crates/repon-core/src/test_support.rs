@@ -147,6 +147,7 @@ pub(crate) fn remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
 
 /// Gives `path`'s own repository a committer identity, so nothing depends on whether the
 /// machine running the tests happens to have one configured globally.
+#[cfg(feature = "fetch")]
 pub(crate) fn set_identity(path: &Path) {
     for (key, value) in [("user.email", "test@example.com"), ("user.name", "Test")] {
         let status = Command::new("git")
