@@ -34,6 +34,17 @@ use crate::{
     theme::{Meaning, Role, Theme},
 };
 
+/// [`Stage::Choosing`]'s second row when the query matches no configured Action, kept
+/// apart from [`NO_ACTIONS_CONFIGURED_MESSAGE`] and identical to
+/// [`crate::launcher_palette::NO_MATCHES_MESSAGE`] so both palettes read the same.
+pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
+
+/// [`Stage::Choosing`]'s second row when `actions` itself is empty: `ActionConfig`'s
+/// document field defaults to `Vec::new()` and no `[[action]]` entries ship, unlike
+/// Launcher's four shipped defaults. Names where to fix that, since a user who has never
+/// configured an Action has no reason to know where one is declared.
+pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
+
 /// Case-insensitive substring match against a `[[action]]` entry's own name, never its
 /// description: matching on the description would let a query naming an unrelated Action's
 /// stray word highlight the wrong entry, one keystroke short of the slip
@@ -363,12 +374,10 @@ impl ActionPalette {
         format!(" run on {operable_count} repos ")
     }
 
-    /// Takes the whole frame in place of everything else, the same priority
-    /// [`crate::help::HelpOverlay`] and the expanded warning list already claim (the
-    /// `App::render` method's own doc comment): [`Stage::Choosing`] lists the narrowed matches with the highlighted
-    /// row marked and any refusal message on its own last line; [`Stage::Confirming`] shows
-    /// [actions.md](../../../docs/spec/actions.md)'s own confirm sentence, `run "name" on N
-    /// repos?`.
+    /// Takes the whole frame in place of everything else. [`Stage::Choosing`]'s first
+    /// interior row is always the typed query, below it the match list or whichever
+    /// empty-state message applies; [`Stage::Confirming`] shows actions.md's confirm sentence
+    /// instead.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -400,17 +409,40 @@ impl ActionPalette {
                 );
             }
             Stage::Choosing => {
+                let query_line = format!("; {}", self.query);
+                frame.buffer_mut().set_string(
+                    interior.x,
+                    interior.y,
+                    &query_line,
+                    theme.style_for(Role::Text),
+                );
+
                 let matches = self.matches(actions);
-                for (row, entry) in matches.iter().enumerate().take(interior.height as usize) {
-                    let marker = if row == self.cursor { "> " } else { "  " };
-                    let description = entry.description.as_deref().unwrap_or("");
-                    let line = format!("{marker}{}  {description}", entry.name.get_ref());
+                let rows_below_query = interior.height.saturating_sub(1) as usize;
+                if matches.is_empty() {
+                    let message = if actions.is_empty() {
+                        NO_ACTIONS_CONFIGURED_MESSAGE
+                    } else {
+                        NO_MATCHES_MESSAGE
+                    };
                     frame.buffer_mut().set_string(
                         interior.x,
-                        interior.y + row as u16,
-                        &line,
-                        Style::new(),
+                        interior.y + 1,
+                        message,
+                        theme.style_for(Role::Dim),
                     );
+                } else {
+                    for (row, entry) in matches.iter().enumerate().take(rows_below_query) {
+                        let marker = if row == self.cursor { "> " } else { "  " };
+                        let description = entry.description.as_deref().unwrap_or("");
+                        let line = format!("{marker}{}  {description}", entry.name.get_ref());
+                        frame.buffer_mut().set_string(
+                            interior.x,
+                            interior.y + 1 + row as u16,
+                            &line,
+                            Style::new(),
+                        );
+                    }
                 }
                 if let Some(refusal) = &self.refusal {
                     let row = interior.y + interior.height.saturating_sub(1);
@@ -887,17 +919,18 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
-        assert!(row_text(1).contains("reinstall"));
-        assert!(row_text(2).contains("deploy"));
+        // Row 1 is the query line, row 2 "reinstall", row 3 the cursor's own "deploy".
+        assert!(row_text(2).contains("reinstall"));
+        assert!(row_text(3).contains("deploy"));
         assert!(
-            row_text(2).contains("> deploy"),
+            row_text(3).contains("> deploy"),
             "the highlighted row (index 1, \"deploy\") must carry the highlight marker: {:?}",
-            row_text(2)
+            row_text(3)
         );
         assert!(
-            !row_text(1).contains('>'),
+            !row_text(2).contains('>'),
             "only the highlighted row carries the marker: {:?}",
-            row_text(1)
+            row_text(2)
         );
     }
 
@@ -1006,16 +1039,17 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        // Row 1 is the query line, row 2 "reinstall", row 3 the cursor's own "deploy".
         assert!(
-            row_text(2).contains("> deploy"),
+            row_text(3).contains("> deploy"),
             "with every colour identical, the highlighted row must still read as \
              highlighted from its text alone: {:?}",
-            row_text(2)
+            row_text(3)
         );
         assert!(
-            !row_text(1).contains('>'),
+            !row_text(2).contains('>'),
             "and the non-highlighted row must still read as not highlighted: {:?}",
-            row_text(1)
+            row_text(2)
         );
         assert!(
             buf.area.width > 0,
@@ -1088,5 +1122,230 @@ mod tests {
                  as a palette annotation, at: {offending:?}"
             );
         }
+    }
+
+    // --- the typed query itself ---
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn draw_to_buffer(
+        palette: &ActionPalette,
+        actions: &[ActionConfig],
+        theme: &Theme,
+        operable_count: usize,
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| palette.draw(frame, frame.area(), theme, actions, operable_count))
+            .expect("draw the frame");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The worthless version of this test types a character that also appears in a listed
+    /// name, so a buffer scan cannot tell whether the query line drew it or a match row did.
+    /// `"zzq"` appears in neither "reinstall" nor "deploy", so the only way it reaches the
+    /// screen is the query line itself.
+    #[test]
+    fn the_typed_query_is_visible_and_updates_as_characters_are_added_and_removed() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+
+        let empty = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        assert!(
+            !row_text(&empty, 1, 40).contains("zzq"),
+            "an unopened query must not already show text nobody typed"
+        );
+
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+        let typed = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        assert!(
+            row_text(&typed, 1, 40).contains("zzq"),
+            "expected the typed query on the interior's first row: {:?}",
+            row_text(&typed, 1, 40)
+        );
+
+        palette.delete_previous_word(&actions);
+        let cleared = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        assert!(
+            !row_text(&cleared, 1, 40).contains("zzq"),
+            "removing the typed characters must remove them from the query row too: {:?}",
+            row_text(&cleared, 1, 40)
+        );
+    }
+
+    // --- the three states: matches, no matches, nothing configured ---
+
+    #[test]
+    fn a_query_matching_no_action_says_so_without_leaving_stale_rows() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "expected the no-matches message, got: {:?}",
+            row_text(&buf, 2, 40)
+        );
+        for name in ["reinstall", "deploy"] {
+            assert!(
+                !row_text(&buf, 2, 40).contains(name) && !row_text(&buf, 3, 40).contains(name),
+                "a no-matches render must not also list a stale row for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_actions_configured_at_all_says_so_and_names_where_to_declare_one() {
+        let palette = ActionPalette::new();
+
+        let buf = draw_to_buffer(&palette, &[], &Theme::default(), 0);
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_ACTIONS_CONFIGURED_MESSAGE),
+            "expected the nothing-configured message naming `[[action]]`, got: {:?}",
+            row_text(&buf, 2, 40)
+        );
+    }
+
+    /// The distinction the whole pair of tickets is about: a query matching nothing and a
+    /// list with nothing in it are different facts, so their renders must differ, not merely
+    /// each carry a message that happens to read differently in isolation.
+    #[test]
+    fn no_matches_and_nothing_configured_render_differently_from_each_other() {
+        let theme = Theme::default();
+        let some_actions = vec![action("reinstall", true)];
+        let mut no_match = ActionPalette::new();
+        for c in "zzq".chars() {
+            no_match.type_char(c, &some_actions);
+        }
+        let nothing_configured = ActionPalette::new();
+
+        let no_match_buf = draw_to_buffer(&no_match, &some_actions, &theme, 3);
+        let nothing_configured_buf = draw_to_buffer(&nothing_configured, &[], &theme, 0);
+
+        assert_ne!(
+            row_text(&no_match_buf, 2, 40),
+            row_text(&nothing_configured_buf, 2, 40),
+            "a query matching nothing and an empty Action list must render differently"
+        );
+    }
+
+    /// This ticket's own criterion: "A test covers each of the three states: matches, no
+    /// matches, nothing configured." The three renders below must be pairwise distinct, not
+    /// merely individually plausible.
+    #[test]
+    fn the_three_states_matches_no_matches_and_nothing_configured_are_pairwise_distinct() {
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+
+        let matching_state = draw_to_buffer(&ActionPalette::new(), &actions, &theme, 3);
+        let mut no_match = ActionPalette::new();
+        for c in "zzq".chars() {
+            no_match.type_char(c, &actions);
+        }
+        let no_match_state = draw_to_buffer(&no_match, &actions, &theme, 3);
+        let nothing_configured_state = draw_to_buffer(&ActionPalette::new(), &[], &theme, 0);
+
+        let second_row = |buf: &ratatui::buffer::Buffer| row_text(buf, 2, 40);
+        assert!(
+            second_row(&matching_state).contains("reinstall"),
+            "the matches state must list the configured entry"
+        );
+        assert!(second_row(&no_match_state).contains(NO_MATCHES_MESSAGE));
+        assert!(second_row(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
+        assert_ne!(second_row(&matching_state), second_row(&no_match_state));
+        assert_ne!(
+            second_row(&matching_state),
+            second_row(&nothing_configured_state)
+        );
+        assert_ne!(
+            second_row(&no_match_state),
+            second_row(&nothing_configured_state)
+        );
+    }
+
+    #[test]
+    fn clearing_the_query_restores_the_full_list_on_screen() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char('r', &actions);
+        let narrowed = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        assert!(!row_text(&narrowed, 2, 40).contains("deploy"));
+
+        palette.clear_line(&actions);
+
+        let restored = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        assert!(row_text(&restored, 2, 40).contains("reinstall"));
+        assert!(row_text(&restored, 3, 40).contains("deploy"));
+    }
+
+    // --- consistency with the Launcher palette (ADR 0008 keeps the code separate, not the
+    // wording): 163's own brief asks the query line and the empty states to "read the same
+    // way in both". Asserted here, on both palettes at once, rather than eyeballed. ---
+
+    #[test]
+    fn the_no_matches_message_and_its_placement_read_the_same_way_in_both_palettes() {
+        use crate::launcher_palette::{LauncherPalette, NO_MATCHES_MESSAGE as LAUNCHER_NO_MATCHES};
+
+        assert_eq!(
+            NO_MATCHES_MESSAGE, LAUNCHER_NO_MATCHES,
+            "the two palettes must use identical no-matches wording"
+        );
+
+        let theme = Theme::default();
+        let launchers = vec![crate::launcher::Launcher {
+            name: "lazygit".to_string(),
+            source: crate::launcher::Source::Args(vec!["true".to_string()]),
+            shell: false,
+            env: std::collections::BTreeMap::new(),
+        }];
+        let mut launcher_palette = LauncherPalette::new();
+        launcher_palette.type_char('z', &launchers);
+        launcher_palette.type_char('z', &launchers);
+
+        let actions = vec![action("reinstall", true)];
+        let mut action_palette = ActionPalette::new();
+        for c in "zz".chars() {
+            action_palette.type_char(c, &actions);
+        }
+
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| launcher_palette.draw(frame, frame.area(), &theme, &launchers, "repo-a"))
+            .expect("draw the launcher palette");
+        let launcher_buf = terminal.backend().buffer().clone();
+        // Issue 162 turned the Launcher palette into a centred popup, so its border no
+        // longer sits at the frame's own row 0 the way the still-full-frame Action palette's
+        // does; its own message row is wherever its own popup landed, one row below its own
+        // query line.
+        let launcher_popup =
+            launcher_palette.popup_area(Rect::new(0, 0, 40, 10), &launchers, "repo-a");
+        let launcher_message_row = launcher_popup.y + 2; // +1 past the border, +1 past the query line
+
+        let action_buf = draw_to_buffer(&action_palette, &actions, &theme, 3);
+        let action_message_row = 2; // the Action palette's border sits at row 0 in this branch
+
+        assert!(
+            row_text(&launcher_buf, launcher_message_row, 40).contains(NO_MATCHES_MESSAGE),
+            "expected the Launcher palette's own no-matches row to read the message"
+        );
+        assert!(
+            row_text(&action_buf, action_message_row, 40).contains(NO_MATCHES_MESSAGE),
+            "expected the Action palette's own no-matches row to read the message"
+        );
     }
 }

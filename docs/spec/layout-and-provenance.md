@@ -12,6 +12,14 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 - One status row sits above the frame, carrying a live Notice, any outstanding warning and the header; the rule for how they share it is the next section's.
 - Visual language follows superfile: rounded borders, the panel title inline in the top border rather than in a separate title row, focus communicated by border colour, panels tiled edge to edge.
 
+## The Launcher palette popup
+
+Opening the Launcher palette (`!`) draws a centred popup over the live frame rather than replacing the frame with a full screen: the status row, the list or detail pane, and the footer all stay visible and correct underneath it. Choosing a Launcher is a decision about the row under the cursor, and that row must still be on screen while choosing, which is the reason a full-frame palette is wrong here rather than merely unpolished.
+
+`ratatui::widgets::Clear` is rendered into the popup's own rect before its border, so whatever the list drew there is wiped rather than bleeding through the interior. The popup is sized to its content, the query line plus however many rows the current match list needs, both clamped to the live frame's own width and height: a Launcher list far longer than the frame can show never grows the popup past the frame's own edge, it only grows the number of rows the interior scrolls past. The popup must still fit and read at the 88-column narrow screen [keybindings.md](keybindings.md#the-footer) budgets the rest of this spec's ladders against.
+
+This is the Launcher palette's own shape, not a shared widget: the Action palette and the Set picker still take the whole frame in this change, and [0008](../adr/0008-two-palettes-not-one.md) keeps every palette a separate implementation on purpose, so each becomes a popup on its own change rather than through one this spec would have to generalise. The help overlay and the expanded warning list are unaffected and stay full-frame: they are surfaces the user reads rather than chooses from, so covering the screen costs nothing there.
+
 ## The status row
 
 This document owns the row in full: what may appear on it, in what order, and what happens when they do not all fit. [theming.md](theming.md) owns what a Notice and a Warning are, [actions.md](actions.md) owns run progress as an item, and neither restates the composition, because a rule kept in two places is how the two came to disagree ([0026](../adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
