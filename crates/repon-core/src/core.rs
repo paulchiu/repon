@@ -3028,6 +3028,77 @@ mod tests {
     /// which happened: `run_action` returns before its own fan-out and completion
     /// Generation finish, so a test that wants to see the far side of one needs to wait
     /// for it rather than asserting immediately.
+    /// Sets every polled gitdir entry's modification time ten seconds into the past, so any
+    /// write that follows reads as newer than the baseline by more than a filesystem's
+    /// timestamp granularity. Without it a commit made microseconds after the baseline sweep
+    /// lands in the same coarse tick on Linux and reads as no movement at all, which is a race
+    /// in the harness rather than in the poll: real sweeps are a configured interval apart.
+    /// Reads the polled names from [`poll::POLLED_GITDIR_ENTRIES`] rather than restating them.
+    fn backdate_polled_entries(work_dir: &Path) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work_dir)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            output.status.success(),
+            "resolve the gitdir of {}",
+            work_dir.display()
+        );
+        let gitdir = Path::new(
+            std::str::from_utf8(&output.stdout)
+                .expect("a utf-8 gitdir path")
+                .trim(),
+        );
+
+        let past = std::time::SystemTime::now() - Duration::from_secs(10);
+        let mut touched = 0;
+        for name in poll::POLLED_GITDIR_ENTRIES {
+            let path = gitdir.join(name);
+            if path.exists() {
+                set_mtime_to(&path, past);
+                touched += 1;
+            }
+        }
+        assert!(
+            touched > 0,
+            "backdated nothing under {}; the gitdir holds none of the polled entries and the \
+             baseline this sets up would not be older than what follows",
+            gitdir.display()
+        );
+    }
+
+    /// `utimensat`, since a plain file handle cannot set a directory's time and `refs` is one.
+    fn set_mtime_to(path: &Path, at: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let secs = at
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL");
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            rc,
+            0,
+            "set mtime on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
         loop {
@@ -4818,6 +4889,8 @@ mod tests {
         let core = started.core;
         let key = core.snapshot().entities[0].key.clone();
 
+        backdate_polled_entries(&repo);
+
         // The first tick only records a baseline: nothing has moved yet against a
         // fingerprint that did not exist before this tick.
         tick_tx
@@ -4908,6 +4981,10 @@ mod tests {
             "the fresh refresh must land dirty as not stale"
         );
 
+        backdate_polled_entries(&repo_a);
+
+        backdate_polled_entries(&repo_b);
+
         core.poll_once_for_test();
         assert!(
             core.poll_reprobed_for_test().is_empty(),
@@ -4977,6 +5054,7 @@ mod tests {
 
         let core = Core::start(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
+        backdate_polled_entries(&repo);
         core.poll_once_for_test();
         assert!(core.poll_reprobed_for_test().is_empty());
 
@@ -5040,6 +5118,9 @@ mod tests {
             .expect("worktree discovered")
             .key
             .clone();
+
+        backdate_polled_entries(&parent);
+        backdate_polled_entries(&worktree_path);
 
         core.poll_once_for_test();
         assert!(core.poll_reprobed_for_test().is_empty());
@@ -5168,6 +5249,7 @@ mod tests {
             .expect("the submodule is discovered regardless of show_submodules")
             .key
             .clone();
+        backdate_polled_entries(&submodule_path);
         hidden_core.poll_once_for_test();
         commit_allow_empty(&submodule_path, "into the hidden submodule");
         hidden_core.poll_once_for_test();
@@ -5191,6 +5273,7 @@ mod tests {
             .expect("the submodule is discovered regardless of show_submodules")
             .key
             .clone();
+        backdate_polled_entries(&submodule_path);
         shown_core.poll_once_for_test();
         commit_allow_empty(&submodule_path, "into the shown submodule");
         shown_core.poll_once_for_test();
