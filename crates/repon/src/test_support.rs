@@ -774,4 +774,137 @@ mod tests {
              use instead (`at: _, stale: _`, say), at: {offending:?}"
         );
     }
+
+    // --- Issue #65: "exactly eight" triggers start or cancel a Generation, and nothing
+    // else does. Every one of the eight goes through one of three primitives: `Core::refresh`
+    // (called from the `repon` crate, wherever a trigger has a cursor and a viewport to order
+    // by), `RefreshHandles::dispatch` (the one function that actually mints a new Generation,
+    // private to `repon-core` and unreachable from `repon`), and `cancel_in_flight` (the one
+    // function that cancels one, equally private). Three scans, one per primitive, are the
+    // absence half of "no other code path starts one": a ninth trigger, wherever it lived,
+    // would change one of the three counts below. Each scan asserts a non-zero file count and
+    // a non-zero call-site count before comparing to the expected total, so a scan that
+    // silently stopped inspecting anything fails loudly rather than passing on having found
+    // nothing (the same reason `every_settled_known_destructure_names_every_field_it_does_not_use`
+    // above guards itself the same way): here every expected total is itself non-zero, so an
+    // empty scan already fails the exact-count assertion, and the extra guards are kept for the
+    // same reason that test's are, to name the right cause when one does.
+
+    /// The `repon` crate's own production call sites into the public `Core::refresh`: the six
+    /// triggers that have a cursor and a viewport to order by, which `repon-core` has neither
+    /// (`dispatch_order`'s own doc comment in `app.rs`), so the other two triggers
+    /// (an Action starting and finishing) never call this method at all. Startup (`App::new`),
+    /// returning from suspension (`App::on_resume`, shared by a bare `SIGTSTP` and a
+    /// Launcher's own handoff), `Action::RefreshAll`, terminal focus gained
+    /// (`App::on_focus_gained`), `Action::RefreshSelection` and a Set switch
+    /// (`reload::apply_active_set`): six call sites for six triggers, one each. Scanned across
+    /// both crates' `src` (via `production_lines_containing`) rather than `repon`'s alone, so
+    /// a stray production call newly appearing in `repon-core` would still be caught instead
+    /// of silently falling outside the scan's own boundary.
+    #[test]
+    fn exactly_six_production_call_sites_call_core_refresh_from_the_repon_crate() {
+        let files: usize = workspace_crate_src_dirs()
+            .iter()
+            .map(|dir| rust_source_files(dir).len())
+            .sum();
+        assert!(
+            files > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let offending = production_lines_containing(&format!(".{}(", "refresh"));
+
+        assert!(
+            !offending.is_empty(),
+            "found zero calls to `Core::refresh`; this scan's own needle broke rather than \
+             every trigger disappearing, and would otherwise pass vacuously"
+        );
+        assert_eq!(
+            offending.len(),
+            6,
+            "expected exactly six production call sites into `Core::refresh` (Startup, \
+             returning from suspension, RefreshAll, terminal focus gained, RefreshSelection \
+             and a Set switch); a count that moved means a trigger was added, removed, or a \
+             call site duplicated, at: {offending:?}"
+        );
+    }
+
+    /// `RefreshHandles::dispatch` is the one function that mints a new Generation
+    /// (`core.rs`'s own doc comment on `Core::refresh`); it is private to `repon-core`, so a
+    /// call to it can only ever live there, and a scan confined to that crate is not "a check
+    /// that quietly stops checking" the way excluding a legitimate file would be, it is the
+    /// claim's own shape: the thing scanned for cannot live anywhere else. Its two production
+    /// callers are `Core::refresh` itself (the funnel every one of the six `repon`-side
+    /// triggers above shares) and `Core::run_action`'s own completion (an Action finishing,
+    /// which bypasses `Core::refresh` because it has no cursor to order by either, the same
+    /// reason named on the scan above). The needle names the field the call sits on rather
+    /// than a bare `.dispatch(`, which `BindingTable::dispatch` (an unrelated key-routing
+    /// method called throughout `repon`'s own `app.rs`) would otherwise flood this scan with.
+    #[test]
+    fn exactly_two_production_call_sites_mint_a_new_generation_in_repon_core() {
+        let files = rust_source_files(&workspace_crate_src_dirs()[1]);
+        assert!(
+            !files.is_empty(),
+            "scanned zero files under repon-core/src; the relative path above no longer \
+             resolves, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let mut offending =
+            production_lines_containing(&format!("refresh_handles.{}(", "dispatch"));
+        offending.extend(production_lines_containing(&format!(
+            "refresh_handles().{}(",
+            "dispatch"
+        )));
+
+        assert!(
+            !offending.is_empty(),
+            "found zero calls to `RefreshHandles::dispatch`; this scan's own needle broke \
+             rather than every Generation-minting call site disappearing, and would otherwise \
+             pass vacuously"
+        );
+        assert_eq!(
+            offending.len(),
+            2,
+            "expected exactly two production call sites that mint a new Generation (`Core::refresh`'s \
+             own body, and an Action's completion inside `Core::run_action`); a count that \
+             moved means a new place starts one, at: {offending:?}"
+        );
+    }
+
+    /// `cancel_in_flight` is the one function that cancels a Generation, equally private to
+    /// `repon-core` for the same reason `RefreshHandles::dispatch` above is. Its two
+    /// production callers are `Core::run_action`'s own first move (an Action starting, one of
+    /// the eight triggers) and `spawn_clock_thread`'s handling of `ClockControl::Pause` (the
+    /// Suspension mechanism `App::run`'s `SIGTSTP` branch and `App::around_entity_handoff`
+    /// both drive through `Core::pause`), which refresh.md's own "Suspension" section
+    /// describes as part of what a return from suspension depends on rather than a trigger of
+    /// its own: pausing only ever cancels, it starts nothing, so it mints no Generation for
+    /// this ticket's own "exactly eight" to count. The needle excludes the function's own
+    /// `fn cancel_in_flight(table: &Arc<...>, ...)` declaration line, whose first parameter
+    /// name carries no leading `&`, unlike every real call site's first argument.
+    #[test]
+    fn exactly_two_production_call_sites_cancel_a_generation_in_repon_core() {
+        let files = rust_source_files(&workspace_crate_src_dirs()[1]);
+        assert!(
+            !files.is_empty(),
+            "scanned zero files under repon-core/src; the relative path above no longer \
+             resolves, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let offending = production_lines_containing(&format!("{}(&", "cancel_in_flight"));
+
+        assert!(
+            !offending.is_empty(),
+            "found zero calls to `cancel_in_flight`; this scan's own needle broke rather than \
+             every cancellation call site disappearing, and would otherwise pass vacuously"
+        );
+        assert_eq!(
+            offending.len(),
+            2,
+            "expected exactly two production call sites that cancel a Generation (an Action \
+             starting, and the pre-existing Suspension pause); a count that moved means a new \
+             place cancels one, at: {offending:?}"
+        );
+    }
 }
