@@ -210,27 +210,34 @@ fn classify_pty_open_failure(raw: i32) -> PtyOpenFailure {
 /// leak this module exists to prevent (only the dup2'd copies `build_command` wires
 /// onto the child's stdout and stderr are meant to reach it).
 ///
-/// Retries up to [`OPEN_PTY_MAX_ATTEMPTS`] times when the underlying `openpty` call
-/// fails with `ENXIO`: this project's own reproduction (`open a pty: Os { code: -6, ...
-/// }` under concurrent test runs, `errno=6` positive when the table is deliberately
-/// exhausted single-threaded) shows this errno covers two different situations, one of
-/// them a transient race inside macOS's `openpty` between `grantpt`/`unlockpt` and the
-/// slave-side `open`, worth retrying because it resolves within microseconds. A bounded
-/// retry cannot mask a genuine, permanent exhaustion: that fails identically on every
-/// attempt, so the bound is simply reached and the error reported, never spun on
-/// forever (proved by `exhausting_the_pty_table_still_fails_rather_than_spinning`).
+/// Retries via [`retrying_enxio`] when the underlying `openpty` call fails with `ENXIO`:
+/// this project's own reproduction (`open a pty: Os { code: -6, ... }` under concurrent
+/// test runs, `errno=6` positive when the table is deliberately exhausted
+/// single-threaded) shows this errno covers two different situations, one of them a
+/// transient race inside macOS's `openpty` between `grantpt`/`unlockpt` and the
+/// slave-side `open`, worth retrying because it resolves within microseconds.
 fn open_pty(width: u16) -> Result<(OwnedFd, OwnedFd), PtyOpenFailure> {
+    retrying_enxio(|| open_pty_once(width))
+}
+
+/// [`open_pty`]'s retry policy, taken over the attempt rather than written inside it so
+/// that a permanently failing attempt can be handed in directly. A bounded retry cannot
+/// mask a genuine, permanent exhaustion, which fails identically every time: the bound is
+/// simply reached and the error reported, never spun on forever. That bound is the only
+/// thing standing between a caller and a hang, so it is proved by
+/// `a_permanently_failing_attempt_stops_at_the_bound_rather_than_retrying_forever` in the
+/// ordinary suite, not only by the `#[ignore]`d test that exhausts the real pty table.
+fn retrying_enxio<T>(mut attempt: impl FnMut() -> io::Result<T>) -> Result<T, PtyOpenFailure> {
     let mut last_enxio = None;
-    for attempt in 1..=OPEN_PTY_MAX_ATTEMPTS {
-        match open_pty_once(width) {
-            Ok(fds) => return Ok(fds),
+    for number in 1..=OPEN_PTY_MAX_ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
             Err(error) => {
-                let is_enxio = error.raw_os_error().map(|code| code.abs()) == Some(libc::ENXIO);
-                if !is_enxio {
+                if error.raw_os_error().map(i32::abs) != Some(libc::ENXIO) {
                     return Err(PtyOpenFailure::Other(error));
                 }
                 last_enxio = error.raw_os_error();
-                if attempt < OPEN_PTY_MAX_ATTEMPTS {
+                if number < OPEN_PTY_MAX_ATTEMPTS {
                     thread::sleep(OPEN_PTY_RETRY_DELAY);
                 }
             }
@@ -1436,6 +1443,57 @@ print(1 if inherited else 0)"
         assert_ne!(exhausted, race);
         assert!(exhausted.contains("full"));
         assert!(race.contains("attempts"));
+    }
+
+    /// The bound is the only thing standing between a caller and a hang on a table that
+    /// is genuinely full, and the test that exhausts the real table is `#[ignore]`d, so
+    /// without this the retry can be made unbounded with the whole suite still green.
+    #[test]
+    fn a_permanently_failing_attempt_stops_at_the_bound_rather_than_retrying_forever() {
+        let mut attempts = 0;
+        let failure = retrying_enxio::<()>(|| {
+            attempts += 1;
+            // A ceiling well above the bound, so losing the bound fails here in
+            // milliseconds instead of hanging the job until CI's own timeout.
+            assert!(attempts <= 64, "retried {attempts} times without giving up");
+            Err(io::Error::from_raw_os_error(libc::ENXIO))
+        });
+
+        assert_eq!(attempts, OPEN_PTY_MAX_ATTEMPTS);
+        assert!(matches!(failure, Err(PtyOpenFailure::TableExhausted(_))));
+    }
+
+    /// The retry has to actually retry, or the bound above is satisfied by never trying
+    /// twice: the race's own negated errno must be recognised and the later success
+    /// returned.
+    #[test]
+    fn an_attempt_that_succeeds_after_one_enxio_returns_the_success() {
+        let mut attempts = 0;
+        let opened = retrying_enxio(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from_raw_os_error(-libc::ENXIO))
+            } else {
+                Ok("opened")
+            }
+        });
+
+        assert_eq!(attempts, 2);
+        assert_eq!(opened.expect("retried past the race"), "opened");
+    }
+
+    /// Only the ENXIO shape is known to be transient, so anything else is reported on the
+    /// first attempt rather than delayed by the whole retry budget.
+    #[test]
+    fn a_failure_that_is_not_enxio_is_not_retried() {
+        let mut attempts = 0;
+        let failure = retrying_enxio::<()>(|| {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        });
+
+        assert_eq!(attempts, 1);
+        assert!(matches!(failure, Err(PtyOpenFailure::Other(_))));
     }
 
     /// Deliberately exhausts this machine's whole, system-wide pty table, so it must run
