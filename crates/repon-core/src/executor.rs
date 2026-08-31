@@ -836,6 +836,19 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
     }
 
+    /// The device `fd` refers to, or `None` if it is closed. A descriptor *number* says
+    /// nothing on its own once freed, since a concurrent test can be handed the same one
+    /// immediately; the device tells a reused number apart from the original.
+    fn fd_device(fd: std::os::fd::RawFd) -> Option<libc::dev_t> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes one `libc::stat` through the pointer and reads nothing else.
+        let ok = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0;
+        // Returned as `dev_t` rather than widened: the type is signed on Darwin and
+        // unsigned on Linux, and a cast that suits one is a lint error on the other.
+        // SAFETY: `fstat` returning 0 means it initialised the whole struct.
+        ok.then(|| unsafe { stat.assume_init() }.st_rdev)
+    }
+
     /// `keepalive` (`run_step`'s spare slave-side descriptor, held for the whole of
     /// [`drain_until_exit`]) must close once a step it survives finishes, or a fan-out of
     /// many steps would exhaust this process's descriptor table one at a time. Replicates
@@ -850,6 +863,7 @@ mod tests {
         let slave_dup = duplicate(&slave).expect("duplicate the slave for stderr");
         let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
         let keepalive_fd = keepalive.as_raw_fd();
+        let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the drain");
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
         let child = command.spawn().expect("spawn the child");
         drop(command);
@@ -857,9 +871,14 @@ mod tests {
         let (_raw, status) = drain_until_exit(master, keepalive, child);
 
         assert!(status.is_some_and(|status| status.success()));
-        assert!(
-            !fd_is_open(keepalive_fd),
-            "expected keepalive's descriptor {keepalive_fd} to be closed once draining finished"
+        // The claim is that no descriptor onto *this pty* survives, not that this number
+        // is unused: the tests run concurrently, so another one can be handed the freed
+        // number before this line runs, and that is not a leak.
+        assert_ne!(
+            fd_device(keepalive_fd),
+            Some(pty_device),
+            "expected no descriptor onto this pty to survive draining; number \
+             {keepalive_fd} still refers to it"
         );
     }
 
@@ -889,6 +908,59 @@ mod tests {
         assert!(
             !fd_is_open(keepalive_fd),
             "expected keepalive's descriptor {keepalive_fd} to be closed after a spawn failure"
+        );
+    }
+
+    // --- `keepalive` must never reach the step's own program ---
+
+    /// The honest form of this claim is observed from inside the child, not by reading
+    /// `run_step`'s own `fcntl` flag back: a leaked `keepalive` would hand the step's own
+    /// program, and anything it backgrounds, an extra live reference onto the pty beyond
+    /// the two (stdout, stderr) it was deliberately given, which is exactly what would let
+    /// a backgrounded grandchild hold the pty open indefinitely after the step itself
+    /// exits. `master`'s own raw descriptor and `slave`'s and `slave_dup`'s own pre-`dup2`
+    /// numbers already leak into every step's program today, a separate, pre-existing gap
+    /// this ticket does not cover; matching by device against the child's own stdout
+    /// (`os.fstat(1).st_rdev`) excludes `master`, which is a distinct device, but still
+    /// counts those two unrelated leaks, so the bound below is an upper bound (2) rather
+    /// than an exact count, immune to that gap ever being closed separately. A leaked
+    /// `keepalive` adds a third.
+    #[test]
+    fn a_steps_own_program_gains_no_more_pty_references_than_the_two_it_was_given() {
+        let dir = tempdir();
+        let count_extra_pty_references = "\
+import os
+target = os.fstat(1).st_rdev
+def points_at_target(fd):
+    try:
+        return os.fstat(fd).st_rdev == target
+    except OSError:
+        return False
+extra = [
+    fd for fd in map(int, os.listdir('/dev/fd'))
+    if fd not in (0, 1, 2) and points_at_target(fd)
+]
+print(len(extra))";
+
+        let result = run(&["python3", "-c", count_extra_pty_references], dir.path());
+
+        // Names the interpreter, since this is the one test here that depends on something
+        // outside the repository and a bare outcome mismatch would not say so.
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Ok,
+            "the probe step failed; it needs `python3` on PATH. output: {}",
+            String::from_utf8_lossy(&result.output)
+        );
+        let extra_references: usize = String::from_utf8_lossy(&result.output)
+            .trim()
+            .parse()
+            .expect("the probe prints a single integer");
+        assert!(
+            extra_references <= 2,
+            "expected at most the two pre-existing, unrelated raw duplicates beyond \
+             stdout and stderr, got {extra_references} extra references onto the pty; \
+             a leaked keepalive descriptor would add a third"
         );
     }
 
