@@ -2048,6 +2048,141 @@ mod tests {
     /// its runs: an ahead count and a behind count sitting in the one cell each keep their own
     /// `Meaning`, not a shared one, so a cell mixing both is exactly where a single-role
     /// implementation of this column would fail first.
+    /// A repository whose `feature` branch is one commit ahead of its upstream and one
+    /// behind it, so `sync` renders both counts in the one cell. The remote-tracking ref is
+    /// fabricated with `update-ref` the way the sibling fixture above does, rather than
+    /// needing a real remote.
+    fn settled_snapshot_with_an_ahead_and_behind_sync() -> repon_core::Snapshot {
+        use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
+        use std::time::Duration;
+
+        fn git(root: &Path, args: &[&str], what: &str) {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .status()
+                .unwrap_or_else(|error| panic!("run git {what}: {error}"));
+            assert!(status.success(), "git {what} failed");
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_on_branch(&root, "main");
+        std::fs::write(root.join("second.txt"), "second").expect("write second file");
+        git(&root, &["add", "second.txt"], "add second");
+        git(&root, &["commit", "-m", "second"], "commit second");
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "main"])
+            .output()
+            .expect("run git rev-parse main");
+        assert!(output.status.success());
+        let upstream_sha = String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+
+        // `feature` forks one commit before `main`'s tip and gains one of its own, so it is
+        // exactly one ahead of and one behind the ref fabricated at `main`.
+        git(
+            &root,
+            &["checkout", "--quiet", "-b", "feature", "HEAD~1"],
+            "checkout feature",
+        );
+        std::fs::write(root.join("theirs.txt"), "theirs").expect("write feature file");
+        git(&root, &["add", "theirs.txt"], "add feature file");
+        git(&root, &["commit", "-m", "feature"], "commit feature");
+        git(
+            &root,
+            &["update-ref", "refs/remotes/origin/feature", &upstream_sha],
+            "update-ref feature",
+        );
+        // Set the tracking config directly: `--set-upstream-to` refuses a ref with no remote
+        // behind it, and this fixture fabricates the ref rather than fetching one.
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+            "remote add",
+        );
+        git(
+            &root,
+            &["config", "branch.feature.remote", "origin"],
+            "config branch remote",
+        );
+        git(
+            &root,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+            "config branch merge",
+        );
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.clone()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: vec![RepoOverride {
+                path: root,
+                default_branch: Some("main".to_string()),
+                excluded: false,
+            }],
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_secs(5))
+    }
+
+    /// `draw_row` reads [`sync_cell_runs`], not [`sync_glyph`], and the two join their runs
+    /// separately, so the separator has to be asserted on the path that renders. Dropping it
+    /// there leaves every other test in this file green while the cell reads `↑1↓1`.
+    #[test]
+    fn the_rendered_sync_cell_keeps_a_space_between_an_ahead_and_a_behind_run() {
+        let snapshot = settled_snapshot_with_an_ahead_and_behind_sync();
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        let terminal = render(140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+
+        assert_eq!(
+            cell_text(buf, absolute_x(SYNC_X), y, 5),
+            "↑1 ↓1",
+            "the cell that renders must carry the separator, not only `sync_glyph`'s own join"
+        );
+
+        let ahead_fg = buf[(absolute_x(SYNC_X), y)].fg;
+        let behind_fg = buf[(absolute_x(SYNC_X) + 3, y)].fg;
+        assert_eq!(
+            ahead_fg,
+            theme::DEFAULT.role_color(role_named_in_theming_md("Ahead count")),
+            "the ahead count takes theming.md's own `ok` role"
+        );
+        assert_eq!(
+            behind_fg,
+            theme::DEFAULT.role_color(role_named_in_theming_md("Behind count")),
+            "the behind count keeps its own role rather than the cell settling on one"
+        );
+    }
+
     #[test]
     fn sync_value_runs_gives_an_ahead_and_a_behind_count_each_their_own_meaning_in_one_cell() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
