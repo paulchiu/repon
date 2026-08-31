@@ -13,16 +13,30 @@
 //! blocked in `wait()` removes a worker from whichever pool holds it, and a
 //! concurrency at or above the shared pool's own thread count starves a refresh
 //! outright. Pinned to two global-pool threads and an Action concurrency of two, a
-//! fan-out wrongly dispatched onto that same global pool occupies both of its
-//! workers for the whole step's sleep; one correctly built on its own pool leaves
-//! both free the entire time. A probe dispatched on the global pool while the Action
-//! runs tells the two apart: fast and settled if the wiring is right, still in
-//! flight past a generous deadline if it is not.
+//! fan-out wrongly dispatched onto that same global pool occupies both of its workers
+//! for as long as its own steps block; one correctly built on its own pool leaves both
+//! free the entire time.
+//!
+//! The two blocked steps poll for a signal file this test writes only after observing
+//! the probe settle, rather than sleeping a fixed duration: a wall-clock margin
+//! between the two (the previous shape of this test) is either tight enough to be
+//! flaky under a noisy shared CI runner or wide enough to make a real regression slow
+//! rather than caught, and there is no number that is neither. With the signal, the
+//! probe can only ever settle at all while both blocked steps are still waiting for
+//! it, so there is no timing race to get wrong: a fan-out that wrongly shares the
+//! global pool leaves the probe no worker to run on and it never settles until one of
+//! the blocked steps gives up on its own generous, bounded poll; one correctly
+//! isolated on its own pool never touches the global pool's workers at all, so the
+//! probe settles in a handful of milliseconds, nowhere near either bound.
+//! `core.settle`'s own bound below is a backstop against a hang, not the assertion
+//! under test: it exists only so a wrong implementation fails this test in seconds
+//! rather than tying up a CI runner, and the steps' own poll cap exists so a failing
+//! run's child processes still exit on their own rather than lingering indefinitely.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use repon_core::{ActionSpec, Core, CoreSpec, RepoOverride, SetSpec, Step};
 
@@ -61,6 +75,18 @@ fn spec(roots: Vec<PathBuf>) -> CoreSpec {
     }
 }
 
+/// A step that polls for `signal` to appear every 100ms, giving up after `attempts`
+/// polls regardless: a self-imposed cap inside the child itself, independent of
+/// anything this test asserts, so a failing run's own children exit on their own
+/// rather than lingering as orphans (they run under `setsid`, per `executor.rs`)
+/// for the life of the machine.
+fn poll_for_signal_command(signal: &Path, attempts: u32) -> String {
+    format!(
+        "i=0; while [ ! -f \"{}\" ] && [ \"$i\" -lt {attempts} ]; do sleep 0.1; i=$((i+1)); done",
+        signal.display()
+    )
+}
+
 #[test]
 fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_while_it_blocks() {
     // The only touch of rayon's global pool this whole process makes before the real
@@ -83,7 +109,7 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
     init_repo_with_a_commit(&blocked_b);
     init_repo_with_a_commit(&probed);
 
-    let core = Core::start(spec(vec![root]));
+    let core = Core::start(spec(vec![root.clone()]));
     let snapshot = core.snapshot();
     let key_of = |path: &Path| {
         snapshot
@@ -97,14 +123,23 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
     let blocked_keys = vec![key_of(&blocked_a), key_of(&blocked_b)];
     let probed_key = key_of(&probed);
 
+    // Never created until after the probe below has already settled (or the outer
+    // bound gave up waiting for it), so both blocked steps are still holding their
+    // worker for the whole window the probe's own result depends on. 600 polls of
+    // 100ms each, one minute, is generous enough that a passing run never gets close
+    // and a failing one still exits well inside any sane CI job timeout.
+    let signal = root.join("signal");
+    let block_command = poll_for_signal_command(&signal, 600);
+
     // Two entities, concurrency two: on the Action's own dedicated pool this
-    // occupies both of its workers for the whole sleep, and touches neither of the
-    // global pool's.
+    // occupies both of its workers for as long as they poll, and touches neither of
+    // the global pool's.
     let action = ActionSpec {
         label: Arc::from("block-both-workers"),
         name: Some(Arc::from("block-both-workers")),
         steps: vec![Step {
-            argv: vec!["sh".to_string(), "-c".to_string(), "sleep 0.8".to_string()],
+            argv: vec!["sh".to_string(), "-c".to_string(), block_command],
+            shell: false,
             env: Vec::new(),
         }],
         concurrency: 2,
@@ -114,26 +149,29 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
 
     // Dispatched immediately after, on the global pool, exactly like every other
     // probe. If the fan-out above ever lands on that same pool, both of its threads
-    // are busy sleeping and this has nowhere to run for the length of that sleep.
-    let dispatch_started = Instant::now();
+    // are busy polling for `signal`, which does not exist yet, and this has nowhere
+    // to run until one of them gives up on its own 60 second cap. Ten seconds is a
+    // deliberately loose backstop against that hang, not a margin against the
+    // blocked steps' own timing: a correct implementation settles in milliseconds,
+    // nowhere near it.
     core.refresh(std::slice::from_ref(&probed_key));
-    let settled = core.settle(Duration::from_millis(400));
-    let elapsed = dispatch_started.elapsed();
+    let settled = core.settle(Duration::from_secs(10));
 
     let probe_settled = settled
         .entities
         .iter()
         .find(|entity| entity.key == probed_key)
         .is_some_and(|entity| entity.branch.settled().is_some());
+
+    // Written regardless of the assertion below's outcome, so the two blocked steps
+    // stop polling and this test's own child processes exit promptly rather than
+    // running out their full 60 second cap on a failing run.
+    std::fs::write(&signal, b"go").expect("write the signal file");
+
     assert!(
         probe_settled,
-        "a probe on the global pool must settle well inside the Action's own 0.8s sleep \
-         (got no result after {elapsed:?}); a fan-out wrongly sharing the global pool would \
-         produce exactly this: no free worker until the sleep ends"
-    );
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "a probe dispatched on the global pool while the Action's own dedicated pool is busy \
-         must not be measurably delayed by it; took {elapsed:?}"
+        "a probe on the global pool must settle while the Action's own two steps are still \
+         blocked waiting for a signal this test has not written yet; a fan-out wrongly sharing \
+         the global pool leaves no worker free for it to run on at all"
     );
 }

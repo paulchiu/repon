@@ -30,16 +30,20 @@ const PTY_WIDTH: u16 = 120;
 
 /// Runs one step to completion: `argv[0]` under `argv[1..]`, in `cwd`, with `env` applied
 /// as [`crate::environment::environment`] already produces it (`Some` sets a variable,
-/// `None` unsets it). Blocks until the child exits or its output stream closes, whichever
-/// comes last; there is no per-step timeout (`docs/spec/actions.md`'s "Cancellation,
-/// suspend and quit" accepts the residual risk that a step whose child never exits holds
-/// its concurrency slot until the run is cancelled or Repon quits).
+/// `None` unsets it). With `shell` set, `argv` is instead `shell = true`'s own convention,
+/// one element holding the whole command string
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// "Launchers"), and this runs it as [`shell_argv`] builds it rather than as a literal
+/// binary name. Blocks until the child exits or its output stream closes, whichever comes
+/// last; there is no per-step timeout (`docs/spec/actions.md`'s "Cancellation, suspend and
+/// quit" accepts the residual risk that a step whose child never exits holds its
+/// concurrency slot until the run is cancelled or Repon quits).
 ///
 /// Only ever returns [`StepOutcome::Ok`] or [`StepOutcome::Failed`]: `NotRun` and
 /// `Cancelled` belong to the multi-step sequencing this function does not do.
-#[allow(dead_code)] // no caller until run_action is filled in
 pub(crate) fn run_step(
     argv: &[String],
+    shell: bool,
     cwd: &Path,
     env: &[(String, Option<String>)],
 ) -> StepResult {
@@ -55,7 +59,12 @@ pub(crate) fn run_step(
         Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
     };
 
-    let mut command = build_command(argv, cwd, env, slave, slave_dup);
+    let resolved_argv = if shell {
+        shell_argv(argv)
+    } else {
+        argv.to_vec()
+    };
+    let mut command = build_command(&resolved_argv, cwd, env, slave, slave_dup);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
@@ -131,6 +140,18 @@ fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: `dup` just handed back a freshly duplicated, uniquely owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+/// Turns `shell = true`'s own convention, `argv` holding exactly one element with the
+/// whole command string, into `$SHELL -c <string> repon`
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// `shell = true` sentence): a literal `repon` as `$0`, because POSIX `sh -c` fills `$0`
+/// from the first argument after the command string, and a naive call with nothing there
+/// leaves `$0` reading whatever the shell defaults it to instead. Falls back to `/bin/sh`
+/// when `$SHELL` is unset, matching a Launcher's own `shell = true` in the `repon` crate.
+fn shell_argv(argv: &[String]) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    vec![shell, "-c".to_string(), argv.join(" "), "repon".to_string()]
 }
 
 /// Builds the child's `Command`: stdin the null device unconditionally, stdout and
@@ -311,7 +332,12 @@ mod tests {
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        run_step(&argv, cwd, &[])
+        run_step(&argv, false, cwd, &[])
+    }
+
+    /// `shell = true`'s own convention: one argv element, the whole command string.
+    fn run_shell(command: &str, cwd: &Path) -> StepResult {
+        run_step(&[command.to_string()], true, cwd, &[])
     }
 
     fn tempdir() -> tempfile::TempDir {
@@ -362,6 +388,46 @@ mod tests {
         assert!(
             production.contains(&needle),
             "expected the child's own stdin to be wired to Stdio::null() unconditionally"
+        );
+    }
+
+    // --- `shell = true`: `$SHELL -c <string>` with a literal `repon` as `$0` ---
+
+    /// Asserts the argv the child actually receives, not what was passed to the
+    /// builder: `$0` inside the running shell must read the literal `repon`
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// `shell = true` sentence), which only holds if `run_step` appends it as the
+    /// argument immediately after the command string.
+    #[test]
+    fn a_shell_true_step_receives_repon_literally_as_its_own_dollar_zero() {
+        let dir = tempdir();
+
+        let result = run_shell("echo \"[$0]\"", dir.path());
+
+        assert_eq!(result.outcome, StepOutcome::Ok);
+        assert_eq!(&*result.output, b"[repon]\n");
+    }
+
+    /// The trap `docs/spec/config.md`'s `shell = true` sentence names: POSIX `sh -c`
+    /// fills `$0` from the first argument after the command string, so a naive
+    /// `$SHELL -c <string> <name>` call that appends a name expecting it to land in
+    /// `$1` instead loses it into `$0`. Spawned directly, outside `run_step`, to prove
+    /// the shift is a real property of `sh -c` rather than something only this crate's
+    /// own (correct) call site avoids; it is what earns the placeholder `run_step`
+    /// appends rather than nothing.
+    #[test]
+    fn a_naive_shell_c_call_with_no_placeholder_shifts_the_next_argument_into_dollar_zero() {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("echo \"[$0][$1]\"")
+            .arg("intended-as-dollar-one")
+            .output()
+            .expect("run the naive form directly");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "[intended-as-dollar-one][]\n",
+            "sh -c must swallow the intended $1 into $0 with no placeholder in between"
         );
     }
 
@@ -547,7 +613,7 @@ mod tests {
             "-c".to_string(),
             "echo \"${REPON_EXECUTOR_TEST_VAR:-unset}\"".to_string(),
         ];
-        let result = run_step(&argv, dir.path(), &env);
+        let result = run_step(&argv, false, dir.path(), &env);
 
         assert_eq!(result.outcome, StepOutcome::Ok);
         assert_eq!(&*result.output, b"unset\n");

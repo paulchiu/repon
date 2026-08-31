@@ -52,6 +52,23 @@ pub(crate) fn production_source_at(path: &Path) -> String {
     production_source(&std::fs::read_to_string(path).expect("read a crate source file"))
 }
 
+/// The lines strictly between a `// scan: <name> begin` and `// scan: <name> end`
+/// comment pair in `source`, the marker lines themselves excluded, or `None` if the
+/// pair is not both present. For an absence claim narrower than "anywhere in this
+/// crate's production source" (one call site is legitimate, another is not), the
+/// owning code names its own boundary with the pair rather than a scan guessing it
+/// from indentation or brace-matching, which a string literal or a `{}` inside a
+/// `format!` call would defeat. `None` on a missing pair rather than treating it as an
+/// empty region, so a test built on this cannot pass vacuously because the marker was
+/// renamed or deleted out from under it.
+pub(crate) fn source_region(source: &str, name: &str) -> Option<String> {
+    let begin = format!("// scan: {name} begin");
+    let end = format!("// scan: {name} end");
+    let after_begin = source.find(&begin)? + begin.len();
+    let end_offset = source[after_begin..].find(&end)?;
+    Some(source[after_begin..after_begin + end_offset].to_string())
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so
@@ -113,6 +130,30 @@ mod tests {
         let source = "fn only_production() {}\n";
 
         assert!(production_source(source).contains("fn only_production"));
+    }
+
+    #[test]
+    fn source_region_extracts_only_the_lines_between_its_named_markers() {
+        let source = "fn before() {}\n\
+                       // scan: example begin\n\
+                       fn inside() {}\n\
+                       // scan: example end\n\
+                       fn after() {}\n";
+
+        let region = source_region(source, "example").expect("the marker pair is present");
+
+        assert!(region.contains("fn inside"));
+        assert!(!region.contains("fn before"));
+        assert!(!region.contains("fn after"));
+    }
+
+    #[test]
+    fn source_region_is_none_when_either_marker_is_missing() {
+        let only_begin = "// scan: example begin\nfn inside() {}\n";
+        let neither = "fn inside() {}\n";
+
+        assert!(source_region(only_begin, "example").is_none());
+        assert!(source_region(neither, "example").is_none());
     }
 
     /// The cut finds the *last* `#[cfg(test)] mod tests` line, not the first: a file that
@@ -427,34 +468,46 @@ mod tests {
 
     // --- Criterion 4: re-probing each affected entity synchronously first, the
     // way a Launcher return does with `probe_now`, is explicitly not done for an Action's
-    // completion. `Core::run_action`'s own doc comment in repon-core's `core.rs`, and
-    // `docs/spec/actions.md`'s "Refreshing around a run", record the reason: `probe_now` is
-    // synchronous and single-entity, and forty of them costs about 3.6s under the fan-out's
-    // own contention, a frozen TUI for that whole window. The absence half below is what
-    // keeps that refusal real rather than merely written down.
+    // own completion path. `Core::run_action`'s own doc comment in repon-core's `core.rs`,
+    // and `docs/spec/actions.md`'s "Refreshing around a run", record the reason: `probe_now`
+    // is synchronous and single-entity, and forty of them costs about 3.6s under the
+    // fan-out's own contention, a frozen TUI for that whole window. The absence half below
+    // is what keeps that refusal real rather than merely written down.
 
     /// A call to `probe_now` (the method, never its declaration: the needle is the call
-    /// syntax `.probe_now(`, which a `pub fn probe_now(` definition never matches) does not
-    /// exist anywhere in either crate's production source today, since nothing in either
-    /// crate implements a Launcher-return re-probe yet either. That makes this scan strict
-    /// rather than loose: it fails the moment *any* production caller appears, Action or
-    /// not, which is deliberately wider than the criterion strictly needs and will need
-    /// narrowing (to "no caller inside `run_action`'s own completion path") the day a
-    /// legitimate Launcher-return caller lands elsewhere; recorded here rather than solved
-    /// in advance of a caller that does not exist yet.
+    /// syntax `.probe_now(`, which a `pub fn probe_now(` definition never matches) inside
+    /// `run_action`'s own completion path, marked in `core.rs` with a
+    /// `// scan: action-completion-path begin` / `end` pair rather than found by scanning
+    /// every production line in either crate: a Launcher return elsewhere needs exactly this
+    /// synchronous re-probe at its own, unrelated call site, so a scan wide enough to reject
+    /// *any* `probe_now` caller anywhere would turn a correct Launcher implementation into a
+    /// failing build here. `source_region` returning `None` fails this test outright (a
+    /// renamed or deleted marker must not read as "region empty, nothing to find"), which is
+    /// why this is not the same shape as the other absence scans in this module: the claim
+    /// only holds for one function in one crate, not "every crate the thing could live in".
     #[test]
     fn an_actions_completion_never_synchronously_reprobes_each_affected_entity_the_way_a_launcher_return_does()
      {
-        let needle = format!(".{}(", "probe_now");
+        let core_source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../repon-core/src/core.rs"),
+        )
+        .expect("read repon-core's core.rs");
+        let completion_path = source_region(&core_source, "action-completion-path")
+            .expect("core.rs carries the action-completion-path scan markers");
 
-        let offending = production_lines_containing(&needle);
+        let needle = format!(".{}(", "probe_now");
+        let offending: Vec<&str> = completion_path
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//") && line.contains(&needle))
+            .collect();
 
         assert!(
             offending.is_empty(),
-            "found a call to `probe_now`; docs/spec/actions.md's \"Refreshing around a run\" \
-             explicitly rejects synchronously re-probing each affected entity when an Action \
-             finishes (measured: about 3.6s for forty entities under the fan-out's own \
-             contention, a frozen TUI), at: {offending:?}"
+            "found a call to `probe_now` inside run_action's own completion path; \
+             docs/spec/actions.md's \"Refreshing around a run\" explicitly rejects \
+             synchronously re-probing each affected entity when an Action finishes \
+             (measured: about 3.6s for forty entities under the fan-out's own contention, a \
+             frozen TUI), at: {offending:?}"
         );
     }
 }

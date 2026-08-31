@@ -69,17 +69,21 @@ pub struct RepoOverride {
 }
 
 /// One command in an Action's ordered list, crossing from the consumer as plain data:
-/// argv already split (never a shell string) and any per-step environment overrides
-/// already resolved, so this crate never learns what `shell = true` or `from_env` even
-/// mean ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
-/// "Actions", "Launchers" carries the same split for a Launcher's own argv). `env`'s
-/// pairs are applied after
+/// `from_env` already resolved, so this crate never learns what that means
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// "Actions", "Launchers" carries the same split for a Launcher's own argv). `shell`
+/// crosses over unresolved, because resolving it is `executor::run_step`'s own job,
+/// the same convention the `repon` crate's Launcher `shell = true` uses: with
+/// `shell` set, `argv` holds exactly one element, the whole command string, per
+/// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// "Launchers". `env`'s pairs are applied after
 /// [`environment::environment`]'s own set-or-unset pairs, so a step's own `env` table
 /// overrides the guaranteed set exactly as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// Launcher `env` field already does.
 #[derive(Debug, Clone)]
 pub struct Step {
     pub argv: Vec<String>,
+    pub shell: bool,
     pub env: Vec<(String, String)>,
 }
 
@@ -495,20 +499,13 @@ impl Core {
     /// never discovered) is silently skipped, the same fallback `refresh` gives one.
     ///
     /// Starting a run cancels any in-flight Generation outright rather than sharing
-    /// execution with it, measured at a 3.7x penalty to the Action
-    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-    /// "Refreshing around a run"). Completion starts exactly one normal Generation over
-    /// every entity the table currently knows, not only the ones this run touched,
-    /// following the precedent a finished periodic fetch already sets
-    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
-    ///
-    /// Explicitly not done: re-probing each affected entity synchronously first, the way
-    /// a Launcher return does with [`Core::probe_now`]. Measured and rejected:
-    /// `probe_now` is synchronous and single-entity, and forty of them costs 0.44s at
-    /// best and about 3.6s under the contention the fan-out itself creates, which is a
-    /// frozen TUI for that whole window
-    /// (`docs/spec/actions.md`'s "Refreshing around a run"). The accepted cost instead:
-    /// the first entity to finish shows stale cells for the length of the run.
+    /// execution with it, and completion starts exactly one normal Generation over
+    /// every entity the table currently knows, not only the ones this run touched.
+    /// Explicitly not done, for the same reason: re-probing each affected entity
+    /// synchronously first, the way a Launcher return does with [`Core::probe_now`].
+    /// Both choices, and their measured cost, are
+    /// [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// ("Refreshing around a run").
     pub fn run_action(&self, action: ActionSpec, order: &[EntityKey]) -> bool {
         if self
             .action_running
@@ -567,20 +564,41 @@ impl Core {
                 .build()
                 .expect("build the Action fan-out's own dedicated pool");
 
-            pool.install(|| {
-                included.into_par_iter().for_each(|entity| {
-                    let receipt = run_action_for_entity(&entity, &action);
-                    let mut table = table_handle.write().unwrap();
-                    if let Some(&idx) = table.index.get(&entity.key) {
-                        table.entities[idx].last_action = Some(receipt);
-                    }
+            // Caught rather than left to unwind straight out of this thread: a poisoned
+            // `RwLock` from an unrelated earlier panic is enough to panic the
+            // `table_handle.write().unwrap()` below, and without `catch_unwind` that
+            // would skip the flag reset just past it, leaving `action_running` stuck
+            // true for the life of this `Core`.
+            let fan_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.install(|| {
+                    included.into_par_iter().for_each(|entity| {
+                        let receipt = run_action_for_entity(&entity, &action);
+                        let mut table = table_handle.write().unwrap();
+                        if let Some(&idx) = table.index.get(&entity.key) {
+                            table.entities[idx].last_action = Some(receipt);
+                        }
+                    });
                 });
-            });
+            }));
 
+            // scan: action-completion-path begin -- criterion 4: nothing from here to the
+            // matching end marker below may re-probe an affected entity synchronously the
+            // way a Launcher return does with `probe_now`; scoped this narrowly (rather
+            // than a whole-crate scan) because a legitimate Launcher-return caller lives
+            // in an unrelated call site the same absence claim must not forbid.
             // Criterion 6: the fan-out itself ends the moment every entity's own steps
-            // have finished; a second `run_action` racing in from here on is racing the
-            // completion Generation below, never another fan-out.
+            // have finished, panic or not; a second `run_action` racing in from here on
+            // is racing the completion Generation below, never another fan-out.
             action_running.store(false, Ordering::Release);
+
+            // A panicked fan-out never finished cleanly, so it earns no completion
+            // Generation once the flag above is safely reset. Swallowed rather than
+            // resumed: the default panic hook already printed it to stderr before
+            // `catch_unwind` returned, and this crate carries no logger to hand it to
+            // instead.
+            let Ok(()) = fan_out else {
+                return;
+            };
 
             // Criterion 3's second half: completion starts one normal Generation over
             // every entity currently known, not only the ones this run acted on.
@@ -592,6 +610,7 @@ impl Core {
                 .map(|entity| entity.key.clone())
                 .collect();
             refresh_handles.dispatch(&all_keys);
+            // scan: action-completion-path end
         });
 
         true
@@ -1086,7 +1105,7 @@ fn run_action_for_entity(entity: &EntityState, action: &ActionSpec) -> ActionRec
                 .iter()
                 .map(|(name, value)| (name.clone(), Some(value.clone()))),
         );
-        let result = executor::run_step(&step.argv, entity.key.path(), &env);
+        let result = executor::run_step(&step.argv, step.shell, entity.key.path(), &env);
         failed = result.outcome.is_failure();
         results.push(result);
     }
@@ -2149,6 +2168,16 @@ mod tests {
     fn step(argv: &[&str]) -> Step {
         Step {
             argv: argv.iter().map(|s| s.to_string()).collect(),
+            shell: false,
+            env: Vec::new(),
+        }
+    }
+
+    /// `shell = true`'s own convention: one argv element, the whole command string.
+    fn shell_step(command: &str) -> Step {
+        Step {
+            argv: vec![command.to_string()],
+            shell: true,
             env: Vec::new(),
         }
     }
@@ -2371,6 +2400,41 @@ mod tests {
         );
     }
 
+    /// `Step::shell` must actually reach the child, end to end through `run_action`,
+    /// not merely be a field that parses. Prints `$0` inside the step's own
+    /// command string: `sh -c <string>` with no third argument would leave `$0` reading
+    /// whatever the shell defaults it to, never the literal `repon`
+    /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// `shell = true` sentence requires. `executor.rs`'s own unit tests cover `run_step`
+    /// directly; this proves `core.rs` actually sets `shell` on the `Step` it builds and
+    /// passes it through.
+    #[test]
+    fn a_shell_true_step_runs_through_shell_c_with_repon_as_its_own_dollar_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![shell_step("echo \"[$0]\"")];
+
+        let started = core.run_action(action("shell-step", steps), std::slice::from_ref(&key));
+
+        assert!(started);
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0].last_action.is_some()
+        });
+        assert!(settled, "the fan-out must finish and write a receipt");
+        let receipt = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps.len(), 1);
+        assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+        assert_eq!(&*receipt.steps[0].output, b"[repon]\n");
+    }
+
     /// Criterion 3's first half. `begin_shared_generation_for_test` puts the entity
     /// in flight against a Generation of its own, exactly as a real `refresh` would;
     /// this proves `run_action` cancels that Generation's own flag rather than merely
@@ -2582,6 +2646,80 @@ mod tests {
             &*receipt.label, "first",
             "the surviving receipt must be the accepted first run's, never the rejected second"
         );
+    }
+
+    /// A panic anywhere inside the fan-out, a poisoned `RwLock` from an unrelated
+    /// earlier panic is enough, must not leave `action_running` stuck true for the
+    /// life of this `Core`. Poisons the table lock directly rather than
+    /// injecting a fault into `run_action_for_entity`, which runs a real child process
+    /// and has no seam for one: the fan-out's own `table_handle.write().unwrap()` then
+    /// panics on the poisoned lock exactly the way an unrelated earlier panic would in
+    /// production.
+    #[test]
+    fn a_panicking_fan_out_still_resets_action_running_so_a_later_action_can_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        // A step slow enough that the fan-out's own write of `last_action` cannot have
+        // happened yet by the time the poisoning below completes: `run_action`'s own
+        // synchronous prefix (the `compare_exchange`, `cancel_in_flight`, the read
+        // that builds `included`) is already finished by the time this call returns,
+        // so poisoning the lock afterwards can only reach the fan-out's own write,
+        // inside its own spawned thread.
+        let started = core.run_action(
+            action("boom", vec![step(&["sh", "-c", "sleep 0.3"])]),
+            std::slice::from_ref(&key),
+        );
+        assert!(started);
+
+        let table = Arc::clone(&core.table);
+        thread::spawn(move || {
+            let _guard = table.write().unwrap();
+            panic!("deliberately poison the table lock for this test");
+        })
+        .join()
+        .expect_err("the poisoning thread must itself panic to poison the lock");
+
+        // Without `catch_unwind` around the fan-out this never becomes false: its own write
+        // panics on the now-poisoned lock, unwinds out of `pool.install` and skips the
+        // `action_running.store(false, ...)` line entirely, leaving the flag stuck
+        // true for the life of this `Core`.
+        let flag_reset = wait_until(Duration::from_secs(5), || {
+            !core.action_running.load(Ordering::Acquire)
+        });
+        assert!(
+            flag_reset,
+            "a panicking fan-out must still reset action_running rather than leave it stuck true"
+        );
+
+        // Clears the poison this test itself introduced to force the panic, an
+        // artifact of the test rather than anything production code ever does, so a
+        // real, full `run_action` call below proves the reset flag actually lets
+        // another Action run to completion, not merely that one private atomic flipped.
+        core.table.clear_poison();
+
+        let second_started = core.run_action(
+            action("second", vec![step(&["true"])]),
+            std::slice::from_ref(&key),
+        );
+        assert!(
+            second_started,
+            "a later Action must be able to start once the panicking one has finished"
+        );
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot()
+                .entities
+                .iter()
+                .find(|entity| entity.key == key)
+                .and_then(|entity| entity.last_action.as_ref())
+                .is_some_and(|receipt| &*receipt.label == "second")
+        });
+        assert!(settled, "the second Action must actually run to completion");
     }
 
     /// Asserts `entity` reads exactly as a Vanished row must: still in the table,
