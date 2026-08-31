@@ -1586,18 +1586,44 @@ mod tests {
         );
     }
 
-    // Criterion 5's own "a row that already shows its cheap columns still animates its
-    // outstanding cell on refresh" used to be proven here against the unborn-Repo fixture
-    // above, whose `base` cell stayed unsettled forever before this ticket. Fixing `base`
-    // and `state` to settle Not applicable on an unborn HEAD (criterion 4) closes the last
-    // real, uncancelled path in this codebase to a cell that never settles: every column, in
-    // every HEAD shape, now settles to something, so no real fixture is left to drive a
-    // per-cell spinner across two ticks. The claim this test made still holds structurally
-    // (`draw_row` reads one `loading_frame` per tick and threads it into both the gutter and
-    // every cell's own loading glyph, so the two can never disagree), and the two pieces that
-    // claim rests on stay covered: `spinner_frame_advances_a_step_every_interval_and_wraps_around`
-    // proves the clock math, and `the_gutters_loading_frame_advances_as_the_components_own_clock_moves_forward`
-    // proves that same clock drives a real render's gutter mark across ticks.
+    /// A row that already shows its cheap columns must still animate the cell it is waiting
+    /// on, never a static screen. Until this ticket an unborn Repo's `base` supplied that
+    /// fixture by accident, because it never settled at all; settling it Not applicable
+    /// closed the last cell that stays outstanding forever. The state itself is not gone,
+    /// it is the ordinary one on first load, where the cheap columns land before the
+    /// expensive ones, so the fixture is now built rather than found.
+    #[test]
+    fn a_row_that_already_shows_its_cheap_columns_still_animates_its_outstanding_cell_on_refresh() {
+        let mut snap = settled_snapshot_with_a_resolvable_default_branch("main");
+        snap.entities[0].base = repon_core::Cell::default();
+        assert!(
+            snap.entities[0].base.settled().is_none(),
+            "sanity check: the claim below is about a cell with nothing settled in it yet"
+        );
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        let mut at_zero = List {
+            started_at: Instant::now(),
+            ..List::default()
+        };
+        let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
+        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
+
+        let mut later = List {
+            started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
+            ..List::default()
+        };
+        let second_tick = render_with_list(&mut later, 140, 24, &snap);
+        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
+
+        assert_eq!(base_first, glyphs.loading[0].to_string());
+        assert_eq!(base_second, glyphs.loading[5].to_string());
+        assert_ne!(
+            base_first, base_second,
+            "an already-populated row's outstanding cell must show moving spinner frames on \
+             refresh, never a static screen"
+        );
+    }
 
     /// No header row exists in the sidebar: there is nothing left worth labelling once only
     /// the gutter and the name remain.
@@ -3350,6 +3376,16 @@ mod tests {
     /// fail this, which is the drift a single shared rule is meant to rule out.
     #[test]
     fn format_head_is_called_from_exactly_one_production_site_besides_its_own_declaration() {
+        let files: usize = crate::test_support::workspace_crate_src_dirs()
+            .iter()
+            .map(|dir| crate::test_support::rust_source_files(dir).len())
+            .sum();
+        assert!(
+            files > 0,
+            "scanned zero source files, so a count of zero below would report a second \
+             branch-cell rule rather than a scan that read nothing"
+        );
+
         let offending = crate::test_support::production_lines_containing("format_head(");
         assert_eq!(
             offending.len(),
