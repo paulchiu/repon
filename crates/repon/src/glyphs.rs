@@ -169,11 +169,8 @@ glyph_set! {
 const FULL_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// `dots`' cadence in the cli-spinners table ADR 0020 cites: 80ms per frame, a full rotation
-/// in 800ms.
-///
-/// Read outside `#[cfg(test)]` only once a renderer schedules spinner frames; recorded now
-/// because ADR 0020 requires the cadence written down beside the frames.
-#[allow(dead_code)]
+/// in 800ms. `components::list` reuses this same interval for the ascii wobble too, since
+/// ADR 0020 records no separate ascii cadence.
 pub const FULL_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
 pub const FULL: GlyphSet = GlyphSet {
@@ -463,6 +460,29 @@ mod tests {
         assert!(
             corners.iter().all(|&corner| corner == '+'),
             "expected every ascii corner to collapse onto '+', got {corners:?}"
+        );
+    }
+
+    /// ADR 0020's other recorded border artefact, distinct from the horizontal-rule one
+    /// above: the ascii spinner's middle frame is `|`, the same character as the ascii
+    /// border's vertical rule, so a spinning row against the panel's left or right edge
+    /// renders `||` for one beat in three. Accepted rather than fixed, per the ADR's own
+    /// "Consequences": "one beat in three, and only while a row holds no values at all,
+    /// since the spinner moves into cells the moment some settle." Recorded here the same
+    /// way the horizontal-rule collision is recorded above, so a future change to either
+    /// glyph fails a named test rather than silently curing (or reintroducing) the artefact.
+    #[test]
+    fn the_ascii_spinners_middle_frame_shares_the_border_verticals_glyph_and_that_is_the_accepted_one_beat_in_three_artefact()
+     {
+        assert_eq!(
+            ASCII.loading[1], '|',
+            "expected the ascii spinner's middle frame to be '|', the frame ADR 0020 names as \
+             the one that collides with the border"
+        );
+        assert_eq!(
+            ASCII.border.vertical, ASCII.loading[1],
+            "the specific accepted collision: one beat in three, only while a row holds no \
+             values at all"
         );
     }
 
