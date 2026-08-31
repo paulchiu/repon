@@ -19,6 +19,7 @@ mod glyphs;
 mod help;
 mod keys;
 mod launcher;
+mod launcher_palette;
 mod logging;
 mod message;
 mod scroll;

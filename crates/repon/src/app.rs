@@ -15,6 +15,8 @@ use crate::{
     glyphs::GlyphSet,
     help::HelpOverlay,
     keys::{self, Action, BindingTable, Context},
+    launcher::{self, Launcher},
+    launcher_palette::LauncherPalette,
     message::Message,
     selection::Selection,
     set_picker::SetPicker,
@@ -127,10 +129,21 @@ pub struct App {
     /// (`;`) and closed by `Action::Cancel` from its own `Stage::Choosing`
     /// ([`ActionPalette::decline`] returns to `Choosing` instead of closing, from
     /// `Stage::Confirming`). [ADR 0008](../../../docs/adr/0008-two-palettes-not-one.md)
-    /// keeps this on a key, and a struct, entirely separate from the Launcher palette
-    /// (`Action::OpenLauncher`, issue #98, not built yet), the safety boundary the two
-    /// palettes exist to hold.
+    /// keeps this on a key, and a struct, entirely separate from `launcher_palette`, the
+    /// safety boundary the two palettes exist to hold.
     action_palette: Option<ActionPalette>,
+    /// `Some` while the Launcher palette has focus, opened by `Action::OpenLauncher` (`!`)
+    /// and closed by `Action::Cancel` (`Esc`,
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context, the same one
+    /// `action_palette` uses) or by choosing an entry
+    /// ([`Self::choose_highlighted_launcher`]). Unlike `action_palette` there is no confirm
+    /// stage: a Launcher hands off immediately.
+    launcher_palette: Option<LauncherPalette>,
+    /// `Some` between [`Self::choose_highlighted_launcher`] queuing a chosen Launcher and
+    /// [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, since
+    /// `handle_key_event` itself never holds one. Taken (never merely read) the moment it is
+    /// handed to [`Self::run_launcher_handoff`], so a handoff runs at most once per choice.
+    pending_launcher_handoff: Option<(EntityKey, Launcher)>,
     /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s`) and
     /// closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
@@ -290,6 +303,8 @@ impl App {
             help: None,
             warning_overlay_open: false,
             action_palette: None,
+            launcher_palette: None,
+            pending_launcher_handoff: None,
             set_picker: None,
             unimplemented_action_notice: None,
             theme_warnings,
@@ -358,6 +373,13 @@ impl App {
         loop {
             self.handle_events(&tui)?;
             self.handle_messages(&mut tui)?;
+            // `handle_key_event` never holds a `Tui`, so choosing a Launcher only queues the
+            // choice; this is the one point in the loop that drains it with a live `Tui` in
+            // hand, the same reason `should_suspend` below is a flag `handle_key_event` sets
+            // and only `run` itself acts on.
+            if let Some((entity_key, launcher)) = self.pending_launcher_handoff.take() {
+                self.run_launcher_handoff(&mut tui, &entity_key, &launcher);
+            }
             if self.should_suspend {
                 // refresh.md's "Suspension": all background work stops while the TUI is
                 // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
@@ -419,6 +441,13 @@ impl App {
     /// [`Self::handle_set_picker_key`] is what its own `Enter` routes through
     /// [`Self::switch_to_set`], the same path `1` to `9` (`SwitchToSet`) already take.
     ///
+    /// `OpenLauncher` (`!`) opens [`Self::launcher_palette`], `Context::Input` like the
+    /// Action palette rather than `Context::Overlay` like the Set picker
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s contexts table names the
+    /// Launcher palette alongside the Action palette, not the Set picker);
+    /// [`Self::handle_launcher_palette_key`] is what its own `Apply` (`Enter`) routes through
+    /// [`Self::choose_highlighted_launcher`] and [`Self::run_launcher_handoff`].
+    ///
     /// The match is exhaustive over every [`Action`] variant, with no catch-all: a variant
     /// this crate binds but has not built yet still gets its own arm, doing nothing beyond
     /// [`Self::notify_not_implemented`], so a later addition to [`Action`] fails to compile
@@ -452,6 +481,11 @@ impl App {
 
         if self.action_palette.is_some() {
             self.handle_action_palette_key(key);
+            return Ok(());
+        }
+
+        if self.launcher_palette.is_some() {
+            self.handle_launcher_palette_key(key);
             return Ok(());
         }
 
@@ -579,9 +613,7 @@ impl App {
                 None
             }
             Some(Action::OpenLauncher) => {
-                // TODO(#98): route through the Launcher palette; `around_entity_handoff`
-                // is the seam it will call into.
-                self.notify_not_implemented(Action::OpenLauncher);
+                self.launcher_palette = Some(LauncherPalette::new());
                 None
             }
             // TODO(#63): the Filter line does not exist yet.
@@ -793,6 +825,124 @@ impl App {
         }
     }
 
+    /// Every key event while `self.launcher_palette` is `Some`, dispatched through
+    /// `Context::Input`,
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s own context for the Launcher
+    /// palette (the same one [`Self::handle_action_palette_key`] uses for the Action
+    /// palette's own `Stage::Choosing`). There is no `Context::Confirm` half here: a
+    /// Launcher has no confirm gate, so `Apply` hands off immediately
+    /// ([`Self::choose_highlighted_launcher`]'s own doc comment). The trailing
+    /// `unreachable!` arm is the same proof-made-loud shape
+    /// [`Self::handle_action_palette_key`] already uses for `Context::Input`.
+    fn handle_launcher_palette_key(&mut self, key: KeyEvent) {
+        match self.bindings.dispatch(Context::Input, key) {
+            Some(Action::Cancel) => self.launcher_palette = None,
+            Some(Action::Text(c)) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.type_char(c, &launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::DeletePreviousWord) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.delete_previous_word(&launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::ClearLine) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.clear_line(&launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::PreviousEntry) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.move_highlight(-1, &launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::NextEntry) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.move_highlight(1, &launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::Apply) => self.choose_highlighted_launcher(),
+            Some(Action::AcceptCompletion | Action::OpenInEditor) => {}
+            None => {}
+            Some(other) => unreachable!(
+                "dispatch(Context::Input, _) only ever returns the input vocabulary or \
+                 Text, got {other:?}"
+            ),
+        }
+    }
+
+    /// `Action::Apply` (`Enter`) inside the Launcher palette: the highlighted entry, resolved
+    /// through [`launcher::resolve`] rather than `self.document.launchers` directly, so a
+    /// `disabled = true` entry or a missing shipped default can never reach here. A Launcher
+    /// always acts on the cursor row alone, never a fanned-out Selection
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "The Selection"), so this reads
+    /// `self.cursor_key()` rather than `self.selection.targets(..)`.
+    ///
+    /// Closes the palette and queues the choice in `self.pending_launcher_handoff` for
+    /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
+    /// ([`Self::run_launcher_handoff`] is what actually calls
+    /// [`Self::around_entity_handoff`]): `handle_key_event` itself never holds one, the same
+    /// reason `Action::Suspend` only sets `self.should_suspend` here and leaves the real
+    /// `tui.suspend()` call to `Self::run`. A missing cursor (an empty table) or an empty
+    /// match list leaves the palette open and untouched, the same as
+    /// [`Self::choose_highlighted_action`] does for a query matching nothing.
+    fn choose_highlighted_launcher(&mut self) {
+        let Some(cursor_key) = self.cursor_key() else {
+            return;
+        };
+        let launchers = launcher::resolve(&self.document);
+        let Some(palette) = &self.launcher_palette else {
+            return;
+        };
+        let Some(chosen) = palette.choose(&launchers) else {
+            return;
+        };
+        self.launcher_palette = None;
+        self.pending_launcher_handoff = Some((cursor_key, chosen));
+    }
+
+    /// Runs a queued Launcher choice: re-reads `entity_key`'s current `EntityState` off the
+    /// live Snapshot (never a copy the palette drew from, which could be a Generation stale
+    /// by the time `tui` is free to hand off with) and, if the row is still present, hands it
+    /// to [`launcher::run`] through [`Self::around_entity_handoff`], the one path a return
+    /// from suspension, `SIGTSTP` and a Launcher handoff now all share.
+    ///
+    /// A vanished row is silently a no-op; a failed handoff is logged rather than propagated,
+    /// the same grade [`Self::reread_theme`] gives a failed reread, since a Launcher failing
+    /// is not a reason to tear down the whole session.
+    fn run_launcher_handoff(&mut self, tui: &mut Tui, entity_key: &EntityKey, chosen: &Launcher) {
+        self.run_handoff_over_entity(entity_key, chosen, |entity| {
+            launcher::run(tui, chosen, entity)
+        });
+    }
+
+    /// [`Self::run_launcher_handoff`] with the terminal-owning half passed in. `Tui::new`
+    /// asks the terminal for its size and fails with `EAGAIN` where there is no controlling
+    /// one, so a test that builds a real one passes on a developer's machine and cannot run
+    /// on CI at all; `launcher::run` under a real terminal is covered by the pty harness in
+    /// `tests/terminal_restoration.rs`, the one place allowed to drive one.
+    fn run_handoff_over_entity<T>(
+        &mut self,
+        entity_key: &EntityKey,
+        chosen: &Launcher,
+        handoff: impl FnOnce(&EntityState) -> Result<T>,
+    ) {
+        let Some(entity) = self
+            .core
+            .snapshot()
+            .entities
+            .into_iter()
+            .find(|entity| &entity.key == entity_key)
+        else {
+            return;
+        };
+        let result = self.around_entity_handoff(entity_key, || handoff(&entity));
+        if let Err(err) = result {
+            tracing::error!("Launcher {:?} failed: {err:#}", chosen.name);
+        }
+    }
+
     /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count
     /// from `self.selection.targets(cursor)` through
     /// [`repon_core::Core::operable_count`], the identical computation
@@ -957,13 +1107,10 @@ impl App {
     /// ([`Self::on_resume`]), per refresh.md's "the entity that was handed off is re-probed
     /// first and synchronously, then a normal generation starts."
     ///
-    /// The Launcher palette itself ([keybindings.md](../../../docs/spec/keybindings.md)'s
-    /// `!`) is later work; once it exists, its call to
-    /// [`crate::launcher::run`] is what `handoff` will wrap, as
-    /// `self.around_entity_handoff(&entity.key, || launcher::run(tui, launcher, entity))`.
-    /// `#[allow(dead_code)]` because nothing outside `#[cfg(test)]` calls this yet, the same
-    /// reason `theme.rs`'s own unread roles carry it: its future caller is that palette.
-    #[allow(dead_code)]
+    /// [`Self::run_launcher_handoff`] is the one production caller, wrapping
+    /// [`crate::launcher::run`] as `handoff`; the pty-backed handoff itself needs a real
+    /// terminal to exercise, which is what
+    /// `crates/repon/tests/terminal_restoration.rs` is for.
     fn around_entity_handoff<T>(
         &mut self,
         entity_key: &EntityKey,
@@ -1026,6 +1173,19 @@ impl App {
         // before the frame-drawing closure below borrows `self` immutably, so the border
         // title can never show a different number than a real choice would act on.
         let action_palette_operable_count = self.action_palette_operable_count();
+        // The identical read `Self::choose_highlighted_launcher` does: the resolved Launcher
+        // list and the cursor row's own name, computed once here for the same reason
+        // `action_palette_operable_count` is, so the border title can never name a different
+        // Entity than a real choice would act on.
+        let launcher_palette_view = self.launcher_palette.as_ref().map(|_| {
+            let launchers = launcher::resolve(&self.document);
+            let entity_name = self
+                .cursor_key()
+                .and_then(|key| snapshot.entities.iter().find(|entity| entity.key == key))
+                .map(|entity| entity.name.to_string())
+                .unwrap_or_default();
+            (launchers, entity_name)
+        });
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
@@ -1045,6 +1205,13 @@ impl App {
                     &self.document.actions,
                     action_palette_operable_count.unwrap_or(0),
                 );
+                return;
+            }
+            if let Some(palette) = &self.launcher_palette {
+                let (launchers, entity_name) = launcher_palette_view
+                    .as_ref()
+                    .expect("computed above whenever launcher_palette is Some");
+                palette.draw(frame, area, &self.theme, launchers, entity_name);
                 return;
             }
             if let Some(picker) = &self.set_picker {
@@ -1233,6 +1400,8 @@ mod tests {
             help: None,
             warning_overlay_open: false,
             action_palette: None,
+            launcher_palette: None,
+            pending_launcher_handoff: None,
             set_picker: None,
             unimplemented_action_notice: None,
             theme_warnings: Vec::new(),
@@ -2199,13 +2368,11 @@ mod tests {
     }
 
     // --- `OpenLauncher` has its own arm rather than falling through `handle_key_event`'s
-    // catch-all: the ticket's headline feature has no palette yet, and that gap must be
-    // visible in the dispatch itself, not absorbed silently alongside implemented actions.
+    // catch-all, the same exhaustiveness guarantee every other named arm carries (issue #97).
 
-    /// `Action::OpenLauncher` is bound, has a footer hint and a help entry, but the palette
-    /// that would select a Launcher to hand off to does not exist yet. Without its own arm,
-    /// pressing the bound key would fall into the wildcard next to every other implemented
-    /// action, indistinguishable from one that works.
+    /// A regression guard against a reintroduced wildcard: without its own arm, pressing
+    /// `OpenLauncher`'s bound key would fall into a catch-all next to every other action,
+    /// indistinguishable from a genuine gap.
     #[test]
     fn open_launcher_has_its_own_arm_in_handle_key_event_rather_than_the_catch_all() {
         let source = production_source_at(
@@ -2230,9 +2397,10 @@ mod tests {
     /// footer and help overlay already show for the same action. The list was the nine
     /// named in #97 plus List's own `Ctrl+D`/`Ctrl+U`, a gap this ticket's own exhaustiveness
     /// requirement surfaced that no issue tracks; `OpenActionPalette` left this list once #64
-    /// gave it a real arm (its own tests live in `action_palette.rs` and below), and
-    /// `OpenSetPicker` leaves it here for the same reason once this ticket gave it one (its
-    /// own tests live in `set_picker.rs` and below).
+    /// gave it a real arm (its own tests live in `action_palette.rs` and below),
+    /// `OpenSetPicker` left it once #94 gave it one (its own tests live in `set_picker.rs`
+    /// and below), and `OpenLauncher` leaves it here for the same reason once this ticket
+    /// gave it one (its own tests live in `launcher_palette.rs` and below).
     #[test]
     fn every_bound_but_unimplemented_action_tells_the_user_through_the_shared_warning_slot() {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -2243,7 +2411,6 @@ mod tests {
         let mut app = test_app(&root);
 
         let cases = [
-            (KeyCode::Char('!'), KeyModifiers::NONE, Action::OpenLauncher),
             (KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterFilter),
             (KeyCode::Char('r'), KeyModifiers::NONE, Action::RefreshAll),
             (
@@ -2319,14 +2486,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
         };
 
-        let cases: [(&str, Option<u32>); 9] = [
+        let cases: [(&str, Option<u32>); 8] = [
             ("EnterFilter", Some(63)),
             ("RefreshAll", Some(65)),
             ("RefreshSelection", Some(65)),
             ("RederiveDefaultBranches", Some(73)),
             ("NextFailed", Some(78)),
             ("PreviousFailed", Some(78)),
-            ("OpenLauncher", Some(98)),
             ("DismissVanished", None),
             // List's own half-page movement, reached when the guarded Detail arm above
             // does not claim these: no open issue tracks it either.
@@ -2649,8 +2815,8 @@ mod tests {
     }
 
     // Criterion 1: two distinct keys, no shared entry point. `!` (OpenLauncher) must never
-    // touch the Action palette's own state, and `;` must never fall into OpenLauncher's
-    // still-unimplemented arm.
+    // touch the Action palette's own state, and `;` must never touch the Launcher palette's,
+    // per ADR 0008's safety boundary between a one-Repo handoff and an N-Repo fan-out.
     #[test]
     fn open_launcher_and_open_action_palette_are_wholly_separate_keys_with_no_shared_state() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2661,22 +2827,252 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
             .expect("handle !");
         assert!(
+            app.launcher_palette.is_some(),
+            "OpenLauncher must open the Launcher palette"
+        );
+        assert!(
             app.action_palette.is_none(),
             "OpenLauncher must never open the Action palette"
         );
-        let warnings = app.current_warnings();
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.to_string().contains("Launcher palette")),
-            "OpenLauncher must still take its own unimplemented path, got: {warnings:?}"
-        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel the launcher palette");
+        assert!(app.launcher_palette.is_none());
 
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("handle ;");
         assert!(
             app.action_palette.is_some(),
             "OpenActionPalette must open the Action palette"
+        );
+        assert!(
+            app.launcher_palette.is_none(),
+            "OpenActionPalette must never open the Launcher palette"
+        );
+    }
+
+    // --- issue #98: the Launcher palette ---
+
+    /// A declared `[[launcher]]` entry with a real, literal argv (never a shell string, per
+    /// [ADR 0007](../../../docs/adr/0007-launchers-are-argv-vectors.md)), built by the test
+    /// rather than reused from `launcher.rs`'s own fixtures.
+    fn launcher_config(name: &str, args: Vec<&str>, disabled: bool) -> document::LauncherConfig {
+        document::LauncherConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            args: Some(args.into_iter().map(str::to_string).collect()),
+            from_env: None,
+            shell: false,
+            env: Default::default(),
+            disabled,
+        }
+    }
+
+    /// Criterion 1, proven through the palette itself rather than through `launcher::resolve`
+    /// alone (already exhaustively tested in `launcher.rs`): a document with a disabled entry
+    /// sorting into the middle of the declared tail, between two enabled ones. A build that
+    /// fed the palette `self.document.launchers` directly, unfiltered, would still let
+    /// `beta`'s own name match and queue a handoff for it; only feeding the resolved list
+    /// omits it. `alpha` and `gamma` staying reachable either side proves the drop does not
+    /// also swallow or shift its neighbours.
+    #[test]
+    fn the_launcher_palette_omits_a_disabled_entry_while_keeping_its_neighbours_reachable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .launchers
+            .push(launcher_config("alpha", vec!["true"], false));
+        app.document
+            .launchers
+            .push(launcher_config("beta", vec!["true"], true));
+        app.document
+            .launchers
+            .push(launcher_config("gamma", vec!["true"], false));
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the palette");
+        for c in "beta".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the disabled entry's own name");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press enter");
+        assert!(
+            app.launcher_palette.is_some(),
+            "typing a disabled Launcher's name must match nothing, leaving the palette open"
+        );
+        assert!(
+            app.pending_launcher_handoff.is_none(),
+            "a disabled Launcher must never be queued for a handoff"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("clear the line");
+        for c in "gamma".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the entry declared right after the disabled one");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose gamma");
+        let (_, chosen) = app
+            .pending_launcher_handoff
+            .take()
+            .expect("gamma must still be reachable and chosen");
+        assert_eq!(chosen.name, "gamma");
+    }
+
+    /// The Generation-counter analogue #94's own equivalent test needed: reading
+    /// `app.launcher_palette` back is half a test, since it says nothing about whether a
+    /// dismiss quietly still queued or ran a handoff. Asserting the Generation counter too
+    /// catches a dismiss that starts one anyway, the observable a build that ran the handoff
+    /// on `Esc` rather than only on `Apply` would otherwise slip past.
+    #[test]
+    fn dismissing_the_launcher_palette_without_choosing_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let generation_before = app.core.snapshot().generation;
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel");
+
+        assert!(app.launcher_palette.is_none());
+        assert!(
+            app.pending_launcher_handoff.is_none(),
+            "dismissing must queue no handoff"
+        );
+        assert_eq!(
+            app.core.snapshot().generation,
+            generation_before,
+            "dismissing must start no new Generation; one starting anyway is the tell that \
+             a handoff ran despite nothing being chosen"
+        );
+    }
+
+    /// Criterion 2: choosing a Launcher must reach `on_resume`'s own theme reread through
+    /// `around_entity_handoff`, not merely re-probe the entity. A second implementation that
+    /// called `launcher::run` directly and skipped `on_resume` would still pass a
+    /// reprobe-only check, since re-probing and rereading the theme are two separate calls
+    /// inside `around_entity_handoff`; this asserts the one a copy is easiest to drop.
+    /// theming.md: "read again on resume, both from a Launcher returning and from SIGTSTP."
+    #[test]
+    fn choosing_a_launcher_rereads_the_theme_file_through_the_shared_handoff_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let themes_dir = tempfile::tempdir().expect("themes dir");
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"red\"\n")
+            .expect("write initial theme");
+
+        let mut app = test_app(&root);
+        app.theme_name = "custom".to_string();
+        app.theme_source = theme::ThemeSource::Config;
+        app.themes_dir = themes_dir.path().to_path_buf();
+        app.reread_theme();
+        assert_eq!(app.theme.text, ratatui::style::Color::Red);
+        app.document
+            .launchers
+            .push(launcher_config("noop", vec!["true"], false));
+
+        // The file changes while Repon is notionally suspended, e.g. the user opened it in
+        // `$EDITOR` from inside the handed-off shell.
+        std::fs::write(themes_dir.path().join("custom.toml"), "text = \"blue\"\n")
+            .expect("rewrite theme");
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the palette");
+        for c in "noop".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the launcher's name");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose it");
+        let (entity_key, chosen) = app
+            .pending_launcher_handoff
+            .take()
+            .expect("choosing must queue a handoff");
+        // `Tui::new` needs a controlling terminal, so the handoff runs through the seam that
+        // takes the terminal-owning half as a closure. The Launcher's own argv still reaches a
+        // real process; only the terminal suspend and reclaim are skipped, and those are what
+        // the pty harness in tests/terminal_restoration.rs covers.
+        app.run_handoff_over_entity(&entity_key, &chosen, |entity| {
+            Ok(launcher::build_command(&chosen, entity).status()?)
+        });
+
+        assert_eq!(
+            app.theme.text,
+            ratatui::style::Color::Blue,
+            "expected the theme file re-read after the Launcher handoff returned, the same \
+             reread SIGTSTP and a direct `around_entity_handoff` call both already give"
+        );
+    }
+
+    /// Criterion 4, end to end: the Launcher's own child changes the repository (checks out a
+    /// new branch) while Repon is notionally suspended, driven through real key presses
+    /// against the real palette rather than calling `around_entity_handoff` by hand, so this
+    /// proves `App` wires the whole path together, not only that the seam itself works. The
+    /// entity's branch cell must already show the new branch the instant the queued handoff
+    /// returns, with no sleep and no settle: the trap this brief warns against is asserting on
+    /// a state that would also hold if the re-probe happened later (on the next poll) or not
+    /// at all, which is why this checks immediately rather than after a wait.
+    #[test]
+    fn choosing_a_launcher_reprobes_the_entitys_cells_before_the_palette_returns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app(&root);
+        app.document.launchers.push(launcher_config(
+            "checkout",
+            vec!["git", "checkout", "-q", "-b", "handoff-branch"],
+            false,
+        ));
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the palette");
+        for c in "checkout".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the launcher's name");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose it");
+        assert!(
+            app.launcher_palette.is_none(),
+            "choosing must close the palette"
+        );
+        let (entity_key, chosen) = app
+            .pending_launcher_handoff
+            .take()
+            .expect("choosing must queue a handoff");
+        // `Tui::new` needs a controlling terminal, so the handoff runs through the seam that
+        // takes the terminal-owning half as a closure. The Launcher's own argv still reaches a
+        // real process; only the terminal suspend and reclaim are skipped, and those are what
+        // the pty harness in tests/terminal_restoration.rs covers.
+        app.run_handoff_over_entity(&entity_key, &chosen, |entity| {
+            Ok(launcher::build_command(&chosen, entity).status()?)
+        });
+
+        let snapshot = app.core.snapshot();
+        let entity = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key == entity_key)
+            .expect("the handed-off entity is still in the table");
+        assert!(
+            matches!(
+                entity.branch.settled(),
+                Some(repon_core::Settled::Known {
+                    value: repon_core::Head::Branch { name, .. },
+                    ..
+                }) if &**name == "handoff-branch"
+            ),
+            "expected the branch the Launcher checked out to already be visible with no \
+             sleep and no settle, got: {:?}",
+            entity.branch.settled()
         );
     }
 
