@@ -47,13 +47,13 @@ One keystroke reaches lazygit, an editor, or a shell in the Repo under the curso
 
 ## Influences
 
-The problem statement comes from mrx, a private multi-repo tool I use daily. It established that the outer loop is worth a tool of its own, and using it is where Repon's design principles came from: per-cell provenance, and the feedback rules. Repon takes the problem and none of the code, which is [ADR 0003](docs/adr/0003-clean-room-from-mrx.md).
+The problem statement comes from [mrx](https://github.com/benfriebe/mrx), a multi-repo tool covering similar ground. It established that the outer loop is worth a tool of its own, and it is where Repon's design principles came from: per-cell provenance, and the feedback rules. mrx carries no licence file, so all rights are reserved and its source is not consulted here. Repon takes the problem and none of the code, which is [ADR 0003](docs/adr/0003-clean-room-from-mrx.md).
 
 The visual language comes from [superfile](https://github.com/yorukot/superfile): bordered panels, restrained colour, calm spacing, and the philosophy of picking a narrow lane and polishing it.
 
 The interaction structure comes from [lazygit](https://github.com/jesseduffield/lazygit): context-sensitive keybindings, an always-visible footer, and a Selection that drives a detail pane.
 
-Both are MIT licensed.
+superfile and lazygit are both MIT licensed.
 
 ## Documents
 
