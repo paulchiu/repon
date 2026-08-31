@@ -9165,6 +9165,7 @@ mod tests {
                 .status()
                 .expect("run git clone");
             assert!(status.success());
+            crate::test_support::set_identity(dest);
         }
 
         /// The scheduler's first rule: enabling the periodic fetch runs one cycle

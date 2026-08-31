@@ -136,6 +136,25 @@ pub(crate) fn remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
         .status()
         .expect("run git clone");
     assert!(status.success());
+    // Written into the clone's own config rather than passed per command: a fetch updates
+    // refs through gix, in this process, and gix writes a reflog entry for that update,
+    // which needs a committer identity it can only read from the repository. A machine with
+    // no global git identity, which is every CI runner, otherwise fails the fetch itself.
+    set_identity(clone.path());
 
     (remote, clone)
+}
+
+/// Gives `path`'s own repository a committer identity, so nothing depends on whether the
+/// machine running the tests happens to have one configured globally.
+pub(crate) fn set_identity(path: &Path) {
+    for (key, value) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config");
+        assert!(status.success(), "git config {key} failed");
+    }
 }
