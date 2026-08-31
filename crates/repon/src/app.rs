@@ -1264,40 +1264,84 @@ mod tests {
     // claimed. `tests/terminal_restoration.rs` asserts on raw bytes over a real pty, which is
     // the only proof strong enough to stand alone; a source scan is a weaker second layer,
     // since it cannot see a print reached through a helper it does not name by this literal
-    // text. Scoped to the files a warning actually flows through rather than the whole
-    // crate, since `main.rs` legitimately prints CLI output (`repon config`, the debug-only
-    // test harness subcommands) before the terminal is ever claimed, or without claiming it
-    // at all.
+    // text. Scans every file in the crate rather than a fixed list, so a warning print added
+    // to a file nobody enumerated ahead of time is still caught. Two functions are excluded by
+    // name rather than by file, `print_config_paths` (`repon config`'s plain-form CLI output)
+    // and `errors.rs`'s `init` (color_eyre's crash report, which only ever prints after
+    // `crate::tui::restore()` has already run); a third shape, anything in `main.rs` gated
+    // behind `#[cfg(debug_assertions)]`, covers its debug-only test harness subcommands
+    // without naming each one. None of the three ever reads `warnings::Warning` or
+    // `WarningSources`, and a warning must still print in a release build, so none can be the
+    // path this test exists to refuse.
+
+    /// The line index of the top-level `fn`/`pub fn` declaration enclosing `lines[index]`:
+    /// the nearest such line above it at zero indentation. Reliable for `main.rs` and
+    /// `errors.rs` specifically, whose production source declares every function at the top
+    /// level, with no `impl` block to nest one inside another.
+    fn enclosing_top_level_fn_start(lines: &[&str], index: usize) -> Option<usize> {
+        let mut cursor = index;
+        while cursor > 0 {
+            cursor -= 1;
+            if lines[cursor].starts_with("fn ") || lines[cursor].starts_with("pub fn ") {
+                return Some(cursor);
+            }
+        }
+        None
+    }
+
+    /// The name a `fn`/`pub fn` declaration line binds, or `None` if `line` is not one.
+    fn fn_name_of(line: &str) -> Option<&str> {
+        let rest = line
+            .strip_prefix("pub fn ")
+            .or_else(|| line.strip_prefix("fn "))?;
+        rest.split(['(', '<']).next().map(str::trim)
+    }
+
+    /// True if `#[cfg(debug_assertions)]` sits directly above the declaration at `fn_line`.
+    fn is_debug_assertions_gated(lines: &[&str], fn_line: usize) -> bool {
+        fn_line > 0 && lines[fn_line - 1].trim() == "#[cfg(debug_assertions)]"
+    }
 
     /// A `println!` or `eprintln!` anywhere a warning is gathered, logged or drawn would
     /// bypass `tracing`'s file-only writer entirely.
     #[test]
-    fn no_warning_related_file_calls_println_or_eprintln() {
+    fn no_warning_path_calls_println_or_eprintln_anywhere_in_this_crates_production_source() {
+        let legitimate_producers = [("main.rs", "print_config_paths"), ("errors.rs", "init")];
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let warning_related_files = ["app.rs", "reload.rs", "warnings.rs"];
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
-            if !path
+            let file_name = path
                 .file_name()
-                .is_some_and(|name| warning_related_files.iter().any(|file| name == *file))
-            {
-                continue;
-            }
+                .expect("a source file has a name")
+                .to_string_lossy()
+                .into_owned();
             let production = production_source_at(&path);
-            for (number, line) in production.lines().enumerate() {
+            let lines: Vec<&str> = production.lines().collect();
+            for (number, line) in lines.iter().enumerate() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                if trimmed.contains("println!(") {
-                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                if !trimmed.contains("println!(") {
+                    continue;
                 }
+                if let Some(fn_line) = enclosing_top_level_fn_start(&lines, number) {
+                    let is_named_legitimate = fn_name_of(lines[fn_line]).is_some_and(|name| {
+                        legitimate_producers.contains(&(file_name.as_str(), name))
+                    });
+                    let is_debug_harness =
+                        file_name == "main.rs" && is_debug_assertions_gated(&lines, fn_line);
+                    if is_named_legitimate || is_debug_harness {
+                        continue;
+                    }
+                }
+                offending_locations.push(format!("{}:{}", path.display(), number + 1));
             }
         }
         assert!(
             offending_locations.is_empty(),
-            "found a println!/eprintln! call in a warning-related file, at: \
-             {offending_locations:?}"
+            "found a println!/eprintln! call outside this crate's known-legitimate, \
+             non-warning producers, at: {offending_locations:?}"
         );
     }
 
