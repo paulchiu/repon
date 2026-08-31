@@ -77,6 +77,16 @@ _Avoid_: Handoff (that names the act, not the thing)
 **Action**:
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
+**Action receipt**:
+An Entity's most recent Action run: its label, its ordered Step results, whether the row was excluded and never operated on, and when it finished. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session.
+_Avoid_: Action run, Action result (the receipt is the specific, settled word)
+
+**Step result**:
+One Step's own record inside an Action receipt: its label, its Step outcome, its captured output and its elapsed time.
+
+**Step outcome**:
+A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.
+
 **Environment contract**:
 The set-or-unset variable pairs a Launcher or an Action step's child receives, computed from an Entity's already-settled Cells as plain data. An Unknown or Not applicable value unsets its variable rather than setting it empty, and Repon exports none of its own Selection state.
 
@@ -115,7 +125,7 @@ _Avoid_: Row (that names the rendering, not the domain object)
 An Entity's identity: a newtype over its own resolved absolute working directory. Not its name, which collides across the population; not the git common dir, which a Repo shares with every Worktree attached to it.
 
 **Entity state**:
-The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action run, its Presence, its in progress operation and its recent commits.
+The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action receipt, its Presence, its in progress operation and its recent commits.
 
 **HEAD**:
 Exactly three shapes, one to one with git's own: attached to a branch with a commit, detached at a commit with no branch, or unborn with a branch and no commit yet.

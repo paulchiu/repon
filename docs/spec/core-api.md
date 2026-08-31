@@ -116,7 +116,7 @@ pub struct EntityState {
     pub state: Cell<WorktreeState>,
     pub default_branch: Cell<DefaultBranch>,
     pub diagnostics: Diagnostics,
-    pub last_action: Option<ActionRun>,
+    pub last_action: Option<ActionReceipt>,
     pub presence: Presence,
 }
 ```
