@@ -7,13 +7,14 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect, Size},
 };
-use repon_core::{Core, EntityKey, EntityState, Snapshot};
+use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Snapshot};
 use tracing::debug;
 
 use crate::{
     action_palette::{ActionPalette, Decision, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
+    filter_line::FilterLine,
     footer,
     glyphs::GlyphSet,
     header::HeaderContent,
@@ -32,7 +33,8 @@ use crate::{
     warnings::{self, Warning, WarningSources},
 };
 
-mod reload;
+pub(crate) mod reload;
+pub(crate) mod status;
 
 use reload::{ActiveSet, action_running_notice};
 
@@ -87,6 +89,26 @@ impl UnwindLevel for ClosePaneOnUnwind<'_> {
         if self.pane.is_some() {
             *self.pane = None;
             *self.focus = Context::List;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Clearing a committed Filter is the unwind stack's fourth and last level
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)), the reason clearing a
+/// Filter has no key of its own
+/// ([filter.md](../../../../docs/spec/filter.md)'s "The input line"). Live only while
+/// `self.filter` is active, and tried only once every earlier level is already empty.
+struct ClearFilterOnUnwind<'a> {
+    filter: &'a mut Filter,
+}
+
+impl UnwindLevel for ClearFilterOnUnwind<'_> {
+    fn unwind(&mut self) -> bool {
+        if self.filter.is_active() {
+            *self.filter = Filter::default();
             true
         } else {
             false
@@ -231,6 +253,20 @@ pub struct App {
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
     /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
     document: Document,
+    /// The committed Filter narrowing the list ([CONTEXT.md](../../../CONTEXT.md)'s
+    /// "Committed Filter"): applied while `self.filter_line` is `None`, and what `Esc`
+    /// restores when an edit is abandoned. Session state, never persisted
+    /// ([`crate::filter_line`]'s own doc comment records that gap). `Filter::default()`
+    /// (the empty string) until `/` and Enter commit one.
+    filter: Filter,
+    /// `Some` while the Filter line has focus, opened by `Action::EnterFilter` (`/`) and
+    /// closed either by `Action::Apply` (Enter, which also commits its live text into
+    /// `self.filter`) or `Action::Cancel` (Esc, which abandons the edit and leaves `self.filter`
+    /// untouched). Dispatched through `Context::Input` like `action_palette` and
+    /// `launcher_palette`, but drawn inline above the footer rather than as a full-screen
+    /// overlay, since the list keeps narrowing live underneath it
+    /// ([filter.md](../../../docs/spec/filter.md)).
+    filter_line: Option<FilterLine>,
 }
 
 impl App {
@@ -338,6 +374,8 @@ impl App {
             bindings,
             active_set,
             document: config.document,
+            filter: Filter::default(),
+            filter_line: None,
         })
     }
 
@@ -395,24 +433,41 @@ impl App {
 
     /// The status row's own content for this frame: the active Set's name, `snapshot`'s
     /// entity count folded into the same rank-1 item, `warnings`, and every warning
-    /// [`Self::acknowledged_warnings`] has marked seen. The header's other four items
-    /// (`run_progress`, `filter_match_count`, `worktrees_note`, `elapsed`) stay `None`: `App`
-    /// has no in-flight Action progress counter, no live Filter and no elapsed timer yet
-    /// ([`crate::header`]'s own doc comment), so the ladder is over whichever subset already
-    /// exists, the same treatment [keybindings.md](../../../docs/spec/keybindings.md) gives
-    /// the footer.
+    /// [`Self::acknowledged_warnings`] has marked seen. `filter_match_count` and
+    /// `worktrees_note` read [`Self::active_filter`] and `visible_row_order`
+    /// ([`crate::components::list`]) so the header's own count is the identical set the list
+    /// draws ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the matching
+    /// rows, the header's match count ... are all the same set"). `run_progress` and
+    /// `elapsed` stay `None`: `App` has no in-flight Action progress counter or elapsed timer
+    /// yet ([`crate::header`]'s own doc comment).
     fn status_row_content<'a>(
         &'a self,
         snapshot: &Snapshot,
         warnings: &'a [Warning],
     ) -> StatusRowContent<'a> {
+        let filter = self.active_filter();
+        let visible = crate::components::list::visible_row_order(
+            &snapshot.entities,
+            self.document.show_worktrees,
+            self.document.show_submodules,
+            &filter,
+        );
+        let filter_match_count = filter.is_active().then_some(visible.len());
+        let worktrees_override =
+            !self.document.show_worktrees && filter.requests_kind(Kind::Worktree);
+        let worktrees_note = worktrees_override.then(|| {
+            visible
+                .iter()
+                .filter(|&&index| matches!(snapshot.entities[index].kind, Kind::Worktree))
+                .count()
+        });
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
                 entity_count: snapshot.entities.len(),
                 run_progress: None,
-                filter_match_count: None,
-                worktrees_note: None,
+                filter_match_count,
+                worktrees_note,
                 elapsed: None,
             },
             warnings,
@@ -582,6 +637,11 @@ impl App {
             return Ok(());
         }
 
+        if self.filter_line.is_some() {
+            self.handle_filter_line_key(key);
+            return Ok(());
+        }
+
         // scan: key_event_dispatch begin -- criterion 4: this match's own exhaustiveness test
         // (app.rs's own `handle_key_events_dispatch_match_carries_no_wildcard_arm`) reads only
         // the lines between this pair, so a reintroduced wildcard fails it wherever this match
@@ -684,7 +744,10 @@ impl App {
                     pane: &mut self.pane,
                     focus: &mut self.focus,
                 };
-                unwind::unwind_one(&mut [&mut self.selection, &mut close_pane]);
+                let mut clear_filter = ClearFilterOnUnwind {
+                    filter: &mut self.filter,
+                };
+                unwind::unwind_one(&mut [&mut self.selection, &mut close_pane, &mut clear_filter]);
                 None
             }
             Some(Action::OpenHelp) => {
@@ -733,17 +796,20 @@ impl App {
                 }
                 None
             }
-            // `EnterFilter`, `RederiveDefaultBranches`, `NextFailed`, `PreviousFailed`,
-            // `DismissVanished` and the List-only half of `HalfPageDown`/`HalfPageUp` are all
-            // unbuilt (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch`
-            // never returns an unbuilt action ([`keys::lookup`]'s own doc comment), so
+            Some(Action::EnterFilter) => {
+                self.filter_line = Some(FilterLine::new(&self.filter));
+                None
+            }
+            // `RederiveDefaultBranches`, `NextFailed`, `PreviousFailed`, `DismissVanished` and
+            // the List-only half of `HalfPageDown`/`HalfPageUp` are all unbuilt
+            // (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch` never returns
+            // an unbuilt action ([`keys::lookup`]'s own doc comment), so
             // `self.bindings.dispatch(self.focus, key)` above can never produce one of these;
             // this arm exists only because the match itself has to name every `Action`
             // variant, the same proof-made-loud shape the `unreachable!` arm just below
             // already uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
             Some(
-                Action::EnterFilter
-                | Action::RederiveDefaultBranches
+                Action::RederiveDefaultBranches
                 | Action::NextFailed
                 | Action::PreviousFailed
                 | Action::DismissVanished
@@ -909,6 +975,52 @@ impl App {
             Some(other) => unreachable!(
                 "dispatch(Context::Overlay, _) only ever returns Choose, Close, a scroll \
                  action or None while the Set picker is open, got {other:?}"
+            ),
+        }
+    }
+
+    /// Every key event while `self.filter_line` is `Some`, dispatched through
+    /// `Context::Input` like both palettes. `Apply` (Enter) commits the live buffer into
+    /// `self.filter` and closes the line, which is what returns focus to the list
+    /// ([filter.md](../../../docs/spec/filter.md): "Enter commits it and returns focus to the
+    /// list"). `Cancel` (Esc) abandons the edit, closing the line with `self.filter`
+    /// untouched, so it still reads whatever was last committed. `AcceptCompletion`,
+    /// `OpenInEditor`, `PreviousEntry` and `NextEntry` are inert: [`crate::filter_line`]'s own
+    /// doc comment records why. The trailing `unreachable!` arm is the same proof-made-loud
+    /// shape [`Self::handle_action_palette_key`] already uses for `Context::Input`.
+    fn handle_filter_line_key(&mut self, key: KeyEvent) {
+        match self.bindings.dispatch(Context::Input, key) {
+            Some(Action::Cancel) => self.filter_line = None,
+            Some(Action::Apply) => {
+                if let Some(line) = self.filter_line.take() {
+                    self.filter = line.live_filter();
+                }
+            }
+            Some(Action::Text(c)) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.type_char(c);
+                }
+            }
+            Some(Action::DeletePreviousWord) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.delete_previous_word();
+                }
+            }
+            Some(Action::ClearLine) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.clear_line();
+                }
+            }
+            Some(
+                Action::AcceptCompletion
+                | Action::OpenInEditor
+                | Action::PreviousEntry
+                | Action::NextEntry,
+            ) => {}
+            None => {}
+            Some(other) => unreachable!(
+                "dispatch(Context::Input, _) only ever returns the input vocabulary or Text, \
+                 got {other:?}"
             ),
         }
     }
@@ -1082,24 +1194,34 @@ impl App {
         let _ = self.core.run_action(spec, &targets);
     }
 
-    /// Every currently shown Entity's key, in the same grouped, Repo-then-its-own-children
-    /// order [`crate::components::list::List`] draws
-    /// ([`crate::components::list::grouped_row_order`]): this crate's whole "visible list"
-    /// until a Filter narrows it further, and what `select_all_visible`, `extend_range` and
-    /// the cursor bounds all read. A hidden Submodule
-    /// ([`crate::components::list::kind_is_visible`]) never appears here, which is what
-    /// bounds `select_all_visible` by visibility rather than by every Entity discovery
-    /// knows about ([discovery.md](../../../docs/spec/discovery.md)'s "Showing Submodules").
+    /// The Filter currently narrowing the list: the edit buffer's own live parse while
+    /// `self.filter_line` is open, since a Filter applies live on every keystroke
+    /// ([filter.md](../../../docs/spec/filter.md)), or the committed one otherwise.
+    fn active_filter(&self) -> Filter {
+        match &self.filter_line {
+            Some(line) => line.live_filter(),
+            None => self.filter.clone(),
+        }
+    }
+
+    /// Every currently shown Entity's key, in the same order
+    /// [`crate::components::list::List`] draws
+    /// ([`crate::components::list::visible_row_order`]): this crate's whole "visible list",
+    /// narrowed by the show-worktrees and show-submodules preferences and by
+    /// [`Self::active_filter`], and what `select_all_visible`, `extend_range` and the cursor
+    /// bounds all read.
     fn visible_keys(&self) -> Vec<EntityKey> {
         let snapshot = self.core.snapshot();
-        crate::components::list::grouped_row_order(&snapshot.entities)
-            .into_iter()
-            .map(|index| &snapshot.entities[index])
-            .filter(|entity| {
-                crate::components::list::kind_is_visible(entity.kind, self.document.show_submodules)
-            })
-            .map(|entity| entity.key.clone())
-            .collect()
+        let filter = self.active_filter();
+        crate::components::list::visible_row_order(
+            &snapshot.entities,
+            self.document.show_worktrees,
+            self.document.show_submodules,
+            &filter,
+        )
+        .into_iter()
+        .map(|index| snapshot.entities[index].key.clone())
+        .collect()
     }
 
     /// The row the cursor sits on, if the table is non-empty.
@@ -1107,11 +1229,18 @@ impl App {
         self.visible_keys().get(self.cursor).cloned()
     }
 
-    /// The context [`Self::render`]'s footer draws for: `self.focus`, named as its own method
-    /// so a mutation that hardcoded `Context::List` there instead is something a test can
-    /// call directly rather than needing a full terminal render to observe.
+    /// The context [`Self::render`]'s footer draws for: `Context::Input` while the Filter
+    /// line is open, naming its own `enter apply  esc cancel` hint
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-footer)), or `self.focus`
+    /// otherwise, named as its own method so a mutation that hardcoded `Context::List` there
+    /// instead is something a test can call directly rather than needing a full terminal
+    /// render to observe.
     fn footer_context(&self) -> Context {
-        self.focus
+        if self.filter_line.is_some() {
+            Context::Input
+        } else {
+            self.focus
+        }
     }
 
     /// The Entity the open pane shows, read fresh off the current Snapshot rather than cached,
@@ -1350,14 +1479,26 @@ impl App {
                 picker.draw(frame, area, &self.document.sets, &self.active_set.name);
                 return;
             }
+            // The Filter narrowing this frame's list, live while `self.filter_line` is open
+            // ([`Self::active_filter`]), read once and handed to `self.list` before either of
+            // its own draw methods runs below.
+            let filter = self.active_filter();
+            self.list.set_filter(filter);
+            // A row for the Filter line takes real height only while it is open, shifting
+            // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
+            // screen: a change on a mode switch takes a real row").
+            let filter_row_height = if self.filter_line.is_some() { 1 } else { 0 };
             let areas = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Min(0),
+                Constraint::Length(filter_row_height),
                 Constraint::Length(1),
             ])
             .split(area);
             let status_area = areas[0];
             let content_area = areas[1];
+            let filter_area = areas[2];
+            let footer_area = areas[3];
             let status_row_content = self.status_row_content(&snapshot, &warnings);
             draw_status_row(
                 frame,
@@ -1404,9 +1545,12 @@ impl App {
                     }
                 }
             }
+            if let Some(line) = &self.filter_line {
+                line.draw(frame, filter_area, &self.theme);
+            }
             footer::draw(
                 frame,
-                areas[2],
+                footer_area,
                 self.footer_context(),
                 &self.bindings,
                 &self.theme,
@@ -1526,6 +1670,23 @@ mod tests {
         assert!(status.success());
     }
 
+    /// Adds a real linked Worktree at `worktree`, on a new branch, off `parent`'s own repo.
+    fn worktree_add(parent: &std::path::Path, worktree: &std::path::Path, branch: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(parent)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                worktree.to_str().expect("utf8 path"),
+            ])
+            .status()
+            .expect("run git worktree add");
+        assert!(status.success());
+    }
+
     /// An `App` wired to a real `Core` over `root`, bypassing `App::new`'s config and
     /// discovery-dispatch side effects, which a cursor and Selection test has no need of.
     pub(crate) fn test_app(root: &std::path::Path) -> App {
@@ -1605,6 +1766,8 @@ mod tests {
                 });
                 document
             },
+            filter: Filter::default(),
+            filter_line: None,
         }
     }
 
@@ -3252,7 +3415,7 @@ mod tests {
         );
     }
 
-    // --- issue #119: an unbuilt action dispatches nothing and answers with silence, not the
+    // --- an unbuilt action dispatches nothing and answers with silence, not the
     // shared warning slot `Warning::NotImplemented` used to. See
     // `every_unbuilt_binding_produces_nothing_on_press` below for the replacement anchor.
 
@@ -4372,6 +4535,240 @@ mod tests {
         assert_eq!(
             app.active_set.name, active_before,
             "choosing with no declared Sets must not change the active Set"
+        );
+    }
+
+    // =====================================================================================
+    // The Filter narrows the view without changing the work.
+    // =====================================================================================
+
+    /// Criterion 1's discriminating claim, and the whole distinction between a Filter and a
+    /// Set: a row a Filter hides must still be discovered and still be probed to settlement.
+    /// The mutation this catches is a Filter wired into `Core::refresh`'s own dispatch order
+    /// (the way a Set's roots are): that would make `hidden` never settle at all, rather
+    /// than settle and merely stay off the visible list.
+    #[test]
+    fn a_filter_never_changes_what_is_discovered_or_probed_only_what_is_visible() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("shown"));
+        init_repo(&root.join("hidden"));
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core
+            .refresh(&dispatch_order(keys.first(), &keys, &keys));
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                app.core
+                    .snapshot()
+                    .entities
+                    .iter()
+                    .all(|entity| entity.branch.settled().is_some())
+            }),
+            "expected every entity to settle before this test's own claim can be checked"
+        );
+
+        app.filter = Filter::parse("shown");
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "discovery must still find every entity regardless of the active Filter"
+        );
+        let hidden = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "hidden")
+            .expect("the filtered-out entity must still be in the Snapshot");
+        assert!(
+            hidden.branch.settled().is_some(),
+            "a row the Filter hides must still be probed and settled, which is what \
+             distinguishes a Filter from a Set"
+        );
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&hidden.key),
+            "sanity: the Filter really does hide the row from the visible list, or the claim \
+             above would be checking nothing"
+        );
+    }
+
+    fn status_row_text_with_active_filter(app: &mut App, filter: &str, width: u16) -> String {
+        app.filter = Filter::parse(filter);
+        status_row_text(app, width)
+    }
+
+    // --- criteria 3 and 4: an explicit Filter gesture beats the stored show-worktrees
+    // preference, and the header names the override when it happens ---
+
+    #[test]
+    fn filtering_to_worktrees_shows_them_even_with_the_preference_off_and_the_header_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+
+        let worktree_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-a-wt")
+            .expect("the Worktree row exists regardless of the preference")
+            .key
+            .clone();
+
+        // Baseline: preference off, no Filter. The Worktree is hidden, and since nothing
+        // overrode the preference the header carries no note about it.
+        assert!(
+            !app.visible_keys().contains(&worktree_key),
+            "with the preference off and no Filter, the Worktree row must stay hidden"
+        );
+        let baseline = status_row_text(&mut app, 200);
+        assert!(
+            !baseline.contains("preference off"),
+            "no override is in play, so the header must carry no note about it: {baseline:?}"
+        );
+
+        // An explicit kind:worktree Filter beats the stored preference.
+        let overridden = status_row_text_with_active_filter(&mut app, "kind:worktree", 200);
+        assert!(
+            app.visible_keys().contains(&worktree_key),
+            "an explicit Filter gesture must beat the stored show-worktrees preference"
+        );
+        assert!(
+            overridden.contains("worktrees: 1 (preference off)"),
+            "the header must show the count beside a note that the preference is off: \
+             {overridden:?}"
+        );
+    }
+
+    #[test]
+    fn the_worktrees_note_is_absent_once_the_preference_is_on_or_no_filter_requests_worktrees() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        // The preference is on (`Document::default`'s own value): a kind:worktree Filter
+        // still matches, but there is no preference for it to override, so no note is due.
+        let mut app_preference_on = test_app(&root);
+        let text = status_row_text_with_active_filter(&mut app_preference_on, "kind:worktree", 200);
+        assert!(
+            !text.contains("preference off"),
+            "the preference is already on, so nothing was overridden: {text:?}"
+        );
+
+        // The preference is off, but the Filter never asks for Worktrees at all: still no
+        // override, and still no note.
+        let mut app_no_override = test_app(&root);
+        app_no_override.document.show_worktrees = false;
+        let text = status_row_text_with_active_filter(&mut app_no_override, "is:dirty", 200);
+        assert!(
+            !text.contains("preference off"),
+            "a Filter that never names kind:worktree overrides nothing: {text:?}"
+        );
+    }
+
+    // --- criterion 5: the header shows the match count whenever a Filter is active,
+    // including the zero-match case, and never when no Filter is active ---
+
+    #[test]
+    fn the_header_shows_the_match_count_whenever_a_filter_is_active_including_zero_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let no_filter = status_row_text(&mut app, 200);
+        assert!(
+            !no_filter.contains("matches"),
+            "no Filter is active, so the header must carry no match count: {no_filter:?}"
+        );
+
+        let zero_matches = status_row_text_with_active_filter(&mut app, "name:nonexistent", 200);
+        assert!(
+            zero_matches.contains("filter: 0 matches"),
+            "a zero-match Filter is exactly when the count matters most: {zero_matches:?}"
+        );
+
+        let one_match = status_row_text_with_active_filter(&mut app, "repo-a", 200);
+        assert!(one_match.contains("filter: 1 matches"), "{one_match:?}");
+    }
+
+    // --- the input line: `/` opens it, Enter commits, Esc abandons an edit, and a second
+    // Esc (the unwind stack's last rung) clears a committed Filter ---
+
+    #[test]
+    fn slash_opens_the_filter_line_typing_narrows_live_and_enter_commits() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("shown"));
+        init_repo(&root.join("hidden"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter");
+        assert!(app.filter_line.is_some(), "/ must open the Filter line");
+
+        for c in "shown".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a character into the Filter line");
+        }
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "the live buffer must narrow the list before Enter ever commits it"
+        );
+        assert!(
+            app.filter.as_str().is_empty(),
+            "typing must not touch the committed Filter until Enter"
+        );
+
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the Filter");
+        assert!(
+            app.filter_line.is_none(),
+            "Enter must close the Filter line"
+        );
+        assert_eq!(app.filter.as_str(), "shown");
+        assert_eq!(app.visible_keys().len(), 1);
+    }
+
+    #[test]
+    fn esc_while_editing_abandons_the_edit_and_a_second_esc_clears_the_committed_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.filter = Filter::parse("repo-a");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter");
+        app.handle_key_event(press(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("type over the prefilled text");
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("abandon the edit");
+        assert!(app.filter_line.is_none(), "Esc must close the Filter line");
+        assert_eq!(
+            app.filter.as_str(),
+            "repo-a",
+            "abandoning an edit must restore the previously committed Filter, untouched"
+        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear the committed Filter, the unwind stack's last rung");
+        assert!(
+            !app.filter.is_active(),
+            "a second Esc, with nothing left to unwind first, must clear the committed Filter"
         );
     }
 }

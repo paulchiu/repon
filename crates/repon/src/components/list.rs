@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    Cell, DirtyCounts, EntityState, Head, Kind, RowSummary, Settled, Snapshot, SyncState,
+    Cell, DirtyCounts, EntityState, Filter, Head, Kind, RowSummary, Settled, Snapshot, SyncState,
     WorktreeState, summary,
 };
 
@@ -79,13 +79,23 @@ pub struct List {
     /// the predecessor's recorded defect
     /// (`docs/spec/refresh.md`'s "What the gutter and the cells show").
     started_at: Instant,
+    /// The show-worktrees preference read at the last config handshake: `true`, matching
+    /// `Document::default`, until one arrives. An active Filter's own `kind:worktree` term
+    /// beats this ([`kind_is_visible`]'s own doc comment,
+    /// [config.md](../../../../docs/spec/config.md)'s "the stake on `show_worktrees`").
+    show_worktrees: bool,
     /// The show-submodules preference read at the last config handshake: `false`, matching
     /// `Document::default`, until one arrives. Governs only which rows this draws
     /// ([discovery.md](../../../../docs/spec/discovery.md)'s "Showing Submodules": "the flag
     /// decides... whether they are rows"); `crate::app::App::visible_keys` reads the same
-    /// config field independently, through [`kind_is_visible`], so the two never disagree
+    /// config fields independently, through [`visible_row_order`], so the two never disagree
     /// about which rows exist.
     show_submodules: bool,
+    /// The Filter currently narrowing this draw, handed in every frame by
+    /// [`crate::app::App::render`] ([`Self::set_filter`]) rather than read from config: a
+    /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
+    /// every row) until one arrives, which is every unit test in this module.
+    filter: Filter,
 }
 
 impl Default for List {
@@ -93,7 +103,9 @@ impl Default for List {
         List {
             glyphs: None,
             started_at: Instant::now(),
+            show_worktrees: true,
             show_submodules: false,
+            filter: Filter::default(),
         }
     }
 }
@@ -146,11 +158,15 @@ impl List {
         if !compact {
             draw_header(buf, interior);
         }
-        let row_order = grouped_row_order(&snapshot.entities);
+        let row_order = visible_row_order(
+            &snapshot.entities,
+            self.show_worktrees,
+            self.show_submodules,
+            &self.filter,
+        );
         for (offset, entity) in row_order
             .into_iter()
             .map(|index| &snapshot.entities[index])
-            .filter(|entity| kind_is_visible(entity.kind, self.show_submodules))
             .enumerate()
         {
             let Some(y) = interior.y.checked_add(first_row + offset as u16) else {
@@ -173,6 +189,7 @@ impl List {
 impl Component for List {
     fn register_config_handler(&mut self, config: Config) -> Result<()> {
         self.glyphs = Some(GlyphSet::for_config(config.document.glyphs));
+        self.show_worktrees = config.document.show_worktrees;
         self.show_submodules = config.document.show_submodules;
         Ok(())
     }
@@ -198,6 +215,13 @@ impl List {
     ) -> Result<()> {
         self.render(frame, area, snapshot, true);
         Ok(())
+    }
+
+    /// Hands this draw the Filter currently narrowing the list, read fresh every frame by
+    /// [`crate::app::App::render`]: a Filter is per-frame session state, not something a
+    /// config handshake carries.
+    pub(crate) fn set_filter(&mut self, filter: Filter) {
+        self.filter = filter;
     }
 }
 
@@ -248,16 +272,58 @@ pub(crate) fn write_cell_runs(
     }
 }
 
-/// Whether `kind`'s row is ever drawn: a Repo or a Worktree always, a Submodule only while
-/// `show_submodules` is on
+/// Whether `kind`'s row is ever drawn: a Repo always, a Worktree while `show_worktrees` is
+/// on, a Submodule while `show_submodules` is on
 /// ([discovery.md](../../../../docs/spec/discovery.md)'s "Showing Submodules": "the flag
-/// decides... whether they are rows"). Exhaustive over [`Kind`], and shared with
-/// `crate::app::App::visible_keys`, so the two never disagree about which rows exist.
-pub(crate) fn kind_is_visible(kind: Kind, show_submodules: bool) -> bool {
+/// decides... whether they are rows"). Either preference is beaten by `filter` explicitly
+/// naming that Kind ([`repon_core::Filter::requests_kind`],
+/// [config.md](../../../../docs/spec/config.md)'s "the stake on `show_worktrees`": "A
+/// Worktrees-only Filter ... beats `show_worktrees = false`"). Exhaustive over [`Kind`], and
+/// shared with `crate::app::App::visible_keys` through [`visible_row_order`], so the two
+/// never disagree about which rows exist.
+pub(crate) fn kind_is_visible(
+    kind: Kind,
+    show_worktrees: bool,
+    show_submodules: bool,
+    filter: &Filter,
+) -> bool {
     match kind {
-        Kind::Repo | Kind::Worktree => true,
-        Kind::Submodule => show_submodules,
+        Kind::Repo => true,
+        Kind::Worktree => show_worktrees || filter.requests_kind(Kind::Worktree),
+        Kind::Submodule => show_submodules || filter.requests_kind(Kind::Submodule),
     }
+}
+
+/// The rows a consumer should draw or count as visible: `entities` reordered and narrowed by
+/// the show-worktrees and show-submodules preferences ([`kind_is_visible`]) and by `filter`
+/// ([`repon_core::Filter::matches`]). Shared by [`List::render`] and
+/// `crate::app::App::visible_keys` so the two can never disagree about which rows exist or
+/// what order they come in.
+///
+/// With no Filter active this groups each Repo with its own Worktrees and Submodules
+/// immediately after it ([`grouped_row_order`]). An active Filter flattens instead, keeping
+/// discovery order and dropping the grouping entirely
+/// ([filter.md](../../../../docs/spec/filter.md)'s "What a Filter does to the list": a
+/// non-matching parent is never dragged in as context).
+pub(crate) fn visible_row_order(
+    entities: &[EntityState],
+    show_worktrees: bool,
+    show_submodules: bool,
+    filter: &Filter,
+) -> Vec<usize> {
+    let base_order: Vec<usize> = if filter.is_active() {
+        (0..entities.len()).collect()
+    } else {
+        grouped_row_order(entities)
+    };
+    base_order
+        .into_iter()
+        .filter(|&index| {
+            let entity = &entities[index];
+            kind_is_visible(entity.kind, show_worktrees, show_submodules, filter)
+                && filter.matches(entity)
+        })
+        .collect()
 }
 
 /// A child entity's own group key: the common dir of the Repo (or Worktree) whose
@@ -3402,6 +3468,39 @@ mod tests {
                 row.name
             );
         }
+    }
+
+    /// Filter criterion 2: `head:detached` matches any row at a detached HEAD, across every
+    /// Kind, on the head shape matrix's own real, fully probed rows rather than a manually
+    /// constructed one. The fixture also carries an attached row (`feature-worktree`) and an
+    /// unborn one (`brand-new`); the discriminating claim is that neither of those two
+    /// appears, which is what a term that matched every row (rather than only detached ones)
+    /// would get wrong.
+    #[test]
+    fn head_detached_reaches_every_kind_of_detached_row_without_opening_the_detail_pane() {
+        let (snapshot, _ids) = settled_snapshot_for_the_head_shape_matrix();
+        let filter = Filter::parse("head:detached");
+
+        let visible = visible_row_order(&snapshot.entities, true, true, &filter);
+        let names: std::collections::BTreeSet<&str> = visible
+            .iter()
+            .map(|&index| snapshot.entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            ["manage", "pr-920", "vendor/lib"].into_iter().collect(),
+            "head:detached must reach a detached Repo, Worktree and Submodule alike, and \
+             nothing else in the matrix"
+        );
+        assert!(
+            !names.contains("feature-worktree"),
+            "an attached row must never match head:detached, or this term matches every row"
+        );
+        assert!(
+            !names.contains("brand-new"),
+            "an unborn row must never match head:detached either"
+        );
     }
 
     /// Criterion 1's structural half: `format_head` is called from exactly one production

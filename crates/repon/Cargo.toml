@@ -36,9 +36,15 @@ etcetera = "0.11.0"
 globset = "0.4.20"
 humantime-serde = "1.1.1"
 ratatui = "0.30"
-repon-core.workspace = true
+# `serde` turns on the settled document's wire format (ADR 0015), off by default in
+# repon-core itself: `repon status` is the one caller that needs it.
+repon-core = { workspace = true, features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1.14"
+# Encodes the settled document `repon status` prints: repon-core only derives `Serialize` on
+# its own types (per ADR 0015's "no separate consumer-side wire structs"), so this crate picks
+# the actual wire encoding.
+serde_json = "1.0.145"
 # Splits a Launcher's `from_env` value, and the editor chain's, into argv with no shell
 # involved; already in the dependency tree transitively via gix-command, per ADR 0018.
 shell-words = "1.1.1"

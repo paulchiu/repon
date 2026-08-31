@@ -12,6 +12,7 @@ use crate::entity::{AheadBehind, DirtyCounts, Head, Kind, SyncState};
 /// every frame. A shared trait object was rejected: it gives no discriminant to
 /// branch on and nothing to serialise, and nothing in this crate reads a source chain.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ProbeError {
     /// The path could not be opened as a git repository.
     Open(Arc<str>),
@@ -214,6 +215,7 @@ pub(crate) fn resolve_sync(
 /// provenance of its own: it is a fact of the moment it was read, not a value
 /// that can go stale or fail to resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum InProgressOperation {
     ApplyMailbox,
     ApplyMailboxRebase,
@@ -251,6 +253,7 @@ pub(crate) fn in_progress_operation(repo: &gix::Repository) -> Option<InProgress
 /// reasoning as [`InProgressOperation`]: it is read fresh alongside `branch`
 /// rather than tracked as a Cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RecentCommit {
     pub short_id: Arc<str>,
     pub summary: Arc<str>,

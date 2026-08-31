@@ -61,6 +61,7 @@ mod entity;
 mod environment;
 mod executor;
 mod fanout;
+mod filter;
 mod git;
 mod landing;
 mod patch_equivalence;
@@ -68,6 +69,8 @@ mod poll;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
+#[cfg(feature = "serde")]
+mod wire;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
 pub use core::{ActionSpec, Core, CoreSpec, RepoOverride, Step};
@@ -89,8 +92,11 @@ pub use entity::StepResult;
 pub use entity::SyncState;
 pub use entity::WorktreeState;
 pub use environment::environment;
+pub use filter::Filter;
 pub use git::{InProgressOperation, ProbeError, RecentCommit};
 pub use snapshot::{RowSummary, Snapshot, summary};
+#[cfg(feature = "serde")]
+pub use wire::SettledDocument;
 
 #[cfg(test)]
 mod tests {

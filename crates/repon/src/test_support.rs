@@ -812,8 +812,9 @@ mod tests {
         );
     }
 
-    // --- Issue #65: "exactly eight" triggers start or cancel a Generation, and nothing
-    // else does. Every one of the eight goes through one of three primitives: `Core::refresh`
+    // --- Issue #65: "exactly nine" triggers start or cancel a Generation, and nothing
+    // else does (nine now that `repon status` added a one-shot dispatch of its own to the
+    // eight this originally counted). Every one of the nine goes through one of three primitives: `Core::refresh`
     // (called from the `repon` crate, wherever a trigger has a cursor and a viewport to order
     // by), `RefreshHandles::dispatch` (the one function that actually mints a new Generation,
     // private to `repon-core` and unreachable from `repon`), and `cancel_in_flight` (the one
@@ -827,19 +828,21 @@ mod tests {
     // empty scan already fails the exact-count assertion, and the extra guards are kept for the
     // same reason that test's are, to name the right cause when one does.
 
-    /// The `repon` crate's own production call sites into the public `Core::refresh`: the six
-    /// triggers that have a cursor and a viewport to order by, which `repon-core` has neither
-    /// (`dispatch_order`'s own doc comment in `app.rs`), so the other two triggers
+    /// The `repon` crate's own production call sites into the public `Core::refresh`: the
+    /// seven triggers that have a cursor and a viewport to order by, which `repon-core` has
+    /// neither (`dispatch_order`'s own doc comment in `app.rs`), so the other two triggers
     /// (an Action starting and finishing) never call this method at all. Startup (`App::new`),
     /// returning from suspension (`App::on_resume`, shared by a bare `SIGTSTP` and a
     /// Launcher's own handoff), `Action::RefreshAll`, terminal focus gained
-    /// (`App::on_focus_gained`), `Action::RefreshSelection` and a Set switch
-    /// (`reload::apply_active_set`): six call sites for six triggers, one each. Scanned across
+    /// (`App::on_focus_gained`), `Action::RefreshSelection`, a Set switch
+    /// (`reload::apply_active_set`) and `repon status`'s own one-shot dispatch
+    /// (`app::status::settle_document`, a separate, short-lived `Core` this process starts,
+    /// refreshes once and drops): seven call sites for seven triggers, one each. Scanned across
     /// both crates' `src` (via `production_lines_containing`) rather than `repon`'s alone, so
     /// a stray production call newly appearing in `repon-core` would still be caught instead
     /// of silently falling outside the scan's own boundary.
     #[test]
-    fn exactly_six_production_call_sites_call_core_refresh_from_the_repon_crate() {
+    fn exactly_seven_production_call_sites_call_core_refresh_from_the_repon_crate() {
         let files: usize = workspace_crate_src_dirs()
             .iter()
             .map(|dir| rust_source_files(dir).len())
@@ -859,11 +862,11 @@ mod tests {
         );
         assert_eq!(
             offending.len(),
-            6,
-            "expected exactly six production call sites into `Core::refresh` (Startup, \
-             returning from suspension, RefreshAll, terminal focus gained, RefreshSelection \
-             and a Set switch); a count that moved means a trigger was added, removed, or a \
-             call site duplicated, at: {offending:?}"
+            7,
+            "expected exactly seven production call sites into `Core::refresh` (Startup, \
+             returning from suspension, RefreshAll, terminal focus gained, RefreshSelection, \
+             a Set switch and `repon status`'s own one-shot dispatch); a count that moved \
+             means a trigger was added, removed, or a call site duplicated, at: {offending:?}"
         );
     }
 
@@ -872,7 +875,7 @@ mod tests {
     /// call to it can only ever live there, and confining the scan to that crate is the
     /// claim's own shape rather than a scan quietly narrowing what it inspects: the thing
     /// scanned for cannot live anywhere else. Its two production callers are `Core::refresh`
-    /// itself (the funnel every one of the six `repon`-side triggers above shares) and
+    /// itself (the funnel every one of the seven `repon`-side triggers above shares) and
     /// `Core::run_action`'s own completion (an Action finishing, which bypasses
     /// `Core::refresh` because it has no cursor to order by either, the same reason named on
     /// the scan above). Confining the scan is also what lets the needle be the bare
@@ -908,12 +911,12 @@ mod tests {
     /// `cancel_in_flight` is the one function that cancels a Generation, equally private to
     /// `repon-core` for the same reason `RefreshHandles::dispatch` above is, and scanned the
     /// same confined way. Its two production callers are `Core::run_action`'s own first move
-    /// (an Action starting, one of the eight triggers) and `spawn_clock_thread`'s handling of
+    /// (an Action starting, one of the nine triggers) and `spawn_clock_thread`'s handling of
     /// `ClockControl::Pause` (the Suspension mechanism `App::run`'s `SIGTSTP` branch and
     /// `App::around_entity_handoff` both drive through `Core::pause`), which refresh.md's own
     /// "Suspension" section describes as part of what a return from suspension depends on
     /// rather than a trigger of its own: pausing only ever cancels, it starts nothing, so it
-    /// mints no Generation for this ticket's own "exactly eight" to count. The third match is
+    /// mints no Generation for this ticket's own "exactly nine" to count. The third match is
     /// the function's own `fn cancel_in_flight(...)` declaration, counted rather than filtered
     /// out: the needle stops at the opening paren, which rustfmt never separates from the name
     /// it follows, so a call whose arguments it wrapped onto the next line is still counted

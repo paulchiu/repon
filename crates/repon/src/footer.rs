@@ -210,6 +210,28 @@ fn confirm_items(table: &BindingTable) -> Vec<Item> {
     ]
 }
 
+/// The Filter line's own footer
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): both hints pinned,
+/// since the whole line is documented at 23 columns, `enter apply  esc cancel`, short enough
+/// to survive almost any frame.
+fn filter_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
+    vec![
+        item(
+            hint_item(table, Context::Input, Action::Apply, "apply"),
+            Priority::Pinned,
+        ),
+        item(
+            hint_item(table, Context::Input, Action::Cancel, "cancel"),
+            Priority::Pinned,
+        ),
+    ]
+}
+
 /// The ASCII ellipsis [keybindings.md](../../../../docs/spec/keybindings.md#the-footer) rule
 /// 1 fixes: a space then three dots, never unicode's `…`, because `unicode-width` scores
 /// that as 2 under `width_cjk` while every other footer glyph scores 1.
@@ -271,22 +293,32 @@ fn budget(items: &[Item], width: usize) -> FooterLine {
     }
 }
 
-/// [`budget`]'s selection for `context` at `width` columns, read off `table`. `Input` has no
-/// content yet: `Context::Input` covers the Filter line and both palettes alike, and each is
-/// documented with a different footer, so the context alone cannot choose which to show.
-/// `Confirm` names one surface unambiguously and is implemented above.
+/// [`budget`]'s selection for `context` at `width` columns, read off `table`. `Input`'s
+/// content is the Filter line's own footer: the Action and Launcher palettes never reach
+/// this function, since each draws its own self-contained overlay rather than sharing the
+/// list's status row, list and footer layout. `Global` and `Overlay` never reach it either,
+/// since neither owns a footer of its own.
 fn footer_line(table: &BindingTable, context: Context, width: u16) -> FooterLine {
     let items = match context {
         Context::List => list_items(table),
         Context::Detail => detail_items(table),
         Context::Confirm => confirm_items(table),
-        other => panic!("no footer content is defined yet for {other:?}"),
+        Context::Input => filter_items(table),
+        Context::Global | Context::Overlay => {
+            panic!("no footer content is defined yet for {context:?}")
+        }
     };
-    // Carries only Built bindings ([ADR
-    // 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
-    // an unbuilt item never enters the width budget at all, dropped unconditionally rather
-    // than at some particular width, since it was never offered regardless of how much room
-    // there is.
+    drop_unbuilt_then_budget(items, width)
+}
+
+/// Carries only Built bindings ([ADR
+/// 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
+/// an unbuilt item never enters the width budget at all, dropped unconditionally rather than
+/// at some particular width, since it was never offered regardless of how much room there is.
+/// A named function rather than inlined in [`footer_line`] so a test can drive this exact
+/// filtering step directly, since every context [`footer_line`] dispatches to happens to
+/// carry no unbuilt item today.
+fn drop_unbuilt_then_budget(items: Vec<Item>, width: u16) -> FooterLine {
     let items: Vec<Item> = items.into_iter().filter(|item| item.built).collect();
     budget(&items, width as usize)
 }
@@ -634,51 +666,53 @@ mod tests {
         }
     }
 
-    // --- issue #119: the real footer, unlike the ladder above, carries only Built bindings ---
+    // --- the real footer, unlike the ladder above, carries only Built bindings ---
 
-    /// The mutation this catches: deleting `footer_line`'s `.filter(|item| item.built)` line.
-    /// Scans every width from 0 up to the full unfiltered ladder's own length, in both
-    /// contexts, for the literal hint text of every currently-unbuilt item `list_items` and
-    /// `detail_items` would otherwise have offered; none of it may ever appear in the real,
-    /// filtered `render` output.
+    /// The mutation this catches: deleting `drop_unbuilt_then_budget`'s
+    /// `.filter(|item| item.built)` line. `footer_line` dispatches every real context to
+    /// this same function, so this exercises the production code path rather than a copy of
+    /// it; no real footer content today references an unbuilt action (keybindings.md's "Not
+    /// built yet" list no longer touches any footer at all now that `/` is built), which is
+    /// why this drives the shared function directly with a manufactured unbuilt item rather
+    /// than reading one off `list_items` or `detail_items`.
     #[test]
-    fn list_and_detail_footers_never_advertise_an_unbuilt_binding_at_any_width() {
-        let table = default_table();
-        for (context, items) in [
-            (Context::List, list_items(&table)),
-            (Context::Detail, detail_items(&table)),
-        ] {
-            let unbuilt_hints: Vec<String> = items
-                .iter()
-                .filter(|item| !item.built)
-                .map(|item| item.hint.to_string())
-                .collect();
+    fn drop_unbuilt_then_budget_never_advertises_an_unbuilt_binding_at_any_width() {
+        fn items() -> Vec<Item> {
+            vec![
+                Item {
+                    hint: Hint {
+                        key: "x".to_string(),
+                        label: "built".to_string(),
+                    },
+                    priority: Priority::Pinned,
+                    built: true,
+                },
+                Item {
+                    hint: Hint {
+                        key: "y".to_string(),
+                        label: "unbuilt".to_string(),
+                    },
+                    priority: Priority::Pinned,
+                    built: false,
+                },
+            ]
+        }
+        let full_width: usize = items()
+            .iter()
+            .map(|item| item.hint.to_string())
+            .collect::<Vec<_>>()
+            .join(SEPARATOR)
+            .len();
+        for width in 0..=full_width {
+            let rendered = drop_unbuilt_then_budget(items(), width as u16).to_string();
             assert!(
-                !unbuilt_hints.is_empty(),
-                "no unbuilt hint left in {context:?}'s own item list to prove render() filters \
-                 one out; revisit this test once keybindings.md's \"Not built yet\" list no \
-                 longer touches this footer"
+                !rendered.contains("unbuilt"),
+                "width {width} advertises the unbuilt hint: {rendered:?}"
             );
-            let full_width: usize = items
-                .iter()
-                .map(|item| item.hint.to_string())
-                .collect::<Vec<_>>()
-                .join(SEPARATOR)
-                .len();
-            for width in 0..=full_width {
-                let rendered = render(&table, context, width as u16);
-                for hint_text in &unbuilt_hints {
-                    assert!(
-                        !rendered.contains(hint_text.as_str()),
-                        "{context:?} footer at width {width} advertises the unbuilt hint \
-                         {hint_text:?}: {rendered:?}"
-                    );
-                }
-            }
         }
     }
 
-    // --- confirm: implemented, unlike input which stays deferred ---
+    // --- confirm ---
 
     #[test]
     fn confirm_footer_matches_the_documented_text_at_its_full_width() {
@@ -693,10 +727,25 @@ mod tests {
         assert_eq!(render(&default_table(), Context::Confirm, 14), "");
     }
 
+    // --- input: the Filter line's own footer ---
+
     #[test]
-    #[should_panic(expected = "no footer content is defined yet for Input")]
-    fn footer_still_panics_for_input_which_stays_deferred() {
-        render(&default_table(), Context::Input, 80);
+    fn filter_line_footer_matches_the_documented_text_at_its_full_width() {
+        assert_eq!(
+            render(&default_table(), Context::Input, 23),
+            "enter apply  esc cancel"
+        );
+    }
+
+    #[test]
+    fn filter_line_footer_renders_nothing_once_even_the_pinned_pair_cannot_fit() {
+        assert_eq!(render(&default_table(), Context::Input, 22), "");
+    }
+
+    #[test]
+    #[should_panic(expected = "no footer content is defined yet for Global")]
+    fn footer_still_panics_for_global_and_overlay_which_own_no_footer_of_their_own() {
+        render(&default_table(), Context::Global, 80);
     }
 
     // --- absences the ADR names by name ---

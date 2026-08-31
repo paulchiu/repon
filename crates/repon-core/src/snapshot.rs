@@ -108,7 +108,10 @@ impl<T> FoldableCell for Cell<T> {
 pub fn summary(entity: &EntityState) -> RowSummary {
     // Exhaustive: a Cell or derivation source added to EntityState or Diagnostics
     // later must be named here or the pattern fails to compile, so it cannot be
-    // silently left out of the fold below.
+    // silently left out of the fold below. This is also the only compile-time stop
+    // for the exit-code predicate behind `repon status`, which folds the same Cells
+    // by hand because the terminal crate forbids naming the in-progress-operation
+    // field outside its detail pane; a Cell added here belongs in that fold too.
     let EntityState {
         key: _,
         name: _,
@@ -175,6 +178,7 @@ pub fn summary(entity: &EntityState) -> RowSummary {
 /// crate's public surface: a consumer reads a `Snapshot` when it decides to, it
 /// never gets pushed one.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Snapshot {
     pub generation: Generation,
     pub discovered_at: Timestamp,

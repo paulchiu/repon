@@ -211,6 +211,14 @@ The one state a row's Cells fold into for the gutter: in flight outranks everyth
 **Snapshot**:
 The whole table, cloned, as a consumer reads it: a Generation, when it was discovered, and every Entity's state.
 
+### The wire format
+
+**Schema**:
+The integer at a Settled document's root, bumped whenever the Settled state set or the Unknown reason set gains or loses a variant. A shell script has no Cargo resolver, so this is the one thing it can check itself before an enum variant it has never seen silently misreads as something else.
+
+**Settled document**:
+The one document `repon status` prints: a Schema plus a Snapshot, serialised once after settling rather than streamed.
+
 ### Worktree state
 
 Four mutually exclusive states describing a Worktree's branch, plus one orthogonal flag. A Worktree at a detached HEAD has no branch, so only Merged stays provable and the other three do not apply.
