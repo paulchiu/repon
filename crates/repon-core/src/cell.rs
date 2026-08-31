@@ -208,13 +208,32 @@ impl<T> Cell<T> {
     /// no-op on every other shape: `Unknown`, `Failed` and `NotApplicable` carry
     /// no staleness of their own, and a cell nothing has looked at yet has no
     /// value to mark old. This is what a Vanished Entity forces on every cell it
-    /// holds, never blanking the last known values.
+    /// holds, never blanking the last known values, and what the metadata poll
+    /// forces on a row's status cells the moment it sees movement it cannot
+    /// cheaply attribute to a fresh probe.
     pub(crate) fn force_stale(&mut self) {
         if let Some(Settled::Known {
             stale,
             value: _,
             at: _,
         }) = &mut self.settled
+        {
+            *stale = true;
+        }
+    }
+
+    /// Marks a `Known` value stale in place once it is at least `threshold` old.
+    /// The elapsed-age writer of the same `stale` field [`Self::force_stale`]
+    /// writes on evidence, for a cell with no cheap detector of its own
+    /// (`docs/spec/core-api.md`'s "Staleness"). A no-op on every other shape, for
+    /// the same reasons as `force_stale`.
+    pub(crate) fn age_into_stale(&mut self, threshold: Duration) {
+        if let Some(Settled::Known {
+            at,
+            stale,
+            value: _,
+        }) = &mut self.settled
+            && at.elapsed() >= threshold
         {
             *stale = true;
         }
@@ -398,6 +417,80 @@ mod tests {
             }
             other => panic!("expected the Known value to survive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn age_into_stale_marks_a_known_value_stale_once_it_is_old_enough() {
+        let mut cell: Cell<u32> = Cell::default();
+        cell.settle(
+            Generation::new(1),
+            Settled::Known {
+                value: 42,
+                at: Timestamp::at(SystemTime::now() - Duration::from_secs(3600)),
+                stale: false,
+            },
+        );
+
+        cell.age_into_stale(Duration::from_secs(300));
+
+        match cell.settled() {
+            Some(Settled::Known {
+                value,
+                stale,
+                at: _,
+            }) => {
+                assert_eq!(*value, 42, "the value must survive ageing into stale");
+                assert!(
+                    *stale,
+                    "an hour-old value past a five-minute threshold must go stale"
+                );
+            }
+            other => panic!("expected the Known value to survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age_into_stale_leaves_a_known_value_fresh_before_the_threshold() {
+        let mut cell: Cell<u32> = Cell::default();
+        cell.settle(
+            Generation::new(1),
+            Settled::Known {
+                value: 7,
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
+
+        cell.age_into_stale(Duration::from_secs(300));
+
+        match cell.settled() {
+            Some(Settled::Known {
+                stale,
+                value: _,
+                at: _,
+            }) => {
+                assert!(
+                    !*stale,
+                    "a value settled moments ago must not age into stale yet"
+                )
+            }
+            other => panic!("expected a fresh Known value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age_into_stale_on_a_cell_with_no_known_value_is_a_no_op() {
+        let mut unknown_cell: Cell<u32> = Cell::default();
+        unknown_cell.settle(Generation::new(1), Settled::Unknown(Unknown::TimedOut));
+        unknown_cell.age_into_stale(Duration::ZERO);
+        assert!(matches!(
+            unknown_cell.settled(),
+            Some(Settled::Unknown(Unknown::TimedOut))
+        ));
+
+        let mut never_probed: Cell<u32> = Cell::default();
+        never_probed.age_into_stale(Duration::ZERO);
+        assert!(never_probed.settled().is_none());
     }
 
     #[test]
