@@ -427,7 +427,19 @@ mod tests {
                 "confirm={confirm} must not change a zero count's refusal"
             );
             assert!(matches!(palette.stage(), Stage::Choosing));
-            assert!(palette.refusal().is_some());
+            // The criterion is that it refuses *and says so*, so the message has to name
+            // the Action and the count. Asserting only that some message exists would pass
+            // with an empty one.
+            let refusal = palette.refusal().expect("a refusal message");
+            assert!(
+                refusal.contains("reinstall"),
+                "the refusal must name the Action the user chose, got {refusal:?}"
+            );
+            assert!(
+                refusal.contains('0'),
+                "the refusal must say how many repos it would have run against, got \
+                 {refusal:?}"
+            );
         }
     }
 

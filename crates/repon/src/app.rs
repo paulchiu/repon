@@ -746,6 +746,18 @@ impl App {
     /// [`Self::start_action`]'s own confirm dialog reads, then hands it to
     /// [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
     /// untouched, the same as choosing with no match at all.
+    /// How many entities a choice made right now would actually run against: the
+    /// Selection narrowed by [`repon_core::Core::operable_count`], which is the same
+    /// partition the fan-out itself uses, so the border title can never show a number a
+    /// real choice would not act on. `None` while no palette is open.
+    fn action_palette_operable_count(&self) -> Option<usize> {
+        self.action_palette.as_ref().map(|_| {
+            self.cursor_key()
+                .map(|key| self.core.operable_count(&self.selection.targets(&key)))
+                .unwrap_or(0)
+        })
+    }
+
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
@@ -946,11 +958,7 @@ impl App {
         // The identical computation `Self::choose_highlighted_action` reads: read once,
         // before the frame-drawing closure below borrows `self` immutably, so the border
         // title can never show a different number than a real choice would act on.
-        let action_palette_operable_count = self.action_palette.as_ref().map(|_| {
-            self.cursor_key()
-                .map(|key| self.core.operable_count(&self.selection.targets(&key)))
-                .unwrap_or(0)
-        });
+        let action_palette_operable_count = self.action_palette_operable_count();
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
@@ -2628,6 +2636,44 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(100));
         assert!(!marker.exists(), "declining must never run the Action");
+    }
+
+    /// The border title must carry the count of rows the run will *actually* touch, so an
+    /// excluded row in a wider Selection has to be subtracted rather than counted. A
+    /// single-row fixture cannot tell a correct count from one reporting the excluded rows
+    /// instead, since both read the same number when there is only one row.
+    #[test]
+    fn the_palettes_count_subtracts_excluded_rows_from_a_wider_selection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let excluded_repo = root.join("excluded");
+        init_repo(&excluded_repo);
+        init_repo(&root.join("kept-a"));
+        init_repo(&root.join("kept-b"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: excluded_repo,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+        app.selection.select_all_visible(&visible);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        assert_eq!(
+            app.action_palette_operable_count(),
+            Some(2),
+            "three selected rows with one excluded must count two, not three and not one"
+        );
     }
 
     /// Criterion 4's sharpest claim: a count of zero refuses even though the excluded row
