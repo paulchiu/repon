@@ -85,7 +85,9 @@ fn any_probe_failed(snapshot: &Snapshot) -> bool {
 /// destructure has no way to ignore one field without naming it. So this reaches for the six
 /// Cells and the one Diagnostics field it needs directly instead; a Cell-typed field added to
 /// `EntityState` later is not caught at compile time here the way it would be by a
-/// destructure, which is the cost of that trade.
+/// destructure, which is the cost of that trade. `repon_core::summary`'s own exhaustive
+/// destructure is the compile-time stop that catches it instead, and carries a note back
+/// to this fold.
 fn entity_probe_failed(entity: &EntityState) -> bool {
     let cells: [&dyn ProbeOutcome; 6] = [
         &entity.branch,
