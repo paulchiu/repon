@@ -23,12 +23,13 @@ const SETTLE_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
 /// Builds a Core over the Set `flag_set` (or `REPON_SET`, or the first declared Set) resolves
 /// to, dispatches one Generation over every discovered Entity, blocks until it settles or the
-/// deadline passes, then serialises the settled document to standard output. The process
-/// exits non-zero only when [`any_probe_failed`] finds one: a dirty tree, an ahead/behind
-/// count, a stale value or a Not-applicable cell never does, whatever it reads
+/// deadline passes, then serialises the settled document to standard output. `flag_no_fetch`
+/// is `--no-fetch`, forcing `fetch.enabled` off the same way it does for [`super::App::new`].
+/// The process exits non-zero only when [`any_probe_failed`] finds one: a dirty tree, an
+/// ahead/behind count, a stale value or a Not-applicable cell never does, whatever it reads
 /// (`docs/spec/core-api.md`'s "Exit codes").
-pub(crate) fn run(config: &Config, flag_set: Option<&str>) -> Result<()> {
-    let (document, any_failed) = settle_document(config, flag_set)?;
+pub(crate) fn run(config: &Config, flag_set: Option<&str>, flag_no_fetch: bool) -> Result<()> {
+    let (document, any_failed) = settle_document(config, flag_set, flag_no_fetch)?;
 
     // One document, printed once: `docs/spec/core-api.md`'s "The machine-readable consumer
     // emits one settled document rather than a stream". A plain `Write`, not `println!`,
@@ -48,13 +49,21 @@ pub(crate) fn run(config: &Config, flag_set: Option<&str>) -> Result<()> {
 
 /// [`run`]'s own work, split out so a test can inspect the settled document and the failure
 /// verdict directly rather than parsing what standard output printed.
-fn settle_document(config: &Config, flag_set: Option<&str>) -> Result<(SettledDocument, bool)> {
+fn settle_document(
+    config: &Config,
+    flag_set: Option<&str>,
+    flag_no_fetch: bool,
+) -> Result<(SettledDocument, bool)> {
     let env_set = std::env::var("REPON_SET").ok();
     let active_set_config =
         reload::resolve_startup_set(&config.document.sets, flag_set, env_set.as_deref())?;
     let active_set = ActiveSet::from_config(active_set_config);
 
-    let core = Core::start(reload::core_spec(&config.document, &active_set));
+    let core = Core::start(reload::core_spec(
+        &config.document,
+        &active_set,
+        flag_no_fetch,
+    ));
     let keys: Vec<_> = core
         .snapshot()
         .entities
@@ -358,7 +367,7 @@ mod tests {
         let config = config_with_document(document_for_root(&root));
 
         let (document, any_failed) =
-            settle_document(&config, None).expect("settle a real, healthy repo");
+            settle_document(&config, None, false).expect("settle a real, healthy repo");
 
         assert!(!any_failed, "a clean repo must never report a failed probe");
         assert_eq!(document.snapshot.entities.len(), 1);
