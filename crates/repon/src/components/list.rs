@@ -19,7 +19,7 @@ use super::Component;
 use crate::{
     config::Config,
     glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
-    theme::{self, Meaning, Role},
+    theme::{self, Meaning, Role, Theme},
 };
 
 const GUTTER_WIDTH: u16 = 1;
@@ -96,6 +96,8 @@ pub struct List {
     /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
     /// every row) until one arrives, which is every unit test in this module.
     filter: Filter,
+    /// The cursor's offset into `row_order`, handed in every frame ([`Self::set_cursor`]).
+    cursor: usize,
     /// How many leading rows of `row_order` this draw skips, handed in every frame by
     /// [`crate::app::App::render`] ([`Self::set_offset`]) the same way `filter` is: `App`
     /// owns the viewport math ([`crate::list_viewport::offset_following_cursor`]); this
@@ -103,6 +105,9 @@ pub struct List {
     /// [`Self::render`], never trusted as-is, so a stale offset (a filter narrowing the table
     /// after the last recompute) can never blank the list.
     offset: usize,
+    /// The theme [`Theme::selection_style`] highlights the cursor row from, handed in every
+    /// frame ([`Self::set_theme`]).
+    theme: Theme,
 }
 
 impl Default for List {
@@ -113,7 +118,9 @@ impl Default for List {
             show_worktrees: true,
             show_submodules: false,
             filter: Filter::default(),
+            cursor: 0,
             offset: 0,
+            theme: Theme::default(),
         }
     }
 }
@@ -177,16 +184,14 @@ impl List {
         // blank the list, so this stops one row short of `row_order.len()` rather than at it,
         // leaving at least the last row drawn whenever there is any row at all.
         let skip = row_order.len().saturating_sub(1).min(self.offset);
-        // Only which rows are drawn changes below; no row's own style does. A cursor
-        // highlight and a selection highlight are separate, not-yet-landed work; leaving
-        // every row's styling untouched here is deliberate, not an oversight.
-        for (position, entity) in row_order
+        let cursor_screen_row = self.cursor_screen_row(skip);
+        for (screen_row, entity) in row_order
             .into_iter()
             .skip(skip)
             .map(|index| &snapshot.entities[index])
             .enumerate()
         {
-            let Some(y) = interior.y.checked_add(first_row + position as u16) else {
+            let Some(y) = interior.y.checked_add(first_row + screen_row as u16) else {
                 break;
             };
             if y >= interior.bottom() {
@@ -199,7 +204,26 @@ impl List {
             } else {
                 draw_row(buf, interior, y, entity, glyphs, loading_frame);
             }
+            // Painted after the row's own cells, over the row's full interior width, so it
+            // reaches every column and every gap between them rather than only the cells a
+            // value happened to write text into. `Buffer::set_style` patches rather than
+            // replaces, so `Theme::selection_style`'s reverse-video default layers onto each
+            // cell's own role colour and its explicit colours override them, matching
+            // theming.md's two directions either way.
+            if Some(screen_row) == cursor_screen_row {
+                buf.set_style(
+                    Rect::new(interior.x, y, interior.width, 1),
+                    self.theme.selection_style(),
+                );
+            }
         }
+    }
+
+    /// `self.cursor` translated into `render`'s own screen-row coordinate space by the window
+    /// starting at `skip`. `None` when the cursor sits above the window, which draws no
+    /// highlight at all rather than marking the first drawn row as one the cursor is not on.
+    fn cursor_screen_row(&self, skip: usize) -> Option<usize> {
+        self.cursor.checked_sub(skip)
     }
 }
 
@@ -241,11 +265,24 @@ impl List {
         self.filter = filter;
     }
 
+    /// Hands this draw the cursor's offset into the rendered row order, read fresh every
+    /// frame the same way [`Self::set_filter`] is.
+    pub(crate) fn set_cursor(&mut self, cursor: usize) {
+        self.cursor = cursor;
+    }
+
     /// Hands this draw the viewport offset [`crate::app::App::render`] computed for this
     /// frame from [`crate::list_viewport::offset_following_cursor`], the same per-frame
     /// handoff `set_filter` already uses.
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
+    }
+
+    /// Hands this draw the theme the cursor row's highlight takes
+    /// [`Theme::selection_style`] from, read fresh every frame the same way
+    /// [`Self::set_filter`] is.
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 }
 
@@ -990,7 +1027,11 @@ pub(crate) fn state_meaning(value: &WorktreeState) -> Meaning {
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::{Color, Modifier},
+    };
     use repon_core::{
         AheadBehind, EntityKey, EntityState, Generation, Kind, ProbeError, RowSummary, Snapshot,
         Timestamp, Unknown,
@@ -3798,10 +3839,11 @@ mod tests {
     // distinct once colour is set aside. `NO_COLOR` strips colour only, never glyphs
     // (theming.md's own "Colour is never the only carrier"), so the honest proof reads each
     // pair's plain text (`cell_text`, which never looks at `.fg`) rather than swapping in a
-    // monochrome `Theme`: `List`'s own render path has no way to accept one yet, since
-    // `Component::draw` and `draw_sidebar` both still paint through `theme::DEFAULT`
-    // unconditionally rather than a theme `App` threads through, a pre-existing gap this
-    // ticket leaves for whichever ticket finishes wiring a live theme into this component.
+    // monochrome `Theme`: every per-`Meaning` role in `draw_row` still paints through
+    // `theme::DEFAULT` unconditionally rather than a live theme `App` threads through
+    // (`List::set_theme` only reaches `Theme::selection_style` for the cursor row), a
+    // pre-existing gap this ticket leaves for whichever ticket finishes wiring a live theme
+    // into the rest of this component.
 
     #[test]
     fn ahead_and_behind_read_as_distinct_counts_once_colour_is_set_aside() {
@@ -3947,4 +3989,360 @@ mod tests {
              baseline Loading's motion is what tells the two apart with no colour"
         );
     }
+
+    // --- The cursor row's highlight: `List::render` paints `Theme::selection_style()`
+    // over the cursor row's own interior width with `Buffer::set_style` after the row's own
+    // cells are drawn, so it reaches every column and every gap between them, not only the
+    // cells a value happened to write text into.
+
+    fn is_reversed(buf: &Buffer, x: u16, y: u16) -> bool {
+        buf[(x, y)].modifier.contains(Modifier::REVERSED)
+    }
+
+    /// The regression the name-cell-only probes below cannot see: `Buffer::set_style` must
+    /// cover the row's *whole* interior width, not just the cells a value wrote text into.
+    /// Counts every cell across the row rather than sampling one column, so a highlight that
+    /// only reached the gutter and the name text (5 of 140 cells, this ticket's actual first
+    /// defect) fails here even though it would have passed a name-cell-only assertion.
+    #[test]
+    fn the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+        let mut list = List::default();
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+        let interior_width = 138; // 140 columns minus the panel's left and right border.
+
+        for x in 1..1 + interior_width {
+            assert!(
+                is_reversed(buf, x, entity_row_y(1)),
+                "cursor row cell at x={x} must be reversed, not just the cells with text in \
+                 them"
+            );
+        }
+        for row in [0, 2] {
+            for x in 1..1 + interior_width {
+                assert!(
+                    !is_reversed(buf, x, entity_row_y(row)),
+                    "row {row} cell at x={x} is not the cursor row and must not be reversed"
+                );
+            }
+        }
+    }
+
+    /// Renders three rows so the assertion cannot pass for the wrong reason: with only one
+    /// row, that row is trivially both "the cursor row" and "every row", so a highlight
+    /// applied unconditionally would still pass. The other two rows must carry no highlight
+    /// at all.
+    #[test]
+    fn the_cursor_row_is_reverse_video_by_default_and_the_other_rows_are_not() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+        let mut list = List::default();
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "the cursor row (offset 1, \"beta\") must render reversed with no theme selection \
+             colours set"
+        );
+        for (row, name) in [(0, "alpha"), (2, "gamma")] {
+            assert!(
+                !is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)),
+                "row {row} (\"{name}\") is not the cursor row and must not be reversed"
+            );
+        }
+    }
+
+    /// Counts across the whole rendered area rather than asserting the cursor row alone
+    /// carries the highlight: a mutation that highlighted every row would still satisfy the
+    /// weaker assertion, but not a count that must equal exactly one.
+    #[test]
+    fn exactly_one_row_carries_the_cursor_highlight_at_a_time() {
+        let snap = snapshot(vec![
+            entity("alpha"),
+            entity("beta"),
+            entity("gamma"),
+            entity("delta"),
+        ]);
+        let mut list = List::default();
+        list.set_cursor(2);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        let highlighted_rows = (0..4)
+            .filter(|&row| is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)))
+            .count();
+
+        assert_eq!(
+            highlighted_rows, 1,
+            "exactly one row must carry the cursor highlight, got {highlighted_rows}"
+        );
+    }
+
+    /// The seam between the cursor row's highlight and the viewport's own offset: with a
+    /// window that has scrolled, the cursor's index into `row_order` and its screen row are
+    /// different numbers, and the highlight must follow the screen row. A highlight still
+    /// keyed to `self.cursor` alone would mark "gamma" here, one row below the cursor's own.
+    #[test]
+    fn the_cursor_highlight_follows_the_screen_row_once_the_viewport_has_scrolled() {
+        let snap = snapshot(vec![
+            entity("alpha"),
+            entity("beta"),
+            entity("gamma"),
+            entity("delta"),
+        ]);
+        let mut list = List::default();
+        list.set_offset(1);
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, absolute_x(NAME_X), entity_row_y(0), 4),
+            "beta",
+            "an offset of 1 must put the cursor's own row, `beta`, on screen row 0"
+        );
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "the cursor row must carry the highlight at its screen row, not at its row_order index"
+        );
+        assert!(
+            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "`gamma` is not the cursor row and must carry no highlight"
+        );
+    }
+
+    /// A cursor above the window draws no highlight at all. `checked_sub` returning `None` is
+    /// what keeps this honest: a `saturating_sub` would collapse to screen row 0 and mark the
+    /// window's first row as one the cursor is not on.
+    #[test]
+    fn a_cursor_above_the_window_highlights_no_row_rather_than_the_windows_first() {
+        let snap = snapshot(vec![
+            entity("alpha"),
+            entity("beta"),
+            entity("gamma"),
+            entity("delta"),
+        ]);
+        let mut list = List::default();
+        list.set_offset(2);
+        list.set_cursor(0);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        let highlighted_rows = (0..2)
+            .filter(|&row| is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)))
+            .count();
+
+        assert_eq!(
+            highlighted_rows, 0,
+            "a cursor above the window must leave every drawn row unhighlighted, got \
+             {highlighted_rows}"
+        );
+    }
+
+    /// Redraws the same `List` and the same `Terminal` twice with a different cursor between
+    /// the two, so a bug that painted the highlight and never cleared it (rather than
+    /// recomputing which row is `self.cursor` fresh on every draw) would leave the old row
+    /// still reversed after the second draw.
+    #[test]
+    fn moving_the_cursor_moves_the_highlight_off_the_old_row_and_onto_the_new_one() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+        let mut list = List::default();
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        list.set_cursor(0);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw(frame, area, &snap).expect("draw the list");
+            })
+            .expect("draw the frame");
+        {
+            let buf = terminal.backend().buffer();
+            assert!(
+                is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+                "row 0 must be reversed while the cursor sits on it"
+            );
+            assert!(
+                !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+                "row 1 must not be reversed before the cursor ever reaches it"
+            );
+        }
+
+        list.set_cursor(1);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw(frame, area, &snap).expect("draw the list");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+        assert!(
+            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "row 0 must lose the highlight once the cursor moves off it"
+        );
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "row 1 must gain the highlight once the cursor moves onto it"
+        );
+    }
+
+    /// theming.md's other documented direction: once a theme sets both selection keys, the
+    /// cursor row takes those two colours instead of the reverse-video fallback. The
+    /// expected colours come from the `Theme` this test builds, not from a second call into
+    /// `Theme::selection_style` (which would only prove the function agrees with itself).
+    #[test]
+    fn a_theme_with_explicit_selection_colours_paints_the_cursor_row_with_them() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta")]);
+        let mut list = List::default();
+        list.set_theme(Theme {
+            selection_fg: Some(Color::Black),
+            selection_bg: Some(Color::LightBlue),
+            ..Theme::default()
+        });
+        list.set_cursor(0);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        let cursor_cell = &buf[(absolute_x(NAME_X), entity_row_y(0))];
+        assert_eq!(cursor_cell.fg, Color::Black);
+        assert_eq!(cursor_cell.bg, Color::LightBlue);
+        assert!(
+            !cursor_cell.modifier.contains(Modifier::REVERSED),
+            "an explicit selection colour must not also be reversed"
+        );
+
+        let other_cell = &buf[(absolute_x(NAME_X), entity_row_y(1))];
+        assert_ne!(
+            other_cell.bg,
+            Color::LightBlue,
+            "a row that is not the cursor must not take the selection background"
+        );
+    }
+
+    /// The sidebar seam: [`List::draw_sidebar`] must apply the same highlight
+    /// [`List::draw`] does, since the ticket names both surfaces.
+    #[test]
+    fn the_sidebar_also_reverses_the_cursor_row_and_no_other() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+        let mut list = List::default();
+        list.set_cursor(1);
+        let terminal = {
+            let backend = TestBackend::new(SIDEBAR_WIDTH, 24);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    list.draw_sidebar(frame, area, &snap)
+                        .expect("draw the sidebar");
+                })
+                .expect("draw the frame");
+            terminal
+        };
+        let buf = terminal.backend().buffer();
+
+        // The sidebar has no header row, so its entity rows start one line below the
+        // border rather than two (see `entity_row_y`'s own doc comment).
+        let sidebar_row_y = |row: u16| 1 + row;
+
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), sidebar_row_y(1)),
+            "the sidebar's cursor row must be reversed"
+        );
+        for row in [0, 2] {
+            assert!(
+                !is_reversed(buf, absolute_x(NAME_X), sidebar_row_y(row)),
+                "sidebar row {row} is not the cursor row and must not be reversed"
+            );
+        }
+    }
+
+    /// The header-row boundary: the full list's row 0 sits at absolute `y` 2 (border plus
+    /// header) while the sidebar's own row 0 sits at `y` 1 (border only, no header), per
+    /// `entity_row_y`'s own doc comment. Picks cursor 0 specifically, the value where a
+    /// highlight computation that had leaked `first_row` (or any other `y`-only geometry)
+    /// into its own row comparison, rather than staying keyed purely by position in
+    /// `row_order`, would show up as the two surfaces disagreeing by exactly the one row
+    /// their header difference accounts for.
+    #[test]
+    fn the_full_list_and_the_sidebar_each_highlight_their_own_row_zero_at_cursor_zero() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+
+        let mut full_list = List::default();
+        full_list.set_cursor(0);
+        let full_terminal = render_with_list(&mut full_list, 140, 24, &snap);
+        assert!(
+            is_reversed(
+                full_terminal.backend().buffer(),
+                absolute_x(NAME_X),
+                entity_row_y(0)
+            ),
+            "the full list must highlight its own row 0 at cursor 0"
+        );
+
+        let mut sidebar_list = List::default();
+        sidebar_list.set_cursor(0);
+        let sidebar_terminal = {
+            let backend = TestBackend::new(SIDEBAR_WIDTH, 24);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    sidebar_list
+                        .draw_sidebar(frame, area, &snap)
+                        .expect("draw the sidebar");
+                })
+                .expect("draw the frame");
+            terminal
+        };
+        assert!(
+            is_reversed(sidebar_terminal.backend().buffer(), absolute_x(NAME_X), 1),
+            "the sidebar must highlight its own row 0 (y=1, one line higher than the full \
+             list's row 0 because it has no header) at cursor 0"
+        );
+    }
+
+    /// theming.md's "survives a filter" seam: filters out "beta" so "gamma" moves from
+    /// offset 2 to offset 1, the same offset the cursor is set to. A mutation that
+    /// highlighted by the entity's raw index into `snapshot.entities` rather than its
+    /// position in the filtered `row_order` would highlight nothing (index 1 is "beta",
+    /// filtered out) instead of "gamma".
+    #[test]
+    fn the_highlight_is_keyed_to_position_in_the_filtered_row_order_not_the_raw_snapshot_index() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]);
+        let mut list = List::default();
+        list.set_filter(Filter::parse("-beta"));
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, absolute_x(NAME_X), entity_row_y(0), 5),
+            "alpha",
+            "sanity: beta filtered out, alpha is still offset 0"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(NAME_X), entity_row_y(1), 5),
+            "gamma",
+            "sanity: with beta filtered out, gamma is now offset 1"
+        );
+
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "gamma, now at the cursor's offset, must carry the highlight"
+        );
+        assert!(
+            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "alpha must not carry the highlight"
+        );
+    }
+
+    // Deferred: a filter narrowing the table while a viewport offset stands (so the offset
+    // itself gets clamped in the same gesture the cursor does). No offset exists in this
+    // crate yet (see `List::cursor_screen_row`'s own doc comment); a test asserting a
+    // clamped-offset interaction against machinery that cannot clamp anything would pass
+    // vacuously. Left for whichever ticket lands `List::set_offset`.
 }

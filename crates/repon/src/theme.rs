@@ -165,9 +165,8 @@ impl Theme {
     }
 
     /// The selected row's style: reversed video while both selection keys are unset, the two
-    /// colours once a theme sets them; not read outside tests until a component renders a
-    /// selected row.
-    #[allow(dead_code)]
+    /// colours once a theme sets them. Read by [`crate::components::list::List`] for the
+    /// cursor row.
     pub fn selection_style(&self) -> Style {
         match (self.selection_fg, self.selection_bg) {
             (None, None) => Style::new().add_modifier(Modifier::REVERSED),

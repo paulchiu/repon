@@ -804,7 +804,9 @@ impl App {
                 Some(Action::Close) => self.help = None,
                 Some(action) => {
                     let content_len = HelpOverlay::content_len(&self.bindings, self.focus);
-                    overlay.apply(action, content_len, self.frame_size.height);
+                    let frame_area = Rect::new(0, 0, self.frame_size.width, self.frame_size.height);
+                    let viewport_height = HelpOverlay::viewport_height(frame_area);
+                    overlay.apply(action, content_len, viewport_height);
                 }
                 None => {}
             }
@@ -1837,8 +1839,18 @@ impl App {
         // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
         tui.draw(|frame| {
             let area = frame.area();
+            // Help is a reading surface, not a chooser, so unlike a palette it always takes
+            // the whole frame rather than leaving anything visible around it
+            // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
             if let Some(overlay) = &self.help {
-                overlay.draw(frame, area, self.focus, &self.bindings, &self.theme);
+                overlay.draw(
+                    frame,
+                    area,
+                    self.focus,
+                    &self.bindings,
+                    &self.theme,
+                    self.glyphs,
+                );
                 return;
             }
             if self.warning_overlay_open {
@@ -1855,13 +1867,6 @@ impl App {
                 );
                 return;
             }
-            if let Some(palette) = &self.launcher_palette {
-                let (launchers, entity_name) = launcher_palette_view
-                    .as_ref()
-                    .expect("computed above whenever launcher_palette is Some");
-                palette.draw(frame, area, &self.theme, launchers, entity_name);
-                return;
-            }
             if let Some(picker) = &self.set_picker {
                 picker.draw(frame, area, &self.document.sets, &self.active_set.name);
                 return;
@@ -1871,7 +1876,14 @@ impl App {
             // its own draw methods runs below.
             let filter = self.active_filter();
             self.list.set_filter(filter);
+            // The cursor, its viewport offset and the loaded theme, handed to `self.list`
+            // the same per-frame way as `filter` above, so the cursor row's highlight
+            // ([`theme::Theme::selection_style`]) and the window it is drawn in always
+            // reflect this tick's cursor and this run's resolved theme rather than whatever
+            // `List` was constructed with.
+            self.list.set_cursor(self.cursor);
             self.list.set_offset(self.list_offset);
+            self.list.set_theme(self.theme);
             // A row for the Filter line takes real height only while it is open, shifting
             // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
             // screen: a change on a mode switch takes a real row").
@@ -1943,6 +1955,18 @@ impl App {
                 &self.bindings,
                 &self.theme,
             );
+
+            // The Launcher palette overlays the base frame just drawn above, as a centred
+            // popup, rather than replacing it the way the three early returns above do
+            // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
+            // "The Launcher palette popup"): choosing a Launcher is a decision about the row
+            // under the cursor, and that row has to stay on screen while choosing.
+            if let Some(palette) = &self.launcher_palette {
+                let (launchers, entity_name) = launcher_palette_view
+                    .as_ref()
+                    .expect("computed above whenever launcher_palette is Some");
+                palette.draw(frame, area, &self.theme, launchers, entity_name);
+            }
         })?;
         if let Some(err) = error {
             self.message_tx
@@ -2045,6 +2069,7 @@ mod tests {
     use super::*;
     use crate::{
         config::document,
+        help::HelpLayout,
         test_support::{capture_tracing, production_source_at, rust_source_files, source_region},
     };
 
@@ -2576,6 +2601,66 @@ mod tests {
             row.trim_end(),
             "work 403 entities · run 7/12 · filter: 12 matches · worktrees: 161 (preference \
              off) · 12000ms"
+        );
+    }
+
+    // =====================================================================================
+    // Ticket 164: the help overlay draws in the house style, full-frame (help is a reading
+    // surface, not a chooser, so it does not become a centred popup). `App::render`'s own
+    // draw closure runs against a real terminal (`Tui::terminal` is hardcoded to
+    // `CrosstermBackend<Stdout>`, not a `TestBackend`), so this drives the same drawing call
+    // it makes directly against a `ratatui::Terminal<TestBackend>`, the same workaround
+    // `render_status_row` above already uses for `draw_status_row`.
+    // =====================================================================================
+
+    /// Guards `handle_key_event`'s scroll clamp against reading the raw frame height instead
+    /// of the overlay's own interior viewport, two rows shorter once the border is drawn.
+    #[test]
+    fn scrolling_the_open_help_overlay_clamps_to_its_own_bordered_viewport() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(100, 15);
+        app.help = Some(HelpOverlay::default());
+
+        let content_len = HelpOverlay::content_len(&app.bindings, app.focus);
+        for _ in 0..content_len {
+            app.handle_key_event(press(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .expect("scroll down past the end of the content");
+        }
+
+        let frame_area = Rect::new(0, 0, app.frame_size.width, app.frame_size.height);
+        let backend = ratatui::backend::TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                app.help.as_ref().expect("help is open").draw(
+                    frame,
+                    frame.area(),
+                    app.focus,
+                    &app.bindings,
+                    &app.theme,
+                    app.glyphs,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let lines = HelpOverlay::content(&app.bindings, app.focus);
+        let (_, last_description) = lines.last().expect("expected content");
+        let content_area = HelpLayout::compute(frame_area).content_area(frame_area);
+        let last_row_y = content_area.bottom() - 1;
+        let row_text: String = (content_area.x..content_area.right())
+            .map(|x| buf[(x, last_row_y)].symbol())
+            .collect();
+        assert!(
+            row_text.contains(last_description),
+            "expected the last content line {last_description:?} on the viewport's own last \
+             row, got {row_text:?}"
         );
     }
 
