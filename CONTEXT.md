@@ -157,6 +157,12 @@ An optional background cycle, off by default, that fetches every remote with pru
 The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Present only when the core is built with its `fetch` cargo feature, the mutating path's own isolation boundary.
 _Avoid_: FetchConfig (that names the consumer's parsed TOML shape, not the core's)
 
+**The fast-forward-only auto-update**:
+An optional mutation that rides the periodic fetch cycle rather than carrying a timer of its own, off by default. It acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, never fixed, by leaving its true Cells to say so on the next Generation. It never rebases, merges, commits or resets: moving the branch a fast-forward's own way (a ref update and the working-tree writes a tree diff between the two commits names) is the whole mechanism.
+
+**Auto update spec**:
+The auto-update's own bounding data as the core receives it: whether it runs at all, plain data with no TOML type. Present regardless of the `fetch` cargo feature, the same way Fetch spec is; inert without it, and inert while Fetch spec's own `enabled` is false.
+
 ### Provenance
 
 **Probe**:

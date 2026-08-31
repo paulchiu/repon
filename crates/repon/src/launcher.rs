@@ -626,6 +626,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let key = core.snapshot().entities[0].key.clone();
         let entity = core.probe_now(&key);

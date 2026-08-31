@@ -1103,6 +1103,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -1183,6 +1184,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -1291,6 +1293,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -2267,6 +2270,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -2810,6 +2814,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3047,6 +3052,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3331,6 +3337,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3629,6 +3636,7 @@ mod tests {
                 interval: std::time::Duration::from_secs(3600),
                 concurrency: 4,
             },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
         });
         let keys: Vec<_> = core
             .snapshot()
