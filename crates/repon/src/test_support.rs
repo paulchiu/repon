@@ -86,9 +86,18 @@ pub(crate) fn workspace_crate_src_dirs() -> Vec<PathBuf> {
 /// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
 /// naming the very pattern this scan bans does not trip it.
 pub(crate) fn production_lines_containing(needle: &str) -> Vec<String> {
+    production_lines_under_containing(&workspace_crate_src_dirs(), needle)
+}
+
+/// [`production_lines_containing`] over the given `dirs` rather than every workspace crate's
+/// `src`. For a claim about a symbol that is private to one crate and so cannot be called from
+/// another, narrowing lets the needle be the bare method call, which no line wrap can split,
+/// instead of one qualified by a receiver name to dodge an unrelated same-named method
+/// elsewhere in the workspace.
+pub(crate) fn production_lines_under_containing(dirs: &[PathBuf], needle: &str) -> Vec<String> {
     let mut offending = Vec::new();
-    for dir in workspace_crate_src_dirs() {
-        for path in rust_source_files(&dir) {
+    for dir in dirs {
+        for path in rust_source_files(dir) {
             let production = production_source_at(&path);
             for (number, line) in production.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
@@ -832,30 +841,26 @@ mod tests {
 
     /// `RefreshHandles::dispatch` is the one function that mints a new Generation
     /// (`core.rs`'s own doc comment on `Core::refresh`); it is private to `repon-core`, so a
-    /// call to it can only ever live there, and a scan confined to that crate is not "a check
-    /// that quietly stops checking" the way excluding a legitimate file would be, it is the
-    /// claim's own shape: the thing scanned for cannot live anywhere else. Its two production
-    /// callers are `Core::refresh` itself (the funnel every one of the six `repon`-side
-    /// triggers above shares) and `Core::run_action`'s own completion (an Action finishing,
-    /// which bypasses `Core::refresh` because it has no cursor to order by either, the same
-    /// reason named on the scan above). The needle names the field the call sits on rather
-    /// than a bare `.dispatch(`, which `BindingTable::dispatch` (an unrelated key-routing
-    /// method called throughout `repon`'s own `app.rs`) would otherwise flood this scan with.
+    /// call to it can only ever live there, and confining the scan to that crate is the
+    /// claim's own shape rather than a scan quietly narrowing what it inspects: the thing
+    /// scanned for cannot live anywhere else. Its two production callers are `Core::refresh`
+    /// itself (the funnel every one of the six `repon`-side triggers above shares) and
+    /// `Core::run_action`'s own completion (an Action finishing, which bypasses
+    /// `Core::refresh` because it has no cursor to order by either, the same reason named on
+    /// the scan above). Confining the scan is also what lets the needle be the bare
+    /// `.dispatch(`, which no line wrap can split: qualifying it by the receiver, to dodge
+    /// `BindingTable::dispatch` over in `repon`, would make a call rustfmt wrapped onto its
+    /// own line invisible to this count.
     #[test]
     fn exactly_two_production_call_sites_mint_a_new_generation_in_repon_core() {
-        let files = rust_source_files(&workspace_crate_src_dirs()[1]);
+        let core_src = vec![workspace_crate_src_dirs()[1].clone()];
         assert!(
-            !files.is_empty(),
+            !rust_source_files(&core_src[0]).is_empty(),
             "scanned zero files under repon-core/src; the relative path above no longer \
              resolves, and this scan would otherwise pass on having inspected nothing"
         );
 
-        let mut offending =
-            production_lines_containing(&format!("refresh_handles.{}(", "dispatch"));
-        offending.extend(production_lines_containing(&format!(
-            "refresh_handles().{}(",
-            "dispatch"
-        )));
+        let offending = production_lines_under_containing(&core_src, &format!(".{}(", "dispatch"));
 
         assert!(
             !offending.is_empty(),
@@ -873,38 +878,42 @@ mod tests {
     }
 
     /// `cancel_in_flight` is the one function that cancels a Generation, equally private to
-    /// `repon-core` for the same reason `RefreshHandles::dispatch` above is. Its two
-    /// production callers are `Core::run_action`'s own first move (an Action starting, one of
-    /// the eight triggers) and `spawn_clock_thread`'s handling of `ClockControl::Pause` (the
-    /// Suspension mechanism `App::run`'s `SIGTSTP` branch and `App::around_entity_handoff`
-    /// both drive through `Core::pause`), which refresh.md's own "Suspension" section
-    /// describes as part of what a return from suspension depends on rather than a trigger of
-    /// its own: pausing only ever cancels, it starts nothing, so it mints no Generation for
-    /// this ticket's own "exactly eight" to count. The needle excludes the function's own
-    /// `fn cancel_in_flight(table: &Arc<...>, ...)` declaration line, whose first parameter
-    /// name carries no leading `&`, unlike every real call site's first argument.
+    /// `repon-core` for the same reason `RefreshHandles::dispatch` above is, and scanned the
+    /// same confined way. Its two production callers are `Core::run_action`'s own first move
+    /// (an Action starting, one of the eight triggers) and `spawn_clock_thread`'s handling of
+    /// `ClockControl::Pause` (the Suspension mechanism `App::run`'s `SIGTSTP` branch and
+    /// `App::around_entity_handoff` both drive through `Core::pause`), which refresh.md's own
+    /// "Suspension" section describes as part of what a return from suspension depends on
+    /// rather than a trigger of its own: pausing only ever cancels, it starts nothing, so it
+    /// mints no Generation for this ticket's own "exactly eight" to count. The third match is
+    /// the function's own `fn cancel_in_flight(...)` declaration, counted rather than filtered
+    /// out: the needle stops at the opening paren, which rustfmt never separates from the name
+    /// it follows, so a call whose arguments it wrapped onto the next line is still counted
+    /// here, where a needle reaching into the first argument to exclude the declaration would
+    /// have missed it.
     #[test]
     fn exactly_two_production_call_sites_cancel_a_generation_in_repon_core() {
-        let files = rust_source_files(&workspace_crate_src_dirs()[1]);
+        let core_src = vec![workspace_crate_src_dirs()[1].clone()];
         assert!(
-            !files.is_empty(),
+            !rust_source_files(&core_src[0]).is_empty(),
             "scanned zero files under repon-core/src; the relative path above no longer \
              resolves, and this scan would otherwise pass on having inspected nothing"
         );
 
-        let offending = production_lines_containing(&format!("{}(&", "cancel_in_flight"));
+        let offending =
+            production_lines_under_containing(&core_src, &format!("{}(", "cancel_in_flight"));
 
         assert!(
             !offending.is_empty(),
-            "found zero calls to `cancel_in_flight`; this scan's own needle broke rather than \
-             every cancellation call site disappearing, and would otherwise pass vacuously"
+            "found zero mentions of `cancel_in_flight`; this scan's own needle broke rather \
+             than every cancellation call site disappearing, and would otherwise pass vacuously"
         );
         assert_eq!(
             offending.len(),
-            2,
+            3,
             "expected exactly two production call sites that cancel a Generation (an Action \
-             starting, and the pre-existing Suspension pause); a count that moved means a new \
-             place cancels one, at: {offending:?}"
+             starting, and the pre-existing Suspension pause), plus the function's own \
+             declaration; a count that moved means a new place cancels one, at: {offending:?}"
         );
     }
 }
