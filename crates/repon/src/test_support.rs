@@ -105,9 +105,8 @@ pub(crate) fn production_lines_containing(needle: &str) -> Vec<String> {
 
 /// Every `Settled::Known { .. }`-shaped region in `source`: `(total, incomplete_lines)`.
 /// `total` counts every such region found; `incomplete_lines` names the 1-based line of
-/// each one whose own field list still hides a field behind a bare `..`, the shape issue
-/// #109 exists to close (a fourth field added to `Settled::Known` would reach a site like
-/// that and be silently ignored). A nested type's own `..` (`value: Head::Branch { .. }`)
+/// each one whose own field list still hides a field behind a bare `..`: a fourth field
+/// added to `Settled::Known` would reach a site like that and be silently ignored. A nested type's own `..` (`value: Head::Branch { .. }`)
 /// is one brace deeper than `Settled::Known`'s and is never this scan's business; only a
 /// `..` sitting directly among `Settled::Known`'s own fields counts. Comment lines are
 /// skipped so a doc comment naming the shape in prose is never a self-match. Full source
@@ -660,8 +659,8 @@ mod tests {
         );
     }
 
-    // --- Issue #109: a `Settled::Known` destructure that hides a field behind `..`
-    // compiles silently once a fourth field is added, and quietly ignores it forever.
+    // --- A `Settled::Known` destructure that hides a field behind `..` compiles silently
+    // once a fourth field is added, and quietly ignores it forever.
 
     /// The literal these tests build their fixtures from, fragmented so none of them is
     /// itself a self-match for
@@ -734,7 +733,7 @@ mod tests {
         assert!(incomplete.is_empty());
     }
 
-    /// The criterion issue #109 exists to satisfy: every `Settled::Known` destructure
+    /// Every `Settled::Known` destructure
     /// across both crates, production and test code alike, names every field it does not
     /// use rather than hiding it behind `..`. Scanned raw rather than through
     /// [`production_source_at`]: criterion 3 puts test code in scope, so a check that cut
@@ -771,8 +770,8 @@ mod tests {
         assert!(
             offending.is_empty(),
             "found a `Settled::Known` destructure hiding a field behind a bare `..`, which \
-             lets a fourth field reach this site unnoticed (issue #109); name every field \
-             it does not use instead (`at: _, stale: _`, say), at: {offending:?}"
+             lets a fourth field reach this site unnoticed; name every field it does not \
+             use instead (`at: _, stale: _`, say), at: {offending:?}"
         );
     }
 }
