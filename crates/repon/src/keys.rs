@@ -31,6 +31,7 @@ pub(crate) enum Action {
     Suspend,
     OpenLauncher,
     OpenActionPalette,
+    OpenManagementPalette,
     EnterFilter,
     RefreshAll,
     RefreshSelection,
@@ -134,6 +135,9 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::Suspend => "Suspend",
         Action::OpenLauncher => "Open the Launcher palette",
         Action::OpenActionPalette => "Open the Action palette",
+        Action::OpenManagementPalette => {
+            "Open the Action palette filtered to management operations"
+        }
         Action::EnterFilter => "Enter a Filter",
         Action::RefreshAll => "Refresh everything",
         Action::RefreshSelection => "Refresh the Selection",
@@ -247,6 +251,12 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char(';'),
         NONE,
         Action::OpenActionPalette,
+    ),
+    binding_not_built(
+        Context::Global,
+        KeyCode::Char('m'),
+        NONE,
+        Action::OpenManagementPalette,
     ),
     binding(
         Context::Global,
@@ -706,6 +716,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::Suspend => "suspend",
         Action::OpenLauncher => "open_launcher",
         Action::OpenActionPalette => "open_action_palette",
+        Action::OpenManagementPalette => "open_management_palette",
         Action::EnterFilter => "enter_filter",
         Action::RefreshAll => "refresh_all",
         Action::RefreshSelection => "refresh_selection",
