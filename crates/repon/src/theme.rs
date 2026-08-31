@@ -193,6 +193,7 @@ enum_with_all! {
     #[allow(dead_code)]
     pub enum Meaning {
         FreshValue,
+        Notice,
         StaleOrUnknownGutterMark,
         KnownZero,
         MergedWorktree,
@@ -224,7 +225,7 @@ impl Meaning {
     #[allow(dead_code)]
     pub const fn role(self) -> Role {
         match self {
-            Meaning::FreshValue => Role::Text,
+            Meaning::FreshValue | Meaning::Notice => Role::Text,
             Meaning::StaleOrUnknownGutterMark
             | Meaning::KnownZero
             | Meaning::MergedWorktree

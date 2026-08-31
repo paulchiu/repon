@@ -133,13 +133,12 @@ pub struct App {
     /// The description of the most recently pressed bound-but-unimplemented action
     /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
     /// action in the spec's own words. One of the four sources [`Self::current_warnings`]
-    /// folds into the shared warning slot ([`warnings::WarningSources`]): neither
-    /// keybindings.md nor layout-and-provenance.md settles a surface of its own for this, so
-    /// it shares the slot rather than inventing one. Replaced by the next such press; nothing
-    /// else clears it.
+    /// folds into the shared warning slot ([`warnings::WarningSources`]). Replaced by the
+    /// next such press; nothing else clears it.
     ///
-    // TODO(#106): sharing the slot is this code's choice, not a documented rule. That
-    // ticket decides where the notice belongs.
+    // TODO(#119): this whole field is on its way out. 0023 rules that an unbuilt binding is
+    // not advertised and so has nothing to say, and that the warning slot carries standing
+    // conditions only, so `Warning::NotImplemented` is deleted rather than relocated.
     unimplemented_action_notice: Option<&'static str>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
     /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into

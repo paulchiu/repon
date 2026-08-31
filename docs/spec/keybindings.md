@@ -1,6 +1,6 @@
 # Keybindings
 
-The map is context-sensitive per pane, after lazygit: a key means what the focused surface says it means, and nothing else. The vocabulary is vim's letters, an always-visible footer teaches whichever subset is live, and one binding table in code is the single source of truth from which the footer, the help overlay and the config merge are all derived. The reasoning is in [0016](../adr/0016-one-binding-table-feeds-every-surface.md).
+The map is context-sensitive per pane, after lazygit: a key means what the focused surface says it means, and nothing else. The vocabulary is vim's letters, an always-visible footer teaches whichever subset is live, and one binding table in code is the single source of truth from which the footer, the help overlay and the config merge are all derived. The reasoning is in [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Two further properties qualify every row of the map below: a binding is Built or not, which decides whether it is offered at all, and a Built binding is Available or not, which decides whether it acts on a given keystroke; [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) settles both and [Built and available](#built-and-available) states the rules.
 
 ## The contexts
 
@@ -107,6 +107,31 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `n`, `Esc` | Decline |
 | every other key | Ignored |
 
+## Built and available
+
+Every row of the default map carries two properties beyond its chord and its action. **Built** is static, fixed at compile time, and decides whether the binding is offered at all. **Available** is dynamic, decided per keystroke against the current state, and decides only whether a Built binding acts. [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) carries the reasoning; the rules are these.
+
+An **unbuilt** binding keeps its chord in the table, so the reservation is still protected by the load-time collision check and the debug-build assertion, and is otherwise absent from every surface. It is not in the footer, not in the help overlay, and does not dispatch, and pressing it does nothing and says nothing, because the user was never told it did anything. There is no message for this case and no glyph: an advertised key that does nothing is [0001](../adr/0001-per-cell-provenance.md)'s absent count rendering as a zero, told about the program rather than about a Repo, so the answer is to withdraw the offer rather than to explain it.
+
+An **unavailable** binding is Built, is advertised exactly as it always is, and answers the press with a Notice ([theming.md](theming.md)) naming why it did nothing. The footer never marks it, because the footer is a teaching surface and has to hold still: a mark would rewrite the footer as the cursor moved between a failed row and a clean one, there is no room for one at 87 columns of an 88-column screen, and [0011](../adr/0011-themes-correct-the-terminal-palette.md) forbids meaning carried by colour alone, so dimming alone is not available.
+
+The reason is computed at the point of refusal rather than fixed per action, since `;` refusing because no Actions are configured and `;` refusing because none of the selected Repos define one are different facts. Each reason's static text is authored to fit 44 columns, half the narrow screen, and a test asserts the budget rather than the renderer truncating to it.
+
+Four bindings are already conditional in this way. While an Action is fanning out, `;`, `s`, `1` to `9` and `Ctrl+R` are inert, and each now answers with a Notice rather than the silence it gives today.
+
+### Not built yet
+
+The bindings below are reserved and specified but not built. Each is absent from the footer and the help overlay and inert on press. The list is checked by the `spec_conformance` test against the compiled table, so it cannot drift, and it shrinks to nothing as the features land.
+
+- `!` open the Launcher palette ([#98](https://github.com/paulchiu/repon/issues/98))
+- `/` enter a Filter ([#63](https://github.com/paulchiu/repon/issues/63))
+- `r` refresh everything and `R` refresh the Selection ([#65](https://github.com/paulchiu/repon/issues/65))
+- `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
+- `s` open the Set picker ([#94](https://github.com/paulchiu/repon/issues/94))
+- `d` dismiss a Vanished row
+- `n` and `N` walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78))
+- `Ctrl+D`, `PageDown`, `Ctrl+U` and `PageUp` in `list` only; the same chords in `detail` and `overlay` are built
+
 ## Why these keys and not others
 
 `!` for the Launcher palette was settled in [0008](../adr/0008-two-palettes-not-one.md). `;` for the Action palette comes from mutt, whose generic map binds `!` to shell-escape and `;` to tag-prefix, "apply the next command to everything tagged". That is the same one-target versus N-target split, in a tool that has shipped it for thirty years. `;` is unshifted home row while `!` is Shift+1, so they are far apart under the fingers, which is what 0008 actually asks for. `@` was rejected despite reading well as "across", because Shift+2 sits directly beside Shift+1 and the whole requirement is that the two keys not be one slip apart. The cost of `;` is real: it is bound in lf, yazi, nnn, ranger and helix with five different meanings, so its prior is inconsistent rather than absent.
@@ -133,7 +158,7 @@ Esc-twice gestures were measured safe against human typing: crossterm collapses 
 
 ## Quitting, suspending, confirming
 
-`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
 
 The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
 
@@ -151,7 +176,7 @@ What such a command does when it runs, how its lines gate, and what its output l
 
 ## The footer
 
-Derived from the binding table, never written as strings. Left-aligned. Each context renders its own.
+Derived from the binding table, never written as strings, and carrying only Built bindings ([Built and available](#built-and-available)). Left-aligned. Each context renders its own. The drop tables below describe the finished keyboard; today's footer is the same ladder over whichever subset is Built.
 
 The list context's footer is 87 columns at full width, which fits inside both the 90-column list from [layout-and-provenance.md](layout-and-provenance.md) and the 88-column narrow screen the prototype ran at. It degrades like this:
 
@@ -190,7 +215,7 @@ The other three are short enough to survive almost any frame: `enter apply  esc 
 
 ## The help overlay
 
-Generated from the same table. It shows the current context's bindings first, then `global`. It scrolls, and closes with Esc or `q`. `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`. It scrolls, and closes with Esc or `q`. `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
 
 ## Configuration
 
@@ -199,6 +224,7 @@ A `[keys]` block in config.toml, one sub-table per context. The merge is per con
 | case | behaviour |
 | --- | --- |
 | Unknown context or unknown action name | Warn, name the dotted path, continue, matching [config.md](config.md)'s unknown-key grade |
+| A known action that is not Built | Warn, name the dotted path, continue, and ignore the binding. The message says not built yet rather than unknown, since the name is in this spec and the user would otherwise go looking for a typo that is not there |
 | An unparseable key name | Exit non-zero before the terminal is claimed |
 | Two or more actions bound to the same key in one context | Exit non-zero before the terminal is claimed, naming every colliding action and key |
 

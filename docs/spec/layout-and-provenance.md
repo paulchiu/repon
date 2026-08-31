@@ -9,6 +9,7 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 - Below 100 columns the detail pane takes the whole frame and the list is hidden.
 - There is no permanently pinned bottom output pane. Output from an Action fanned out across the Selection lives in the detail pane, per step, labelled, separately readable, and it survives the run. It wraps rather than truncates and keeps the colours the step emitted, settled in [actions.md](actions.md).
 - One footer line sits below the frame carrying the focused context's bindings, degrading by dropping whole bindings behind an ellipsis; it is specified in [keybindings.md](keybindings.md).
+- One status row sits above the frame. It shows one thing at a time, a live Notice first, then the most severe outstanding warning, then the header; [theming.md](theming.md) carries the rule and [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) the reasoning.
 - Visual language follows superfile: rounded borders, the panel title inline in the top border rather than in a separate title row, focus communicated by border colour, panels tiled edge to edge.
 
 ## The list
