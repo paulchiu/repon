@@ -15,7 +15,7 @@ Six named contexts. `global` is live in `list` and `detail` only, and is suspend
 | `overlay` | The help overlay, the expanded warning list, and the Set picker |
 | `confirm` | The yes/no gate before an Action fans out |
 
-An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
+An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
 ## The default map
 
@@ -83,6 +83,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Up`, `Ctrl+K` | Previous entry |
 | `Down`, `Ctrl+J` | Next entry |
 | `Tab` | Accept the highlighted completion (the Filter line only) |
+| `Backspace` | Delete the previous character |
 | `Ctrl+W` | Delete the previous word |
 | `Ctrl+U` | Clear the line |
 | `Ctrl+E` | Open the field in `$EDITOR` |
