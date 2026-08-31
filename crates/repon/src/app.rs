@@ -1795,13 +1795,6 @@ impl App {
                 );
                 return;
             }
-            if let Some(palette) = &self.launcher_palette {
-                let (launchers, entity_name) = launcher_palette_view
-                    .as_ref()
-                    .expect("computed above whenever launcher_palette is Some");
-                palette.draw(frame, area, &self.theme, launchers, entity_name);
-                return;
-            }
             if let Some(picker) = &self.set_picker {
                 picker.draw(frame, area, &self.document.sets, &self.active_set.name);
                 return;
@@ -1888,6 +1881,18 @@ impl App {
                 &self.bindings,
                 &self.theme,
             );
+
+            // The Launcher palette overlays the base frame just drawn above, as a centred
+            // popup, rather than replacing it the way the three early returns above do
+            // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
+            // "The Launcher palette popup"): choosing a Launcher is a decision about the row
+            // under the cursor, and that row has to stay on screen while choosing.
+            if let Some(palette) = &self.launcher_palette {
+                let (launchers, entity_name) = launcher_palette_view
+                    .as_ref()
+                    .expect("computed above whenever launcher_palette is Some");
+                palette.draw(frame, area, &self.theme, launchers, entity_name);
+            }
         })?;
         if let Some(err) = error {
             self.message_tx

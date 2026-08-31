@@ -17,12 +17,34 @@
 //! ([keybindings.md](../../../docs/spec/keybindings.md)'s "The Selection"), so `Enter` runs
 //! the highlighted entry immediately with nothing left to gate.
 
-use ratatui::{Frame, layout::Rect, style::Style, widgets::Block};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Rect},
+    style::Style,
+    widgets::{Block, Clear},
+};
 
 use crate::{
     launcher::Launcher,
     theme::{Role, Theme},
 };
+
+/// A floor under the popup's own computed width and height
+/// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The Launcher
+/// palette popup"), so a query line and a title with almost nothing typed or configured
+/// still reads as a palette rather than a sliver.
+const MIN_POPUP_WIDTH: u16 = 24;
+const MIN_POPUP_HEIGHT: u16 = 4;
+
+/// The interior's second row when the query matches no configured Launcher, kept apart
+/// from [`NO_LAUNCHERS_CONFIGURED_MESSAGE`] since the two are different facts.
+pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
+
+/// The interior's second row when `launchers` itself is empty: every shipped default
+/// disabled and nothing declared. Names where to fix that, the same way
+/// [`crate::action_palette::NO_ACTIONS_CONFIGURED_MESSAGE`] does for its own list, since a
+/// user who has never configured a Launcher has no reason to know where one is declared.
+pub(crate) const NO_LAUNCHERS_CONFIGURED_MESSAGE: &str = "no launchers; see [[launcher]]";
 
 /// Case-insensitive substring match against a Launcher's own name, the same convention
 /// [`crate::action_palette::matching`] uses and for the same reason: a plain substring test
@@ -119,10 +141,59 @@ impl LauncherPalette {
         self.highlighted(launchers).cloned()
     }
 
-    /// theming.md: "The Launcher palette keeps `border_focused` and names the one Repo,"
-    /// the same role [`crate::components::detail`] and [`crate::components::list`] already
-    /// use for a focused border, never a tenth one. `entity_name` is the cursor row's own
-    /// Entity, the one Repo a choice here would act on.
+    /// The one-line message [`Self::draw`] shows in place of the match list, or `None` while
+    /// the query still matches something; shared with [`Self::popup_area`] so sizing agrees.
+    fn empty_state_message(
+        matches_is_empty: bool,
+        launchers_is_empty: bool,
+    ) -> Option<&'static str> {
+        if !matches_is_empty {
+            return None;
+        }
+        Some(if launchers_is_empty {
+            NO_LAUNCHERS_CONFIGURED_MESSAGE
+        } else {
+            NO_MATCHES_MESSAGE
+        })
+    }
+
+    /// The popup's own rect inside `frame_area`, sized to content and clamped to the frame
+    /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The Launcher palette popup").
+    pub(crate) fn popup_area(
+        &self,
+        frame_area: Rect,
+        launchers: &[Launcher],
+        entity_name: &str,
+    ) -> Rect {
+        let matches = self.matches(launchers);
+        let list_or_message_width =
+            match Self::empty_state_message(matches.is_empty(), launchers.is_empty()) {
+                Some(message) => message.len(),
+                None => matches
+                    .iter()
+                    .map(|launcher| launcher.name.len() + 2) // the two-column cursor marker
+                    .max()
+                    .unwrap_or(0),
+            };
+        let content_width = list_or_message_width
+            .max(self.query.len() + 2) // the leading "! "
+            .max(entity_name.len() + 2); // the border title's own " {name} "
+        let width = (content_width as u16)
+            .saturating_add(2) // the two border columns
+            .clamp(MIN_POPUP_WIDTH, frame_area.width);
+
+        let content_rows = 1 + matches.len().max(1); // the query line, then the list or a message
+        let height = (content_rows as u16)
+            .saturating_add(2) // the two border rows
+            .clamp(MIN_POPUP_HEIGHT, frame_area.height);
+
+        frame_area.centered(Constraint::Length(width), Constraint::Length(height))
+    }
+
+    /// Draws as a centred popup over `frame`, `entity_name` in the border title
+    /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
+    /// Launcher palette popup"). The first interior row is always the typed query and the
+    /// second is the match list or whichever empty-state message applies.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -131,19 +202,43 @@ impl LauncherPalette {
         launchers: &[Launcher],
         entity_name: &str,
     ) {
+        let popup = self.popup_area(area, launchers, entity_name);
+        frame.render_widget(Clear, popup);
+
         let block = Block::bordered()
             .border_style(theme.style_for(Role::BorderFocused))
             .title(format!(" {entity_name} "));
-        let interior = block.inner(area);
-        frame.render_widget(block, area);
+        let interior = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let query_line = format!("! {}", self.query);
+        frame.buffer_mut().set_string(
+            interior.x,
+            interior.y,
+            &query_line,
+            theme.style_for(Role::Text),
+        );
 
         let matches = self.matches(launchers);
-        for (row, launcher) in matches.iter().enumerate().take(interior.height as usize) {
-            let marker = if row == self.cursor { "> " } else { "  " };
-            let line = format!("{marker}{}", launcher.name);
-            frame
-                .buffer_mut()
-                .set_string(interior.x, interior.y + row as u16, &line, Style::new());
+        let rows_below_query = interior.height.saturating_sub(1) as usize;
+        if let Some(message) = Self::empty_state_message(matches.is_empty(), launchers.is_empty()) {
+            frame.buffer_mut().set_string(
+                interior.x,
+                interior.y + 1,
+                message,
+                theme.style_for(Role::Dim),
+            );
+        } else {
+            for (row, launcher) in matches.iter().enumerate().take(rows_below_query) {
+                let marker = if row == self.cursor { "> " } else { "  " };
+                let line = format!("{marker}{}", launcher.name);
+                frame.buffer_mut().set_string(
+                    interior.x,
+                    interior.y + 1 + row as u16,
+                    &line,
+                    Style::new(),
+                );
+            }
         }
     }
 }
@@ -170,6 +265,13 @@ mod tests {
             .collect()
     }
 
+    /// The `TestBackend` area every test below draws into: named once so a test computing
+    /// where the popup landed (via [`LauncherPalette::popup_area`]) uses the exact same
+    /// frame the real draw ran against.
+    fn frame_area() -> Rect {
+        Rect::new(0, 0, 40, 10)
+    }
+
     fn draw_to_buffer(
         palette: &LauncherPalette,
         launchers: &[Launcher],
@@ -183,6 +285,22 @@ mod tests {
             .draw(|frame| palette.draw(frame, frame.area(), theme, launchers, entity_name))
             .expect("draw the frame");
         terminal.backend().buffer().clone()
+    }
+
+    /// The popup's own interior for this exact palette state, since a test can no longer
+    /// hard-code a row or column now the popup is sized to content.
+    fn popup_interior(
+        palette: &LauncherPalette,
+        launchers: &[Launcher],
+        entity_name: &str,
+    ) -> Rect {
+        let popup = palette.popup_area(frame_area(), launchers, entity_name);
+        Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        }
     }
 
     // --- matching ---
@@ -229,8 +347,11 @@ mod tests {
         ];
         let palette = LauncherPalette::new();
         let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let interior = popup_interior(&palette, &launchers, "repo-a");
 
-        let rendered: Vec<String> = (1..6).map(|y| row_text(&buf, y, 40)).collect();
+        let rendered: Vec<String> = (interior.y..interior.y + interior.height)
+            .map(|y| row_text(&buf, y, 40))
+            .collect();
         let occurrences = |name: &str| rendered.iter().filter(|line| line.contains(name)).count();
         for name in ["alpha", "beta", "gamma", "delta"] {
             assert_eq!(
@@ -260,9 +381,13 @@ mod tests {
         palette.move_highlight(2, &launchers);
 
         let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
-        assert!(row_text(&buf, 3, 40).contains("> gamma"));
-        assert!(!row_text(&buf, 1, 40).contains('>'));
-        assert!(!row_text(&buf, 2, 40).contains('>'));
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        // Interior row 0 is the query line, row 1 "alpha", row 2 "beta", row 3 the cursor's
+        // own "gamma".
+        assert!(row_text(&buf, interior.y + 3, 40).contains("> gamma"));
+        assert!(!row_text(&buf, interior.y, 40).contains('>'));
+        assert!(!row_text(&buf, interior.y + 1, 40).contains('>'));
+        assert!(!row_text(&buf, interior.y + 2, 40).contains('>'));
     }
 
     #[test]
@@ -270,9 +395,10 @@ mod tests {
         let launchers = vec![launcher("lazygit")];
         let palette = LauncherPalette::new();
         let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "worktree-name");
+        let popup = palette.popup_area(frame_area(), &launchers, "worktree-name");
 
         assert!(
-            row_text(&buf, 0, 40).contains("worktree-name"),
+            row_text(&buf, popup.y, 40).contains("worktree-name"),
             "expected the border title to name the one Entity the choice would act on"
         );
     }
@@ -295,7 +421,8 @@ mod tests {
             .expect("draw the frame");
 
         let buf = terminal.backend().buffer();
-        assert_eq!(buf[(0, 0)].fg, theme.border_focused);
+        let popup = palette.popup_area(frame_area(), &launchers, "repo-a");
+        assert_eq!(buf[(popup.x, popup.y)].fg, theme.border_focused);
     }
 
     /// theming.md's "no tenth role": the Launcher palette's border reuses one of the nine
@@ -400,6 +527,8 @@ mod tests {
     // --- risk: a Launcher list with nothing in it (every shipped default disabled and
     // nothing declared) must never panic and never move the cursor past it ---
 
+    /// Pinned an empty Launcher list rendering no rows at all; updated rather than deleted
+    /// to assert the state the fix replaces it with.
     #[test]
     fn an_empty_launcher_list_leaves_the_cursor_at_zero_and_draws_nothing_for_every_movement_action()
      {
@@ -411,11 +540,11 @@ mod tests {
         assert!(palette.choose(&[]).is_none());
 
         let buf = draw_to_buffer(&palette, &[], &Theme::default(), "repo-a");
-        let interior_row: String = row_text(&buf, 1, 40).chars().skip(1).take(38).collect();
-        assert_eq!(
-            interior_row.trim(),
-            "",
-            "an empty Launcher list must render no rows inside the border"
+        let interior = popup_interior(&palette, &[], "repo-a");
+        assert!(
+            row_text(&buf, interior.y + 1, 40).contains(NO_LAUNCHERS_CONFIGURED_MESSAGE),
+            "an empty Launcher list must say so and name where to declare one, rather than \
+             rendering an empty interior"
         );
     }
 
@@ -451,12 +580,260 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        // Interior row 0 is the query line, row 1 "lazygit", row 2 the cursor's own "tuicr".
         assert!(
-            row_text(2).contains("> tuicr"),
+            row_text(interior.y + 2).contains("> tuicr"),
             "with every colour identical, the highlighted row must still read as \
              highlighted from its text alone: {:?}",
-            row_text(2)
+            row_text(interior.y + 2)
         );
-        assert!(!row_text(1).contains('>'));
+        assert!(!row_text(interior.y + 1).contains('>'));
+    }
+
+    // --- the typed query itself ---
+
+    /// The worthless version of this test types a character that also appears in a listed
+    /// name, so a buffer scan cannot tell whether the query line drew it or a match row did.
+    /// `"zzq"` appears in neither "lazygit" nor "tuicr", so the only way it reaches the
+    /// screen is the query line itself.
+    #[test]
+    fn the_typed_query_is_visible_and_updates_as_characters_are_added_and_removed() {
+        let launchers = vec![launcher("lazygit"), launcher("tuicr")];
+        let mut palette = LauncherPalette::new();
+
+        let empty = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let empty_interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(
+            !row_text(&empty, empty_interior.y, 40).contains("zzq"),
+            "an unopened query must not already show text nobody typed"
+        );
+
+        for c in "zzq".chars() {
+            palette.type_char(c, &launchers);
+        }
+        let typed = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let typed_interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(
+            row_text(&typed, typed_interior.y, 40).contains("zzq"),
+            "expected the typed query on the interior's first row: {:?}",
+            row_text(&typed, typed_interior.y, 40)
+        );
+
+        palette.delete_previous_word(&launchers);
+        let cleared = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let cleared_interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(
+            !row_text(&cleared, cleared_interior.y, 40).contains("zzq"),
+            "removing the typed characters must remove them from the query row too: {:?}",
+            row_text(&cleared, cleared_interior.y, 40)
+        );
+    }
+
+    // --- the two empty states ---
+
+    #[test]
+    fn a_query_matching_no_launcher_says_so_without_leaving_stale_rows() {
+        let launchers = vec![launcher("lazygit"), launcher("tuicr")];
+        let mut palette = LauncherPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &launchers);
+        }
+
+        let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        let message_row = interior.y + 1;
+
+        assert!(
+            row_text(&buf, message_row, 40).contains(NO_MATCHES_MESSAGE),
+            "expected the no-matches message, got: {:?}",
+            row_text(&buf, message_row, 40)
+        );
+        for name in ["lazygit", "tuicr"] {
+            for y in interior.y..interior.y + interior.height {
+                assert!(
+                    !row_text(&buf, y, 40).contains(name),
+                    "a no-matches render must not also list a stale row for {name:?}"
+                );
+            }
+        }
+    }
+
+    /// The distinction the whole pair of tickets is about: a query matching nothing and a
+    /// list with nothing in it are different facts, so their renders must differ, not merely
+    /// each carry a message that happens to read differently in isolation.
+    #[test]
+    fn no_matches_and_nothing_configured_render_differently_from_each_other() {
+        let theme = Theme::default();
+        let some_launchers = vec![launcher("lazygit")];
+        let mut no_match = LauncherPalette::new();
+        for c in "zzq".chars() {
+            no_match.type_char(c, &some_launchers);
+        }
+        let nothing_configured = LauncherPalette::new();
+
+        let no_match_buf = draw_to_buffer(&no_match, &some_launchers, &theme, "repo-a");
+        let no_match_interior = popup_interior(&no_match, &some_launchers, "repo-a");
+        let nothing_configured_buf = draw_to_buffer(&nothing_configured, &[], &theme, "repo-a");
+        let nothing_configured_interior = popup_interior(&nothing_configured, &[], "repo-a");
+
+        assert_ne!(
+            row_text(&no_match_buf, no_match_interior.y + 1, 40),
+            row_text(
+                &nothing_configured_buf,
+                nothing_configured_interior.y + 1,
+                40
+            ),
+            "a query matching nothing and an empty Launcher list must render differently"
+        );
+    }
+
+    #[test]
+    fn clearing_the_query_restores_the_full_list_on_screen() {
+        let launchers = vec![launcher("lazygit"), launcher("tuicr")];
+        let mut palette = LauncherPalette::new();
+        palette.type_char('l', &launchers);
+        let narrowed = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let narrowed_interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(!row_text(&narrowed, narrowed_interior.y + 2, 40).contains("tuicr"));
+
+        palette.clear_line(&launchers);
+
+        let restored = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let restored_interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(row_text(&restored, restored_interior.y + 1, 40).contains("lazygit"));
+        assert!(row_text(&restored, restored_interior.y + 2, 40).contains("tuicr"));
+    }
+
+    // --- the popup: sized to content, clamped to the frame, `Clear` under it ---
+
+    #[test]
+    fn the_popup_does_not_take_the_whole_frame_the_corners_stay_as_drawn_underneath() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let launchers = vec![launcher("lazygit")];
+        let palette = LauncherPalette::new();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(
+                        0,
+                        y,
+                        "#".repeat(area.width as usize),
+                        Style::new(),
+                    );
+                }
+                palette.draw(frame, area, &Theme::default(), &launchers, "repo-a");
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "#",
+            "the top-left corner sits outside a centred popup and must stay whatever the \
+             base frame drew there"
+        );
+        assert_eq!(
+            buf[(39, 9)].symbol(),
+            "#",
+            "the bottom-right corner sits outside a centred popup and must stay whatever \
+             the base frame drew there"
+        );
+    }
+
+    /// This ticket's own required test: not "the popup drew something", but that a cell
+    /// inside the popup's interior no longer carries content that was underneath it before
+    /// the popup drew, which is exactly what a missing `Clear` would fail to catch.
+    #[test]
+    fn clear_is_rendered_under_the_popup_so_a_stale_cell_from_beneath_does_not_bleed_through() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let launchers = vec![launcher("lazygit")];
+        let palette = LauncherPalette::new();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                // Simulates a table row already drawn underneath, the same as the base
+                // frame `App::render` draws before overlaying this popup.
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(
+                        0,
+                        y,
+                        "#".repeat(area.width as usize),
+                        Style::new(),
+                    );
+                }
+                palette.draw(frame, area, &Theme::default(), &launchers, "repo-a");
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        // The query row's own trailing columns, past the leading "! " (the query is
+        // empty): `draw`'s own `set_string` calls never reach this cell, so only `Clear`
+        // running first can explain it no longer carrying the sentinel.
+        let trailing_x = interior.x + 2;
+        assert!(
+            trailing_x < interior.x + interior.width,
+            "test fixture assumption: the interior must be wider than the leading \"! \""
+        );
+        assert_ne!(
+            buf[(trailing_x, interior.y)].symbol(),
+            "#",
+            "expected `Clear` to wipe the popup's own interior before its border and \
+             content draw, so nothing from the row underneath bleeds through"
+        );
+    }
+
+    #[test]
+    fn the_popup_is_clamped_to_fit_and_read_at_the_88_column_narrow_screen() {
+        let launchers = vec![launcher("a-fairly-long-launcher-name-for-this-fixture")];
+        let palette = LauncherPalette::new();
+        let narrow_frame = Rect::new(0, 0, 88, 24);
+
+        let popup = palette.popup_area(narrow_frame, &launchers, "repo-a");
+
+        assert!(
+            popup.x + popup.width <= narrow_frame.width
+                && popup.y + popup.height <= narrow_frame.height,
+            "the popup must fit entirely inside the 88-column narrow screen, got {popup:?}"
+        );
+        assert!(
+            popup.width >= MIN_POPUP_WIDTH && popup.height >= MIN_POPUP_HEIGHT,
+            "the popup must still read as a palette, not shrink to nothing, got {popup:?}"
+        );
+    }
+
+    /// This ticket's own criterion in its own words: "A table taller than the popup does
+    /// not make the popup taller than the frame." 200 Launchers is far more than any frame
+    /// this crate targets could show at once.
+    #[test]
+    fn a_table_taller_than_the_popup_does_not_make_the_popup_taller_than_the_frame() {
+        let launchers: Vec<Launcher> = (0..200)
+            .map(|i| launcher(&format!("launcher-{i}")))
+            .collect();
+        let palette = LauncherPalette::new();
+        let frame = frame_area();
+
+        let popup = palette.popup_area(frame, &launchers, "repo-a");
+
+        assert!(
+            popup.height <= frame.height,
+            "a 200-entry Launcher list must not grow the popup past the frame's own \
+             height, got {popup:?} against frame height {}",
+            frame.height
+        );
+
+        // Also proves `draw` itself never panics indexing past the frame with a list this
+        // long, the behavioural half of the same criterion.
+        let _ = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
     }
 }
