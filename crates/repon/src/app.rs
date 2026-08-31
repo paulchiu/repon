@@ -1579,6 +1579,44 @@ mod tests {
         );
     }
 
+    /// Pins the table's `built` flag to what `App` actually does on press. `spec_conformance`
+    /// checks that flag against keybindings.md, so the two cannot drift from each other, and
+    /// until this test neither was pinned to the dispatch that decides the question: `r` and
+    /// `R` sat marked unbuilt, and listed as unbuilt, while both already had live arms, and
+    /// every check agreed. An unbuilt row must answer as not implemented; one that does real
+    /// work fails here.
+    ///
+    /// The guard is the table's own size, not the unbuilt count: an empty unbuilt set is this
+    /// list's expected end state, and must not read the same as a table that was never loaded.
+    #[test]
+    fn every_unbuilt_binding_answers_on_press_as_not_implemented() {
+        assert!(
+            keys::compiled_binding_count() > 0,
+            "read no bindings at all; this test would otherwise pass on an empty table"
+        );
+
+        for (context, code, modifiers, action) in keys::unbuilt_bindings() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            init_repo(&dir.path().join("repo"));
+            let mut app = test_app(dir.path());
+            app.focus = match context {
+                keys::Context::Global | keys::Context::List => keys::Context::List,
+                keys::Context::Detail => keys::Context::Detail,
+                keys::Context::Input => keys::Context::Input,
+                keys::Context::Overlay => keys::Context::Overlay,
+                keys::Context::Confirm => keys::Context::Confirm,
+            };
+            app.handle_key_event(press(code, modifiers))
+                .expect("dispatch an unbuilt chord");
+
+            assert!(
+                app.unimplemented_action_notice.is_some(),
+                "{action:?} is marked unbuilt in the compiled table, but pressing its chord \
+                 did real work instead of answering as not implemented"
+            );
+        }
+    }
+
     fn press(
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,

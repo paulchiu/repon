@@ -212,6 +212,24 @@ pub(crate) const PERMANENTLY_UNBINDABLE: [(KeyCode, KeyModifiers); 3] = [
 /// asserts the two never drift apart. Rows built with [`binding_not_built`] are transcribed
 /// the same way from [keybindings.md#not-built-yet](../../../../docs/spec/keybindings.md#not-built-yet);
 /// `spec_conformance` is what checks those against that list.
+/// Every compiled row whose `built` flag is false, for the test that pins that flag to what
+/// `App` actually does on press.
+#[cfg(test)]
+pub(crate) fn unbuilt_bindings() -> Vec<(Context, KeyCode, KeyModifiers, Action)> {
+    BINDINGS
+        .iter()
+        .filter(|(_, _, _, _, built)| !built)
+        .map(|(context, code, modifiers, action, _)| (*context, *code, *modifiers, *action))
+        .collect()
+}
+
+/// How many rows the compiled table holds, so a scan over it can tell "nothing is unbuilt",
+/// this list's expected end state, from "the table was never read".
+#[cfg(test)]
+pub(crate) fn compiled_binding_count() -> usize {
+    BINDINGS.len()
+}
+
 const BINDINGS: &[Binding] = &[
     // global
     binding(Context::Global, KeyCode::Char('?'), NONE, Action::OpenHelp),
@@ -236,13 +254,13 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::EnterFilter,
     ),
-    binding_not_built(
+    binding(
         Context::Global,
         KeyCode::Char('r'),
         NONE,
         Action::RefreshAll,
     ),
-    binding_not_built(
+    binding(
         Context::Global,
         KeyCode::Char('R'),
         SHIFT,

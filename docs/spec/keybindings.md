@@ -121,12 +121,11 @@ Four bindings are already conditional in this way. While an Action is fanning ou
 
 ### Not built yet
 
-The bindings below are reserved and specified but not built: `crates/repon/src/keys.rs` marks each row's chord `built: false`, and `spec_conformance` reads this list at test time and asserts it matches that flag exactly, in both directions, so a row cannot go stale in either place without failing the build. The list shrinks to nothing as the features land.
+The bindings below are reserved and specified but not built: `crates/repon/src/keys.rs` marks each row's chord `built: false`, and `spec_conformance` reads this list at test time and asserts it matches that flag exactly, in both directions, so a row cannot go stale in either place without failing the build. That check alone would only hold this list and that flag to each other, so `every_unbuilt_binding_answers_on_press_as_not_implemented` presses every unbuilt row's chord and asserts it answers as not implemented, which pins the flag to what the code actually does. The reverse direction, a row marked built that does nothing, is not checked; it is the case the footer and the help overlay would advertise, which is [#119](https://github.com/paulchiu/repon/issues/119). The list shrinks to nothing as the features land.
 
 Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, and still answers on press with a "not implemented" warning rather than the silence [Built and available](#built-and-available) promises; wiring the footer, the help overlay and `dispatch` to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
 - `/` enter a Filter ([#63](https://github.com/paulchiu/repon/issues/63))
-- `r` refresh everything and `R` refresh the Selection ([#65](https://github.com/paulchiu/repon/issues/65))
 - `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
 - `d` dismiss a Vanished row
 - `n` and `N`, in `list` only, walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78)); `confirm` binds `n` to the unrelated Decline
