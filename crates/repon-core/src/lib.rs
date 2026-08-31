@@ -58,6 +58,7 @@ mod default_branch;
 mod discovery;
 mod entity;
 mod environment;
+mod executor;
 mod fanout;
 mod git;
 mod landing;

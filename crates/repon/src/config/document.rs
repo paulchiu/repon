@@ -1024,4 +1024,20 @@ mod tests {
             "config/example.toml has drifted from docs/spec/config.md's annotated example"
         );
     }
+
+    /// Issue #58, criterion 4's "no config key" half: the PTY is a fixed 120-column
+    /// constant, never a config key, and this crate already parses `[[action]]` into a
+    /// typed struct, so a width key would be a visible new field here. An exhaustive
+    /// destructure names every field `ActionConfig` has; a width field added under any
+    /// name fails to compile this test rather than landing unacknowledged inside `rest`.
+    #[test]
+    fn action_config_carries_no_pty_width_field_the_pty_is_a_fixed_constant_never_a_config_key() {
+        let loaded = parse_ok("[[action]]\nname = \"reinstall\"\n");
+        let ActionConfig { name: _, rest: _ } = loaded
+            .document
+            .actions
+            .into_iter()
+            .next()
+            .expect("one parsed [[action]] entry");
+    }
 }

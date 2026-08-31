@@ -283,4 +283,104 @@ mod tests {
              scan's input shrank"
         );
     }
+
+    // --- Issue #58: absence claims about an Action step's PTY-backed child. The executor
+    // itself lives in repon-core, but both crates spawn child processes (this one for
+    // Launchers), so a scan confined to one crate is exactly the defect this project keeps
+    // finding: "a check that quietly stops checking". Every line number reported below is
+    // `production_source_at`'s output with its own `//` comment lines filtered out too, so a
+    // doc comment explaining why a pattern must never appear can still name it.
+
+    /// Every workspace crate's own `src` directory a source-scan absence claim must cover,
+    /// derived from this crate's manifest dir rather than hard-coded twice, so a third
+    /// workspace crate would need adding here once, not once per scan.
+    fn workspace_crate_src_dirs() -> Vec<PathBuf> {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        vec![
+            manifest_dir.join("src"),
+            manifest_dir.join("../repon-core/src"),
+        ]
+    }
+
+    /// Every `path:line` across every workspace crate's `src` whose production source
+    /// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
+    /// naming the very pattern this scan bans does not trip it.
+    fn production_lines_containing(needle: &str) -> Vec<String> {
+        let mut offending = Vec::new();
+        for dir in workspace_crate_src_dirs() {
+            for path in rust_source_files(&dir) {
+                let production = production_source_at(&path);
+                for (number, line) in production.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if line.contains(needle) {
+                        offending.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+        offending
+    }
+
+    /// Criterion 1's absence half: `setsid` and Rust's safe `CommandExt::process_group` are
+    /// mutually exclusive (`setpgid` then `setsid` fails `EPERM`), so an Action step's child
+    /// must never use the latter. The needle is built from fragments so this test's own
+    /// source line is never a self-match, the same reason `repon-core`'s own
+    /// `gix_interrupt_is_interrupted_is_never_used` fragments its banned string.
+    #[test]
+    fn an_action_steps_child_never_uses_the_process_group_call_setsid_is_exclusive_with() {
+        let needle = format!("process_group{}", "(");
+
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found `{needle}`, which fails with EPERM alongside `setsid` and must never be \
+             used for an Action step's child (docs/spec/actions.md's \"The child\"), at: \
+             {offending:?}"
+        );
+    }
+
+    /// Criterion 3's absence half: a PTY already recovers colour with no help from the
+    /// child's environment, so none of the three variables that either force or strip it
+    /// belong in an Action step's environment.
+    #[test]
+    fn no_environment_variable_forces_or_strips_colour_for_an_action_step() {
+        let needles = [
+            format!("{}{}", "FORCE_COL", "OR"),
+            format!("{}{}", "CLICOLOR_F", "ORCE"),
+            format!("{}{}", "NO_COL", "OR"),
+        ];
+
+        for needle in needles {
+            let offending = production_lines_containing(&needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; neither CLICOLOR_FORCE=1 nor FORCE_COLOR=1 recovers colour \
+                 from a pipe and a PTY needs no help doing it, so none of the three belong in \
+                 an Action step's environment (docs/spec/actions.md's \"The PTY\"), at: \
+                 {offending:?}"
+            );
+        }
+    }
+
+    /// Criterion 8's absence half: there is no per-step timeout, configurable or fixed. The
+    /// needle is the `wait-timeout` crate's own method name with its call parenthesis, which
+    /// is specific enough to miss `repon-core`'s own, unrelated
+    /// `Condvar::wait_timeout_while` (the settle gate's deadline wait), a real false positive
+    /// a bare `wait_timeout` needle would have caught.
+    #[test]
+    fn no_per_step_timeout_wraps_waiting_for_an_action_steps_child() {
+        let needle = format!("wait_{}", "timeout(");
+
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found `{needle}`; a legitimate step can take minutes, so there is no per-step \
+             timeout, configurable or fixed, only per-step elapsed time \
+             (docs/spec/actions.md's \"Cancellation, suspend and quit\"), at: {offending:?}"
+        );
+    }
 }

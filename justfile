@@ -40,8 +40,7 @@ docs:
 # it is allowed, and the comparison set is derived from that pairing, so a crate
 # cannot be added here without recording why.
 #
-# Two later additions are already known and belong here when they land:
-#   - the PTY child, for setsid(2) and openpty(3)
+# One later addition is already known and belongs here when it lands:
 #   - the wire format, for the settled document on stdout
 # The terminal and rendering crates never belong here.
 check-core-isolation:
@@ -51,6 +50,7 @@ check-core-isolation:
         "crossbeam-channel:the fan-out result channel between rayon workers and the core"
         "globset:Set include/exclude glob matching in the discovery walk"
         "gix:the git backend this crate wraps"
+        "libc:setsid(2) and openpty(3) for an Action step's PTY-backed child, per ADR 0018"
         "rayon:the probe phases' worker pool"
     )
     allowed_names=()
