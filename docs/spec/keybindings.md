@@ -121,12 +121,11 @@ Four bindings are already conditional in this way. While an Action is fanning ou
 
 ### Not built yet
 
-The bindings below are reserved and specified but not built. Each is absent from the footer and the help overlay and inert on press. The list is checked by the `spec_conformance` test against the compiled table, so it cannot drift, and it shrinks to nothing as the features land.
+The bindings below are reserved and specified but not built. Each is absent from the footer and the help overlay and inert on press. The list shrinks to nothing as the features land. Nothing checks it against the compiled table yet, so it can drift and has ([#125](https://github.com/paulchiu/repon/issues/125)); until that lands, a binding leaving this list is a manual step in the change that builds it.
 
 - `/` enter a Filter ([#63](https://github.com/paulchiu/repon/issues/63))
 - `r` refresh everything and `R` refresh the Selection ([#65](https://github.com/paulchiu/repon/issues/65))
 - `b` re-derive default branches over the Selection ([#73](https://github.com/paulchiu/repon/issues/73))
-- `s` open the Set picker ([#94](https://github.com/paulchiu/repon/issues/94))
 - `d` dismiss a Vanished row
 - `n` and `N` walk the rows whose last Action failed ([#78](https://github.com/paulchiu/repon/issues/78))
 - `Ctrl+D`, `PageDown`, `Ctrl+U` and `PageUp` in `list` only; the same chords in `detail` and `overlay` are built
