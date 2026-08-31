@@ -6,10 +6,18 @@
 //! `docs/spec/refresh.md`'s "The periodic fetch" and
 //! [ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)'s
 //! "The read-only invariant is scoped to the probe path".
+//!
+//! [`probe_remote_head`] is this module's one read-only export, used by
+//! `docs/spec/default-branch.md`'s "The network": the handshake alone
+//! ([`gix::Remote::connect`] then [`gix::remote::Connection::ref_map`]), never
+//! [`fetch_and_prune`]'s own pack transfer or prune, which is what lets a
+//! user-triggered re-derive run it without fetching anything.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
+
+use gix::bstr::ByteSlice;
 
 /// Why one repository's fetch attempt produced nothing to apply.
 #[derive(Debug, Clone)]
@@ -52,6 +60,122 @@ fn refuse_credentials(
     Ok(None)
 }
 
+/// The remote's own advertised HEAD, read from a fetch handshake's ref-map alone
+/// (`docs/spec/default-branch.md`'s "The network"): never a probe result the
+/// local chain would itself produce, since only a live remote can answer it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdvertisedDefaultBranch {
+    /// The remote's `HEAD` is symbolic and names a branch, formatted
+    /// `<remote>/<branch>` to match [`crate::default_branch::resolve`]'s own
+    /// local rungs, so the two answers are always directly comparable.
+    Branch(String),
+    /// `handshake::Ref::Unborn`: the remote exists but has no branches yet, not
+    /// an error and never an answer to supersede a local one with.
+    Unborn,
+}
+
+/// The outcome of one [`fetch_and_prune`] call: how many stale remote-tracking
+/// refs it deleted, and the remote's own advertised HEAD, read from the same
+/// handshake this fetch already paid for.
+#[derive(Debug)]
+pub(crate) struct FetchOutcome {
+    pub(crate) pruned: usize,
+    pub(crate) advertised_default_branch: Option<AdvertisedDefaultBranch>,
+}
+
+/// The `HEAD` refspec every default-branch network lookup adds to its own
+/// handshake: an owned copy, since [`gix::remote::ref_map::Options::extra_refspecs`]
+/// takes ownership and every caller below needs its own.
+fn head_refspec() -> gix::refspec::RefSpec {
+    gix::refspec::parse("HEAD".into(), gix::refspec::parse::Operation::Fetch)
+        .expect("\"HEAD\" is a valid refspec")
+        .to_owned()
+}
+
+/// [`gix::remote::Connection::ref_map`] and [`gix::remote::Connection::prepare_fetch`]'s
+/// shared options: `extra_refspecs: ["HEAD"]` is what makes the server advertise `HEAD`
+/// at all, per `docs/spec/default-branch.md`'s "The network": the default
+/// `prefix_from_spec_as_filter_on_remote: true` derives a `refs/heads/` ref-prefix filter
+/// from the standard refspec alone, which the server then applies before `HEAD` is ever
+/// considered.
+fn head_ref_map_options() -> gix::remote::ref_map::Options {
+    gix::remote::ref_map::Options {
+        extra_refspecs: vec![head_refspec()],
+        ..Default::default()
+    }
+}
+
+/// Extracts the remote's own advertised `HEAD` from `ref_map`'s unfiltered
+/// `remote_refs`, present only because [`head_ref_map_options`]'s extra `HEAD`
+/// refspec is what makes the server actually send it. Formats a resolved branch
+/// exactly like [`crate::default_branch::resolve`]'s own local rungs.
+fn advertised_default_branch(
+    remote_name: &str,
+    ref_map: &gix::remote::fetch::RefMap,
+) -> Option<AdvertisedDefaultBranch> {
+    ref_map
+        .remote_refs
+        .iter()
+        .find_map(|reference| match reference {
+            gix::protocol::handshake::Ref::Symbolic {
+                full_ref_name,
+                target,
+                ..
+            } if full_ref_name == "HEAD" => {
+                let branch = target
+                    .strip_prefix(b"refs/heads/")
+                    .unwrap_or(target.as_slice());
+                Some(AdvertisedDefaultBranch::Branch(format!(
+                    "{remote_name}/{}",
+                    branch.to_str_lossy()
+                )))
+            }
+            gix::protocol::handshake::Ref::Unborn { full_ref_name, .. }
+                if full_ref_name == "HEAD" =>
+            {
+                Some(AdvertisedDefaultBranch::Unborn)
+            }
+            _ => None,
+        })
+}
+
+/// Reads `path`'s fetch-default remote's own advertised `HEAD` via a fetch
+/// handshake alone, per `docs/spec/default-branch.md`'s "A user-triggered
+/// re-derive over the Selection ... on demand": [`gix::remote::Connection::ref_map`]
+/// performs the handshake and lists the remote's refs, but transfers no pack and
+/// updates no ref, which is what makes this safe to run without
+/// [`fetch_and_prune`]'s own mutation. `Ok(None)` covers no remote to ask, or one
+/// gix's own fetch-default choice refuses to guess between, the same convention
+/// [`fetch_and_prune`] already uses. Fails closed on a credential prompt exactly
+/// as [`fetch_and_prune`] does, via the same [`refuse_credentials`].
+pub(crate) fn probe_remote_head(
+    path: &Path,
+) -> Result<Option<AdvertisedDefaultBranch>, FetchError> {
+    let repo = gix::open(path).map_err(|error| FetchError::Open(error.to_string()))?;
+
+    let remote_name = match repo.remote_default_name(gix::remote::Direction::Fetch) {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+    let remote = repo
+        .find_remote(&*remote_name)
+        .map_err(|error| FetchError::Connect(error.to_string()))?;
+
+    let connection = remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(|error| FetchError::Connect(error.to_string()))?
+        .with_credentials(refuse_credentials);
+
+    let (ref_map, _handshake) = connection
+        .ref_map(gix::progress::Discard, head_ref_map_options())
+        .map_err(|error| FetchError::Connect(error.to_string()))?;
+
+    Ok(advertised_default_branch(
+        &remote_name.to_string(),
+        &ref_map,
+    ))
+}
+
 /// Fetches `path`'s fetch-default remote with pruning, cancellable through
 /// `cancel` the same way a probe is
 /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
@@ -65,18 +189,31 @@ fn refuse_credentials(
 /// pack is written to the object database and refs are updated, exactly the two things
 /// a plain `git fetch --prune` also does.
 ///
-/// Returns the number of stale remote-tracking refs this call deleted, `Ok(0)`
-/// covering both "nothing was stale" and "there was no remote to fetch at all".
-/// A repository whose remote gix's own fetch-default choice refuses to guess
-/// between (two or more remotes, none named `origin`) is treated the same way,
-/// the identical refusal [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)
+/// Returns how many stale remote-tracking refs this call deleted and the
+/// remote's own advertised HEAD, read from the same handshake this fetch
+/// already pays for ([`head_ref_map_options`], `docs/spec/default-branch.md`'s
+/// "The network": "the remote's answer arrives inside a round trip already
+/// being paid for"). `pruned: 0` covers both "nothing was stale" and "there was
+/// no remote to fetch at all", the latter also leaving
+/// `advertised_default_branch: None`. A repository whose remote gix's own
+/// fetch-default choice refuses to guess between (two or more remotes, none
+/// named `origin`) is treated the same way, the identical refusal
+/// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)
 /// already lives with for the default branch chain.
-pub(crate) fn fetch_and_prune(path: &Path, cancel: &AtomicBool) -> Result<usize, FetchError> {
+pub(crate) fn fetch_and_prune(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<FetchOutcome, FetchError> {
     let repo = gix::open(path).map_err(|error| FetchError::Open(error.to_string()))?;
 
     let remote_name = match repo.remote_default_name(gix::remote::Direction::Fetch) {
         Some(name) => name,
-        None => return Ok(0),
+        None => {
+            return Ok(FetchOutcome {
+                pruned: 0,
+                advertised_default_branch: None,
+            });
+        }
     };
     let remote = repo
         .find_remote(&*remote_name)
@@ -88,14 +225,21 @@ pub(crate) fn fetch_and_prune(path: &Path, cancel: &AtomicBool) -> Result<usize,
         .with_credentials(refuse_credentials);
 
     let prepare = connection
-        .prepare_fetch(gix::progress::Discard, Default::default())
+        .prepare_fetch(gix::progress::Discard, head_ref_map_options())
         .map_err(|error| FetchError::Connect(error.to_string()))?;
 
     let outcome = prepare
         .receive(gix::progress::Discard, cancel)
         .map_err(|error| FetchError::Receive(error.to_string()))?;
 
-    prune_stale_remote_tracking_refs(&repo, &remote_name.to_string(), &outcome.ref_map)
+    let advertised_default_branch =
+        advertised_default_branch(&remote_name.to_string(), &outcome.ref_map);
+    let pruned =
+        prune_stale_remote_tracking_refs(&repo, &remote_name.to_string(), &outcome.ref_map)?;
+    Ok(FetchOutcome {
+        pruned,
+        advertised_default_branch,
+    })
 }
 
 /// Deletes every loose or packed ref under `refs/remotes/<remote>/` that this
@@ -209,9 +353,9 @@ mod tests {
 
         git(remote.path(), &["branch", "-D", "topic"]);
 
-        let pruned = fetch_and_prune(clone.path(), &never_cancelled()).expect("fetch and prune");
+        let outcome = fetch_and_prune(clone.path(), &never_cancelled()).expect("fetch and prune");
         assert_eq!(
-            pruned, 1,
+            outcome.pruned, 1,
             "exactly the one stale ref must be reported pruned"
         );
         assert!(
@@ -449,6 +593,142 @@ mod tests {
             peak.load(Ordering::SeqCst),
             concurrency,
             "the bound must actually be reached, not merely never exceeded"
+        );
+    }
+
+    // --- `probe_remote_head`: the handshake alone, criterion 1 ---
+
+    /// Sets `path`'s own `HEAD` (a bare repo, so this is the "remote"'s advertised answer,
+    /// not a local cache) to point at `branch` without checking it out.
+    fn set_remote_head(path: &std::path::Path, branch: &str) {
+        git(
+            path,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+    }
+
+    /// Criterion 1's "asks for the extra HEAD reference during the handshake", proven by a
+    /// mutation this test would otherwise never catch: the clone's own cached
+    /// `refs/remotes/origin/HEAD` still names `main`, the branch it was cloned with, so an
+    /// answer of `origin/trunk` can only have come from actually asking the remote, not from
+    /// rereading anything already on disk. Also the symbolic half of criterion 1's "both the
+    /// symbolic and unborn advertised forms". Removing `extra_refspecs: ["HEAD"]` from
+    /// [`head_ref_map_options`] makes the server's `ls-refs` response never mention `HEAD` at
+    /// all (the standard refspec's own prefix filter derives `refs/heads/`), which turns this
+    /// assertion into `None` rather than `Some(Branch(..))`: that is the mutation this test is
+    /// chosen to catch.
+    #[test]
+    fn probe_remote_head_reports_the_remotes_own_current_symbolic_answer_not_the_clones_cache() {
+        let (remote, clone) = remote_and_clone();
+        git(remote.path(), &["branch", "trunk"]);
+        set_remote_head(remote.path(), "trunk");
+
+        let answer = probe_remote_head(clone.path()).expect("probe the remote's head");
+
+        assert_eq!(
+            answer,
+            Some(AdvertisedDefaultBranch::Branch("origin/trunk".to_string())),
+            "the clone's own cached origin/HEAD still names main; this answer can only have \
+             come from the handshake actually asking the remote for its current HEAD"
+        );
+    }
+
+    /// Criterion 1's unborn half: a remote with no commits yet advertises `HEAD` as
+    /// `handshake::Ref::Unborn`, not an error and not a `Branch` answer to supersede a local
+    /// chain with, per ADR 0012.
+    #[test]
+    fn probe_remote_head_reports_unborn_for_a_remote_with_no_commits_yet() {
+        let remote = tempfile::tempdir().expect("temp dir");
+        crate::test_support::init_bare(remote.path());
+
+        let clone = tempfile::tempdir().expect("temp dir");
+        git(clone.path(), &["init", "--initial-branch=main"]);
+        crate::test_support::set_identity(clone.path());
+        git(
+            clone.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &remote.path().display().to_string(),
+            ],
+        );
+
+        let answer = probe_remote_head(clone.path()).expect("probe the remote's head");
+
+        assert_eq!(
+            answer,
+            Some(AdvertisedDefaultBranch::Unborn),
+            "a remote with no commits at all must report Unborn, not an error"
+        );
+    }
+
+    /// Criterion 1's "fails closed on credentials", mirroring
+    /// `a_fetch_against_a_remote_needing_a_credential_helper_fails_rather_than_prompts`
+    /// exactly, for `probe_remote_head` rather than `fetch_and_prune`: the same `.invalid`
+    /// host routes through gix's own credential-resolution path with no real network I/O,
+    /// and the same bounded channel turns a regression back to prompting into a failed
+    /// assertion rather than a hang.
+    #[test]
+    fn probe_remote_head_against_a_remote_needing_a_credential_helper_fails_rather_than_prompts() {
+        let clone = tempfile::tempdir().expect("temp dir");
+        git(clone.path(), &["init", "--initial-branch=main"]);
+        commit_file(clone.path(), "README.md", "seed\n");
+        git(
+            clone.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://askpass-required.invalid/example.git",
+            ],
+        );
+        let (tx, rx) = mpsc::channel();
+        let path = clone.path().to_path_buf();
+        std::thread::spawn(move || {
+            let result = probe_remote_head(&path);
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a lookup that fails closed must return, never hang, on a credential prompt");
+        assert!(
+            result.is_err(),
+            "a remote this sandbox cannot reach must fail rather than succeed"
+        );
+    }
+
+    /// Criterion 2's first absence claim: the network's answer is held in memory only and
+    /// never written back to `refs/remotes/<remote>/HEAD`. Asserts the on-disk file is
+    /// byte-identical after the lookup, not merely that the returned session value is right,
+    /// per the standing note that the weaker check would still pass a regression that wrote
+    /// the answer back.
+    #[test]
+    fn probe_remote_head_never_writes_the_answer_back_to_the_local_origin_head_file() {
+        let (remote, clone) = remote_and_clone();
+        git(remote.path(), &["branch", "trunk"]);
+        set_remote_head(remote.path(), "trunk");
+        let head_path = clone
+            .path()
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin")
+            .join("HEAD");
+        let before = std::fs::read(&head_path).expect("read origin/HEAD before the lookup");
+
+        let answer = probe_remote_head(clone.path()).expect("probe the remote's head");
+        assert_eq!(
+            answer,
+            Some(AdvertisedDefaultBranch::Branch("origin/trunk".to_string())),
+            "the lookup must still have reached the remote's own differing answer"
+        );
+
+        let after = std::fs::read(&head_path).expect("read origin/HEAD after the lookup");
+        assert_eq!(
+            before, after,
+            "a lookup that landed a differing network answer must never write it back to the \
+             local origin/HEAD file"
         );
     }
 }

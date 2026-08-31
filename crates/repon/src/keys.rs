@@ -266,7 +266,7 @@ const BINDINGS: &[Binding] = &[
         SHIFT,
         Action::RefreshSelection,
     ),
-    binding_not_built(
+    binding(
         Context::Global,
         KeyCode::Char('b'),
         NONE,
@@ -2189,26 +2189,27 @@ mod tests {
     /// binding is ignored outright, leaving the action's reserved chord exactly as
     /// unreachable as it was before this entry was ever read.
     ///
-    /// Picks whichever Global action is currently unbuilt off [`unbuilt_bindings`] rather
-    /// than naming one, so this keeps checking the real thing as bindings move from unbuilt
-    /// to built over time instead of drifting onto an action that has since shipped.
+    /// Picks whichever action is currently unbuilt in any context off [`unbuilt_bindings`]
+    /// rather than naming one, so this keeps checking the real thing as bindings move from
+    /// unbuilt to built over time instead of drifting onto an action that has since shipped.
+    /// Not pinned to `Global` specifically: that context can run dry (as it did once `b`
+    /// was built), while `List` still carries `d` and the List-only half of the page
+    /// bindings.
     #[test]
     fn a_known_action_that_is_not_built_yet_warns_saying_so_rather_than_unknown_and_is_ignored() {
-        let (unbuilt_context, unbuilt_code, unbuilt_modifiers, unbuilt_action) = unbuilt_bindings()
-            .into_iter()
-            .find(|(context, ..)| *context == Context::Global)
-            .expect(
-                "expected at least one currently-unbuilt Global action to test this \
-                     criterion against",
+        let (unbuilt_context, unbuilt_code, unbuilt_modifiers, unbuilt_action) =
+            unbuilt_bindings().into_iter().next().expect(
+                "expected at least one currently-unbuilt action to test this criterion against",
             );
-        let action_name = action_name(unbuilt_action)
-            .expect("an unbuilt Global action must still have a config name");
+        let action_name =
+            action_name(unbuilt_action).expect("an unbuilt action must still have a config name");
+        let context_name_text = context_name(unbuilt_context);
 
-        let (bindings, warnings) = merge_ok(&[("global", &[(action_name, "f5")])]);
+        let (bindings, warnings) = merge_ok(&[(context_name_text, &[(action_name, "f5")])]);
         assert_eq!(
             warnings,
             vec![KeysWarning::NotBuilt {
-                context: "global".to_string(),
+                context: context_name_text.to_string(),
                 action: action_name.to_string(),
             }]
         );
@@ -2222,7 +2223,7 @@ mod tests {
             "must not read as an unknown action, got: {message:?}"
         );
         assert_eq!(
-            bindings.dispatch(Context::Global, press(KeyCode::F(5), NONE)),
+            bindings.dispatch(unbuilt_context, press(KeyCode::F(5), NONE)),
             None,
             "the ignored binding must never dispatch"
         );
