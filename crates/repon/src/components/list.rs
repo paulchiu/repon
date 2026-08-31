@@ -29,6 +29,11 @@ const SYNC_WIDTH: u16 = 9;
 const BASE_WIDTH: u16 = 6;
 const DIRTY_WIDTH: u16 = 6;
 const STATE_WIDTH: u16 = 10;
+/// A detached row's branch cell shows the commit's object id abbreviated to this many
+/// characters, fixed rather than the repository's own `core.abbrev`, which scales with
+/// object count and would make a mixed list ragged
+/// ([head.md](../../../../docs/spec/head.md)'s "The branch cell").
+const BRANCH_CELL_OBJECT_ID_WIDTH: usize = 9;
 /// The single-space gap [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)
 /// puts between every column, gutter included.
 const GAP: u16 = 1;
@@ -678,12 +683,26 @@ fn cell_role<T>(
     }
 }
 
+/// The one rule for every detached row, Repo, Worktree or Submodule alike
+/// (ADR 0019, head.md's "The branch cell"): the bare abbreviated object id, no marker
+/// word and no prefix, taking the same text role every other shape of this cell does
+/// (`draw_row`'s branch cell always resolves `Meaning::FreshValue`), so colour never
+/// carries the distinction between a branch name and an id. That an object id is
+/// itself a legal git branch name is an accepted cost recorded in ADR 0019: the
+/// detail pane, which shows the full id rather than this abbreviation, is the only
+/// discriminator. A reflog-based recovery of the branch a detached HEAD came from was
+/// measured and rejected in the same ADR; no such recovery exists anywhere in this
+/// workspace.
 fn format_head(cell: &Cell<Head>, loading_glyph: Option<char>) -> String {
     render_cell(
         cell.settled(),
         |value| match value {
             Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
-            Head::Detached(oid) => oid.to_string().chars().take(7).collect(),
+            Head::Detached(oid) => oid
+                .to_string()
+                .chars()
+                .take(BRANCH_CELL_OBJECT_ID_WIDTH)
+                .collect(),
         },
         loading_glyph,
     )
@@ -1022,13 +1041,14 @@ mod tests {
 
     /// Inits a real disposable git repository at `path` on a named branch with no commit
     /// at all, so `HEAD` is unborn: the one HEAD shape [`repon_core`]'s `base` cell can
-    /// never compute a count for (there is no commit to compare), so it stays `None`
-    /// forever even after every other cell this codebase probes has settled. Carries a
-    /// real (unreachable) remote, never touched over the network, so `base`'s own "no
-    /// remote at all" exemption does not short-circuit ahead of the unborn-HEAD case this
-    /// fixture means to exercise; `sync` reads that same remote's absence of an upstream
-    /// on this branch, not the no-remote case, which is why it settles `-` rather than `∅`
-    /// here. The same real-repo pattern as [`init_repo_on_branch`], minus the commit.
+    /// never compute a count for (there is no commit to compare from), so it settles Not
+    /// applicable rather than a real count. Carries a real (unreachable) remote, never
+    /// touched over the network, so `base`'s own "no remote at all" exemption does not
+    /// short-circuit ahead of the unborn-HEAD case this fixture means to exercise: without
+    /// it, base's Not applicable would be ambiguous between the two reasons. `sync` reads
+    /// that same remote's absence of an upstream on this branch, not the no-remote case,
+    /// which is why it settles `-` rather than `∅` here. The same real-repo pattern as
+    /// [`init_repo_on_branch`], minus the commit.
     fn init_unborn_repo_on_branch(path: &Path, branch: &str) {
         std::fs::create_dir_all(path).expect("create repo dir");
         let status = std::process::Command::new("git")
@@ -1054,12 +1074,11 @@ mod tests {
 
     /// A real, settled `Snapshot` off a real disposable repo with an unborn `HEAD`, whose
     /// `default_branch` still settles `Known` via a rung-1 `RepoOverride` rather than the
-    /// repo's own (real but unreachable) remote. `branch`, `sync`, `dirty` and
-    /// `default_branch` all settle normally on an unborn HEAD; `state` is `NotApplicable`
-    /// by kind (a Repo row); `base` alone has no commit to count behind anything and stays
-    /// `None` forever, which is exactly the "outstanding cell beside settled ones" shape
-    /// these tests exercise: a row that holds some values while one is still, and always
-    /// will be, outstanding.
+    /// repo's own (real but unreachable) remote, so `base` reaches its own Unborn branch
+    /// rather than propagating an Unknown default branch instead. `branch`, `sync`,
+    /// `dirty` and `default_branch` all settle normally on an unborn HEAD; `state` is
+    /// `NotApplicable` by kind (a Repo row); `base` is `NotApplicable` too, because there
+    /// is no commit to compare from (head.md's "The unborn row").
     fn settled_snapshot_with_a_resolvable_default_branch(branch: &str) -> repon_core::Snapshot {
         use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
         use std::time::Duration;
@@ -1372,18 +1391,26 @@ mod tests {
         );
     }
 
-    // --- Criteria 1 and 2: the cheap columns land while the outstanding ones spin ---
+    // --- Criteria 1 and 2: the cheap columns land, and an unborn row's base settles ---
 
     /// Criterion 1 and criterion 2's "partial" case together, on a real probed row: the name
-    /// and branch (the cheap columns) already show through, `sync` and `dirty` both show
-    /// their settled values (a clean working tree, for `dirty`), and `base` (the one column
-    /// no probe has reached, in this codebase's current scope) shows the loading mark rather
-    /// than sitting blank or reading a raw zero. The gutter shows the row's least-settled
-    /// *settled* state (Fresh, a blank space) rather than `?`: the sanity check above rules
-    /// out a version of this test that would pass merely because `default_branch` happened
-    /// to read Unknown for an unrelated reason (no remote to resolve rung 2/3 against).
+    /// and branch (the cheap columns) already show through, and `sync` and `dirty` both show
+    /// their settled values (a clean working tree, for `dirty`). The gutter shows the row's
+    /// least-settled *settled* state (Fresh, a blank space) rather than `?`: the sanity check
+    /// above rules out a version of this test that would pass merely because `default_branch`
+    /// happened to read Unknown for an unrelated reason (no remote to resolve rung 2/3
+    /// against).
+    ///
+    /// Criterion 4's own claim rides along on the same row: `base` on an unborn HEAD settles
+    /// Not applicable and renders blank, because there is no commit to compare from, which is
+    /// distinct from having no answer (head.md's "The unborn row"). The mutation this rules
+    /// out is `base` staying unsettled and showing the loading mark forever, which is what
+    /// this codebase drew before this ticket's fix; a version of `base::probe` that returned
+    /// `Unknown` instead of `NotApplicable` for an unborn HEAD would also fail this, since
+    /// `Unknown` renders blank too but is a different word in the detail pane and a different
+    /// gutter mark once nothing else masks it.
     #[test]
-    fn an_outstanding_status_cell_shows_the_loading_mark_once_the_row_holds_other_values() {
+    fn an_unborn_rows_base_settles_not_applicable_and_renders_blank_rather_than_spinning() {
         let snapshot = settled_snapshot_with_a_resolvable_default_branch("main");
         assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
         assert_eq!(
@@ -1391,18 +1418,26 @@ mod tests {
             RowSummary::Fresh,
             "sanity check: branch and default_branch must both have settled Known already"
         );
+        assert!(
+            matches!(
+                snapshot.entities[0].base.settled(),
+                Some(repon_core::Settled::NotApplicable)
+            ),
+            "sanity check: base's own settled shape must be Not applicable, not Unknown, so \
+             this test proves the criterion rather than merely a shape that also renders \
+             blank"
+        );
         let name = snapshot.entities[0].name.to_string();
 
         let terminal = render(140, 24, &snapshot);
         let buf = terminal.backend().buffer();
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
-        let frame = glyphs.loading[0].to_string();
 
         assert_eq!(
             cell_text(buf, 1, 2, 1),
             " ",
-            "the gutter must show the row's least-settled settled state, not the outstanding \
-             cells' own loading mark"
+            "the gutter must show the row's least-settled settled state, not an outstanding \
+             cell's own loading mark"
         );
         assert_eq!(cell_text(buf, 3, 2, name.len() as u16), name);
         assert_eq!(cell_text(buf, 32, 2, 4), "main");
@@ -1413,10 +1448,10 @@ mod tests {
              so it must show its settled value rather than a loading mark"
         );
         assert_eq!(
-            cell_text(buf, 67, 2, 1),
-            frame,
-            "base is probed too, but an unborn HEAD has no commit to count behind anything, \
-             so it stays outstanding and must show the loading mark"
+            cell_text(buf, 67, 2, BASE_WIDTH),
+            " ".repeat(BASE_WIDTH as usize),
+            "base is Not applicable on an unborn HEAD and must render blank, never the \
+             loading mark and never a raw zero"
         );
         assert_eq!(
             cell_text(buf, 74, 2, 1),
@@ -1448,14 +1483,16 @@ mod tests {
         }
     }
 
-    /// The transition itself, criterion 2's substance: one render, two rows, each computed
-    /// independently. The first holds no value at all (gutter spinner, blank cells); the
-    /// second already holds values with one column still outstanding (blank gutter, that
-    /// column's own spinner). Proving both shapes in the same frame is what rules out a
-    /// single, row-independent "the table is busy" flag: each row's gutter and cells answer
-    /// from that row's own summary, not from whether *some* row somewhere is still loading.
+    /// One render, two rows, each computed independently. The first holds no value at all
+    /// (gutter spinner, every cell blank); the second is fully settled, including a
+    /// Not-applicable `base` on its unborn HEAD, and shows no spinner anywhere, not even on
+    /// that cell. Proving both shapes in the same frame is what rules out a single,
+    /// row-independent "the table is busy" flag: each row's gutter and cells answer from that
+    /// row's own summary, not from whether *some* row somewhere is still loading. The
+    /// mutation this rules out is a stray loading mark leaking from row 1 onto row 2's own
+    /// settled `base` cell.
     #[test]
-    fn two_rows_in_one_render_show_the_spinner_in_different_places_never_a_single_shared_one() {
+    fn two_rows_in_one_render_are_computed_independently_and_no_spinner_leaks_across_rows() {
         let never_probed = entity("never-probed");
         let settled = settled_snapshot_with_a_resolvable_default_branch("main")
             .entities
@@ -1473,10 +1510,10 @@ mod tests {
         assert_eq!(cell_text(buf, 1, 2, 1), frame);
         assert_eq!(cell_text(buf, 67, 2, 1), " ");
 
-        // Row 2 (y=3): holds values, so the gutter is blank (Fresh) and the outstanding
-        // `base` column spins instead.
+        // Row 2 (y=3): fully settled, so the gutter is blank (Fresh) and `base` (Not
+        // applicable on this unborn HEAD) renders blank too, never row 1's own spinner.
         assert_eq!(cell_text(buf, 1, 3, 1), " ");
-        assert_eq!(cell_text(buf, 67, 3, 1), frame);
+        assert_eq!(cell_text(buf, 67, 3, 1), " ");
     }
 
     // --- Criteria 4 and 5: the mark moves, including on an already-populated row ---
@@ -1549,23 +1586,19 @@ mod tests {
         );
     }
 
-    /// Criterion 5, the criterion the whole ticket exists for, and its own stated trap: a
-    /// worthless version would start from an empty table, where anything looks like progress.
-    /// This starts from a row that already shows its name, its branch and its default branch
-    /// (everything this codebase's `Core::refresh` probes today, "a fully-populated table" in
-    /// its current scope) rather than a freshly discovered one, and proves the still-outstanding
-    /// `base` column animates across two ticks of the *same* row, the shape the predecessor's
-    /// recorded defect describes: "a measured 4.02 second refresh sampled 55 times with not
-    /// one spinner frame on any row". No sleeping: `started_at` moves by arithmetic, not by
-    /// waiting, so this cannot flake on a loaded runner.
+    /// A row that already shows its cheap columns must still animate the cell it is waiting
+    /// on, never a static screen. Until this ticket an unborn Repo's `base` supplied that
+    /// fixture by accident, because it never settled at all; settling it Not applicable
+    /// closed the last cell that stays outstanding forever. The state itself is not gone,
+    /// it is the ordinary one on first load, where the cheap columns land before the
+    /// expensive ones, so the fixture is now built rather than found.
     #[test]
     fn a_row_that_already_shows_its_cheap_columns_still_animates_its_outstanding_cell_on_refresh() {
-        let snap = settled_snapshot_with_a_resolvable_default_branch("main");
-        assert_eq!(
-            repon_core::summary(&snap.entities[0]),
-            RowSummary::Fresh,
-            "sanity check: this row must already be fully populated in this codebase's \
-             current scope before the real claim below means anything"
+        let mut snap = settled_snapshot_with_a_resolvable_default_branch("main");
+        snap.entities[0].base = repon_core::Cell::default();
+        assert!(
+            snap.entities[0].base.settled().is_none(),
+            "sanity check: the claim below is about a cell with nothing settled in it yet"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
 
@@ -2570,7 +2603,7 @@ mod tests {
     /// A real disposable repo, committed, then checked out detached at that same commit:
     /// the shape every Submodule in the measured population is in
     /// (`docs/spec/discovery.md`'s "The Submodule row": "all 16 initialised Submodules...
-    /// are at a detached HEAD"). Returns the commit's abbreviated id, seven characters,
+    /// are at a detached HEAD"). Returns the commit's abbreviated id, nine characters,
     /// matching `format_head`'s own truncation, so a test can assert the exact text a real
     /// probe settles rather than merely "some hex string".
     fn init_detached_repo_with_a_commit(path: &Path) -> String {
@@ -2619,7 +2652,7 @@ mod tests {
             .status()
             .expect("run git checkout --detach");
         assert!(status.success());
-        sha.chars().take(7).collect()
+        sha.chars().take(BRANCH_CELL_OBJECT_ID_WIDTH).collect()
     }
 
     /// A real, settled `Snapshot` off one Repo with a linked Worktree and a real,
@@ -2807,7 +2840,7 @@ mod tests {
 
     /// Criterion 3's positive cells, at the list level rather than the detail pane: a real,
     /// initialised, detached Submodule renders its relative path as the name, a
-    /// seven-character object id in branch, `-` (no upstream) in sync, and blank base and
+    /// nine-character object id in branch, `-` (no upstream) in sync, and blank base and
     /// state.
     #[test]
     fn a_shown_submodules_row_renders_its_path_a_short_id_and_blank_base_and_state() {
@@ -2826,9 +2859,14 @@ mod tests {
             "expected the submodule's declared relative path as its name"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(BRANCH_X), y, 7),
+            cell_text(
+                buf,
+                absolute_x(BRANCH_X),
+                y,
+                BRANCH_CELL_OBJECT_ID_WIDTH as u16
+            ),
             short_id,
-            "expected the real commit's own seven-character abbreviated id in branch"
+            "expected the real commit's own nine-character abbreviated id in branch"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         assert_eq!(
@@ -2992,6 +3030,516 @@ mod tests {
         assert_eq!(
             CHILD_ROW_NAME_WIDTH, budget,
             "the child name budget must match the ADR's own figure"
+        );
+    }
+
+    // --- Criterion 6: the acceptance fixture mixing every HEAD shape at once ---
+
+    fn rev_parse(path: &Path, rev: &str) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("run git rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string()
+    }
+
+    fn commit_allow_empty(path: &Path, message: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "--allow-empty", "-m", message])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+    }
+
+    /// Every id this fixture's caller needs to assert against: each is a real, freshly
+    /// computed commit id no literal could predict, abbreviated to the branch cell's own
+    /// nine-character width.
+    struct HeadShapeMatrixIds {
+        manage_detached_id: String,
+        pr_920_detached_id: String,
+        vendor_lib_detached_id: String,
+    }
+
+    /// The acceptance fixture criterion 6 asks for: an attached row (`feature-worktree`), two
+    /// detached rows across two different kinds (`manage`, a Repo, and `pr-920`, a Worktree),
+    /// an initialised Submodule (`vendor/lib`, detached too, the fourth shape reaching the
+    /// same rendering by a different route per ADR 0019) and an unborn row (`brand-new`), all
+    /// discovered together and rendered in one frame.
+    ///
+    /// Commit graph on `manage`: `C1` ("first") is `main`'s root. `feature` branches from
+    /// `C1`, and `feature-worktree` (a linked Worktree on it) commits `C2`. `manage`'s own
+    /// primary working copy, still on `main` at `C1`, then commits `C3`: `feature` (`C2`) and
+    /// `main` (`C3`) diverge, siblings of `C1`, neither an ancestor of the other, so
+    /// `feature-worktree` reads Local only (no upstream configured), one commit behind `main`.
+    /// `manage` itself is then checked out detached at `C1`, one commit behind `main`'s new
+    /// tip. `pr-920`, a second Worktree, is detached at `main`'s tip `C3` itself: an ancestor
+    /// of its own commit (Merged) and level with it (zero behind).
+    fn settled_snapshot_for_the_head_shape_matrix() -> (repon_core::Snapshot, HeadShapeMatrixIds) {
+        use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let manage = root.join("manage");
+
+        init_repo_on_branch(&manage, "main");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/manage.git",
+            ])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+        let c1 = rev_parse(&manage, "HEAD");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args(["branch", "feature"])
+            .status()
+            .expect("run git branch feature");
+        assert!(status.success());
+
+        let feature_worktree = root.join("feature-worktree");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args([
+                "worktree",
+                "add",
+                feature_worktree.to_str().expect("utf8 path"),
+                "feature",
+            ])
+            .status()
+            .expect("run git worktree add");
+        assert!(status.success());
+        commit_allow_empty(&feature_worktree, "feature work");
+        // An untracked file, so `feature-worktree`'s own dirty count is nonzero, alongside
+        // `pr-920`'s and `manage`'s own clean ones, exercising both `dirty` values in the
+        // matrix.
+        std::fs::write(feature_worktree.join("untracked.txt"), "x").expect("write untracked file");
+
+        commit_allow_empty(&manage, "main moved on");
+        let c3 = rev_parse(&manage, "HEAD");
+        // A real remote-tracking ref rather than a config override: rung 1's own override
+        // would qualify a bare name against `manage`'s configured remote (`origin/main`),
+        // which then has to actually resolve once `state` and `base` need a real commit to
+        // compare against, unlike the unborn fixture elsewhere in this module, whose Unborn
+        // branch returns before ever reaching that resolution.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args(["update-ref", "refs/remotes/origin/main", &c3])
+            .status()
+            .expect("run git update-ref");
+        assert!(status.success());
+
+        let pr_920 = root.join("pr-920");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                pr_920.to_str().expect("utf8 path"),
+                &c3,
+            ])
+            .status()
+            .expect("run git worktree add --detach");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&manage)
+            .args(["checkout", "--quiet", "--detach", &c1])
+            .status()
+            .expect("run git checkout --detach");
+        assert!(status.success());
+
+        write_gitmodules(&manage, "lib", "vendor/lib");
+        let vendor_lib_detached_id =
+            init_detached_repo_with_a_commit(&manage.join("vendor").join("lib"));
+
+        let brand_new = root.join("brand-new");
+        init_unborn_repo_on_branch(&brand_new, "main");
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: vec![RepoOverride {
+                path: brand_new.clone(),
+                default_branch: Some("main".to_string()),
+                excluded: false,
+            }],
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: true,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let snapshot = core.settle(Duration::from_secs(5));
+
+        (
+            snapshot,
+            HeadShapeMatrixIds {
+                manage_detached_id: c1.chars().take(BRANCH_CELL_OBJECT_ID_WIDTH).collect(),
+                pr_920_detached_id: c3.chars().take(BRANCH_CELL_OBJECT_ID_WIDTH).collect(),
+                vendor_lib_detached_id,
+            },
+        )
+    }
+
+    /// Pads `text` with trailing spaces to `width`, matching what an unwritten cell past a
+    /// value's own text reads as in a freshly rendered `Buffer`: this is what lets the matrix
+    /// test below assert a whole column's width in one comparison rather than a value's own
+    /// prefix plus a separate blank check.
+    fn padded(text: &str, width: u16) -> String {
+        format!("{text:<width$}", width = width as usize)
+    }
+
+    /// A child row's own 28-column name cell in full: the fixed indent and marker, the active
+    /// table's own gap, then `name` padded out to the child budget. Built once here so the
+    /// matrix test below never restates the geometry `draw_name_cell` itself computes.
+    fn child_name_cell(glyphs: &'static GlyphSet, name: &str) -> String {
+        format!(
+            "{}{}{}{}",
+            " ".repeat(CHILD_ROW_INDENT_WIDTH as usize),
+            glyphs.child_row,
+            " ".repeat(CHILD_ROW_GAP_WIDTH as usize),
+            padded(name, CHILD_ROW_NAME_WIDTH)
+        )
+    }
+
+    /// Criterion 6's own test: the whole rendered matrix for a fixture mixing an attached row
+    /// (`feature-worktree`), two detached rows across two different kinds (`manage`, a Repo,
+    /// and `pr-920`, a Worktree), a Submodule (`vendor/lib`, detached too) and an unborn row
+    /// (`brand-new`), every cell of every row asserted rather than a sample. `vendor/lib`'s
+    /// gutter reads `?` because its own `default_branch` cannot resolve in this hermetic
+    /// fixture (no fetched remote-tracking ref exists for it, a real Submodule fact per ADR
+    /// 0012 rather than an artefact this test papers over).
+    #[test]
+    fn the_head_shape_matrix_renders_every_cell_of_every_row_correctly_at_once() {
+        let (snapshot, ids) = settled_snapshot_for_the_head_shape_matrix();
+        assert_eq!(
+            snapshot.entities.len(),
+            5,
+            "expected exactly the fixture's five rows"
+        );
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        struct Row<'a> {
+            name: &'a str,
+            gutter: char,
+            name_cell: String,
+            branch: &'a str,
+            sync: &'a str,
+            base: &'a str,
+            dirty: &'a str,
+            state: &'a str,
+        }
+
+        let rows = [
+            Row {
+                name: "manage",
+                gutter: glyphs.fresh,
+                name_cell: padded("manage", NAME_WIDTH),
+                branch: ids.manage_detached_id.as_str(),
+                sync: "-",
+                base: "↓1",
+                dirty: "●2",
+                state: "",
+            },
+            Row {
+                name: "feature-worktree",
+                gutter: glyphs.fresh,
+                name_cell: child_name_cell(glyphs, "feature-worktree"),
+                branch: "feature",
+                sync: "-",
+                base: "↓1",
+                dirty: "●1",
+                state: "local only",
+            },
+            Row {
+                name: "pr-920",
+                gutter: glyphs.fresh,
+                name_cell: child_name_cell(glyphs, "pr-920"),
+                branch: ids.pr_920_detached_id.as_str(),
+                sync: "-",
+                base: "≡",
+                dirty: "·",
+                state: "merged",
+            },
+            Row {
+                name: "vendor/lib",
+                gutter: glyphs.unknown,
+                name_cell: child_name_cell(glyphs, "vendor/lib"),
+                branch: ids.vendor_lib_detached_id.as_str(),
+                sync: "-",
+                base: "",
+                dirty: "·",
+                state: "",
+            },
+            Row {
+                name: "brand-new",
+                gutter: glyphs.fresh,
+                name_cell: padded("brand-new", NAME_WIDTH),
+                branch: "main",
+                sync: "-",
+                base: "",
+                dirty: "·",
+                state: "",
+            },
+        ];
+
+        for row in rows {
+            let (index, entity) = find_entity_row(&snapshot, row.name);
+            let y = entity_row_y(index);
+            assert_eq!(entity.name.as_ref(), row.name);
+
+            assert_eq!(
+                cell_text(buf, absolute_x(GUTTER_X), y, 1),
+                row.gutter.to_string(),
+                "{}: gutter",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(NAME_X), y, NAME_WIDTH),
+                row.name_cell,
+                "{}: name",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(BRANCH_X), y, BRANCH_WIDTH),
+                padded(row.branch, BRANCH_WIDTH),
+                "{}: branch",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(SYNC_X), y, SYNC_WIDTH),
+                padded(row.sync, SYNC_WIDTH),
+                "{}: sync",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(BASE_X), y, BASE_WIDTH),
+                padded(row.base, BASE_WIDTH),
+                "{}: base",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(DIRTY_X), y, DIRTY_WIDTH),
+                padded(row.dirty, DIRTY_WIDTH),
+                "{}: dirty",
+                row.name
+            );
+            assert_eq!(
+                cell_text(buf, absolute_x(STATE_X), y, STATE_WIDTH),
+                padded(row.state, STATE_WIDTH),
+                "{}: state",
+                row.name
+            );
+        }
+    }
+
+    /// Criterion 1's structural half: `format_head` is called from exactly one production
+    /// site, in `draw_row`, plus its own declaration. A kind-specific branch-cell code path
+    /// (one for Repo, one for Worktree, one for Submodule) would add a second call site and
+    /// fail this, which is the drift a single shared rule is meant to rule out.
+    #[test]
+    fn format_head_is_called_from_exactly_one_production_site_besides_its_own_declaration() {
+        let files: usize = crate::test_support::workspace_crate_src_dirs()
+            .iter()
+            .map(|dir| crate::test_support::rust_source_files(dir).len())
+            .sum();
+        assert!(
+            files > 0,
+            "scanned zero source files, so a count of zero below would report a second \
+             branch-cell rule rather than a scan that read nothing"
+        );
+
+        let offending = crate::test_support::production_lines_containing("format_head(");
+        assert_eq!(
+            offending.len(),
+            2,
+            "expected exactly two matches (format_head's own declaration and its one call \
+             site in draw_row); a count that moved means a second, potentially kind-specific \
+             branch-cell rule crept in, at: {offending:?}"
+        );
+    }
+
+    /// Criterion 5: colour is never the discriminator between a branch name and a detached
+    /// object id. `draw_row` resolves the branch cell's role from `Meaning::FreshValue`
+    /// regardless of the settled value, so a real attached row and a real detached row must
+    /// render the exact same foreground colour; the detail pane, which shows the full id, is
+    /// the only place that can tell the two apart.
+    #[test]
+    fn the_branch_cells_colour_cannot_disambiguate_a_branch_name_from_an_object_id() {
+        let (snapshot, _ids) = settled_snapshot_for_the_head_shape_matrix();
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        let (attached_row, _) = find_entity_row(&snapshot, "feature-worktree");
+        let (detached_row, _) = find_entity_row(&snapshot, "manage");
+        let attached_fg = buf[(absolute_x(BRANCH_X), entity_row_y(attached_row))].fg;
+        let detached_fg = buf[(absolute_x(BRANCH_X), entity_row_y(detached_row))].fg;
+
+        assert_eq!(
+            attached_fg, detached_fg,
+            "a branch name and a detached object id must take the same colour, since colour \
+             is never the only carrier of meaning (theming.md); the detail pane's full id is \
+             the only discriminator (ADR 0019's accepted cost)"
+        );
+    }
+
+    /// Sets `core.abbrev` to `abbrev` on a fresh detached repo at `path`, after
+    /// [`init_detached_repo_with_a_commit`] has already run, and returns the same
+    /// nine-character abbreviation that function computed: this crate truncates the full hex
+    /// id itself rather than asking git for one, so nothing here should change with the
+    /// setting.
+    fn init_detached_repo_with_a_commit_and_core_abbrev(path: &Path, abbrev: &str) -> String {
+        let id = init_detached_repo_with_a_commit(path);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "core.abbrev", abbrev])
+            .status()
+            .expect("run git config core.abbrev");
+        assert!(status.success());
+        id
+    }
+
+    fn settled_snapshot_of_one_repo_at(root: &Path) -> repon_core::Snapshot {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.to_path_buf()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_secs(5))
+    }
+
+    /// Criterion 2: the branch cell's abbreviation is a fixed nine characters, independent of
+    /// a repository's own `core.abbrev` setting, since `core.abbrev auto` scales with object
+    /// count and would make a mixed list ragged. Two repositories at opposite ends of a
+    /// plausible `core.abbrev` range must both still read nine: a build that asked gix for a
+    /// short id instead of truncating the full one itself would render four characters for
+    /// the first repository here and fail this.
+    #[test]
+    fn the_branch_cells_abbreviation_is_fixed_regardless_of_the_repositorys_own_core_abbrev() {
+        for abbrev in ["4", "40"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().canonicalize().expect("canonicalize temp dir");
+            let expected_id = init_detached_repo_with_a_commit_and_core_abbrev(&root, abbrev);
+            assert_eq!(expected_id.len(), BRANCH_CELL_OBJECT_ID_WIDTH);
+
+            let snapshot = settled_snapshot_of_one_repo_at(&root);
+            assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+            let terminal = render(140, 24, &snapshot);
+            let buf = terminal.backend().buffer();
+            let y = entity_row_y(0);
+
+            assert_eq!(
+                cell_text(
+                    buf,
+                    absolute_x(BRANCH_X),
+                    y,
+                    BRANCH_CELL_OBJECT_ID_WIDTH as u16
+                ),
+                expected_id,
+                "core.abbrev={abbrev}: expected the fixed nine-character id regardless of \
+                 the repository's own abbreviation setting"
+            );
+        }
+    }
+
+    /// The pitfall the previous test alone cannot catch: both its expected value and its
+    /// assertion width come from the same production constant, so a mutation that widened or
+    /// narrowed `BRANCH_CELL_OBJECT_ID_WIDTH` uniformly would still pass it, self-consistently
+    /// wrong. This test instead reads head.md's own prose at test time and maps its number
+    /// word to a digit, so the constant is checked against the design of record rather than
+    /// against itself.
+    #[test]
+    fn branch_cell_object_id_width_matches_head_mds_own_prose() {
+        fn number_word_to_digit(word: &str) -> usize {
+            match word {
+                "one" => 1,
+                "two" => 2,
+                "three" => 3,
+                "four" => 4,
+                "five" => 5,
+                "six" => 6,
+                "seven" => 7,
+                "eight" => 8,
+                "nine" => 9,
+                "ten" => 10,
+                other => panic!("unrecognised number word {other:?} in head.md's own prose"),
+            }
+        }
+
+        let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/head.md");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()));
+        let needle = "The abbreviation is ";
+        let start = spec
+            .find(needle)
+            .expect("expected head.md to still state the abbreviation-width sentence")
+            + needle.len();
+        let word = spec[start..]
+            .split_whitespace()
+            .next()
+            .expect("a word after 'The abbreviation is '");
+
+        assert_eq!(
+            BRANCH_CELL_OBJECT_ID_WIDTH,
+            number_word_to_digit(word),
+            "the production constant must match head.md's own stated width"
         );
     }
 }

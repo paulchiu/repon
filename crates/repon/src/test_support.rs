@@ -584,6 +584,34 @@ mod tests {
         );
     }
 
+    /// ADR 0019 measured and rejected reflog-based recovery of a detached HEAD's original
+    /// branch name: of 125 detached entities, 107 have `logs/HEAD` entries that never name a
+    /// ref at all, and of the 16 that do, 10 say `FETCH_HEAD`, leaving 6 of 125, and even a
+    /// recovered name would not fit a 24-column cell. No code path may call gix's own
+    /// `Reference::log_iter`, the method that reads a reflog, anywhere in the workspace. The
+    /// needle stops at the opening paren, per this module's own convention, so a call whose
+    /// arguments wrap onto a new line under rustfmt is still caught.
+    #[test]
+    fn no_reflog_based_branch_recovery_exists_anywhere_in_the_workspace() {
+        let dirs = workspace_crate_src_dirs();
+        let files_scanned: usize = dirs.iter().map(|dir| rust_source_files(dir).len()).sum();
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let needle = format!("log_{}(", "iter");
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found a call to gix's own reflog reader (`Reference::log_iter`); ADR 0019 \
+             measured and rejected reflog-based recovery of a detached HEAD's original \
+             branch name, at: {offending:?}"
+        );
+    }
+
     /// Criterion 8's absence half: there is no per-step timeout, configurable or fixed. The
     /// needle is the `wait-timeout` crate's own method name with its call parenthesis, which
     /// is specific enough to miss `repon-core`'s own, unrelated

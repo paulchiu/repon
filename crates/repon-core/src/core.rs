@@ -2158,16 +2158,16 @@ fn probe_sync(
 }
 
 /// Phase B's second rev-walk: the `base` cell's count behind the resolved default
-/// branch, for every entity [`crate::base::probe`] does not exempt or leave
-/// Outstanding ([default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
-/// "The two behind counts"). `None` if `cancel` was already set, if either
+/// branch, for every entity [`crate::base::probe`] does not exempt
+/// ([default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "The two behind counts"). `None` if `cancel` was already set, or if either
 /// `branch_settled` or `default_branch_settled` is itself `None` because the probe
-/// it depends on was cancelled first, or if `crate::base::probe` itself leaves the
-/// cell Outstanding (an unborn HEAD). A `Failed` or not-yet-`Known` `branch_settled`
-/// carries no commit to compare, so it is treated the same "nothing to settle yet"
-/// way, except a genuine `Failed` branch read, which propagates onto `base` too:
-/// a row whose HEAD could not be read has nothing to compute behind anything. `repo`
-/// follows the same cached-handle convention as [`probe_branch`].
+/// it depends on was cancelled first; [`crate::base::probe`] itself always settles
+/// once reached. A `Failed` or not-yet-`Known` `branch_settled` carries no commit to
+/// compare, so it is treated the same "nothing to settle yet" way, except a genuine
+/// `Failed` branch read, which propagates onto `base` too: a row whose HEAD could
+/// not be read has nothing to compute behind anything. `repo` follows the same
+/// cached-handle convention as [`probe_branch`].
 fn probe_base(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
@@ -2200,7 +2200,7 @@ fn probe_base(
         },
     };
     let local = repo.to_thread_local();
-    base::probe(&local, head, default_branch_settled)
+    Some(base::probe(&local, head, default_branch_settled))
 }
 
 /// Phase C's typed counts, dispatched over every entity in a Generation with no
@@ -2487,12 +2487,10 @@ fn probe_worktree_state(
 
 /// Phase D's expensive half, reached only when `landing::probe` answered
 /// `Outstanding`: this is the seam that keeps patch equivalence off every
-/// entity ancestry already settled. Re-derives the entity's own HEAD commit
-/// (an unborn HEAD has none yet, and stays `Outstanding` here too, for the same
-/// reason `landing::probe` leaves it there) and the default branch's own
-/// commit, computes this entity's own merge base and reports it to `report`
-/// *before* asking for the shared scan, then checks patch equivalence against
-/// `memo`'s per-common-dir cache, per
+/// entity ancestry already settled. Re-derives the entity's own HEAD commit and
+/// the default branch's own commit, computes this entity's own merge base and
+/// reports it to `report` *before* asking for the shared scan, then checks patch
+/// equivalence against `memo`'s per-common-dir cache, per
 /// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
 /// "Two passes on screen" and its bound on the scan's own depth.
 fn probe_patch_equivalence(
@@ -2517,9 +2515,12 @@ fn probe_patch_equivalence(
         return None;
     };
     let Some(entity_tip) = head.id().map(|id| id.detach()) else {
-        // Unborn: no commit exists yet, so there is nothing to diff. Left
-        // Outstanding, matching `landing::probe`'s own unborn-HEAD case.
-        return None;
+        // Unreachable via `landing::probe`, which now settles Not applicable for
+        // an unborn HEAD directly rather than reaching this second pass at all;
+        // kept only as a defensive fallback settling the same value, rather than
+        // reintroducing an unsettled cell, if HEAD's own commit were ever to
+        // disappear between the two reads within one probe cycle.
+        return Some(Settled::NotApplicable);
     };
     if cancel.load(Ordering::Acquire) {
         return None;
@@ -2762,11 +2763,10 @@ struct ProbeOutcomes {
 /// already landed that same entity's cheap cells; a test's simulated late result
 /// goes through the same path so it does not duplicate this bookkeeping.
 ///
-/// `outcomes.state` being `None` writes nothing at all: the `state` cell is
-/// left exactly as unsettled as `begin_probe` alone leaves it, which is what an
-/// entity `landing::probe` and then `probe_patch_equivalence` both leave
-/// `Outstanding` (an unborn HEAD, still with no commit to prove anything from)
-/// still shows.
+/// `outcomes.state` being `None` writes nothing at all: the `state` cell is left
+/// exactly as unsettled as `begin_probe` alone leaves it, which is what an
+/// attached branch with a live upstream ancestry could not clear, and that
+/// `probe_patch_equivalence` was itself cancelled before answering, still shows.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
     settle_gate: &Arc<(Mutex<usize>, Condvar)>,

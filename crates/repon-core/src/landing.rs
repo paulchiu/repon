@@ -42,12 +42,13 @@ pub(crate) enum Outcome {
 
 /// The ancestry-only first pass: `Merged` when the entity's own commit is an
 /// ancestor of `default_branch`'s; `NotApplicable` when it is not and HEAD is
-/// detached, the only state a detached HEAD can prove; and, when it is not and
-/// HEAD is attached, whichever of `Local only`, `Gone` or [`Outcome::Outstanding`]
-/// the branch's own upstream settles (see [`classify_unmerged_branch`]). A
-/// non-`Known` `default_branch` (`Unknown`, `Failed` or `NotApplicable`)
-/// propagates onto `state` unchanged, since every value derived from an
-/// unresolved default branch is exactly as unresolved.
+/// detached, the only state a detached HEAD can prove, or when HEAD is unborn and
+/// has no commit to prove ancestry from at all; and, when it is not and HEAD is
+/// attached with a commit, whichever of `Local only`, `Gone` or
+/// [`Outcome::Outstanding`] the branch's own upstream settles (see
+/// [`classify_unmerged_branch`]). A non-`Known` `default_branch` (`Unknown`,
+/// `Failed` or `NotApplicable`) propagates onto `state` unchanged, since every
+/// value derived from an unresolved default branch is exactly as unresolved.
 pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBranch>) -> Outcome {
     let default_branch = match default_branch {
         Settled::Known {
@@ -67,10 +68,11 @@ pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBran
         }
     };
     let Some(commit) = head.id() else {
-        // Unborn: no commit exists yet, so ancestry cannot even be attempted.
-        // Whether this branch is Local only or Active once it has a commit is
-        // exactly the second pass's question, so it is left Outstanding too.
-        return Outcome::Outstanding;
+        // Unborn: no commit exists yet, so there is nothing to prove ancestry
+        // from, and no later Generation's probe of this same, still-unborn HEAD
+        // could ever answer it either; Not applicable rather than Outstanding
+        // (head.md's "The unborn row").
+        return Outcome::Settle(Settled::NotApplicable);
     };
     let commit = commit.detach();
 
@@ -425,8 +427,13 @@ mod tests {
         }
     }
 
+    /// An unborn HEAD has no commit to prove ancestry from, so `state` settles Not
+    /// applicable immediately rather than staying Outstanding: no later Generation's
+    /// probe of this same, still-unborn HEAD could ever answer it either, which is
+    /// what distinguishes it from having no answer yet (head.md's "The unborn
+    /// row").
     #[test]
-    fn an_unborn_head_stays_outstanding_with_no_commit_to_prove_ancestry_from() {
+    fn an_unborn_head_settles_state_not_applicable_with_no_commit_to_prove_ancestry_from() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = dir.path().join("repo");
         fs::create_dir_all(&repo).expect("create repo dir");
@@ -435,7 +442,11 @@ mod tests {
 
         let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
 
-        assert!(matches!(outcome, Outcome::Outstanding));
+        assert!(
+            matches!(outcome, Outcome::Settle(Settled::NotApplicable)),
+            "expected an unborn HEAD to settle state Not applicable rather than stay \
+             Outstanding, got a shape that does not match"
+        );
     }
 
     #[test]
