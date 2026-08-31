@@ -125,13 +125,15 @@ _Avoid_: Row (that names the rendering, not the domain object)
 An Entity's identity: a newtype over its own resolved absolute working directory. Not its name, which collides across the population; not the git common dir, which a Repo shares with every Worktree attached to it.
 
 **Entity state**:
-The struct of named Cells describing one Entity: its HEAD, its ahead behind Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action receipt, its Presence, its in progress operation and its recent commits.
+The struct of named Cells describing one Entity: its HEAD, its Sync, its base and dirty counts, its Worktree state, its default branch, its Diagnostics, its last Action receipt, its Presence, its in progress operation and its recent commits.
 
 **HEAD**:
 Exactly three shapes, one to one with git's own: attached to a branch with a commit, detached at a commit with no branch, or unborn with a branch and no commit yet.
 
 **Sync**:
-An Entity's ahead behind pair of commit counts against its upstream.
+An Entity's comparison against its branch's upstream, settled as a Sync state: a live
+upstream's ahead behind pair of commit counts, no branch or no configured upstream, or
+no remote on the Repo at all.
 
 **Diagnostics**:
 Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2's `origin/HEAD` named a target that no longer resolves, whether rung 2 and rung 3 disagreed, why the default branch stopped resolving when no rung answered, and why an entity's own `.gitmodules` failed to read or parse, if it did. Every field but the `.gitmodules` one reaches the detail pane and never the list.

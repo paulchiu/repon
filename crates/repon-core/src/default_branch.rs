@@ -97,7 +97,7 @@ impl ChainFacts {
     /// reference lookups for the name list, none of which depend on any entity's
     /// own override.
     pub(crate) fn resolve(repo: &gix::Repository) -> Self {
-        let has_any_remote = !repo.remote_names().is_empty();
+        let has_any_remote = crate::git::has_any_remote(repo);
         let Some(remote) = chosen_remote(repo) else {
             return ChainFacts {
                 remote: None,

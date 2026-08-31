@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::entity::{Head, Kind};
+use crate::entity::{AheadBehind, Head, Kind, SyncState};
 
 /// Error from a git read, cheap to clone because the whole state table is cloned
 /// every frame. A shared trait object was rejected: it gives no discriminant to
@@ -24,6 +24,9 @@ pub enum ProbeError {
     /// The patch-equivalence check could not run: a missing or corrupt commit
     /// or tree, never a stand-in for "not equivalent".
     PatchEquivalence(Arc<str>),
+    /// The ahead/behind comparison against a live upstream could not run: a
+    /// missing or corrupt commit, never a stand-in for zero.
+    AheadBehind(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -35,6 +38,9 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Ancestry(message) => write!(f, "failed to check ancestry: {message}"),
             ProbeError::PatchEquivalence(message) => {
                 write!(f, "failed to check patch equivalence: {message}")
+            }
+            ProbeError::AheadBehind(message) => {
+                write!(f, "failed to compute ahead/behind counts: {message}")
             }
         }
     }
@@ -68,6 +74,99 @@ pub(crate) fn checked_merge_base(
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
         Err(other) => Err(other.to_string()),
     }
+}
+
+/// Whether `repo` has any remote configured at all, read once from
+/// `Repository::remote_names()`. Reused by [`crate::default_branch::ChainFacts::resolve`]'s
+/// own rung-4 classification and by [`resolve_sync`], so the two never disagree about
+/// what "no remote" means; remote configuration is shared config, identical for a Repo
+/// and every Worktree attached to it, so a linked Worktree's own handle answers this
+/// exactly as its Repo's would.
+pub(crate) fn has_any_remote(repo: &gix::Repository) -> bool {
+    !repo.remote_names().is_empty()
+}
+
+/// Commits reachable from `tip` and not from `hidden` (and not from `hidden`'s own
+/// ancestry), the same shape as `git rev-list tip ^hidden --count`. Reflexive tips
+/// (`tip == hidden`) short-circuit to zero without a walk.
+fn commits_unique_to(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    hidden: gix::ObjectId,
+) -> Result<u32, String> {
+    if tip == hidden {
+        return Ok(0);
+    }
+    for id in [tip, hidden] {
+        if !repo.has_object(id) {
+            return Err(format!("commit object not found: {id}"));
+        }
+    }
+    let walk = repo
+        .rev_walk([tip])
+        .with_hidden([hidden])
+        .all()
+        .map_err(|error| error.to_string())?;
+    let mut count = 0u32;
+    for info in walk {
+        info.map_err(|error| error.to_string())?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `branch`'s ahead/behind counts against `upstream`: two rev-walks, each hidden
+/// behind the other's tip, the same shape as `git rev-list --left-right --count
+/// branch...upstream`. A plain `String` error, like [`checked_merge_base`]'s, so the
+/// one caller wraps it in its own [`ProbeError`] variant.
+pub(crate) fn ahead_behind(
+    repo: &gix::Repository,
+    branch: gix::ObjectId,
+    upstream: gix::ObjectId,
+) -> Result<AheadBehind, String> {
+    Ok(AheadBehind {
+        ahead: commits_unique_to(repo, branch, upstream)?,
+        behind: commits_unique_to(repo, upstream, branch)?,
+    })
+}
+
+/// The commit a branch's configured upstream currently resolves to, or `None` when
+/// there is no upstream to compare against: no `branch.<name>.merge`/`.remote`
+/// configured, or a configured tracking ref that itself no longer resolves. Both
+/// causes settle to the same [`SyncState::NoUpstream`] at the call site, since
+/// neither has a count to show.
+fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
+    let full_name = gix::refs::FullName::try_from(format!("refs/heads/{branch_name}")).ok()?;
+    let tracking_ref_name = repo
+        .branch_remote_tracking_ref_name(full_name.as_ref(), gix::remote::Direction::Fetch)?
+        .ok()?;
+    let mut reference = repo.find_reference(tracking_ref_name.as_ref()).ok()?;
+    reference.peel_to_id().ok().map(|id| id.detach())
+}
+
+/// Resolves the `sync` cell's value for one entity, per
+/// [layout-and-provenance.md](https://github.com/paulchiu/repon/blob/main/docs/spec/layout-and-provenance.md)'s
+/// "Glyphs": a Repo with no remote at all settles every one of its rows to
+/// [`SyncState::NoRemote`] before HEAD's own shape is even considered, since none of
+/// them can have an upstream either way; otherwise a row with no branch, or a branch
+/// with no live upstream, settles to [`SyncState::NoUpstream`]; otherwise the
+/// branch's ahead/behind counts against its upstream.
+pub(crate) fn resolve_sync(
+    repo: &gix::Repository,
+    head: Option<&Head>,
+) -> Result<SyncState, ProbeError> {
+    if !has_any_remote(repo) {
+        return Ok(SyncState::NoRemote);
+    }
+    let Some(Head::Branch { name, commit }) = head else {
+        return Ok(SyncState::NoUpstream);
+    };
+    let Some(upstream) = upstream_commit(repo, name) else {
+        return Ok(SyncState::NoUpstream);
+    };
+    ahead_behind(repo, *commit, upstream)
+        .map(SyncState::Tracking)
+        .map_err(|error| ProbeError::AheadBehind(error.into()))
 }
 
 /// One of the ten shapes an in-progress git operation can take, one to one with
@@ -306,7 +405,7 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::git;
+    use crate::test_support::{git, head_sha};
 
     /// The path-taking shape most tests want: opens `path` fresh through the same
     /// shared-handle path production uses (`open_thread_safe` then
@@ -672,5 +771,252 @@ mod tests {
         let resolved = resolve_boundary(dir.path()).expect("resolve boundary");
 
         assert_eq!(resolved.submodules.expect("no read failure"), Vec::new());
+    }
+
+    // --- has_any_remote, ahead_behind and resolve_sync: Phase B's comparison ---
+
+    /// Wires `branch_name` up to track `refs/remotes/origin/<branch_name>` at
+    /// `upstream_sha`, adding `origin` first if this repo has no remote yet. Mirrors
+    /// `core.rs`'s own `patch_equivalence_is_memoised_once_per_common_dir_per_generation`
+    /// fixture, which sets up an upstream the same way against a real disposable repo.
+    fn configure_upstream(path: &Path, branch_name: &str, upstream_sha: &str) {
+        let repo = open_thread_safe(path).expect("open repo").to_thread_local();
+        if !has_any_remote(&repo) {
+            git(
+                path,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/repo.git",
+                ],
+            );
+        }
+        git(
+            path,
+            &["config", &format!("branch.{branch_name}.remote"), "origin"],
+        );
+        git(
+            path,
+            &[
+                "config",
+                &format!("branch.{branch_name}.merge"),
+                &format!("refs/heads/{branch_name}"),
+            ],
+        );
+        git(
+            path,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch_name}"),
+                upstream_sha,
+            ],
+        );
+    }
+
+    #[test]
+    fn has_any_remote_is_false_until_one_is_added() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        assert!(!has_any_remote(&repo));
+
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        assert!(has_any_remote(&repo));
+    }
+
+    /// The arithmetic `resolve_sync` leans on: two rev-walks, each hidden behind the
+    /// other's tip. `main` gains two commits of its own after the fork point while
+    /// `feature` (built off the same fork point) gains one of its own, so `main` is
+    /// 2 ahead of `feature` and `feature` is 1 ahead of (2 behind, from `main`'s own
+    /// point of view) `main`; asymmetric counts on both sides are what catches a
+    /// swapped `tip`/`hidden` argument, which a symmetric fixture could not.
+    #[test]
+    fn ahead_behind_counts_commits_unique_to_each_side_not_the_total_on_either() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let fork_sha = head_sha(dir.path());
+        git(dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(dir.path().join("feature.txt"), "one\n").expect("write file");
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "feature work"]);
+        let feature_sha = head_sha(dir.path());
+        git(dir.path(), &["checkout", "main"]);
+        for name in ["a", "b"] {
+            std::fs::write(dir.path().join(format!("{name}.txt")), "content\n")
+                .expect("write file");
+            git(dir.path(), &["add", "."]);
+            git(dir.path(), &["commit", "-m", &format!("main work {name}")]);
+        }
+        let main_sha = head_sha(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let fork = gix::ObjectId::from_hex(fork_sha.as_bytes()).expect("parse sha");
+        let feature = gix::ObjectId::from_hex(feature_sha.as_bytes()).expect("parse sha");
+        let main = gix::ObjectId::from_hex(main_sha.as_bytes()).expect("parse sha");
+
+        let against_fork = ahead_behind(&repo, main, fork).expect("ahead/behind against fork");
+        assert_eq!(
+            against_fork,
+            AheadBehind {
+                ahead: 2,
+                behind: 0
+            }
+        );
+
+        let against_feature =
+            ahead_behind(&repo, main, feature).expect("ahead/behind against feature");
+        assert_eq!(
+            against_feature,
+            AheadBehind {
+                ahead: 2,
+                behind: 1
+            },
+            "main's own two commits are ahead, feature's own one commit is behind"
+        );
+    }
+
+    #[test]
+    fn ahead_behind_of_a_branch_against_itself_is_zero_and_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let commit = gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha");
+
+        let counts = ahead_behind(&repo, commit, commit).expect("ahead/behind reflexive");
+
+        assert_eq!(
+            counts,
+            AheadBehind {
+                ahead: 0,
+                behind: 0
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_sync_settles_no_remote_even_though_the_branch_has_a_configured_upstream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        // `branch.<name>.remote`/`.merge` and the tracking ref itself are set by hand,
+        // with no `[remote "origin"]` section ever created: proves `has_any_remote`'s
+        // check runs, and wins, before the branch's own tracking config is even read.
+        git(dir.path(), &["config", "branch.main.remote", "origin"]);
+        git(
+            dir.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &sha],
+        );
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
+
+        assert_eq!(sync, SyncState::NoRemote);
+    }
+
+    #[test]
+    fn resolve_sync_settles_no_upstream_for_a_branch_with_no_tracking_configured() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let sha = head_sha(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
+
+        assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// No branch at all (a detached or unborn HEAD) settles the same way a branch with no
+    /// upstream does, on a repo that does have a remote: `resolve_sync` never invents a
+    /// name to look an upstream up under.
+    #[test]
+    fn resolve_sync_settles_no_upstream_when_head_carries_no_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+
+        let sync = resolve_sync(&repo, None).expect("resolve sync");
+
+        assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    #[test]
+    fn resolve_sync_computes_tracking_counts_against_a_live_upstream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let upstream_sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &upstream_sha);
+        git(dir.path(), &["commit", "--allow-empty", "-m", "local work"]);
+        let tip_sha = head_sha(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(tip_sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
+
+        assert_eq!(
+            sync,
+            SyncState::Tracking(AheadBehind {
+                ahead: 1,
+                behind: 0
+            })
+        );
     }
 }
