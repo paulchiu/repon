@@ -115,7 +115,15 @@ A transient one-line message on the status row replying to a keystroke that coul
 _Avoid_: Toast, flash, advisory (advisory is the Filter line's `?` slot)
 
 **Warning**:
-A standing condition of this session that puts something already on screen in doubt: a theme that half-applied, a config key that fell back, an abandoned discovery. Continuously true until something changes it, reported both on screen and in the log, and ranked against the others so the most severe holds the slot.
+A standing condition of this session that puts something already on screen in doubt: a theme that half-applied, a config key that fell back, an abandoned discovery. Continuously true until something changes it, reported both on screen and in the log, and ranked against the others so the most severe holds the slot. It leaves the Status row only by ceasing to be true; nothing dismisses one.
+_Avoid_: Dismissing a warning (only an Acknowledgement exists, and it hides the message, not the condition)
+
+**Status row**:
+The one line above the frame. It carries a Notice alone, or otherwise one list of items sharing a single drop table: the entity count, the most severe Warning's message, run progress, the Filter's match count, the worktrees note and timing.
+_Avoid_: Status bar, header (the header is the items on this row, not the row)
+
+**Acknowledgement**:
+The record that the user has read the outstanding Warnings, made by opening the expanded list. It frees the Warning's message from the Status row and leaves the indicator, a `!` and a count, which is reserved ahead of every item and is the one thing on that row that never drops.
 
 **Terminal state**:
 The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released.
