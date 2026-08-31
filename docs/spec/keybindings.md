@@ -11,8 +11,8 @@ Six named contexts. `global` is live in `list` and `detail` only, and is suspend
 | `global` | Live in `list` and `detail`. Suspended in every other context |
 | `list` | The table of Repos and their Worktrees |
 | `detail` | The detail pane, when it has focus |
-| `input` | The Filter line, the Launcher palette, the Action palette, and the ad hoc command field |
-| `overlay` | The help overlay, the expanded warning list, and the Set picker |
+| `input` | The Filter line, the Launcher palette, the Action palette, the ad hoc command field, and (once open) the help overlay's own search |
+| `overlay` | The expanded warning list and the Set picker. The help overlay dispatches through `input` instead, per "The help overlay" below |
 | `confirm` | The yes/no gate before an Action fans out |
 
 An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
@@ -87,6 +87,9 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Ctrl+E` | Open the field in `$EDITOR` |
 
 ### overlay
+
+The expanded warning list and the Set picker only; the help overlay is documented separately
+under "The help overlay", since it dispatches through `input` while open.
 
 | key | action |
 | --- | --- |
@@ -210,15 +213,23 @@ The other three are short enough to survive almost any frame: `enter apply  esc 
 
 ## The help overlay
 
-Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`. It scrolls, and closes with Esc or `q`. `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`, then a legend naming what the `sync`, `base`, `dirty` and `state` glyphs mean ([layout-and-provenance.md](layout-and-provenance.md)). `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+
+### The help overlay is searchable, and dispatches through `input` while open
+
+A query line is always the overlay's own first row, and typing narrows both the binding list and the glyph legend to whatever it matches (key or glyph column, and description or meaning), the same case-insensitive substring convention the two palettes already use for their own lists. An empty result says so rather than rendering blank.
+
+Reaching the query means printable characters have to take the whole keyboard, the same trade the Filter line already makes for `q` (`q` quits globally, but not while `/` has focus). Rather than give help a bespoke key path of its own, it dispatches through `Context::Input` in full once open, not `Context::Overlay`: `Ctrl+U` clears the query and `Ctrl+W` deletes the previous word, both already `input`'s own vocabulary; `Up`/`Down` and `Ctrl+K`/`Ctrl+J` scroll one line, reusing `input`'s `PreviousEntry`/`NextEntry` the way `Overlay`'s own `Enter` already means something only the Set picker gives it; and `Esc` closes help through `input`'s own `Cancel`. Backspace is not yet bound in `input` (tracked separately); once it is, help's query gets it for free with no change here, since it dispatches through the same context.
+
+The cost is `q` as a second close key: it is query text like any other letter while help is open, and only `Esc` closes it. `g`/`G`/`j`/`k`/`Ctrl+D`, `overlay`'s own scroll keys, are query text here too; the half-page and top/bottom jumps `overlay` gives every other overlay are not available while help's own search is open, the same way the Filter line already forgoes `j`/`k` as list-navigation keys once it has focus. The expanded warning list and the Set picker are unaffected: neither is searchable, so both keep dispatching through `Context::Overlay` exactly as before.
 
 ### The help overlay's own chrome
 
-This spec fixes the overlay's content and behaviour above but says nothing about its presentation, which used to mean it filled the whole frame with no border at all. This is a presentation decision, not a spec violation: the overlay now draws in the house style, a bordered block using the same rounded border set and `border`/`border_focused` roles as the list and detail panes, titled ` help (esc or q closes) ` in the style of detail's own title. Content sits one cell inset from the border, the panel's own interior, the way a bordered panel's interior sits everywhere else in this crate, rather than flush against the border characters themselves.
+This spec fixes the overlay's content and behaviour above but says nothing about its presentation, which used to mean it filled the whole frame with no border at all. This is a presentation decision, not a spec violation: the overlay now draws in the house style, a bordered block using the same rounded border set and `border`/`border_focused` roles as the list and detail panes, titled ` help (esc closes) ` in the style of detail's own title. Content sits one cell inset from the border, the panel's own interior, the way a bordered panel's interior sits everywhere else in this crate, rather than flush against the border characters themselves.
 
 Help stays full-frame rather than becoming a centred popup: it is a reading surface, not a chooser, so nothing is lost by covering the screen with it and the row under the cursor does not need to stay visible behind it. The popup treatment stays reserved for the palettes, which are choosers ([0008](../adr/0008-two-palettes-not-one.md)), and is tracked on issue 162.
 
-Every line's own key text is padded to one fixed width, the longest key text this context has, so every description lines up in the same column instead of each line finding its own spacing from a shorter or longer key; the gutter's width comes from the content alone; a wide frame with a short two-column table is not stretched to spread it across the extra space. Below a frame too short or too narrow to hold the border and at least one row and column of content, the panel degrades to flush, borderless content rather than clipping its own border against a frame that cannot hold it.
+Every line's own key or glyph text is padded to one fixed width, the longest either column has across the whole unfiltered content, so every description or meaning lines up in the same column instead of each line finding its own spacing, and the column does not shift as a query narrows what is on screen; the gutter's width comes from the content alone; a wide frame with a short two-column table is not stretched to spread it across the extra space. The query line is always the panel's own first interior row, one row shorter for the scrollable list beneath it. Below a frame too short or too narrow to hold the border and at least one row and column of content, the panel degrades to flush, borderless content rather than clipping its own border against a frame that cannot hold it.
 
 ## Configuration
 
@@ -264,3 +275,4 @@ Each item below is also listed, with its reopening condition, in [the open-quest
 - Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have. Reopenable if either existing route turns out not to cover the need, or if the map grows multi-key sequences for an unrelated reason.
 - Mouse support. Ruled out above for a stated reason rather than an absent one, and the reopening condition is someone wanting to try it.
 - The dismiss gesture has no undo. Whether it needs one, and whether a Vanished row wants a Filter of its own, is open in [layout-and-provenance.md](layout-and-provenance.md).
+- The help overlay's search has no half-page scroll or Backspace. Both are open in [the open-questions register](../open-questions.md#helps-search-has-no-half-page-scroll-or-backspace).

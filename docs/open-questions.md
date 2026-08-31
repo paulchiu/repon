@@ -97,3 +97,22 @@ one.
 - **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open) (the undo
   question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
   (the gutter mark).
+
+## Help's search has no half-page scroll or Backspace
+
+The help overlay dispatches through `input` while its search is open, which is
+what makes typing a letter query text instead of `overlay`'s own `j`/`k`/`g`/`G`
+navigation. `Ctrl+D`/`Ctrl+U` as half page down/up and the `g`/`G` jumps to the
+ends are casualties of that: `input` has no half-page or jump vocabulary of its
+own, so once help's search has focus only `Up`/`Down` (one line at a time) are
+left to move through the list underneath a query. Separately, `input` itself has
+no Backspace binding yet, so a mistyped character in help's query cannot be
+deleted one character at a time; `Ctrl+U` (clear) and `Ctrl+W` (delete the
+previous word) are the only edits available in the meantime.
+
+- **Reopens if**: `input` gains Backspace (closing the second half on its own,
+  with no code change in the help overlay, since it reads whatever `input`
+  dispatches), or a user finds losing `overlay`'s half-page/jump keys while
+  searching costly enough to want a dedicated scroll vocabulary restored
+  alongside the query.
+- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#the-help-overlay).
