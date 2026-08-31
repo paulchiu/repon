@@ -1,5 +1,5 @@
 //! `Action::ReloadConfig`'s whole effect: re-merging `[keys]`, reloading the theme and
-//! re-resolving the active Set. Split out of `app.rs` (issue #84) because that file is edited
+//! re-resolving the active Set. Split out of `app.rs` because that file is edited
 //! for two separable reasons: what `App` renders and dispatches, and how a config reload
 //! re-merges keys, reloads the theme and swaps the active Set. This module is the second
 //! reason; `app.rs` keeps the first.

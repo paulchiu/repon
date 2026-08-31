@@ -199,37 +199,50 @@ mod tests {
     /// [`this_files_production_source_names_no_core_symbol_beyond_count_and_setspec`], read
     /// from `repon-core`'s own side: `count`'s defining file must itself never construct an
     /// `EntityState` or a `Cell`, which is what makes "no cell ever written" true by
-    /// construction rather than by a probe simply not happening to run this time. Both
-    /// crates are read through the shared [`rust_source_files`]/[`production_source_at`] pair
-    /// so a future move of `count` out of `discovery.rs` cannot quietly leave this scan
-    /// behind.
+    /// construction rather than by a probe simply not happening to run this time.
+    ///
+    /// The file is found by locating `count`'s own definition rather than by name, so moving
+    /// the function carries the scan with it; a scan keyed to a filename would inspect
+    /// nothing and pass after such a move.
     #[test]
     fn counts_defining_file_never_constructs_an_entity_state_or_a_cell() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let core_src = manifest_dir.join("../repon-core/src");
         let repon_src = manifest_dir.join("src");
 
-        let mut offending = Vec::new();
+        let mut definitions = Vec::new();
         for dir in [core_src, repon_src] {
             for path in rust_source_files(&dir) {
-                if path.file_name().is_none_or(|name| name != "discovery.rs") {
-                    continue;
-                }
                 let production = production_source_at(&path);
-                for (number, line) in production.lines().enumerate() {
-                    if line.trim_start().starts_with("//") {
-                        continue;
-                    }
-                    if line.contains("EntityState") || line.contains("Cell") {
-                        offending.push(format!("{}:{}", path.display(), number + 1));
-                    }
+                if production.contains("pub fn count(spec: &SetSpec)") {
+                    definitions.push((path, production));
                 }
             }
         }
+
+        assert_eq!(
+            definitions.len(),
+            1,
+            "expected exactly one definition of `count` to scan, found {}: {:?}",
+            definitions.len(),
+            definitions
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let (path, production) = &definitions[0];
+        let offending: Vec<String> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains("EntityState") || line.contains("Cell"))
+            .map(|(number, _)| format!("{}:{}", path.display(), number + 1))
+            .collect();
+
         assert!(
             offending.is_empty(),
-            "found `EntityState` or `Cell` in discovery.rs, `count`'s own defining file: \
-             {offending:?}"
+            "found `EntityState` or `Cell` in `count`'s own defining file: {offending:?}"
         );
     }
 }

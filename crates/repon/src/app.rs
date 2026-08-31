@@ -341,10 +341,9 @@ impl App {
     /// [`Self::switch_to_set`] and `Unwind` reaches [`unwind::unwind_one`] over the range
     /// anchor then the pane.
     ///
-    /// `OpenSetPicker` (`s`) and its overlay's own `Choose` are bound in [`keys`] per
-    /// [keybindings.md](../../../docs/spec/keybindings.md), but the picker overlay itself is
-    /// not built yet, so `OpenSetPicker` falls through to this match's own `_ => None` today;
-    /// `1` to `9` (`SwitchToSet`) do not depend on it and are wired above.
+    /// `OpenSetPicker` (`s`) is bound in [`keys`] per
+    /// [keybindings.md](../../../docs/spec/keybindings.md) and has its own arm below, doing
+    /// nothing until the overlay exists. `1` to `9` (`SwitchToSet`) do not depend on it.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
@@ -474,6 +473,9 @@ impl App {
                 self.switch_to_set(nth);
                 None
             }
+            // TODO(#94): the picker overlay does not exist yet. Named here rather than left
+            // to the catch-all, which would absorb the gap silently.
+            Some(Action::OpenSetPicker) => None,
             _ => None,
         };
         if let Some(message) = message {
