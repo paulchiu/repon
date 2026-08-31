@@ -6,11 +6,12 @@
 
 use std::fmt;
 
-use ratatui::{Frame, layout::Rect, style::Style};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
     degrade::{self, Priority},
     keys::{Action, BindingTable, Context},
+    theme::{Role, Theme},
 };
 
 // `Priority`'s own doc lives on `degrade::Priority`: lower drops first, `Pinned` never
@@ -22,9 +23,8 @@ use crate::{
 
 /// One hint's chord text and its label, kept as two fields rather than joined into one
 /// opaque string: [theming.md](../../../../docs/spec/theming.md) fixes the key's role as
-/// `accent` and the label's as `dim`, and a later styling ticket can only apply that split
-/// if it survives to where [`draw`] paints the line. This ticket applies no role yet; the
-/// interim rendering still paints every hint with one `.dim()`.
+/// `accent` and the label's as `dim`, and that split only survives to where [`draw`] paints
+/// the line because nothing here joins the two first.
 #[derive(Clone, Debug)]
 struct Hint {
     key: String,
@@ -293,19 +293,64 @@ fn footer_line(table: &BindingTable, context: Context, width: u16) -> FooterLine
 
 /// The footer text for `context` at `width` columns, ASCII throughout, read off `table`
 /// rather than a literal binding string: never stale after a rebind, because `App` hands this
-/// its live table on every frame, including one right after a config reload.
+/// its live table on every frame, including one right after a config reload. `draw` no
+/// longer calls this now that it paints each hint's key and label in their own role: kept as
+/// the plain-text oracle the width-budget tests in this module, `app.rs` and `reload.rs`
+/// check the render against, independent of colour.
+#[allow(dead_code)] // read only from `#[cfg(test)]` call sites now that `draw` paints directly
 pub(crate) fn render(table: &BindingTable, context: Context, width: u16) -> String {
     footer_line(table, context, width).to_string()
 }
 
-/// Draws `context`'s footer into `area`, one row. Calls [`ratatui`]'s unbounded
-/// `Buffer::set_string` rather than `set_stringn`: [`render`] has already produced a string
-/// no wider than `area`, so nothing here needs, or should trust, a second truncation pass.
-pub(crate) fn draw(frame: &mut Frame, area: Rect, context: Context, table: &BindingTable) {
-    let text = render(table, context, area.width);
-    frame
-        .buffer_mut()
-        .set_string(area.x, area.y, &text, Style::new().dim());
+/// Writes `text` at `(*x, y)` in `style` and advances `*x` by its own byte length: sound
+/// only because every footer item is ASCII (the same invariant [`budget`]'s own
+/// `debug_assert!` already leans on), so a byte count is always a display-column count.
+/// Calls the unbounded `set_string`, never `set_stringn`
+/// ([0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)'s ban on the
+/// latter's silent truncation): [`footer_line`] has already selected a line that fits
+/// `area`'s own width, so nothing here needs, or should trust, a second clipping pass.
+fn paint_run(buf: &mut Buffer, x: &mut u16, y: u16, text: &str, style: Style) {
+    debug_assert!(text.is_ascii(), "a footer span must be ASCII: {text:?}");
+    buf.set_string(*x, y, text, style);
+    *x += text.len() as u16;
+}
+
+/// Draws `context`'s footer into `area`, one row, each hint's key in `accent` and its label
+/// in `dim` ([theming.md](../../../../docs/spec/theming.md)'s per-surface assignment), the
+/// separator and ellipsis carrying no meaning of their own so they paint `dim` alongside the
+/// labels: this is [`footer_line`]'s same selection, painted span by span instead of joined
+/// into one string first.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    context: Context,
+    table: &BindingTable,
+    theme: &Theme,
+) {
+    let line = footer_line(table, context, area.width);
+    let buf = frame.buffer_mut();
+    let mut x = area.x;
+    let mut first = true;
+    for hint in &line.hints {
+        if !first {
+            paint_run(buf, &mut x, area.y, SEPARATOR, theme.style_for(Role::Dim));
+        }
+        first = false;
+        paint_run(
+            buf,
+            &mut x,
+            area.y,
+            &hint.key,
+            theme.style_for(Role::Accent),
+        );
+        if !hint.label.is_empty() {
+            paint_run(buf, &mut x, area.y, " ", theme.style_for(Role::Dim));
+            paint_run(buf, &mut x, area.y, &hint.label, theme.style_for(Role::Dim));
+        }
+    }
+    if line.truncated {
+        paint_run(buf, &mut x, area.y, ELLIPSIS, theme.style_for(Role::Dim));
+    }
 }
 
 #[cfg(test)]
@@ -713,11 +758,49 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 2, 87, 1);
-                draw(frame, area, Context::List, &table);
+                draw(frame, area, Context::List, &table, &crate::theme::DEFAULT);
             })
             .expect("draw the frame");
         let buf = terminal.backend().buffer();
         let row: String = (0..87).map(|x| buf[(x, 2)].symbol().to_string()).collect();
         assert_eq!(row.trim_end(), render(&table, Context::List, 87));
+    }
+
+    // --- criterion 3: the footer's key/label split takes its colour from the theme's own
+    // accent/dim roles, per theming.md's per-surface assignment, rather than the interim
+    // uniform `.dim()` this ticket replaces ---
+
+    #[test]
+    fn draw_paints_a_hints_key_in_accent_and_its_label_in_dim() {
+        let table = default_table();
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let theme = crate::theme::DEFAULT;
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), Context::List, &table, &theme);
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        // The first item is `Enter`'s own chord, per `list_items`; whichever key it is, the
+        // rendered row's own first character is that key's own first character, since no
+        // hint's key is empty.
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme.role_color(Role::Accent),
+            "expected the first hint's key painted in the theme's accent role"
+        );
+
+        let rendered = render(&table, Context::List, 40);
+        let first_space = rendered
+            .find(' ')
+            .expect("the first hint has a non-empty label after its key");
+        assert_eq!(
+            buf[(first_space as u16 + 1, 0)].fg,
+            theme.role_color(Role::Dim),
+            "expected the first hint's label, after the key and its separating space, \
+             painted in the theme's dim role"
+        );
     }
 }

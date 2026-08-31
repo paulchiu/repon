@@ -12,10 +12,15 @@
 //! row, and the reserved warning indicator, are the status row's composition
 //! ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row),
 //! [0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)),
-//! not this module's. [`render`] is `#[allow(dead_code)]`: `App` has no in-flight Action
-//! progress counter, no live Filter and no elapsed timer yet (blocked by #55 and #64), and
-//! `warnings.rs`'s own `TODO(#131)` already records that folding an item source into the row
-//! is separate work. Wiring this in is that same later ticket's job, not a second one.
+//! owned by [`crate::status_row`] instead, which is why [`trailing_items`] rather than
+//! [`render`] is this module's real production export: `status_row` splices its own rank-1
+//! item (the active Set's name and the entity count) ahead of the four items below it rather
+//! than taking this module's own entity-count-only rank 1. [`render`] itself stays
+//! `#[allow(dead_code)]`, kept for this module's own tests against
+//! [actions.md](../../../../docs/spec/actions.md#the-run-on-screen)'s published ladder: `App`
+//! still has no in-flight Action progress counter, no live Filter and no elapsed timer, so
+//! `run_progress`, `filter_match_count` and `elapsed` are always `None` in production for
+//! now, the same "absent costs nothing" rule this ladder already encodes.
 
 use std::time::Duration;
 
@@ -25,7 +30,6 @@ use crate::degrade::{self, Priority};
 /// piece of state. `None` means the item has nothing to report this frame: no run in flight
 /// (`run_progress`, `elapsed`), no Filter committed (`filter_match_count`), or
 /// `show_worktrees` already true (`worktrees_note`). `entity_count` alone is never absent.
-#[allow(dead_code)] // constructed only by this module's own tests until the fields above are wired
 pub(crate) struct HeaderContent {
     pub(crate) entity_count: usize,
     pub(crate) run_progress: Option<(usize, usize)>,
@@ -37,14 +41,14 @@ pub(crate) struct HeaderContent {
 const SEPARATOR: &str = " · ";
 const ELLIPSIS: &str = " ...";
 
-/// `content`'s five items in priority order, highest first, present only where `content`
-/// carries a value: [`degrade::budget`] drops from the low-priority end first, so an absent
-/// item costs the ladder nothing rather than leaving a hole in the middle of it.
-fn items(content: &HeaderContent) -> Vec<degrade::Item<String>> {
-    let mut items = vec![degrade::Item {
-        content: format!("{} entities", content.entity_count),
-        priority: Priority::Pinned,
-    }];
+/// The four items ranked below rank 1 (run progress, the Filter's match count, the
+/// worktrees note, then timing), present only where `content` carries a value:
+/// [`degrade::budget`] drops from the low-priority end first, so an absent item costs the
+/// ladder nothing rather than leaving a hole in the middle of it. `pub(crate)` so
+/// [`crate::status_row`] can splice its own rank-1 item ahead of these instead of
+/// [`items`]'s own entity-count-only one.
+pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<String>> {
+    let mut items = Vec::new();
     if let Some((done, total)) = content.run_progress {
         items.push(degrade::Item {
             content: format!("run {done}/{total}"),
@@ -76,10 +80,21 @@ fn items(content: &HeaderContent) -> Vec<degrade::Item<String>> {
     items
 }
 
+/// `content`'s five items in priority order, highest first: [`render`]'s own entity-count
+/// rank 1 followed by [`trailing_items`].
+fn items(content: &HeaderContent) -> Vec<degrade::Item<String>> {
+    let mut items = vec![degrade::Item {
+        content: format!("{} entities", content.entity_count),
+        priority: Priority::Pinned,
+    }];
+    items.extend(trailing_items(content));
+    items
+}
+
 /// The header's text at `width` display columns, ASCII throughout apart from the ` · `
 /// separator's own middle dot, which [0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)
 /// measures at one column regardless of glyph set.
-#[allow(dead_code)] // no caller until the status row folds this in as an item source (#131)
+#[allow(dead_code)] // kept for this module's own tests; [`trailing_items`] is the real production export
 pub(crate) fn render(content: &HeaderContent, width: u16) -> String {
     let items = items(content);
     degrade::budget(&items, width as usize, SEPARATOR, ELLIPSIS).render(SEPARATOR, ELLIPSIS)
