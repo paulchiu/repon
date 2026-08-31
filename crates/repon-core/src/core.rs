@@ -2974,13 +2974,75 @@ mod tests {
     /// with the same explicit identity `init_repo_with_a_commit` supplies: never
     /// relying on a global git identity, which a machine running CI has none of.
     fn commit_allow_empty(path: &Path, message: &str) {
+        commit(path, message, &["--allow-empty", "-m", message]);
+    }
+
+    /// Commits a real change, which is what the poll's own user story is about and what an
+    /// empty commit is not: `git add` rewrites `.git/index` unconditionally, while whether a
+    /// commit with nothing staged rewrites it is left to git's racy-entry heuristic and
+    /// differs between platforms. `index` is the only one of the polled paths a commit on an
+    /// attached HEAD moves, so a test that depends on an empty commit moving it is testing
+    /// that heuristic rather than the poll.
+    fn commit_a_change(path: &Path, message: &str) {
+        let gitdir = gitdir_of(path);
+        let before = poll::fingerprint(&gitdir);
+
+        std::fs::write(path.join(format!("{message}.txt")), message.as_bytes())
+            .expect("write a file to commit");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "-A"])
+            .status()
+            .expect("run git add");
+        assert!(added.success());
+        commit(path, message, &["-m", message]);
+
+        // The fixture's own premise, asserted rather than assumed: a commit on an attached
+        // HEAD moves none of the polled paths except `index` (`HEAD` is untouched, and
+        // rewriting `refs/heads/<branch>` does not move `refs/` itself), so if git leaves
+        // `index` alone here there is nothing for the poll to see and the failure belongs to
+        // this fixture, not to the sweep it is setting up.
+        assert!(
+            poll::moved(&before, &poll::fingerprint(&gitdir)),
+            "committing in {} moved none of the polled paths under {}, so this fixture cannot \
+             show the poll anything",
+            path.display(),
+            gitdir.display()
+        );
+    }
+
+    /// The absolute gitdir git itself reports, which for a linked Worktree is its own
+    /// `.git/worktrees/<name>` rather than the `.git` file beside the checkout.
+    fn gitdir_of(work_dir: &Path) -> PathBuf {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(work_dir)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            output.status.success(),
+            "resolve the gitdir of {}",
+            work_dir.display()
+        );
+        PathBuf::from(
+            std::str::from_utf8(&output.stdout)
+                .expect("a utf-8 gitdir path")
+                .trim(),
+        )
+    }
+
+    /// The shared tail of both commit helpers.
+    fn commit(path: &Path, message: &str, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
             .arg(path)
             .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
-            .args(["commit", "--allow-empty", "-m", message])
+            .arg("commit")
+            .args(args)
             .status()
-            .expect("run git commit");
+            .unwrap_or_else(|error| panic!("run git commit {message}: {error}"));
         assert!(status.success());
     }
 
@@ -3035,22 +3097,7 @@ mod tests {
     /// in the harness rather than in the poll: real sweeps are a configured interval apart.
     /// Reads the polled names from [`poll::POLLED_GITDIR_ENTRIES`] rather than restating them.
     fn backdate_polled_entries(work_dir: &Path) {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(work_dir)
-            .args(["rev-parse", "--absolute-git-dir"])
-            .output()
-            .expect("run git rev-parse");
-        assert!(
-            output.status.success(),
-            "resolve the gitdir of {}",
-            work_dir.display()
-        );
-        let gitdir = Path::new(
-            std::str::from_utf8(&output.stdout)
-                .expect("a utf-8 gitdir path")
-                .trim(),
-        );
+        let gitdir = gitdir_of(work_dir);
 
         let past = std::time::SystemTime::now() - Duration::from_secs(10);
         let mut touched = 0;
@@ -4903,7 +4950,7 @@ mod tests {
         );
         assert!(core.poll_reprobed_for_test().is_empty());
 
-        commit_allow_empty(&repo, "second");
+        commit_a_change(&repo, "second");
 
         tick_tx
             .send(Instant::now())
@@ -4991,7 +5038,7 @@ mod tests {
             "a first sweep has nothing to compare against, so it must report no movement"
         );
 
-        commit_allow_empty(&repo_a, "second");
+        commit_a_change(&repo_a, "second");
         core.poll_once_for_test();
 
         assert_eq!(
@@ -5064,7 +5111,7 @@ mod tests {
             .modified()
             .expect("HEAD mtime");
 
-        commit_allow_empty(&repo, "second");
+        commit_a_change(&repo, "second");
 
         let head_mtime_after = fs::metadata(&head_path)
             .expect("stat HEAD")
@@ -5135,7 +5182,7 @@ mod tests {
             .modified()
             .expect("HEAD mtime");
 
-        commit_allow_empty(&worktree_path, "on the detached worktree");
+        commit_a_change(&worktree_path, "on the detached worktree");
 
         let head_mtime_after = fs::metadata(&worktree_head_path)
             .expect("stat the per-worktree HEAD")
@@ -5251,7 +5298,7 @@ mod tests {
             .clone();
         backdate_polled_entries(&submodule_path);
         hidden_core.poll_once_for_test();
-        commit_allow_empty(&submodule_path, "into the hidden submodule");
+        commit_a_change(&submodule_path, "into the hidden submodule");
         hidden_core.poll_once_for_test();
         assert!(
             !hidden_core
@@ -5275,7 +5322,7 @@ mod tests {
             .clone();
         backdate_polled_entries(&submodule_path);
         shown_core.poll_once_for_test();
-        commit_allow_empty(&submodule_path, "into the shown submodule");
+        commit_a_change(&submodule_path, "into the shown submodule");
         shown_core.poll_once_for_test();
         assert_eq!(
             shown_core.poll_reprobed_for_test(),
