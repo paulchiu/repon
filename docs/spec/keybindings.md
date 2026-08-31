@@ -29,6 +29,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Ctrl+Z` | Suspend |
 | `!` | Open the Launcher palette |
 | `;` | Open the Action palette |
+| `m` | Open the Action palette filtered to management operations |
 | `/` | Enter a Filter |
 | `r` | Refresh everything |
 | `R` | Refresh the Selection |
@@ -121,15 +122,18 @@ Four bindings are already conditional in this way. While an Action is fanning ou
 
 ### Not built yet
 
-The bindings below are reserved and specified but not built: `crates/repon/src/keys.rs` marks each row's chord `built: false`, and `spec_conformance` reads this list at test time and asserts it matches that flag exactly, in both directions, so a row cannot go stale in either place without failing the build. That check alone would only hold this list and that flag to each other, so `every_unbuilt_binding_answers_on_press_as_not_implemented` presses every unbuilt row's chord and asserts it answers as not implemented, which pins the flag to what the code actually does. The reverse direction, a row marked built that does nothing, is not checked; it is the case the footer and the help overlay would advertise, which is [#119](https://github.com/paulchiu/repon/issues/119). The list shrinks to nothing as the features land.
+The bindings below are reserved and specified but not built: `crates/repon/src/keys.rs` marks each row's chord `built: false`, and `spec_conformance` reads this list at test time and asserts it matches that flag exactly, in both directions, so a row cannot go stale in either place without failing the build. That check alone would only hold this list and that flag to each other, so `every_unbuilt_binding_produces_nothing_on_press` presses every unbuilt row's chord and asserts it produces nothing at all, which pins the flag to what the code actually does. The reverse direction, a row marked built that does nothing, is not checked; it is the case the footer and the help overlay would advertise, which is [#119](https://github.com/paulchiu/repon/issues/119). The list shrinks to nothing as the features land.
 
-Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, and still answers on press with a "not implemented" warning rather than the silence [Built and available](#built-and-available) promises; wiring the footer, the help overlay and `dispatch` to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
+Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, though pressing it now produces nothing: [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) deleted the "not implemented" warning this section used to describe. Wiring the footer and the help overlay to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
 - `d` dismiss a Vanished row
+- `m` open the Action palette filtered to management operations
 
 ## Why these keys and not others
 
 `!` for the Launcher palette was settled in [0008](../adr/0008-two-palettes-not-one.md). `;` for the Action palette comes from mutt, whose generic map binds `!` to shell-escape and `;` to tag-prefix, "apply the next command to everything tagged". That is the same one-target versus N-target split, in a tool that has shipped it for thirty years. `;` is unshifted home row while `!` is Shift+1, so they are far apart under the fingers, which is what 0008 actually asks for. `@` was rejected despite reading well as "across", because Shift+2 sits directly beside Shift+1 and the whole requirement is that the two keys not be one slip apart. The cost of `;` is real: it is bound in lf, yazi, nnn, ranger and helix with five different meanings, so its prior is inconsistent rather than absent.
+
+`m` for management is free rather than fought over: it is unbound in Repon today, and `Ctrl+M` is already reserved as permanently unbindable because terminals deliver it as `Enter`, which does not reach the unmodified key. It opens the same palette `;` opens rather than a third one, so it adds a filter and not a surface, and [0008](../adr/0008-two-palettes-not-one.md)'s boundary is unmoved: management fans out over the Selection and can do damage, which puts it on the Action palette's side of the split.
 
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
