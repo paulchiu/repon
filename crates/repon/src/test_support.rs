@@ -570,4 +570,24 @@ mod tests {
              frozen TUI), at: {offending:?}"
         );
     }
+
+    /// Criterion 1's absence half: the cheap boolean dirtiness check
+    /// (`gix::Repository::is_dirty`) is never used as a substitute for phase C's typed
+    /// counts, since `docs/spec/refresh.md`'s own measurement is what rules it out (proving
+    /// clean costs the same as counting, and it cannot answer the untracked count at all).
+    /// The needle is the call itself, comments excluded by `production_lines_containing`, so
+    /// the doc comments in `git.rs` and `entity.rs` that name it while explaining the
+    /// rejection are not themselves a match.
+    #[test]
+    fn the_boolean_dirtiness_check_is_never_called_as_a_substitute_for_typed_counts() {
+        let needle = format!("is_{}(", "dirty");
+
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found `{needle}`; refresh.md measured the boolean check and rejected it as a \
+             phase C substitute, at: {offending:?}"
+        );
+    }
 }

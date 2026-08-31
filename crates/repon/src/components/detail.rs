@@ -7,8 +7,8 @@
 
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    ActionReceipt, DefaultBranch, DefaultBranchStopped, Diagnostics, EntityState, Head,
-    InProgressOperation, Kind, Settled, SyncState, Timestamp, Unknown,
+    ActionReceipt, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts, EntityState,
+    Head, InProgressOperation, Kind, Settled, SyncState, Timestamp, Unknown,
 };
 
 use super::list::worktree_state_word;
@@ -278,11 +278,15 @@ fn base_word(value: &u32) -> String {
     }
 }
 
-fn dirty_word(value: &u32) -> String {
-    if *value == 0 {
+/// The same total [`format_dirty`](super::list) shows in the list column, in words: the
+/// breakdown between modified, untracked and deleted stays out of both surfaces, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s mock.
+fn dirty_word(value: &DirtyCounts) -> String {
+    let total = value.total();
+    if total == 0 {
         "clean".to_string()
     } else {
-        format!("{value} changed")
+        format!("{total} changed")
     }
 }
 
@@ -908,16 +912,15 @@ mod tests {
     }
 
     /// The defining behaviour of criterion 2: every one of the six per-Cell lines reads its
-    /// own cell's value and its own cell's age, never a neighbour's. `base` and `dirty` are
-    /// the one pair the type system does not guard, both `Cell<u32>`, so a wiring bug that
-    /// reads one from the other compiles silently; every other pair has a distinct Cell type
-    /// and could not compile if `content_lines` swapped them. A Kind::Submodule entity is
-    /// built from a real disposable repository (`branch`, `default_branch` and `sync` are
-    /// the three Cells this crate probes for real today) nested under a `.gitmodules`
-    /// boundary, which construction alone settles `state` and `base` to `NotApplicable`
-    /// while `dirty` stays forever unprobed: exactly the combination that gives `base` and
-    /// `dirty` distinct, non-`Known` text ("not applicable" against "loading") without a way
-    /// to reach into a private `Cell` from this crate.
+    /// own cell's value and its own cell's age, never a neighbour's. `base` (`Cell<u32>`) and
+    /// `dirty` (`Cell<DirtyCounts>`) now carry distinct types, so a wiring bug that read one
+    /// from the other could not compile; this test still proves it at the value level rather
+    /// than resting on that alone, since a future change could narrow both back to the same
+    /// shape. A `Kind::Submodule` entity is built from a real disposable repository nested
+    /// under a `.gitmodules` boundary, whose own working tree this crate probes and finds
+    /// clean; construction alone settles `state` and `base` to `NotApplicable`, which is what
+    /// gives `base` and `dirty` distinct, non-equal text ("not applicable" against "clean")
+    /// without a way to reach into a private `Cell` from this crate.
     #[test]
     fn content_lines_never_reads_one_cells_line_from_a_different_cell() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -989,12 +992,17 @@ mod tests {
             "the submodule's own branch has a remote but no upstream configured for it, got \
              {sync_line:?}"
         );
-        assert!(dirty_line.ends_with("loading"), "got {dirty_line:?}");
+        assert!(
+            dirty_line.contains("clean") && dirty_line.contains("fresh"),
+            "the submodule's own working tree is freshly committed and clean, got \
+             {dirty_line:?}"
+        );
         assert!(base_line.ends_with("not applicable"), "got {base_line:?}");
         assert!(state_line.ends_with("not applicable"), "got {state_line:?}");
 
-        // The one pair sharing a Cell type: a wiring bug that read one from the other would
-        // still compile, so only a real value difference at runtime catches it.
+        // Defence in depth beyond the type-level guard `DirtyCounts` now gives `dirty` over
+        // `base`'s plain `u32`: a wiring bug that read one cell's line from the other would
+        // still show up here as a value that reads alike.
         assert_ne!(
             base_line, dirty_line,
             "base and dirty must never read alike: {base_line:?} vs {dirty_line:?}"

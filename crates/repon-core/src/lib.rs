@@ -75,6 +75,7 @@ pub use entity::AheadBehind;
 pub use entity::DefaultBranch;
 pub use entity::DefaultBranchStopped;
 pub use entity::Diagnostics;
+pub use entity::DirtyCounts;
 pub use entity::EntityKey;
 pub use entity::EntityState;
 pub use entity::Head;
