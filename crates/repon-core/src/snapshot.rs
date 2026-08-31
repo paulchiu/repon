@@ -46,8 +46,16 @@ impl<T> FoldableCell for Cell<T> {
     fn settledness(&self) -> Option<Settledness> {
         match self.settled() {
             Some(Settled::NotApplicable) => None,
-            Some(Settled::Known { stale: false, .. }) => Some(Settledness::Fresh),
-            Some(Settled::Known { stale: true, .. }) => Some(Settledness::Stale),
+            Some(Settled::Known {
+                stale: false,
+                value: _,
+                at: _,
+            }) => Some(Settledness::Fresh),
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => Some(Settledness::Stale),
             Some(Settled::Unknown(_)) => Some(Settledness::Unknown),
             Some(Settled::Failed(_)) => Some(Settledness::Failed),
             // Nothing has settled this Cell yet, whether a probe is currently
@@ -65,7 +73,12 @@ impl<T> FoldableCell for Cell<T> {
     fn holds_a_value(&self) -> bool {
         matches!(
             self.settled(),
-            Some(Settled::Known { .. }) | Some(Settled::Unknown(_)) | Some(Settled::Failed(_))
+            Some(Settled::Known {
+                value: _,
+                at: _,
+                stale: _
+            }) | Some(Settled::Unknown(_))
+                | Some(Settled::Failed(_))
         )
     }
 }

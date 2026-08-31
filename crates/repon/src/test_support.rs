@@ -103,6 +103,75 @@ pub(crate) fn production_lines_containing(needle: &str) -> Vec<String> {
     offending
 }
 
+/// Every `Settled::Known { .. }`-shaped region in `source`: `(total, incomplete_lines)`.
+/// `total` counts every such region found; `incomplete_lines` names the 1-based line of
+/// each one whose own field list still hides a field behind a bare `..`, the shape issue
+/// #109 exists to close (a fourth field added to `Settled::Known` would reach a site like
+/// that and be silently ignored). A nested type's own `..` (`value: Head::Branch { .. }`)
+/// is one brace deeper than `Settled::Known`'s and is never this scan's business; only a
+/// `..` sitting directly among `Settled::Known`'s own fields counts. Comment lines are
+/// skipped so a doc comment naming the shape in prose is never a self-match. Full source
+/// rather than [`production_source`]'s cut: a test module is in scope here exactly as
+/// much as production is.
+pub(crate) fn incomplete_settled_known_destructures(source: &str) -> (usize, Vec<usize>) {
+    const NEEDLE: &str = "Settled::Known";
+    let bytes = source.as_bytes();
+    let mut total = 0;
+    let mut incomplete = Vec::new();
+
+    for (found, _) in source.match_indices(NEEDLE) {
+        let line_start = source[..found]
+            .rfind('\n')
+            .map_or(0, |position| position + 1);
+        let line_end = source[found..]
+            .find('\n')
+            .map_or(source.len(), |position| found + position);
+        if source[line_start..line_end].trim_start().starts_with("//") {
+            continue;
+        }
+
+        let after = &source[found + NEEDLE.len()..];
+        let Some(brace_offset) = after.find(|character: char| !character.is_whitespace()) else {
+            continue;
+        };
+        if after.as_bytes()[brace_offset] != b'{' {
+            continue; // named in prose or otherwise not the struct-shaped variant
+        }
+        total += 1;
+
+        let mut brace_depth = 1i32;
+        let mut paren_depth = 0i32;
+        let mut position = found + NEEDLE.len() + brace_offset + 1;
+        let mut bare_rest_at = None;
+        while position < bytes.len() && brace_depth > 0 {
+            match bytes[position] {
+                b'{' => brace_depth += 1,
+                b'}' => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        break;
+                    }
+                }
+                b'(' => paren_depth += 1,
+                b')' => paren_depth -= 1,
+                b'.' if brace_depth == 1
+                    && paren_depth == 0
+                    && bytes.get(position + 1) == Some(&b'.') =>
+                {
+                    bare_rest_at = Some(position);
+                }
+                _ => {}
+            }
+            position += 1;
+        }
+        if let Some(rest_position) = bare_rest_at {
+            incomplete.push(source[..rest_position].matches('\n').count() + 1);
+        }
+    }
+
+    (total, incomplete)
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so
@@ -588,6 +657,122 @@ mod tests {
             offending.is_empty(),
             "found `{needle}`; refresh.md measured the boolean check and rejected it as a \
              phase C substitute, at: {offending:?}"
+        );
+    }
+
+    // --- Issue #109: a `Settled::Known` destructure that hides a field behind `..`
+    // compiles silently once a fourth field is added, and quietly ignores it forever.
+
+    /// The literal these tests build their fixtures from, fragmented so none of them is
+    /// itself a self-match for
+    /// [`every_settled_known_destructure_names_every_field_it_does_not_use`]'s scan of
+    /// this very file, the same reason [`naive_cfg_test_cut_needle`] fragments its needle.
+    fn settled_known_needle() -> String {
+        format!("{}::{}", "Settled", "Known")
+    }
+
+    /// Proves the mechanism before trusting it over the crate: a bare `..` sitting
+    /// directly among `Settled::Known`'s own fields must be caught.
+    #[test]
+    fn incomplete_settled_known_destructures_flags_a_bare_rest_pattern() {
+        let source = format!(
+            "match x {{\n    {} {{ value, .. }} => value,\n}}\n",
+            settled_known_needle()
+        );
+
+        let (total, incomplete) = incomplete_settled_known_destructures(&source);
+
+        assert_eq!(total, 1);
+        assert_eq!(incomplete, vec![2]);
+    }
+
+    /// A destructure that already names every field must not be flagged.
+    #[test]
+    fn incomplete_settled_known_destructures_accepts_every_field_named() {
+        let source = format!(
+            "match x {{\n    {} {{ value, at, stale }} => value,\n}}\n",
+            settled_known_needle()
+        );
+
+        let (total, incomplete) = incomplete_settled_known_destructures(&source);
+
+        assert_eq!(total, 1);
+        assert!(incomplete.is_empty());
+    }
+
+    /// A nested type's own rest pattern, one brace deeper than `Settled::Known`'s, is not
+    /// this scan's business: flagging it would ban legitimate destructures of `Head`,
+    /// `SyncState` and every other value `Settled` carries.
+    #[test]
+    fn incomplete_settled_known_destructures_ignores_a_nested_types_own_rest_pattern() {
+        let source = format!(
+            "match x {{\n    {} {{ value: Head::Branch {{ name, .. }}, at, stale }} => value,\n}}\n",
+            settled_known_needle()
+        );
+
+        let (total, incomplete) = incomplete_settled_known_destructures(&source);
+
+        assert_eq!(total, 1);
+        assert!(
+            incomplete.is_empty(),
+            "the nested Head::Branch rest pattern is not Settled::Known's own"
+        );
+    }
+
+    /// A doc comment describing the banned shape in prose must never be a self-match, the
+    /// same reason every other scan in this module skips comment lines.
+    #[test]
+    fn incomplete_settled_known_destructures_skips_a_comment_naming_the_shape_in_prose() {
+        let source = format!(
+            "// {} {{ value, .. }} is the shape this test bans\nfn f() {{}}\n",
+            settled_known_needle()
+        );
+
+        let (total, incomplete) = incomplete_settled_known_destructures(&source);
+
+        assert_eq!(total, 0);
+        assert!(incomplete.is_empty());
+    }
+
+    /// The criterion issue #109 exists to satisfy: every `Settled::Known` destructure
+    /// across both crates, production and test code alike, names every field it does not
+    /// use rather than hiding it behind `..`. Scanned raw rather than through
+    /// [`production_source_at`]: criterion 3 puts test code in scope, so a check that cut
+    /// at the tests module would inspect exactly the code this ticket cares about least.
+    #[test]
+    fn every_settled_known_destructure_names_every_field_it_does_not_use() {
+        let mut files_scanned = 0;
+        let mut total_sites = 0;
+        let mut offending = Vec::new();
+
+        for dir in workspace_crate_src_dirs() {
+            for path in rust_source_files(&dir) {
+                files_scanned += 1;
+                let source = std::fs::read_to_string(&path).expect("read a crate source file");
+                let (sites, incomplete_lines) = incomplete_settled_known_destructures(&source);
+                total_sites += sites;
+                for line in incomplete_lines {
+                    offending.push(format!("{}:{}", path.display(), line));
+                }
+            }
+        }
+
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+        assert!(
+            total_sites > 0,
+            "found zero `Settled::Known {{ }}` sites across either crate; this scan's own \
+             matcher broke rather than the type disappearing, and would otherwise pass \
+             vacuously"
+        );
+        assert!(
+            offending.is_empty(),
+            "found a `Settled::Known` destructure hiding a field behind a bare `..`, which \
+             lets a fourth field reach this site unnoticed (issue #109); name every field \
+             it does not use instead (`at: _, stale: _`, say), at: {offending:?}"
         );
     }
 }

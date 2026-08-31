@@ -281,7 +281,8 @@ mod tests {
                 outcome,
                 Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 }
             ),
             "expected a cleanly squash-merged branch to settle Merged, got {outcome:?}"
@@ -318,7 +319,8 @@ mod tests {
                 outcome,
                 Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 }
             ),
             "expected genuinely unmerged work to never settle Merged, got {outcome:?}"
@@ -422,7 +424,8 @@ mod tests {
                 outcome,
                 Settled::Known {
                     value: WorktreeState::Active,
-                    ..
+                    at: _,
+                    stale: _
                 }
             ),
             "expected two unrelated histories to settle Active, not Failed, got {outcome:?}"

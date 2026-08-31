@@ -34,7 +34,11 @@ pub(crate) fn probe(
     }
 
     let default_branch = match default_branch {
-        Settled::Known { value, .. } => value,
+        Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        } => value,
         Settled::Unknown(reason) => return Some(Settled::Unknown(*reason)),
         Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
         Settled::NotApplicable => return Some(Settled::NotApplicable),
@@ -201,7 +205,11 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         match outcome {
-            Some(Settled::Known { value, .. }) => assert_eq!(value, 1),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(value, 1),
             other => panic!(
                 "expected a branch tracking something other than the default branch to \
                  compute a real count, got {other:?}"
@@ -300,7 +308,11 @@ mod tests {
         let outcome = probe(&open(&repo), &head, &known_default_branch("origin/main"));
 
         match outcome {
-            Some(Settled::Known { value, .. }) => assert_eq!(value, 1),
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => assert_eq!(value, 1),
             other => panic!("expected a detached HEAD to get a live count, got {other:?}"),
         }
     }
@@ -405,7 +417,11 @@ mod tests {
             other => panic!("expected feature's sync to be Tracking, got {other:?}"),
         };
         let feature_base_value = match feature_base {
-            Some(Settled::Known { value, .. }) => value,
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => value,
             other => panic!("expected feature's base to be a real count, got {other:?}"),
         };
         assert_ne!(
