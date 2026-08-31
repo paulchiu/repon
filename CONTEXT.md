@@ -150,6 +150,13 @@ One Refresh, named so a newer one can beat an older one still in flight. Every v
 **Vanished**:
 A Repo or Worktree an earlier Refresh found and the current one did not. It keeps its last known values until the user dismisses it, so nothing leaves the list silently.
 
+**The periodic fetch**:
+An optional background cycle, off by default, that fetches every remote with pruning and fires immediately on being enabled rather than waiting for its first tick. It always prunes, since `Gone` only appears after a prune; fails closed on a credential prompt rather than hanging; touches nothing in the working tree; and is bounded to a configured concurrency. A finished cycle starts one normal Generation, the same completion path an Action's own fan-out finishing already takes.
+
+**Fetch spec**:
+The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Present only when the core is built with its `fetch` cargo feature, the mutating path's own isolation boundary.
+_Avoid_: FetchConfig (that names the consumer's parsed TOML shape, not the core's)
+
 ### Provenance
 
 **Probe**:

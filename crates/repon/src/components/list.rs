@@ -1098,6 +1098,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -1173,6 +1178,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -1276,6 +1286,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -2247,6 +2262,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -2785,6 +2805,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: true,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3017,6 +3042,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: true,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3296,6 +3326,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: true,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -3589,6 +3624,11 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let keys: Vec<_> = core
             .snapshot()

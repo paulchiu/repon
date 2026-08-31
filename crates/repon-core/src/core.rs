@@ -190,6 +190,24 @@ fn dispatches_kind(kind: Kind, show_submodules: bool) -> bool {
     }
 }
 
+/// The periodic fetch's own crossing data
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// `[fetch]` table): whether it runs at all, its cadence, and how many run at once.
+///
+/// Always present, regardless of the `fetch` cargo feature: this is plain bounding
+/// data, not the mutating mechanism, so a consumer can always express "run the
+/// periodic fetch" in `CoreSpec` without the feature's blocking network client, HTTP
+/// transport and credential machinery ever entering its dependency tree. Only
+/// `fetch.rs` and the scheduler's own dispatch of a real cycle are gated behind the
+/// feature ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)):
+/// without it, `enabled: true` here is inert and no cycle ever runs.
+#[derive(Debug, Clone)]
+pub struct FetchSpec {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub concurrency: usize,
+}
+
 /// Everything `Core::start` needs, handed as plain data. The core reads no file, no
 /// path and no environment variable: this is the whole crossing, per
 /// `docs/spec/core-api.md`'s "What crosses from config".
@@ -206,6 +224,9 @@ pub struct CoreSpec {
     /// Live-updatable afterwards through [`Core::set_show_submodules`], which is what lets
     /// toggling it skip a Core rebuild and the rediscovery that would come with one.
     pub show_submodules: bool,
+    /// The periodic fetch's own bounding data. See [`FetchSpec`]: always present,
+    /// inert without the `fetch` cargo feature.
+    pub fetch: FetchSpec,
 }
 
 /// One entity's in-flight probe: which Generation dispatched it, and the flag that
@@ -374,6 +395,16 @@ pub struct Core {
     /// movement then did.
     #[allow(dead_code)] // read only by poll_sweep_count_for_test
     poll_sweep_count: Arc<AtomicUsize>,
+    /// How many periodic-fetch cycles have run in total, whether or not any
+    /// repository had a remote to fetch: the immediate first cycle plus one per
+    /// `fetch.interval` tick since. Read only by `fetch_cycle_count_for_test`,
+    /// which is what proves the immediate cycle ran without waiting on the
+    /// recurring cadence at all. Present only when this crate is built with the
+    /// `fetch` cargo feature, the mutating path's own isolation boundary
+    /// ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)).
+    #[cfg(feature = "fetch")]
+    #[allow(dead_code)] // read only by fetch_cycle_count_for_test
+    fetch_cycle_count: Arc<AtomicUsize>,
 }
 
 /// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
@@ -401,11 +432,25 @@ impl Core {
         let interval = spec.poll_interval.max(Duration::from_nanos(1));
         let ticks = crossbeam_channel::tick(interval);
         let alive = Arc::new(AtomicBool::new(true));
+        // `spec.fetch` is always present (see `FetchSpec`'s own doc comment), so this
+        // reads it unconditionally: without the `fetch` cargo feature, `run_fetch_cycle`
+        // is a no-op stub regardless of what this schedules, so there is no separate
+        // "feature off" branch to maintain here.
+        let fetch_start = FetchStart {
+            enabled: spec.fetch.enabled,
+            concurrency: spec.fetch.concurrency.max(1),
+            ticks: if spec.fetch.enabled {
+                crossbeam_channel::tick(spec.fetch.interval.max(Duration::from_nanos(1)))
+            } else {
+                crossbeam_channel::never()
+            },
+        };
         start_internal(
             spec,
             Duration::from_secs(1),
             discovery::ABANDON_AFTER,
             ticks,
+            fetch_start,
             alive,
         )
         .core
@@ -850,10 +895,15 @@ impl Core {
 }
 
 /// Every `Arc` and plain-data field a Generation's dispatch reads, owned rather than
-/// borrowed: [`Core::refresh_handles`] is the only constructor, and its own doc comment
-/// carries the reason this exists at all. Field names and types mirror `Core`'s own
-/// exactly, so [`Self::dispatch`] and [`Self::rerun_discovery`] are `refresh` and
+/// borrowed: [`Core::refresh_handles`] is the only constructor once a `Core` exists,
+/// and its own doc comment carries the reason this exists at all. `start_internal`
+/// builds one directly, since the periodic fetch's own completion Generation needs
+/// this before there is a `Core` to ask; `Clone` is what lets that one value serve
+/// both the recurring cadence and the immediate first cycle without a second,
+/// drifting construction. Field names and types mirror `Core`'s own exactly, so
+/// [`Self::dispatch`] and [`Self::rerun_discovery`] are `refresh` and
 /// `rerun_discovery`'s bodies moved verbatim, `self.field` unchanged.
+#[derive(Clone)]
 struct RefreshHandles {
     table: Arc<RwLock<Table>>,
     overrides: Arc<Vec<ResolvedOverride>>,
@@ -1394,7 +1444,10 @@ impl Core {
 
     /// `start_for_test`, with the discovery abandon deadline also injected, so a
     /// test can force a walk to abandon deterministically instead of running one
-    /// for the real thirty seconds.
+    /// for the real thirty seconds. The periodic fetch is always off here: a test
+    /// that wants it runs [`Core::start_for_test_with_fetch`] instead, which is
+    /// what keeps this constructor's own signature free of a feature-gated
+    /// parameter.
     pub(crate) fn start_for_test_with_discovery_abandon(
         spec: CoreSpec,
         warn_after: Duration,
@@ -1402,7 +1455,54 @@ impl Core {
         ticks: Receiver<Instant>,
     ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
-        start_internal(spec, warn_after, discovery_abandon_after, ticks, alive)
+        start_internal(
+            spec,
+            warn_after,
+            discovery_abandon_after,
+            ticks,
+            FetchStart {
+                enabled: false,
+                concurrency: 1,
+                ticks: crossbeam_channel::never(),
+            },
+            alive,
+        )
+    }
+
+    /// `start_for_test_with_discovery_abandon`, with the periodic fetch's own tick
+    /// channel injected too, so a test can prove the recurring cadence without
+    /// waiting out a real `fetch.interval`. `spec.fetch.enabled` still governs
+    /// whether the immediate first cycle fires; `fetch_ticks` governs every cycle
+    /// after that.
+    #[cfg(feature = "fetch")]
+    pub(crate) fn start_for_test_with_fetch(
+        spec: CoreSpec,
+        warn_after: Duration,
+        ticks: Receiver<Instant>,
+        fetch_ticks: Receiver<Instant>,
+    ) -> StartForTest {
+        let alive = Arc::new(AtomicBool::new(true));
+        let fetch_start = FetchStart {
+            enabled: spec.fetch.enabled,
+            concurrency: spec.fetch.concurrency.max(1),
+            ticks: fetch_ticks,
+        };
+        start_internal(
+            spec,
+            warn_after,
+            discovery::ABANDON_AFTER,
+            ticks,
+            fetch_start,
+            alive,
+        )
+    }
+
+    /// How many periodic-fetch cycles have run in total: the immediate first one
+    /// plus one per `fetch.interval` tick since, whether or not any repository had
+    /// a remote to fetch.
+    #[cfg(feature = "fetch")]
+    pub(crate) fn fetch_cycle_count_for_test(&self) -> usize {
+        self.fetch_cycle_count.load(Ordering::Acquire)
     }
 
     /// Whether an abandoned discovery has already taken this `Core` out of the
@@ -1605,8 +1705,14 @@ fn start_internal(
     warn_after: Duration,
     discovery_abandon_after: Duration,
     ticks: Receiver<Instant>,
+    fetch_start: FetchStart,
     alive: Arc<AtomicBool>,
 ) -> StartForTest {
+    let FetchStart {
+        enabled: fetch_enabled,
+        concurrency: fetch_concurrency,
+        ticks: fetch_ticks,
+    } = fetch_start;
     let discovery_warning = Arc::new(Mutex::new(None));
     let (discovery, discovery_watcher) = run_watched_discovery(
         &spec.set,
@@ -1652,15 +1758,70 @@ fn start_internal(
         poll_reprobed: Arc::clone(&poll_reprobed),
         poll_sweep_count: Arc::clone(&poll_sweep_count),
     };
+
+    // Hoisted out of the `Core` struct literal below, rather than built inline
+    // there as before this field existed: `RefreshHandles` needs its own clone of
+    // each of these, constructed before `Core` takes ownership of the originals.
+    let discovery_abandon_after_atomic =
+        Arc::new(AtomicU64::new(discovery_abandon_after.as_nanos() as u64));
+    let default_branch_chain_reads = Arc::new(AtomicUsize::new(0));
+    let patch_identity_reads = Arc::new(AtomicUsize::new(0));
+    let patch_scan_bounds = Arc::new(Mutex::new(Vec::new()));
+    let dispatch_log = Arc::new(Mutex::new(Vec::new()));
+    let phase_c_gates = Arc::new(Mutex::new(HashMap::new()));
+    let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
+
+    let fetch_refresh_handles = RefreshHandles {
+        table: Arc::clone(&table),
+        overrides: Arc::clone(&overrides),
+        set: spec.set.clone(),
+        discovery_manual: Arc::clone(&discovery_manual),
+        discovery_warn_after: warn_after,
+        discovery_abandon_after: Arc::clone(&discovery_abandon_after_atomic),
+        discovery_warning: Arc::clone(&discovery_warning),
+        show_submodules: Arc::clone(&show_submodules),
+        settle_gate: Arc::clone(&settle_gate),
+        default_branch_chain_reads: Arc::clone(&default_branch_chain_reads),
+        patch_identity_reads: Arc::clone(&patch_identity_reads),
+        patch_scan_bounds: Arc::clone(&patch_scan_bounds),
+        dispatch_log: Arc::clone(&dispatch_log),
+        phase_c_gates: Arc::clone(&phase_c_gates),
+    };
+    let fetch_schedule = FetchSchedule {
+        concurrency: fetch_concurrency,
+        ticks: fetch_ticks,
+        refresh: fetch_refresh_handles.clone(),
+        cycle_count: Arc::clone(&fetch_cycle_count),
+    };
+
     let clock_thread = spawn_clock_thread(
         Arc::clone(&table),
         poll_handles,
+        fetch_schedule,
         Arc::clone(&settle_gate),
-        control_rx,
-        ticks,
         spec.generation_deadline,
-        Arc::clone(&alive),
+        ClockChannels {
+            control: control_rx,
+            ticks,
+            alive: Arc::clone(&alive),
+        },
     );
+
+    // "Fires immediately on being enabled rather than waiting for the first
+    // tick" ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    // "The periodic fetch"): the recurring cadence above only ever fires after a
+    // full `fetch.interval` has elapsed, so the first cycle is dispatched here,
+    // once, on its own plain thread rather than on the dedicated clock thread,
+    // which must stay free to keep polling and sweeping deadlines while this
+    // cycle runs.
+    if fetch_enabled {
+        let table = Arc::clone(&table);
+        let refresh = fetch_refresh_handles.clone();
+        let cycle_count = Arc::clone(&fetch_cycle_count);
+        thread::spawn(move || {
+            run_fetch_cycle(&table, fetch_concurrency, &refresh, &cycle_count);
+        });
+    }
 
     StartForTest {
         core: Core {
@@ -1669,23 +1830,23 @@ fn start_internal(
             set: spec.set,
             discovery_manual,
             discovery_warn_after: warn_after,
-            discovery_abandon_after: Arc::new(AtomicU64::new(
-                discovery_abandon_after.as_nanos() as u64
-            )),
+            discovery_abandon_after: discovery_abandon_after_atomic,
             show_submodules,
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
             discovery_warning,
-            default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
-            patch_identity_reads: Arc::new(AtomicUsize::new(0)),
-            patch_scan_bounds: Arc::new(Mutex::new(Vec::new())),
+            default_branch_chain_reads,
+            patch_identity_reads,
+            patch_scan_bounds,
             action_running: Arc::new(AtomicBool::new(false)),
-            dispatch_log: Arc::new(Mutex::new(Vec::new())),
-            phase_c_gates: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_log,
+            phase_c_gates,
             status_stale_after: spec.status_stale_after,
             poll_reprobed,
             poll_sweep_count,
+            #[cfg(feature = "fetch")]
+            fetch_cycle_count,
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1702,23 +1863,66 @@ struct PollHandles {
     poll_sweep_count: Arc<AtomicUsize>,
 }
 
-/// The dedicated thread: the metadata poll tick and the Generation deadline sweep
-/// share this one interval loop, separate from the probe pool and from any render
-/// loop, so suspending the terminal reschedules none of it. Driven by `ticks`
-/// rather than its own `thread::sleep`, which is what a test replaces to make the
-/// cadence deterministic. The poll runs first on every tick, then the deadline
-/// sweep, both while `!paused`; while paused the poll's own baseline still holds,
-/// since [`run_poll_sweep`] simply never runs, and no fingerprint goes stale by
-/// being skipped.
+/// What [`start_internal`] needs from `CoreSpec::fetch` to schedule the periodic fetch,
+/// bundled into one argument rather than three so this crate's own `clippy::too_many_arguments`
+/// budget has room for it: extracted once at each of `Core::start`'s two callers, which is
+/// what keeps `start_internal`'s own signature identical whether or not this crate is built
+/// with the `fetch` cargo feature (see [`FetchSpec`]'s own doc comment).
+struct FetchStart {
+    enabled: bool,
+    concurrency: usize,
+    ticks: Receiver<Instant>,
+}
+
+/// The periodic fetch's own scheduling inputs, threaded through [`start_internal`]
+/// and [`spawn_clock_thread`] as plain values rather than reading `CoreSpec::fetch`
+/// directly: extracting them once at each of the two callers is what keeps both
+/// functions' own signatures identical whether or not this crate is built with the
+/// `fetch` cargo feature. Carries no `enabled` flag of its own: `ticks` is
+/// [`crossbeam_channel::never`] whenever the periodic fetch is off, so the arm that
+/// reads it simply never fires, the same way the poll's own `ticks` does when a
+/// test has no interest in it.
+struct FetchSchedule {
+    concurrency: usize,
+    ticks: Receiver<Instant>,
+    refresh: RefreshHandles,
+    cycle_count: Arc<AtomicUsize>,
+}
+
+/// The dedicated thread's own control-plane wiring, bundled into one argument so
+/// [`spawn_clock_thread`] stays within clippy's argument limit: `control` is the
+/// pause/resume/shutdown channel every `Core` method sends into, `ticks` drives the
+/// poll and deadline sweep, and `alive` is the flag the thread clears on its way out
+/// (both for a test to observe and for nothing else, since `Drop` joins the handle
+/// directly rather than polling this).
+struct ClockChannels {
+    control: Receiver<ClockControl>,
+    ticks: Receiver<Instant>,
+    alive: Arc<AtomicBool>,
+}
+
+/// The dedicated thread: the metadata poll tick, the Generation deadline sweep and
+/// the periodic fetch's own tick share this one interval loop, separate from the
+/// probe pool and from any render loop, so suspending the terminal reschedules
+/// none of it. Driven by `ticks` and `fetch.ticks` rather than a bare
+/// `thread::sleep`, which is what a test replaces to make the cadence
+/// deterministic. The poll and deadline sweep run first on every `ticks` tick,
+/// both while `!paused`; a fetch cycle runs on every `fetch.ticks` tick, also only
+/// while `!paused`, so a suspended Repon neither sweeps nor fetches while the user
+/// is in a Launcher.
 fn spawn_clock_thread(
     table: Arc<RwLock<Table>>,
     poll: PollHandles,
+    fetch: FetchSchedule,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
-    control: Receiver<ClockControl>,
-    ticks: Receiver<Instant>,
     generation_deadline: Duration,
-    alive: Arc<AtomicBool>,
+    channels: ClockChannels,
 ) -> JoinHandle<()> {
+    let ClockChannels {
+        control,
+        ticks,
+        alive,
+    } = channels;
     thread::spawn(move || {
         let mut paused = false;
         loop {
@@ -1746,10 +1950,103 @@ fn spawn_clock_thread(
                         sweep_deadline(&table, &settle_gate, generation_deadline);
                     }
                 }
+                recv(fetch.ticks) -> tick => {
+                    if tick.is_err() {
+                        break;
+                    }
+                    if !paused {
+                        run_fetch_cycle(&table, fetch.concurrency, &fetch.refresh, &fetch.cycle_count);
+                    }
+                }
             }
         }
         alive.store(false, Ordering::Release);
     })
+}
+
+/// One periodic-fetch cycle: every distinct git common dir this table currently
+/// knows, not excluded, fetched with pruning, bounded to `concurrency` at once,
+/// then one normal Generation over every entity the table now knows
+/// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The periodic fetch": "a finished fetch starts a normal generation"), the exact
+/// completion path [`Core::run_action`] already uses. `cycle_count` counts every
+/// call, whether or not any repository had a remote to fetch, so a test driving
+/// the dedicated thread's own tick channel can prove a tick reached this function
+/// at all, the same proof [`Core::poll_sweep_count_for_test`] gives the poll.
+///
+/// A no-op without the `fetch` cargo feature: `fetch.ticks` is
+/// [`crossbeam_channel::never`] whenever this crate is built without it (see
+/// [`FetchSchedule`]), so this is never actually reached in that build; the stub
+/// exists so [`spawn_clock_thread`]'s own signature does not depend on the
+/// feature.
+///
+/// Two things worth recording beside this scheduler rather than only in
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md):
+/// `Gone` is systematically under-reported without this cycle running, because a
+/// remote-tracking ref only disappears once a prune removes it
+/// ([`crate::landing`]'s `classify_unmerged_branch` doc comment), so a Repo with
+/// `fetch.enabled = false` can carry a stale upstream indefinitely and never show
+/// it. And the cadence itself is unresolved: `fetch.interval`'s default of five
+/// minutes is [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// stated number, not one this crate has measured against a real population the
+/// way the poll interval and the generation deadline were.
+#[cfg(feature = "fetch")]
+fn run_fetch_cycle(
+    table: &Arc<RwLock<Table>>,
+    concurrency: usize,
+    refresh: &RefreshHandles,
+    cycle_count: &Arc<AtomicUsize>,
+) {
+    cycle_count.fetch_add(1, Ordering::Release);
+
+    let common_dirs = distinct_fetchable_common_dirs(table);
+    crate::fetch::run_bounded(common_dirs, concurrency.max(1), |common_dir| {
+        let cancel = AtomicBool::new(false);
+        // Every repository's own fetch result is independent: one credential
+        // failure or one unreachable remote must never stop the rest of the
+        // cycle from running, so a per-repository error is swallowed here
+        // rather than aborting the whole cycle.
+        let _ = crate::fetch::fetch_and_prune(&common_dir, &cancel);
+    });
+
+    let all_keys: Vec<EntityKey> = table
+        .read()
+        .unwrap()
+        .entities
+        .iter()
+        .map(|entity| entity.key.clone())
+        .collect();
+    refresh.dispatch(&all_keys);
+}
+
+#[cfg(not(feature = "fetch"))]
+fn run_fetch_cycle(
+    _table: &Arc<RwLock<Table>>,
+    _concurrency: usize,
+    _refresh: &RefreshHandles,
+    _cycle_count: &Arc<AtomicUsize>,
+) {
+}
+
+/// Every distinct git common dir a fetch cycle should fetch: deduplicated across
+/// every entity sharing one (a Repo and its linked Worktrees), and skipped only
+/// when every entity sharing that common dir is excluded
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)'s
+/// "listed, never operated on"), since a Worktree named directly by its own path
+/// can carry a different `excluded` than an entry it would otherwise inherit.
+#[cfg(feature = "fetch")]
+fn distinct_fetchable_common_dirs(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
+    let table = table.read().unwrap();
+    let mut seen: HashMap<PathBuf, bool> = HashMap::new();
+    for entity in &table.entities {
+        let common_dir = entity.common_dir.to_path_buf();
+        let operable = seen.entry(common_dir).or_insert(false);
+        *operable = *operable || !entity.excluded;
+    }
+    seen.into_iter()
+        .filter(|(_, operable)| *operable)
+        .map(|(common_dir, _)| common_dir)
+        .collect()
 }
 
 /// One entity as the metadata poll sweep found it, everything gathered under one
@@ -3077,6 +3374,17 @@ mod tests {
         assert!(status.success());
     }
 
+    /// A `FetchSpec` that never fires on its own: `enabled: false`, so every
+    /// existing test that does not care about the periodic fetch keeps behaving
+    /// exactly as it did before this field existed.
+    fn fetch_spec_for_test() -> FetchSpec {
+        FetchSpec {
+            enabled: false,
+            interval: Duration::from_secs(3600),
+            concurrency: 4,
+        }
+    }
+
     fn spec(roots: Vec<PathBuf>) -> CoreSpec {
         CoreSpec {
             set: SetSpec {
@@ -3090,6 +3398,7 @@ mod tests {
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
+            fetch: fetch_spec_for_test(),
         }
     }
 
@@ -3100,7 +3409,9 @@ mod tests {
     /// deliberately: it narrows probing and rendering, never what discovery bounds, so it
     /// is not the scoping field this test guards against
     /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
-    /// "narrows the view rather than bounding the work").
+    /// "narrows the view rather than bounding the work"). `fetch` is excluded from that
+    /// same guard for the same reason: it narrows what the periodic fetch touches, never
+    /// what discovery bounds.
     #[test]
     fn core_spec_carries_no_scoping_field_scope_is_never_a_dial() {
         let CoreSpec {
@@ -3110,6 +3421,7 @@ mod tests {
             status_stale_after: _,
             generation_deadline: _,
             show_submodules: _,
+            fetch: _,
         } = spec(Vec::new());
     }
 
@@ -8631,6 +8943,213 @@ mod tests {
             other => panic!(
                 "expected the second Generation to recompute and read 1 ahead, got {other:?}"
             ),
+        }
+    }
+
+    /// The periodic fetch's own scheduler: criterion 3's five rules
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "The periodic fetch"). Every fixture here is a bare repo this test creates plus a
+    /// real `git clone` of it, per the standing constraint that a fetch test never
+    /// touches a real remote or the network.
+    #[cfg(feature = "fetch")]
+    mod fetch_scheduler {
+        use super::*;
+
+        fn fetch_spec(enabled: bool, root: PathBuf) -> CoreSpec {
+            let mut spec = spec(vec![root]);
+            spec.fetch = FetchSpec {
+                enabled,
+                interval: Duration::from_secs(3600),
+                concurrency: 4,
+            };
+            spec
+        }
+
+        /// A bare "remote" this call creates and seeds with one commit, never a real
+        /// remote and never touched over the network.
+        fn seeded_remote() -> tempfile::TempDir {
+            let remote = tempfile::tempdir().expect("temp dir");
+            crate::test_support::init_bare(remote.path());
+            crate::test_support::push_new_commit(remote.path(), "README.md", "seed\n");
+            remote
+        }
+
+        fn clone_into(remote: &Path, dest: &Path) {
+            let status = Command::new("git")
+                .arg("clone")
+                .arg(remote)
+                .arg(dest)
+                .status()
+                .expect("run git clone");
+            assert!(status.success());
+        }
+
+        /// The scheduler's first rule: enabling the periodic fetch runs one cycle
+        /// immediately rather than waiting for `fetch.interval` to elapse. `fetch_ticks`
+        /// is `crossbeam_channel::never()`, so the only way `fetch_cycle_count_for_test`
+        /// can ever move is the immediate cycle `start_internal` dispatches on its own
+        /// plain thread; a scheduler that only reacted to a tick would leave this at
+        /// zero forever.
+        #[test]
+        fn enabling_the_periodic_fetch_runs_one_cycle_before_any_tick_arrives() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            );
+            let core = started.core;
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    core.fetch_cycle_count_for_test() >= 1
+                }),
+                "the periodic fetch must run its first cycle without waiting for a tick"
+            );
+        }
+
+        /// A tick on the periodic fetch's own channel runs a second cycle, proving the
+        /// recurring cadence is wired to the same dedicated thread the immediate cycle
+        /// used, not merely a one-shot dispatched at start.
+        #[test]
+        fn a_tick_on_the_fetch_channel_runs_another_cycle() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            );
+            let core = started.core;
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    core.fetch_cycle_count_for_test() >= 1
+                }),
+                "the immediate cycle must have run first"
+            );
+
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    core.fetch_cycle_count_for_test() >= 2
+                }),
+                "a tick on the fetch channel must run a second cycle"
+            );
+        }
+
+        /// [`crate::test_support::push_new_commit`], but onto `branch` rather than
+        /// always `main`: this scheduler test needs a second commit on `topic`
+        /// specifically, so ancestry alone cannot call it merged into `main`.
+        fn push_new_commit_on_branch(remote: &Path, branch: &str, name: &str, contents: &str) {
+            let contributor = tempfile::tempdir().expect("temp dir");
+            let status = Command::new("git")
+                .arg("clone")
+                .arg("--branch")
+                .arg(branch)
+                .arg(remote)
+                .arg(contributor.path())
+                .status()
+                .expect("run git clone");
+            assert!(status.success());
+            std::fs::write(contributor.path().join(name), contents).expect("write fixture file");
+            git(contributor.path(), &["add", name]);
+            git(contributor.path(), &["commit", "-m", "extra work on topic"]);
+            git(contributor.path(), &["push", "origin", branch]);
+        }
+
+        /// Criteria 3 and 4 together, end to end: the periodic fetch always prunes, so
+        /// `Gone` can appear at all, and a finished fetch starts one normal Generation
+        /// on its own, so the pruned state actually lands on the table without the test
+        /// calling `refresh` itself. `topic` carries a commit `main` never gets, so
+        /// ancestry alone cannot call it `Merged`; deleting it upstream before the
+        /// scheduler's own fetch is what a plain, non-pruning fetch could never turn
+        /// into `Gone`.
+        #[test]
+        fn a_finished_fetch_prunes_and_starts_its_own_generation_that_lands_gone() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+
+            git(remote.path(), &["branch", "topic"]);
+            push_new_commit_on_branch(remote.path(), "topic", "topic.txt", "extra work\n");
+
+            // A deliberate, ordinary fetch by the test's own setup, distinct from the
+            // Core's own periodic fetch under test: `parent` was cloned before `topic`
+            // existed, so this is what teaches it about `origin/topic` at all, the same
+            // way any real clone would only learn of a branch created after it cloned
+            // on its own next fetch.
+            git(&parent, &["fetch", "origin"]);
+
+            let worktree_path = root_path.join("topic-worktree");
+            git(
+                &parent,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "topic",
+                    worktree_path.to_str().expect("utf8 path"),
+                    "origin/topic",
+                ],
+            );
+
+            // Deleted only now, after the worktree already tracks it: this is the
+            // upstream disappearance a plain fetch can see but never prune away, and
+            // exactly what the scheduler's own fetch (not this setup) must prune.
+            git(remote.path(), &["branch", "-D", "topic"]);
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            );
+            let core = started.core;
+
+            let gone = wait_until(Duration::from_secs(10), || {
+                core.snapshot()
+                    .entities
+                    .iter()
+                    .filter(|entity| matches!(entity.kind, Kind::Worktree))
+                    .any(|entity| {
+                        matches!(
+                            entity.state.settled(),
+                            Some(Settled::Known {
+                                value: WorktreeState::Gone,
+                                at: _,
+                                stale: _,
+                            })
+                        )
+                    })
+            });
+            assert!(
+                gone,
+                "a finished fetch's own Generation must land the pruned Worktree as Gone \
+                 without the test ever calling refresh; snapshot: {:?}",
+                core.snapshot()
+                    .entities
+                    .iter()
+                    .map(|entity| (entity.kind, entity.state.settled().cloned()))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }

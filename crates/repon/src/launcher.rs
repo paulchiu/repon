@@ -621,6 +621,11 @@ mod tests {
             status_stale_after: std::time::Duration::from_secs(3600),
             generation_deadline: std::time::Duration::from_secs(3600),
             show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
         });
         let key = core.snapshot().entities[0].key.clone();
         let entity = core.probe_now(&key);

@@ -1,4 +1,10 @@
-//! The git backend. gix reads; nothing here writes.
+//! The git backend. gix reads here; nothing in this module writes.
+//!
+//! Scoped to the probe path: the periodic fetch in `fetch.rs` always prunes, which
+//! mutates `refs/remotes/`, so it is a separate mutating path behind its own cargo
+//! feature rather than a claim this module makes
+//! ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)'s
+//! "The read-only invariant is scoped to the probe path").
 //!
 //! Private, and nothing here is re-exported yet: see the crate root doc comment.
 

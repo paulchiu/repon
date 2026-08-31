@@ -107,6 +107,56 @@ check-core-isolation:
     check_isolation "serde feature on, the settled document's wire format" serde \
         "${base_allowed_with_reasons[@]}" \
         "serde:the settled document's wire format on stdout, off by default (ADR 0015)"
+    # The periodic fetch's blocking network client, HTTP transport and credential
+    # machinery resolve inside gix's own already-allowed subtree, so they never
+    # surface as a direct dependency and the allowed set here is identical to the
+    # base build. That identity is not itself evidence of anything: a depth-1 check
+    # cannot see them either way, which is what `check_network_stack_is_gated`
+    # below exists to cover (ADR 0015's "The read-only invariant is scoped to the
+    # probe path").
+    check_isolation "fetch feature on, the periodic fetch" fetch "${base_allowed_with_reasons[@]}"
+
+    # The claim the depth-1 check above is structurally blind to: the mutating
+    # path's network stack is absent from the default build and present only under
+    # the feature. Read over the whole transitive tree, since that is the depth the
+    # crates actually live at.
+    #
+    # Checked against both `repon-core` alone and the `repon` binary a user actually
+    # builds, because `repon-core` passing this in isolation already did once while
+    # `repon`'s own manifest requested `repon-core/fetch` unconditionally, putting the
+    # network stack (and aws-lc-sys's C sources, which fail to cross-compile to
+    # Windows) in every ordinary `cargo build`. `repon` has no `fetch` feature of its
+    # own to turn on, by design (`Cargo.toml`'s own comment on the dependency line), so
+    # only its default build is asserted clean; there is no "on" case to check there.
+    check_network_stack_is_gated() {
+        local -a network_crates=(reqwest rustls hyper-rustls tokio-rustls)
+
+        local core_default_tree core_fetch_tree repon_default_tree
+        core_default_tree=$(cargo tree -p repon-core --edges normal --prefix none)
+        core_fetch_tree=$(cargo tree -p repon-core --edges normal --prefix none --features fetch)
+        repon_default_tree=$(cargo tree -p repon --edges normal --prefix none)
+
+        for name in "${network_crates[@]}"; do
+            if grep -qE "^${name} v" <<<"$core_default_tree"; then
+                echo "$name is in repon-core's default build; the mutating fetch path's" >&2
+                echo "network stack must reach the tree only under the fetch feature" >&2
+                exit 1
+            fi
+            if grep -qE "^${name} v" <<<"$repon_default_tree"; then
+                echo "$name is in repon's own default build; the binary a user actually" >&2
+                echo "builds must not pull the fetch path's network stack in either" >&2
+                exit 1
+            fi
+            if ! grep -qE "^${name} v" <<<"$core_fetch_tree"; then
+                echo "$name is absent even with the fetch feature on; this check is naming a" >&2
+                echo "crate the fetch path no longer pulls, so it proves nothing as written" >&2
+                exit 1
+            fi
+        done
+        echo "repon-core's and repon's own default builds pull none of: ${network_crates[*]}, and repon-core's fetch feature pulls all of them"
+    }
+
+    check_network_stack_is_gated
 
 # Build and test against the declared floor
 #

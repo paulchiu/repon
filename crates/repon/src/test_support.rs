@@ -874,16 +874,18 @@ mod tests {
     /// (`core.rs`'s own doc comment on `Core::refresh`); it is private to `repon-core`, so a
     /// call to it can only ever live there, and confining the scan to that crate is the
     /// claim's own shape rather than a scan quietly narrowing what it inspects: the thing
-    /// scanned for cannot live anywhere else. Its two production callers are `Core::refresh`
-    /// itself (the funnel every one of the seven `repon`-side triggers above shares) and
-    /// `Core::run_action`'s own completion (an Action finishing, which bypasses
-    /// `Core::refresh` because it has no cursor to order by either, the same reason named on
-    /// the scan above). Confining the scan is also what lets the needle be the bare
-    /// `.dispatch(`, which no line wrap can split: qualifying it by the receiver, to dodge
-    /// `BindingTable::dispatch` over in `repon`, would make a call rustfmt wrapped onto its
-    /// own line invisible to this count.
+    /// scanned for cannot live anywhere else. Its three production callers are `Core::refresh`
+    /// itself (the funnel every one of the seven `repon`-side triggers above shares),
+    /// `Core::run_action`'s own completion (an Action finishing), and the periodic fetch's own
+    /// completion inside `run_fetch_cycle` (a finished fetch,
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "The periodic fetch": "a finished fetch starts a normal generation"); all three bypass
+    /// `Core::refresh` because none has a cursor to order by. Confining the scan is also what
+    /// lets the needle be the bare `.dispatch(`, which no line wrap can split: qualifying it by
+    /// the receiver, to dodge `BindingTable::dispatch` over in `repon`, would make a call
+    /// rustfmt wrapped onto its own line invisible to this count.
     #[test]
-    fn exactly_two_production_call_sites_mint_a_new_generation_in_repon_core() {
+    fn exactly_three_production_call_sites_mint_a_new_generation_in_repon_core() {
         let core_src = vec![workspace_crate_src_dirs()[1].clone()];
         assert!(
             !rust_source_files(&core_src[0]).is_empty(),
@@ -901,11 +903,65 @@ mod tests {
         );
         assert_eq!(
             offending.len(),
-            2,
-            "expected exactly two production call sites that mint a new Generation (`Core::refresh`'s \
-             own body, and an Action's completion inside `Core::run_action`); a count that \
+            3,
+            "expected exactly three production call sites that mint a new Generation \
+             (`Core::refresh`'s own body, an Action's completion inside `Core::run_action`, and \
+             a finished periodic fetch's completion inside `run_fetch_cycle`); a count that \
              moved means a new place starts one, at: {offending:?}"
         );
+    }
+
+    /// The periodic-fetch ticket's own criterion: the only mutating git operations anywhere
+    /// in the program are the periodic fetch's own fetch-and-prune and the fast-forward-only
+    /// auto-update ADR 0002 names beside it. The auto-update does not exist yet (no
+    /// `fast_forward` or `ff_only` in either crate's source at the time this test was
+    /// written), so today's provable claim is the narrower half: no push-direction remote
+    /// operation, no commit, no merge, no rebase and no reset exists in production code
+    /// anywhere in the workspace. Each needle stops at its call's opening paren, or is a
+    /// parenthesis-free shape unique enough on its own (`Direction::Push`), per this module's
+    /// own convention: a call whose arguments wrap under rustfmt is still caught, and a
+    /// needle that reached past the paren would not be.
+    ///
+    /// Deliberately not scanned here: a shelled-out `git` invocation. `repon-core`'s own
+    /// `test_support.rs` is entirely git-fixture helpers with no internal `#[cfg(test)] mod
+    /// tests` marker, so [`production_source`]'s own documented fallback (a file with no such
+    /// module is scanned whole) would flag every one of them as production, which they are
+    /// not; excluding that one file would be excluding a whole file to dodge a false positive,
+    /// the shape this module's own scans are built to refuse. [ADR 0004](https://github.com/paulchiu/repon/blob/main/docs/adr/0004-gix-over-git2.md)
+    /// already makes gix the sole git backend for production code, so the five needles below
+    /// cover the criterion's named verbs at the layer that can actually reach them.
+    #[test]
+    fn no_push_commit_merge_rebase_or_reset_operation_exists_in_production_code() {
+        let dirs = workspace_crate_src_dirs();
+        let files_scanned: usize = dirs.iter().map(|dir| rust_source_files(dir).len()).sum();
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let needles: [(&str, &str); 5] = [
+            (
+                "a push-direction remote operation (gix's own `Direction::Push`)",
+                "Direction::Push",
+            ),
+            (
+                "a commit created via gix's own commit machinery",
+                ".commit(",
+            ),
+            ("a merge via gix's own merge machinery", ".merge("),
+            ("a rebase via gix's own machinery", ".rebase("),
+            ("a reset via gix's own machinery", ".reset("),
+        ];
+
+        for (description, needle) in needles {
+            let offending = production_lines_containing(needle);
+            assert!(
+                offending.is_empty(),
+                "found {description} (needle `{needle}`) in production code, which this \
+                 ticket's narrowest-safe-operation rule forbids outright: {offending:?}"
+            );
+        }
     }
 
     /// `cancel_in_flight` is the one function that cancels a Generation, equally private to
