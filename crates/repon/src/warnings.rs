@@ -627,4 +627,90 @@ mod tests {
             "the indicator is reserved ahead of every item, so no rung may drop it"
         );
     }
+
+    /// Reads the fenced ladder that follows `heading` in `name`, as a width and the line it
+    /// renders. Shared by the two ladder tests below, which check different documents for the
+    /// same shape.
+    fn ladder(name: &str, heading: &str) -> Vec<(usize, String)> {
+        let text = spec(name);
+        let section = text
+            .split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("docs/spec/{name} carries `{heading}`"));
+        section
+            .split("```")
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{heading}` in docs/spec/{name} carries a ladder"))
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (width, rendered) = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .expect("every rung is a width and the line it renders");
+                (
+                    width
+                        .parse::<usize>()
+                        .expect("the rung's width is a number"),
+                    rendered.trim().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The acknowledged ladder is not published as a block: layout-and-provenance.md states
+    /// it in a sentence, as actions.md's own shifted by the indicator's three reserved
+    /// columns. Parsing both is what keeps that sentence true, which a prose cross-reference
+    /// cannot do for itself, and it is the one arithmetic tying the two documents together
+    /// after [0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)
+    /// moved the composition out of actions.md.
+    #[test]
+    fn the_acknowledged_ladder_is_the_headers_own_shifted_by_the_reserved_indicator() {
+        let header = ladder("actions.md", "## The run on screen");
+        for (width, rendered) in &header {
+            assert_eq!(
+                rendered.chars().count(),
+                *width,
+                "header rung {width} renders {} columns: `{rendered}`",
+                rendered.chars().count()
+            );
+        }
+
+        let shifted: Vec<String> = header
+            .iter()
+            .map(|(width, _)| (width + 3).to_string())
+            .collect();
+        let layout = spec("layout-and-provenance.md");
+        let stated = layout
+            .split("shifted three columns by the reserved indicator: ")
+            .nth(1)
+            .expect("layout-and-provenance.md states the acknowledged ladder")
+            .split(", and the same")
+            .next()
+            .expect("the stated ladder ends before the floor");
+        assert_eq!(
+            stated,
+            shifted.join(", "),
+            "the acknowledged ladder must be the header's own plus the indicator's three columns"
+        );
+    }
+
+    /// [0027](../../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)
+    /// spends the program's name on the active Set's, so a ladder that still opens with
+    /// `repon` is a document that reverted the decision without saying so. The active Set is
+    /// the most consequential state Repon holds and the reason it is on screen at all.
+    #[test]
+    fn the_status_rows_first_item_names_the_active_set_rather_than_the_program() {
+        let layout = spec("layout-and-provenance.md");
+        assert!(
+            layout.contains("| 1 | the active Set's name and the entity count |"),
+            "rank 1 is the active Set's name and the count it bounds"
+        );
+        for name in ["layout-and-provenance.md", "actions.md"] {
+            assert!(
+                !spec(name).contains("repon 403 entities"),
+                "docs/spec/{name} still opens its ladder with the program's name"
+            );
+        }
+    }
 }

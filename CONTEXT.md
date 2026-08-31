@@ -29,8 +29,12 @@ The work done across many Repos: seeing their combined state, and acting on many
 ### Selection and scoping
 
 **Set**:
-A named, saved predicate over Repos, defined in config and selectable by flag or environment variable. Seeded from directory structure so Repon is useful with no config at all. It bounds the work rather than the view, so a Set named at startup that does not exist is never substituted with another one.
-_Avoid_: Group, workspace, project
+A named, saved predicate over Repos, defined in config and selectable by flag or environment variable. With no config at all there is one implicit Set, `all`, rooted at the working directory, which is what keeps zero config zero; Sets are never seeded from directory structure. It bounds the work rather than the view, so a Set named at startup that does not exist is never substituted with another one.
+_Avoid_: Group, workspace, project, tab strip (file order fixes the numbers that switch Set, and nothing draws a strip)
+
+**Active Set**:
+The one Set bounding this session's work. It is named on screen ahead of the entity count it bounds, and it changes only by an explicit gesture: a number, the picker, or a reload whose file no longer declares it.
+_Avoid_: Current Set, selected Set (a Selection is rows the user picked, which is a different thing)
 
 **Set spec**:
 A Set's bounding specification as the core receives it: roots, include and exclude globs, plain data with no TOML type and no file path.

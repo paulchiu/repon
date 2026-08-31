@@ -26,7 +26,7 @@ Priority, after the indicator is reserved:
 
 | rank | item | source |
 | --- | --- | --- |
-| 1 | the entity count | [core-api.md](core-api.md) |
+| 1 | the active Set's name and the entity count | [config.md](config.md), [core-api.md](core-api.md) |
 | 2 | the most severe warning's message, plus `(+N more, w to expand)` while more stand | [theming.md](theming.md) |
 | 3 | run progress | [actions.md](actions.md) |
 | 4 | the Filter's match count | [filter.md](filter.md) |
@@ -35,22 +35,24 @@ Priority, after the indicator is reserved:
 
 The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
 
+Rank 1 names the **active Set**, where the program's own name used to sit: `work 403 entities`, and `all 403 entities` running zero-config. A Set bounds the work rather than the view ([config.md](config.md)), so the count is the size of what the Set bounds and the two are one item rather than two, which is also what stops a count surviving on a row its own name has dropped from. The name is never truncated: the item renders whole or drops whole, because a Set name is user-supplied, two Sets can share a prefix, and a cut name reads exactly like a name ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)). There is no tab strip. `s` opens the Set picker, numbered in file order, and [keybindings.md](keybindings.md) carries it along with what a switch says.
+
 `w` **acknowledges**. Opening the expanded list marks every currently outstanding condition seen, and the row falls back to the indicator alone, freeing the message's columns for the items below it. A condition arriving that has not been seen expands the row again. Acknowledgement is not dismissal: the indicator keeps its full count either way, and a condition leaves the row only by ceasing to be true. It is session state and never persists ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)).
 
 One warning outstanding and unacknowledged, a run in flight, so every item is live:
 
 ```
-158  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
-152  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
-118  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
- 97  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
- 86  !1 repon 403 entities · theme `solarized-dark` named in config.toml does not exist ...
- 25  !1 repon 403 entities ...
- 21  !1 repon 403 entities
+157  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
+151  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
+117  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
+ 96  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
+ 85  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist ...
+ 24  !1 work 403 entities ...
+ 20  !1 work 403 entities
   2  !1
 ```
 
-Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted three columns by the reserved indicator: 97, 91, 57, 36, 25, 21, and the same 2-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
+Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted three columns by the reserved indicator: 96, 90, 56, 35, 24, 20, and the same 2-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
 
 ## The list
 
@@ -109,7 +111,7 @@ The detail pane always reports provenance per cell, which is the escape hatch fr
 
 ## Screens
 
-These snapshots were generated from the prototype; colour does not survive the dump. The bottom row in each is the prototype's variant switcher, which is scaffolding rather than part of the design. They predate the `base` column and the `∅` glyph, so read them for the gutter and blank-cell behaviour they were made to settle rather than as the current column set.
+These snapshots were generated from the prototype; colour does not survive the dump. The bottom row in each is the prototype's variant switcher, which is scaffolding rather than part of the design. They predate the `base` column, the `∅` glyph and this document's own status row, whose first item now names the active Set rather than the program, so read them for the gutter and blank-cell behaviour they were made to settle rather than as the current column set.
 
 ### First frame, 140x24
 
