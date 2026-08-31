@@ -16,6 +16,7 @@
 //! descriptor open, as `keepalive` does, returns the output intact even past two
 //! seconds. Linux is not this abrupt: the closed-but-unread buffer drains before `EIO`.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
@@ -23,7 +24,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +41,108 @@ const CAPTURE_TAIL_LINES: usize = 200;
 /// PTY (`docs/spec/actions.md`'s "The PTY").
 const PTY_WIDTH: u16 = 120;
 
+/// How long a cancelled step's process group is given to exit on its own SIGTERM before
+/// [`RunControl::cancel`] escalates to the uncatchable SIGKILL: SIGTERM is trappable and
+/// SIGKILL is not (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
+const CANCEL_GRACE: Duration = Duration::from_millis(350);
+
+/// One Action run's own reach into its steps' children, from outside the call stack that
+/// runs them: which process groups are currently live, so [`Self::hold`],
+/// [`Self::continue_run`] and [`Self::cancel`] know who to signal, and whether the run has
+/// been cancelled, so a step not yet started can become [`StepOutcome::Cancelled`] instead
+/// of ever spawning. `Core::run_action` builds one fresh instance per call and shares it
+/// with every entity's own rayon task; it is never reused across runs.
+///
+/// A process group is identified by its leader's pid, since `setsid(2)` (`build_command`'s
+/// own doc comment) makes the child's pgid equal its pid; [`register`](Self::register) and
+/// [`deregister`](Self::deregister) bracket exactly the span [`run_step`] can have a live
+/// child, so a signal here can never reach a pid this run did not itself spawn.
+pub(crate) struct RunControl {
+    cancelled: AtomicBool,
+    live_groups: Mutex<HashSet<libc::pid_t>>,
+}
+
+impl RunControl {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            live_groups: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Whether [`Self::cancel`] has been called: checked by the fan-out's own per-entity
+    /// loop before starting each step, so a step that had not yet started becomes
+    /// `Cancelled` rather than ever spawning.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn register(&self, pgid: libc::pid_t) {
+        self.live_groups.lock().unwrap().insert(pgid);
+    }
+
+    fn deregister(&self, pgid: libc::pid_t) {
+        self.live_groups.lock().unwrap().remove(&pgid);
+    }
+
+    fn live_snapshot(&self) -> Vec<libc::pid_t> {
+        self.live_groups.lock().unwrap().iter().copied().collect()
+    }
+
+    /// SIGSTOPs every step's process group currently live. Reversible with
+    /// [`Self::continue_run`]; kept apart from `Core::pause`, which stays ignorant of why
+    /// background work stopped (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
+    pub(crate) fn hold(&self) {
+        for pgid in self.live_snapshot() {
+            signal_group(pgid, libc::SIGSTOP);
+        }
+    }
+
+    /// SIGCONTs every step's process group currently live, undoing [`Self::hold`].
+    pub(crate) fn continue_run(&self) {
+        for pgid in self.live_snapshot() {
+            signal_group(pgid, libc::SIGCONT);
+        }
+    }
+
+    /// Marks the run cancelled, so a step not yet started never spawns, then SIGTERMs every
+    /// process group currently live and, on a separate thread, SIGKILLs after
+    /// [`CANCEL_GRACE`] whichever of those are still live at that point: SIGTERM is
+    /// trappable, SIGKILL is not.
+    pub(crate) fn cancel(self: &Arc<Self>) {
+        self.cancelled.store(true, Ordering::Release);
+        let groups = self.live_snapshot();
+        for &pgid in &groups {
+            signal_group(pgid, libc::SIGTERM);
+        }
+        let control = Arc::clone(self);
+        thread::spawn(move || {
+            thread::sleep(CANCEL_GRACE);
+            let live = control.live_groups.lock().unwrap();
+            let still_live: Vec<libc::pid_t> = groups
+                .into_iter()
+                .filter(|pgid| live.contains(pgid))
+                .collect();
+            drop(live);
+            for pgid in still_live {
+                signal_group(pgid, libc::SIGKILL);
+            }
+        });
+    }
+}
+
+/// Sends `signal` to the process group `pgid` leads, via the negative-pid convention
+/// `kill(2)` gives a process group. A `pgid` already reaped is a harmless no-op (`ESRCH`),
+/// since [`RunControl::deregister`] runs the instant a step's own `wait()` returns.
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: `kill` with a negative pid targets the process group that pid leads and
+    // touches no memory of its own; a group already gone is reported back as `ESRCH`,
+    // never undefined behaviour.
+    unsafe {
+        libc::kill(-pgid, signal);
+    }
+}
+
 /// Runs one step to completion: `argv[0]` under `argv[1..]`, in `cwd`, with `env` applied
 /// as [`crate::environment::environment`] already produces it (`Some` sets a variable,
 /// `None` unsets it). With `shell` set, `argv` is instead `shell = true`'s own convention,
@@ -51,12 +155,20 @@ const PTY_WIDTH: u16 = 120;
 /// concurrency slot until the run is cancelled or Repon quits).
 ///
 /// Only ever returns [`StepOutcome::Ok`] or [`StepOutcome::Failed`]: `NotRun` and
-/// `Cancelled` belong to the multi-step sequencing this function does not do.
+/// `Cancelled` belong to the multi-step sequencing this function does not do, which is also
+/// why a step killed by [`RunControl::cancel`] still comes back `Failed` here (a signalled
+/// exit has no clean exit code) rather than `Cancelled`; the caller is what turns that
+/// `Failed` into `Cancelled` once it sees `control.is_cancelled()`.
+///
+/// `control` learns this step's process group the instant it has one, and forgets it the
+/// instant this call is done with it, which is the whole window in which `control.cancel`,
+/// `control.hold` or `control.continue_run` can reach this child at all.
 pub(crate) fn run_step(
     argv: &[String],
     shell: bool,
     cwd: &Path,
     env: &[(String, Option<String>)],
+    control: &RunControl,
 ) -> StepResult {
     let label: Arc<str> = Arc::from(argv.join(" "));
     let start = Instant::now();
@@ -103,7 +215,12 @@ pub(crate) fn run_step(
     // dropping `command`. `keepalive` is deliberately not touched here.
     drop(command);
 
+    // `setsid` in `pre_exec` already made this child its own session and process-group
+    // leader, so its pid doubles as the pgid `control` signals.
+    let pgid = child.id() as libc::pid_t;
+    control.register(pgid);
     let (raw, status) = drain_until_exit(master, keepalive, child);
+    control.deregister(pgid);
 
     let outcome = match status {
         Some(status) if status.success() => StepOutcome::Ok,
@@ -706,12 +823,12 @@ mod tests {
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        run_step(&argv, false, cwd, &[])
+        run_step(&argv, false, cwd, &[], &RunControl::new())
     }
 
     /// `shell = true`'s own convention: one argv element, the whole command string.
     fn run_shell(command: &str, cwd: &Path) -> StepResult {
-        run_step(&[command.to_string()], true, cwd, &[])
+        run_step(&[command.to_string()], true, cwd, &[], &RunControl::new())
     }
 
     fn tempdir() -> tempfile::TempDir {
@@ -836,6 +953,132 @@ mod tests {
             pgid, pid,
             "setsid must make the child its own process-group leader"
         );
+    }
+
+    // --- `RunControl`: cancel escalates from a trappable signal to an uncatchable one,
+    // and hold/continue_run are reversible ---
+
+    /// This machine's own idea of `pid`'s current process state, the leading `ps` state
+    /// code (`T` for stopped, on both the Linux and the BSD/macOS `ps` this project
+    /// targets), or `None` once `ps` can no longer find the process at all.
+    fn process_state(pid: libc::pid_t) -> Option<char> {
+        let output = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .chars()
+            .next()
+    }
+
+    /// Polls [`process_state`] until it matches `wanted` or `timeout` elapses, since a
+    /// signal this test just sent has not necessarily already landed the instant `kill`
+    /// returns. Bounded so a regression (the signal never lands, or lands as the wrong one)
+    /// fails this test rather than hanging it.
+    fn wait_for_process_state(pid: libc::pid_t, wanted: char, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if process_state(pid) == Some(wanted) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Spawns `argv` under a real PTY and `setsid`, exactly as [`run_step`] would, but
+    /// returns the raw pieces rather than blocking to completion, so a test can act on the
+    /// live child before it exits.
+    fn spawn_controlled(argv: &[&str], cwd: &Path) -> (OwnedFd, OwnedFd, Child, libc::pid_t) {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
+        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
+        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+        let mut command = build_command(&argv, cwd, &[], slave, slave_dup);
+        let child = command.spawn().expect("spawn a controlled child");
+        drop(command);
+        let pgid = child.id() as libc::pid_t;
+        (master, keepalive, child, pgid)
+    }
+
+    /// The whole reason [`RunControl::cancel`] sends two signals rather than one: a child
+    /// that traps and ignores SIGTERM must still die, from the uncatchable SIGKILL that
+    /// follows. A test whose child dies on the first signal would still pass if `cancel`
+    /// were mutated to send only SIGTERM, which is exactly the regression this criterion
+    /// exists to catch; trapping TERM here is what rules that mutation out.
+    ///
+    /// Bounded end to end by `recv_timeout` on a real child spawned to sleep 30s: the grace
+    /// plus SIGKILL together take well under a second, so a regression that drops the
+    /// SIGKILL follow-up fails this test's own timeout rather than hanging the suite for
+    /// 30s or forever.
+    #[test]
+    fn a_child_that_traps_sigterm_still_dies_once_cancel_escalates_to_sigkill() {
+        let dir = tempdir();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (master, keepalive, child, pgid) = spawn_controlled(
+                &["sh", "-c", "trap '' TERM; echo ready; sleep 30"],
+                dir.path(),
+            );
+            let control = RunControl::new();
+            control.register(pgid);
+
+            // Blocks until the child's own "ready" line proves its trap is already
+            // installed, so `cancel` below can never race a SIGTERM against a trap not
+            // yet in place. Without this a SIGTERM that happens to arrive first would
+            // kill the child outright and this test would still pass, never having
+            // exercised the SIGKILL follow-up at all.
+            let mut buf = [0u8; 64];
+            let mut collected = Vec::new();
+            while !collected.windows(5).any(|window| window == b"ready") {
+                read_blocking(&master, &mut buf, &mut collected);
+            }
+
+            control.cancel();
+
+            let (_raw, status) = drain_until_exit(master, keepalive, child);
+            let _ = tx.send(status);
+        });
+
+        let status = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a TERM-trapping child must still die once cancel escalates to SIGKILL");
+        assert!(
+            status.is_some_and(|status| !status.success()),
+            "a killed child must not report a clean exit"
+        );
+    }
+
+    /// [`RunControl::hold`] and [`RunControl::continue_run`] must be the reverse of each
+    /// other: SIGSTOP leaves the child's own process state Stopped, and SIGCONT moves it
+    /// back out again, proving suspend is reversible rather than a one-way cancellation by
+    /// another name.
+    #[test]
+    fn hold_sigstops_a_live_group_and_continue_run_sigconts_it_back() {
+        let dir = tempdir();
+        let (master, keepalive, child, pgid) = spawn_controlled(&["sleep", "2"], dir.path());
+        let control = RunControl::new();
+        control.register(pgid);
+
+        control.hold();
+        assert!(
+            wait_for_process_state(pgid, 'T', Duration::from_secs(2)),
+            "SIGSTOP must leave the child's own process state Stopped"
+        );
+
+        control.continue_run();
+        assert!(
+            wait_for_process_state(pgid, 'S', Duration::from_secs(2))
+                || wait_for_process_state(pgid, 'R', Duration::from_secs(2)),
+            "SIGCONT must move the child back out of the Stopped state"
+        );
+
+        control.deregister(pgid);
+        let (_raw, status) = drain_until_exit(master, keepalive, child);
+        assert!(status.is_some_and(|status| status.success()));
     }
 
     // --- Criterion 3: one PTY slave for both streams, colour and order intact ---
@@ -1278,7 +1521,7 @@ print(1 if inherited else 0)"
             "-c".to_string(),
             "echo \"${REPON_EXECUTOR_TEST_VAR:-unset}\"".to_string(),
         ];
-        let result = run_step(&argv, false, dir.path(), &env);
+        let result = run_step(&argv, false, dir.path(), &env, &RunControl::new());
 
         assert_eq!(result.outcome, StepOutcome::Ok);
         assert_eq!(&*result.output, b"unset\n");
@@ -1344,6 +1587,29 @@ print(1 if inherited else 0)"
     fn pty_width_constant_matches_the_spec_of_record() {
         let spec = spec_actions_md();
         assert_eq!(spec_pty_width_columns(&spec), PTY_WIDTH);
+    }
+
+    fn spec_cancel_grace_ms(spec: &str) -> u64 {
+        let anchor = "The grace is ";
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .expect("the cancellation grace sentence is present");
+        after
+            .split("ms,")
+            .next()
+            .expect("a millisecond count")
+            .parse()
+            .expect("the grace is an integer number of milliseconds")
+    }
+
+    #[test]
+    fn cancel_grace_constant_matches_the_spec_of_record() {
+        let spec = spec_actions_md();
+        assert_eq!(
+            Duration::from_millis(spec_cancel_grace_ms(&spec)),
+            CANCEL_GRACE
+        );
     }
 
     // --- Criterion 5: raw bytes, bounded head and tail, char-boundary safe ---
