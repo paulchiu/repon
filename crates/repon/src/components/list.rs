@@ -671,20 +671,53 @@ mod tests {
         core.settle(Duration::from_secs(5))
     }
 
-    /// A real, settled `Snapshot` off a real disposable repo whose `default_branch` also
-    /// settles `Known`, via a rung-1 `RepoOverride` rather than a remote (this repo has
-    /// none). `branch`, `default_branch` and `state` are the only cells this codebase's
-    /// `Core::refresh` dispatches a probe for today; `sync`, `base` and `dirty` have no
-    /// probe wired to them at all, so they stay `None` forever, which is exactly the
-    /// "outstanding cell beside settled ones" shape these tests exercise: a row that holds
-    /// some values while others are still to come.
+    /// Inits a real disposable git repository at `path` on a named branch with no commit
+    /// at all, so `HEAD` is unborn: the one HEAD shape [`repon_core`]'s `base` cell can
+    /// never compute a count for (there is no commit to compare), so it stays `None`
+    /// forever even after every other cell this codebase probes has settled. Carries a
+    /// real (unreachable) remote, never touched over the network, so `base`'s own "no
+    /// remote at all" exemption does not short-circuit ahead of the unborn-HEAD case this
+    /// fixture means to exercise; `sync` reads that same remote's absence of an upstream
+    /// on this branch, not the no-remote case, which is why it settles `-` rather than `∅`
+    /// here. The same real-repo pattern as [`init_repo_on_branch`], minus the commit.
+    fn init_unborn_repo_on_branch(path: &Path, branch: &str) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", branch])
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+    }
+
+    /// A real, settled `Snapshot` off a real disposable repo with an unborn `HEAD`, whose
+    /// `default_branch` still settles `Known` via a rung-1 `RepoOverride` rather than the
+    /// repo's own (real but unreachable) remote. `branch`, `sync`, `dirty` and
+    /// `default_branch` all settle normally on an unborn HEAD; `state` is `NotApplicable`
+    /// by kind (a Repo row); `base` alone has no commit to count behind anything and stays
+    /// `None` forever, which is exactly the "outstanding cell beside settled ones" shape
+    /// these tests exercise: a row that holds some values while one is still, and always
+    /// will be, outstanding.
     fn settled_snapshot_with_a_resolvable_default_branch(branch: &str) -> repon_core::Snapshot {
         use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
         use std::time::Duration;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        init_repo_on_branch(&root, branch);
+        init_unborn_repo_on_branch(&root, branch);
 
         let core = Core::start(CoreSpec {
             set: SetSpec {
@@ -778,14 +811,15 @@ mod tests {
         assert_eq!(cell_text(buf, 32, 2, 4), "main");
         assert_eq!(
             cell_text(buf, 57, 2, 1),
-            glyphs.no_remote.to_string(),
-            "sync is probed, and this fixture has no remote, so it must show its settled \
-             value rather than a loading mark"
+            glyphs.no_upstream.to_string(),
+            "sync is probed, and an unborn HEAD has no branch to configure an upstream on, \
+             so it must show its settled value rather than a loading mark"
         );
         assert_eq!(
             cell_text(buf, 67, 2, 1),
             frame,
-            "base must show the loading mark for the same reason"
+            "base is probed too, but an unborn HEAD has no commit to count behind anything, \
+             so it stays outstanding and must show the loading mark"
         );
         assert_eq!(
             cell_text(buf, 74, 2, 1),
@@ -1095,6 +1129,88 @@ mod tests {
         assert!(
             top_row.contains("repos"),
             "expected the title inline in the top border row, got: {top_row:?}"
+        );
+    }
+
+    /// Reads [default-branch.md](../../../../docs/spec/default-branch.md)'s own "Column
+    /// widths" sentence at test time, so `base`'s width and position can never quietly
+    /// drift from the design of record. Every column's own width comes from the spec's
+    /// text, not from this module's own layout constants, so a `BASE_X` built from the
+    /// wrong preceding widths still fails here; only `GUTTER_WIDTH` and `GAP` are reused,
+    /// since both are shared row geometry rather than a fact about any one column.
+    #[test]
+    fn base_occupies_its_spec_stated_width_and_position_after_sync() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/default-branch.md"))
+            .expect("read the default branch specification");
+
+        let sentence = spec
+            .lines()
+            .find(|line| line.starts_with("Name 28, branch 24, sync 9, base 6"))
+            .expect("default-branch.md must state the list's column widths");
+        let widths_text = sentence
+            .split(", then the filler column")
+            .next()
+            .expect("the column widths sentence must name a filler column");
+
+        let mut widths: Vec<(String, u16)> = Vec::new();
+        for entry in widths_text.split(", ") {
+            let mut parts = entry.split_whitespace();
+            let name = parts
+                .next()
+                .unwrap_or_else(|| panic!("empty column width entry: {entry:?}"))
+                .to_lowercase();
+            let width: u16 = parts
+                .next()
+                .unwrap_or_else(|| panic!("column width entry has no number: {entry:?}"))
+                .parse()
+                .unwrap_or_else(|_| {
+                    panic!("column width entry's number does not parse: {entry:?}")
+                });
+            widths.push((name, width));
+        }
+
+        let by_name = |name: &str| {
+            widths
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!("default-branch.md's column widths sentence has no {name:?} column")
+                })
+                .1
+        };
+        let sync_index = widths
+            .iter()
+            .position(|(n, _)| n == "sync")
+            .expect("a sync column");
+        let base_index = widths
+            .iter()
+            .position(|(n, _)| n == "base")
+            .expect("a base column");
+        assert_eq!(
+            base_index,
+            sync_index + 1,
+            "base must be the column immediately after sync in default-branch.md's own list"
+        );
+
+        assert_eq!(
+            BASE_WIDTH,
+            by_name("base"),
+            "BASE_WIDTH must match default-branch.md's stated width"
+        );
+
+        let expected_base_x = GUTTER_WIDTH
+            + GAP
+            + by_name("name")
+            + GAP
+            + by_name("branch")
+            + GAP
+            + by_name("sync")
+            + GAP;
+        assert_eq!(
+            BASE_X, expected_base_x,
+            "base must sit at the position default-branch.md's own stated widths for name, \
+             branch and sync (plus gaps) predict, immediately after sync"
         );
     }
 
