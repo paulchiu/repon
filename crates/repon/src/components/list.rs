@@ -19,7 +19,7 @@ use super::Component;
 use crate::{
     config::Config,
     glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
-    theme,
+    theme::{self, Meaning, Role},
 };
 
 const GUTTER_WIDTH: u16 = 1;
@@ -215,6 +215,34 @@ fn write_cell(
     buf.set_stringn(x, y, text, max_width as usize, style);
 }
 
+/// [`write_cell`]'s counterpart for a cell that carries more than one role at once: writes
+/// `runs` left to right from `x`, each in its own `Style`, sharing one `width` budget the way a
+/// single `set_stringn` call would rather than budgeting each run separately, so truncation
+/// lands exactly where it would have landed before any run was split out. `sync` is the one
+/// column that needs this, per theming.md's own reasoning for the `behind` role: an ahead count
+/// and a behind count "sit adjacent in the same cell".
+fn write_cell_runs(
+    buf: &mut Buffer,
+    interior: Rect,
+    x: u16,
+    y: u16,
+    width: u16,
+    runs: &[(String, Style)],
+) {
+    if x >= interior.right() {
+        return;
+    }
+    let end = x.saturating_add(width).min(interior.right());
+    let mut cursor = x;
+    for (text, style) in runs {
+        if cursor >= end {
+            break;
+        }
+        let (next_x, _) = buf.set_stringn(cursor, y, text, (end - cursor) as usize, *style);
+        cursor = next_x;
+    }
+}
+
 /// Whether `kind`'s row is ever drawn: a Repo or a Worktree always, a Submodule only while
 /// `show_submodules` is on
 /// ([discovery.md](../../../../docs/spec/discovery.md)'s "Showing Submodules": "the flag
@@ -298,19 +326,37 @@ fn is_child_row(kind: Kind) -> bool {
     }
 }
 
+/// The name column's own role, from the entity's `Kind` alone: a Worktree name is always
+/// `Meaning::WorktreeName`, a Submodule name always `Meaning::SubmoduleName`, and a Repo name
+/// has no entry of its own in theming.md's map, so it takes `Meaning::FreshValue`, the table's
+/// default for a value named nowhere else. Exhaustive over [`Kind`], so a fourth variant fails
+/// to compile here rather than falling in on either side. A Repo row and its own Worktree or
+/// Submodule children necessarily resolve different roles for this same column, since a child
+/// row is always `Worktree` or `Submodule` and a parent row is always `Repo`
+/// ([`is_child_row`]).
+fn name_cell_meaning(kind: Kind) -> Meaning {
+    match kind {
+        Kind::Repo => Meaning::FreshValue,
+        Kind::Worktree => Meaning::WorktreeName,
+        Kind::Submodule => Meaning::SubmoduleName,
+    }
+}
+
 /// Draws the name cell: a top-level row's name at the column's own start, or a child row's
 /// name indented behind the active table's one-character child marker, in the reduced budget
 /// [`CHILD_ROW_NAME_WIDTH`] reserves for it. The one place [`is_child_row`] and the child-row
 /// geometry constants are read, so [`draw_row`] and [`draw_row_compact`] can never draw a
-/// child row two different ways.
+/// child row two different ways. The marker itself is structural, like the gutter, and stays
+/// unstyled; only the name text takes [`name_cell_meaning`]'s role, since the marker names no
+/// meaning of its own in theming.md.
 fn draw_name_cell(
     buf: &mut Buffer,
     interior: Rect,
     y: u16,
     entity: &EntityState,
     glyphs: &'static GlyphSet,
-    style: Style,
 ) {
+    let name_style = theme::DEFAULT.style_for(name_cell_meaning(entity.kind).role());
     if is_child_row(entity.kind) {
         let marker_x = interior.x + NAME_X + CHILD_ROW_INDENT_WIDTH;
         write_cell(
@@ -320,7 +366,7 @@ fn draw_name_cell(
             y,
             CHILD_ROW_MARKER_WIDTH,
             &glyphs.child_row.to_string(),
-            style,
+            Style::new(),
         );
         let name_x = marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
         write_cell(
@@ -330,7 +376,7 @@ fn draw_name_cell(
             y,
             CHILD_ROW_NAME_WIDTH,
             &entity.name,
-            style,
+            name_style,
         );
     } else {
         write_cell(
@@ -340,7 +386,7 @@ fn draw_name_cell(
             y,
             NAME_WIDTH,
             &entity.name,
-            style,
+            name_style,
         );
     }
 }
@@ -424,7 +470,9 @@ fn draw_row(
     // some value elsewhere, an outstanding cell (one nothing has settled yet) shows this
     // same frame in its own place instead of sitting blank.
     let cell_loading_glyph = (row_summary != RowSummary::InFlight).then_some(loading_frame);
-    let style = Style::new();
+    // The gutter is not a value cell (it carries the row's least-settled provenance state, not
+    // a `Meaning` of its own in theming.md's map), so it keeps the flat style it always drew
+    // with; only the columns below take a per-`Meaning` role.
     write_cell(
         buf,
         interior,
@@ -432,9 +480,9 @@ fn draw_row(
         y,
         GUTTER_WIDTH,
         &gutter,
-        style,
+        Style::new(),
     );
-    draw_name_cell(buf, interior, y, entity, glyphs, style);
+    draw_name_cell(buf, interior, y, entity, glyphs);
     write_cell(
         buf,
         interior,
@@ -442,16 +490,22 @@ fn draw_row(
         y,
         BRANCH_WIDTH,
         &format_head(&entity.branch, cell_loading_glyph),
-        style,
+        theme::DEFAULT.style_for(cell_role(
+            entity.branch.settled(),
+            |_| Meaning::FreshValue,
+            cell_loading_glyph,
+        )),
     );
-    write_cell(
+    write_cell_runs(
         buf,
         interior,
         interior.x + SYNC_X,
         y,
         SYNC_WIDTH,
-        &format_sync(&entity.sync, glyphs, cell_loading_glyph),
-        style,
+        &sync_cell_runs(&entity.sync, glyphs, cell_loading_glyph)
+            .into_iter()
+            .map(|(text, role)| (text, theme::DEFAULT.style_for(role)))
+            .collect::<Vec<_>>(),
     );
     write_cell(
         buf,
@@ -460,7 +514,11 @@ fn draw_row(
         y,
         BASE_WIDTH,
         &format_base(&entity.base, glyphs, cell_loading_glyph),
-        style,
+        theme::DEFAULT.style_for(cell_role(
+            entity.base.settled(),
+            base_meaning,
+            cell_loading_glyph,
+        )),
     );
     write_cell(
         buf,
@@ -469,7 +527,11 @@ fn draw_row(
         y,
         DIRTY_WIDTH,
         &format_dirty(&entity.dirty, glyphs, cell_loading_glyph),
-        style,
+        theme::DEFAULT.style_for(cell_role(
+            entity.dirty.settled(),
+            dirty_meaning,
+            cell_loading_glyph,
+        )),
     );
     write_cell(
         buf,
@@ -478,7 +540,11 @@ fn draw_row(
         y,
         STATE_WIDTH,
         &format_state(&entity.state, cell_loading_glyph),
-        style,
+        theme::DEFAULT.style_for(cell_role(
+            entity.state.settled(),
+            state_meaning,
+            cell_loading_glyph,
+        )),
     );
 }
 
@@ -494,7 +560,6 @@ fn draw_row_compact(
     loading_frame: char,
 ) {
     let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
-    let style = Style::new();
     write_cell(
         buf,
         interior,
@@ -502,9 +567,9 @@ fn draw_row_compact(
         y,
         GUTTER_WIDTH,
         &gutter,
-        style,
+        Style::new(),
     );
-    draw_name_cell(buf, interior, y, entity, glyphs, style);
+    draw_name_cell(buf, interior, y, entity, glyphs);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -544,27 +609,68 @@ fn gutter_glyph(entity: &EntityState, glyphs: &'static GlyphSet, loading_frame: 
     gutter_glyph_for(summary(entity), glyphs, loading_frame)
 }
 
+/// A cell's shape as every renderer below needs to see it: a Known value, a blank (every other
+/// settled shape), or Loading (nothing settled yet, and the caller supplied a mark for it).
+/// [`render_cell`], [`cell_role`] and [`sync_cell_runs`] all match this rather than `Settled`
+/// itself, so `Settled::Known` is destructured in exactly one place regardless of how many
+/// renderers a cell later grows, and a state added to `Settled` fails to compile here instead
+/// of silently falling through into a raw value or a raw default.
+enum CellShape<'a, T> {
+    Known(&'a T),
+    Blank,
+    /// Only ever produced when the caller supplied a mark: see [`cell_shape`].
+    Loading(char),
+}
+
+/// [`CellShape`]'s own classifier, used by every renderer below instead of matching `Settled`
+/// directly. `loading_glyph` is `draw_row`'s per-cell spinner mark, withheld exactly while the
+/// whole row holds no value at all so the row's one spinner stays in the gutter rather than
+/// also appearing here (criterion 3: "loading rather than unknown, keyed specifically to there
+/// being no prior state").
+fn cell_shape<T>(settled: Option<&Settled<T>>, loading_glyph: Option<char>) -> CellShape<'_, T> {
+    match settled {
+        Some(Settled::Known { value, .. }) => CellShape::Known(value),
+        Some(Settled::Unknown(_)) => CellShape::Blank,
+        Some(Settled::Failed(_)) => CellShape::Blank,
+        Some(Settled::NotApplicable) => CellShape::Blank,
+        None => match loading_glyph {
+            Some(glyph) => CellShape::Loading(glyph),
+            None => CellShape::Blank,
+        },
+    }
+}
+
 /// The one function every column widget renders a cell's text through: a Known value renders
 /// through `format`, every other settled shape renders the blank cell
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The mapping
-/// is exactly" table commits to. A Cell nothing has settled yet (`None`) renders
-/// `loading_glyph` when the caller supplies one, which `draw_row` withholds exactly while the
-/// whole row holds no value at all, so the row's one spinner stays in the gutter rather than
-/// also appearing here (criterion 3: "loading rather than unknown, keyed specifically to
-/// there being no prior state"). Exhaustive over `Option<&Settled<T>>` with no wildcard arm,
-/// so a state added to `Settled` later fails to compile here instead of silently falling
-/// through into a raw value or a raw default.
+/// is exactly" table commits to, and Loading renders its own mark verbatim.
 fn render_cell<T>(
     settled: Option<&Settled<T>>,
     format: impl FnOnce(&T) -> String,
     loading_glyph: Option<char>,
 ) -> String {
-    match settled {
-        Some(Settled::Known { value, .. }) => format(value),
-        Some(Settled::Unknown(_)) => String::new(),
-        Some(Settled::Failed(_)) => String::new(),
-        Some(Settled::NotApplicable) => String::new(),
-        None => loading_glyph.map(String::from).unwrap_or_default(),
+    match cell_shape(settled, loading_glyph) {
+        CellShape::Known(value) => format(value),
+        CellShape::Blank => String::new(),
+        CellShape::Loading(glyph) => glyph.to_string(),
+    }
+}
+
+/// [`render_cell`]'s counterpart for style: the `Role` a value cell resolves through, from the
+/// same [`CellShape`] so the two functions can never disagree about which state produced which
+/// colour. A Known value takes whichever `Meaning` `meaning_for_value` names for it; a blank
+/// cell renders no text, so `Meaning::FreshValue`'s role stands in as the harmless default and
+/// is never seen; Loading takes `Meaning::LoadingSpinner`, since a lone spinner character is
+/// not the value `meaning_for_value` was written for.
+fn cell_role<T>(
+    settled: Option<&Settled<T>>,
+    meaning_for_value: impl FnOnce(&T) -> Meaning,
+    loading_glyph: Option<char>,
+) -> Role {
+    match cell_shape(settled, loading_glyph) {
+        CellShape::Known(value) => meaning_for_value(value).role(),
+        CellShape::Blank => Meaning::FreshValue.role(),
+        CellShape::Loading(_) => Meaning::LoadingSpinner.role(),
     }
 }
 
@@ -579,31 +685,59 @@ fn format_head(cell: &Cell<Head>, loading_glyph: Option<char>) -> String {
     )
 }
 
-/// `sync`'s glyph: `∅` no remote at all, `-` no branch or no upstream, `≡` level, `↑n`/`↓n`
-/// otherwise, per
-/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
-/// glyphs for real values". Exhaustive over [`SyncState`], so a variant added there later
+/// `sync`'s glyph, split into its own ordered runs before they are joined: one run for every
+/// settled shape except `Tracking` with both an ahead and a behind count, which is two. Each
+/// run pairs its text with the `Meaning` that colours it, so [`sync_glyph`]'s joined text and
+/// [`sync_cell_runs`]'s styled runs are built from the one place and can never name a different
+/// glyph for the same value. Exhaustive over [`SyncState`], so a variant added there later
 /// fails to compile here instead of silently rendering blank.
-fn sync_glyph(value: &SyncState, glyphs: &'static GlyphSet) -> String {
+fn sync_value_runs(value: &SyncState, glyphs: &'static GlyphSet) -> Vec<(String, Meaning)> {
     match value {
-        SyncState::NoRemote => glyphs.no_remote.to_string(),
-        SyncState::NoUpstream => glyphs.no_upstream.to_string(),
+        SyncState::NoRemote => vec![(glyphs.no_remote.to_string(), Meaning::FreshValue)],
+        SyncState::NoUpstream => vec![(glyphs.no_upstream.to_string(), Meaning::FreshValue)],
         SyncState::Tracking(counts) if counts.ahead == 0 && counts.behind == 0 => {
-            glyphs.in_sync.to_string()
+            vec![(glyphs.in_sync.to_string(), Meaning::KnownZero)]
         }
         SyncState::Tracking(counts) => {
-            let mut parts = Vec::new();
+            let mut runs = Vec::new();
             if counts.ahead > 0 {
-                parts.push(format!("{}{}", glyphs.ahead, counts.ahead));
+                runs.push((
+                    format!("{}{}", glyphs.ahead, counts.ahead),
+                    Meaning::AheadCount,
+                ));
             }
             if counts.behind > 0 {
-                parts.push(format!("{}{}", glyphs.behind, counts.behind));
+                runs.push((
+                    format!("{}{}", glyphs.behind, counts.behind),
+                    Meaning::BehindCount,
+                ));
             }
-            parts.join(" ")
+            runs
         }
     }
 }
 
+/// `sync`'s glyph: `∅` no remote at all, `-` no branch or no upstream, `≡` level, `↑n`/`↓n`
+/// otherwise, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "In-cell
+/// glyphs for real values". Joins [`sync_value_runs`]'s own text runs with a space, the same
+/// join [`sync_cell_runs`] re-inserts between its styled runs.
+///
+/// `draw_row` reads [`sync_cell_runs`] directly rather than this, since it needs each run's own
+/// role and a joined `String` cannot carry that; kept as the plain-text form its own tests below
+/// exercise.
+#[allow(dead_code)]
+fn sync_glyph(value: &SyncState, glyphs: &'static GlyphSet) -> String {
+    sync_value_runs(value, glyphs)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The plain-text counterpart to [`sync_cell_runs`], not read by `draw_row` for the same reason
+/// [`sync_glyph`] is not; kept for its own tests below.
+#[allow(dead_code)]
 fn format_sync(
     cell: &Cell<SyncState>,
     glyphs: &'static GlyphSet,
@@ -614,6 +748,34 @@ fn format_sync(
         |value| sync_glyph(value, glyphs),
         loading_glyph,
     )
+}
+
+/// [`format_sync`]'s counterpart for style: the same text as [`sync_value_runs`], each of its
+/// pieces paired with its own `Role` and rejoined by an unstyled space, so an ahead count and a
+/// behind count sitting in the one cell each keep their own role rather than the cell settling
+/// on a single one, per theming.md's own reasoning for the `behind` role's existence. Mirrors
+/// [`cell_role`]'s exhaustive match over `Settled` and `draw_row`'s per-cell loading glyph.
+fn sync_cell_runs(
+    cell: &Cell<SyncState>,
+    glyphs: &'static GlyphSet,
+    loading_glyph: Option<char>,
+) -> Vec<(String, Role)> {
+    match cell_shape(cell.settled(), loading_glyph) {
+        CellShape::Known(value) => {
+            let mut runs = sync_value_runs(value, glyphs).into_iter();
+            let mut out = Vec::new();
+            if let Some((text, meaning)) = runs.next() {
+                out.push((text, meaning.role()));
+            }
+            for (text, meaning) in runs {
+                out.push((" ".to_string(), Role::Text));
+                out.push((text, meaning.role()));
+            }
+            out
+        }
+        CellShape::Blank => Vec::new(),
+        CellShape::Loading(glyph) => vec![(glyph.to_string(), Meaning::LoadingSpinner.role())],
+    }
 }
 
 /// `base`'s glyph: `≡` level, `↓n` behind. No ahead-of-default glyph exists, per
@@ -630,6 +792,16 @@ fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet, loading_glyph: Optio
         },
         loading_glyph,
     )
+}
+
+/// `base`'s own role: a known zero is `Meaning::KnownZero`, any other count a behind count
+/// (`base` has no ahead-of-default glyph, so every nonzero value is one).
+fn base_meaning(value: &u32) -> Meaning {
+    if *value == 0 {
+        Meaning::KnownZero
+    } else {
+        Meaning::BehindCount
+    }
 }
 
 /// `dirty`'s glyph: `·` clean, `●n` changed. `n` is the typed counts' total
@@ -655,6 +827,15 @@ fn format_dirty(
     )
 }
 
+/// `dirty`'s own role: a known zero is `Meaning::KnownZero`, any other total `Meaning::Dirty`.
+fn dirty_meaning(value: &DirtyCounts) -> Meaning {
+    if value.total() == 0 {
+        Meaning::KnownZero
+    } else {
+        Meaning::Dirty
+    }
+}
+
 /// The word for one of the four Worktree states, shared with the detail pane's own
 /// per-cell provenance line so the two surfaces never drift onto different wording for the
 /// same value.
@@ -673,6 +854,19 @@ fn format_state(cell: &Cell<WorktreeState>, loading_glyph: Option<char>) -> Stri
         |value| worktree_state_word(value).to_string(),
         loading_glyph,
     )
+}
+
+/// `state`'s own role: theming.md gives each of the four Worktree states its own, per the
+/// "Colour is never the only carrier" section's "the four Worktree states have a text column".
+/// Exhaustive over [`WorktreeState`], so a fifth state fails to compile here rather than
+/// falling in on an existing role.
+fn state_meaning(value: &WorktreeState) -> Meaning {
+    match value {
+        WorktreeState::Merged => Meaning::MergedWorktree,
+        WorktreeState::Gone => Meaning::GoneWorktree,
+        WorktreeState::LocalOnly => Meaning::LocalOnly,
+        WorktreeState::Active => Meaning::ActiveWorktree,
+    }
 }
 
 #[cfg(test)]
@@ -895,6 +1089,253 @@ mod tests {
             .collect();
         core.refresh(&keys);
         core.settle(Duration::from_secs(5))
+    }
+
+    /// A real, settled `Snapshot` off one Repo checked out one commit behind its own default
+    /// branch, with one untracked file sitting in its working tree: `base` settles a nonzero
+    /// behind count and `dirty` settles a nonzero changed count on the very same row, the
+    /// fixture the theming test below needs to prove two adjacent value cells take two
+    /// different roles. Carries a real (unreachable) remote for the same reason
+    /// [`settled_snapshot_with_a_resolvable_default_branch`] does: `base`'s own "no remote at
+    /// all" exemption would otherwise render it Not applicable rather than the nonzero count
+    /// this fixture means to exercise.
+    fn settled_snapshot_with_a_nonzero_base_and_dirty_count() -> repon_core::Snapshot {
+        use repon_core::{Core, CoreSpec, RepoOverride, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_on_branch(&root, "main");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+        std::fs::write(root.join("second.txt"), "second").expect("write second file");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "second.txt"])
+            .status()
+            .expect("run git add");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "-m", "second"])
+            .status()
+            .expect("run git commit second");
+        assert!(status.success());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "main"])
+            .output()
+            .expect("run git rev-parse main");
+        assert!(output.status.success());
+        let main_sha = String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+        // `base` resolves the default branch through a remote-tracking ref
+        // ([ADR 0012](../../../../docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)),
+        // so `refs/remotes/origin/main` is fabricated the same way `base.rs`'s own tests do,
+        // rather than relying on local `main` to resolve as a fallback.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .status()
+            .expect("run git update-ref");
+        assert!(status.success());
+        // `feature` starts one commit behind `main`'s own tip, so `base` has exactly one
+        // commit to count once `main` is named the default branch below.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "--quiet", "-b", "feature", "HEAD~1"])
+            .status()
+            .expect("run git checkout -b feature HEAD~1");
+        assert!(status.success());
+        std::fs::write(root.join("untracked.txt"), "scratch").expect("write untracked file");
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.clone()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: vec![RepoOverride {
+                path: root,
+                default_branch: Some("main".to_string()),
+                excluded: false,
+            }],
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_secs(5))
+    }
+
+    /// One meaning phrase's role, read from theming.md's own "map from meaning to role" table
+    /// at test time, the way `glyphs.rs`'s own value-glyph test pins its table: an independent
+    /// reading of the design of record rather than a second call into the very
+    /// `Meaning::role()` this ticket wires into `draw_row`, which `theme.rs`'s own test already
+    /// pins to this same table. `needle` must uniquely identify one data row's own phrase list
+    /// by substring. A row naming `k` roles pairs its last `k - 1` phrases with the last `k - 1`
+    /// roles and every leading phrase with the first, theming.md's own convention for its one
+    /// split row ("accent" / "border_focused").
+    fn role_named_in_theming_md(needle: &str) -> Role {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        const HEADING: &str = "### The map from meaning to role";
+        let after_heading = &spec[spec
+            .find(HEADING)
+            .expect("theming.md must contain the meaning-to-role heading")
+            + HEADING.len()..];
+        let row = after_heading
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|'))
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no meaning-to-role row in theming.md contains {needle:?}"));
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let [meanings_cell, roles_cell] = cells.as_slice() else {
+            panic!("theming.md meaning-to-role row does not have exactly two cells: {row:?}");
+        };
+        let phrases: Vec<&str> = meanings_cell.split(',').map(str::trim).collect();
+        let roles: Vec<&str> = roles_cell
+            .split('/')
+            .map(|key| key.trim().trim_matches('`'))
+            .collect();
+        let phrase_index = phrases
+            .iter()
+            .position(|phrase| phrase.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not found among the row's own phrases: {row:?}"));
+        let leading_count = phrases.len() - (roles.len() - 1);
+        let role_key = if phrase_index < leading_count {
+            roles[0]
+        } else {
+            roles[phrase_index - leading_count + 1]
+        };
+        Role::ALL
+            .into_iter()
+            .find(|role| role.spec_key() == role_key)
+            .unwrap_or_else(|| panic!("theming.md names an unknown role `{role_key}`"))
+    }
+
+    /// The criterion's own test: a value cell's style comes from its own `Meaning`'s role
+    /// rather than one flat row style, on a row where two adjacent cells (`base` and `dirty`)
+    /// resolve two different roles read from theming.md itself. A version of `draw_row` that
+    /// hands every cell one flat style (this ticket's predecessor shape) fails here because
+    /// `base_fg` and `dirty_fg` would be equal.
+    #[test]
+    fn two_adjacent_value_cells_take_their_own_meanings_role_not_one_flat_row_style() {
+        let snapshot = settled_snapshot_with_a_nonzero_base_and_dirty_count();
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        let terminal = render(140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+
+        assert_eq!(
+            cell_text(buf, absolute_x(BASE_X), y, 2),
+            "↓1",
+            "sanity: base must show a nonzero behind count"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(DIRTY_X), y, 2),
+            "●1",
+            "sanity: dirty must show a nonzero changed count"
+        );
+
+        let base_role = role_named_in_theming_md("Behind count");
+        let dirty_role = role_named_in_theming_md("Dirty");
+        assert_ne!(
+            base_role, dirty_role,
+            "sanity: the fixture must exercise two different roles"
+        );
+
+        let base_fg = buf[(absolute_x(BASE_X), y)].fg;
+        let dirty_fg = buf[(absolute_x(DIRTY_X), y)].fg;
+
+        assert_eq!(
+            base_fg,
+            theme::DEFAULT.role_color(base_role),
+            "base's nonzero count must take theming.md's own `behind` role"
+        );
+        assert_eq!(
+            dirty_fg,
+            theme::DEFAULT.role_color(dirty_role),
+            "dirty's nonzero count must take theming.md's own `warn` role"
+        );
+        assert_ne!(
+            base_fg, dirty_fg,
+            "two adjacent cells with different meanings must render in different colours, \
+             which a flat row style applied to the whole row cannot produce"
+        );
+    }
+
+    /// The child-row risk: a Worktree's own name and a Submodule's own name each take the role
+    /// theming.md names for them (`accent` and `dim`), read from the spec at test time, while
+    /// the parent Repo's name, which theming.md names nowhere, takes `text`, the table's
+    /// default for a value with no entry of its own. The parent row and its own children
+    /// resolve different roles for the exact same column, which a version of `draw_name_cell`
+    /// still taking one flat `style` parameter could not do.
+    #[test]
+    fn a_worktree_and_a_submodule_take_their_own_named_role_while_the_parent_repo_takes_the_default()
+     {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (repo_row, _) = find_entity_row(&snapshot, "parent");
+        let (worktree_row, _) = find_entity_row(&snapshot, "feature-worktree");
+        let (submodule_row, _) = find_entity_row(&snapshot, "vendor/lib");
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        // 3 is the top-level name column's own absolute start, 9 the child name column's own
+        // start behind the marker and its gap, both already fixed by
+        // `a_child_row_is_indented_and_marked_while_its_parent_row_is_not` above.
+        let repo_fg = buf[(3, entity_row_y(repo_row))].fg;
+        let worktree_fg = buf[(9, entity_row_y(worktree_row))].fg;
+        let submodule_fg = buf[(9, entity_row_y(submodule_row))].fg;
+
+        assert_eq!(
+            repo_fg,
+            theme::DEFAULT.role_color(role_named_in_theming_md("Fresh value")),
+            "a Repo name has no entry of its own in theming.md's map, so it takes `text`"
+        );
+        assert_eq!(
+            worktree_fg,
+            theme::DEFAULT.role_color(role_named_in_theming_md("Worktree name")),
+            "a Worktree name must take theming.md's own `accent` role"
+        );
+        assert_eq!(
+            submodule_fg,
+            theme::DEFAULT.role_color(role_named_in_theming_md("Submodule name")),
+            "a Submodule name must take theming.md's own `dim` role"
+        );
+        assert_ne!(worktree_fg, submodule_fg);
+        assert_ne!(repo_fg, worktree_fg);
     }
 
     /// The defining behaviour of criterion 1: the sidebar shows only the gutter and the name,
@@ -1601,6 +2042,166 @@ mod tests {
             ),
             "<1"
         );
+    }
+
+    /// `sync`'s own reasoning for the `behind` role's existence, at the function that builds
+    /// its runs: an ahead count and a behind count sitting in the one cell each keep their own
+    /// `Meaning`, not a shared one, so a cell mixing both is exactly where a single-role
+    /// implementation of this column would fail first.
+    #[test]
+    fn sync_value_runs_gives_an_ahead_and_a_behind_count_each_their_own_meaning_in_one_cell() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(
+            sync_value_runs(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 2,
+                    behind: 4
+                }),
+                glyphs
+            ),
+            vec![
+                ("↑2".to_string(), Meaning::AheadCount),
+                ("↓4".to_string(), Meaning::BehindCount),
+            ]
+        );
+    }
+
+    #[test]
+    fn sync_value_runs_gives_a_known_zero_and_a_lone_ahead_or_behind_count_their_own_meaning() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(
+            sync_value_runs(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            vec![("≡".to_string(), Meaning::KnownZero)]
+        );
+        assert_eq!(
+            sync_value_runs(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 3,
+                    behind: 0
+                }),
+                glyphs
+            ),
+            vec![("↑3".to_string(), Meaning::AheadCount)]
+        );
+        assert_eq!(
+            sync_value_runs(
+                &SyncState::Tracking(AheadBehind {
+                    ahead: 0,
+                    behind: 5
+                }),
+                glyphs
+            ),
+            vec![("↓5".to_string(), Meaning::BehindCount)]
+        );
+    }
+
+    /// `base`'s own role, exhaustive over its two shapes: a known zero is `Meaning::KnownZero`
+    /// and every nonzero count is a behind count, since `base` has no ahead-of-default glyph.
+    #[test]
+    fn base_meaning_names_a_known_zero_and_a_behind_count() {
+        assert_eq!(base_meaning(&0), Meaning::KnownZero);
+        assert_eq!(base_meaning(&1), Meaning::BehindCount);
+    }
+
+    /// `dirty`'s own role: a known zero total is `Meaning::KnownZero`, any other total is
+    /// `Meaning::Dirty`.
+    #[test]
+    fn dirty_meaning_names_a_known_zero_and_a_nonzero_dirty_count() {
+        assert_eq!(
+            dirty_meaning(&DirtyCounts {
+                modified: 0,
+                untracked: 0,
+                deleted: 0
+            }),
+            Meaning::KnownZero
+        );
+        assert_eq!(
+            dirty_meaning(&DirtyCounts {
+                modified: 1,
+                untracked: 0,
+                deleted: 0
+            }),
+            Meaning::Dirty
+        );
+    }
+
+    /// `state`'s own role, one variant at a time, per theming.md's "the four Worktree states
+    /// have a text column": a mistake wiring one state to another's role shows up here rather
+    /// than only in a hand-eyeballed screenshot.
+    #[test]
+    fn state_meaning_names_each_of_the_four_worktree_states_through_its_own_meaning() {
+        assert_eq!(
+            state_meaning(&WorktreeState::Merged),
+            Meaning::MergedWorktree
+        );
+        assert_eq!(state_meaning(&WorktreeState::Gone), Meaning::GoneWorktree);
+        assert_eq!(state_meaning(&WorktreeState::LocalOnly), Meaning::LocalOnly);
+        assert_eq!(
+            state_meaning(&WorktreeState::Active),
+            Meaning::ActiveWorktree
+        );
+    }
+
+    /// The name column's own role, one `Kind` at a time: a Worktree and a Submodule each take
+    /// the meaning theming.md names for them, and a Repo, named nowhere in the map, takes the
+    /// table's default.
+    #[test]
+    fn name_cell_meaning_names_each_kind_through_its_own_meaning() {
+        assert_eq!(name_cell_meaning(Kind::Repo), Meaning::FreshValue);
+        assert_eq!(name_cell_meaning(Kind::Worktree), Meaning::WorktreeName);
+        assert_eq!(name_cell_meaning(Kind::Submodule), Meaning::SubmoduleName);
+    }
+
+    /// [`cell_role`]'s own loading override: an outstanding cell (`None`) offered a per-cell
+    /// loading glyph takes `Meaning::LoadingSpinner`'s role rather than whatever
+    /// `meaning_for_value` would have named for a real value, since a lone spinner character is
+    /// not that value.
+    #[test]
+    fn cell_role_takes_the_loading_meaning_over_meaning_for_value_when_a_glyph_is_supplied() {
+        let settled: Option<&Settled<u32>> = None;
+
+        assert_eq!(
+            cell_role(settled, |_| Meaning::BehindCount, Some('⠋')),
+            Meaning::LoadingSpinner.role()
+        );
+    }
+
+    /// [`cell_role`]'s harmless default: with nothing settled and no loading glyph offered,
+    /// there is no text to colour at all, so it falls back to `Meaning::FreshValue`'s role
+    /// rather than reading `meaning_for_value` against a value that does not exist.
+    #[test]
+    fn cell_role_falls_back_to_fresh_value_with_nothing_settled_and_no_loading_glyph() {
+        let settled: Option<&Settled<u32>> = None;
+
+        assert_eq!(
+            cell_role(settled, |_| Meaning::BehindCount, None),
+            Meaning::FreshValue.role()
+        );
+    }
+
+    /// Every blank-rendering settled shape ignores `meaning_for_value` the same way
+    /// [`render_cell`] ignores `format` for the same three shapes, since a cell rendering no
+    /// text has no colour worth reading.
+    #[test]
+    fn cell_role_ignores_meaning_for_value_for_every_blank_settled_shape() {
+        let unknown: Settled<u32> = Settled::Unknown(Unknown::TimedOut);
+        let failed: Settled<u32> = Settled::Failed(ProbeError::Read(Arc::from("boom")));
+        let not_applicable: Settled<u32> = Settled::NotApplicable;
+
+        for settled in [&unknown, &failed, &not_applicable] {
+            assert_eq!(
+                cell_role(Some(settled), |_| Meaning::BehindCount, None),
+                Meaning::FreshValue.role()
+            );
+        }
     }
 
     #[test]
