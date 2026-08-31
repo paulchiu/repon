@@ -222,5 +222,7 @@ A detached Submodule closes a hole in the environment contract. [discovery.md](d
 
 ## Open
 
+Each item below is also listed, with its reopening condition, in [the open-questions register](../open-questions.md); that page points back here rather than restating the reasoning.
+
 - Per-Repo Action applicability. [CONTEXT.md](../../CONTEXT.md) promised a palette count of how many selected Repos define an Action, which nothing in the `[[action]]` schema can compute; the palette shows the Selection count and the clause is corrected out of the glossary. The dropped requirement was recorded as the single biggest usability gain over the CLI, so it stays open rather than settled as never.
 - A headless run verb. Nothing in v1 can ask Repon to run an Action outside the TUI, so no exit code reports Action failure, and [the core API spec](core-api.md)'s rule stands untouched: nonzero means the tool could not get an answer, never that the news is bad. The receipt carrying the per-entity exit code is what keeps the second consumer addable.
