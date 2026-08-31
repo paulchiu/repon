@@ -457,13 +457,29 @@ mod tests {
         git(dir.path(), &["checkout", "-"]);
         std::fs::write(dir.path().join("file.txt"), "main\n").expect("write file");
         git(dir.path(), &["commit", "-am", "main change"]);
-        // Expected to exit non-zero on conflict; the point of this fixture is the
-        // marker file it leaves behind, not the exit code.
-        let _ = std::process::Command::new("git")
+        // Expected to exit non-zero on conflict, so this cannot go through the
+        // helper, which asserts success. It still needs the helper's identity
+        // arguments, since a machine with no global identity refuses the merge
+        // outright and leaves no marker file behind.
+        let merge = std::process::Command::new("git")
             .arg("-C")
             .arg(dir.path())
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
             .args(["merge", "feature"])
-            .status();
+            .output()
+            .expect("run git merge");
+
+        // The fixture is the marker file, so prove it exists before reading the
+        // repository: a merge that never started fails here, naming why, rather
+        // than as an opaque None further down.
+        assert!(
+            dir.path().join(".git/MERGE_HEAD").exists(),
+            "the merge left no MERGE_HEAD, so there is no in-progress operation to read. \
+             git exited {:?}\nstdout: {}\nstderr: {}",
+            merge.status.code(),
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr),
+        );
 
         let repo = open_thread_safe(dir.path()).expect("open repo");
 
