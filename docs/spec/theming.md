@@ -40,6 +40,10 @@ This map lives in code and here. A theme file cannot reach into it, so Gone and 
 
 Stated explicitly so a tenth role is added deliberately rather than discovered. The status bar is `dim` text above a `border`, with the theme warning indicator in `warn` and a Notice in plain `text`, which makes it the brightest thing on the row through contrast that already exists rather than through a tenth role. The detail pane's labels are `dim` and its values take whichever role their meaning already has, which is the point of naming roles for meaning. The help overlay's keys are `accent` and its descriptions are `dim`, and the footer takes the same pair ([keybindings.md](keybindings.md)).
 
+### The cursor row
+
+The row `j`/`k` moves is not the Selection (the rows marked with space; that is a separate gap the row gutter does not yet cover). It takes `selection_style()` verbatim: reversed video by default, or the theme's own `selection_fg`/`selection_bg` once both are set. Exactly one row carries it at a time, in both the full list and the collapsed sidebar, and it moves with the cursor rather than staying on whichever row drew it first. A Filter that changes which row sits at the cursor's own offset moves the highlight with it, since the highlight is applied by offset into the rendered row order, the same offset the cursor itself is.
+
 ## Colour is never the only carrier
 
 No meaning is carried by colour alone. Every colour-carried distinction is also readable as a glyph, a number or a word in the same row: ahead and behind carry their counts, Dirty carries its count, the four Worktree states have a text column, and the provenance gutter is glyphs ([0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)).
