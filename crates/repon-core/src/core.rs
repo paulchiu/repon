@@ -54,6 +54,7 @@ use crate::executor;
 use crate::git;
 use crate::landing;
 use crate::patch_equivalence;
+use crate::poll;
 use crate::snapshot::Snapshot;
 
 /// Budget within which rows with names must be on screen at first frame
@@ -233,6 +234,13 @@ struct Table {
     /// `Repository` with another one; a missing entry (a Submodule, or a boundary
     /// that would not open) falls back to opening fresh at probe time.
     repos: HashMap<EntityKey, Arc<gix::ThreadSafeRepository>>,
+    /// Each entity's gitdir reading as of the previous metadata poll sweep, so the
+    /// next sweep can tell whether any of [`poll::POLLED_GITDIR_ENTRIES`] moved
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "The poll"). Absent for an entity the sweep has never yet reached, which is
+    /// what lets a first sweep record a baseline rather than reporting the whole
+    /// population as having just moved.
+    poll_fingerprints: HashMap<EntityKey, poll::GitdirFingerprint>,
 }
 
 /// A message the dedicated thread's control channel carries; distinct from a tick.
@@ -347,6 +355,25 @@ pub struct Core {
     /// read only by the `_for_test` methods below.
     #[allow(dead_code)] // populated and read only by tests
     phase_c_gates: Arc<Mutex<HashMap<EntityKey, PhaseCGateHandle>>>,
+    /// The age past which a `Known` `dirty` or `state` cell reads Stale even though
+    /// nothing probed it again: `CoreSpec::status_stale_after`'s own copy, applied
+    /// inside [`Core::snapshot`] rather than by a background sweep, since
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Staleness" rules out a global clock-driven one.
+    status_stale_after: Duration,
+    /// Every key the metadata poll's most recent sweep actually re-ran phases A
+    /// and B for, in the order it found them moved, cleared at the start of every
+    /// sweep. Read only by `poll_reprobed_for_test`, which is what proves a
+    /// sweep re-probes the moved entity alone rather than the whole population.
+    #[allow(dead_code)] // read only by poll_reprobed_for_test
+    poll_reprobed: Arc<Mutex<Vec<EntityKey>>>,
+    /// How many metadata-poll sweeps have run in total, whether or not any entity
+    /// had moved. Read only by `poll_sweep_count_for_test`, which is what proves a
+    /// real tick sent through the dedicated thread's own channel reaches the
+    /// sweep at all, distinct from `poll_reprobed` proving what a sweep that found
+    /// movement then did.
+    #[allow(dead_code)] // read only by poll_sweep_count_for_test
+    poll_sweep_count: Arc<AtomicUsize>,
 }
 
 /// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
@@ -559,13 +586,21 @@ impl Core {
         table.entities[idx].clone()
     }
 
-    /// Clones the whole table now, without waiting for anything in flight.
+    /// Clones the whole table now, without waiting for anything in flight. Ages
+    /// every entity's `dirty` and `state` cells into Stale here, on the clone
+    /// rather than the stored table, so a snapshot stays a pure read: the other
+    /// staleness writer, poll evidence, does mutate the stored table, because a
+    /// detected move is itself a fact worth keeping, but elapsed time is not.
     pub fn snapshot(&self) -> Snapshot {
         let table = self.table.read().unwrap();
+        let mut entities = table.entities.clone();
+        for entity in &mut entities {
+            entity.age_status_cells(self.status_stale_after);
+        }
         Snapshot {
             generation: Generation::new(table.generation),
             discovered_at: table.discovered_at,
-            entities: table.entities.clone(),
+            entities,
         }
     }
 
@@ -591,6 +626,7 @@ impl Core {
                 }
             }
         }
+        table.poll_fingerprints.remove(key);
         if let Some(in_flight) = table.in_flight.remove(key) {
             in_flight.cancel.store(true, Ordering::Release);
             drop(table);
@@ -1232,6 +1268,35 @@ impl Core {
         self.dispatch_log.lock().unwrap().clone()
     }
 
+    /// Runs one metadata-poll sweep synchronously on the calling thread: the exact
+    /// work the dedicated thread's tick arm performs, called directly so a test can
+    /// prove the sweep's own effects without racing the injected tick channel's
+    /// delivery to that other thread.
+    pub(crate) fn poll_once_for_test(&self) {
+        run_poll_sweep(
+            &self.table,
+            &self.overrides,
+            &self.show_submodules,
+            &self.poll_reprobed,
+            &self.poll_sweep_count,
+        );
+    }
+
+    /// Every key the most recent `poll_once_for_test` call actually re-ran phases A
+    /// and B for, in the order it found them moved: proves "for that entity only"
+    /// by naming exactly which entities were touched, not merely that one of them
+    /// was.
+    pub(crate) fn poll_reprobed_for_test(&self) -> Vec<EntityKey> {
+        self.poll_reprobed.lock().unwrap().clone()
+    }
+
+    /// How many metadata-poll sweeps have run in total, so a test driving the real
+    /// dedicated thread through its injected tick channel can prove a tick reached
+    /// the sweep at all, not only what the sweep did once it ran.
+    pub(crate) fn poll_sweep_count_for_test(&self) -> usize {
+        self.poll_sweep_count.load(Ordering::Acquire)
+    }
+
     /// Registers a closed phase C/D gate for `key`, so the next `refresh` that
     /// dispatches it will land its cheap outcomes, then block before touching
     /// phase C or D until [`Core::release_phase_c_for_test`] opens the gate.
@@ -1522,6 +1587,7 @@ fn start_internal(
     // produced a given entry.
     let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
     let overrides = Arc::new(resolve_overrides(&spec.overrides));
+    let show_submodules = Arc::new(AtomicBool::new(spec.show_submodules));
 
     let table = Arc::new(RwLock::new(Table {
         generation: 0,
@@ -1531,6 +1597,7 @@ fn start_internal(
         in_flight: HashMap::new(),
         generation_started_at: HashMap::new(),
         repos: HashMap::new(),
+        poll_fingerprints: HashMap::new(),
     }));
     {
         let mut table = table.write().unwrap();
@@ -1541,9 +1608,18 @@ fn start_internal(
     }
 
     let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let poll_reprobed = Arc::new(Mutex::new(Vec::new()));
+    let poll_sweep_count = Arc::new(AtomicUsize::new(0));
     let (control, control_rx) = crossbeam_channel::unbounded();
+    let poll_handles = PollHandles {
+        overrides: Arc::clone(&overrides),
+        show_submodules: Arc::clone(&show_submodules),
+        poll_reprobed: Arc::clone(&poll_reprobed),
+        poll_sweep_count: Arc::clone(&poll_sweep_count),
+    };
     let clock_thread = spawn_clock_thread(
         Arc::clone(&table),
+        poll_handles,
         Arc::clone(&settle_gate),
         control_rx,
         ticks,
@@ -1561,7 +1637,7 @@ fn start_internal(
             discovery_abandon_after: Arc::new(AtomicU64::new(
                 discovery_abandon_after.as_nanos() as u64
             )),
-            show_submodules: Arc::new(AtomicBool::new(spec.show_submodules)),
+            show_submodules,
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
@@ -1572,20 +1648,36 @@ fn start_internal(
             action_running: Arc::new(AtomicBool::new(false)),
             dispatch_log: Arc::new(Mutex::new(Vec::new())),
             phase_c_gates: Arc::new(Mutex::new(HashMap::new())),
+            status_stale_after: spec.status_stale_after,
+            poll_reprobed,
+            poll_sweep_count,
         },
         clock_alive: alive,
         discovery_watcher,
     }
 }
 
+/// Everything the dedicated thread's tick arm needs for [`run_poll_sweep`] beyond
+/// the table it already takes, bundled so `spawn_clock_thread` stays within
+/// clippy's argument limit.
+struct PollHandles {
+    overrides: Arc<Vec<ResolvedOverride>>,
+    show_submodules: Arc<AtomicBool>,
+    poll_reprobed: Arc<Mutex<Vec<EntityKey>>>,
+    poll_sweep_count: Arc<AtomicUsize>,
+}
+
 /// The dedicated thread: the metadata poll tick and the Generation deadline sweep
 /// share this one interval loop, separate from the probe pool and from any render
 /// loop, so suspending the terminal reschedules none of it. Driven by `ticks`
 /// rather than its own `thread::sleep`, which is what a test replaces to make the
-/// cadence deterministic. The actual metadata poll (staleness from gitdir mtimes)
-/// is later work; this loop is where it will run once it exists.
+/// cadence deterministic. The poll runs first on every tick, then the deadline
+/// sweep, both while `!paused`; while paused the poll's own baseline still holds,
+/// since [`run_poll_sweep`] simply never runs, and no fingerprint goes stale by
+/// being skipped.
 fn spawn_clock_thread(
     table: Arc<RwLock<Table>>,
+    poll: PollHandles,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     control: Receiver<ClockControl>,
     ticks: Receiver<Instant>,
@@ -1609,6 +1701,13 @@ fn spawn_clock_thread(
                         break;
                     }
                     if !paused {
+                        run_poll_sweep(
+                            &table,
+                            &poll.overrides,
+                            &poll.show_submodules,
+                            &poll.poll_reprobed,
+                            &poll.poll_sweep_count,
+                        );
                         sweep_deadline(&table, &settle_gate, generation_deadline);
                     }
                 }
@@ -1616,6 +1715,161 @@ fn spawn_clock_thread(
         }
         alive.store(false, Ordering::Release);
     })
+}
+
+/// One entity as the metadata poll sweep found it, everything gathered under one
+/// read lock so the filesystem stats and any re-probe below run outside it.
+struct PollCandidate {
+    key: EntityKey,
+    path: PathBuf,
+    common_dir: Arc<Path>,
+    kind: Kind,
+    cached_repo: Option<Arc<gix::ThreadSafeRepository>>,
+    probes_base: bool,
+}
+
+/// One metadata-poll sweep ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The poll"): for every entity a Generation's dispatch would also cover (a
+/// hidden Submodule is skipped by the same [`dispatches_kind`] rule), stats
+/// [`poll::POLLED_GITDIR_ENTRIES`] in its own gitdir. That gitdir is the cached
+/// [`gix::ThreadSafeRepository`] handle's own `git_dir()` where discovery cached
+/// one (the per-worktree location a linked Worktree's `HEAD` and `index` actually
+/// live at), or else a fresh open's `git_dir()`, the same fallback every other
+/// probe in this module already takes for a Submodule, which discovery never
+/// opens. A first sweep for a newly discovered entity has nothing to compare
+/// against yet, so it only records a baseline and reports no movement.
+///
+/// On movement it force-stales `dirty` and `state`, the two cells with no cheap
+/// detector, then re-runs phases A and B for that entity alone and lets their own
+/// supersession land the fresh values; it never starts a status probe of its own.
+/// `poll_reprobed` is cleared and refilled with exactly the keys this call
+/// actually re-ran, in the order it found them moved. `poll_sweep_count` counts
+/// every call, whether or not anything moved, so a test can prove a real tick
+/// reached this function at all.
+fn run_poll_sweep(
+    table: &Arc<RwLock<Table>>,
+    overrides: &Arc<Vec<ResolvedOverride>>,
+    show_submodules: &Arc<AtomicBool>,
+    poll_reprobed: &Arc<Mutex<Vec<EntityKey>>>,
+    poll_sweep_count: &Arc<AtomicUsize>,
+) {
+    poll_sweep_count.fetch_add(1, Ordering::Release);
+    poll_reprobed.lock().unwrap().clear();
+    let show_submodules = show_submodules.load(Ordering::Acquire);
+
+    let candidates: Vec<PollCandidate> = {
+        let table = table.read().unwrap();
+        table
+            .entities
+            .iter()
+            .filter(|entity| dispatches_kind(entity.kind, show_submodules))
+            .map(|entity| PollCandidate {
+                key: entity.key.clone(),
+                path: entity.key.path().to_path_buf(),
+                common_dir: Arc::clone(&entity.common_dir),
+                kind: entity.kind,
+                cached_repo: table.repos.get(&entity.key).cloned(),
+                probes_base: entity.probes_base(),
+            })
+            .collect()
+    };
+
+    for candidate in candidates {
+        // A fresh open, never cached across sweeps: this is the same cost every
+        // other probe in this module already pays for an entity discovery left
+        // no handle for (always true of a Submodule), and reusing the handle it
+        // returns for the re-probe below saves a second open on the one path
+        // that actually detected movement.
+        let opened;
+        let repo = match candidate.cached_repo.as_deref() {
+            Some(repo) => Some(repo),
+            None => match git::open_thread_safe(&candidate.path) {
+                Ok(repo) => {
+                    opened = repo;
+                    Some(&opened)
+                }
+                Err(_) => None,
+            },
+        };
+        let gitdir = repo
+            .map(|repo| repo.git_dir().to_path_buf())
+            .unwrap_or_else(|| candidate.common_dir.to_path_buf());
+
+        let current = poll::fingerprint(&gitdir);
+        let moved = {
+            let mut table = table.write().unwrap();
+            let previous = table
+                .poll_fingerprints
+                .insert(candidate.key.clone(), current);
+            previous.is_some_and(|previous| poll::moved(&previous, &current))
+        };
+        if !moved {
+            continue;
+        }
+
+        {
+            let mut table = table.write().unwrap();
+            if let Some(&idx) = table.index.get(&candidate.key) {
+                table.entities[idx].force_stale_status_cells();
+            }
+        }
+
+        let override_branch = find_override(overrides, &candidate.path, &candidate.common_dir)
+            .and_then(|entry| entry.default_branch.clone());
+        let never_cancelled = AtomicBool::new(false);
+        let chain_cache: ChainFactsCache = Mutex::new(HashMap::new());
+        let chain_reads = AtomicUsize::new(0);
+
+        let branch_outcome = probe_branch(&candidate.path, repo, candidate.kind, &never_cancelled);
+        let sync_outcome = probe_sync(
+            &candidate.path,
+            repo,
+            branch_outcome.as_ref().map(|(settled, ..)| settled),
+            candidate.kind,
+            &never_cancelled,
+        );
+        let default_branch_outcome = probe_default_branch_memoised(
+            &candidate.path,
+            repo,
+            &candidate.common_dir,
+            override_branch.as_deref(),
+            candidate.kind,
+            &never_cancelled,
+            &ChainFactsMemo {
+                cache: &chain_cache,
+                reads: &chain_reads,
+            },
+        );
+        let base_outcome = if candidate.probes_base {
+            probe_base(
+                &candidate.path,
+                repo,
+                branch_outcome.as_ref().map(|(settled, ..)| settled),
+                default_branch_outcome.as_ref().map(|r| &r.settled),
+                &never_cancelled,
+            )
+        } else {
+            None
+        };
+
+        let generation = {
+            let mut table = table.write().unwrap();
+            table.generation += 1;
+            Generation::new(table.generation)
+        };
+        apply_cheap_probe_outcomes(
+            table,
+            &candidate.key,
+            generation,
+            CheapProbeOutcomes {
+                branch: branch_outcome,
+                sync: sync_outcome,
+                base: base_outcome,
+                default_branch: default_branch_outcome,
+            },
+        );
+        poll_reprobed.lock().unwrap().push(candidate.key);
+    }
 }
 
 /// Cancels every probe currently in flight and drops the table's record of them,
@@ -2711,6 +2965,20 @@ mod tests {
             .arg(path)
             .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
             .args(["commit", "--allow-empty", "-m", "first"])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+    }
+
+    /// A second (or later) commit against an already-initialised repo at `path`,
+    /// with the same explicit identity `init_repo_with_a_commit` supplies: never
+    /// relying on a global git identity, which a machine running CI has none of.
+    fn commit_allow_empty(path: &Path, message: &str) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "--allow-empty", "-m", message])
             .status()
             .expect("run git commit");
         assert!(status.success());
@@ -4526,6 +4794,411 @@ mod tests {
             after.entities[0].branch.settled(),
             Some(Settled::Unknown(Unknown::TimedOut))
         ));
+    }
+
+    /// Proves the real dedicated thread's tick arm actually reaches
+    /// [`run_poll_sweep`], not merely that [`Core::poll_once_for_test`]'s direct
+    /// call does the right thing: a mutation deleting the call inside
+    /// `spawn_clock_thread` would leave every other poll test in this file green
+    /// while failing only this one. `wait_until` (already used elsewhere in this
+    /// file for `run_action`'s own genuinely asynchronous completion) bounds the
+    /// wait rather than asserting any particular latency: the two ticks are sent
+    /// from this thread and merely need to be picked up by the idle dedicated
+    /// thread, not to land within a stated budget.
+    #[test]
+    fn a_real_tick_through_the_dedicated_thread_reaches_the_poll_sweep_and_reprobes_a_moved_entity()
+    {
+        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let started = Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx);
+        let core = started.core;
+        let key = core.snapshot().entities[0].key.clone();
+
+        // The first tick only records a baseline: nothing has moved yet against a
+        // fingerprint that did not exist before this tick.
+        tick_tx
+            .send(Instant::now())
+            .expect("send the baseline tick");
+        assert!(
+            wait_until(Duration::from_secs(2), || core.poll_sweep_count_for_test()
+                >= 1),
+            "a tick sent on the real channel must reach the poll sweep"
+        );
+        assert!(core.poll_reprobed_for_test().is_empty());
+
+        commit_allow_empty(&repo, "second");
+
+        tick_tx
+            .send(Instant::now())
+            .expect("send the movement tick");
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                core.poll_reprobed_for_test() == vec![key.clone()]
+            }),
+            "the real tick channel must reach the poll sweep and reprobe the moved entity"
+        );
+        drop(tick_tx);
+    }
+
+    /// Criterion 2's whole claim, over two entities so "for that entity only" has
+    /// something to discriminate against: committing into one of two Repos and
+    /// running one poll sweep re-probes branch/sync/base for the moved Repo alone
+    /// (`poll_reprobed_for_test` names exactly it, never the other), force-stales
+    /// its `dirty` and `state` without changing their value or timestamp (the
+    /// absence claim that no status probe ran), and leaves the untouched Repo's
+    /// cells byte-for-byte as the prior real `refresh` left them.
+    #[test]
+    fn poll_reprobe_touches_only_the_moved_entity_and_never_runs_a_status_probe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo_with_a_commit(&repo_a);
+        init_repo_with_a_commit(&repo_b);
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let key_a = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == repo_a)
+            .expect("repo-a discovered")
+            .key
+            .clone();
+        let key_b = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == repo_b)
+            .expect("repo-b discovered")
+            .key
+            .clone();
+
+        core.refresh(&[key_a.clone(), key_b.clone()]);
+        let landed = core.settle(Duration::from_secs(2));
+        let entity_of = |snapshot: &Snapshot, key: &EntityKey| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| &entity.key == key)
+                .expect("entity present")
+                .clone()
+        };
+        let a_before = entity_of(&landed, &key_a);
+        let b_before = entity_of(&landed, &key_b);
+        let branch_at = |entity: &EntityState| match entity.branch.settled() {
+            Some(Settled::Known {
+                at,
+                value: _,
+                stale: _,
+            }) => *at,
+            other => panic!("expected a landed branch, got {other:?}"),
+        };
+        let dirty_state = |entity: &EntityState| match entity.dirty.settled() {
+            Some(Settled::Known { value, at, stale }) => (*value, *at, *stale),
+            other => panic!("expected a landed dirty count, got {other:?}"),
+        };
+        let (a_dirty_value_before, a_dirty_at_before, a_dirty_stale_before) =
+            dirty_state(&a_before);
+        assert!(
+            !a_dirty_stale_before,
+            "the fresh refresh must land dirty as not stale"
+        );
+
+        core.poll_once_for_test();
+        assert!(
+            core.poll_reprobed_for_test().is_empty(),
+            "a first sweep has nothing to compare against, so it must report no movement"
+        );
+
+        commit_allow_empty(&repo_a, "second");
+        core.poll_once_for_test();
+
+        assert_eq!(
+            core.poll_reprobed_for_test(),
+            vec![key_a.clone()],
+            "only the entity whose gitdir actually moved must be re-probed"
+        );
+
+        let after = core.snapshot();
+        let a_after = entity_of(&after, &key_a);
+        let b_after = entity_of(&after, &key_b);
+
+        assert_ne!(
+            branch_at(&a_after),
+            branch_at(&a_before),
+            "the moved entity's branch must carry a fresh timestamp from the re-probe"
+        );
+        let (a_dirty_value_after, a_dirty_at_after, a_dirty_stale_after) = dirty_state(&a_after);
+        assert_eq!(
+            a_dirty_value_after, a_dirty_value_before,
+            "no status probe ran, so dirty's value must be exactly what the last real refresh \
+             landed"
+        );
+        assert_eq!(
+            a_dirty_at_after, a_dirty_at_before,
+            "no status probe ran, so dirty's timestamp must be untouched, only its stale flag \
+             set"
+        );
+        assert!(
+            a_dirty_stale_after,
+            "the moved entity's dirty cell must go stale on poll evidence"
+        );
+
+        assert_eq!(
+            branch_at(&b_after),
+            branch_at(&b_before),
+            "the untouched entity's branch must be exactly as the prior refresh left it"
+        );
+        let (b_dirty_value_after, b_dirty_at_after, b_dirty_stale_after) = dirty_state(&b_after);
+        let (b_dirty_value_before, b_dirty_at_before, b_dirty_stale_before) =
+            dirty_state(&b_before);
+        assert_eq!(b_dirty_value_after, b_dirty_value_before);
+        assert_eq!(b_dirty_at_after, b_dirty_at_before);
+        assert_eq!(
+            b_dirty_stale_after, b_dirty_stale_before,
+            "an entity the sweep found unmoved must never go stale"
+        );
+    }
+
+    /// Criterion 3's attached half, and one of `refresh.md`'s two named traps: a
+    /// commit on an attached HEAD never touches `.git/HEAD` at all, only
+    /// `.git/logs/HEAD`. The poll must still see the commit, through `index`
+    /// rather than through `HEAD`.
+    #[test]
+    fn poll_detects_an_attached_commit_through_index_while_head_itself_never_moves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        core.poll_once_for_test();
+        assert!(core.poll_reprobed_for_test().is_empty());
+
+        let head_path = repo.join(".git").join("HEAD");
+        let head_mtime_before = fs::metadata(&head_path)
+            .expect("stat HEAD")
+            .modified()
+            .expect("HEAD mtime");
+
+        commit_allow_empty(&repo, "second");
+
+        let head_mtime_after = fs::metadata(&head_path)
+            .expect("stat HEAD")
+            .modified()
+            .expect("HEAD mtime");
+        assert_eq!(
+            head_mtime_before, head_mtime_after,
+            "a commit on an attached HEAD must never touch HEAD itself"
+        );
+
+        core.poll_once_for_test();
+        assert_eq!(
+            core.poll_reprobed_for_test(),
+            vec![key],
+            "the poll must still detect the attached commit, through index rather than HEAD"
+        );
+    }
+
+    /// Criterion 3's detached half: [head.md](https://github.com/paulchiu/repon/blob/main/docs/spec/head.md)'s
+    /// claim that a detached row's evidence is better than an attached row's,
+    /// because a commit on a detached HEAD writes the new object id straight into
+    /// the per-worktree `HEAD` file itself. Run against a real linked Worktree,
+    /// never the main working tree, since that per-worktree file is exactly what
+    /// distinguishes this case from the attached one above.
+    #[test]
+    fn poll_detects_a_detached_commit_through_the_per_worktree_head_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree_path = root.join("detached-worktree");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&parent)
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                worktree_path.to_str().expect("utf8 path"),
+            ])
+            .status()
+            .expect("run git worktree add");
+        assert!(status.success());
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let worktree_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Worktree))
+            .expect("worktree discovered")
+            .key
+            .clone();
+
+        core.poll_once_for_test();
+        assert!(core.poll_reprobed_for_test().is_empty());
+
+        let worktree_head_path = parent
+            .join(".git")
+            .join("worktrees")
+            .join("detached-worktree")
+            .join("HEAD");
+        let head_mtime_before = fs::metadata(&worktree_head_path)
+            .expect("stat the per-worktree HEAD")
+            .modified()
+            .expect("HEAD mtime");
+
+        commit_allow_empty(&worktree_path, "on the detached worktree");
+
+        let head_mtime_after = fs::metadata(&worktree_head_path)
+            .expect("stat the per-worktree HEAD")
+            .modified()
+            .expect("HEAD mtime");
+        assert_ne!(
+            head_mtime_before, head_mtime_after,
+            "a commit on a detached HEAD must write the new object id straight into its own \
+             HEAD file"
+        );
+
+        core.poll_once_for_test();
+        assert_eq!(
+            core.poll_reprobed_for_test(),
+            vec![worktree_key],
+            "the poll must detect the detached commit via the per-worktree HEAD file"
+        );
+    }
+
+    /// Criterion 4's elapsed-age writer, wired through `Core::snapshot` end to end:
+    /// `status_stale_after` from `CoreSpec` is what decides whether a freshly
+    /// landed `dirty` cell already reads Stale. A `Duration::from_nanos(1)`
+    /// threshold has necessarily already elapsed by the time `snapshot` runs
+    /// afterwards, so this needs no sleep and depends on no stated latency budget,
+    /// only on real wall-clock time having advanced at all between two calls.
+    #[test]
+    fn snapshot_ages_a_freshly_landed_dirty_cell_stale_once_status_stale_after_has_elapsed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let mut short_lived = spec(vec![root]);
+        short_lived.status_stale_after = Duration::from_nanos(1);
+        let core = Core::start(short_lived);
+        let key = core.snapshot().entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&key));
+        core.settle(Duration::from_secs(2));
+
+        let aged = core.snapshot();
+        match aged.entities[0].dirty.settled() {
+            Some(Settled::Known {
+                stale: true,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!(
+                "expected a landed dirty cell to have already aged past a one-nanosecond \
+                 threshold, got {other:?}"
+            ),
+        }
+    }
+
+    /// The same wiring's other side: a landed `dirty` cell stays fresh under a
+    /// large `status_stale_after`, so the wiring is genuinely reading the
+    /// threshold rather than always staling.
+    #[test]
+    fn snapshot_leaves_a_freshly_landed_dirty_cell_fresh_under_a_large_status_stale_after() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&key));
+        core.settle(Duration::from_secs(2));
+
+        let fresh = core.snapshot();
+        match fresh.entities[0].dirty.settled() {
+            Some(Settled::Known {
+                stale: false,
+                value: _,
+                at: _,
+            }) => {}
+            other => panic!("expected a freshly landed dirty cell to stay fresh, got {other:?}"),
+        }
+    }
+
+    /// Criterion 5's absence claim: a hidden Submodule (`show_submodules` off) is
+    /// never in the poll's own candidate set, so a commit into it is never
+    /// detected, while the identical commit against the same Submodule shown is.
+    /// Run as one test over the same fixture with the flag flipped, rather than
+    /// two, so the only variable between the two sweeps is the flag itself.
+    #[test]
+    fn hidden_submodules_are_never_polled_but_shown_ones_are() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        let submodule_path = parent.join("vendor").join("lib");
+        init_repo_with_a_commit(&submodule_path);
+
+        let mut hidden_spec = spec(vec![root.clone()]);
+        hidden_spec.show_submodules = false;
+        let hidden_core = Core::start(hidden_spec);
+        // Discovery's own pass always runs regardless of the flag
+        // (discovery.md's "Showing Submodules": "the pass always runs, so
+        // Submodules are always known"), so the row exists; only probing and the
+        // poll are gated on it.
+        let hidden_submodule_key = hidden_core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("the submodule is discovered regardless of show_submodules")
+            .key
+            .clone();
+        hidden_core.poll_once_for_test();
+        commit_allow_empty(&submodule_path, "into the hidden submodule");
+        hidden_core.poll_once_for_test();
+        assert!(
+            !hidden_core
+                .poll_reprobed_for_test()
+                .contains(&hidden_submodule_key),
+            "a hidden Submodule must never be re-probed by the poll, since it was never \
+             polled at all"
+        );
+        drop(hidden_core);
+
+        let mut shown_spec = spec(vec![root]);
+        shown_spec.show_submodules = true;
+        let shown_core = Core::start(shown_spec);
+        let submodule_key = shown_core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("the submodule is discovered regardless of show_submodules")
+            .key
+            .clone();
+        shown_core.poll_once_for_test();
+        commit_allow_empty(&submodule_path, "into the shown submodule");
+        shown_core.poll_once_for_test();
+        assert_eq!(
+            shown_core.poll_reprobed_for_test(),
+            vec![submodule_key],
+            "a shown Submodule must be polled and re-probed exactly like any other row"
+        );
     }
 
     /// Pause cancels a real in-flight entry (not merely stores a flag nobody
