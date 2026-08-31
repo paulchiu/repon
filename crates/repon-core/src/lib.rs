@@ -74,6 +74,11 @@ mod test_support;
 #[cfg(feature = "serde")]
 mod wire;
 
+/// Whether this build carries the periodic fetch's own mechanism, rather than only the
+/// bounding data on [`CoreSpec`]. False on a default build: `fetch.enabled` is then accepted
+/// and inert, which a consumer is expected to say out loud rather than leave silent.
+pub const FETCH_AVAILABLE: bool = cfg!(feature = "fetch");
+
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
 pub use core::{ActionSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
