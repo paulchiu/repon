@@ -14,6 +14,7 @@ use crate::git::ProbeError;
 /// Ordered so a [`Cell`] can tell a superseded write from a current one. Minting one
 /// is `Core::refresh`'s job elsewhere; this crate only compares them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Generation(u64);
 
 impl Generation {
@@ -83,6 +84,20 @@ impl std::fmt::Display for Timestamp {
     }
 }
 
+/// RFC 3339 on the wire (`docs/spec/core-api.md`'s "The timestamp"), reusing [`Display`](std::fmt::Display)
+/// rather than deriving on the private `SystemTime`: `SystemTime`'s own `Serialize` impl
+/// writes a `{"secs_since_epoch":...,"nanos_since_epoch":...}` pair, the exact shape ADR 0015
+/// rejects as something "no consumer wants".
+#[cfg(feature = "serde")]
+impl serde::Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
 /// Days since the Unix epoch to a proleptic Gregorian (year, month, day).
 ///
 /// Howard Hinnant's `civil_from_days` (<https://howardhinnant.github.io/date_algorithms.html>),
@@ -111,6 +126,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// rendered elsewhere (a branch with no upstream renders `-`, a Repo with no remote
 /// renders `∅`), so no `NoUpstream` or `NoRemote` reason exists here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Unknown {
     /// The Generation hit its deadline while this cell was still being probed.
     TimedOut,
@@ -126,6 +142,7 @@ pub enum Unknown {
 /// What a [`Cell`] has settled to. Never a bare `Option<T>`, so an absent value can
 /// never be read as a default.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Settled<T> {
     /// Asked and got nothing back, for one of [`Unknown`]'s closed reasons.
     Unknown(Unknown),
@@ -154,9 +171,13 @@ pub enum Settled<T> {
 /// `in_flight` is `false` is a cell nothing has looked at yet, only reachable before
 /// the first Generation covers the entity.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Cell<T> {
     settled: Option<Settled<T>>,
     in_flight: bool,
+    // Internal supersession bookkeeping, not a fact about the value: skipped on the wire
+    // rather than leaking a Generation number a consumer never needs.
+    #[cfg_attr(feature = "serde", serde(skip))]
     #[allow(dead_code)] // read only by settle's own supersession check for now
     generation: Generation,
 }

@@ -100,6 +100,11 @@ pub enum Command {
     },
     /// Lists every declared Set's name, roots and match count.
     Sets,
+    /// Settles the active Set once and prints the whole table as one JSON document, per
+    /// docs/spec/core-api.md's "The wire format". Exits non-zero only when a probe never got
+    /// an answer; a dirty tree, an ahead/behind count or a stale value never does, whatever it
+    /// reads.
+    Status,
 }
 
 /// A rate the event thread can honour. Rejected here so a typo reads as a usage error

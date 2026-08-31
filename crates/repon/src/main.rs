@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use crate::{
-    app::App,
+    app::{App, status},
     cli::{Cli, Command},
 };
 
@@ -76,7 +76,7 @@ fn main() -> color_eyre::Result<()> {
     }
 
     if let Some(command) = &args.command {
-        return run_command(command, args.config);
+        return run_command(command, args.config, args.set);
     }
 
     errors::init()?;
@@ -232,7 +232,11 @@ fn reprint_config_path_after_env_change(new_value: &Path) -> color_eyre::Result<
 
 /// Runs a subcommand and exits without claiming the terminal or writing to the data
 /// directory: only standard output, and only a read of the config half when reporting on it.
-fn run_command(command: &Command, flag_config_file: Option<PathBuf>) -> color_eyre::Result<()> {
+fn run_command(
+    command: &Command,
+    flag_config_file: Option<PathBuf>,
+    flag_set: Option<String>,
+) -> color_eyre::Result<()> {
     match command {
         Command::Config { example: true } => {
             print!("{}", config::document::annotated_example());
@@ -245,6 +249,11 @@ fn run_command(command: &Command, flag_config_file: Option<PathBuf>) -> color_ey
             config::init(flag_config_file);
             let config = config::Config::new()?;
             sets::print(&config.document);
+        }
+        Command::Status => {
+            config::init(flag_config_file);
+            let config = config::Config::new()?;
+            status::run(&config, flag_set.as_deref())?;
         }
     }
     Ok(())

@@ -267,6 +267,8 @@ The core derives `Serialize` on its public types rather than the consumer defini
 
 The document carries a `schema` integer at its root, and the settled-state set and the reason set are documented as closed and versioned by it. A shell script has no Cargo resolver, so the compiler protection that makes a closed enum safe in Rust does nothing for it, and one integer is the only cheap way to let a script fail loudly rather than silently misread a state it has never seen.
 
+The version-bump discipline: bump `SCHEMA` whenever `Settled` or `Unknown` gains or loses a variant. `crates/repon-core/src/wire.rs`'s own test pins today's variant counts against an exhaustive match with no wildcard arm, so a variant added to either enum without being classified there fails to compile, and updating that classification is where the bump happens.
+
 The machine-readable consumer emits one settled document rather than a stream: `settle`, then serialise. `gh --json` buffers one array and `cargo --message-format=json` streams a line per completed unit, and streaming here would mean polling and diffing the snapshot, which is a second supersession implementation. The cost is stated plainly: a one-shot run waits out the full 4.4 second probe before printing anything, and a population an order of magnitude larger would want streaming and the diff machinery that comes with it.
 
 Exit codes follow two measured precedents. Google's `repo status` and `vcstool status` both return zero for a dirty tree and reserve nonzero for a probe that failed. So nonzero means the tool could not get an answer, never that the news is bad.
