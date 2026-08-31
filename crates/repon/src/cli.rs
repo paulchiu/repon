@@ -30,6 +30,13 @@ pub struct Cli {
     #[arg(short = 's', long = "set", value_name = "NAME")]
     pub set: Option<String>,
 
+    /// Filter to commit at startup, beating whatever the active scope's own `state.toml`
+    /// entry stored, per docs/spec/config.md's "The command line": transient, so it is never
+    /// itself written back to `state.toml`, though a Filter typed later in the same session
+    /// persists like any other.
+    #[arg(long, value_name = "TEXT")]
+    pub filter: Option<String>,
+
     /// Claims the terminal, then panics immediately, before the event loop starts.
     /// Debug-only: exists so a test can observe panic-time terminal restoration in a real
     /// process rather than describing it, and must not reach a release binary.

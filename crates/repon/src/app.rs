@@ -26,6 +26,7 @@ use crate::{
     notice,
     selection::Selection,
     set_picker::SetPicker,
+    state,
     status_row::{self, StatusRowContent},
     theme::{self, Theme},
     tui::{Event, Tui},
@@ -129,7 +130,9 @@ pub struct App {
     should_quit: bool,
     should_suspend: bool,
     /// The rows this session's Actions and Launchers will act on, and the innermost
-    /// Escape-unwind level ([`unwind`]): cancelling a live range anchor.
+    /// Escape-unwind level ([`unwind`]): cancelling a live range anchor. Persisted to
+    /// `state.toml` by name, never by index, on quit ([`Self::persist_state`]) and restored
+    /// the same way at startup ([`Self::restore_session_state`]).
     selection: Selection,
     /// The row the movement keys move and the toggle, anchor and empty-Selection default all
     /// read: an index into the current [`Snapshot`]'s entities, which is
@@ -253,11 +256,28 @@ pub struct App {
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
     /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
     document: Document,
+    /// Where `state.toml` lives, fixed for the process the same way [`config::data_dir`]
+    /// itself is; kept as a field rather than re-read from that `OnceLock` on every call so
+    /// a test can point it at a tempdir ([`Self::persist_state`],
+    /// [`Self::restore_session_state`]).
+    data_dir: PathBuf,
+    /// Whether this run has no config at all: the default path absent, or a `REPON_CONFIG`
+    /// directory holding no `config.toml` ([`config::document::Loaded::zero_config`]). Read
+    /// by [`Self::scope_key`], which is the only thing that reads it.
+    zero_config: bool,
+    /// The working directory `state.toml` keys its scope by when `self.zero_config`, resolved
+    /// once at startup ([`config::document::working_directory`]) rather than re-read per
+    /// call, since a session never changes directory mid-run.
+    cwd: PathBuf,
     /// The committed Filter narrowing the list ([CONTEXT.md](../../../CONTEXT.md)'s
     /// "Committed Filter"): applied while `self.filter_line` is `None`, and what `Esc`
-    /// restores when an edit is abandoned. Session state, never persisted
-    /// ([`crate::filter_line`]'s own doc comment records that gap). `Filter::default()`
-    /// (the empty string) until `/` and Enter commit one.
+    /// restores when an edit is abandoned. Session state, persisted to `state.toml` on quit
+    /// ([`Self::persist_state`]) and restored at startup
+    /// ([`Self::restore_session_state`]), which also announces a Filter that restores active
+    /// with a Notice naming its expression and its current match count
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    /// `Filter::default()` (the empty string) until startup restore, `--filter` or `/` and
+    /// Enter commit one.
     filter: Filter,
     /// `Some` while the Filter line has focus, opened by `Action::EnterFilter` (`/`) and
     /// closed either by `Action::Apply` (Enter, which also commits its live text into
@@ -282,6 +302,7 @@ impl App {
         frame_rate: f64,
         flag_theme: Option<String>,
         flag_set: Option<String>,
+        flag_filter: Option<String>,
     ) -> Result<Self> {
         let (message_tx, message_rx) = unbounded();
         let config = Config::new()?;
@@ -339,7 +360,7 @@ impl App {
         let theme_warnings = loaded_theme.warnings;
         let config_warnings = config.warnings;
 
-        Ok(Self {
+        let mut app = Self {
             tick_rate,
             frame_rate,
             core,
@@ -374,9 +395,14 @@ impl App {
             bindings,
             active_set,
             document: config.document,
+            data_dir: config.data_dir,
+            zero_config: config.zero_config,
+            cwd: config::document::working_directory(),
             filter: Filter::default(),
             filter_line: None,
-        })
+        };
+        app.restore_session_state(flag_filter.as_deref());
+        Ok(app)
     }
 
     /// Replaces the live Notice: read by every raiser
@@ -405,6 +431,62 @@ impl App {
             None
         } else {
             Some(text)
+        }
+    }
+
+    /// `state.toml`'s own scope key for this run: the active Set's name when a config was
+    /// loaded, or `self.cwd` when running with no config at all, so two directories that
+    /// both fall back to the implicit `all` Set never restore each other's session state
+    /// ([`crate::state::scope_key`]).
+    fn scope_key(&self) -> String {
+        state::scope_key(self.zero_config, &self.cwd, &self.active_set.name)
+    }
+
+    /// The startup half of session-state restore, split out of [`Self::new`] so a test can
+    /// drive it against a hand-built `App` and a tempdir `data_dir`, never the process-wide
+    /// path [`config::data_dir`] resolves (the same reason `reload.rs`'s own
+    /// `apply_reloaded_config` takes a `Config` argument instead of calling `Config::new`
+    /// itself). Reads `state.toml` under `self.data_dir`, restores the
+    /// Selection by name against `self.core`'s freshly discovered entities
+    /// ([`Selection::restore_by_name`]), and commits either `flag_filter` or the scope's own
+    /// stored Filter, `flag_filter` always winning
+    /// ([config.md](../../../docs/spec/config.md#the-command-line)'s "An explicit flag
+    /// always beats stored state"). Announces a Filter that ends up active with a Notice
+    /// naming its expression and its current match count, so a silently narrowed view
+    /// cannot masquerade as the whole set
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    fn restore_session_state(&mut self, flag_filter: Option<&str>) {
+        let scope_state = state::load(&self.data_dir).scope(&self.scope_key());
+        let entities = &self.core.snapshot().entities;
+        self.selection = Selection::restore_by_name(&scope_state.selection, entities);
+        self.filter = match flag_filter {
+            Some(text) => Filter::parse(text),
+            None => Filter::parse(&scope_state.filter),
+        };
+        if self.filter.is_active() {
+            let match_count = self.visible_keys().len();
+            self.set_notice(restored_filter_notice(&self.filter, match_count));
+        }
+    }
+
+    /// Writes this scope's whole session state to `state.toml`, leaving every other scope's
+    /// own entry untouched: the checked rows by name and the committed Filter's own
+    /// expression, nothing `self.core` computed from git
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Called
+    /// on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the same
+    /// grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session is
+    /// already over by the time this runs, so there is nothing left to report to but
+    /// `repon.log`.
+    pub(crate) fn persist_state(&self) {
+        let entities = &self.core.snapshot().entities;
+        let scope_state = state::ScopeState {
+            selection: self.selection.names(entities),
+            filter: self.filter.as_str().to_string(),
+        };
+        let mut file = state::load(&self.data_dir);
+        file.set_scope(self.scope_key(), scope_state);
+        if let Err(err) = state::save(&self.data_dir, &file) {
+            tracing::error!("could not write state.toml: {err:#}");
         }
     }
 
@@ -532,6 +614,7 @@ impl App {
                 break;
             }
         }
+        self.persist_state();
         tui.exit()
     }
 
@@ -1564,6 +1647,17 @@ impl App {
     }
 }
 
+/// The Notice [`App::restore_session_state`] raises for a Filter that restores active,
+/// naming both its expression and its current match count: neither half alone tells the
+/// user whether the view in front of them is the whole set
+/// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+fn restored_filter_notice(filter: &Filter, match_count: usize) -> String {
+    format!(
+        "restored filter `{}`: {match_count} matches",
+        filter.as_str()
+    )
+}
+
 /// Every Entity's key in `snapshot`, in table order: the one mapping [`App::new`] and
 /// [`App::visible_keys`] both need, kept in one place rather than two.
 fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
@@ -1766,6 +1860,13 @@ mod tests {
                 });
                 document
             },
+            // `zero_config: false` means `scope_key` reads `active_set.name` alone, so an
+            // empty, never-created `data_dir`/`cwd` are harmless placeholders here, the same
+            // shape `themes_dir` above already takes; a test exercising `persist_state` or
+            // `restore_session_state` points `data_dir` at a real tempdir first.
+            data_dir: PathBuf::new(),
+            zero_config: false,
+            cwd: PathBuf::new(),
             filter: Filter::default(),
             filter_line: None,
         }
@@ -4770,5 +4871,357 @@ mod tests {
             !app.filter.is_active(),
             "a second Esc, with nothing left to unwind first, must clear the committed Filter"
         );
+    }
+
+    // =========================================================================================
+    // `state.toml`: `App::persist_state` and `App::restore_session_state`, driven directly
+    // against a tempdir `data_dir` rather than `config::data_dir`'s process-wide path, the
+    // same reason `apply_reloaded_config` takes a `Config` argument instead of calling
+    // `Config::new` itself.
+    // =========================================================================================
+
+    /// Criterion 1's Set-name branch, proven end to end through the real seams: persisting one
+    /// Set's Selection and Filter, then restoring a fresh `App` for a *different* Set's own
+    /// scope over the same `data_dir`, must come back empty rather than picking up the first
+    /// Set's state.
+    #[test]
+    fn two_different_sets_over_the_same_data_dir_never_restore_each_others_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut work_app = test_app(&root);
+        work_app.active_set.name = "work".to_string();
+        work_app.data_dir = state_dir.path().to_path_buf();
+        let repo_a_key = work_app.core.snapshot().entities[0].key.clone();
+        work_app.selection.toggle(repo_a_key);
+        work_app.filter = Filter::parse("is:dirty");
+        work_app.persist_state();
+
+        let mut personal_app = test_app(&root);
+        personal_app.active_set.name = "personal".to_string();
+        personal_app.data_dir = state_dir.path().to_path_buf();
+        personal_app.restore_session_state(None);
+
+        assert!(
+            personal_app.selection.is_empty(),
+            "a different Set's scope must not restore `work`'s Selection"
+        );
+        assert!(
+            !personal_app.filter.is_active(),
+            "a different Set's scope must not restore `work`'s Filter"
+        );
+
+        // The negative control: restoring `work`'s own scope over the same `data_dir` does
+        // come back, proving the isolation above is real scoping and not a restore that
+        // silently never reads anything.
+        let mut work_app_again = test_app(&root);
+        work_app_again.active_set.name = "work".to_string();
+        work_app_again.data_dir = state_dir.path().to_path_buf();
+        work_app_again.restore_session_state(None);
+        assert_eq!(work_app_again.filter.as_str(), "is:dirty");
+        assert_eq!(work_app_again.selection.count(), 1);
+    }
+
+    /// Criterion 1's working-directory branch, the one the ticket names as the one that gets
+    /// skipped: two zero-config `App`s, each over its own working directory but sharing the
+    /// same declared Set name (`all`, the only one zero-config ever has), must not restore
+    /// each other's state either.
+    #[test]
+    fn two_different_working_directories_running_zero_config_never_restore_each_others_state() {
+        // Both roots discover a repo of the exact same name: if the scope key ever collided
+        // (both directories fall back to the same `all` Set), the restore below would
+        // actually find a same-named row to select and this test would pass for the wrong
+        // reason. Two differently named repos would let a real collision hide behind
+        // `restore_by_name`'s own silent-drop rule instead of being caught here.
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("shared-repo-name"));
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("shared-repo-name"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app_a = test_app(&root_a);
+        app_a.active_set.name = "all".to_string();
+        app_a.zero_config = true;
+        app_a.cwd = root_a.clone();
+        app_a.data_dir = state_dir.path().to_path_buf();
+        let repo_a_key = app_a.core.snapshot().entities[0].key.clone();
+        app_a.selection.toggle(repo_a_key);
+        app_a.persist_state();
+
+        let mut app_b = test_app(&root_b);
+        app_b.active_set.name = "all".to_string();
+        app_b.zero_config = true;
+        app_b.cwd = root_b.clone();
+        app_b.data_dir = state_dir.path().to_path_buf();
+        app_b.restore_session_state(None);
+
+        assert!(
+            app_b.selection.is_empty(),
+            "a different working directory must not restore the first one's Selection, even \
+             though both share the implicit `all` Set name and discover an identically \
+             named row"
+        );
+    }
+
+    /// Criterion 2: the written file holds only the Selection's names and the Filter's own
+    /// string, nothing `self.core` computed from git, checked against the whole file's
+    /// content rather than a round trip that would pass just as happily if a git-derived
+    /// field were also written.
+    #[test]
+    fn persisting_writes_only_the_selection_names_and_the_filter_string() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+        app.selection.toggle(repo_a_key);
+        app.filter = Filter::parse("kind:worktree");
+        app.persist_state();
+
+        let text =
+            std::fs::read_to_string(state_dir.path().join("state.toml")).expect("read state.toml");
+        assert_eq!(
+            text.trim(),
+            "[test]\nselection = [\"repo-a\"]\nfilter = \"kind:worktree\"",
+            "expected exactly the Selection's names and the Filter string, nothing else: {text:?}"
+        );
+    }
+
+    /// Criterion 3, proven at the `App` seam rather than only `Selection`'s own: a row
+    /// discovered ahead of the stored one shifts every later index, so restoring the same
+    /// stored name against a `Core` whose discovery order changed must still select the
+    /// right row.
+    #[test]
+    fn restoring_survives_an_index_shift_in_the_freshly_discovered_entities() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        let repo_b_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-b")
+            .expect("repo-b discovered")
+            .key
+            .clone();
+        app.selection.toggle(repo_b_key.clone());
+        app.persist_state();
+
+        // A third repo, alphabetically ahead of both, changes discovery's own order the next
+        // time this scope is restored.
+        init_repo(&root.join("repo-aaa-ahead"));
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert!(
+            app_again.selection.contains(&repo_b_key),
+            "expected repo-b restored by name even though a new row shifted its index"
+        );
+        assert_eq!(
+            app_again.selection.count(),
+            1,
+            "the newly discovered row ahead of it must not itself be swept in"
+        );
+    }
+
+    /// A stored name matching nothing this run discovered is dropped silently: no panic, no
+    /// Notice, no error, just an empty Selection.
+    #[test]
+    fn a_stored_name_matching_nothing_discovered_is_dropped_silently() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+        std::fs::write(
+            state_dir.path().join("state.toml"),
+            "[test]\nselection = [\"repo-that-no-longer-exists\"]\nfilter = \"\"\n",
+        )
+        .expect("write state.toml");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.restore_session_state(None);
+
+        assert!(app.selection.is_empty());
+        assert_eq!(app.notice(), None, "a dropped name must raise no Notice");
+    }
+
+    /// Criterion 4, both named corruptions reaching the same outcome a missing file gives:
+    /// malformed TOML and well-formed TOML in the wrong shape must each restore to the exact
+    /// same state as no file at all, proven by comparing all three outcomes against each
+    /// other rather than merely asserting each one individually looks empty.
+    #[test]
+    fn any_parse_failure_restores_identically_to_a_missing_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let restored_filter = |state_dir: &std::path::Path| -> (bool, usize) {
+            let mut app = test_app(&root);
+            app.data_dir = state_dir.to_path_buf();
+            app.restore_session_state(None);
+            (app.selection.is_empty(), app.selection.count())
+        };
+
+        let missing_dir = tempfile::tempdir().expect("temp dir (no state.toml written)");
+        let missing = restored_filter(missing_dir.path());
+
+        let malformed_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            malformed_dir.path().join("state.toml"),
+            "this is not = = valid toml [[[\n",
+        )
+        .expect("write malformed state.toml");
+        let malformed = restored_filter(malformed_dir.path());
+
+        let wrong_shape_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            wrong_shape_dir.path().join("state.toml"),
+            "[test]\nselection = \"repo-a\"\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write well-formed but wrong-shaped state.toml");
+        let wrong_shape = restored_filter(wrong_shape_dir.path());
+
+        assert_eq!(
+            missing, malformed,
+            "malformed TOML must restore identically to no file"
+        );
+        assert_eq!(
+            missing, wrong_shape,
+            "well-formed TOML in the wrong shape must restore identically to no file"
+        );
+
+        let mut deleted_after_write = test_app(&root);
+        let deleted_dir = tempfile::tempdir().expect("temp dir");
+        deleted_after_write.data_dir = deleted_dir.path().to_path_buf();
+        let repo_a_key = deleted_after_write.core.snapshot().entities[0].key.clone();
+        deleted_after_write.selection.toggle(repo_a_key);
+        deleted_after_write.persist_state();
+        std::fs::remove_file(deleted_dir.path().join("state.toml"))
+            .expect("delete state.toml by hand, a supported reset");
+        let after_deletion = restored_filter(deleted_dir.path());
+        assert_eq!(
+            missing, after_deletion,
+            "deleting state.toml by hand must be a supported reset, restoring the same as \
+             never having written one"
+        );
+    }
+
+    /// Criterion 5's three rungs, each proven against the one below it: a flag beats stored
+    /// state, and stored state beats the default. A test that only checked the flag winning
+    /// would not show stored state ever beats anything.
+    #[test]
+    fn a_flag_filter_beats_stored_state_which_beats_the_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+        std::fs::write(
+            state_dir.path().join("state.toml"),
+            "[test]\nselection = []\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write state.toml with a stored Filter");
+
+        // Rung 3: with nothing stored and no flag, the default (inactive) Filter wins.
+        let empty_state_dir = tempfile::tempdir().expect("temp dir with no state.toml");
+        let mut default_app = test_app(&root);
+        default_app.data_dir = empty_state_dir.path().to_path_buf();
+        default_app.restore_session_state(None);
+        assert!(
+            !default_app.filter.is_active(),
+            "expected the default with nothing stored"
+        );
+
+        // Rung 2: stored state beats the default when no flag is given.
+        let mut stored_app = test_app(&root);
+        stored_app.data_dir = state_dir.path().to_path_buf();
+        stored_app.restore_session_state(None);
+        assert_eq!(
+            stored_app.filter.as_str(),
+            "is:dirty",
+            "expected the scope's own stored Filter with no flag to override it"
+        );
+
+        // Rung 1: an explicit flag beats that same stored state, over the identical
+        // `data_dir` used just above, so this cannot pass by there being nothing stored to
+        // beat.
+        let mut flagged_app = test_app(&root);
+        flagged_app.data_dir = state_dir.path().to_path_buf();
+        flagged_app.restore_session_state(Some("kind:worktree"));
+        assert_eq!(
+            flagged_app.filter.as_str(),
+            "kind:worktree",
+            "expected the flag to win over the real stored Filter it was given"
+        );
+    }
+
+    /// Criterion 6: a restored Filter's Notice must carry both its expression and its
+    /// current match count, since a test only checking that a Notice appeared proves
+    /// neither.
+    #[test]
+    fn a_restored_filter_announces_its_expression_and_its_current_match_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+        std::fs::write(
+            state_dir.path().join("state.toml"),
+            "[test]\nselection = []\nfilter = \"repo-a\"\n",
+        )
+        .expect("write state.toml with a stored Filter matching exactly one row");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.restore_session_state(None);
+
+        let notice = app
+            .notice()
+            .expect("a restored active Filter must raise a Notice");
+        assert!(
+            notice.contains("repo-a"),
+            "expected the Filter's own expression in the Notice, got: {notice:?}"
+        );
+        assert!(
+            notice.contains('1'),
+            "expected the current match count in the Notice, got: {notice:?}"
+        );
+    }
+
+    /// The negative control for the announcement above: restoring with nothing stored (the
+    /// default, inactive Filter) must raise no Notice at all, since there is no narrowed
+    /// view to warn about.
+    #[test]
+    fn restoring_with_no_stored_filter_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("temp dir with no state.toml");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.restore_session_state(None);
+
+        assert_eq!(app.notice(), None);
     }
 }

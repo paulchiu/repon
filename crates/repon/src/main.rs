@@ -30,6 +30,7 @@ mod scroll;
 mod selection;
 mod set_picker;
 mod sets;
+mod state;
 mod status_row;
 #[cfg(test)]
 mod test_support;
@@ -83,7 +84,14 @@ fn main() -> color_eyre::Result<()> {
     errors::init()?;
     logging::init()?;
     config::init(args.config);
-    App::new(args.tick_rate, args.frame_rate, args.theme, args.set)?.run()
+    App::new(
+        args.tick_rate,
+        args.frame_rate,
+        args.theme,
+        args.set,
+        args.filter,
+    )?
+    .run()
 }
 
 /// Claims the terminal then panics, so a test can attach to a real process over a pty and
