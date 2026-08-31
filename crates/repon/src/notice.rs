@@ -3,10 +3,10 @@
 //! otherwise say nothing about what changed.
 //!
 //! Only rendering lives here. Being cleared by its timeout, a replacement or the next
-//! keypress, the `notice_timeout` config key, and the status row's full ordering ahead of a
-//! warning and the header, all live in `crate::app::App`: its `notice_set_at` field and
-//! `notice()`'s own timeout read, `set_notice`, and `render`'s own match on `notice()` ahead
-//! of [`crate::warnings::draw_slot`].
+//! keypress, the `notice_timeout` config key, and the status row's full ordering ahead of the
+//! rest of the row, all live in `crate::app::App`: its `notice_set_at` field and `notice()`'s
+//! own timeout read, `set_notice`, and `draw_status_row`'s own match on `notice()` ahead of
+//! [`crate::status_row::draw`].
 
 use ratatui::{Frame, layout::Rect};
 
@@ -14,8 +14,8 @@ use crate::theme::{Meaning, Theme};
 
 /// Draws `text` on the status bar's own row, in the Notice's role
 /// ([theming.md](../../../docs/spec/theming.md)'s meaning-to-role map). Takes over the row
-/// ahead of the shared warning slot: [`crate::app::App::render`] calls this instead of
-/// [`crate::warnings::draw_slot`] whenever a Notice is live.
+/// ahead of the rest of its content: `draw_status_row` in `crate::app` calls this instead of
+/// [`crate::status_row::draw`] whenever a Notice is live.
 pub(crate) fn draw(frame: &mut Frame, area: Rect, text: &str, theme: &Theme) {
     let style = theme.style_for(Meaning::Notice.role());
     frame.buffer_mut().set_string(area.x, area.y, text, style);

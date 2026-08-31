@@ -1,26 +1,22 @@
-//! The one shared warning slot [config.md](../../../../docs/spec/config.md) amends
+//! The one shared warning population [config.md](../../../../docs/spec/config.md) amends
 //! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings and
-//! an abandoned discovery fold into one [`Warning`] list, the status bar shows the single
-//! most severe ([`slot_line`]), and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
-//! expands it to the full list ([`draw_overlay`]). [theming.md](../../../../docs/spec/theming.md)'s
-//! "Warnings and Notices" fixes the slot to these three **standing conditions of the
-//! session**: a bound-but-unbuilt key the user just pressed was a fourth source here until
+//! an abandoned discovery fold into one [`Warning`] list. This module is an item source for
+//! [`crate::status_row`], not a renderer: [`slot_line`] computes the single most severe
+//! warning's own text, the same text the status row shows as its rank-2 item while any
+//! condition is unacknowledged, and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
+//! expands the population to the full list ([`draw_overlay`]), still drawn from here since
+//! the overlay is its own screen rather than an item in the status row's list
+//! ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
+//! [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" fixes the
+//! population to these three **standing conditions of the session**: a bound-but-unbuilt key
+//! the user just pressed was a fourth source here until
 //! [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
-//! removed it, since a reply to a keystroke is not a standing condition and this slot never
+//! removed it, since a reply to a keystroke is not a standing condition and this module never
 //! clears one on its own; [`crate::notice`] is where that reply now lives instead.
 //!
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
 //! ([0001](../../../../docs/adr/0001-per-cell-provenance.md)).
-//!
-//! TODO(#131): [`draw_slot`] owns the whole status row, which is no longer the design of
-//! record.
-//! [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)
-//! makes the row one list of items sharing one drop table, in which a warning is an item
-//! beside the entity count and run progress rather than the row's sole occupant, its `!`
-//! indicator is reserved out of the budget before anything is laid out and can never be
-//! dropped, and `w` acknowledges ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
-//! This module becomes an item source; the layout moves out of it.
 
 use ratatui::{Frame, layout::Rect};
 
@@ -136,26 +132,9 @@ pub(crate) fn slot_line(warnings: &[Warning], bindings: &BindingTable) -> Option
     ))
 }
 
-/// Draws the shared slot, one line, in the status bar's own row. Draws nothing at all while
-/// `warnings` is empty, rather than an empty styled line, so an unaffected run costs no
-/// visible row.
-pub(crate) fn draw_slot(
-    frame: &mut Frame,
-    area: Rect,
-    warnings: &[Warning],
-    bindings: &BindingTable,
-    theme: &Theme,
-) {
-    let Some(text) = slot_line(warnings, bindings) else {
-        return;
-    };
-    let style = theme.style_for(theme::Role::Warn);
-    frame.buffer_mut().set_string(area.x, area.y, &text, style);
-}
-
-/// Draws every outstanding warning, one per line, most severe first, in the same role the
-/// slot uses, so the expanded list and the slot agree on colour: `Action::ExpandWarning`'s
-/// whole reason to exist.
+/// Draws every outstanding warning, one per line, most severe first, in the same role
+/// [`crate::status_row`] paints the reserved indicator: `Action::ExpandWarning`'s whole
+/// reason to exist.
 pub(crate) fn draw_overlay(frame: &mut Frame, area: Rect, warnings: &[Warning], theme: &Theme) {
     let style = theme.style_for(theme::Role::Warn);
     let buf = frame.buffer_mut();
@@ -341,56 +320,27 @@ mod tests {
         assert_eq!(slot_line(&[], &BindingTable::compiled_default()), None);
     }
 
-    // --- criterion: the slot survives a redraw with the same warnings still outstanding,
-    // rather than a one-shot toast that only ever paints once ---
-
-    const RENDER_WIDTH: u16 = 100;
-
-    fn render_slot(warnings: &[Warning], bindings: &BindingTable) -> String {
-        let backend = TestBackend::new(RENDER_WIDTH, 1);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                draw_slot(frame, area, warnings, bindings, &theme::DEFAULT);
-            })
-            .expect("draw the slot");
-        let buf = terminal.backend().buffer();
-        (0..RENDER_WIDTH)
-            .map(|x| buf[(x, 0)].symbol().to_string())
-            .collect()
-    }
+    // --- criterion: the same outstanding warnings compute the same slot text on a later
+    // call, rather than a one-shot toast that only ever answers once ---
 
     #[test]
-    fn the_slot_survives_a_redraw_with_the_same_warnings_still_outstanding() {
+    fn slot_line_answers_identically_on_a_later_call_with_the_same_warnings_still_outstanding() {
         let warnings = vec![config_set_named_all()];
         let bindings = BindingTable::compiled_default();
 
-        let first = render_slot(&warnings, &bindings);
-        let second = render_slot(&warnings, &bindings);
+        let first = slot_line(&warnings, &bindings);
+        let second = slot_line(&warnings, &bindings);
 
         assert_eq!(
             first, second,
-            "the same outstanding warnings must render identically on a later redraw"
-        );
-        assert!(
-            first.contains("shadowing the implicit Set"),
-            "expected the warning's own message on screen, got: {first:?}"
-        );
-    }
-
-    #[test]
-    fn no_warnings_draws_nothing_into_the_slot_row() {
-        let bindings = BindingTable::compiled_default();
-        let line = render_slot(&[], &bindings);
-        assert!(
-            line.trim().is_empty(),
-            "expected a blank row with no warnings outstanding, got: {line:?}"
+            "the same outstanding warnings must compute the same slot text on a later call"
         );
     }
 
     // --- criterion: the expansion lists every outstanding condition, not only the most
     // severe one the slot shows ---
+
+    const RENDER_WIDTH: u16 = 100;
 
     fn render_overlay(warnings: &[Warning], height: u16) -> Vec<String> {
         let backend = TestBackend::new(RENDER_WIDTH, height);
@@ -499,7 +449,7 @@ mod tests {
     // at test time. There is nothing a runtime test can assert about a variant that does not
     // exist yet; the guarantee lives in the match itself.
 
-    // --- the status row contract, pinned in the documents until #131 builds it ---
+    // --- the status row contract, pinned in the documents status_row.rs builds against ---
 
     fn spec(name: &str) -> String {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
