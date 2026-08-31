@@ -1,10 +1,11 @@
 //! The config document: its schema, its defaults, the deep merge and the four failure grades.
 //!
 //! `docs/spec/config.md` is the specification. This module implements the top-level bare
-//! keys, `[refresh]`, `[fetch]`, `[auto_update]`, the `[[set]]` fields and `[[launcher]]` in
-//! full. `[[action]]` is parsed only enough to prove the document shape: a required identity
-//! field, file order preserved, duplicates rejected. Its own field schema belongs to a later
-//! ticket, so anything else in it is captured whole rather than validated.
+//! keys, `[refresh]`, `[fetch]`, `[auto_update]`, the `[[set]]`, `[[launcher]]` and
+//! `[[action]]` fields in full. Turning a parsed `[[action]]` and its `[[action.steps]]`
+//! into something `repon_core::Core::run_action` can run (resolving `shell = true`,
+//! merging each step's `env` with the environment contract, the confirm gate, the
+//! palette) is a later ticket's crossing; this module only proves the schema.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -134,14 +135,55 @@ pub struct LauncherConfig {
     pub disabled: bool,
 }
 
-/// An `[[action]]` entry, parsed only enough to prove the document shape. Its fields are a
-/// later ticket's schema.
+/// One `[[action.steps]]` table, per [config.md](../../../../docs/spec/config.md#actions):
+/// `args` is the argv vector (with `shell = true`, one element holding the command
+/// string, the same convention [`LauncherConfig`] already uses), `env` is merged over
+/// the guaranteed environment contract rather than replacing it. Turning this into
+/// something the core can run (resolving `shell = true`, merging `env` with the
+/// environment contract) is a later ticket's crossing, the same way
+/// [`crate::launcher::resolve`] is for a Launcher; this struct only proves the shape.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // parsed in full; read once a later ticket resolves this into repon_core::Step
+pub struct StepConfig {
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub shell: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// `true`, [config.md](../../../../docs/spec/config.md#actions)'s stated default for
+/// `confirm`: an Action asks before fanning out unless a config author opts out
+/// explicitly. Read by [`ActionConfig::confirm`]'s `#[serde(default = ...)]` rather than
+/// derived from `bool::default()`, since that would silently default to `false` and run
+/// a destructive Action unprompted.
+fn default_action_confirm() -> bool {
+    true
+}
+
+/// `4`, [config.md](../../../../docs/spec/config.md#actions)'s stated default for
+/// `concurrency`, the same number `fetch.concurrency` carries.
+fn default_action_concurrency() -> u32 {
+    4
+}
+
+/// An `[[action]]` entry, per [config.md](../../../../docs/spec/config.md#actions)'s full
+/// field table: a unique `name`, an optional `description`, the required ordered `steps`,
+/// `confirm` defaulting on, and `concurrency` defaulting to four with no schema maximum
+/// (`concurrency` is a bare `u32`, so the only ceiling is the type's own, never a
+/// deliberate one this schema imposes). Turning this, plus its `steps`, into
+/// `repon_core::ActionSpec` and `repon_core::Step` is a later ticket's crossing.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // parsed in full; read once a later ticket resolves this into repon_core::ActionSpec
 pub struct ActionConfig {
     pub name: toml::Spanned<String>,
-    #[serde(flatten)]
-    #[allow(dead_code)]
-    pub rest: toml::Table,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub steps: Vec<StepConfig>,
+    #[serde(default = "default_action_confirm")]
+    pub confirm: bool,
+    #[serde(default = "default_action_concurrency")]
+    pub concurrency: u32,
 }
 
 /// The document as the file declares it, deep-merged over the compiled defaults.
@@ -1118,13 +1160,40 @@ mod tests {
     /// `include_str!`, following repon-core's precedent for `CONTEXT.md`: the spec lives
     /// outside this crate's directory, so `include_str!` would compile fine in the
     /// workspace checkout but fail the packaged crate's build with no test to report it.
+    fn read_config_spec() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
+            .expect("read the config specification")
+    }
+
+    /// The default value the "Actions" field table's own row for `field` states, e.g.
+    /// `"true"` from `| \`confirm\` | bool, default \`true\` | ... |`. Read from the
+    /// document's own text rather than hand-copied, so a spec edit and this test's
+    /// expectation can never silently drift apart.
+    fn spec_action_field_default(spec: &str, field: &str) -> String {
+        let anchor = format!("| `{field}` |");
+        let row = spec
+            .lines()
+            .find(|line| line.contains(&anchor))
+            .unwrap_or_else(|| panic!("no `{field}` row in the Actions field table"));
+        let after = row
+            .split("default `")
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{field}`'s row names no stated default: {row}"));
+        after
+            .split('`')
+            .next()
+            .unwrap_or_else(|| {
+                panic!("`{field}`'s default value is not backtick-terminated: {row}")
+            })
+            .to_string()
+    }
+
     /// Comparing its fenced block against the shipped `example.toml` byte for byte is what
     /// keeps `repon config --example`'s output and the specification from drifting apart.
     #[test]
     fn the_shipped_example_matches_the_specs_fenced_block() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/config.md"))
-            .expect("read the config specification");
+        let spec = read_config_spec();
         let expected = extract_fenced_example(&spec);
         assert_eq!(
             annotated_example(),
@@ -1134,19 +1203,135 @@ mod tests {
     }
 
     /// Issue #58, criterion 4's "no config key" half: the PTY is a fixed 120-column
-    /// constant, never a config key, and this crate already parses `[[action]]` into a
-    /// typed struct, so a width key would be a visible new field here. An exhaustive
-    /// destructure names every field `ActionConfig` has; a width field added under any
-    /// name fails to compile this test rather than landing unacknowledged inside `rest`.
+    /// constant, never a config key. An exhaustive destructure names every field
+    /// `ActionConfig` has; a width field added under any name fails to compile this
+    /// test rather than landing unacknowledged.
     #[test]
     fn action_config_carries_no_pty_width_field_the_pty_is_a_fixed_constant_never_a_config_key() {
-        let loaded = parse_ok("[[action]]\nname = \"reinstall\"\n");
-        let ActionConfig { name: _, rest: _ } = loaded
+        let loaded =
+            parse_ok("[[action]]\nname = \"reinstall\"\n\n[[action.steps]]\nargs = [\"true\"]\n");
+        let ActionConfig {
+            name: _,
+            description: _,
+            steps: _,
+            confirm: _,
+            concurrency: _,
+        } = loaded
             .document
             .actions
             .into_iter()
             .next()
             .expect("one parsed [[action]] entry");
+    }
+
+    /// Criterion 1: every field [config.md](../../../../docs/spec/config.md#actions)'s
+    /// "Actions" table names, parsed from one entry that sets all of them, an ordered
+    /// step carrying `args`, `shell` and `env` together, and description preserved
+    /// rather than discarded.
+    #[test]
+    fn an_action_entry_parses_every_field_the_spec_names() {
+        let loaded = parse_ok(
+            "[[action]]\n\
+             name = \"reinstall\"\n\
+             description = \"Reinstall dependencies from scratch\"\n\
+             confirm = false\n\
+             concurrency = 8\n\n\
+             [[action.steps]]\n\
+             args = [\"rm -rf node_modules && pnpm install\"]\n\
+             shell = true\n\
+             env = { FOO = \"bar\" }\n",
+        );
+        let action = &loaded.document.actions[0];
+        assert_eq!(action.name.get_ref(), "reinstall");
+        assert_eq!(
+            action.description.as_deref(),
+            Some("Reinstall dependencies from scratch")
+        );
+        assert!(!action.confirm);
+        assert_eq!(action.concurrency, 8);
+        assert_eq!(action.steps.len(), 1);
+        assert_eq!(
+            action.steps[0].args,
+            vec!["rm -rf node_modules && pnpm install"]
+        );
+        assert!(action.steps[0].shell);
+        assert_eq!(
+            action.steps[0].env.get("FOO").map(String::as_str),
+            Some("bar")
+        );
+    }
+
+    /// Criterion 1: `steps` is required, per
+    /// [config.md](../../../../docs/spec/config.md#actions)'s "ordered list of step
+    /// tables, required". An `[[action]]` naming no steps at all must fail to parse
+    /// rather than silently default to an empty run.
+    #[test]
+    fn an_action_with_no_steps_field_at_all_fails_to_parse() {
+        parse_err("[[action]]\nname = \"reinstall\"\n");
+    }
+
+    /// Criterion 1: `confirm`'s default is read from
+    /// [config.md](../../../../docs/spec/config.md#actions) at test time rather than
+    /// restated as a literal, so a schema that flipped the default to off (silently
+    /// running a destructive Action unprompted) would be caught here rather than only
+    /// in a hand-maintained expectation that drifted along with the same mistake.
+    #[test]
+    fn action_confirm_defaults_to_the_specs_own_stated_value() {
+        let spec = read_config_spec();
+        let expected: bool = spec_action_field_default(&spec, "confirm")
+            .parse()
+            .expect("confirm's stated default parses as a bool");
+
+        let loaded =
+            parse_ok("[[action]]\nname = \"reinstall\"\n\n[[action.steps]]\nargs = [\"true\"]\n");
+
+        assert_eq!(loaded.document.actions[0].confirm, expected);
+    }
+
+    /// Criterion 1: `concurrency`'s default, read the same way `confirm`'s is.
+    #[test]
+    fn action_concurrency_defaults_to_the_specs_own_stated_value() {
+        let spec = read_config_spec();
+        let expected: u32 = spec_action_field_default(&spec, "concurrency")
+            .parse()
+            .expect("concurrency's stated default parses as an integer");
+
+        let loaded =
+            parse_ok("[[action]]\nname = \"reinstall\"\n\n[[action.steps]]\nargs = [\"true\"]\n");
+
+        assert_eq!(loaded.document.actions[0].concurrency, expected);
+    }
+
+    /// Criterion 1: "no schema maximum" is an absence claim, so checking only
+    /// the default (four) proves nothing about whether some later clamp was added. A
+    /// concurrency far past any plausible clamp must still parse to exactly what was
+    /// written.
+    #[test]
+    fn action_concurrency_has_no_schema_maximum() {
+        let loaded = parse_ok(
+            "[[action]]\nname = \"reinstall\"\nconcurrency = 999999999\n\n\
+             [[action.steps]]\nargs = [\"true\"]\n",
+        );
+
+        assert_eq!(loaded.document.actions[0].concurrency, 999_999_999);
+    }
+
+    /// Criterion 1: "unique name" needs a test that two Actions sharing a
+    /// name is rejected, not just that one Action parses, the same shape
+    /// [`a_duplicate_set_name_is_rejected_with_a_line_number`] and
+    /// [`a_duplicate_repo_path_is_rejected_with_a_line_number`] already prove for their
+    /// own identity fields.
+    #[test]
+    fn a_duplicate_action_name_is_rejected_with_a_line_number() {
+        let message = parse_err(
+            "[[action]]\nname = \"reinstall\"\n\n[[action.steps]]\nargs = [\"true\"]\n\n\
+             [[action]]\nname = \"reinstall\"\n\n[[action.steps]]\nargs = [\"true\"]\n",
+        );
+        assert!(message.contains("duplicate action name"));
+        assert!(
+            message.contains("line 8"),
+            "expected the second declaration's line, got: {message}"
+        );
     }
 
     /// Criterion 2's "no config key" half, for `[refresh]`: `refresh.md`'s "Scope and

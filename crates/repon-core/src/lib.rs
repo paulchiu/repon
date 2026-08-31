@@ -68,7 +68,7 @@ mod snapshot;
 mod test_support;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
-pub use core::{Core, CoreSpec, RepoOverride};
+pub use core::{ActionSpec, Core, CoreSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;
