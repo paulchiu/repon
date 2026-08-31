@@ -424,4 +424,37 @@ mod tests {
              (docs/spec/actions.md's \"Cancellation, suspend and quit\"), at: {offending:?}"
         );
     }
+
+    // --- Criterion 4: re-probing each affected entity synchronously first, the
+    // way a Launcher return does with `probe_now`, is explicitly not done for an Action's
+    // completion. `Core::run_action`'s own doc comment in repon-core's `core.rs`, and
+    // `docs/spec/actions.md`'s "Refreshing around a run", record the reason: `probe_now` is
+    // synchronous and single-entity, and forty of them costs about 3.6s under the fan-out's
+    // own contention, a frozen TUI for that whole window. The absence half below is what
+    // keeps that refusal real rather than merely written down.
+
+    /// A call to `probe_now` (the method, never its declaration: the needle is the call
+    /// syntax `.probe_now(`, which a `pub fn probe_now(` definition never matches) does not
+    /// exist anywhere in either crate's production source today, since nothing in either
+    /// crate implements a Launcher-return re-probe yet either. That makes this scan strict
+    /// rather than loose: it fails the moment *any* production caller appears, Action or
+    /// not, which is deliberately wider than the criterion strictly needs and will need
+    /// narrowing (to "no caller inside `run_action`'s own completion path") the day a
+    /// legitimate Launcher-return caller lands elsewhere; recorded here rather than solved
+    /// in advance of a caller that does not exist yet.
+    #[test]
+    fn an_actions_completion_never_synchronously_reprobes_each_affected_entity_the_way_a_launcher_return_does()
+     {
+        let needle = format!(".{}(", "probe_now");
+
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found a call to `probe_now`; docs/spec/actions.md's \"Refreshing around a run\" \
+             explicitly rejects synchronously re-probing each affected entity when an Action \
+             finishes (measured: about 3.6s for forty entities under the fan-out's own \
+             contention, a frozen TUI), at: {offending:?}"
+        );
+    }
 }

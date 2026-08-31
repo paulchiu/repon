@@ -77,6 +77,13 @@ _Avoid_: Handoff (that names the act, not the thing)
 **Action**:
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
+**Action spec**:
+An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps and its concurrency, plain data with no TOML type and no confirm gate.
+_Avoid_: ActionConfig (that names the consumer's parsed TOML shape, not the core's)
+
+**Step**:
+One command in an Action's ordered list, as the core receives it: its argv, already split rather than a shell string, and any per-step environment overrides already resolved. Distinct from a Step result, which is what running one produces.
+
 **Action receipt**:
 An Entity's most recent Action run: its label, its ordered Step results, whether the row was excluded and never operated on, and when it finished. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session.
 _Avoid_: Action run, Action result (the receipt is the specific, settled word)

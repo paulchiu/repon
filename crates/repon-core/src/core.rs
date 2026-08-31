@@ -37,11 +37,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, select};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
-use crate::entity::{DefaultBranch, EntityKey, EntityState, Head, Kind, Presence, WorktreeState};
+use crate::entity::{
+    ActionReceipt, DefaultBranch, EntityKey, EntityState, Head, Kind, Presence, StepOutcome,
+    StepResult, WorktreeState,
+};
+use crate::environment;
+use crate::executor;
 use crate::git;
 use crate::landing;
 use crate::patch_equivalence;
@@ -60,6 +66,35 @@ pub struct RepoOverride {
     pub path: PathBuf,
     pub default_branch: Option<String>,
     pub excluded: bool,
+}
+
+/// One command in an Action's ordered list, crossing from the consumer as plain data:
+/// argv already split (never a shell string) and any per-step environment overrides
+/// already resolved, so this crate never learns what `shell = true` or `from_env` even
+/// mean ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// "Actions", "Launchers" carries the same split for a Launcher's own argv). `env`'s
+/// pairs are applied after
+/// [`environment::environment`]'s own set-or-unset pairs, so a step's own `env` table
+/// overrides the guaranteed set exactly as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// Launcher `env` field already does.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// One Action fan-out, crossing from the consumer as plain data: no TOML type, no
+/// confirm gate, no palette. `label` is what a receipt's own label carries: the
+/// Action's name, or the ad hoc command string typed into the palette. `name` is
+/// `REPON_ACTION`'s own value and is `None` for an ad hoc run, exactly as
+/// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// environment contract already treats a Launcher's absent `REPON_ACTION`.
+#[derive(Debug, Clone)]
+pub struct ActionSpec {
+    pub label: Arc<str>,
+    pub name: Option<Arc<str>>,
+    pub steps: Vec<Step>,
+    pub concurrency: u32,
 }
 
 /// A [`RepoOverride`] with its common dir already resolved, built once at
@@ -241,6 +276,11 @@ pub struct Core {
     /// Read only by `patch_scan_bounds_for_test`.
     #[allow(dead_code)] // read only by patch_scan_bounds_for_test
     patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
+    /// `true` while one Action fan-out's steps are running, `false` otherwise. Guards
+    /// [`Core::run_action`]'s own entry rather than anything a probe touches: only one
+    /// fan-out runs at a time, per [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// "One Action runs at a time".
+    action_running: Arc<AtomicBool>,
 }
 
 impl Core {
@@ -265,6 +305,343 @@ impl Core {
     /// dispatches nothing and carries no other meaning. Returns immediately: the
     /// probes run on rayon's global pool.
     pub fn refresh(&self, order: &[EntityKey]) -> Generation {
+        self.refresh_handles().dispatch(order)
+    }
+
+    /// Clones out every `Arc` a Generation's dispatch reads, plus the plain data
+    /// ([`SetSpec`], the two durations) it cannot share by reference: a handful of
+    /// refcount bumps, never a copy of the table itself. This is what lets
+    /// [`run_action`](Core::run_action)'s completion, which runs on a plain thread
+    /// this `Core` does not own and outlives the `&self` borrow that started it,
+    /// start the one normal Generation `docs/spec/actions.md`'s "Refreshing around a
+    /// run" promises through the exact same [`RefreshHandles::dispatch`] `refresh`
+    /// itself calls, rather than a second, drifting copy of its body.
+    fn refresh_handles(&self) -> RefreshHandles {
+        RefreshHandles {
+            table: Arc::clone(&self.table),
+            overrides: Arc::clone(&self.overrides),
+            set: self.set.clone(),
+            discovery_manual: Arc::clone(&self.discovery_manual),
+            discovery_warn_after: self.discovery_warn_after,
+            discovery_abandon_after: Arc::clone(&self.discovery_abandon_after),
+            discovery_warning: Arc::clone(&self.discovery_warning),
+            settle_gate: Arc::clone(&self.settle_gate),
+            default_branch_chain_reads: Arc::clone(&self.default_branch_chain_reads),
+            patch_identity_reads: Arc::clone(&self.patch_identity_reads),
+            patch_scan_bounds: Arc::clone(&self.patch_scan_bounds),
+        }
+    }
+
+    /// Re-probes one entity synchronously against the table's current Generation,
+    /// which is what a Launcher return needs before a normal Generation starts.
+    /// Inserts a fresh entity for an unknown key rather than panicking, since a
+    /// caller can otherwise only reach this with a key `snapshot` just handed it.
+    pub fn probe_now(&self, key: &EntityKey) -> EntityState {
+        let never_cancelled = AtomicBool::new(false);
+        let (cached_repo, common_dir_hint, probes_state) = {
+            let table = self.table.read().unwrap();
+            let repo = table.repos.get(key).cloned();
+            let common_dir = table
+                .index
+                .get(key)
+                .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
+            // An unknown key has no entity yet to ask, and falls back to `false`,
+            // matching the fallback insert below: a freshly inserted `Kind::Repo`
+            // entity's `state` is `NotApplicable` from construction too.
+            let probes_state = table
+                .index
+                .get(key)
+                .map(|&idx| table.entities[idx].probes_state())
+                .unwrap_or(false);
+            (repo, common_dir, probes_state)
+        };
+        let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
+        let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
+        let override_branch = matched.and_then(|entry| entry.default_branch.clone());
+        let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
+
+        let branch_outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let default_branch_outcome = probe_default_branch(
+            key.path(),
+            cached_repo.as_deref(),
+            override_branch.as_deref(),
+            &never_cancelled,
+        );
+        let state_outcome = if probes_state {
+            // A single synchronous re-probe shares nothing with any Generation's
+            // dispatch, so a throwaway cache is exactly as much sharing as this
+            // one call needs. Its bound gate has exactly one entity to hear
+            // from: itself, so it never actually waits.
+            let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
+            let patch_reads = AtomicUsize::new(0);
+            let patch_scan_bounds = Mutex::new(Vec::new());
+            let gate = BoundGate::new(1);
+            let mut report = GateReport::new(&gate);
+            let memo = PatchEquivalenceMemo {
+                cache: &patch_cache,
+                reads: &patch_reads,
+                scan_bounds: &patch_scan_bounds,
+            };
+            probe_worktree_state(
+                key.path(),
+                cached_repo.as_deref(),
+                default_branch_outcome.as_ref().map(|r| &r.settled),
+                &common_dir_hint,
+                &never_cancelled,
+                &memo,
+                &mut report,
+            )
+        } else {
+            None
+        };
+
+        let mut table = self.table.write().unwrap();
+        let generation = Generation::new(table.generation);
+        let idx = match table.index.get(key).copied() {
+            Some(idx) => idx,
+            None => {
+                let name = display_name(key.path());
+                table.entities.push(EntityState::new(
+                    key.clone(),
+                    name,
+                    common_dir_hint,
+                    Kind::Repo,
+                ));
+                let idx = table.entities.len() - 1;
+                table.index.insert(key.clone(), idx);
+                idx
+            }
+        };
+        table.entities[idx].excluded = excluded;
+        if let Some((settled, in_progress, recent)) = branch_outcome {
+            table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
+        }
+        if let Some(resolution) = default_branch_outcome {
+            table.entities[idx].apply_default_branch_resolution(generation, resolution);
+        }
+        if let Some(settled) = state_outcome {
+            table.entities[idx].state.settle(generation, settled);
+        }
+        table.entities[idx].clone()
+    }
+
+    /// Clones the whole table now, without waiting for anything in flight.
+    pub fn snapshot(&self) -> Snapshot {
+        let table = self.table.read().unwrap();
+        Snapshot {
+            generation: Generation::new(table.generation),
+            discovered_at: table.discovered_at,
+            entities: table.entities.clone(),
+        }
+    }
+
+    /// Blocks until nothing is in flight or `within` elapses, then returns a
+    /// snapshot. The machine-readable consumer's whole loop.
+    pub fn settle(&self, within: Duration) -> Snapshot {
+        let (lock, cvar) = &*self.settle_gate;
+        let guard = lock.lock().unwrap();
+        let _ = cvar
+            .wait_timeout_while(guard, within, |count| *count > 0)
+            .unwrap();
+        self.snapshot()
+    }
+
+    /// Drops one entity from the table, cancelling any probe in flight against it.
+    pub fn dismiss(&self, key: &EntityKey) {
+        let mut table = self.table.write().unwrap();
+        if let Some(idx) = table.index.remove(key) {
+            table.entities.remove(idx);
+            for position in table.index.values_mut() {
+                if *position > idx {
+                    *position -= 1;
+                }
+            }
+        }
+        if let Some(in_flight) = table.in_flight.remove(key) {
+            in_flight.cancel.store(true, Ordering::Release);
+            drop(table);
+            complete_one(&self.settle_gate);
+        }
+    }
+
+    /// Runs `action` across every key in `order` that the table currently knows: each
+    /// entity's own steps run in order and stop at that entity's first failure, exactly
+    /// as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// "Actions" fixes, with later steps recorded `NotRun` rather than silently skipped.
+    /// Cross-entity concurrency is bounded by `action.concurrency`, on a
+    /// `rayon::ThreadPool` this call builds and owns for the run alone, never rayon's
+    /// global pool the probe fan-out shares: a step blocked in `wait()` removes a
+    /// worker from whichever pool holds it, and the global pool has none to spare
+    /// without starving a refresh in flight
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The fan-out"). Returns immediately; every step's own child, and this run's
+    /// completion, run off the calling thread.
+    ///
+    /// Returns `false` and touches nothing if a fan-out is already running: only one
+    /// runs at a time
+    /// ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// "One Action runs at a time"), but the spec settles only that the *palette* goes
+    /// inert while one is live, never what a second, concurrent call to this seam itself
+    /// should do. Rejecting outright, rather than queuing, is this call's own choice: a
+    /// queue needs its own ordering and cancellation story that no acceptance criterion
+    /// here asks for.
+    ///
+    /// An entity in `order` carrying a matching `[[repo]]` `exclude = true`
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries))
+    /// never runs a step: it receives a `not_applicable` receipt with an empty step list
+    /// immediately, the one legitimate producer of that outcome
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate"). An unknown key in `order` (already dismissed, or
+    /// never discovered) is silently skipped, the same fallback `refresh` gives one.
+    ///
+    /// Starting a run cancels any in-flight Generation outright rather than sharing
+    /// execution with it, measured at a 3.7x penalty to the Action
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "Refreshing around a run"). Completion starts exactly one normal Generation over
+    /// every entity the table currently knows, not only the ones this run touched,
+    /// following the precedent a finished periodic fetch already sets
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
+    ///
+    /// Explicitly not done: re-probing each affected entity synchronously first, the way
+    /// a Launcher return does with [`Core::probe_now`]. Measured and rejected:
+    /// `probe_now` is synchronous and single-entity, and forty of them costs 0.44s at
+    /// best and about 3.6s under the contention the fan-out itself creates, which is a
+    /// frozen TUI for that whole window
+    /// (`docs/spec/actions.md`'s "Refreshing around a run"). The accepted cost instead:
+    /// the first entity to finish shows stale cells for the length of the run.
+    pub fn run_action(&self, action: ActionSpec, order: &[EntityKey]) -> bool {
+        if self
+            .action_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        // Criterion 3's first half: starting a run cancels any in-flight Generation
+        // outright, never sharing the machine with it.
+        cancel_in_flight(&self.table, &self.settle_gate);
+
+        let (included, excluded): (Vec<EntityState>, Vec<EntityState>) = {
+            let table = self.table.read().unwrap();
+            order
+                .iter()
+                .filter_map(|key| table.index.get(key).map(|&idx| table.entities[idx].clone()))
+                .partition(|entity| !entity.excluded)
+        };
+
+        if !excluded.is_empty() {
+            let finished_at = Timestamp::now();
+            let mut table = self.table.write().unwrap();
+            for entity in &excluded {
+                if let Some(&idx) = table.index.get(&entity.key) {
+                    table.entities[idx].last_action = Some(ActionReceipt {
+                        label: Arc::clone(&action.label),
+                        steps: Arc::from(Vec::new()),
+                        not_applicable: true,
+                        finished_at,
+                    });
+                }
+            }
+        }
+
+        let table_handle = Arc::clone(&self.table);
+        let action_running = Arc::clone(&self.action_running);
+        let refresh_handles = self.refresh_handles();
+        // At least one worker regardless of what `action.concurrency` says: 0 has no
+        // sensible reading as "run nothing" here (the schema has no floor, only an
+        // explicit absence of a *ceiling*, `docs/spec/actions.md`'s "The fan-out"), and
+        // `rayon::ThreadPoolBuilder::num_threads(0)` means "let rayon choose" rather
+        // than zero workers, which would silently hand this run back to a pool sized by
+        // something other than `concurrency`.
+        let concurrency = action.concurrency.max(1) as usize;
+
+        // A plain OS thread, never a job on either rayon pool: `RefreshHandles::dispatch`
+        // below calls `rayon::spawn`, which targets whichever pool the *calling* thread
+        // already belongs to, so running this orchestration from inside the dedicated
+        // pool built below would misroute the completion Generation's own probes onto
+        // it instead of the global pool every other probe uses.
+        thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrency)
+                .build()
+                .expect("build the Action fan-out's own dedicated pool");
+
+            pool.install(|| {
+                included.into_par_iter().for_each(|entity| {
+                    let receipt = run_action_for_entity(&entity, &action);
+                    let mut table = table_handle.write().unwrap();
+                    if let Some(&idx) = table.index.get(&entity.key) {
+                        table.entities[idx].last_action = Some(receipt);
+                    }
+                });
+            });
+
+            // Criterion 6: the fan-out itself ends the moment every entity's own steps
+            // have finished; a second `run_action` racing in from here on is racing the
+            // completion Generation below, never another fan-out.
+            action_running.store(false, Ordering::Release);
+
+            // Criterion 3's second half: completion starts one normal Generation over
+            // every entity currently known, not only the ones this run acted on.
+            let all_keys: Vec<EntityKey> = table_handle
+                .read()
+                .unwrap()
+                .entities
+                .iter()
+                .map(|entity| entity.key.clone())
+                .collect();
+            refresh_handles.dispatch(&all_keys);
+        });
+
+        true
+    }
+
+    /// Stops all background work: the dedicated thread stops ticking and every
+    /// probe currently in flight is cancelled. The core is never told why.
+    pub fn pause(&self) {
+        let _ = self.control.send(ClockControl::Pause);
+    }
+
+    /// Restarts the dedicated thread's ticking. Nothing is queued to fire on
+    /// resume; a normal Generation is the consumer's decision, not this call's.
+    pub fn resume(&self) {
+        let _ = self.control.send(ClockControl::Resume);
+    }
+
+    /// The persistent warning a re-run discovery walk leaves behind once it abandons, or
+    /// `None` while none has. Never cleared once set, the same as `discovery_manual`: the
+    /// Set stays out of the automatic refresh path for the life of this `Core`. The UI's
+    /// shared warning slot polls this every frame, since it can turn from `None` to `Some`
+    /// at any point in the run with no reload involved.
+    pub fn discovery_warning(&self) -> Option<String> {
+        self.discovery_warning.lock().unwrap().clone()
+    }
+}
+
+/// Every `Arc` and plain-data field a Generation's dispatch reads, owned rather than
+/// borrowed: [`Core::refresh_handles`] is the only constructor, and its own doc comment
+/// carries the reason this exists at all. Field names and types mirror `Core`'s own
+/// exactly, so [`Self::dispatch`] and [`Self::rerun_discovery`] are `refresh` and
+/// `rerun_discovery`'s bodies moved verbatim, `self.field` unchanged.
+struct RefreshHandles {
+    table: Arc<RwLock<Table>>,
+    overrides: Arc<Vec<ResolvedOverride>>,
+    set: SetSpec,
+    discovery_manual: Arc<AtomicBool>,
+    discovery_warn_after: Duration,
+    discovery_abandon_after: Arc<AtomicU64>,
+    discovery_warning: Arc<Mutex<Option<String>>>,
+    settle_gate: Arc<(Mutex<usize>, Condvar)>,
+    default_branch_chain_reads: Arc<AtomicUsize>,
+    patch_identity_reads: Arc<AtomicUsize>,
+    patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
+}
+
+impl RefreshHandles {
+    /// `Core::refresh`'s whole body, moved here so `run_action`'s completion can call
+    /// the identical dispatch from a thread that owns no reference to `Core` itself.
+    fn dispatch(&self, order: &[EntityKey]) -> Generation {
         // Scoped to this one Generation, per default-branch.md's "memoised per
         // common dir within a single refresh generation": a fresh cache every
         // call, never carried over, never touched by the previous Generation's
@@ -467,179 +844,6 @@ impl Core {
             complete_many(&self.settle_gate, cancelled);
         }
     }
-
-    /// Re-probes one entity synchronously against the table's current Generation,
-    /// which is what a Launcher return needs before a normal Generation starts.
-    /// Inserts a fresh entity for an unknown key rather than panicking, since a
-    /// caller can otherwise only reach this with a key `snapshot` just handed it.
-    pub fn probe_now(&self, key: &EntityKey) -> EntityState {
-        let never_cancelled = AtomicBool::new(false);
-        let (cached_repo, common_dir_hint, probes_state) = {
-            let table = self.table.read().unwrap();
-            let repo = table.repos.get(key).cloned();
-            let common_dir = table
-                .index
-                .get(key)
-                .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
-            // An unknown key has no entity yet to ask, and falls back to `false`,
-            // matching the fallback insert below: a freshly inserted `Kind::Repo`
-            // entity's `state` is `NotApplicable` from construction too.
-            let probes_state = table
-                .index
-                .get(key)
-                .map(|&idx| table.entities[idx].probes_state())
-                .unwrap_or(false);
-            (repo, common_dir, probes_state)
-        };
-        let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
-        let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
-        let override_branch = matched.and_then(|entry| entry.default_branch.clone());
-        let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
-
-        let branch_outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
-        let default_branch_outcome = probe_default_branch(
-            key.path(),
-            cached_repo.as_deref(),
-            override_branch.as_deref(),
-            &never_cancelled,
-        );
-        let state_outcome = if probes_state {
-            // A single synchronous re-probe shares nothing with any Generation's
-            // dispatch, so a throwaway cache is exactly as much sharing as this
-            // one call needs. Its bound gate has exactly one entity to hear
-            // from: itself, so it never actually waits.
-            let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
-            let patch_reads = AtomicUsize::new(0);
-            let patch_scan_bounds = Mutex::new(Vec::new());
-            let gate = BoundGate::new(1);
-            let mut report = GateReport::new(&gate);
-            let memo = PatchEquivalenceMemo {
-                cache: &patch_cache,
-                reads: &patch_reads,
-                scan_bounds: &patch_scan_bounds,
-            };
-            probe_worktree_state(
-                key.path(),
-                cached_repo.as_deref(),
-                default_branch_outcome.as_ref().map(|r| &r.settled),
-                &common_dir_hint,
-                &never_cancelled,
-                &memo,
-                &mut report,
-            )
-        } else {
-            None
-        };
-
-        let mut table = self.table.write().unwrap();
-        let generation = Generation::new(table.generation);
-        let idx = match table.index.get(key).copied() {
-            Some(idx) => idx,
-            None => {
-                let name = display_name(key.path());
-                table.entities.push(EntityState::new(
-                    key.clone(),
-                    name,
-                    common_dir_hint,
-                    Kind::Repo,
-                ));
-                let idx = table.entities.len() - 1;
-                table.index.insert(key.clone(), idx);
-                idx
-            }
-        };
-        table.entities[idx].excluded = excluded;
-        if let Some((settled, in_progress, recent)) = branch_outcome {
-            table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
-        }
-        if let Some(resolution) = default_branch_outcome {
-            table.entities[idx].apply_default_branch_resolution(generation, resolution);
-        }
-        if let Some(settled) = state_outcome {
-            table.entities[idx].state.settle(generation, settled);
-        }
-        table.entities[idx].clone()
-    }
-
-    /// Clones the whole table now, without waiting for anything in flight.
-    pub fn snapshot(&self) -> Snapshot {
-        let table = self.table.read().unwrap();
-        Snapshot {
-            generation: Generation::new(table.generation),
-            discovered_at: table.discovered_at,
-            entities: table.entities.clone(),
-        }
-    }
-
-    /// Blocks until nothing is in flight or `within` elapses, then returns a
-    /// snapshot. The machine-readable consumer's whole loop.
-    pub fn settle(&self, within: Duration) -> Snapshot {
-        let (lock, cvar) = &*self.settle_gate;
-        let guard = lock.lock().unwrap();
-        let _ = cvar
-            .wait_timeout_while(guard, within, |count| *count > 0)
-            .unwrap();
-        self.snapshot()
-    }
-
-    /// Drops one entity from the table, cancelling any probe in flight against it.
-    pub fn dismiss(&self, key: &EntityKey) {
-        let mut table = self.table.write().unwrap();
-        if let Some(idx) = table.index.remove(key) {
-            table.entities.remove(idx);
-            for position in table.index.values_mut() {
-                if *position > idx {
-                    *position -= 1;
-                }
-            }
-        }
-        if let Some(in_flight) = table.in_flight.remove(key) {
-            in_flight.cancel.store(true, Ordering::Release);
-            drop(table);
-            complete_one(&self.settle_gate);
-        }
-    }
-
-    /// The fan-out entry point [`docs/spec/core-api.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/core-api.md)
-    /// reserves for Action fan-out ("no terminal is involved"), placed as a seam only: `order`
-    /// names which entities a caller intends to act on, and this call does nothing else.
-    ///
-    /// Deliberately unimplemented, not merely unfinished: spawning a step's child, capturing
-    /// its output, and writing the result to [`EntityState::last_action`] are all
-    /// [`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-    /// own design, still open, and building any of them here would be guessing at a shape
-    /// this signature cannot yet commit to. This body will therefore always run to completion
-    /// having touched nothing; it never panics and never blocks, so a caller reaching it early
-    /// is safe.
-    ///
-    /// Also deferred: running steps in order and stopping at the first failure, the schema's
-    /// whole gating mechanism (there is no success-condition field, so sequential stop-on-fail
-    /// is the only one). Nothing here produces [`crate::entity::StepOutcome::NotRun`] yet;
-    /// that variant has no producer until this seam is filled.
-    pub fn run_action(&self, order: &[EntityKey]) {
-        let _ = order;
-    }
-
-    /// Stops all background work: the dedicated thread stops ticking and every
-    /// probe currently in flight is cancelled. The core is never told why.
-    pub fn pause(&self) {
-        let _ = self.control.send(ClockControl::Pause);
-    }
-
-    /// Restarts the dedicated thread's ticking. Nothing is queued to fire on
-    /// resume; a normal Generation is the consumer's decision, not this call's.
-    pub fn resume(&self) {
-        let _ = self.control.send(ClockControl::Resume);
-    }
-
-    /// The persistent warning a re-run discovery walk leaves behind once it abandons, or
-    /// `None` while none has. Never cleared once set, the same as `discovery_manual`: the
-    /// Set stays out of the automatic refresh path for the life of this `Core`. The UI's
-    /// shared warning slot polls this every frame, since it can turn from `None` to `Some`
-    /// at any point in the run with no reload involved.
-    pub fn discovery_warning(&self) -> Option<String> {
-        self.discovery_warning.lock().unwrap().clone()
-    }
 }
 
 impl Drop for Core {
@@ -837,9 +1041,9 @@ impl Core {
         );
     }
 
-    /// Writes `receipt` directly onto `key`'s `last_action`, bypassing `run_action`'s seam
-    /// (which writes nothing): the only way a test can put a receipt on a live `Core`'s table
-    /// until a real executor exists to produce one.
+    /// Writes `receipt` directly onto `key`'s `last_action`, bypassing `run_action`
+    /// entirely: lets a test put an exact, hand-built receipt on a live `Core`'s table
+    /// without spawning any real child process.
     pub(crate) fn set_last_action_for_test(
         &self,
         key: &EntityKey,
@@ -849,6 +1053,48 @@ impl Core {
         if let Some(&idx) = table.index.get(key) {
             table.entities[idx].last_action = Some(receipt);
         }
+    }
+}
+
+/// One entity's whole Action run: every step in `action.steps`, in order, stopping at
+/// the first failure, with every step after it recorded `NotRun` rather than silently
+/// skipped ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// "Actions", `docs/spec/actions.md`'s "Step outcomes"). Never called for an excluded
+/// entity: [`Core::run_action`] gives those their `not_applicable` receipt itself and
+/// never reaches this function for them.
+fn run_action_for_entity(entity: &EntityState, action: &ActionSpec) -> ActionReceipt {
+    let base_env = environment::environment(entity, action.name.as_deref());
+    let mut failed = false;
+    let mut results = Vec::with_capacity(action.steps.len());
+    for step in &action.steps {
+        if failed {
+            results.push(StepResult {
+                label: Arc::from(step.argv.join(" ")),
+                outcome: StepOutcome::NotRun,
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::ZERO,
+            });
+            continue;
+        }
+        // The step's own `env` table is applied after the environment contract's
+        // set-or-unset pairs, so it overrides the guaranteed set exactly as a
+        // Launcher's own `env` field already does (`docs/spec/config.md`'s
+        // "Launchers").
+        let mut env = base_env.clone();
+        env.extend(
+            step.env
+                .iter()
+                .map(|(name, value)| (name.clone(), Some(value.clone()))),
+        );
+        let result = executor::run_step(&step.argv, entity.key.path(), &env);
+        failed = result.outcome.is_failure();
+        results.push(result);
+    }
+    ActionReceipt {
+        label: Arc::clone(&action.label),
+        steps: Arc::from(results),
+        not_applicable: false,
+        finished_at: Timestamp::now(),
     }
 }
 
@@ -963,6 +1209,7 @@ fn start_internal(
             default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
             patch_identity_reads: Arc::new(AtomicUsize::new(0)),
             patch_scan_bounds: Arc::new(Mutex::new(Vec::new())),
+            action_running: Arc::new(AtomicBool::new(false)),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1882,6 +2129,39 @@ mod tests {
         dir.path().canonicalize().expect("canonicalize temp dir")
     }
 
+    /// Polls `condition` every 10ms until it is `true` or `timeout` elapses, returning
+    /// which happened: `run_action` returns before its own fan-out and completion
+    /// Generation finish, so a test that wants to see the far side of one needs to wait
+    /// for it rather than asserting immediately.
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn step(argv: &[&str]) -> Step {
+        Step {
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            env: Vec::new(),
+        }
+    }
+
+    fn action(label: &str, steps: Vec<Step>) -> ActionSpec {
+        ActionSpec {
+            label: Arc::from(label),
+            name: Some(Arc::from(label)),
+            steps,
+            concurrency: 4,
+        }
+    }
+
     /// End-to-end: the test thread never spawns anything itself, only calls
     /// `Core`'s public methods, and real branch data still lands in the snapshot.
     /// That is the proof that the core owns the threads doing the work, not the
@@ -2050,30 +2330,257 @@ mod tests {
         assert!(core.snapshot().entities.is_empty());
     }
 
-    /// Criterion 7's seam, proven rather than merely declared: a real, running `Core`
-    /// survives the call with nothing observable changed, which is what "deliberately
-    /// unimplemented" has to mean here rather than "untested".
+    /// Foundation for every criterion below: one entity's own steps run in order and a
+    /// failure marks every later step `NotRun` rather than silently skipping it or
+    /// running it anyway, exactly the closed set of four outcomes
+    /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// "Actions" and `docs/spec/actions.md`'s "Step outcomes" both fix.
     #[test]
-    fn run_action_is_a_safely_callable_seam_that_writes_nothing() {
+    fn an_entitys_steps_run_in_order_and_a_failure_marks_every_later_step_not_run() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
         let core = Core::start(spec(vec![root]));
-        let before = core.snapshot();
-        let keys: Vec<EntityKey> = before.entities.iter().map(|e| e.key.clone()).collect();
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![
+            step(&["true"]),
+            step(&["sh", "-c", "exit 7"]),
+            step(&["true"]),
+        ];
 
-        core.run_action(&keys);
+        let started = core.run_action(action("reinstall", steps), std::slice::from_ref(&key));
+
+        assert!(started);
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0].last_action.is_some()
+        });
+        assert!(settled, "the fan-out must finish and write a receipt");
+        let receipt = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps.len(), 3);
+        assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+        assert_eq!(receipt.steps[1].outcome, StepOutcome::Failed(7));
+        assert_eq!(
+            receipt.steps[2].outcome,
+            StepOutcome::NotRun,
+            "a step after a failure must be recorded NotRun, not silently dropped or run anyway"
+        );
+    }
+
+    /// Criterion 3's first half. `begin_shared_generation_for_test` puts the entity
+    /// in flight against a Generation of its own, exactly as a real `refresh` would;
+    /// this proves `run_action` cancels that Generation's own flag rather than merely
+    /// starting alongside it, which is the difference between the 0.85s and 3.14s
+    /// measurements `docs/spec/actions.md`'s "Refreshing around a run" reports.
+    #[test]
+    fn starting_an_action_cancels_any_generation_already_in_flight() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let cancels = core.begin_shared_generation_for_test(std::slice::from_ref(&key));
+        let cancel = cancels
+            .get(&key)
+            .expect("the in-flight entity has a cancel flag")
+            .clone();
+        assert!(!cancel.load(Ordering::Acquire));
+
+        let started = core.run_action(
+            action("reinstall", vec![step(&["true"])]),
+            std::slice::from_ref(&key),
+        );
+
+        assert!(started);
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "starting an Action must cancel a Generation already in flight, not share \
+             execution with it"
+        );
+        // Drain the fan-out and its completion refresh so this test's background
+        // thread does not outlive it.
+        assert!(wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0].last_action.is_some()
+        }));
+    }
+
+    /// Criterion 3's second half, and the double-refresh mutation this test is written
+    /// to catch: a completed Action starting its own Generation *and* a second one
+    /// left over from a naive implementation that also called `refresh` directly would
+    /// both leave every entity settled, so counting settled entities alone cannot tell
+    /// zero, one and two apart. Reading the table's own `generation` number after
+    /// completion can: it must read exactly 1, one Generation minted from a fresh
+    /// `Core` starting at 0, covering both entities although the Action only ever
+    /// named one of them.
+    #[test]
+    fn a_finished_action_starts_exactly_one_generation_over_every_known_entity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let acted_on = root.join("acted-on");
+        let untouched = root.join("untouched");
+        init_repo_with_a_commit(&acted_on);
+        init_repo_with_a_commit(&untouched);
+
+        let core = Core::start(spec(vec![root]));
+        let before = core.snapshot();
+        assert_eq!(before.generation, Generation::default());
+        let acted_key = before
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == acted_on)
+            .expect("the acted-on entity is discovered")
+            .key
+            .clone();
+
+        let started = core.run_action(
+            action("reinstall", vec![step(&["true"])]),
+            std::slice::from_ref(&acted_key),
+        );
+
+        assert!(started);
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot()
+                .entities
+                .iter()
+                .all(|entity| matches!(entity.branch.settled(), Some(Settled::Known { .. })))
+        });
+        assert!(
+            settled,
+            "the completion Generation must eventually probe every known entity, including \
+             the one the Action never touched"
+        );
+        assert_eq!(
+            core.snapshot().generation,
+            Generation::new(1),
+            "completion must start exactly one Generation: not zero (no refresh at all) and \
+             not two (a double refresh)"
+        );
+    }
+
+    /// Criterion 5. The excluded row gets the one legitimate `not_applicable` receipt
+    /// with no steps; the acted-on row's own step is made to fail, which is the strong
+    /// half of the claim: a receipt with steps that failed is still not the
+    /// `not_applicable` shape, so nothing but an excluded row can ever produce it.
+    #[test]
+    fn an_excluded_row_swept_into_an_action_gets_a_not_applicable_receipt_and_no_other_path_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let excluded_repo = root.join("excluded");
+        let normal_repo = root.join("normal");
+        init_repo_with_a_commit(&excluded_repo);
+        init_repo_with_a_commit(&normal_repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: excluded_repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let snapshot = core.snapshot();
+        let find = |path: &Path| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == path)
+                .unwrap_or_else(|| panic!("entity at {path:?} present"))
+                .key
+                .clone()
+        };
+        let excluded_key = find(&excluded_repo);
+        let normal_key = find(&normal_repo);
+        assert!(
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key == excluded_key)
+                .unwrap()
+                .excluded
+        );
+
+        let started = core.run_action(
+            action("reinstall", vec![step(&["sh", "-c", "exit 3"])]),
+            &[excluded_key.clone(), normal_key.clone()],
+        );
+
+        assert!(started);
+        let settled = wait_until(Duration::from_secs(5), || {
+            let snapshot = core.snapshot();
+            let has_receipt = |key: &EntityKey| {
+                snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == *key)
+                    .and_then(|entity| entity.last_action.as_ref())
+                    .is_some()
+            };
+            has_receipt(&excluded_key) && has_receipt(&normal_key)
+        });
+        assert!(settled);
 
         let after = core.snapshot();
-        assert_eq!(after.entities.len(), before.entities.len());
-        assert!(
+        let receipt_of = |key: &EntityKey| {
             after
                 .entities
                 .iter()
-                .all(|entity| entity.last_action.is_none()),
-            "run_action is a seam only: it must never write EntityState::last_action"
+                .find(|entity| entity.key == *key)
+                .unwrap()
+                .last_action
+                .clone()
+                .unwrap()
+        };
+        let excluded_receipt = receipt_of(&excluded_key);
+        assert!(excluded_receipt.not_applicable);
+        assert!(excluded_receipt.steps.is_empty());
+
+        let normal_receipt = receipt_of(&normal_key);
+        assert!(
+            !normal_receipt.not_applicable,
+            "a row that actually ran a step, even a failing one, must never read as \
+             not_applicable: an excluded row is the one legitimate producer of that outcome"
+        );
+        assert!(!normal_receipt.steps.is_empty());
+        assert!(normal_receipt.failed());
+    }
+
+    /// Criterion 6. The second call is rejected synchronously (`action_running`'s
+    /// `compare_exchange` fails before anything else runs), so this needs no waiting to
+    /// observe; only the cleanup wait at the end needs `wait_until`.
+    #[test]
+    fn only_one_action_fan_out_runs_at_a_time_a_second_call_is_rejected_while_one_is_live() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let slow = action("first", vec![step(&["sh", "-c", "sleep 0.3"])]);
+        let fast = action("second", vec![step(&["true"])]);
+
+        let first_started = core.run_action(slow, std::slice::from_ref(&key));
+        let second_started = core.run_action(fast, std::slice::from_ref(&key));
+
+        assert!(first_started);
+        assert!(
+            !second_started,
+            "a second run_action call must be rejected while the first is still in flight"
+        );
+        let settled = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0].last_action.is_some()
+        });
+        assert!(settled);
+        let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
+        assert_eq!(
+            &*receipt.label, "first",
+            "the surviving receipt must be the accepted first run's, never the rejected second"
         );
     }
 
