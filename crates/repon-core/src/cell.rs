@@ -106,7 +106,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// Why a [`Cell`] is [`Settled::Unknown`]. Closed at exactly these two: every other
+/// Why a [`Cell`] is [`Settled::Unknown`]. Closed at exactly these three: every other
 /// absence this design once modelled as Unknown turned out to be a settled value
 /// rendered elsewhere (a branch with no upstream renders `-`, a Repo with no remote
 /// renders `∅`), so no `NoUpstream` or `NoRemote` reason exists here.
@@ -116,6 +116,11 @@ pub enum Unknown {
     TimedOut,
     /// The default branch resolution chain reached its last rung with no answer.
     NoDefaultBranch,
+    /// A Submodule has never been `git submodule update --init`-ed, so opening it
+    /// found nothing there rather than something broken
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "The Submodule row").
+    SubmoduleUninitialized,
 }
 
 /// What a [`Cell`] has settled to. Never a bare `Option<T>`, so an absent value can

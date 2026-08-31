@@ -644,11 +644,24 @@ impl App {
         Ok(())
     }
 
-    /// Every currently known Entity's key, in table order: this crate's whole "visible list"
-    /// until a Filter narrows it, and what `select_all_visible`, `extend_range` and the
-    /// cursor bounds all read.
+    /// Every currently shown Entity's key, in the same grouped, Repo-then-its-own-children
+    /// order [`crate::components::list::List`] draws
+    /// ([`crate::components::list::grouped_row_order`]): this crate's whole "visible list"
+    /// until a Filter narrows it further, and what `select_all_visible`, `extend_range` and
+    /// the cursor bounds all read. A hidden Submodule
+    /// ([`crate::components::list::kind_is_visible`]) never appears here, which is what
+    /// bounds `select_all_visible` by visibility rather than by every Entity discovery
+    /// knows about ([discovery.md](../../../docs/spec/discovery.md)'s "Showing Submodules").
     fn visible_keys(&self) -> Vec<EntityKey> {
-        entity_keys(&self.core.snapshot())
+        let snapshot = self.core.snapshot();
+        crate::components::list::grouped_row_order(&snapshot.entities)
+            .into_iter()
+            .map(|index| &snapshot.entities[index])
+            .filter(|entity| {
+                crate::components::list::kind_is_visible(entity.kind, self.document.show_submodules)
+            })
+            .map(|entity| entity.key.clone())
+            .collect()
     }
 
     /// The row the cursor sits on, if the table is non-empty.
@@ -970,6 +983,7 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
         });
         let (message_tx, message_rx) = unbounded();
         App {
@@ -1019,6 +1033,74 @@ mod tests {
                 document
             },
         }
+    }
+
+    fn write_gitmodules(parent: &std::path::Path, name: &str, relative_path: &str) {
+        std::fs::write(
+            parent.join(".gitmodules"),
+            format!(
+                "[submodule \"{name}\"]\n\tpath = {relative_path}\n\turl = \
+                 https://example.invalid/{name}.git\n"
+            ),
+        )
+        .expect("write .gitmodules");
+    }
+
+    /// Criterion 6's own negative clause: a hidden Submodule is never in `visible_keys`, so
+    /// `a` (select every visible row) can never silently admit it either. Proven through
+    /// `select_all_visible` itself, the exact production line `Action::SelectAllVisible`
+    /// dispatches to, rather than a hand-built key list `selection.rs`'s own unit tests
+    /// already cover: this test's own contribution is `visible_keys` excluding the
+    /// Submodule, not `select_all_visible`'s bound, which is already proven elsewhere
+    /// (`select_all_visible_is_bounded_by_visibility_and_never_admits_a_hidden_row`).
+    #[test]
+    fn a_hidden_submodule_is_absent_from_visible_keys_and_select_all_visible_never_admits_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo(&parent);
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        std::fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+
+        let mut app = test_app(&root);
+        // `test_app`'s own Core and `document` both default `show_submodules` off, matching
+        // production's own default.
+        let submodule_key = {
+            let snapshot = app.core.snapshot();
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| matches!(entity.kind, repon_core::Kind::Submodule))
+                .expect("a discovered Submodule, hidden or not")
+                .key
+                .clone()
+        };
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&submodule_key),
+            "a hidden Submodule must never appear in visible_keys"
+        );
+
+        app.selection.select_all_visible(&visible);
+        assert!(
+            !app.selection.contains(&submodule_key),
+            "select_all_visible must never admit a hidden Submodule"
+        );
+
+        // Shown, live, no rebuild: the same key now appears and select-all admits it.
+        app.document.show_submodules = true;
+        app.core.set_show_submodules(true);
+        let visible_once_shown = app.visible_keys();
+        assert!(
+            visible_once_shown.contains(&submodule_key),
+            "expected the same Submodule to appear once shown"
+        );
+        app.selection.select_all_visible(&visible_once_shown);
+        assert!(
+            app.selection.contains(&submodule_key),
+            "expected select_all_visible to admit it once shown"
+        );
     }
 
     /// `docs/spec/keybindings.md`'s `v` binding names only `j` and `k` as the keys that

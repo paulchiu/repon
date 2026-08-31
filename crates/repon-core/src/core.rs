@@ -176,6 +176,19 @@ fn find_override<'a>(
         })
 }
 
+/// Whether a Generation's dispatch probes `kind` at all: always for a Repo or a
+/// Worktree, only while `show_submodules` is on for a Submodule
+/// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+/// "Showing Submodules": "the flag decides... whether they are probed"). Exhaustive over
+/// `Kind`, so a fourth variant added later must be named here rather than silently
+/// falling into either branch.
+fn dispatches_kind(kind: Kind, show_submodules: bool) -> bool {
+    match kind {
+        Kind::Repo | Kind::Worktree => true,
+        Kind::Submodule => show_submodules,
+    }
+}
+
 /// Everything `Core::start` needs, handed as plain data. The core reads no file, no
 /// path and no environment variable: this is the whole crossing, per
 /// `docs/spec/core-api.md`'s "What crosses from config".
@@ -186,6 +199,12 @@ pub struct CoreSpec {
     pub poll_interval: Duration,
     pub status_stale_after: Duration,
     pub generation_deadline: Duration,
+    /// The initial reading of the show-submodules preference
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "Showing Submodules"): whether a dispatched Generation probes a Submodule at all.
+    /// Live-updatable afterwards through [`Core::set_show_submodules`], which is what lets
+    /// toggling it skip a Core rebuild and the rediscovery that would come with one.
+    pub show_submodules: bool,
 }
 
 /// One entity's in-flight probe: which Generation dispatched it, and the flag that
@@ -258,6 +277,13 @@ pub struct Core {
     /// test can tighten it after `start`, rather than racing one deadline against both a
     /// walk that must survive and a walk that must not.
     discovery_abandon_after: Arc<AtomicU64>,
+    /// The live show-submodules preference a dispatched Generation reads: `true` once
+    /// [`Core::set_show_submodules`] last set it that way, `CoreSpec::show_submodules` until
+    /// then. Atomic and shared with every `RefreshHandles` clone so toggling it needs no
+    /// rebuild and dispatches nothing of its own
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "Showing Submodules": "toggling is instant, because nothing needs discovering").
+    show_submodules: Arc<AtomicBool>,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
@@ -383,6 +409,7 @@ impl Core {
             discovery_warn_after: self.discovery_warn_after,
             discovery_abandon_after: Arc::clone(&self.discovery_abandon_after),
             discovery_warning: Arc::clone(&self.discovery_warning),
+            show_submodules: Arc::clone(&self.show_submodules),
             settle_gate: Arc::clone(&self.settle_gate),
             default_branch_chain_reads: Arc::clone(&self.default_branch_chain_reads),
             patch_identity_reads: Arc::clone(&self.patch_identity_reads),
@@ -401,7 +428,7 @@ impl Core {
         // its cancel token the way `refresh`'s own dispatch does, and every other probe
         // below still takes it as `&AtomicBool` through the same deref coercion.
         let never_cancelled = Arc::new(AtomicBool::new(false));
-        let (cached_repo, common_dir_hint, probes_state, probes_base) = {
+        let (cached_repo, common_dir_hint, probes_state, probes_base, kind) = {
             let table = self.table.read().unwrap();
             let repo = table.repos.get(key).cloned();
             let common_dir = table
@@ -422,24 +449,34 @@ impl Core {
                 .get(key)
                 .map(|&idx| table.entities[idx].probes_base())
                 .unwrap_or(true);
-            (repo, common_dir, probes_state, probes_base)
+            // Same fallback as `probes_state`/`probes_base`: an unknown key falls back to
+            // the `Kind::Repo` the insert below actually gives it.
+            let kind = table
+                .index
+                .get(key)
+                .map(|&idx| table.entities[idx].kind)
+                .unwrap_or(Kind::Repo);
+            (repo, common_dir, probes_state, probes_base, kind)
         };
         let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
         let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
         let override_branch = matched.and_then(|entry| entry.default_branch.clone());
         let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
 
-        let branch_outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let branch_outcome =
+            probe_branch(key.path(), cached_repo.as_deref(), kind, &never_cancelled);
         let sync_outcome = probe_sync(
             key.path(),
             cached_repo.as_deref(),
             branch_outcome.as_ref().map(|(settled, ..)| settled),
+            kind,
             &never_cancelled,
         );
         let default_branch_outcome = probe_default_branch(
             key.path(),
             cached_repo.as_deref(),
             override_branch.as_deref(),
+            kind,
             &never_cancelled,
         );
         let base_outcome = if probes_base {
@@ -480,7 +517,8 @@ impl Core {
         } else {
             None
         };
-        let dirty_outcome = probe_status(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let dirty_outcome =
+            probe_status(key.path(), cached_repo.as_deref(), kind, &never_cancelled);
 
         let mut table = self.table.write().unwrap();
         let generation = Generation::new(table.generation);
@@ -728,6 +766,17 @@ impl Core {
     pub fn discovery_warning(&self) -> Option<String> {
         self.discovery_warning.lock().unwrap().clone()
     }
+
+    /// Sets the live show-submodules preference a Generation's dispatch reads from this
+    /// point on: whether a Kind::Submodule entity is probed at all
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "Showing Submodules"). Takes effect on the next `refresh`, dispatches nothing of its
+    /// own and starts no Generation, which is what makes toggling this instant rather than a
+    /// rebuild: `CoreSpec`'s own `show_submodules` is only this flag's starting value.
+    pub fn set_show_submodules(&self, show_submodules: bool) {
+        self.show_submodules
+            .store(show_submodules, Ordering::Release);
+    }
 }
 
 /// Every `Arc` and plain-data field a Generation's dispatch reads, owned rather than
@@ -743,6 +792,7 @@ struct RefreshHandles {
     discovery_warn_after: Duration,
     discovery_abandon_after: Arc<AtomicU64>,
     discovery_warning: Arc<Mutex<Option<String>>>,
+    show_submodules: Arc<AtomicBool>,
     settle_gate: Arc<(Mutex<usize>, Condvar)>,
     default_branch_chain_reads: Arc<AtomicUsize>,
     patch_identity_reads: Arc<AtomicUsize>,
@@ -782,11 +832,18 @@ impl RefreshHandles {
             .insert(generation_number, Instant::now());
         let generation = Generation::new(generation_number);
 
+        let show_submodules = self.show_submodules.load(Ordering::Acquire);
         let mut dispatched = Vec::new();
         for key in order {
             let Some(&idx) = table.index.get(key) else {
                 continue;
             };
+            if !dispatches_kind(table.entities[idx].kind, show_submodules) {
+                // Narrows the work, not merely the view: a hidden Submodule's Cells are
+                // left exactly as this Generation found them, so a normal Generation pays
+                // nothing for it (`docs/spec/discovery.md`'s "Showing Submodules").
+                continue;
+            }
             if let Some(previous) = table.in_flight.remove(key) {
                 previous.cancel.store(true, Ordering::Release);
             }
@@ -835,6 +892,10 @@ impl RefreshHandles {
             .iter()
             .map(|(key, _)| table.entities[table.index[key]].probes_base())
             .collect();
+        let kinds: Vec<Kind> = dispatched
+            .iter()
+            .map(|(key, _)| table.entities[table.index[key]].kind)
+            .collect();
         drop(table);
 
         // Scoped to this dispatch alone: every task below gets its own clone of
@@ -862,14 +923,17 @@ impl RefreshHandles {
                 .collect()
         });
 
-        for ((((((key, cancel), repo), override_branch), common_dir), probes_state), probes_base) in
-            dispatched
-                .into_iter()
-                .zip(repos)
-                .zip(override_branches)
-                .zip(common_dirs)
-                .zip(probes_state)
-                .zip(probes_base)
+        for (
+            ((((((key, cancel), repo), override_branch), common_dir), probes_state), probes_base),
+            kind,
+        ) in dispatched
+            .into_iter()
+            .zip(repos)
+            .zip(override_branches)
+            .zip(common_dirs)
+            .zip(probes_state)
+            .zip(probes_base)
+            .zip(kinds)
         {
             // Recorded here, in this loop's own sequential iteration, rather than in the
             // one above: this is the loop whose order a future change (a sort by predicted
@@ -887,11 +951,12 @@ impl RefreshHandles {
             let bound_gates = Arc::clone(&bound_gates);
             let phase_c_gates = Arc::clone(&self.phase_c_gates);
             rayon::spawn(move || {
-                let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
+                let branch_outcome = probe_branch(&path, repo.as_deref(), kind, &cancel);
                 let sync_outcome = probe_sync(
                     &path,
                     repo.as_deref(),
                     branch_outcome.as_ref().map(|(settled, ..)| settled),
+                    kind,
                     &cancel,
                 );
                 let default_branch_outcome = probe_default_branch_memoised(
@@ -899,9 +964,12 @@ impl RefreshHandles {
                     repo.as_deref(),
                     &common_dir,
                     override_branch.as_deref(),
+                    kind,
                     &cancel,
-                    &chain_cache,
-                    &chain_reads,
+                    &ChainFactsMemo {
+                        cache: &chain_cache,
+                        reads: &chain_reads,
+                    },
                 );
                 let base_outcome = if probes_base {
                     probe_base(
@@ -973,7 +1041,7 @@ impl RefreshHandles {
                 } else {
                     None
                 };
-                let dirty_outcome = probe_status(&path, repo.as_deref(), &cancel);
+                let dirty_outcome = probe_status(&path, repo.as_deref(), kind, &cancel);
                 apply_probe_outcome(
                     &table_handle,
                     &settle_gate,
@@ -1472,6 +1540,7 @@ fn start_internal(
             discovery_abandon_after: Arc::new(AtomicU64::new(
                 discovery_abandon_after.as_nanos() as u64
             )),
+            show_submodules: Arc::new(AtomicBool::new(spec.show_submodules)),
             settle_gate,
             control,
             clock_thread: Some(clock_thread),
@@ -1710,9 +1779,23 @@ fn complete_many(settle_gate: &(Mutex<usize>, Condvar), finished: usize) {
 /// own; [`EntityState::apply_branch_probe`] is where that pairing lands.
 const RECENT_COMMITS_LIMIT: usize = 5;
 
+/// What an open-repository failure means for `kind`: a genuine Probe error for a Repo or a
+/// Worktree, but for a Submodule the far more common, expected shape of "never `git
+/// submodule update --init`-ed" ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+/// "The Submodule row": "An uninitialised Submodule is a row with every cell blank and `?`
+/// in the gutter"). Exhaustive over `Kind` rather than a wildcard, so a fourth variant added
+/// later must decide which grade it gets rather than silently inheriting one.
+fn submodule_open_failure<T>(kind: Kind, error: git::ProbeError) -> Settled<T> {
+    match kind {
+        Kind::Repo | Kind::Worktree => Settled::Failed(error),
+        Kind::Submodule => Settled::Unknown(Unknown::SubmoduleUninitialized),
+    }
+}
+
 fn probe_branch(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
+    kind: Kind,
     cancel: &AtomicBool,
 ) -> Option<(
     Settled<Head>,
@@ -1730,7 +1813,7 @@ fn probe_branch(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some((Settled::Failed(error), None, Vec::new())),
+            Err(error) => return Some((submodule_open_failure(kind, error), None, Vec::new())),
         },
     };
     let local = repo.to_thread_local();
@@ -1761,6 +1844,7 @@ fn probe_sync(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     branch_settled: Option<&Settled<Head>>,
+    kind: Kind,
     cancel: &AtomicBool,
 ) -> Option<Settled<SyncState>> {
     if cancel.load(Ordering::Acquire) {
@@ -1779,7 +1863,7 @@ fn probe_sync(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(Settled::Failed(error)),
+            Err(error) => return Some(submodule_open_failure(kind, error)),
         },
     };
     let local = repo.to_thread_local();
@@ -1848,6 +1932,7 @@ fn probe_base(
 fn probe_status(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
+    kind: Kind,
     cancel: &Arc<AtomicBool>,
 ) -> Option<Settled<DirtyCounts>> {
     if cancel.load(Ordering::Acquire) {
@@ -1861,7 +1946,7 @@ fn probe_status(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(Settled::Failed(error)),
+            Err(error) => return Some(submodule_open_failure(kind, error)),
         },
     };
     let local = repo.to_thread_local();
@@ -1903,6 +1988,7 @@ fn probe_default_branch(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     override_branch: Option<&str>,
+    kind: Kind,
     cancel: &AtomicBool,
 ) -> Option<default_branch::Resolution> {
     if cancel.load(Ordering::Acquire) {
@@ -1916,7 +2002,12 @@ fn probe_default_branch(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(default_branch::Resolution::failed(error)),
+            Err(error) => {
+                return Some(match kind {
+                    Kind::Repo | Kind::Worktree => default_branch::Resolution::failed(error),
+                    Kind::Submodule => default_branch::Resolution::submodule_uninitialized(),
+                });
+            }
         },
     };
     Some(default_branch::resolve(
@@ -2272,14 +2363,22 @@ fn chain_facts_for(
 /// "Memoised per common dir within a single refresh generation". `None` if
 /// `cancel` was already set before the read started; `override_branch` is rung 1's
 /// own entity-specific value, never memoised because it is not a common-dir fact.
+/// [`chain_facts_for`]'s own two collaborators, bundled so
+/// [`probe_default_branch_memoised`] stays within clippy's argument limit: the two always
+/// travel together, one dispatch's worth of both, per [`Core::refresh_handles`].
+struct ChainFactsMemo<'a> {
+    cache: &'a ChainFactsCache,
+    reads: &'a AtomicUsize,
+}
+
 fn probe_default_branch_memoised(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     common_dir: &Arc<Path>,
     override_branch: Option<&str>,
+    kind: Kind,
     cancel: &AtomicBool,
-    cache: &ChainFactsCache,
-    reads: &AtomicUsize,
+    memo: &ChainFactsMemo<'_>,
 ) -> Option<default_branch::Resolution> {
     if cancel.load(Ordering::Acquire) {
         return None;
@@ -2292,11 +2391,16 @@ fn probe_default_branch_memoised(
                 opened = repo;
                 &opened
             }
-            Err(error) => return Some(default_branch::Resolution::failed(error)),
+            Err(error) => {
+                return Some(match kind {
+                    Kind::Repo | Kind::Worktree => default_branch::Resolution::failed(error),
+                    Kind::Submodule => default_branch::Resolution::submodule_uninitialized(),
+                });
+            }
         },
     };
     let local = repo.to_thread_local();
-    let facts = chain_facts_for(cache, common_dir, reads, || {
+    let facts = chain_facts_for(memo.cache, common_dir, memo.reads, || {
         default_branch::ChainFacts::resolve(&local)
     });
     Some(default_branch::resolve_with_facts(&facts, override_branch))
@@ -2423,7 +2527,10 @@ fn merge_discovery(
                 }
             }
             None => {
-                let name = display_name(discovered.key.path());
+                let name = discovered
+                    .display_name_override
+                    .clone()
+                    .unwrap_or_else(|| display_name(discovered.key.path()));
                 let mut entity = EntityState::new(
                     discovered.key.clone(),
                     name,
@@ -2559,6 +2666,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
+    use crate::snapshot::{RowSummary, summary};
     use crate::test_support::{git, head_sha, loose_object_count};
 
     fn init_repo_with_a_commit(path: &Path) {
@@ -2586,13 +2694,18 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
         }
     }
 
     /// Criterion 2's "no field" half: scope is never a partial dial, not even as a field
     /// on the plain-data struct crossing into the core. An exhaustive destructure names
     /// every field `CoreSpec` has; a scoping field added under any name fails to compile
-    /// this test rather than landing unacknowledged.
+    /// this test rather than landing unacknowledged. `show_submodules` is named here too,
+    /// deliberately: it narrows probing and rendering, never what discovery bounds, so it
+    /// is not the scoping field this test guards against
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "narrows the view rather than bounding the work").
     #[test]
     fn core_spec_carries_no_scoping_field_scope_is_never_a_dial() {
         let CoreSpec {
@@ -2601,6 +2714,7 @@ mod tests {
             poll_interval: _,
             status_stale_after: _,
             generation_deadline: _,
+            show_submodules: _,
         } = spec(Vec::new());
     }
 
@@ -3815,7 +3929,11 @@ mod tests {
         let submodule_path = parent.join("vendor").join("lib");
         init_repo_with_a_commit(&submodule_path);
 
-        let core = Core::start(spec(vec![root]));
+        // Shown, so the explicit `refresh` just below actually dispatches a probe against
+        // it: this test is about the Vanished rule, not about `show_submodules` gating.
+        let mut core_spec = spec(vec![root]);
+        core_spec.show_submodules = true;
+        let core = Core::start(core_spec);
         let snapshot = core.snapshot();
         let submodule_key = snapshot
             .entities
@@ -4653,7 +4771,12 @@ mod tests {
     fn a_cancelled_probe_never_opens_the_repository_at_all() {
         let cancel = AtomicBool::new(true);
 
-        let outcome = probe_branch(Path::new("/nonexistent/nowhere-at-all"), None, &cancel);
+        let outcome = probe_branch(
+            Path::new("/nonexistent/nowhere-at-all"),
+            None,
+            Kind::Repo,
+            &cancel,
+        );
 
         assert!(
             outcome.is_none(),
@@ -5206,12 +5329,14 @@ mod tests {
         );
     }
 
-    /// Submodules are hidden by default in the TUI (ADR 0009), but `Core` has no
-    /// preference to read and no flag anywhere on `CoreSpec` that could suppress
-    /// one: a discovered Submodule is always part of the snapshot `Core::start`
-    /// builds, whether or not anything downstream chooses to show it.
+    /// `CoreSpec::show_submodules` gates probing and dispatch, never Snapshot membership:
+    /// a discovered Submodule is always part of the snapshot `Core::start` builds, shown or
+    /// not, because the module pass that finds it always runs
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "the pass always runs, so Submodules are always known"). Built with the default,
+    /// hidden reading precisely to prove that.
     #[test]
-    fn a_submodule_is_in_the_snapshot_even_though_core_has_no_way_to_hide_it() {
+    fn a_submodule_is_in_the_snapshot_even_though_hidden_by_the_default_preference() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let parent = root.join("parent");
@@ -5231,7 +5356,7 @@ mod tests {
                 .entities
                 .iter()
                 .any(|entity| matches!(entity.kind, Kind::Submodule)),
-            "a discovered Submodule must be in the snapshot with nothing able to hide it"
+            "a discovered Submodule must be in the snapshot even while show_submodules is off"
         );
     }
 
@@ -5268,7 +5393,11 @@ mod tests {
             &["update-ref", "refs/remotes/origin/main", &tip_sha],
         );
 
-        let core = Core::start(spec(vec![root]));
+        // Shown, so the explicit `refresh` below actually dispatches a probe against it:
+        // this test is about `probes_base`'s own gate, not about `show_submodules`'s.
+        let mut core_spec = spec(vec![root]);
+        core_spec.show_submodules = true;
+        let core = Core::start(core_spec);
         let key = core
             .snapshot()
             .entities
@@ -5294,6 +5423,258 @@ mod tests {
             "expected a Submodule's base to stay Not applicable through a real refresh, \
              got {:?}",
             submodule_entity.base.settled()
+        );
+    }
+
+    /// [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "The Submodule row" fixes `name` as "the submodule path"; this proves the fact lands
+    /// on the real `EntityState` `Core::start` builds, not only on the intermediate
+    /// `DiscoveredEntity` `discovery::tests` already covers.
+    #[test]
+    fn a_submodules_entity_name_is_its_relative_path_not_its_basename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+
+        let core = Core::start(spec(vec![root]));
+        let submodule = core
+            .snapshot()
+            .entities
+            .into_iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("a discovered Submodule");
+
+        assert_eq!(
+            submodule.name.as_ref(),
+            "vendor/lib",
+            "expected the declared relative path, not the basename `lib`"
+        );
+    }
+
+    /// AC3's negative case: an uninitialised Submodule (never `git submodule update
+    /// --init`-ed, so its own path holds no `.git` at all) settles every cell a probe would
+    /// otherwise open a repository for `Unknown(SubmoduleUninitialized)`, never `Failed`,
+    /// because not being there yet is the normal, expected shape
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "An uninitialised Submodule is a row with every cell blank and `?` in the gutter").
+    /// The row still exists (the assertion below finds it), so the row itself is not the
+    /// mutation this covers; `probe_branch`/`probe_sync`/`probe_status`'s classification is.
+    #[test]
+    fn an_uninitialised_submodules_probed_cells_settle_unknown_not_failed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        // Deliberately never initialised: no directory at all at the declared path, the
+        // shape a plain `git clone` (no `--recurse-submodules`) leaves behind.
+
+        let mut core_spec = spec(vec![root]);
+        core_spec.show_submodules = true;
+        let core = Core::start(core_spec);
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("a discovered Submodule")
+            .key
+            .clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_secs(5));
+        let submodule = settled
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("the Submodule entity");
+
+        assert!(
+            matches!(
+                submodule.branch.settled(),
+                Some(Settled::Unknown(Unknown::SubmoduleUninitialized))
+            ),
+            "expected branch to settle Unknown(SubmoduleUninitialized), got {:?}",
+            submodule.branch.settled()
+        );
+        assert!(
+            matches!(
+                submodule.sync.settled(),
+                Some(Settled::Unknown(Unknown::SubmoduleUninitialized))
+            ),
+            "expected sync to settle Unknown(SubmoduleUninitialized), got {:?}",
+            submodule.sync.settled()
+        );
+        assert!(
+            matches!(
+                submodule.dirty.settled(),
+                Some(Settled::Unknown(Unknown::SubmoduleUninitialized))
+            ),
+            "expected dirty to settle Unknown(SubmoduleUninitialized), got {:?}",
+            submodule.dirty.settled()
+        );
+        assert_eq!(
+            summary(submodule),
+            RowSummary::Unknown,
+            "expected the row's own gutter fold to read Unknown, not Failed"
+        );
+    }
+
+    /// AC4's cost half: `show_submodules` off means a dispatched Generation never even
+    /// opens a shown Submodule's own repository, while a shown one right beside it is
+    /// probed normally in the very same Generation. Both submodules are real, valid
+    /// repositories, so a probed-but-ignored implementation and a never-dispatched one are
+    /// distinguishable only by whether the hidden one's cells ever leave "never settled".
+    #[test]
+    fn dispatch_skips_probing_a_hidden_submodule_while_probing_the_same_one_shown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        init_repo_with_a_commit(&parent.join("vendor").join("lib"));
+
+        // `spec`'s own default: `show_submodules: false`.
+        let core = Core::start(spec(vec![root]));
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("a discovered Submodule")
+            .key
+            .clone();
+
+        // First Generation, dispatched while hidden: `dispatch` must skip it outright.
+        core.refresh(std::slice::from_ref(&key));
+        let while_hidden = core.settle(Duration::from_secs(5));
+        let hidden_entity = while_hidden
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("submodule entity");
+        assert!(
+            hidden_entity.branch.settled().is_none(),
+            "a Submodule dispatched while hidden must never even reach probe_branch, \
+             so its cell stays never-settled rather than holding any value at all, got {:?}",
+            hidden_entity.branch.settled()
+        );
+
+        // Toggled live, no rebuild, then the very same key is handed to `refresh` again:
+        // the second Generation is what proves the flag narrows the work rather than the
+        // key, since nothing about the key or the `Core` itself changed in between.
+        core.set_show_submodules(true);
+        core.refresh(std::slice::from_ref(&key));
+        let while_shown = core.settle(Duration::from_secs(5));
+        let shown_entity = while_shown
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("submodule entity");
+        assert!(
+            matches!(shown_entity.branch.settled(), Some(Settled::Known { .. })),
+            "expected the same Submodule's branch to settle a real value once shown, got {:?}",
+            shown_entity.branch.settled()
+        );
+    }
+
+    /// AC4's other half: toggling the live preference is free. Proven the same way
+    /// `reload_with_the_same_active_set_leaves_discovery_and_its_generation_untouched`
+    /// proves a same-Set reload never rebuilds `Core`: a Generation counter a rediscovery
+    /// or a dispatch would have to move, checked before and after the toggle with nothing
+    /// else run in between.
+    #[test]
+    fn toggling_show_submodules_starts_no_new_generation_and_dispatches_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo-a"));
+
+        let core = Core::start(spec(vec![root]));
+        let before = core.snapshot().generation;
+
+        core.set_show_submodules(true);
+        core.set_show_submodules(false);
+
+        assert_eq!(
+            core.snapshot().generation,
+            before,
+            "toggling show_submodules must start no Generation of its own"
+        );
+        assert_eq!(
+            core.dispatch_log_for_test(),
+            Vec::new(),
+            "toggling show_submodules must dispatch no probe of its own"
+        );
+    }
+
+    /// AC5: a `.gitmodules` parse failure marks the parent Repo's row Failed whether or not
+    /// Submodules are shown, because the module pass that finds the failure runs either way
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "Failure": "The mark appears whether or not `show_submodules` is on, because the pass
+    /// ran either way"). `spec`'s own default is already `show_submodules: false`, which is
+    /// what makes this a real proof rather than a coincidence of some other default.
+    #[test]
+    fn a_malformed_gitmodules_file_still_fails_the_parent_while_submodules_are_hidden() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"\n\tpath = lib\n",
+        )
+        .expect("write malformed .gitmodules");
+
+        let core = Core::start(spec(vec![root]));
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == parent)
+            .expect("the parent entity")
+            .key
+            .clone();
+        // The fold reads Failed only once the row holds some probed value at all: a
+        // Generation's own dispatch is what proves the mark survives real probing, not
+        // merely discovery's own construction-time diagnostics write.
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_secs(5));
+        let parent_entity = settled
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("the parent entity");
+
+        assert_eq!(
+            summary(parent_entity),
+            RowSummary::Failed,
+            "expected the parent to fold Failed even with Submodules hidden"
+        );
+        assert!(
+            parent_entity.diagnostics.gitmodules_failed.is_some(),
+            "expected the failure recorded in Diagnostics for the detail pane"
+        );
+        assert!(
+            !settled
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.kind, Kind::Submodule)),
+            "an unparseable .gitmodules yields no Submodule rows for that parent"
         );
     }
 

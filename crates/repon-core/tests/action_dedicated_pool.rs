@@ -72,6 +72,7 @@ fn spec(roots: Vec<PathBuf>) -> CoreSpec {
         poll_interval: Duration::from_secs(3600),
         status_stale_after: Duration::from_secs(3600),
         generation_deadline: Duration::from_secs(3600),
+        show_submodules: false,
     }
 }
 
