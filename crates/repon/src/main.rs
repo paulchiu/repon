@@ -23,6 +23,7 @@ mod logging;
 mod message;
 mod scroll;
 mod selection;
+mod set_picker;
 mod sets;
 #[cfg(test)]
 mod test_support;
