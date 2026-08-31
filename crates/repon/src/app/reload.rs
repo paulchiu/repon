@@ -344,6 +344,9 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
             interval: document.fetch.interval,
             concurrency: document.fetch.concurrency as usize,
         },
+        auto_update: repon_core::AutoUpdateSpec {
+            enabled: document.auto_update.enabled,
+        },
     }
 }
 
