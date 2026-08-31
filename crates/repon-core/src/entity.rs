@@ -71,6 +71,29 @@ pub struct AheadBehind {
     pub behind: u32,
 }
 
+/// The `dirty` cell's settled value: phase C's typed counts, per
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
+/// phases". A boolean `is_dirty` check was measured and rejected there: proving clean costs
+/// the same as counting, and a boolean cannot answer the untracked count at all, so this
+/// carries all three rather than folding them into one number at the probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirtyCounts {
+    /// Tracked paths whose content, mode or type changed against the index.
+    pub modified: u32,
+    /// Paths present in the working tree that the index does not track.
+    pub untracked: u32,
+    /// Tracked paths the index has and the working tree no longer does.
+    pub deleted: u32,
+}
+
+impl DirtyCounts {
+    /// The single number the list column and the detail pane both show: the row is clean
+    /// only when every one of the three counts is zero.
+    pub fn total(&self) -> u32 {
+        self.modified + self.untracked + self.deleted
+    }
+}
+
 /// The `sync` cell's settled value: a live upstream's ahead/behind counts, or one of
 /// two facts that preclude a count. `NoRemote` outranks `NoUpstream`, since a Repo
 /// with no remote at all makes every one of its rows, branch or not, unable to have
@@ -285,7 +308,7 @@ pub struct EntityState {
     pub branch: Cell<Head>,
     pub sync: Cell<SyncState>,
     pub base: Cell<u32>,
-    pub dirty: Cell<u32>,
+    pub dirty: Cell<DirtyCounts>,
     pub state: Cell<WorktreeState>,
     pub default_branch: Cell<DefaultBranch>,
     pub diagnostics: Diagnostics,
@@ -712,7 +735,11 @@ mod tests {
         entity.dirty.settle(
             generation,
             Settled::Known {
-                value: 4,
+                value: DirtyCounts {
+                    modified: 4,
+                    untracked: 1,
+                    deleted: 2,
+                },
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -766,7 +793,12 @@ mod tests {
         }
         match entity.dirty.settled() {
             Some(Settled::Known {
-                value: 4,
+                value:
+                    DirtyCounts {
+                        modified: 4,
+                        untracked: 1,
+                        deleted: 2,
+                    },
                 stale: true,
                 ..
             }) => {}

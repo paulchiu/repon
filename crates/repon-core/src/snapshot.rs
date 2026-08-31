@@ -175,8 +175,8 @@ mod tests {
 
     use super::*;
     use crate::entity::{
-        AheadBehind, DefaultBranch, EntityKey, Head, Kind, StepOutcome, StepResult, SyncState,
-        WorktreeState,
+        AheadBehind, DefaultBranch, DirtyCounts, EntityKey, Head, Kind, StepOutcome, StepResult,
+        SyncState, WorktreeState,
     };
 
     /// One receipt, one step per outcome given, in order: enough for the fold's own tests,
@@ -241,7 +241,7 @@ mod tests {
         entity.dirty.settle(
             generation,
             Settled::Known {
-                value: 0,
+                value: DirtyCounts::default(),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -327,7 +327,7 @@ mod tests {
         entity.dirty.settle(
             generation,
             Settled::Known {
-                value: 0,
+                value: DirtyCounts::default(),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -393,7 +393,7 @@ mod tests {
         entity.dirty.settle(
             generation,
             Settled::Known {
-                value: 0,
+                value: DirtyCounts::default(),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -582,7 +582,11 @@ mod tests {
         entity.dirty.settle(
             Generation::new(2),
             Settled::Known {
-                value: 3,
+                value: DirtyCounts {
+                    modified: 3,
+                    untracked: 0,
+                    deleted: 0,
+                },
                 at: Timestamp::now(),
                 stale: true,
             },
@@ -614,15 +618,15 @@ mod tests {
             Failed,
         }
 
-        fn settle(cell: &mut Cell<u32>, generation: Generation, case: Case) {
+        fn settle<T: Default>(cell: &mut Cell<T>, generation: Generation, case: Case) {
             let settled = match case {
                 Case::Fresh => Settled::Known {
-                    value: 0,
+                    value: T::default(),
                     at: Timestamp::now(),
                     stale: false,
                 },
                 Case::Stale => Settled::Known {
-                    value: 0,
+                    value: T::default(),
                     at: Timestamp::now(),
                     stale: true,
                 },
@@ -789,7 +793,7 @@ mod tests {
         entity.dirty.settle(
             generation,
             Settled::Known {
-                value: 0,
+                value: DirtyCounts::default(),
                 at: Timestamp::now(),
                 stale: false,
             },
@@ -856,7 +860,11 @@ mod tests {
                     entity.dirty.settle(
                         generation,
                         Settled::Known {
-                            value: 3,
+                            value: DirtyCounts {
+                                modified: 3,
+                                untracked: 0,
+                                deleted: 0,
+                            },
                             at: Timestamp::now(),
                             stale: true,
                         },

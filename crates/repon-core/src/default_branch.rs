@@ -26,6 +26,12 @@ const NAME_LIST: [&str; 3] = ["main", "master", "trunk"];
 /// target that no longer resolves, and why resolution stopped when it reached
 /// rung 4. Diagnostics rather than a value's own concern, per
 /// [`crate::entity::Diagnostics`].
+///
+/// Cheap to clone: every field is a small value or an `Arc`-backed one, and
+/// `core.rs`'s dispatch loop clones it once so the value can land on the table
+/// immediately as part of the cheap outcomes while the original is still held
+/// for phase D's landing probe.
+#[derive(Clone)]
 pub(crate) struct Resolution {
     pub settled: Settled<DefaultBranch>,
     pub rung: u8,
