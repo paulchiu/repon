@@ -1040,4 +1040,19 @@ mod tests {
             .next()
             .expect("one parsed [[action]] entry");
     }
+
+    /// Criterion 2's "no config key" half, for `[refresh]`: `refresh.md`'s "Scope and
+    /// order" makes scope never a partial dial, not even as a config toggle, and this is
+    /// where such a toggle would have to live if one existed. An exhaustive destructure
+    /// names every field `RefreshConfig` has (`docs/spec/config.md`'s three
+    /// `refresh.*` keys); a fourth field, under any name, fails to compile this test
+    /// rather than landing unacknowledged.
+    #[test]
+    fn refresh_config_carries_no_scoping_field_scope_is_never_a_config_toggle() {
+        let RefreshConfig {
+            poll_interval: _,
+            status_stale_after: _,
+            on_focus: _,
+        } = RefreshConfig::default();
+    }
 }

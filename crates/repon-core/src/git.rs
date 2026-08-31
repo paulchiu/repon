@@ -4,8 +4,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use crate::entity::{AheadBehind, Head, Kind, SyncState};
+use crate::entity::{AheadBehind, DirtyCounts, Head, Kind, SyncState};
 
 /// Error from a git read, cheap to clone because the whole state table is cloned
 /// every frame. A shared trait object was rejected: it gives no discriminant to
@@ -27,6 +28,9 @@ pub enum ProbeError {
     /// The ahead/behind comparison against a live upstream could not run: a
     /// missing or corrupt commit, never a stand-in for zero.
     AheadBehind(Arc<str>),
+    /// Phase C's status read could not run: a platform that would not build, or
+    /// an iterator that errored partway through.
+    Status(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -42,6 +46,7 @@ impl std::fmt::Display for ProbeError {
             ProbeError::AheadBehind(message) => {
                 write!(f, "failed to compute ahead/behind counts: {message}")
             }
+            ProbeError::Status(message) => write!(f, "failed to read status: {message}"),
         }
     }
 }
@@ -372,8 +377,7 @@ fn read_gitmodules(repo: &gix::Repository) -> Result<Option<Vec<SubmoduleEntry>>
 /// three-shape [`Head`], one to one with gix's `head::Kind`.
 ///
 /// This is Phase A, [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
-/// cheapest and least contended read, and the only probe this crate drives today;
-/// the remaining phases are later work. `repo` is a per-task handle derived from a
+/// cheapest and least contended read. `repo` is a per-task handle derived from a
 /// shared [`gix::ThreadSafeRepository`] via `to_thread_local`, never one shared
 /// across tasks, because `gix::Repository` is `Send` but not `Sync`. A `HEAD` that
 /// will not read at all is `Err` here, checked before any shape is classified, so
@@ -400,6 +404,80 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
         gix::head::Kind::Unborn(name) => Head::Unborn(Arc::from(name.shorten().to_string())),
         gix::head::Kind::Detached { target, peeled } => Head::Detached(peeled.unwrap_or(target)),
     })
+}
+
+/// Phase C's typed counts against `repo`'s index and working tree, per
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
+/// phases": the whole of the cost, and the only phase whose interruption point actually
+/// matters, so `cancel` is handed straight to gix rather than merely checked before the read
+/// starts the way [`head_shape`] and [`resolve_sync`] check theirs.
+///
+/// Deliberately the index-to-worktree comparison alone
+/// ([`gix::Repository::status`]'s `into_index_worktree_iter`), never the head-to-index half a
+/// full [`gix::Repository::is_dirty`] also runs: that second pass is what the boolean check
+/// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md) rejected pays
+/// for redundantly on a population that is 96% clean, and it is why typed counting measured
+/// cheaper than the boolean check it replaces despite counting rather than short-circuiting.
+pub(crate) fn dirty_counts(
+    repo: &gix::Repository,
+    cancel: Arc<AtomicBool>,
+) -> Result<DirtyCounts, ProbeError> {
+    let platform = repo
+        .status(gix::progress::Discard)
+        .map_err(|error| ProbeError::Status(error.to_string().into()))?
+        .should_interrupt_owned(cancel);
+    let iter = platform
+        .into_index_worktree_iter(Vec::new())
+        .map_err(|error| ProbeError::Status(error.to_string().into()))?;
+
+    let mut counts = DirtyCounts::default();
+    for item in iter {
+        let item = item.map_err(|error| ProbeError::Status(error.to_string().into()))?;
+        classify_index_worktree_item(&item, &mut counts);
+    }
+    Ok(counts)
+}
+
+/// Folds one [`gix::status::index_worktree::Item`] into `counts`. Exhaustive over the
+/// item shape and, for a tracked change, over [`gix::status::plumbing::index_as_worktree::EntryStatus`]
+/// and its own [`gix::status::plumbing::index_as_worktree::Change`]: a variant gix adds to
+/// either later must be classified here or this fails to compile, rather than silently
+/// widening or narrowing a count.
+fn classify_index_worktree_item(
+    item: &gix::status::index_worktree::Item,
+    counts: &mut DirtyCounts,
+) {
+    use gix::status::index_worktree::Item;
+    use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+
+    match item {
+        Item::Modification { status, .. } => match status {
+            EntryStatus::Conflict { .. } => counts.modified += 1,
+            EntryStatus::Change(change) => match change {
+                Change::Removed => counts.deleted += 1,
+                Change::Type { .. } => counts.modified += 1,
+                Change::Modification { .. } => counts.modified += 1,
+                Change::SubmoduleModification(_) => counts.modified += 1,
+            },
+            // Neither a real content change nor a missing file: an entry whose stat needs
+            // refreshing, or one added with `git add --intent-to-add` and not yet written.
+            EntryStatus::NeedsUpdate(_) | EntryStatus::IntentToAdd => {}
+        },
+        Item::DirectoryContents { entry, .. } => match entry.status {
+            gix::dir::entry::Status::Untracked => counts.untracked += 1,
+            // The default dirwalk already excludes ignored and pruned paths, matching
+            // `git status --ignored=no`; matched here rather than assumed, so a dirwalk
+            // option this crate never sets cannot silently miscount.
+            gix::dir::entry::Status::Tracked
+            | gix::dir::entry::Status::Ignored(_)
+            | gix::dir::entry::Status::Pruned => {}
+        },
+        // A rename or copy the rewrite tracker matched: this crate never turns rewrite
+        // tracking on ([`dirty_counts`] leaves `Platform`'s renames at their default), so this
+        // arm exists for exhaustiveness rather than a live case. Counted as one modification,
+        // the same as git's own `git status` porcelain, which shows a rename as a single line.
+        Item::Rewrite { .. } => counts.modified += 1,
+    }
 }
 
 #[cfg(test)]
@@ -1017,6 +1095,95 @@ mod tests {
                 ahead: 1,
                 behind: 0
             })
+        );
+    }
+
+    /// Criterion 1: the status phase produces typed counts, not a single total. Every count
+    /// is a different number (1 modified, 2 deleted, 3 untracked) precisely so a test that
+    /// read one count into another's slot would fail rather than pass by coincidence.
+    #[test]
+    fn dirty_counts_reports_distinct_typed_counts_for_modified_untracked_and_deleted_paths() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init repo");
+        std::fs::write(dir.path().join("tracked-modified.txt"), "original\n")
+            .expect("write tracked file");
+        std::fs::write(dir.path().join("tracked-deleted-1.txt"), "bye\n")
+            .expect("write tracked file");
+        std::fs::write(dir.path().join("tracked-deleted-2.txt"), "bye\n")
+            .expect("write tracked file");
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "first"]);
+
+        // One modification: content changed against the index.
+        std::fs::write(dir.path().join("tracked-modified.txt"), "changed\n")
+            .expect("modify tracked file");
+        // Two deletions: removed from the working tree, still in the index.
+        std::fs::remove_file(dir.path().join("tracked-deleted-1.txt"))
+            .expect("delete tracked file");
+        std::fs::remove_file(dir.path().join("tracked-deleted-2.txt"))
+            .expect("delete tracked file");
+        // Three untracked files: never added.
+        for name in ["new-1.txt", "new-2.txt", "new-3.txt"] {
+            std::fs::write(dir.path().join(name), "x").expect("write untracked file");
+        }
+
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let counts =
+            dirty_counts(&repo, Arc::new(AtomicBool::new(false))).expect("compute dirty counts");
+
+        assert_eq!(
+            counts,
+            DirtyCounts {
+                modified: 1,
+                untracked: 3,
+                deleted: 2,
+            }
+        );
+    }
+
+    /// Criterion 1's other claim, the boolean check's own rejected trade-off: a clean
+    /// working tree settles every count to zero, the same "prove clean" case
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)
+    /// measured as costing the same as counting.
+    #[test]
+    fn dirty_counts_reports_a_clean_working_tree_as_all_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+
+        let counts =
+            dirty_counts(&repo, Arc::new(AtomicBool::new(false))).expect("compute dirty counts");
+
+        assert_eq!(counts, DirtyCounts::default());
+    }
+
+    /// `refresh.md`'s "Cancellation" says this phase hands `cancel` straight into gix rather
+    /// than only checking it before the read starts, unlike phases A and B. A flag already
+    /// `true` before the read even begins is the deterministic edge of that: no timing race,
+    /// since `cancel` is set before `dirty_counts` is ever called, and gix reports the stop
+    /// as an error rather than a silently truncated result (`Core::probe_status` is what
+    /// tells this error apart from a genuine one, by checking the same flag it owns). A
+    /// mutation that dropped `should_interrupt_owned` entirely would instead walk to
+    /// completion and return `Ok`, which this test also rules out.
+    #[test]
+    fn dirty_counts_reports_an_error_when_cancel_is_already_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        std::fs::write(dir.path().join("untracked.txt"), "x").expect("write untracked file");
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+
+        let result = dirty_counts(&repo, Arc::new(AtomicBool::new(true)));
+
+        assert!(
+            result.is_err(),
+            "expected the pre-set cancel flag to stop the read rather than complete it, got \
+             {result:?}"
         );
     }
 }

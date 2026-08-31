@@ -44,7 +44,8 @@ use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
-    DefaultBranch, EntityKey, EntityState, Head, Kind, Presence, SyncState, WorktreeState,
+    DefaultBranch, DirtyCounts, EntityKey, EntityState, Head, Kind, Presence, SyncState,
+    WorktreeState,
 };
 use crate::git;
 use crate::landing;
@@ -245,6 +246,15 @@ pub struct Core {
     /// Read only by `patch_scan_bounds_for_test`.
     #[allow(dead_code)] // read only by patch_scan_bounds_for_test
     patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
+    /// Every key `refresh`'s own sequential dispatch loop iterated, in the order it iterated
+    /// them, cleared at the start of every call: this is dispatch order, not completion
+    /// order, recorded synchronously in the loop that decides it, before any `rayon::spawn`
+    /// closure ever runs. [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Scope and order" fixes dispatch order as the one dial phase C has; completion order
+    /// on a concurrent pool is a different, non-deterministic fact this field does not claim
+    /// to answer. Read only by `dispatch_log_for_test`.
+    #[allow(dead_code)] // read only by dispatch_log_for_test
+    dispatch_log: Arc<Mutex<Vec<EntityKey>>>,
 }
 
 impl Core {
@@ -276,6 +286,7 @@ impl Core {
         self.default_branch_chain_reads.store(0, Ordering::Release);
         self.patch_identity_reads.store(0, Ordering::Release);
         self.patch_scan_bounds.lock().unwrap().clear();
+        self.dispatch_log.lock().unwrap().clear();
 
         // Both halves of discovery re-run at the head of every Generation, per
         // refresh.md and discovery.md: an entity no longer found becomes
@@ -378,6 +389,11 @@ impl Core {
             .zip(common_dirs)
             .zip(probes_state)
         {
+            // Recorded here, in this loop's own sequential iteration, rather than in the
+            // one above: this is the loop whose order a future change (a sort by predicted
+            // cost, say) would actually be tempted to touch, since it is the one that decides
+            // each entity's `rayon::spawn` call, not merely which entities were dispatched.
+            self.dispatch_log.lock().unwrap().push(key.clone());
             let path = key.path().to_path_buf();
             let table_handle = Arc::clone(&self.table);
             let settle_gate = Arc::clone(&self.settle_gate);
@@ -426,6 +442,7 @@ impl Core {
                 } else {
                     None
                 };
+                let dirty_outcome = probe_status(&path, repo.as_deref(), &cancel);
                 apply_probe_outcome(
                     &table_handle,
                     &settle_gate,
@@ -436,6 +453,7 @@ impl Core {
                         sync: sync_outcome,
                         default_branch: default_branch_outcome,
                         state: state_outcome,
+                        dirty: dirty_outcome,
                     },
                 );
             });
@@ -484,7 +502,10 @@ impl Core {
     /// Inserts a fresh entity for an unknown key rather than panicking, since a
     /// caller can otherwise only reach this with a key `snapshot` just handed it.
     pub fn probe_now(&self, key: &EntityKey) -> EntityState {
-        let never_cancelled = AtomicBool::new(false);
+        // An `Arc` rather than a bare flag: [`probe_status`] hands gix an owned clone of
+        // its cancel token the way `refresh`'s own dispatch does, and every other probe
+        // below still takes it as `&AtomicBool` through the same deref coercion.
+        let never_cancelled = Arc::new(AtomicBool::new(false));
         let (cached_repo, common_dir_hint, probes_state) = {
             let table = self.table.read().unwrap();
             let repo = table.repos.get(key).cloned();
@@ -547,6 +568,7 @@ impl Core {
         } else {
             None
         };
+        let dirty_outcome = probe_status(key.path(), cached_repo.as_deref(), &never_cancelled);
 
         let mut table = self.table.write().unwrap();
         let generation = Generation::new(table.generation);
@@ -577,6 +599,9 @@ impl Core {
         }
         if let Some(settled) = state_outcome {
             table.entities[idx].state.settle(generation, settled);
+        }
+        if let Some(settled) = dirty_outcome {
+            table.entities[idx].dirty.settle(generation, settled);
         }
         table.entities[idx].clone()
     }
@@ -728,6 +753,13 @@ impl Core {
         self.patch_scan_bounds.lock().unwrap().clone()
     }
 
+    /// Every key the most recent `refresh` call's own sequential dispatch loop iterated,
+    /// in that order: dispatch order, proven directly rather than inferred from completion,
+    /// which a concurrent pool never guarantees (criterion 5's honest half).
+    pub(crate) fn dispatch_log_for_test(&self) -> Vec<EntityKey> {
+        self.dispatch_log.lock().unwrap().clone()
+    }
+
     /// `start`, with the tick source and the discovery-slow warning's threshold
     /// injected rather than real, so a test drives the dedicated thread's cadence
     /// through a channel it controls and never waits out a real second.
@@ -854,6 +886,7 @@ impl Core {
                 sync: None,
                 default_branch: None,
                 state: None,
+                dirty: None,
             },
         );
     }
@@ -984,6 +1017,7 @@ fn start_internal(
             default_branch_chain_reads: Arc::new(AtomicUsize::new(0)),
             patch_identity_reads: Arc::new(AtomicUsize::new(0)),
             patch_scan_bounds: Arc::new(Mutex::new(Vec::new())),
+            dispatch_log: Arc::new(Mutex::new(Vec::new())),
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1119,8 +1153,8 @@ fn sweep_deadline(
             for cell in cells {
                 // Only a cell actually marked in flight times out: a Repo or
                 // Submodule's `state` (`NotApplicable`, never probed) and any
-                // cell no probe yet reaches (`sync`, `base`, `dirty`) are never
-                // in flight, so this never overwrites them with a lie.
+                // cell no probe yet reaches (`sync`, `base`) are never in
+                // flight, so this never overwrites them with a lie.
                 if cell.is_in_flight() {
                     cell.time_out(*generation);
                 }
@@ -1155,7 +1189,7 @@ fn begin_probes(entity: &mut EntityState) {
         branch,
         sync: _,
         base: _,
-        dirty: _,
+        dirty,
         state,
         default_branch,
         diagnostics: _,
@@ -1167,6 +1201,10 @@ fn begin_probes(entity: &mut EntityState) {
     } = entity;
     branch.begin_probe();
     default_branch.begin_probe();
+    // Phase C runs against every dispatched entity, Repo, Worktree or Submodule alike:
+    // refresh.md's "Scope and order" makes scope never a partial dial, so `dirty` carries
+    // no `probes_state`-style condition of its own.
+    dirty.begin_probe();
     // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's is
     // `NotApplicable` from construction, and marking it in flight here would
     // leave it in-flight forever, since nothing would ever call `settle` on it.
@@ -1290,6 +1328,62 @@ fn probe_sync(
         Err(error) => Settled::Failed(error),
     };
     Some(settled)
+}
+
+/// Phase C's typed counts, dispatched over every entity in a Generation with no
+/// scoping of its own: [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "Scope and order" makes scope never a partial dial, only order, so this carries
+/// no visibility filter and no cost heuristic; the caller's dispatch order is the
+/// only dial, expressed entirely by the position `path` already holds in
+/// `Core::refresh`'s `order`. `None` if `cancel` was already set before the read
+/// started; unlike the cheaper phases above, `cancel` is also handed straight
+/// into gix, which checks it while the read is under way rather than only before
+/// it starts, since this is the one phase long enough for that to matter.
+fn probe_status(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<Settled<DirtyCounts>> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(Settled::Failed(error)),
+        },
+    };
+    let local = repo.to_thread_local();
+    classify_status_result(git::dirty_counts(&local, Arc::clone(cancel)), cancel)
+}
+
+/// Folds [`git::dirty_counts`]'s result into [`probe_status`]'s outcome. Split out as its own
+/// function so the one case a live probe cannot reproduce deterministically, cancellation
+/// observed genuinely mid-read, is directly testable: gix's own error carries no typed "this
+/// was cancelled" case (its interrupt point reports through a bare `io::Error`, same as any
+/// other I/O failure), so `cancel` itself, which this task alone owns for the duration of its
+/// probe, is the answer. An error alongside a cancel flag now set is what an interruption
+/// mid-read looks like, and [ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s
+/// precedent is that interrupted work is dropped rather than settled `Failed`, the same as
+/// every cheaper phase's pre-check already does.
+fn classify_status_result(
+    result: Result<DirtyCounts, git::ProbeError>,
+    cancel: &AtomicBool,
+) -> Option<Settled<DirtyCounts>> {
+    match result {
+        Ok(value) => Some(Settled::Known {
+            value,
+            at: Timestamp::now(),
+            stale: false,
+        }),
+        Err(_) if cancel.load(Ordering::Acquire) => None,
+        Err(error) => Some(Settled::Failed(error)),
+    }
 }
 
 /// Runs the four-rung default branch chain against `path`, or `None` if `cancel`
@@ -1714,6 +1808,7 @@ struct ProbeOutcomes {
     sync: Option<Settled<SyncState>>,
     default_branch: Option<default_branch::Resolution>,
     state: Option<Settled<WorktreeState>>,
+    dirty: Option<Settled<DirtyCounts>>,
 }
 
 /// Lands one probe's combined outcome for `key` at `generation`: writes the
@@ -1741,6 +1836,7 @@ fn apply_probe_outcome(
         sync: sync_outcome,
         default_branch: default_branch_outcome,
         state: state_outcome,
+        dirty: dirty_outcome,
     } = outcomes;
     let mut table = table.write().unwrap();
     if let Some(&idx) = table.index.get(&key) {
@@ -1755,6 +1851,9 @@ fn apply_probe_outcome(
         }
         if let Some(settled) = state_outcome {
             table.entities[idx].state.settle(generation, settled);
+        }
+        if let Some(settled) = dirty_outcome {
+            table.entities[idx].dirty.settle(generation, settled);
         }
     }
     table.in_flight.remove(&key);
@@ -1951,6 +2050,21 @@ mod tests {
         }
     }
 
+    /// Criterion 2's "no field" half: scope is never a partial dial, not even as a field
+    /// on the plain-data struct crossing into the core. An exhaustive destructure names
+    /// every field `CoreSpec` has; a scoping field added under any name fails to compile
+    /// this test rather than landing unacknowledged.
+    #[test]
+    fn core_spec_carries_no_scoping_field_scope_is_never_a_dial() {
+        let CoreSpec {
+            set: _,
+            overrides: _,
+            poll_interval: _,
+            status_stale_after: _,
+            generation_deadline: _,
+        } = spec(Vec::new());
+    }
+
     fn root_of(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().canonicalize().expect("canonicalize temp dir")
     }
@@ -1986,6 +2100,112 @@ mod tests {
             }) => {}
             other => panic!("expected an attached branch, got {other:?}"),
         }
+    }
+
+    /// Criterion 2: every entity a Generation is dispatched over gets its phase C read,
+    /// never a subset. `refresh.md`'s "Scope and order" makes scope never a partial dial,
+    /// so this proves it against a population wide enough that a mistaken "first K" or
+    /// "last K" scoping mistake would leave a visible gap: sixteen real repos, dispatched in
+    /// one Generation, every one of them still `dirty: Known` once settled, position sixteen
+    /// exactly as covered as position one. A mutation that scoped phase C to, say, the first
+    /// ten dispatched entities fails this directly.
+    #[test]
+    fn every_dispatched_entity_gets_its_dirty_cell_settled_not_a_subset() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        const ENTITY_COUNT: usize = 16;
+        for index in 0..ENTITY_COUNT {
+            init_repo_with_a_commit(&root.join(format!("repo-{index}")));
+        }
+
+        let core = Core::start(spec(vec![root]));
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(keys.len(), ENTITY_COUNT, "expected every repo discovered");
+
+        core.refresh(&keys);
+        let settled = core.settle(Duration::from_secs(5));
+
+        for entity in &settled.entities {
+            assert!(
+                matches!(entity.dirty.settled(), Some(Settled::Known { .. })),
+                "entity {:?} was left without a settled dirty cell, which is exactly what a \
+                 visibility-scoped dispatch would leave behind on the entities it skipped: \
+                 got {:?}",
+                entity.name,
+                entity.dirty.settled()
+            );
+        }
+    }
+
+    /// Criterion 5, the honest half: a concurrent pool's *completion* order is not
+    /// dispatch order and asserting it would make this test flaky in exact proportion to
+    /// how well rayon's scheduler works, so this asserts *dispatch* order instead, which is
+    /// deterministic because `refresh`'s own dispatch loop is a single sequential pass over
+    /// `order` that spawns work without ever waiting on it. `dispatch_order` itself, the
+    /// function that actually builds the cursor-then-visible-then-rest sequence
+    /// `refresh.md`'s "Scope and order" names, lives in the `repon` crate and is tested
+    /// there: `core-api.md`'s ownership table gives that computation to the consumer, never
+    /// to this crate. What this test proves on the core side is the half core-api.md commits
+    /// to: `refresh` dispatches in exactly the order it is handed, position for position,
+    /// never reordered by any heuristic of its own (never, per `refresh.md`, by predicted
+    /// cost). A hand-built three-tier order stands in for what `dispatch_order` would
+    /// produce, six entities discovered, one named cursor, two named visible, three left
+    /// over in discovery order.
+    #[test]
+    fn refresh_dispatches_phase_c_in_exactly_the_order_it_is_given() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        const ENTITY_COUNT: usize = 6;
+        for index in 0..ENTITY_COUNT {
+            init_repo_with_a_commit(&root.join(format!("repo-{index}")));
+        }
+
+        let core = Core::start(spec(vec![root]));
+        let discovery_order: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(
+            discovery_order.len(),
+            ENTITY_COUNT,
+            "expected every repo discovered"
+        );
+
+        // The cursor row, then the visible rows (never the cursor's own row twice), then
+        // everything else in discovery order: refresh.md's own three tiers, hand-assembled
+        // the way `dispatch_order` would.
+        let cursor = discovery_order[3].clone();
+        let visible = [discovery_order[1].clone(), discovery_order[4].clone()];
+        let mut three_tier_order = vec![cursor.clone()];
+        three_tier_order.extend(visible.iter().cloned());
+        for key in &discovery_order {
+            if *key != cursor && !visible.contains(key) {
+                three_tier_order.push(key.clone());
+            }
+        }
+        assert_eq!(
+            three_tier_order.len(),
+            ENTITY_COUNT,
+            "sanity check: the hand-built order must cover every discovered entity exactly \
+             once"
+        );
+
+        core.refresh(&three_tier_order);
+        core.settle(Duration::from_secs(5));
+
+        assert_eq!(
+            core.dispatch_log_for_test(),
+            three_tier_order,
+            "refresh must dispatch phase C in exactly the order it was given: the cursor \
+             row, then the visible rows, then the rest in discovery order"
+        );
     }
 
     /// The defining behaviour for the shared-handle probe path: discovery leaves
@@ -3146,8 +3366,8 @@ mod tests {
     /// instead is only possible if the read never started. This is the honest
     /// limit of what phase A can prove: `git::head_shape` is one syscall with no
     /// interruption point mid-read, so cancellation here stops work that has not
-    /// started rather than work already running; a genuinely interruptible phase
-    /// (gix `status`, taking `should_interrupt` directly) is later work.
+    /// started rather than work already running. [`classify_status_result_drops_an_error_once_cancel_reads_true`]
+    /// covers the genuinely interruptible phase this crate now has.
     #[test]
     fn a_cancelled_probe_never_opens_the_repository_at_all() {
         let cancel = AtomicBool::new(true);
@@ -3158,6 +3378,47 @@ mod tests {
             outcome.is_none(),
             "a probe observing cancellation before its first read must do no work \
              at all, not attempt the read and fail having tried it"
+        );
+    }
+
+    /// Phase C's own cancellation shape, distinct from phase A and B's "before the read
+    /// starts" check: `git::dirty_counts` itself proves cancellation observed genuinely
+    /// mid-read reports as an `Err` (`dirty_counts_reports_an_error_when_cancel_is_already_set`
+    /// in `git.rs`), and this test covers the half that lives here, that `classify_status_result`
+    /// folds that error back to `None` rather than `Settled::Failed` once `cancel` reads
+    /// `true`, per ADR 0013's "interrupted work becomes Unknown rather than Failed". A
+    /// mutation that dropped the `cancel`-aware arm (always settling `Failed` on any error,
+    /// the way the cheaper phases' own errors do) fails this directly.
+    #[test]
+    fn classify_status_result_drops_an_error_once_cancel_reads_true() {
+        let cancel = AtomicBool::new(true);
+
+        let outcome = classify_status_result(
+            Err(crate::git::ProbeError::Status(Arc::from("boom"))),
+            &cancel,
+        );
+
+        assert!(
+            outcome.is_none(),
+            "an error alongside a cancel flag already set must read as cancelled, not \
+             Failed, got {outcome:?}"
+        );
+    }
+
+    /// The other side of the same fold: an error with `cancel` still `false` is a genuine
+    /// failure and must settle `Failed`, not be silently dropped the way a cancelled read is.
+    #[test]
+    fn classify_status_result_settles_failed_when_cancel_never_fired() {
+        let cancel = AtomicBool::new(false);
+
+        let outcome = classify_status_result(
+            Err(crate::git::ProbeError::Status(Arc::from("boom"))),
+            &cancel,
+        );
+
+        assert!(
+            matches!(outcome, Some(Settled::Failed(git::ProbeError::Status(_)))),
+            "a genuine error with no cancellation must settle Failed, got {outcome:?}"
         );
     }
 

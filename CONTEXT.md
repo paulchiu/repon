@@ -135,6 +135,12 @@ An Entity's comparison against its branch's upstream, settled as a Sync state: a
 upstream's ahead behind pair of commit counts, no branch or no configured upstream, or
 no remote on the Repo at all.
 
+**Dirty counts**:
+Phase C's typed answer for one Entity: modified, untracked and deleted paths, read
+against the index and the working tree. Replaces a cheap boolean dirtiness check,
+which was measured and rejected because proving clean costs the same as counting and
+cannot answer the untracked count at all.
+
 **Diagnostics**:
 Per-Entity facts that are not Cells: which rung of the default branch chain answered, whether rung 2's `origin/HEAD` named a target that no longer resolves, whether rung 2 and rung 3 disagreed, why the default branch stopped resolving when no rung answered, and why an entity's own `.gitmodules` failed to read or parse, if it did. Every field but the `.gitmodules` one reaches the detail pane and never the list.
 

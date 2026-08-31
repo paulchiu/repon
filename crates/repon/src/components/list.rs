@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    Cell, EntityState, Head, RowSummary, Settled, Snapshot, SyncState, WorktreeState, summary,
+    Cell, DirtyCounts, EntityState, Head, RowSummary, Settled, Snapshot, SyncState, WorktreeState,
+    summary,
 };
 
 use super::Component;
@@ -481,19 +482,23 @@ fn format_base(cell: &Cell<u32>, glyphs: &'static GlyphSet, loading_glyph: Optio
     )
 }
 
-/// `dirty`'s glyph: `·` clean, `●n` changed.
+/// `dirty`'s glyph: `·` clean, `●n` changed. `n` is the typed counts' total
+/// ([`DirtyCounts::total`]): the column shows one number, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s mock, not a
+/// breakdown of the three.
 fn format_dirty(
-    cell: &Cell<u32>,
+    cell: &Cell<DirtyCounts>,
     glyphs: &'static GlyphSet,
     loading_glyph: Option<char>,
 ) -> String {
     render_cell(
         cell.settled(),
         |value| {
-            if *value == 0 {
+            let total = value.total();
+            if total == 0 {
                 glyphs.clean.to_string()
             } else {
-                format!("{}{}", glyphs.changed, value)
+                format!("{}{}", glyphs.changed, total)
             }
         },
         loading_glyph,
@@ -740,14 +745,13 @@ mod tests {
     // --- Criteria 1 and 2: the cheap columns land while the outstanding ones spin ---
 
     /// Criterion 1 and criterion 2's "partial" case together, on a real probed row: the name
-    /// and branch (the cheap columns) already show through, `sync` shows its settled value,
-    /// and `base` and `dirty` (the columns no probe has reached, in this codebase's current
-    /// scope) show the loading mark rather than sitting blank or reading a raw zero. The
-    /// gutter shows the row's
-    /// least-settled *settled* state (Fresh, a blank space) rather than `?`: the sanity check
-    /// above rules out a version of this test that would pass merely because `default_branch`
-    /// happened to read Unknown for an unrelated reason (no remote to resolve rung 2/3
-    /// against).
+    /// and branch (the cheap columns) already show through, `sync` and `dirty` both show
+    /// their settled values (a clean working tree, for `dirty`), and `base` (the one column
+    /// no probe has reached, in this codebase's current scope) shows the loading mark rather
+    /// than sitting blank or reading a raw zero. The gutter shows the row's least-settled
+    /// *settled* state (Fresh, a blank space) rather than `?`: the sanity check above rules
+    /// out a version of this test that would pass merely because `default_branch` happened
+    /// to read Unknown for an unrelated reason (no remote to resolve rung 2/3 against).
     #[test]
     fn an_outstanding_status_cell_shows_the_loading_mark_once_the_row_holds_other_values() {
         let snapshot = settled_snapshot_with_a_resolvable_default_branch("main");
@@ -785,13 +789,9 @@ mod tests {
         );
         assert_eq!(
             cell_text(buf, 74, 2, 1),
-            frame,
-            "dirty must show the loading mark for the same reason"
-        );
-        assert_ne!(
-            cell_text(buf, 74, 2, 1),
-            "0",
-            "an outstanding numeric-bearing cell must never read a raw zero"
+            glyphs.clean.to_string(),
+            "dirty is probed too, and this fixture's working tree is clean, so it must show \
+             its settled value rather than a loading mark"
         );
     }
 
@@ -1220,11 +1220,12 @@ mod tests {
     fn no_numeric_bearing_cell_ever_renders_a_raw_default_instead_of_blank() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         let unset: Cell<u32> = Cell::default();
+        let unset_dirty: Cell<DirtyCounts> = Cell::default();
         let unset_sync: Cell<SyncState> = Cell::default();
 
         for text in [
             format_base(&unset, glyphs, None),
-            format_dirty(&unset, glyphs, None),
+            format_dirty(&unset_dirty, glyphs, None),
             format_sync(&unset_sync, glyphs, None),
         ] {
             assert_eq!(
@@ -1240,7 +1241,7 @@ mod tests {
 
         for text in [
             format_base(&unset, glyphs, Some('⠋')),
-            format_dirty(&unset, glyphs, Some('⠋')),
+            format_dirty(&unset_dirty, glyphs, Some('⠋')),
             format_sync(&unset_sync, glyphs, Some('⠋')),
         ] {
             assert_eq!(
