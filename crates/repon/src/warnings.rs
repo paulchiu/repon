@@ -1,9 +1,13 @@
 //! The one shared warning slot [config.md](../../../../docs/spec/config.md) amends
 //! [theming.md](../../../../docs/spec/theming.md) into: every outstanding condition across
-//! theme warnings, config warnings and an abandoned discovery folds into one [`Warning`]
-//! list, the status bar shows the single most severe ([`slot_line`]), and `w`
-//! ([keybindings.md](../../../../docs/spec/keybindings.md)) expands it to the full list
-//! ([`draw_overlay`]).
+//! a bound-but-unimplemented action just pressed, theme warnings, config warnings and an
+//! abandoned discovery folds into one [`Warning`] list, the status bar shows the single most
+//! severe ([`slot_line`]), and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
+//! expands it to the full list ([`draw_overlay`]). The unimplemented-action source is this
+//! slot's answer to
+//! [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) and
+//! keybindings.md not settling a surface of their own for it: rather than invent a second
+//! one, a press of such a key becomes a fourth condition here.
 //!
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
@@ -17,12 +21,13 @@ use crate::{
     theme::{self, Theme},
 };
 
-/// Every source the shared warning slot can carry, one variant per source. Adding a fourth
+/// Every source the shared warning slot can carry, one variant per source. Adding a fifth
 /// source means adding a variant here, which leaves [`Warning::rank`] and [`Warning`]'s own
 /// `Display` impl refusing to compile until the new variant is folded in: neither match below
-/// has a catch-all arm, so a fourth source cannot go silently unranked.
+/// has a catch-all arm, so a fifth source cannot go silently unranked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Warning {
+    NotImplemented(&'static str),
     Theme(theme::ThemeWarning),
     Config(config::document::Warning),
     DiscoveryAbandoned(String),
@@ -32,14 +37,16 @@ impl Warning {
     /// Higher ranks are more severe. Ranked by how much of what is already on screen the
     /// condition puts in doubt: an abandoned walk means the table itself may be missing
     /// Repos, a config warning means some of this session's own behaviour silently fell back
-    /// to a default, and a theme warning is cosmetic only. Exhaustive by construction: a
-    /// fourth [`Warning`] variant leaves this `match` refusing to compile until it is ranked
-    /// too.
+    /// to a default, a theme warning is cosmetic only, and a bound-but-unimplemented action
+    /// the user just pressed puts nothing on screen in doubt at all, ranking below even the
+    /// theme warning. Exhaustive by construction: a fifth [`Warning`] variant leaves this
+    /// `match` refusing to compile until it is ranked too.
     fn rank(&self) -> u8 {
         match self {
-            Warning::Theme(_) => 0,
-            Warning::Config(_) => 1,
-            Warning::DiscoveryAbandoned(_) => 2,
+            Warning::NotImplemented(_) => 0,
+            Warning::Theme(_) => 1,
+            Warning::Config(_) => 2,
+            Warning::DiscoveryAbandoned(_) => 3,
         }
     }
 }
@@ -47,6 +54,9 @@ impl Warning {
 impl std::fmt::Display for Warning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Warning::NotImplemented(description) => {
+                write!(f, "{description} is not implemented yet")
+            }
             Warning::Theme(warning) => write!(f, "{warning}"),
             Warning::Config(warning) => write!(f, "{warning}"),
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
@@ -61,6 +71,7 @@ impl std::fmt::Display for Warning {
 /// site fill a new field in from `..Default::default()` instead of actually supplying it,
 /// which defeats the whole point of this struct.
 pub(crate) struct WarningSources {
+    pub(crate) not_implemented: Option<&'static str>,
     pub(crate) theme: Vec<theme::ThemeWarning>,
     pub(crate) config: Vec<config::document::Warning>,
     pub(crate) discovery_abandoned: Option<String>,
@@ -71,11 +82,16 @@ impl WarningSources {
     /// destructure has no `..`.
     pub(crate) fn into_warnings(self) -> Vec<Warning> {
         let WarningSources {
+            not_implemented,
             theme,
             config,
             discovery_abandoned,
         } = self;
-        let mut warnings: Vec<Warning> = theme.into_iter().map(Warning::Theme).collect();
+        let mut warnings: Vec<Warning> = not_implemented
+            .into_iter()
+            .map(Warning::NotImplemented)
+            .collect();
+        warnings.extend(theme.into_iter().map(Warning::Theme));
         warnings.extend(config.into_iter().map(Warning::Config));
         warnings.extend(
             discovery_abandoned
@@ -194,11 +210,16 @@ mod tests {
         Warning::DiscoveryAbandoned(format!("discovery: stopped at {directories} directories"))
     }
 
+    fn not_implemented(description: &'static str) -> Warning {
+        Warning::NotImplemented(description)
+    }
+
     // --- WarningSources: the compile-time forcing function ---
 
     #[test]
     fn into_warnings_folds_every_source_into_one_flat_list_in_field_order() {
         let sources = WarningSources {
+            not_implemented: Some("Refresh everything"),
             theme: vec![theme::ThemeWarning::UnknownKey {
                 key: "x".to_string(),
             }],
@@ -211,6 +232,7 @@ mod tests {
         assert_eq!(
             warnings,
             vec![
+                Warning::NotImplemented("Refresh everything"),
                 theme_unknown_key("x"),
                 config_set_named_all(),
                 discovery_abandoned(5),
@@ -221,6 +243,7 @@ mod tests {
     #[test]
     fn a_missing_discovery_warning_contributes_nothing_to_the_flat_list() {
         let sources = WarningSources {
+            not_implemented: None,
             theme: Vec::new(),
             config: Vec::new(),
             discovery_abandoned: None,
@@ -258,6 +281,28 @@ mod tests {
     #[test]
     fn no_outstanding_warnings_means_no_most_severe() {
         assert_eq!(most_severe(&[]), None);
+    }
+
+    /// A bound-but-unimplemented action just pressed puts nothing already on screen in
+    /// doubt, so it ranks below even a theme warning, which is merely cosmetic.
+    #[test]
+    fn most_severe_ranks_a_not_implemented_action_below_a_theme_warning() {
+        let warnings = vec![
+            not_implemented("Refresh everything"),
+            theme_unknown_key("a"),
+        ];
+
+        let winner = most_severe(&warnings).expect("expected a most-severe warning");
+
+        assert_eq!(winner, &theme_unknown_key("a"));
+    }
+
+    #[test]
+    fn a_not_implemented_action_displays_its_own_description_and_says_it_is_not_available() {
+        assert_eq!(
+            not_implemented("Refresh everything").to_string(),
+            "Refresh everything is not implemented yet"
+        );
     }
 
     // --- criterion: slot_line names the most severe and, once there is more than one,
@@ -481,7 +526,7 @@ mod tests {
     // --- criterion 5 gets its rule from a comment, not a test; nothing further to prove
     // here beyond this module's own doc comment carrying it ---
 
-    // --- ranking is exhaustive: a fourth Warning variant cannot compile without being
+    // --- ranking is exhaustive: a fifth Warning variant cannot compile without being
     // ranked, which `rank`'s own match (no wildcard arm) enforces at build time rather than
     // at test time. There is nothing a runtime test can assert about a variant that does not
     // exist yet; the guarantee lives in the match itself.
