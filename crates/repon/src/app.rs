@@ -3948,6 +3948,10 @@ mod tests {
             .expect("choose the highlighted entry");
         let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
         assert!(finished, "expected the failing Action to actually finish");
+        // A finished Action starts its own Generation, and a row whose cells hold nothing
+        // yet folds to InFlight ahead of the receipt's own failure, so a caller reading the
+        // summary straight after this would be racing the probes rather than reading them.
+        app.core.settle(Duration::from_secs(10));
     }
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
