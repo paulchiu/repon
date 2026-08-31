@@ -431,6 +431,17 @@ impl EntityState {
         !matches!(self.state.settled(), Some(Settled::NotApplicable))
     }
 
+    /// Whether this Entity's `base` cell is ever (re)probed: `false` once construction
+    /// has settled it `NotApplicable` (a Submodule; its default branch is
+    /// known-wrong with no local detector, per
+    /// [ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md),
+    /// so a count computed against it would be a confident lie), `true` for a Repo
+    /// or a Worktree. The same reasoning as [`Self::probes_state`], reading the
+    /// cell itself rather than re-deriving the rule from `kind`.
+    pub(crate) fn probes_base(&self) -> bool {
+        !matches!(self.base.settled(), Some(Settled::NotApplicable))
+    }
+
     /// Marks this Entity Vanished: it stays in the table with its last known
     /// values, and every Cell's `Known` value is forced stale rather than
     /// blanked. The same call for a Repo, a Worktree or a Submodule alike; a

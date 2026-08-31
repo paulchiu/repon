@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, select};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+use crate::base;
 use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
@@ -386,7 +387,7 @@ impl Core {
         // its cancel token the way `refresh`'s own dispatch does, and every other probe
         // below still takes it as `&AtomicBool` through the same deref coercion.
         let never_cancelled = Arc::new(AtomicBool::new(false));
-        let (cached_repo, common_dir_hint, probes_state) = {
+        let (cached_repo, common_dir_hint, probes_state, probes_base) = {
             let table = self.table.read().unwrap();
             let repo = table.repos.get(key).cloned();
             let common_dir = table
@@ -395,13 +396,19 @@ impl Core {
                 .map(|&idx| Arc::clone(&table.entities[idx].common_dir));
             // An unknown key has no entity yet to ask, and falls back to `false`,
             // matching the fallback insert below: a freshly inserted `Kind::Repo`
-            // entity's `state` is `NotApplicable` from construction too.
+            // entity's `state` is `NotApplicable` from construction too, and its
+            // `base` is not (only a Submodule's is).
             let probes_state = table
                 .index
                 .get(key)
                 .map(|&idx| table.entities[idx].probes_state())
                 .unwrap_or(false);
-            (repo, common_dir, probes_state)
+            let probes_base = table
+                .index
+                .get(key)
+                .map(|&idx| table.entities[idx].probes_base())
+                .unwrap_or(true);
+            (repo, common_dir, probes_state, probes_base)
         };
         let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
         let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
@@ -421,6 +428,17 @@ impl Core {
             override_branch.as_deref(),
             &never_cancelled,
         );
+        let base_outcome = if probes_base {
+            probe_base(
+                key.path(),
+                cached_repo.as_deref(),
+                branch_outcome.as_ref().map(|(settled, ..)| settled),
+                default_branch_outcome.as_ref().map(|r| &r.settled),
+                &never_cancelled,
+            )
+        } else {
+            None
+        };
         let state_outcome = if probes_state {
             // A single synchronous re-probe shares nothing with any Generation's
             // dispatch, so a throwaway cache is exactly as much sharing as this
@@ -473,6 +491,9 @@ impl Core {
         }
         if let Some(settled) = sync_outcome {
             table.entities[idx].sync.settle(generation, settled);
+        }
+        if let Some(settled) = base_outcome {
+            table.entities[idx].base.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
@@ -796,6 +817,10 @@ impl RefreshHandles {
             .iter()
             .map(|(key, _)| table.entities[table.index[key]].probes_state())
             .collect();
+        let probes_base: Vec<bool> = dispatched
+            .iter()
+            .map(|(key, _)| table.entities[table.index[key]].probes_base())
+            .collect();
         drop(table);
 
         // Scoped to this dispatch alone: every task below gets its own clone of
@@ -823,12 +848,14 @@ impl RefreshHandles {
                 .collect()
         });
 
-        for (((((key, cancel), repo), override_branch), common_dir), probes_state) in dispatched
-            .into_iter()
-            .zip(repos)
-            .zip(override_branches)
-            .zip(common_dirs)
-            .zip(probes_state)
+        for ((((((key, cancel), repo), override_branch), common_dir), probes_state), probes_base) in
+            dispatched
+                .into_iter()
+                .zip(repos)
+                .zip(override_branches)
+                .zip(common_dirs)
+                .zip(probes_state)
+                .zip(probes_base)
         {
             // Recorded here, in this loop's own sequential iteration, rather than in the
             // one above: this is the loop whose order a future change (a sort by predicted
@@ -862,6 +889,17 @@ impl RefreshHandles {
                     &chain_cache,
                     &chain_reads,
                 );
+                let base_outcome = if probes_base {
+                    probe_base(
+                        &path,
+                        repo.as_deref(),
+                        branch_outcome.as_ref().map(|(settled, ..)| settled),
+                        default_branch_outcome.as_ref().map(|r| &r.settled),
+                        &cancel,
+                    )
+                } else {
+                    None
+                };
 
                 // Phases A and B land the moment they answer, per refresh.md's "The
                 // first frame": every cheap column filled within 200ms, never gated
@@ -875,6 +913,7 @@ impl RefreshHandles {
                     CheapProbeOutcomes {
                         branch: branch_outcome,
                         sync: sync_outcome,
+                        base: base_outcome,
                         default_branch: default_branch_outcome.clone(),
                     },
                 );
@@ -1252,6 +1291,7 @@ impl Core {
             CheapProbeOutcomes {
                 branch: Some((settled, None, Vec::new())),
                 sync: None,
+                base: None,
                 default_branch: None,
             },
         );
@@ -1740,6 +1780,48 @@ fn probe_sync(
     Some(settled)
 }
 
+/// Phase B's second rev-walk: the `base` cell's count behind the resolved default
+/// branch, for every entity [`crate::base::probe`] does not exempt or leave
+/// Outstanding ([default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "The two behind counts"). `None` if `cancel` was already set, if either
+/// `branch_settled` or `default_branch_settled` is itself `None` because the probe
+/// it depends on was cancelled first, or if `crate::base::probe` itself leaves the
+/// cell Outstanding (an unborn HEAD). A `Failed` or not-yet-`Known` `branch_settled`
+/// carries no commit to compare, so it is treated the same "nothing to settle yet"
+/// way, except a genuine `Failed` branch read, which propagates onto `base` too:
+/// a row whose HEAD could not be read has nothing to compute behind anything. `repo`
+/// follows the same cached-handle convention as [`probe_branch`].
+fn probe_base(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    branch_settled: Option<&Settled<Head>>,
+    default_branch_settled: Option<&Settled<DefaultBranch>>,
+    cancel: &AtomicBool,
+) -> Option<Settled<u32>> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let head = match branch_settled? {
+        Settled::Known { value, .. } => value,
+        Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
+        Settled::Unknown(_) | Settled::NotApplicable => return None,
+    };
+    let default_branch_settled = default_branch_settled?;
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(Settled::Failed(error)),
+        },
+    };
+    let local = repo.to_thread_local();
+    base::probe(&local, head, default_branch_settled)
+}
+
 /// Phase C's typed counts, dispatched over every entity in a Generation with no
 /// scoping of its own: [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
 /// "Scope and order" makes scope never a partial dial, only order, so this carries
@@ -2217,6 +2299,7 @@ struct CheapProbeOutcomes {
         Vec<git::RecentCommit>,
     )>,
     sync: Option<Settled<SyncState>>,
+    base: Option<Settled<u32>>,
     default_branch: Option<default_branch::Resolution>,
 }
 
@@ -2237,6 +2320,7 @@ fn apply_cheap_probe_outcomes(
     let CheapProbeOutcomes {
         branch: branch_outcome,
         sync: sync_outcome,
+        base: base_outcome,
         default_branch: default_branch_outcome,
     } = outcomes;
     let mut table = table.write().unwrap();
@@ -2246,6 +2330,9 @@ fn apply_cheap_probe_outcomes(
         }
         if let Some(settled) = sync_outcome {
             table.entities[idx].sync.settle(generation, settled);
+        }
+        if let Some(settled) = base_outcome {
+            table.entities[idx].base.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
@@ -2913,6 +3000,74 @@ mod tests {
             ),
             "expected probe_now to settle sync, got {:?}",
             entity.sync.settled()
+        );
+    }
+
+    /// The same guard as the `sync` one above, for `base`: `probe_now` must settle it
+    /// too, not only the dispatch loop `refresh` drives.
+    #[test]
+    fn probe_now_settles_the_base_cell_as_well_as_the_branch_it_depends_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        let entity = core.probe_now(&key);
+
+        assert!(
+            matches!(entity.base.settled(), Some(Settled::NotApplicable)),
+            "expected probe_now to settle base Not applicable for a Repo with no remote, \
+             got {:?}",
+            entity.base.settled()
+        );
+    }
+
+    /// The end-to-end wiring `probe_now`'s own guard above cannot prove: a real
+    /// `refresh` dispatch, through `CheapProbeOutcomes`, must land a genuine
+    /// computed `base` count on the table, not just a Not-applicable fallback.
+    #[test]
+    fn refresh_settles_a_real_base_count_against_the_resolved_default_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let root_sha = head_sha(&repo);
+        // The default branch (`origin/main`, resolved through rung 3's name list
+        // since no `origin/HEAD` exists) moves one commit ahead of this Repo's own
+        // checked-out branch, which never gets its own upstream configured, so
+        // `sync` reads `-` while `base` still has a resolved default branch to
+        // count behind.
+        git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+        let tip_sha = head_sha(&repo);
+        git(&repo, &["reset", "--hard", &root_sha]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &tip_sha]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_secs(5));
+
+        assert!(
+            matches!(
+                settled.entities[0].base.settled(),
+                Some(Settled::Known { value: 1, .. })
+            ),
+            "expected a real refresh to settle base's live count against the resolved \
+             default branch, got {:?}",
+            settled.entities[0].base.settled()
         );
     }
 
@@ -4959,6 +5114,68 @@ mod tests {
                 .iter()
                 .any(|entity| matches!(entity.kind, Kind::Submodule)),
             "a discovered Submodule must be in the snapshot with nothing able to hide it"
+        );
+    }
+
+    /// A Submodule's `base` cell must stay `NotApplicable` through a real refresh
+    /// cycle, not only at construction: [`EntityState::probes_base`] is what stops
+    /// `refresh`'s dispatch from ever calling `probe_base` for it again. The
+    /// Submodule here is a real, valid repository with a real remote and a
+    /// resolvable default branch ahead of its own tip, so if the gate were
+    /// missing this would settle a genuine live count rather than merely fail to
+    /// open.
+    #[test]
+    fn a_submodules_base_cell_stays_not_applicable_through_a_real_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n",
+        )
+        .expect("write .gitmodules");
+        let submodule = parent.join("vendor").join("lib");
+        init_repo_with_a_commit(&submodule);
+        git(
+            &submodule,
+            &["remote", "add", "origin", "https://example.invalid/lib.git"],
+        );
+        let root_sha = head_sha(&submodule);
+        git(&submodule, &["commit", "--allow-empty", "-m", "second"]);
+        let tip_sha = head_sha(&submodule);
+        git(&submodule, &["reset", "--hard", &root_sha]);
+        git(
+            &submodule,
+            &["update-ref", "refs/remotes/origin/main", &tip_sha],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("a discovered Submodule")
+            .key
+            .clone();
+
+        core.refresh(std::slice::from_ref(&key));
+        let settled = core.settle(Duration::from_secs(5));
+        let submodule_entity = settled
+            .entities
+            .iter()
+            .find(|entity| entity.key == key)
+            .expect("the Submodule entity");
+
+        assert!(
+            matches!(
+                submodule_entity.base.settled(),
+                Some(Settled::NotApplicable)
+            ),
+            "expected a Submodule's base to stay Not applicable through a real refresh, \
+             got {:?}",
+            submodule_entity.base.settled()
         );
     }
 

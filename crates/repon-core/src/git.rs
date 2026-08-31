@@ -28,6 +28,9 @@ pub enum ProbeError {
     /// The ahead/behind comparison against a live upstream could not run: a
     /// missing or corrupt commit, never a stand-in for zero.
     AheadBehind(Arc<str>),
+    /// The behind-the-default-branch comparison could not run: a missing or
+    /// corrupt commit, never a stand-in for zero.
+    Base(Arc<str>),
     /// Phase C's status read could not run: a platform that would not build, or
     /// an iterator that errored partway through.
     Status(Arc<str>),
@@ -45,6 +48,12 @@ impl std::fmt::Display for ProbeError {
             }
             ProbeError::AheadBehind(message) => {
                 write!(f, "failed to compute ahead/behind counts: {message}")
+            }
+            ProbeError::Base(message) => {
+                write!(
+                    f,
+                    "failed to compute the behind-the-default-branch count: {message}"
+                )
             }
             ProbeError::Status(message) => write!(f, "failed to read status: {message}"),
         }
@@ -135,18 +144,41 @@ pub(crate) fn ahead_behind(
     })
 }
 
+/// The remote-tracking ref name `branch_name`'s configured upstream resolves to, or
+/// `None` when no upstream is configured for it at all. Shared by [`upstream_commit`]
+/// and [`crate::base`]'s own "is this row the default branch's own row" check, so the
+/// two never disagree about what a branch's upstream is.
+pub(crate) fn tracking_ref_name(
+    repo: &gix::Repository,
+    branch_name: &str,
+) -> Option<gix::refs::FullName> {
+    let full_name = gix::refs::FullName::try_from(format!("refs/heads/{branch_name}")).ok()?;
+    repo.branch_remote_tracking_ref_name(full_name.as_ref(), gix::remote::Direction::Fetch)?
+        .ok()
+}
+
 /// The commit a branch's configured upstream currently resolves to, or `None` when
 /// there is no upstream to compare against: no `branch.<name>.merge`/`.remote`
 /// configured, or a configured tracking ref that itself no longer resolves. Both
 /// causes settle to the same [`SyncState::NoUpstream`] at the call site, since
 /// neither has a count to show.
 fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
-    let full_name = gix::refs::FullName::try_from(format!("refs/heads/{branch_name}")).ok()?;
-    let tracking_ref_name = repo
-        .branch_remote_tracking_ref_name(full_name.as_ref(), gix::remote::Direction::Fetch)?
-        .ok()?;
+    let tracking_ref_name = tracking_ref_name(repo, branch_name)?;
     let mut reference = repo.find_reference(tracking_ref_name.as_ref()).ok()?;
     reference.peel_to_id().ok().map(|id| id.detach())
+}
+
+/// `commit`'s count of commits behind `default_commit`: commits reachable from
+/// `default_commit` and not from `commit`. There is no ahead-of-default count
+/// ([default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "The two behind counts"): an ahead count there would only say the branch has
+/// commits of its own, which is not an integration signal.
+pub(crate) fn commits_behind(
+    repo: &gix::Repository,
+    commit: gix::ObjectId,
+    default_commit: gix::ObjectId,
+) -> Result<u32, String> {
+    commits_unique_to(repo, default_commit, commit)
 }
 
 /// Resolves the `sync` cell's value for one entity, per
