@@ -17,6 +17,7 @@ use crate::{
     theme::{self, Theme},
     tui::{Event, Tui},
     unwind::{self, UnwindLevel},
+    warnings::{self, Warning, WarningSources},
 };
 
 mod reload;
@@ -113,6 +114,24 @@ pub struct App {
     /// `focus` does. Opened from whichever of `List` or `Detail` `focus` names at the time,
     /// and its own content describes that same context once open.
     help: Option<HelpOverlay>,
+    /// `true` while the expanded warning list has focus, opened by `Action::ExpandWarning`
+    /// and closed the same way the help overlay is. Carries no content of its own, since
+    /// [`Self::current_warnings`] derives it fresh every frame the same way `help`'s content
+    /// does.
+    warning_overlay_open: bool,
+    /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
+    /// `Action::ReloadConfig`. One of the three sources [`Self::current_warnings`] folds into
+    /// the shared warning slot ([`warnings::WarningSources`]).
+    theme_warnings: Vec<theme::ThemeWarning>,
+    /// Config warnings raised at the last load, the same lifecycle as `theme_warnings` and
+    /// the second of the three sources.
+    config_warnings: Vec<config::document::Warning>,
+    /// Whether the abandoned-discovery warning has already been logged to `repon.log` for
+    /// `self.core`'s lifetime: `Core` never clears the warning once a walk abandons, so this
+    /// stops [`Self::current_warnings`] from re-logging it on every tick. Reset to `false`
+    /// only when `self.core` itself is rebuilt on a reload, since a fresh `Core` starts with
+    /// no discovery warning of its own.
+    discovery_warning_logged: bool,
     /// The last size `Tui` reported, so the help overlay's own scroll clamp
     /// ([`HelpOverlay::apply`]) knows its viewport height without `Tui` reaching back in.
     frame_size: Size,
@@ -121,9 +140,10 @@ pub struct App {
     message_tx: Sender<Message>,
     message_rx: Receiver<Message>,
     /// Resolved once at startup and again on every config reload (`Action::ReloadConfig`);
-    /// not read outside tests until a component styles itself by role instead of a
-    /// hand-picked ratatui colour.
-    #[allow(dead_code)]
+    /// read by [`Self::render`] for the shared warning slot's `warn` role
+    /// ([`warnings::draw_slot`], [`warnings::draw_overlay`]), this field's first production
+    /// reader. Other components still colour themselves from the compiled
+    /// [`theme::DEFAULT`] directly rather than from this loaded copy.
     theme: Theme,
     /// The live binding table the footer and the help overlay read every frame: the compiled
     /// default merged with `[keys]`, per [`keys::merge`]. Replaced wholesale on a config
@@ -190,6 +210,9 @@ impl App {
         let mut list = List::default();
         list.register_config_handler(config.clone())?;
 
+        let theme_warnings = loaded_theme.warnings;
+        let config_warnings = config.warnings;
+
         Ok(Self {
             tick_rate,
             frame_rate,
@@ -204,6 +227,10 @@ impl App {
             pane: None,
             focus: Context::List,
             help: None,
+            warning_overlay_open: false,
+            theme_warnings,
+            config_warnings,
+            discovery_warning_logged: false,
             frame_size: Size::default(),
             message_tx,
             message_rx,
@@ -211,6 +238,28 @@ impl App {
             bindings,
             active_set,
         })
+    }
+
+    /// The shared warning slot's whole current population, folded once from every source
+    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the three sources by
+    /// hand. `self.core`'s own abandoned-discovery warning is read fresh here rather than
+    /// cached, since it can turn from `None` to `Some` at any point in the run with no reload
+    /// involved; the first time it does, this also logs it to `repon.log`
+    /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
+    /// reported twice" (the theme and config halves already log at the point their own load
+    /// raises them).
+    fn current_warnings(&mut self) -> Vec<Warning> {
+        let discovery_abandoned = self.core.discovery_warning();
+        warnings::log_discovery_warning_once(
+            discovery_abandoned.as_ref(),
+            &mut self.discovery_warning_logged,
+        );
+        WarningSources {
+            theme: self.theme_warnings.clone(),
+            config: self.config_warnings.clone(),
+            discovery_abandoned,
+        }
+        .into_warnings()
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -266,14 +315,15 @@ impl App {
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
-    /// `Context::Overlay` while the help overlay is open, `self.focus` (`List` or `Detail`)
-    /// otherwise, so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
-    /// [`Message`], the movement and Selection actions mutate `cursor` and `selection`
-    /// directly, `OpenDetail`/`ClosePane` open and close the pane,
-    /// `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two without
-    /// touching what the pane shows, `OpenHelp` opens the overlay, `ReloadConfig` reaches
-    /// [`Self::reload_config`] and `Unwind` reaches [`unwind::unwind_one`] over the range
-    /// anchor then the pane.
+    /// `Context::Overlay` while the help overlay or the expanded warning list is open,
+    /// `self.focus` (`List` or `Detail`) otherwise, so `Global`'s bindings stay live from
+    /// either. `Quit` and `Suspend` raise a [`Message`], the movement and Selection actions
+    /// mutate `cursor` and `selection` directly, `OpenDetail`/`ClosePane` open and close the
+    /// pane, `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two
+    /// without touching what the pane shows, `OpenHelp` opens the help overlay,
+    /// `ExpandWarning` opens the warning overlay when there is something outstanding to show,
+    /// `ReloadConfig` reaches [`Self::reload_config`] and `Unwind` reaches
+    /// [`unwind::unwind_one`] over the range anchor then the pane.
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
@@ -283,6 +333,13 @@ impl App {
                     overlay.apply(action, content_len, self.frame_size.height);
                 }
                 None => {}
+            }
+            return Ok(());
+        }
+
+        if self.warning_overlay_open {
+            if let Some(Action::Close) = self.bindings.dispatch(Context::Overlay, key) {
+                self.warning_overlay_open = false;
             }
             return Ok(());
         }
@@ -386,6 +443,12 @@ impl App {
                 self.help = Some(HelpOverlay::default());
                 None
             }
+            Some(Action::ExpandWarning) => {
+                if !self.current_warnings().is_empty() {
+                    self.warning_overlay_open = true;
+                }
+                None
+            }
             _ => None,
         };
         if let Some(message) = message {
@@ -484,18 +547,20 @@ impl App {
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
-    /// The help overlay, when open, takes the whole frame in place of everything else;
-    /// otherwise [`layout_state`] decides between the three shapes
-    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
-    /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
-    /// There is no permanently pinned bottom output pane: an Action's own output, once wired,
-    /// lives inside the detail pane rather than a fourth region here.
+    /// The help overlay and the warning overlay, in that priority, each take the whole frame
+    /// in place of everything else when open; otherwise the status bar row shows the shared
+    /// warning slot ([`warnings::draw_slot`]), [`layout_state`] decides between the three
+    /// shapes [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)
+    /// fixes, and [`footer::draw`] renders the last row for whichever of `List` or `Detail`
+    /// is focused. There is no permanently pinned bottom output pane: an Action's own output,
+    /// once wired, lives inside the detail pane rather than a fourth region here.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
         let snapshot = self.core.snapshot();
         let pane_entity = self
             .pane
             .as_ref()
             .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
+        let warnings = self.current_warnings();
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
@@ -503,8 +568,19 @@ impl App {
                 overlay.draw(frame, area, self.focus, &self.bindings);
                 return;
             }
-            let areas = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-            let content_area = areas[0];
+            if self.warning_overlay_open {
+                warnings::draw_overlay(frame, area, &warnings, &self.theme);
+                return;
+            }
+            let areas = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            let status_area = areas[0];
+            let content_area = areas[1];
+            warnings::draw_slot(frame, status_area, &warnings, &self.bindings, &self.theme);
             match layout_state(content_area.width, pane_entity.is_some()) {
                 Layout3::ListOnly => {
                     if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
@@ -540,7 +616,7 @@ impl App {
                     }
                 }
             }
-            footer::draw(frame, areas[1], self.footer_context(), &self.bindings);
+            footer::draw(frame, areas[2], self.footer_context(), &self.bindings);
         })?;
         if let Some(err) = error {
             self.message_tx
@@ -623,6 +699,10 @@ mod tests {
             pane: None,
             focus: Context::List,
             help: None,
+            warning_overlay_open: false,
+            theme_warnings: Vec::new(),
+            config_warnings: Vec::new(),
+            discovery_warning_logged: false,
             frame_size: Size::default(),
             message_tx,
             message_rx,
@@ -852,6 +932,78 @@ mod tests {
         assert_eq!(app.focus, Context::Detail);
     }
 
+    // --- the shared warning slot expands to the full list on a keystroke ---
+
+    #[test]
+    fn expand_warning_opens_the_overlay_only_once_something_is_outstanding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle w with nothing outstanding");
+        assert!(
+            !app.warning_overlay_open,
+            "expanding an empty warning slot must be a no-op"
+        );
+
+        app.config_warnings.push(document::Warning::SetNamedAll);
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle w with a warning outstanding");
+        assert!(
+            app.warning_overlay_open,
+            "expected the overlay to open once a warning is outstanding"
+        );
+    }
+
+    #[test]
+    fn the_warning_overlay_closes_on_esc_the_same_as_the_help_overlay_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.config_warnings.push(document::Warning::SetNamedAll);
+        app.warning_overlay_open = true;
+
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle esc with the overlay open");
+
+        assert!(!app.warning_overlay_open);
+    }
+
+    #[test]
+    fn an_unbound_key_leaves_the_warning_overlay_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.config_warnings.push(document::Warning::SetNamedAll);
+        app.warning_overlay_open = true;
+
+        // `z` is bound in no context at all; `keys.rs`'s own
+        // `global_bindings_never_dispatch_while_overlay_is_focused` already proves Overlay
+        // never falls through to Global at the `dispatch` level, so this only needs to prove
+        // the overlay itself does not close or quit on a stray key.
+        app.handle_key_event(press(
+            crossterm::event::KeyCode::Char('z'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("handle an unbound key with the overlay open");
+
+        assert!(app.warning_overlay_open);
+        assert!(!app.should_quit);
+    }
+
     // --- criterion 2: one footer line for the focused context ---
 
     /// The mutation the ticket names by name: hardcoding `Context::List` regardless of focus.
@@ -1042,11 +1194,14 @@ mod tests {
     // --- criterion 2: no permanently pinned bottom output pane ---
 
     /// The absence is half the criterion, so a scan is the honest form: `render`'s one
-    /// vertical split reserves the footer's single row and nothing else. A second
-    /// `Layout::vertical` call anywhere in this crate's production source would be exactly
-    /// what carves out a fourth, permanently pinned region.
+    /// vertical split reserves the status bar's row, the content and the footer's row, and
+    /// nothing else; the shared warning slot grew it from two constraints to three, not from
+    /// one split into two. A second `Layout::vertical` call anywhere in this crate's
+    /// production source would be exactly what carves out a fourth, permanently pinned
+    /// region.
     #[test]
-    fn there_is_exactly_one_vertical_layout_split_in_the_crate_reserving_only_the_footer_row() {
+    fn there_is_exactly_one_vertical_layout_split_in_the_crate_reserving_only_the_status_bar_and_footer_rows()
+     {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut occurrences = 0usize;
         for path in rust_source_files(&manifest_dir.join("src")) {
@@ -1062,8 +1217,87 @@ mod tests {
         }
         assert_eq!(
             occurrences, 1,
-            "expected exactly one Layout::vertical split (the footer row), found {occurrences}: \
-             a second split would carve out a pinned region this ticket forbids"
+            "expected exactly one Layout::vertical split (the status bar and footer rows), \
+             found {occurrences}: a second split would carve out a pinned region this ticket \
+             forbids"
+        );
+    }
+
+    // --- the shared warning slot: exactly one slot, not one per subsystem ---
+
+    /// The "exactly one slot" half of the criterion is an absence claim, so a scan is the
+    /// honest form: a second call site drawing the slot or its expansion is exactly what a
+    /// per-subsystem indicator (a theme one, a config one, a discovery one) would need,
+    /// since [`warnings::WarningSources`] already forces every source through the one flat
+    /// list `warnings::draw_slot` and `warnings::draw_overlay` each read.
+    #[test]
+    fn the_shared_warning_slot_and_its_expansion_are_each_painted_from_exactly_one_place() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut slot_calls = 0usize;
+        let mut overlay_calls = 0usize;
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            let production = production_source_at(&path);
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains("warnings::draw_slot(") {
+                    slot_calls += 1;
+                }
+                if line.contains("warnings::draw_overlay(") {
+                    overlay_calls += 1;
+                }
+            }
+        }
+        assert_eq!(
+            slot_calls, 1,
+            "expected exactly one call to warnings::draw_slot, found {slot_calls}: a second \
+             would mean a per-subsystem indicator alongside the shared one"
+        );
+        assert_eq!(
+            overlay_calls, 1,
+            "expected exactly one call to warnings::draw_overlay, found {overlay_calls}"
+        );
+    }
+
+    // --- criterion: no warning path prints to standard error after the terminal is
+    // claimed. `tests/terminal_restoration.rs` asserts on raw bytes over a real pty, which is
+    // the only proof strong enough to stand alone; a source scan is a weaker second layer,
+    // since it cannot see a print reached through a helper it does not name by this literal
+    // text. Scoped to the files a warning actually flows through rather than the whole
+    // crate, since `main.rs` legitimately prints CLI output (`repon config`, the debug-only
+    // test harness subcommands) before the terminal is ever claimed, or without claiming it
+    // at all.
+
+    /// A `println!` or `eprintln!` anywhere a warning is gathered, logged or drawn would
+    /// bypass `tracing`'s file-only writer entirely.
+    #[test]
+    fn no_warning_related_file_calls_println_or_eprintln() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let warning_related_files = ["app.rs", "reload.rs", "warnings.rs"];
+        let mut offending_locations = Vec::new();
+        for path in rust_source_files(&manifest_dir.join("src")) {
+            if !path
+                .file_name()
+                .is_some_and(|name| warning_related_files.iter().any(|file| name == *file))
+            {
+                continue;
+            }
+            let production = production_source_at(&path);
+            for (number, line) in production.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed.contains("println!(") {
+                    offending_locations.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+        assert!(
+            offending_locations.is_empty(),
+            "found a println!/eprintln! call in a warning-related file, at: \
+             {offending_locations:?}"
         );
     }
 

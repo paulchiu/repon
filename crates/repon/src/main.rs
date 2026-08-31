@@ -27,6 +27,7 @@ mod test_support;
 mod theme;
 mod tui;
 mod unwind;
+mod warnings;
 
 fn main() -> color_eyre::Result<()> {
     let args = Cli::parse();
