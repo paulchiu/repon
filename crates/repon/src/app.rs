@@ -33,7 +33,8 @@ use crate::{
     warnings::{self, Warning, WarningSources},
 };
 
-mod reload;
+pub(crate) mod reload;
+pub(crate) mod status;
 
 use reload::{ActiveSet, action_running_notice};
 

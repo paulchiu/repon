@@ -836,6 +836,7 @@ dependencies = [
  "gix-command",
  "gix-commitgraph",
  "gix-config",
+ "gix-credentials",
  "gix-date",
  "gix-diff",
  "gix-dir",
@@ -850,6 +851,7 @@ dependencies = [
  "gix-ignore",
  "gix-index",
  "gix-lock",
+ "gix-mailmap",
  "gix-note",
  "gix-object",
  "gix-odb",
@@ -868,6 +870,7 @@ dependencies = [
  "gix-submodule",
  "gix-tempfile",
  "gix-trace",
+ "gix-transport",
  "gix-traverse",
  "gix-url",
  "gix-utils",
@@ -876,6 +879,7 @@ dependencies = [
  "gix-worktree-stream",
  "gix-zlib",
  "nonempty",
+ "serde",
  "smallvec",
  "thiserror 2.0.20",
 ]
@@ -889,6 +893,7 @@ dependencies = [
  "bstr",
  "gix-date",
  "gix-error",
+ "serde",
 ]
 
 [[package]]
@@ -903,6 +908,7 @@ dependencies = [
  "gix-path",
  "gix-quote",
  "gix-trace",
+ "serde",
  "smallvec",
  "thiserror 2.0.20",
  "unicode-bom",
@@ -951,6 +957,7 @@ dependencies = [
  "gix-hash",
  "memmap2",
  "nonempty",
+ "serde",
 ]
 
 [[package]]
@@ -986,6 +993,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-credentials"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16c11822054fd4b80a1ab722b703f2e7c691b20484d898374289b742c1f49e50"
+dependencies = [
+ "bstr",
+ "gix-command",
+ "gix-config-value",
+ "gix-date",
+ "gix-path",
+ "gix-prompt",
+ "gix-quote",
+ "gix-sec",
+ "gix-trace",
+ "gix-url",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gix-date"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -995,6 +1022,7 @@ dependencies = [
  "gix-error",
  "itoa",
  "jiff",
+ "serde",
 ]
 
 [[package]]
@@ -1128,6 +1156,7 @@ dependencies = [
  "bstr",
  "gix-features",
  "gix-path",
+ "serde",
 ]
 
 [[package]]
@@ -1138,6 +1167,7 @@ checksum = "380b9c423a54f0821064b954b5a5ab25c660812f6a91da03c3f1cb4b10762aa5"
 dependencies = [
  "faster-hex",
  "gix-features",
+ "serde",
  "sha1-checked",
  "thiserror 2.0.20",
 ]
@@ -1163,6 +1193,7 @@ dependencies = [
  "gix-glob",
  "gix-path",
  "gix-trace",
+ "serde",
  "unicode-bom",
 ]
 
@@ -1200,6 +1231,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rustix",
+ "serde",
  "smallvec",
  "thiserror 2.0.20",
 ]
@@ -1224,6 +1256,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "gix-mailmap"
+version = "0.34.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a1c6ca2f9481e5e98b3600b859bc595d46cdf3b600709d5f91b8c118ae452a1"
+dependencies = [
+ "bstr",
+ "gix-actor",
+ "gix-date",
+ "gix-error",
+ "serde",
 ]
 
 [[package]]
@@ -1255,6 +1300,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "itoa",
+ "serde",
  "smallvec",
  "thiserror 2.0.20",
 ]
@@ -1277,6 +1323,7 @@ dependencies = [
  "gix-zlib",
  "memmap2",
  "parking_lot",
+ "serde",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -1298,6 +1345,7 @@ dependencies = [
  "gix-path",
  "gix-zlib",
  "memmap2",
+ "serde",
  "smallvec",
  "thiserror 2.0.20",
  "uluru",
@@ -1343,6 +1391,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-prompt"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "802256e13ecb2133ba5f9e6acbaa6b08bac027b1c5929f85f6adbb56ba3a4f28"
+dependencies = [
+ "gix-command",
+ "gix-config-value",
+ "parking_lot",
+ "rustix",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gix-protocol"
 version = "0.65.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1358,6 +1419,7 @@ dependencies = [
  "gix-transport",
  "gix-utils",
  "nonempty",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -1389,6 +1451,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "memmap2",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -1422,6 +1485,7 @@ dependencies = [
  "gix-revwalk",
  "gix-trace",
  "nonempty",
+ "serde",
 ]
 
 [[package]]
@@ -1449,6 +1513,7 @@ dependencies = [
  "bitflags 2.13.1",
  "gix-path",
  "libc",
+ "serde",
  "windows-sys",
 ]
 
@@ -1462,6 +1527,7 @@ dependencies = [
  "gix-hash",
  "gix-lock",
  "nonempty",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -1538,6 +1604,7 @@ dependencies = [
  "gix-quote",
  "gix-sec",
  "gix-url",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -1568,6 +1635,7 @@ dependencies = [
  "gix-path",
  "gix-utils",
  "percent-encoding",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -1609,6 +1677,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-validate",
+ "serde",
 ]
 
 [[package]]
@@ -1635,6 +1704,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e8813f5579b3075ff9c90f7c59cd2b62b4ebb639361f0911648b22d7446cc7c"
 dependencies = [
+ "serde",
  "thiserror 2.0.20",
  "zlib-rs",
 ]
@@ -2049,6 +2119,9 @@ name = "nonempty"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9737e026353e5cd0736f98eddae28665118eb6f6600902a7f50db585621fecb6"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "nu-ansi-term"
@@ -2559,6 +2632,7 @@ dependencies = [
  "repon-core",
  "serde",
  "serde_ignored",
+ "serde_json",
  "shell-words",
  "signal-hook 0.4.4",
  "tempfile",
@@ -2577,6 +2651,7 @@ dependencies = [
  "globset",
  "libc",
  "rayon",
+ "serde",
  "tempfile",
 ]
 
@@ -2679,6 +2754,19 @@ checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
 dependencies = [
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -2795,6 +2883,9 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "stable_deref_trait"
@@ -3461,3 +3552,9 @@ name = "zlib-rs"
 version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
