@@ -62,6 +62,11 @@ impl SetPicker {
     /// One line per declared Set, in file order, the cursor row marked with `> ` and the
     /// currently active Set named, so choosing without moving the cursor at least shows
     /// which Set that would be.
+    ///
+    /// TODO(#134): each row also carries the `1` to `9` number that switches to it, which is
+    /// what makes this picker the tab strip
+    /// [0027](../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)
+    /// declines to draw on the screen. Rows past the ninth carry a name and no number.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,

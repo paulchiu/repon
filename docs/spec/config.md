@@ -91,6 +91,8 @@ Selection order: `--set <name>`, then `REPON_SET`, then the first declared Set, 
 
 With no file at all there is one implicit Set, `all`, rooted at the working directory, everything included.
 
+The active Set is named on screen, as the status row's first item, ahead of the entity count it bounds: `work 403 entities`, or `all 403 entities` running zero-config. [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the row and [keybindings.md](keybindings.md) the picker `s` opens; what belongs here is that a Set the user cannot see is a scope they cannot check, which is the readable half of the same rule that makes an unresolvable name exit ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)).
+
 ## Per-Repo entries
 
 | field | type | meaning |
@@ -208,7 +210,7 @@ Checked at load, each a warning rather than an exit:
 
 Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). There is no file watcher. Because that keystroke can change the keyboard itself, the footer and the help overlay are derived from the binding table rather than written as strings; [keybindings.md](keybindings.md) carries the rule.
 
-`theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in the status bar. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
+`theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in a Notice, and the status row's first item then carries the fallback's name for as long as it is active. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
 
 Paths that came from a flag or the environment are fixed for the process, since re-resolving them mid-session would move the file just edited.
 

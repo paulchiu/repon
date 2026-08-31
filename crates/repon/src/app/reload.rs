@@ -214,6 +214,11 @@ impl App {
     /// are declared, since there is no such Set to switch to; `self.document` is cloned first
     /// so the borrow it and its chosen Set hold never overlaps the `&mut self` this needs to
     /// apply it.
+    ///
+    /// TODO(#134): the switch raises a Notice naming the Set, and the out-of-range press
+    /// answers instead of doing nothing: `1` to `9` is advertised as a range, so it is
+    /// unavailable rather than unbuilt
+    /// ([0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
     pub(crate) fn switch_to_set(&mut self, nth: u8) {
         let document = self.document.clone();
         let index = usize::from(nth).wrapping_sub(1);
