@@ -959,6 +959,12 @@ impl App {
                 }
                 None
             }
+            Some(Action::RederiveDefaultBranches) => {
+                if let Some(order) = self.refresh_selection_order() {
+                    self.core.rederive_default_branches(&order);
+                }
+                None
+            }
             Some(Action::EnterFilter) => {
                 self.filter_line = Some(FilterLine::new(&self.filter));
                 None
@@ -977,22 +983,18 @@ impl App {
                 }
                 None
             }
-            // `RederiveDefaultBranches`, `DismissVanished` and the List-only half of
-            // `HalfPageDown`/`HalfPageUp` are all unbuilt (keybindings.md's "Not built yet").
-            // `keys::BindingTable::dispatch` never returns an unbuilt action
-            // ([`keys::lookup`]'s own doc comment), so `self.bindings.dispatch(self.focus,
-            // key)` above can never produce one of these; this arm exists only because the
-            // match itself has to name every `Action` variant, the same proof-made-loud shape
-            // the `unreachable!` arm just below already uses for
-            // `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
-            Some(
-                Action::RederiveDefaultBranches
-                | Action::DismissVanished
-                | Action::HalfPageDown
-                | Action::HalfPageUp,
-            ) => unreachable!(
-                "these actions are all unbuilt; dispatch never returns an unbuilt action"
-            ),
+            // `DismissVanished` and the List-only half of `HalfPageDown`/`HalfPageUp` are
+            // still unbuilt (keybindings.md's "Not built yet"). `keys::BindingTable::dispatch`
+            // never returns an unbuilt action ([`keys::lookup`]'s own doc comment), so
+            // `self.bindings.dispatch(self.focus, key)` above can never produce one of these;
+            // this arm exists only because the match itself has to name every `Action`
+            // variant, the same proof-made-loud shape the `unreachable!` arm just below
+            // already uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
+            Some(Action::DismissVanished | Action::HalfPageDown | Action::HalfPageUp) => {
+                unreachable!(
+                    "these actions are all unbuilt; dispatch never returns an unbuilt action"
+                )
+            }
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
             // when they fire; this arm exists only because a match guard does not count
@@ -4140,6 +4142,144 @@ mod tests {
             Some(repo_b_original_branch.as_str()),
             "a row the Selection never covered must still be running on its older \
              Generation, i.e. still show its pre-refresh branch"
+        );
+    }
+
+    /// The resolved default branch name a probe actually wrote, or `None` while unsettled,
+    /// mirroring [`branch_name`] for the `default_branch` cell.
+    fn default_branch_name(entity: &EntityState) -> Option<String> {
+        match entity.default_branch.settled() {
+            Some(repon_core::Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => Some(value.name().to_string()),
+            _ => None,
+        }
+    }
+
+    /// Adds a `[remote "origin"]` config entry naming a URL nothing ever connects to: gix's
+    /// own fetch-default remote choice reads git config, not `refs/remotes/` alone, so
+    /// [`set_local_origin_head`]'s hand-written tracking refs need this to be found by rung 2
+    /// or rung 3 at all.
+    fn add_fake_remote(repo: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://rederive-fixture.invalid/repo.git",
+            ])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+    }
+
+    /// Points `repo`'s `origin/HEAD` at `branch`, entirely on local refs: no remote is ever
+    /// contacted, since `repon`'s own build of `repon-core` never turns on the `fetch` cargo
+    /// feature, so `default_branch.rs`'s local chain (rungs 1 to 4, all plain ref reads) is
+    /// the only half of ADR 0012 reachable from this crate's own tests.
+    fn set_local_origin_head(repo: &std::path::Path, branch: &str) {
+        let sha = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(sha.status.success());
+        let sha = String::from_utf8(sha.stdout).expect("utf8 sha");
+        let sha = sha.trim();
+        for args in [
+            vec!["update-ref", &format!("refs/remotes/origin/{branch}"), sha],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&args)
+                .status()
+                .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    /// Criterion 4: `b` (`Action::RederiveDefaultBranches`) re-derives `default_branch` alone,
+    /// over the Selection, without touching anything else. Two claims, checked in one
+    /// fixture: `repo-b`, outside the Selection, is left on its pre-press default branch
+    /// answer even though its own local chain also changed; and `repo-a`, inside the
+    /// Selection, has its `default_branch` cell actually move while its `branch` cell (a
+    /// stand-in for "everything else on the row") does not, which is what tells this apart
+    /// from a build that quietly ran a full `RefreshSelection` instead. `repo-a`'s branch is
+    /// changed externally between the two presses so a `branch` cell that was wrongly
+    /// re-probed would show it; `default_branch` moving without `branch` moving is proof one
+    /// ran and the other did not.
+    #[test]
+    fn rederive_default_branches_re_derives_only_default_branch_over_the_selection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        add_fake_remote(&repo_a);
+        add_fake_remote(&repo_b);
+        set_local_origin_head(&repo_a, "main");
+        set_local_origin_head(&repo_b, "main");
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+
+        let original_snapshot = app.core.snapshot();
+        let repo_a_original_branch = branch_name(entity_for(&original_snapshot, &repo_a))
+            .expect("repo-a has a settled branch before the rederive");
+        let repo_a_original_default_branch =
+            default_branch_name(entity_for(&original_snapshot, &repo_a));
+        let repo_b_original_default_branch =
+            default_branch_name(entity_for(&original_snapshot, &repo_b))
+                .expect("repo-b has a settled default branch before the rederive");
+        let key_a = entity_for(&original_snapshot, &repo_a).key.clone();
+        app.selection.toggle(key_a);
+
+        // Both rows' local chains change after the first refresh: only `repo-a`'s own change
+        // must ever be picked up.
+        checkout_new_branch(&repo_a, "after-rederive-a");
+        set_local_origin_head(&repo_a, "after-rederive-a");
+        set_local_origin_head(&repo_b, "trunk");
+
+        app.handle_key_event(press(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("handle RederiveDefaultBranches");
+        app.core.settle(Duration::from_secs(5));
+
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            default_branch_name(entity_for(&snapshot, &repo_a)),
+            Some("origin/after-rederive-a".to_string()),
+            "the Selection's own row must pick up its own, freshly changed default branch"
+        );
+        assert_ne!(
+            default_branch_name(entity_for(&snapshot, &repo_a)),
+            repo_a_original_default_branch,
+            "the rederive must actually have moved the cell, not merely left it as it was"
+        );
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_a)).as_deref(),
+            Some(repo_a_original_branch.as_str()),
+            "the Selection's own row must have only its default_branch cell re-derived; its \
+             branch cell, changed externally at the same time, must still show the old value"
+        );
+        assert_eq!(
+            default_branch_name(entity_for(&snapshot, &repo_b)),
+            Some(repo_b_original_default_branch),
+            "a row outside the Selection must keep its pre-press default branch answer even \
+             though its own local chain changed too"
         );
     }
 

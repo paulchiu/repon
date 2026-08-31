@@ -612,6 +612,37 @@ mod tests {
         );
     }
 
+    /// [ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)'s
+    /// "no equivalent of setting the remote head exists anywhere": gix has no higher-level
+    /// `set-head`, so the only way to write a symbolic ref such as
+    /// `refs/remotes/<remote>/HEAD` is a hand-built `RefEdit` whose new target is an owned
+    /// `gix::refs::Target::Symbolic`, the mutable counterpart of the `TargetRef::Symbolic`
+    /// every read of `origin/HEAD` already matches against (`default_branch.rs`'s own rung
+    /// 2). No code path may construct one, anywhere in the workspace. The needle stops at the
+    /// opening paren, per this module's own convention, so a call whose arguments wrap under
+    /// rustfmt is still caught, and it is built through `format!` so this very assertion is
+    /// never itself a match.
+    #[test]
+    fn no_remote_head_is_ever_written_back_to_a_reference() {
+        let dirs = workspace_crate_src_dirs();
+        let files_scanned: usize = dirs.iter().map(|dir| rust_source_files(dir).len()).sum();
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let needle = format!("Target::{}(", "Symbolic");
+        let offending = production_lines_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found a hand-built symbolic ref target (`gix::refs::Target::Symbolic`), the only \
+             way to write `refs/remotes/<remote>/HEAD`; ADR 0012 keeps the network's advertised \
+             default branch in memory only and never writes it back, at: {offending:?}"
+        );
+    }
+
     /// Criterion 8's absence half: there is no per-step timeout, configurable or fixed. The
     /// needle is the `wait-timeout` crate's own method name with its call parenthesis, which
     /// is specific enough to miss `repon-core`'s own, unrelated

@@ -434,6 +434,21 @@ pub struct Core {
     #[cfg(feature = "fetch")]
     #[allow(dead_code)] // read only by fetch_cycle_count_for_test
     fetch_cycle_count: Arc<AtomicUsize>,
+    /// The network's advertised default branch, per common dir, read from a fetch
+    /// handshake's own advertised HEAD alone
+    /// ([default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+    /// "The network"): present only once the periodic fetch or
+    /// [`Core::rederive_default_branches`] has actually reached that remote.
+    /// Superseded there, never here on read; consulted by every default-branch
+    /// probe this crate runs, so an answer landed by one persists across every
+    /// later Generation for the life of this `Core`, which is what "supersedes
+    /// the local one for that session" means: never written back to any
+    /// reference, and gone the moment this `Core` is dropped, per ADR 0012.
+    /// Always present, even without the `fetch` cargo feature, so every probe
+    /// site reads the same field regardless: without the feature nothing ever
+    /// writes to it, so a lookup here always misses, the same "inert" shape
+    /// [`FetchSpec`] already takes.
+    network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
 }
 
 /// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
@@ -493,6 +508,127 @@ impl Core {
         self.refresh_handles().dispatch(order)
     }
 
+    /// Re-derives `default_branch` alone for every key in `keys` already known to
+    /// the table, in a fresh Generation, per
+    /// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+    /// "A user-triggered re-derive over the Selection ... on demand" and
+    /// [keybindings.md](https://github.com/paulchiu/repon/blob/main/docs/spec/keybindings.md)'s
+    /// `b`. Unlike [`Self::refresh`], this never re-runs discovery and never
+    /// touches any other cell on any entity, known or not: a key outside `keys`
+    /// is left exactly as it was, and so is every cell but `default_branch` on a
+    /// key inside it.
+    ///
+    /// Runs the local chain exactly as any other refresh would, then, where this
+    /// crate is built with the `fetch` cargo feature, a handshake-only network
+    /// probe per distinct common dir among `keys` (`fetch::probe_remote_head`):
+    /// no pack requested and no ref updated, which is "without fetching". Its
+    /// answer, once landed on `network_default_branch`, is what
+    /// `supersede_with_network` applies here and on every later probe of that
+    /// common dir for the life of this `Core`. Without the feature, only the
+    /// local chain runs, the same "inert" shape the periodic fetch itself takes.
+    ///
+    /// Returns immediately: the probes run on a plain thread, never rayon's
+    /// global pool, for the reason `fetch::run_bounded`'s own doc comment gives
+    /// the periodic fetch's identical choice: a remote blocked on the network
+    /// for seconds must never take a worker away from the pool every other
+    /// probe shares.
+    pub fn rederive_default_branches(&self, keys: &[EntityKey]) -> Generation {
+        let generation = {
+            let mut table = self.table.write().unwrap();
+            table.generation += 1;
+            Generation::new(table.generation)
+        };
+
+        let dispatched: Vec<RederiveCandidate> = {
+            let mut table = self.table.write().unwrap();
+            let mut dispatched = Vec::new();
+            for key in keys {
+                let Some(&idx) = table.index.get(key) else {
+                    continue;
+                };
+                table.entities[idx].default_branch.begin_probe();
+                let common_dir = Arc::clone(&table.entities[idx].common_dir);
+                let override_branch = find_override(&self.overrides, key.path(), &common_dir)
+                    .and_then(|entry| entry.default_branch.clone());
+                let repo = table.repos.get(key).cloned();
+                let kind = table.entities[idx].kind;
+                dispatched.push(RederiveCandidate {
+                    key: key.clone(),
+                    path: key.path().to_path_buf(),
+                    common_dir,
+                    repo,
+                    override_branch,
+                    kind,
+                });
+            }
+            dispatched
+        };
+
+        if dispatched.is_empty() {
+            return generation;
+        }
+
+        {
+            let (lock, _cvar) = &*self.settle_gate;
+            *lock.lock().unwrap() += dispatched.len();
+        }
+
+        let table = Arc::clone(&self.table);
+        let settle_gate = Arc::clone(&self.settle_gate);
+        let network_default_branch = Arc::clone(&self.network_default_branch);
+        thread::spawn(move || {
+            let common_dirs: HashSet<Arc<Path>> = dispatched
+                .iter()
+                .map(|candidate| Arc::clone(&candidate.common_dir))
+                .collect();
+            probe_network_default_branches(&common_dirs, &network_default_branch);
+
+            // Scoped to this one call, never shared with a concurrent `refresh`'s own
+            // memo: the local chain's own per-common-dir facts are cheap enough
+            // (`default-branch.md`'s "about 20ms") that a fresh cache here costs this
+            // call nothing a shared one would have saved.
+            let chain_cache: ChainFactsCache = Mutex::new(HashMap::new());
+            let chain_reads = AtomicUsize::new(0);
+            let never_cancelled = AtomicBool::new(false);
+
+            for candidate in dispatched {
+                let RederiveCandidate {
+                    key,
+                    path,
+                    common_dir,
+                    repo,
+                    override_branch,
+                    kind,
+                } = candidate;
+                let network_branch = network_branch_for(&network_default_branch, &common_dir);
+                let resolution = probe_default_branch_memoised(
+                    &path,
+                    repo.as_deref(),
+                    &common_dir,
+                    DefaultBranchHints {
+                        override_branch: override_branch.as_deref(),
+                        network_branch: network_branch.as_deref(),
+                    },
+                    kind,
+                    &never_cancelled,
+                    &ChainFactsMemo {
+                        cache: &chain_cache,
+                        reads: &chain_reads,
+                    },
+                );
+                {
+                    let mut table = table.write().unwrap();
+                    if let (Some(&idx), Some(resolution)) = (table.index.get(&key), resolution) {
+                        table.entities[idx].apply_default_branch_resolution(generation, resolution);
+                    }
+                }
+                complete_one(&settle_gate);
+            }
+        });
+
+        generation
+    }
+
     /// Clones out every `Arc` a Generation's dispatch reads, plus the plain data
     /// ([`SetSpec`], the two durations) it cannot share by reference: a handful of
     /// refcount bumps, never a copy of the table itself. This is what lets
@@ -517,6 +653,7 @@ impl Core {
             patch_scan_bounds: Arc::clone(&self.patch_scan_bounds),
             dispatch_log: Arc::clone(&self.dispatch_log),
             phase_c_gates: Arc::clone(&self.phase_c_gates),
+            network_default_branch: Arc::clone(&self.network_default_branch),
         }
     }
 
@@ -576,7 +713,11 @@ impl Core {
         let default_branch_outcome = probe_default_branch(
             key.path(),
             cached_repo.as_deref(),
-            override_branch.as_deref(),
+            DefaultBranchHints {
+                override_branch: override_branch.as_deref(),
+                network_branch: network_branch_for(&self.network_default_branch, &common_dir_hint)
+                    .as_deref(),
+            },
             kind,
             &never_cancelled,
         );
@@ -993,6 +1134,10 @@ struct RefreshHandles {
     patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
     dispatch_log: Arc<Mutex<Vec<EntityKey>>>,
     phase_c_gates: Arc<Mutex<HashMap<EntityKey, PhaseCGateHandle>>>,
+    /// [`Core::network_default_branch`]'s own clone: [`run_fetch_cycle`] writes
+    /// into it once a fetch's own handshake advertises a HEAD, and this
+    /// dispatch's own default-branch probes read it back the same Generation.
+    network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
 }
 
 impl RefreshHandles {
@@ -1074,6 +1219,14 @@ impl RefreshHandles {
                     .and_then(|entry| entry.default_branch.clone())
             })
             .collect();
+        let network_branches: Vec<Option<Arc<str>>> = dispatched
+            .iter()
+            .map(|(key, _)| {
+                let idx = table.index[key];
+                let common_dir = &table.entities[idx].common_dir;
+                network_branch_for(&self.network_default_branch, common_dir)
+            })
+            .collect();
         let common_dirs: Vec<Arc<Path>> = dispatched
             .iter()
             .map(|(key, _)| Arc::clone(&table.entities[table.index[key]].common_dir))
@@ -1118,12 +1271,19 @@ impl RefreshHandles {
         });
 
         for (
-            ((((((key, cancel), repo), override_branch), common_dir), probes_state), probes_base),
+            (
+                (
+                    (((((key, cancel), repo), override_branch), network_branch), common_dir),
+                    probes_state,
+                ),
+                probes_base,
+            ),
             kind,
         ) in dispatched
             .into_iter()
             .zip(repos)
             .zip(override_branches)
+            .zip(network_branches)
             .zip(common_dirs)
             .zip(probes_state)
             .zip(probes_base)
@@ -1157,7 +1317,10 @@ impl RefreshHandles {
                     &path,
                     repo.as_deref(),
                     &common_dir,
-                    override_branch.as_deref(),
+                    DefaultBranchHints {
+                        override_branch: override_branch.as_deref(),
+                        network_branch: network_branch.as_deref(),
+                    },
                     kind,
                     &cancel,
                     &ChainFactsMemo {
@@ -1416,6 +1579,7 @@ impl Core {
             &self.show_submodules,
             &self.poll_reprobed,
             &self.poll_sweep_count,
+            &self.network_default_branch,
         );
     }
 
@@ -1849,12 +2013,14 @@ fn start_internal(
     let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
     let poll_reprobed = Arc::new(Mutex::new(Vec::new()));
     let poll_sweep_count = Arc::new(AtomicUsize::new(0));
+    let network_default_branch = Arc::new(Mutex::new(HashMap::new()));
     let (control, control_rx) = crossbeam_channel::unbounded();
     let poll_handles = PollHandles {
         overrides: Arc::clone(&overrides),
         show_submodules: Arc::clone(&show_submodules),
         poll_reprobed: Arc::clone(&poll_reprobed),
         poll_sweep_count: Arc::clone(&poll_sweep_count),
+        network_default_branch: Arc::clone(&network_default_branch),
     };
 
     // Hoisted out of the `Core` struct literal below, rather than built inline
@@ -1884,6 +2050,7 @@ fn start_internal(
         patch_scan_bounds: Arc::clone(&patch_scan_bounds),
         dispatch_log: Arc::clone(&dispatch_log),
         phase_c_gates: Arc::clone(&phase_c_gates),
+        network_default_branch: Arc::clone(&network_default_branch),
     };
     let auto_update_enabled = spec.auto_update.enabled;
     let fetch_schedule = FetchSchedule {
@@ -1954,6 +2121,7 @@ fn start_internal(
             poll_sweep_count,
             #[cfg(feature = "fetch")]
             fetch_cycle_count,
+            network_default_branch,
         },
         clock_alive: alive,
         discovery_watcher,
@@ -1968,6 +2136,10 @@ struct PollHandles {
     show_submodules: Arc<AtomicBool>,
     poll_reprobed: Arc<Mutex<Vec<EntityKey>>>,
     poll_sweep_count: Arc<AtomicUsize>,
+    /// [`Core::network_default_branch`]'s own clone, so a poll-triggered re-probe
+    /// still reflects an already-superseded default branch rather than reverting
+    /// to the local chain's own answer until the next full refresh.
+    network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
 }
 
 /// What [`start_internal`] needs from `CoreSpec::fetch` to schedule the periodic fetch,
@@ -2057,6 +2229,7 @@ fn spawn_clock_thread(
                             &poll.show_submodules,
                             &poll.poll_reprobed,
                             &poll.poll_sweep_count,
+                            &poll.network_default_branch,
                         );
                         sweep_deadline(&table, &settle_gate, generation_deadline);
                     }
@@ -2124,7 +2297,25 @@ fn run_fetch_cycle(
         // failure or one unreachable remote must never stop the rest of the
         // cycle from running, so a per-repository error is swallowed here
         // rather than aborting the whole cycle.
-        let _ = crate::fetch::fetch_and_prune(&common_dir, &cancel);
+        if let Ok(outcome) = crate::fetch::fetch_and_prune(&common_dir, &cancel) {
+            // The handshake this fetch already paid for is what
+            // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+            // "The network" means by "arrives inside a round trip already being
+            // paid for": landed here, before `refresh.dispatch` below re-runs
+            // the local chain, so the local answer always computes first and
+            // this only ever supersedes it. `Unborn` and a missing answer both
+            // leave any earlier session answer for this common dir untouched,
+            // since neither is itself a fact worth overwriting one with.
+            if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
+                outcome.advertised_default_branch
+            {
+                refresh
+                    .network_default_branch
+                    .lock()
+                    .unwrap()
+                    .insert(common_dir.clone(), Arc::from(name));
+            }
+        }
     });
 
     // The fast-forward-only auto-update rides this cycle rather than a timer of its
@@ -2204,6 +2395,51 @@ fn distinct_fetchable_common_dirs(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// [`Core::rederive_default_branches`]'s own network half: a handshake-only probe
+/// per `common_dir`, landing a `Branch` answer on `network_default_branch` for
+/// [`supersede_with_network`] to read back. `Unborn` and a probe failure both
+/// leave any earlier session answer for that common dir untouched, the same
+/// convention [`run_fetch_cycle`] already follows.
+#[cfg(feature = "fetch")]
+fn probe_network_default_branches(
+    common_dirs: &HashSet<Arc<Path>>,
+    network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
+) {
+    for common_dir in common_dirs {
+        if let Ok(Some(crate::fetch::AdvertisedDefaultBranch::Branch(name))) =
+            crate::fetch::probe_remote_head(common_dir)
+        {
+            network_default_branch
+                .lock()
+                .unwrap()
+                .insert(common_dir.to_path_buf(), Arc::from(name));
+        }
+    }
+}
+
+/// Without the `fetch` cargo feature, [`Core::rederive_default_branches`] runs
+/// the local chain alone: there is no blocking network client to probe with, the
+/// same "inert" shape [`FetchSpec`] already takes.
+#[cfg(not(feature = "fetch"))]
+fn probe_network_default_branches(
+    _common_dirs: &HashSet<Arc<Path>>,
+    _network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
+) {
+}
+
+/// One entity [`Core::rederive_default_branches`] gathered under the table lock,
+/// everything its own spawned thread needs to re-run the default-branch chain
+/// without holding that lock while it does: a plain struct rather than a tuple,
+/// per this crate's own `clippy::type_complexity` budget.
+struct RederiveCandidate {
+    key: EntityKey,
+    path: PathBuf,
+    common_dir: Arc<Path>,
+    repo: Option<Arc<gix::ThreadSafeRepository>>,
+    override_branch: Option<String>,
+    kind: Kind,
+}
+
 /// One entity as the metadata poll sweep found it, everything gathered under one
 /// read lock so the filesystem stats and any re-probe below run outside it.
 struct PollCandidate {
@@ -2239,6 +2475,7 @@ fn run_poll_sweep(
     show_submodules: &Arc<AtomicBool>,
     poll_reprobed: &Arc<Mutex<Vec<EntityKey>>>,
     poll_sweep_count: &Arc<AtomicUsize>,
+    network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
 ) {
     poll_sweep_count.fetch_add(1, Ordering::Release);
     poll_reprobed.lock().unwrap().clear();
@@ -2319,7 +2556,11 @@ fn run_poll_sweep(
             &candidate.path,
             repo,
             &candidate.common_dir,
-            override_branch.as_deref(),
+            DefaultBranchHints {
+                override_branch: override_branch.as_deref(),
+                network_branch: network_branch_for(network_default_branch, &candidate.common_dir)
+                    .as_deref(),
+            },
             candidate.kind,
             &never_cancelled,
             &ChainFactsMemo {
@@ -2747,9 +2988,60 @@ fn classify_status_result(
     }
 }
 
+/// Rung 1's config override and the network's session-held answer, bundled into
+/// one argument the way [`ChainFactsMemo`] bundles its own two: both
+/// [`probe_default_branch`] and [`probe_default_branch_memoised`] already sit at
+/// clippy's argument limit, and the two hints always travel together, one per
+/// dispatched entity.
+struct DefaultBranchHints<'a> {
+    /// Matched by common dir before this is called; `None` when no `[[repo]]`
+    /// entry names this entity's own default branch.
+    override_branch: Option<&'a str>,
+    /// [`network_branch_for`]'s own answer for this entity's common dir; `None`
+    /// until a fetch handshake or [`Core::rederive_default_branches`] has
+    /// actually reached that remote this session.
+    network_branch: Option<&'a str>,
+}
+
+/// [`Core::network_default_branch`]'s own lookup, by common dir: a small helper
+/// so every probe site reads it the same way rather than repeating the lock and
+/// clone.
+fn network_branch_for(
+    network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
+    common_dir: &Path,
+) -> Option<Arc<str>> {
+    network_default_branch
+        .lock()
+        .unwrap()
+        .get(common_dir)
+        .cloned()
+}
+
+/// Supersedes `resolution`'s own settled value with `network_branch`, if given,
+/// per [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+/// "The network": never the primary source, so `resolution` is always the local
+/// chain's own complete answer, computed unconditionally by the caller before
+/// this ever runs. This is the one place ADR 0012's stated ceiling is actually
+/// closed: on a Repo where rung 2 and rung 3 agree and are both wrong (the
+/// hidden-Submodule case the ADR measures), no local rung can ever correct
+/// itself, and only a reachable remote's own answer, landed here, can.
+fn supersede_with_network(
+    mut resolution: default_branch::Resolution,
+    network_branch: Option<&str>,
+) -> default_branch::Resolution {
+    if let Some(name) = network_branch {
+        resolution.settled = Settled::Known {
+            value: DefaultBranch::new(name.into()),
+            at: Timestamp::now(),
+            stale: false,
+        };
+    }
+    resolution
+}
+
 /// Runs the four-rung default branch chain against `path`, or `None` if `cancel`
-/// was already set before the read started. `override_branch` is rung 1's
-/// config-supplied value, already matched by common dir before this is called.
+/// was already set before the read started, then [`supersede_with_network`]s the
+/// result with `hints.network_branch`.
 ///
 /// `repo` follows the same cached-handle convention as [`probe_branch`]: `None`
 /// falls back to opening fresh, which is where an unreadable repository surfaces
@@ -2757,7 +3049,7 @@ fn classify_status_result(
 fn probe_default_branch(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
-    override_branch: Option<&str>,
+    hints: DefaultBranchHints<'_>,
     kind: Kind,
     cancel: &AtomicBool,
 ) -> Option<default_branch::Resolution> {
@@ -2780,9 +3072,9 @@ fn probe_default_branch(
             }
         },
     };
-    Some(default_branch::resolve(
-        &repo.to_thread_local(),
-        override_branch,
+    Some(supersede_with_network(
+        default_branch::resolve(&repo.to_thread_local(), hints.override_branch),
+        hints.network_branch,
     ))
 }
 
@@ -3151,7 +3443,7 @@ fn probe_default_branch_memoised(
     path: &Path,
     repo: Option<&gix::ThreadSafeRepository>,
     common_dir: &Arc<Path>,
-    override_branch: Option<&str>,
+    hints: DefaultBranchHints<'_>,
     kind: Kind,
     cancel: &AtomicBool,
     memo: &ChainFactsMemo<'_>,
@@ -3179,7 +3471,10 @@ fn probe_default_branch_memoised(
     let facts = chain_facts_for(memo.cache, common_dir, memo.reads, || {
         default_branch::ChainFacts::resolve(&local)
     });
-    Some(default_branch::resolve_with_facts(&facts, override_branch))
+    Some(supersede_with_network(
+        default_branch::resolve_with_facts(&facts, hints.override_branch),
+        hints.network_branch,
+    ))
 }
 
 /// Phase A and B's per-cell outcomes, landed as soon as they are computed via
@@ -9768,6 +10063,201 @@ mod tests {
                 }),
                 "the eligible branch must fast-forward on the immediate cycle alone, \
                  with no fetch tick and no auto-update tick of its own"
+            );
+        }
+    }
+
+    /// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+    /// "The network": criterion 3 (the local chain answers first, and only a later network
+    /// round trip supersedes it) and criterion 4 (`Core::rederive_default_branches` runs the
+    /// same lookup on demand, over exactly the given keys, without fetching). Every fixture
+    /// here is a bare repo this test creates plus a real `git clone` of it, the same standing
+    /// constraint `fetch_scheduler` above already follows.
+    #[cfg(feature = "fetch")]
+    mod network_default_branch {
+        use super::*;
+
+        fn seeded_remote() -> tempfile::TempDir {
+            let remote = tempfile::tempdir().expect("temp dir");
+            crate::test_support::init_bare(remote.path());
+            crate::test_support::push_new_commit(remote.path(), "README.md", "seed\n");
+            remote
+        }
+
+        fn clone_into(remote: &Path, dest: &Path) {
+            let status = Command::new("git")
+                .arg("clone")
+                .arg(remote)
+                .arg(dest)
+                .status()
+                .expect("run git clone");
+            assert!(status.success());
+            crate::test_support::set_identity(dest);
+        }
+
+        /// Sets `path`'s own `HEAD` (a bare repo, so this is the "remote"'s advertised
+        /// answer) to point at `branch`, without checking anything out.
+        fn set_remote_head(path: &Path, branch: &str) {
+            git(
+                path,
+                &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+            );
+        }
+
+        fn rev_parse(path: &Path, rev: &str) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", rev])
+                .output()
+                .expect("run git rev-parse");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .expect("utf8 sha")
+                .trim()
+                .to_string()
+        }
+
+        fn default_branch_name(entity: &EntityState) -> Option<String> {
+            match entity.default_branch.settled() {
+                Some(Settled::Known {
+                    value,
+                    at: _,
+                    stale: _,
+                }) => Some(value.name().to_string()),
+                _ => None,
+            }
+        }
+
+        /// Criterion 3: with a reachable remote whose advertised HEAD differs from the
+        /// clone's own cached `origin/HEAD`, a plain refresh still answers from the local
+        /// chain alone (the network is never consulted just to render a Generation), and
+        /// only [`Core::rederive_default_branches`] actually reaching the remote supersedes
+        /// it, for the rest of this `Core`'s own session (default-branch.md's "The network":
+        /// "supersedes the local one for that session"). The mutation this is chosen to
+        /// catch: were `supersede_with_network` never applied (or applied unconditionally
+        /// before the local chain even ran), either the first assertion would already read
+        /// `origin/trunk`, or the second would still read `origin/main`.
+        #[test]
+        fn the_local_chain_answers_first_and_only_a_later_network_round_trip_supersedes_it() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo_path = root_path.join("repo");
+            clone_into(remote.path(), &repo_path);
+
+            // The clone's own cached `origin/HEAD` still names `main`; the remote's own
+            // current answer is changed to a different, real branch only after cloning.
+            git(remote.path(), &["branch", "trunk"]);
+            set_remote_head(remote.path(), "trunk");
+
+            let core = Core::start(spec(vec![root_path]));
+            let key = core.snapshot().entities[0].key.clone();
+
+            core.refresh(std::slice::from_ref(&key));
+            let settled = core.settle(Duration::from_millis(500));
+            assert_eq!(
+                default_branch_name(&settled.entities[0]),
+                Some("origin/main".to_string()),
+                "a plain refresh must answer from the local chain alone, unaffected by the \
+                 remote's own current (but not yet asked) truth"
+            );
+
+            core.rederive_default_branches(std::slice::from_ref(&key));
+            let settled = core.settle(Duration::from_millis(2000));
+            assert_eq!(
+                default_branch_name(&settled.entities[0]),
+                Some("origin/trunk".to_string()),
+                "once the network round trip actually ran, its own differing answer must \
+                 supersede the local chain's"
+            );
+        }
+
+        /// Criterion 4: [`Core::rederive_default_branches`] runs the same lookup on demand,
+        /// over exactly the given keys, without fetching. "Without fetching" is shown the
+        /// way `fetch.rs`'s own `a_fetch_transfers_new_commits_so_a_behind_count_can_move`
+        /// shows a real fetch moving one, the mirror image: the remote gains a new commit
+        /// after the clone, and this call must leave the clone's own remote-tracking ref
+        /// exactly where it was, because `probe_remote_head`'s handshake-only lookup
+        /// transfers no pack. "Over the Selection" is exercised as "over exactly the given
+        /// keys": a second, unrelated repo stands in for a row outside it, and its whole
+        /// entity state (every cell, not only `default_branch`) is asserted unchanged.
+        #[test]
+        fn rederive_default_branches_never_fetches_and_leaves_a_row_outside_it_untouched() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let selected_path = root_path.join("selected");
+            let outside_path = root_path.join("outside");
+            clone_into(remote.path(), &selected_path);
+            init_repo_with_a_commit(&outside_path);
+
+            git(remote.path(), &["branch", "trunk"]);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            set_remote_head(remote.path(), "trunk");
+            let before_tracking = rev_parse(&selected_path, "refs/remotes/origin/main");
+
+            let core = Core::start(spec(vec![root_path]));
+            let snapshot = core.snapshot();
+            let selected_key = snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == selected_path)
+                .expect("discovered the selected repo")
+                .key
+                .clone();
+            let outside_key = snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == outside_path)
+                .expect("discovered the outside repo")
+                .key
+                .clone();
+
+            core.refresh(&[selected_key.clone(), outside_key.clone()]);
+            let settled = core.settle(Duration::from_millis(500));
+            let outside_before = format!(
+                "{:?}",
+                settled
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == outside_key)
+                    .expect("outside entity present")
+            );
+
+            core.rederive_default_branches(std::slice::from_ref(&selected_key));
+            let settled = core.settle(Duration::from_millis(2000));
+
+            let selected_after = settled
+                .entities
+                .iter()
+                .find(|entity| entity.key == selected_key)
+                .expect("selected entity present");
+            assert_eq!(
+                default_branch_name(selected_after),
+                Some("origin/trunk".to_string()),
+                "the rederive must have reached the remote's own current, differing answer"
+            );
+
+            let after_tracking = rev_parse(&selected_path, "refs/remotes/origin/main");
+            assert_eq!(
+                before_tracking, after_tracking,
+                "a rederive must never fetch: the remote-tracking ref must not have moved \
+                 even though the remote gained a new commit"
+            );
+
+            let outside_after = format!(
+                "{:?}",
+                settled
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == outside_key)
+                    .expect("outside entity present")
+            );
+            assert_eq!(
+                outside_before, outside_after,
+                "a row outside the rederive's own keys must be left exactly as it was, not \
+                 only on its default_branch cell"
             );
         }
     }
