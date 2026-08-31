@@ -6,7 +6,7 @@ One file, `config.toml`, holds everything Repon can be told: the theme, the glyp
 
 | purpose | path on macOS | override |
 | --- | --- | --- |
-| config file | `~/.config/repon/config.toml` | `REPON_CONFIG` names the directory; `--config <path>` names the file and beats it |
+| config file | `~/.config/repon/config.toml` | `REPON_CONFIG` names the directory; `--config <path>` names the file and beats it. Either must exist if given, though a named directory holding no `config.toml` is zero config and runs |
 | themes | `~/.config/repon/themes/<name>.toml` | follows the config directory |
 | state | `~/Library/Application Support/repon/state.toml` | `REPON_DATA` |
 | log | `~/Library/Application Support/repon/repon.log` | `REPON_DATA` |
@@ -23,7 +23,8 @@ Four failure grades, deliberately a mirror of [theming.md](theming.md)'s table w
 
 | Case | Behaviour |
 | --- | --- |
-| Missing file | Not an error. Zero config: one implicit Set named `all`, rooted at the working directory |
+| Missing file at the default path | Not an error. Zero config: one implicit Set named `all`, rooted at the working directory |
+| A `--config` file or a `REPON_CONFIG` directory that does not exist | Exit non-zero before the terminal is claimed. The user named it, so running on the compiled-in defaults would present them as though that file had loaded ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)) |
 | Malformed TOML, or a bad value in a known key | Exit non-zero before the terminal is claimed, reporting toml's line and column |
 | Unknown key | Warn, name the key's dotted path, continue |
 | A `[[set]]` glob or a `[[repo]]` path that matches nothing | Warn |
@@ -33,6 +34,8 @@ The exit path renders `toml::de::Error`, which exposes `.message()` and `.span()
 A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
 
 A `theme` naming a theme that does not exist warns and falls back to the default, deliberately unlike `--theme <missing>`, which still exits: a flag is a thing typed moments ago and a file is a thing you have to go and fix.
+
+That axis decides the cosmetic cases only. The general rule is [0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)'s: a name that only changes appearance may fall back and warn, and **a name that bounds the work is never substituted**. An unresolvable `--set`, `REPON_SET`, `--config` or `REPON_CONFIG` therefore exits before the terminal is claimed, naming its own source and its value, because the substitute would decide what exists rather than how it looks.
 
 ## The shape of the document
 
@@ -84,7 +87,7 @@ A Set bounds the work. An entity excluded by a Set is never discovered and never
 
 Globs are matched by `globset` against the absolute path, case-sensitive, with `**` crossing directory boundaries. The case-sensitivity is deliberate: the design machine's filesystem is case-insensitive (APFS), so `exclude = ["**/Node_modules/**"]` would match when the OS opens the path and not match in Repon, and Repon's answer is the one that counts. A Submodule's path is tested the same way, even though it reaches the Set from its parent's `.gitmodules` rather than from the walk ([discovery.md](discovery.md)).
 
-Selection order: `--set <name>`, then `REPON_SET`, then the first declared Set, then the implicit `all`. `all` is reserved: declaring a Set named `all` warns and the declaration wins, because shadowing the implicit Set is a reasonable thing to want and silently having two is not. `repon sets` prints each Set's name, roots and match count.
+Selection order: `--set <name>`, then `REPON_SET`, then the first declared Set, then the implicit `all`. A name at either of the first two rungs that matches no declared Set does **not** fall through: Repon exits non-zero before the terminal is claimed, naming the flag or the variable and its value and pointing at `repon sets`. Falling through would substitute an arbitrary Set, the one that happens to be first in the file, for a name Repon could not resolve, and a Set decides what exists rather than what is visible ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)). This is startup only; a Set that vanishes on reload still degrades, per Reload below. `all` is reserved: declaring a Set named `all` warns and the declaration wins, because shadowing the implicit Set is a reasonable thing to want and silently having two is not. `repon sets` prints each Set's name, roots and match count.
 
 With no file at all there is one implicit Set, `all`, rooted at the working directory, everything included.
 
@@ -180,9 +183,9 @@ Across all 403 boundary-stopped entities in the two measured roots, zero names c
 
 | flag or subcommand | config key | notes |
 | --- | --- | --- |
-| `--set <name>` / `-s` | Set selection | Beats `REPON_SET` |
+| `--set <name>` / `-s` | Set selection | Beats `REPON_SET`. A name matching no declared Set exits, as does an unmatched `REPON_SET` |
 | `--theme <name>` | `theme` | A missing theme here exits, unlike the config key |
-| `--config <path>` | none | Beats `REPON_CONFIG` |
+| `--config <path>` | none | Beats `REPON_CONFIG`. A path that does not exist exits, unlike the default path being absent |
 | `--filter <text>` | none | Transient, beats stored state |
 | `--no-fetch` | `fetch.enabled` | Forces off |
 | `--tick-rate`, `--frame-rate` | none | Hidden; render-loop debug knobs, not preferences |
@@ -205,7 +208,7 @@ Checked at load, each a warning rather than an exit:
 
 Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). There is no file watcher. Because that keystroke can change the keyboard itself, the footer and the help overlay are derived from the binding table rather than written as strings; [keybindings.md](keybindings.md) carries the rule.
 
-`theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in the status bar.
+`theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in the status bar. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
 
 Paths that came from a flag or the environment are fixed for the process, since re-resolving them mid-session would move the file just edited.
 
