@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use color_eyre::eyre::{Result, eyre};
 use repon_core::{Core, CoreSpec, SetSpec};
 
 use super::{App, entity_keys};
@@ -54,32 +55,34 @@ impl ActiveSet {
 /// `REPON_SET`, then the first declared Set, which is already the implicit `all` Set when
 /// the file declared none (`document::load` leaves it there as `sets[0]`, so this function
 /// never special-cases "no Sets declared" itself).
-// TODO(#127): the fall-through below is now against the design of record. 0025 rules that a
-// name bounding the work is never substituted, so an unmatched `--set` or `REPON_SET` exits
-// non-zero before the terminal is claimed and this function becomes fallible. The reload
-// precedent it followed does not reach startup: `reload_config`'s own reason for that grade
-// is that the terminal is already claimed, which is not true here.
+///
+/// A name at either of the first two rungs that matches no declared Set is never substituted
+/// with another one: a Set bounds the work rather than merely how it looks
+/// ([0025](../../../../docs/adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)), so
+/// this returns a failure the caller reports and exits non-zero on, before `App::run` ever
+/// constructs a `Tui`, the same shape [`document::load`] and [`keys::merge`] already give
+/// their own startup grades. Each message names its own source and value and points at
+/// `repon sets`, which needs no terminal and is not scoped by the selection that just failed.
 pub(crate) fn resolve_startup_set<'a>(
     sets: &'a [document::SetConfig],
     flag: Option<&str>,
     env: Option<&str>,
-) -> &'a document::SetConfig {
+) -> Result<&'a document::SetConfig> {
     if let Some(name) = flag {
-        match sets.iter().find(|set| set.name.get_ref() == name) {
-            Some(set) => return set,
-            None => tracing::warn!("--set `{name}` names no declared Set; trying REPON_SET"),
-        }
+        return sets
+            .iter()
+            .find(|set| set.name.get_ref() == name)
+            .ok_or_else(|| eyre!("--set `{name}` names no declared Set; see `repon sets`"));
     }
     if let Some(name) = env {
-        match sets.iter().find(|set| set.name.get_ref() == name) {
-            Some(set) => return set,
-            None => tracing::warn!(
-                "REPON_SET `{name}` names no declared Set; falling back to the first declared Set"
-            ),
-        }
+        return sets
+            .iter()
+            .find(|set| set.name.get_ref() == name)
+            .ok_or_else(|| eyre!("REPON_SET `{name}` names no declared Set; see `repon sets`"));
     }
-    sets.first()
-        .expect("Document::load always leaves at least one Set, `all` if none was declared")
+    Ok(sets
+        .first()
+        .expect("Document::load always leaves at least one Set, `all` if none was declared"))
 }
 
 /// The Notice [`App::switch_to_set`] raises on a successful switch, and `reload_active_set`
@@ -545,7 +548,7 @@ mod tests {
     #[test]
     fn the_flag_beats_a_real_environment_value_and_the_first_declared_set() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, Some("gamma"), Some("beta"));
+        let chosen = resolve_startup_set(&sets, Some("gamma"), Some("beta")).expect("gamma exists");
         assert_eq!(chosen.name.get_ref(), "gamma");
     }
 
@@ -555,7 +558,7 @@ mod tests {
     #[test]
     fn the_environment_variable_beats_the_first_declared_set_when_no_flag_is_given() {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let chosen = resolve_startup_set(&sets, None, Some("beta"));
+        let chosen = resolve_startup_set(&sets, None, Some("beta")).expect("beta exists");
         assert_eq!(chosen.name.get_ref(), "beta");
     }
 
@@ -565,7 +568,7 @@ mod tests {
     #[test]
     fn the_first_declared_set_wins_with_no_flag_and_no_environment_value() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, None, None);
+        let chosen = resolve_startup_set(&sets, None, None).expect("a Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "alpha");
     }
 
@@ -578,26 +581,54 @@ mod tests {
     fn the_implicit_set_wins_when_none_is_declared_and_neither_flag_nor_environment_is_given() {
         let loaded = document::load(Path::new("/does/not/exist/anywhere/repon-config.toml"))
             .expect("a missing file is not an error");
-        let chosen = resolve_startup_set(&loaded.document.sets, None, None);
+        let chosen = resolve_startup_set(&loaded.document.sets, None, None)
+            .expect("the implicit `all` Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "all");
     }
 
-    /// A flag naming no declared Set warns and falls through to a real environment value
-    /// rather than stopping the chain: config.md draws the flag-exits-non-zero rule only for
-    /// `--theme`, never for `--set`.
+    /// Criterion 2: a flag naming no declared Set is an error naming the flag and the value
+    /// given, and never falls through to a real environment value that would have resolved,
+    /// which is what proves this is "never substituted" rather than merely "warns first".
     #[test]
-    fn an_unmatched_flag_falls_through_to_the_environment_variable_and_warns() {
+    fn an_unmatched_flag_is_an_error_naming_the_flag_and_value_and_never_falls_through_to_a_real_environment_value()
+     {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let logs = capture_tracing(|| {
-            resolve_startup_set(&sets, Some("nonexistent"), Some("beta"));
-        });
-        // `resolve_startup_set` returns a borrow into `sets`, so it is re-read here rather
-        // than kept alive across `capture_tracing`'s closure.
-        let chosen = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"));
-        assert_eq!(chosen.name.get_ref(), "beta");
+        let err = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"))
+            .expect_err("an unmatched --set must be an error, not a fallback");
+        let message = err.to_string();
         assert!(
-            logs.contains("nonexistent"),
-            "expected the unmatched flag value named in the warning, got: {logs:?}"
+            message.contains("--set"),
+            "expected the flag named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("nonexistent"),
+            "expected the offending value named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("repon sets"),
+            "expected the message to point at `repon sets`, got: {message:?}"
+        );
+    }
+
+    /// Criterion 3: `REPON_SET` naming no declared Set is an error naming the variable and the
+    /// value given, with no flag present to have taken precedence.
+    #[test]
+    fn an_unmatched_environment_variable_is_an_error_naming_the_variable_and_value() {
+        let sets = vec![named_set("alpha"), named_set("beta")];
+        let err = resolve_startup_set(&sets, None, Some("nonexistent"))
+            .expect_err("an unmatched REPON_SET must be an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("REPON_SET"),
+            "expected the variable named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("nonexistent"),
+            "expected the offending value named in the message, got: {message:?}"
+        );
+        assert!(
+            message.contains("repon sets"),
+            "expected the message to point at `repon sets`, got: {message:?}"
         );
     }
 
