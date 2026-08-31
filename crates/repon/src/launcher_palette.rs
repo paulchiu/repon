@@ -102,6 +102,13 @@ impl LauncherPalette {
         self.clamp_cursor(launchers);
     }
 
+    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
+    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    pub(crate) fn delete_previous_char(&mut self, launchers: &[Launcher]) {
+        self.query.pop();
+        self.clamp_cursor(launchers);
+    }
+
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word, the same shape
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
@@ -469,6 +476,42 @@ mod tests {
 
         palette.type_char('b', &launchers); // narrows to ["ab"] alone; cursor must clamp to 0
         assert_eq!(palette.highlighted(&launchers).unwrap().name, "ab");
+    }
+
+    #[test]
+    fn delete_previous_char_removes_the_last_character_and_re_narrows_the_match_list() {
+        let launchers = vec![launcher("reinstall"), launcher("deploy")];
+        let mut palette = LauncherPalette::new();
+        for c in "reinstallx".chars() {
+            palette.type_char(c, &launchers);
+        }
+        assert_eq!(
+            palette.matches(&launchers).len(),
+            0,
+            "\"reinstallx\" must match no configured launcher"
+        );
+
+        palette.delete_previous_char(&launchers);
+
+        assert_eq!(
+            palette.matches(&launchers).len(),
+            1,
+            "removing the trailing \"x\" must restore the \"reinstall\" match"
+        );
+    }
+
+    #[test]
+    fn delete_previous_char_on_an_empty_query_does_not_panic_and_leaves_it_empty() {
+        let launchers = vec![launcher("reinstall")];
+        let mut palette = LauncherPalette::new();
+
+        palette.delete_previous_char(&launchers);
+
+        assert_eq!(
+            palette.matches(&launchers).len(),
+            1,
+            "an empty query still matches everything"
+        );
     }
 
     #[test]
