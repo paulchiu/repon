@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(GlyphSet::for_config(Glyphs::Ascii), &ASCII);
     }
 
-    // --- pinning the in-cell value glyphs to layout-and-provenance.md (issue #44) ---
+    // --- pinning the in-cell value glyphs to layout-and-provenance.md ---
 
     /// The rows of layout-and-provenance.md's "In-cell glyphs for real values" table,
     /// each `| glyph | meaning |`, found by anchoring on that heading rather than the

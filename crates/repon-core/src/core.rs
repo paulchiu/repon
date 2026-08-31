@@ -5172,9 +5172,9 @@ mod tests {
         );
     }
 
-    // --- Phase B's comparison: the `sync` cell, end to end through a real `Core`
-    // (issue #44's six named cases, plus the two ways "every entity, every
-    // Generation" is most easily lost). ---
+    // --- Phase B's comparison: the `sync` cell, end to end through a real `Core`:
+    // the six named cases, plus the two ways "every entity, every Generation" is
+    // most easily lost. ---
 
     fn add_origin_remote(path: &Path) {
         git(

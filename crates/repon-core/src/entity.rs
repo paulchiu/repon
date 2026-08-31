@@ -514,7 +514,7 @@ mod tests {
     }
 
     /// Absence claim: the three `SyncState` variants are the whole set. This match has no
-    /// wildcard arm, so a fourth variant added to `SyncState` (issue #44) fails to compile
+    /// wildcard arm, so a fourth variant added to `SyncState` fails to compile
     /// here rather than silently falling through an `_`.
     #[test]
     fn sync_state_is_exactly_three_mutually_exclusive_variants() {

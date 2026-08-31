@@ -407,9 +407,9 @@ mod tests {
     }
 
     /// [`production_lines_containing`] without the comment exclusion, for an absence claim
-    /// that is explicitly about comments too, not only executable code: issue #44's
-    /// criterion 5 says "the code or comments", so a comment repeating a stale gloss must
-    /// trip this scan the same as a live line would.
+    /// that is explicitly about comments too, not only executable code: the claim covers
+    /// the code and its comments, so a comment repeating a stale gloss must trip this scan
+    /// the same as a live line would.
     fn production_lines_containing_including_comments(needle: &str) -> Vec<String> {
         let mut offending = Vec::new();
         for dir in workspace_crate_src_dirs() {
@@ -425,7 +425,7 @@ mod tests {
         offending
     }
 
-    /// Issue #44 criterion 2's absence half: [ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
+    /// [ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
     /// removed `Unknown::NoUpstream` and `Unknown::NoRemote` from the closed `Unknown`
     /// reason set, since a branch with no upstream and a Repo with no remote are both
     /// settled values (`-` and `∅`) rather than missing ones. The needle is the qualified
@@ -446,7 +446,7 @@ mod tests {
         }
     }
 
-    /// Issue #44 criterion 5's absence half: the corrected gloss from ADR 0019, false for a
+    /// The corrected gloss from ADR 0019, false for a
     /// detached HEAD and for every Submodule row already carrying `-`. Comment lines are not
     /// excluded here, unlike every other scan in this module: the criterion names comments
     /// explicitly, and a doc comment repeating the old, false gloss is exactly the defect
