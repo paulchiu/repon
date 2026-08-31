@@ -3067,7 +3067,8 @@ mod tests {
                 entity.branch.settled(),
                 Some(repon_core::Settled::Known {
                     value: repon_core::Head::Branch { name, .. },
-                    ..
+                    at: _,
+                    stale: _,
                 }) if &**name == "handoff-branch"
             ),
             "expected the branch the Launcher checked out to already be visible with no \
