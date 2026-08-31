@@ -82,6 +82,7 @@ pub use entity::Kind;
 pub use entity::Presence;
 pub use entity::StepOutcome;
 pub use entity::StepResult;
+pub use entity::SyncState;
 pub use entity::WorktreeState;
 pub use environment::environment;
 pub use git::{InProgressOperation, ProbeError, RecentCommit};

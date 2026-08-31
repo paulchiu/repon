@@ -19,11 +19,13 @@
 //! an Entity a later walk does not find goes [`crate::entity::Presence::Vanished`]
 //! rather than disappearing, and one an abandoned walk cannot finish in time takes
 //! its Set out of this automatic path until a fresh `Core` starts over different
-//! roots. The four probe phases beyond identity (`branch`) and `default_branch`
-//! are later work; this module probes only those two, the reads
-//! [`crate::git::head_shape`] and [`crate::default_branch::resolve`] already do
-//! correctly, so the threading and supersession machinery has a real payload to
-//! move rather than a stub. Nothing here is written to or read from disk, so
+//! roots. Phase C, status, is later work; this module already dispatches identity
+//! (`branch`), `default_branch`, Phase B's own comparison (`sync`) and Phase D's
+//! landing pass (`state`), the reads [`crate::git::head_shape`],
+//! [`crate::default_branch::resolve`], [`crate::git::resolve_sync`] and
+//! [`crate::landing::probe`] already do correctly, so the threading and
+//! supersession machinery has a real payload to move rather than a stub. Nothing
+//! here is written to or read from disk, so
 //! every `start` recomputes from scratch; the consequence is that first-frame
 //! speed has to come from progressive loading rather than a cache, which is
 //! future work this crate does not yet do (`start` blocks on its one discovery
@@ -44,7 +46,7 @@ use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
     ActionReceipt, DefaultBranch, EntityKey, EntityState, Head, Kind, Presence, StepOutcome,
-    StepResult, WorktreeState,
+    StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
@@ -365,6 +367,12 @@ impl Core {
         let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
 
         let branch_outcome = probe_branch(key.path(), cached_repo.as_deref(), &never_cancelled);
+        let sync_outcome = probe_sync(
+            key.path(),
+            cached_repo.as_deref(),
+            branch_outcome.as_ref().map(|(settled, ..)| settled),
+            &never_cancelled,
+        );
         let default_branch_outcome = probe_default_branch(
             key.path(),
             cached_repo.as_deref(),
@@ -419,6 +427,9 @@ impl Core {
         table.entities[idx].excluded = excluded;
         if let Some((settled, in_progress, recent)) = branch_outcome {
             table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
+        }
+        if let Some(settled) = sync_outcome {
+            table.entities[idx].sync.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
@@ -781,6 +792,12 @@ impl RefreshHandles {
             let bound_gates = Arc::clone(&bound_gates);
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), &cancel);
+                let sync_outcome = probe_sync(
+                    &path,
+                    repo.as_deref(),
+                    branch_outcome.as_ref().map(|(settled, ..)| settled),
+                    &cancel,
+                );
                 let default_branch_outcome = probe_default_branch_memoised(
                     &path,
                     repo.as_deref(),
@@ -819,6 +836,7 @@ impl RefreshHandles {
                     generation,
                     ProbeOutcomes {
                         branch: branch_outcome,
+                        sync: sync_outcome,
                         default_branch: default_branch_outcome,
                         state: state_outcome,
                     },
@@ -887,6 +905,42 @@ pub(crate) struct StartForTest {
     pub clock_alive: Arc<AtomicBool>,
     #[allow(dead_code)] // read only by tests; the plain lib target never builds them
     pub discovery_watcher: JoinHandle<()>,
+}
+
+impl Core {
+    /// Puts one already-known entity into the in-flight state a real `refresh`
+    /// dispatch would, without spawning anything to complete it, so a test can
+    /// drive the deadline sweep through the tick channel alone and prove the sweep
+    /// runs on a tick rather than on a clock of its own, or prove that `pause`
+    /// cancels a real in-flight entry from outside this crate.
+    ///
+    /// Gated behind `test-util` (on by default under `cfg(test)` for this crate's own
+    /// tests) so a test-only affordance never ships on the default published surface,
+    /// per [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md),
+    /// the same reason `Timestamp::at` is gated.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn begin_untracked_probe_for_test(&self, key: &EntityKey) -> Arc<AtomicBool> {
+        let mut table = self.table.write().unwrap();
+        table.generation += 1;
+        let generation_number = table.generation;
+        table
+            .generation_started_at
+            .insert(generation_number, Instant::now());
+        if let Some(&idx) = table.index.get(key) {
+            begin_probes(&mut table.entities[idx]);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        table.in_flight.insert(
+            key.clone(),
+            InFlight {
+                generation: generation_number,
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let (lock, _cvar) = &*self.settle_gate;
+        *lock.lock().unwrap() += 1;
+        cancel
+    }
 }
 
 #[cfg(test)]
@@ -976,33 +1030,6 @@ impl Core {
         self.discovery_manual.load(Ordering::Acquire)
     }
 
-    /// Puts one already-known entity into the in-flight state a real `refresh`
-    /// dispatch would, without spawning anything to complete it, so a test can
-    /// drive the deadline sweep through the tick channel alone and prove the sweep
-    /// runs on a tick rather than on a clock of its own.
-    pub(crate) fn begin_untracked_probe_for_test(&self, key: &EntityKey) -> Arc<AtomicBool> {
-        let mut table = self.table.write().unwrap();
-        table.generation += 1;
-        let generation_number = table.generation;
-        table
-            .generation_started_at
-            .insert(generation_number, Instant::now());
-        if let Some(&idx) = table.index.get(key) {
-            begin_probes(&mut table.entities[idx]);
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        table.in_flight.insert(
-            key.clone(),
-            InFlight {
-                generation: generation_number,
-                cancel: Arc::clone(&cancel),
-            },
-        );
-        let (lock, _cvar) = &*self.settle_gate;
-        *lock.lock().unwrap() += 1;
-        cancel
-    }
-
     /// Puts several already-known entities into the in-flight state of one shared
     /// Generation, without spawning anything to complete them and without
     /// touching the settle gate, so a test can drive per-entity supersession
@@ -1054,6 +1081,7 @@ impl Core {
             generation,
             ProbeOutcomes {
                 branch: Some((settled, None, Vec::new())),
+                sync: None,
                 default_branch: None,
                 state: None,
             },
@@ -1490,6 +1518,53 @@ fn probe_branch(
     Some((settled, in_progress, recent))
 }
 
+/// Phase B's comparison: the `sync` cell's ahead/behind counts against the
+/// branch's upstream, for every entity whose HEAD carries a branch, every
+/// Generation ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
+/// `None` if `cancel` was already set, or if `branch_settled` is itself `None`
+/// because the branch probe it depends on was cancelled first. A `Failed` branch
+/// read fails `sync` the same way, rather than guessing at a HEAD shape the
+/// branch probe itself could not read; every other shape (a live branch, a
+/// detached or unborn HEAD) is handed to [`git::resolve_sync`], which is where
+/// "no branch" and "no remote at all" settle to their own values. `repo` follows
+/// the same cached-handle convention as [`probe_branch`].
+fn probe_sync(
+    path: &Path,
+    repo: Option<&gix::ThreadSafeRepository>,
+    branch_settled: Option<&Settled<Head>>,
+    cancel: &AtomicBool,
+) -> Option<Settled<SyncState>> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let head = match branch_settled? {
+        Settled::Known { value, .. } => Some(value),
+        Settled::Failed(error) => return Some(Settled::Failed(error.clone())),
+        Settled::Unknown(_) | Settled::NotApplicable => None,
+    };
+    let opened;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => match git::open_thread_safe(path) {
+            Ok(repo) => {
+                opened = repo;
+                &opened
+            }
+            Err(error) => return Some(Settled::Failed(error)),
+        },
+    };
+    let local = repo.to_thread_local();
+    let settled = match git::resolve_sync(&local, head) {
+        Ok(value) => Settled::Known {
+            value,
+            at: Timestamp::now(),
+            stale: false,
+        },
+        Err(error) => Settled::Failed(error),
+    };
+    Some(settled)
+}
+
 /// Runs the four-rung default branch chain against `path`, or `None` if `cancel`
 /// was already set before the read started. `override_branch` is rung 1's
 /// config-supplied value, already matched by common dir before this is called.
@@ -1909,6 +1984,7 @@ struct ProbeOutcomes {
         Option<git::InProgressOperation>,
         Vec<git::RecentCommit>,
     )>,
+    sync: Option<Settled<SyncState>>,
     default_branch: Option<default_branch::Resolution>,
     state: Option<Settled<WorktreeState>>,
 }
@@ -1935,6 +2011,7 @@ fn apply_probe_outcome(
 ) {
     let ProbeOutcomes {
         branch: branch_outcome,
+        sync: sync_outcome,
         default_branch: default_branch_outcome,
         state: state_outcome,
     } = outcomes;
@@ -1942,6 +2019,9 @@ fn apply_probe_outcome(
     if let Some(&idx) = table.index.get(&key) {
         if let Some((settled, in_progress, recent)) = branch_outcome {
             table.entities[idx].apply_branch_probe(generation, settled, in_progress, recent);
+        }
+        if let Some(settled) = sync_outcome {
+            table.entities[idx].sync.settle(generation, settled);
         }
         if let Some(resolution) = default_branch_outcome {
             table.entities[idx].apply_default_branch_resolution(generation, resolution);
@@ -2113,7 +2193,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::entity::{DefaultBranchStopped, WorktreeState};
+    use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
     use crate::test_support::{git, head_sha, loose_object_count};
 
     fn init_repo_with_a_commit(path: &Path) {
@@ -2293,6 +2373,34 @@ mod tests {
 
         assert!(settled.entities[0].branch.settled().is_none());
         assert!(!settled.entities[0].branch.is_in_flight());
+    }
+
+    /// A Launcher return re-probes one entity through `probe_now`, so every cell a
+    /// Generation settles must settle here too. `sync` is the one most recently added and
+    /// the one a merge is most likely to drop, since no other test reads it off this path.
+    #[test]
+    fn probe_now_settles_the_sync_cell_as_well_as_the_branch_it_depends_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+
+        let entity = core.probe_now(&key);
+
+        assert!(
+            matches!(
+                entity.sync.settled(),
+                Some(Settled::Known {
+                    value: SyncState::NoRemote,
+                    ..
+                })
+            ),
+            "expected probe_now to settle sync, got {:?}",
+            entity.sync.settled()
+        );
     }
 
     #[test]
@@ -5742,5 +5850,378 @@ mod tests {
             0,
             "the bypass must settle without ever running the shared scan"
         );
+    }
+
+    // --- Phase B's comparison: the `sync` cell, end to end through a real `Core`:
+    // the six named cases, plus the two ways "every entity, every Generation" is
+    // most easily lost. ---
+
+    fn add_origin_remote(path: &Path) {
+        git(
+            path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+    }
+
+    /// Wires `branch` up to track `refs/remotes/origin/<branch>` at `upstream_sha`,
+    /// mirroring `patch_equivalence_is_memoised_once_per_common_dir_per_generation`'s
+    /// own fixture shape against a real disposable repo.
+    fn set_upstream(path: &Path, branch: &str, upstream_sha: &str) {
+        git(
+            path,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        git(
+            path,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        git(
+            path,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                upstream_sha,
+            ],
+        );
+    }
+
+    fn refresh_and_settle(core: &Core) -> crate::snapshot::Snapshot {
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        core.settle(Duration::from_millis(500))
+    }
+
+    fn sync_of<'a>(
+        snapshot: &'a crate::snapshot::Snapshot,
+        path: &Path,
+    ) -> Option<&'a Settled<SyncState>> {
+        snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == path)
+            .unwrap_or_else(|| panic!("no entity for {}", path.display()))
+            .sync
+            .settled()
+    }
+
+    /// Named case 1 of 6: an attached branch ahead of its upstream.
+    #[test]
+    fn an_attached_branch_ahead_of_its_upstream_reads_the_ahead_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let fork_sha = head_sha(&repo);
+        add_origin_remote(&repo);
+        set_upstream(&repo, "main", &fork_sha);
+        git(&repo, &["commit", "--allow-empty", "-m", "local work"]);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value: SyncState::Tracking(AheadBehind { ahead, behind }),
+                ..
+            }) => {
+                assert_eq!(*ahead, 1);
+                assert_eq!(*behind, 0);
+            }
+            other => panic!("expected 1 ahead, 0 behind, got {other:?}"),
+        }
+    }
+
+    /// Named case 2 of 6: an attached branch behind its upstream.
+    #[test]
+    fn an_attached_branch_behind_its_upstream_reads_the_behind_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        git(&repo, &["checkout", "-b", "temp"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "upstream work"]);
+        let upstream_sha = head_sha(&repo);
+        git(&repo, &["checkout", "main"]);
+        git(&repo, &["branch", "-D", "temp"]);
+        add_origin_remote(&repo);
+        set_upstream(&repo, "main", &upstream_sha);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value: SyncState::Tracking(AheadBehind { ahead, behind }),
+                ..
+            }) => {
+                assert_eq!(*ahead, 0);
+                assert_eq!(*behind, 1);
+            }
+            other => panic!("expected 0 ahead, 1 behind, got {other:?}"),
+        }
+    }
+
+    /// Named case 3 of 6: an attached branch level with its upstream.
+    #[test]
+    fn an_attached_branch_level_with_its_upstream_reads_in_sync() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha = head_sha(&repo);
+        add_origin_remote(&repo);
+        set_upstream(&repo, "main", &sha);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value:
+                    SyncState::Tracking(AheadBehind {
+                        ahead: 0,
+                        behind: 0,
+                    }),
+                ..
+            }) => {}
+            other => panic!("expected level with its upstream, got {other:?}"),
+        }
+    }
+
+    /// Named case 4 of 6: an attached branch tracking nothing, on a Repo that does
+    /// have a remote. Distinguishes this from case 6 below: the absence here is the
+    /// branch's own tracking configuration, not the Repo's remote.
+    #[test]
+    fn an_attached_branch_tracking_nothing_reads_no_upstream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        add_origin_remote(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value: SyncState::NoUpstream,
+                ..
+            }) => {}
+            other => panic!("expected no upstream configured, got {other:?}"),
+        }
+    }
+
+    /// Named case 5 of 6: a detached row, on a Repo that does have a remote.
+    /// Distinguishes this from case 6 below the same way case 4 does.
+    #[test]
+    fn a_detached_row_reads_no_upstream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let first_sha = head_sha(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+        git(&repo, &["checkout", "--detach", &first_sha]);
+        add_origin_remote(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value: SyncState::NoUpstream,
+                ..
+            }) => {}
+            other => panic!("expected a detached row to read no upstream, got {other:?}"),
+        }
+    }
+
+    /// Named case 6 of 6: a Repo with no remote at all. The propagation half of
+    /// criterion 3 is the substance here, not the Repo row alone: a linked Worktree
+    /// shares the parent's config and has no upstream of its own to speak of either,
+    /// so it must read the exact same `NoRemote` value, not `NoUpstream`.
+    #[test]
+    fn a_repo_with_no_remote_reads_no_remote_on_itself_and_every_worktree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree = root.join("feature");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        assert_eq!(
+            settled.entities.len(),
+            2,
+            "expected the parent Repo and its one linked Worktree"
+        );
+        for path in [&parent, &worktree] {
+            match sync_of(&settled, path) {
+                Some(Settled::Known {
+                    value: SyncState::NoRemote,
+                    ..
+                }) => {}
+                other => panic!(
+                    "expected {} to read no remote at all, got {other:?}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    /// Criterion 1's "every entity" half: two sibling Worktrees under one Repo, each
+    /// with a different sync outcome, computed together in one Generation. A test
+    /// driving only one of them could not see an implementation that dispatches the
+    /// comparison for a single hand-picked entity rather than every one whose HEAD
+    /// carries a branch.
+    #[test]
+    fn sync_is_computed_for_every_entity_dispatched_this_generation_not_only_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let fork_sha = head_sha(&parent);
+        add_origin_remote(&parent);
+
+        let ahead_worktree = root.join("feature-ahead");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-ahead",
+                ahead_worktree.to_str().expect("utf8 path"),
+            ],
+        );
+        set_upstream(&parent, "feature-ahead", &fork_sha);
+        git(
+            &ahead_worktree,
+            &["commit", "--allow-empty", "-m", "unpushed"],
+        );
+
+        let behind_worktree = root.join("feature-behind");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-behind",
+                behind_worktree.to_str().expect("utf8 path"),
+            ],
+        );
+        git(
+            &behind_worktree,
+            &["commit", "--allow-empty", "-m", "on the remote only"],
+        );
+        let ahead_of_behind_sha = head_sha(&behind_worktree);
+        git(&behind_worktree, &["reset", "--hard", "HEAD~1"]);
+        set_upstream(&parent, "feature-behind", &ahead_of_behind_sha);
+
+        let core = Core::start(spec(vec![root]));
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &ahead_worktree) {
+            Some(Settled::Known {
+                value:
+                    SyncState::Tracking(AheadBehind {
+                        ahead: 1,
+                        behind: 0,
+                    }),
+                ..
+            }) => {}
+            other => panic!("expected feature-ahead to read 1 ahead, got {other:?}"),
+        }
+        match sync_of(&settled, &behind_worktree) {
+            Some(Settled::Known {
+                value:
+                    SyncState::Tracking(AheadBehind {
+                        ahead: 0,
+                        behind: 1,
+                    }),
+                ..
+            }) => {}
+            other => panic!("expected feature-behind to read 1 behind, got {other:?}"),
+        }
+    }
+
+    /// Criterion 1's "every Generation" half: a second, later refresh recomputes
+    /// `sync` rather than a first Generation's answer sticking around unrefreshed.
+    /// A test that only ever drives one Generation cannot see an implementation
+    /// that dispatches the comparison once, at `Core::start`'s own discovery, and
+    /// never again on an explicit `refresh`.
+    #[test]
+    fn sync_recomputes_on_a_second_generation_not_only_the_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let fork_sha = head_sha(&repo);
+        add_origin_remote(&repo);
+        set_upstream(&repo, "main", &fork_sha);
+
+        let core = Core::start(spec(vec![root]));
+        let first = refresh_and_settle(&core);
+        match sync_of(&first, &repo) {
+            Some(Settled::Known {
+                value:
+                    SyncState::Tracking(AheadBehind {
+                        ahead: 0,
+                        behind: 0,
+                    }),
+                ..
+            }) => {}
+            other => panic!("expected the first Generation level with its upstream, got {other:?}"),
+        }
+
+        git(
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "second Generation's own work",
+            ],
+        );
+        let second = refresh_and_settle(&core);
+        match sync_of(&second, &repo) {
+            Some(Settled::Known {
+                value:
+                    SyncState::Tracking(AheadBehind {
+                        ahead: 1,
+                        behind: 0,
+                    }),
+                ..
+            }) => {}
+            other => panic!(
+                "expected the second Generation to recompute and read 1 ahead, got {other:?}"
+            ),
+        }
     }
 }

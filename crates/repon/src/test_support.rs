@@ -69,6 +69,40 @@ pub(crate) fn source_region(source: &str, name: &str) -> Option<String> {
     Some(source[after_begin..after_begin + end_offset].to_string())
 }
 
+/// Every workspace crate's own `src` directory a source-scan absence claim must cover,
+/// derived from this crate's manifest dir rather than hard-coded twice, so a third
+/// workspace crate would need adding here once, not once per scan. Both a Launcher (this
+/// crate) and an Action step's executor (`repon-core`) spawn child processes, so a scan
+/// confined to one crate is exactly "a check that quietly stops checking".
+pub(crate) fn workspace_crate_src_dirs() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        manifest_dir.join("src"),
+        manifest_dir.join("../repon-core/src"),
+    ]
+}
+
+/// Every `path:line` across every workspace crate's `src` whose production source
+/// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
+/// naming the very pattern this scan bans does not trip it.
+pub(crate) fn production_lines_containing(needle: &str) -> Vec<String> {
+    let mut offending = Vec::new();
+    for dir in workspace_crate_src_dirs() {
+        for path in rust_source_files(&dir) {
+            let production = production_source_at(&path);
+            for (number, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(needle) {
+                    offending.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+    }
+    offending
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so
@@ -373,38 +407,6 @@ mod tests {
     // `production_source_at`'s output with its own `//` comment lines filtered out too, so a
     // doc comment explaining why a pattern must never appear can still name it.
 
-    /// Every workspace crate's own `src` directory a source-scan absence claim must cover,
-    /// derived from this crate's manifest dir rather than hard-coded twice, so a third
-    /// workspace crate would need adding here once, not once per scan.
-    fn workspace_crate_src_dirs() -> Vec<PathBuf> {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        vec![
-            manifest_dir.join("src"),
-            manifest_dir.join("../repon-core/src"),
-        ]
-    }
-
-    /// Every `path:line` across every workspace crate's `src` whose production source
-    /// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
-    /// naming the very pattern this scan bans does not trip it.
-    fn production_lines_containing(needle: &str) -> Vec<String> {
-        let mut offending = Vec::new();
-        for dir in workspace_crate_src_dirs() {
-            for path in rust_source_files(&dir) {
-                let production = production_source_at(&path);
-                for (number, line) in production.lines().enumerate() {
-                    if line.trim_start().starts_with("//") {
-                        continue;
-                    }
-                    if line.contains(needle) {
-                        offending.push(format!("{}:{}", path.display(), number + 1));
-                    }
-                }
-            }
-        }
-        offending
-    }
-
     /// Criterion 1's absence half: `setsid` and Rust's safe `CommandExt::process_group` are
     /// mutually exclusive (`setpgid` then `setsid` fails `EPERM`), so an Action step's child
     /// must never use the latter. The needle is built from fragments so this test's own
@@ -445,6 +447,64 @@ mod tests {
                  {offending:?}"
             );
         }
+    }
+
+    /// [`production_lines_containing`] without the comment exclusion, for an absence claim
+    /// that is explicitly about comments too, not only executable code: the claim covers
+    /// the code and its comments, so a comment repeating a stale gloss must trip this scan
+    /// the same as a live line would.
+    fn production_lines_containing_including_comments(needle: &str) -> Vec<String> {
+        let mut offending = Vec::new();
+        for dir in workspace_crate_src_dirs() {
+            for path in rust_source_files(&dir) {
+                let production = production_source_at(&path);
+                for (number, line) in production.lines().enumerate() {
+                    if line.contains(needle) {
+                        offending.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+        offending
+    }
+
+    /// [ADR 0019](https://github.com/paulchiu/repon/blob/main/docs/adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md)
+    /// removed `Unknown::NoUpstream` and `Unknown::NoRemote` from the closed `Unknown`
+    /// reason set, since a branch with no upstream and a Repo with no remote are both
+    /// settled values (`-` and `∅`) rather than missing ones. The needle is the qualified
+    /// variant path, not the bare word: `SyncState::NoUpstream` and `SyncState::NoRemote`
+    /// are this same ticket's own legitimate new variants and must not trip this scan.
+    #[test]
+    fn the_removed_no_upstream_and_no_remote_unknown_reasons_exist_nowhere_in_the_code() {
+        for needle in [
+            format!("Unknown::{}", "NoUpstream"),
+            format!("Unknown::{}", "NoRemote"),
+        ] {
+            let offending = production_lines_containing(&needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; ADR 0019 removed both reasons from the closed `Unknown` \
+                 set, at: {offending:?}"
+            );
+        }
+    }
+
+    /// The corrected gloss from ADR 0019, false for a
+    /// detached HEAD and for every Submodule row already carrying `-`. Comment lines are not
+    /// excluded here, unlike every other scan in this module: the criterion names comments
+    /// explicitly, and a doc comment repeating the old, false gloss is exactly the defect
+    /// this test exists to catch.
+    #[test]
+    fn the_stale_no_upstream_gloss_appears_nowhere_in_the_code_or_comments() {
+        let needle = format!("you could {} and have not", "push");
+
+        let offending = production_lines_containing_including_comments(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found the stale gloss `{needle}`, corrected by ADR 0019 (false for a detached \
+             HEAD and for every Submodule row already carrying `-`), at: {offending:?}"
+        );
     }
 
     /// Criterion 8's absence half: there is no per-step timeout, configurable or fixed. The
