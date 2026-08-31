@@ -780,6 +780,107 @@ mod tests {
         );
     }
 
+    // --- Criterion 1 (issue #75): the audit. Every colour-bearing `Meaning` names its own
+    // redundant, non-colour signal, so a tenth meaning added later fails to compile here
+    // until someone writes down where its own signal lives, rather than shipping with
+    // colour as its only carrier. ---
+
+    /// Where `meaning`'s own redundant signal lives, in prose. Exhaustive over every
+    /// [`Meaning`] variant with no wildcard arm: a new variant fails to compile here until
+    /// this match names its signal, the forcing function an audit needs to stay honest past
+    /// the day it was written, per the same discipline `Meaning::role`'s own match already
+    /// holds.
+    fn redundant_signal(meaning: Meaning) -> &'static str {
+        match meaning {
+            Meaning::FreshValue => {
+                "named nowhere in the map: an ordinary value carries no distinction to lose"
+            }
+            Meaning::Notice => "the Notice's own authored text",
+            Meaning::StaleOrUnknownGutterMark => {
+                "the gutter's own `~` (stale) or `?` (unknown) mark, disjoint from every value \
+                 glyph by ADR 0010/0020's compile-time `disjoint` check"
+            }
+            Meaning::KnownZero => "the cell's own zero glyph or word",
+            Meaning::MergedWorktree => "the state column's own word, \"merged\"",
+            Meaning::SubmoduleName => {
+                "the row's own Kind, spelled out as \"submodule\" in the \
+                                        detail pane and read from the child marker in the list"
+            }
+            Meaning::Age => "the age text itself, e.g. \"9s ago\"",
+            Meaning::ColumnHeader => "the header's own text",
+            Meaning::ActionStepNotRunOrCancelled => {
+                "the step's own word (\"cancelled\", \"none yet\")"
+            }
+            Meaning::LoadingSpinner => {
+                "the spinner's own motion between ticks, never a static mark \
+                 (loading_and_fresh_stay_distinguishable_because_loading_moves_and_fresh_does_not)"
+            }
+            Meaning::WorktreeName => {
+                "the row's own Kind: a child row's indent and marker, not its colour"
+            }
+            Meaning::ActiveWorktree => "the state column's own word, \"active\"",
+            Meaning::FocusedBorder => {
+                "which panel currently owns keyboard focus is a fact about where input goes, \
+                 not one this UI otherwise hides"
+            }
+            Meaning::AheadCount => "the sync cell's own `↑n` count",
+            Meaning::SucceededActionStep => "the step's own word, \"ok\"",
+            Meaning::Dirty => "the dirty cell's own `●n` count",
+            Meaning::LocalOnly => "the state column's own word, \"local only\"",
+            Meaning::ActionPaletteBorder => {
+                "the border's own title, \"run on N repos\" (theming.md's \"The two palettes\")"
+            }
+            Meaning::ThemeWarningInStatusBar => "the warning slot's own message text",
+            Meaning::FailedProvenance => "the detail pane's own words describing the failure",
+            Meaning::GoneWorktree => "the state column's own word, \"gone\"",
+            Meaning::FailedActionStep => "the step's own word, \"failed\"",
+            Meaning::BehindCount => "the sync cell's own `↓n` count",
+        }
+    }
+
+    #[test]
+    fn every_meaning_names_where_its_own_redundant_signal_lives() {
+        for meaning in Meaning::ALL {
+            assert!(
+                !redundant_signal(meaning).is_empty(),
+                "{meaning:?} names no redundant signal"
+            );
+        }
+    }
+
+    /// The ticket's own audit list (ahead, behind, dirty, the four Worktree states, the
+    /// provenance gutter) read against theming.md's "Colour is never the only carrier"
+    /// paragraph at test time, rather than trusted from the ticket's own prose: if that
+    /// paragraph ever drops or renames one of these four clauses, this fails rather than the
+    /// audit quietly going stale.
+    #[test]
+    fn the_tickets_named_audit_items_are_theming_mds_own_colour_is_never_the_only_carrier_list() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let section = spec
+            .split("## Colour is never the only carrier")
+            .nth(1)
+            .expect("theming.md carries a \"Colour is never the only carrier\" section");
+        let sentence = section
+            .split("This is not only an accessibility floor")
+            .next()
+            .expect("the section's own claim sentence precedes its accessibility gloss");
+
+        for phrase in [
+            "ahead and behind carry their counts",
+            "Dirty carries its count",
+            "the four Worktree states have a text column",
+            "the provenance gutter is glyphs",
+        ] {
+            assert!(
+                sentence.contains(phrase),
+                "expected theming.md to still name {phrase:?} in its own \"Colour is never \
+                 the only carrier\" claim"
+            );
+        }
+    }
+
     /// theming.md and ADR 0011: no bundled third-party palette, and no paired light/dark
     /// variant. Scans this crate's own source for the tells a ported palette or a pairing
     /// mechanism would leave: a well-known palette's name, or the `theme_dark`/`theme_light`
@@ -875,6 +976,129 @@ mod tests {
             offending.is_empty(),
             "found a COLORTERM capability-probe read in source: {offending:?}"
         );
+    }
+
+    // --- Criterion 3 (issue #75): every surface takes its colour from a `Role`, never a
+    // hardcoded `Color`. `theme.rs` is the one place theming.md allows a bare `Color` value:
+    // the compiled-in default and the loader that resolves a theme file's own strings into
+    // one. Every other production line in either crate must read a colour only through
+    // `Theme::role_color` / `Theme::style_for`.
+
+    /// [`crate::test_support::rust_source_files`] and [`crate::test_support::production_source_at`]
+    /// scoped to every workspace crate's `src` with `theme.rs` itself excluded by name, the
+    /// same file-exclusion shape `components::detail::tests::the_default_branchs_diagnostics_fields_are_read_nowhere_outside_this_file`
+    /// already uses for its own single-file exemption. `theme.rs` legitimately holds colours
+    /// (the compiled default and the grammar the loader parses into one); every other file is
+    /// exempted from nothing.
+    fn production_lines_outside_theme_rs_containing(needle: &str) -> Vec<String> {
+        let mut offending = Vec::new();
+        for dir in crate::test_support::workspace_crate_src_dirs() {
+            for path in rust_source_files(&dir) {
+                if path.file_name().is_some_and(|name| name == "theme.rs") {
+                    continue;
+                }
+                let production = production_source_at(&path);
+                for (number, line) in production.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if line.contains(needle) {
+                        offending.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+        offending
+    }
+
+    /// The needle is the bare `Color::` prefix every variant shares (`Color::Red`,
+    /// `Color::Rgb(`, `Color::Indexed(`, ...), which no line wrap can split since a path
+    /// separator is never a wrap point; unlike a call's own parenthesis, there is no opening
+    /// paren to stop at for the variants (`Reset`, the sixteen ANSI names) that take none.
+    #[test]
+    fn no_hardcoded_colour_appears_in_production_code_outside_theme_rs() {
+        let dirs = crate::test_support::workspace_crate_src_dirs();
+        let files_scanned: usize = dirs.iter().map(|dir| rust_source_files(dir).len()).sum();
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        let needle = format!("{}::", "Color");
+        let offending = production_lines_outside_theme_rs_containing(&needle);
+
+        assert!(
+            offending.is_empty(),
+            "found a hardcoded `Color::` outside theme.rs; every surface must take its \
+             colour from a `Role` via `Theme::role_color`/`Theme::style_for` instead, at: \
+             {offending:?}"
+        );
+    }
+
+    /// Proves the mechanism before trusting it over the crate: a real hardcoded colour in a
+    /// disposable fixture file must be caught, the same way
+    /// [`crate::test_support::tests::the_scan_would_catch_a_reintroduction_of_the_naive_cut`]
+    /// proves its own scan against a fabricated source rather than only against the crate as
+    /// it stands today.
+    #[test]
+    fn the_hardcoded_colour_scan_would_catch_a_real_color_variant() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("offender.rs"),
+            "fn style() -> ratatui::style::Style {\n    \
+             ratatui::style::Style::new().fg(ratatui::style::Color::Red)\n}\n",
+        )
+        .expect("write fixture file");
+
+        let offending = crate::test_support::production_lines_under_containing(
+            &[dir.path().to_path_buf()],
+            &format!("{}::", "Color"),
+        );
+
+        assert_eq!(
+            offending.len(),
+            1,
+            "expected the scan to catch exactly the one hardcoded `Color::Red`, got: \
+             {offending:?}"
+        );
+        assert!(offending[0].contains("offender.rs:2"), "got {offending:?}");
+    }
+
+    // --- Criterion 4 (issue #75): the terminal library strips colour, never Repon itself.
+    // theming.md: "crossterm honours `NO_COLOR` automatically inside `SetForegroundColor`,
+    // so `NO_COLOR=1 repon` drops every colour with no code of ours involved." A second
+    // implementation of that rule here would risk disagreeing with crossterm's own, which is
+    // exactly the class of defect the rule exists to keep out.
+
+    /// Neither crate may read `NO_COLOR` itself (which would mean re-implementing crossterm's
+    /// own behaviour) or strip an escape sequence by hand. The needle is fragmented, this
+    /// module's own established habit (see `no_colorterm_capability_probe_exists_in_the_crate_source`
+    /// above), so a future doc comment naming the variable in prose is not itself a match;
+    /// comment lines are excluded regardless, since this scan runs through
+    /// `production_source_at`.
+    #[test]
+    fn no_repon_side_code_reads_no_color_or_strips_an_escape_sequence_itself() {
+        let dirs = crate::test_support::workspace_crate_src_dirs();
+        let files_scanned: usize = dirs.iter().map(|dir| rust_source_files(dir).len()).sum();
+        assert!(
+            files_scanned > 0,
+            "scanned zero source files; workspace_crate_src_dirs points somewhere that no \
+             longer exists, and this scan would otherwise pass on having inspected nothing"
+        );
+
+        for needle in [
+            format!("{}{}", "NO_COL", "OR"),
+            "strip_ansi".to_string(),
+            "strip_str".to_string(),
+        ] {
+            let offending = crate::test_support::production_lines_containing(&needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; the terminal library strips colour, never Repon itself \
+                 (theming.md's \"Colour is never the only carrier\"), at: {offending:?}"
+            );
+        }
     }
 
     fn write_theme_file(dir: &Path, name: &str, contents: &str) -> PathBuf {

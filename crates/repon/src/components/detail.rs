@@ -11,8 +11,16 @@ use repon_core::{
     Head, InProgressOperation, Kind, Settled, SyncState, Timestamp, Unknown,
 };
 
-use super::list::worktree_state_word;
-use crate::{glyphs::GlyphSet, keys::Action, scroll::scroll_after, theme};
+use super::list::{
+    base_meaning, dirty_meaning, name_cell_meaning, state_meaning, worktree_state_word,
+    write_cell_runs,
+};
+use crate::{
+    glyphs::GlyphSet,
+    keys::Action,
+    scroll::scroll_after,
+    theme::{Meaning, Role, Theme},
+};
 
 /// The pane's own scroll position. Owns no content of its own: [`content_lines`] derives it
 /// fresh from the entity on every call, the same shape [`crate::help::HelpOverlay`] takes.
@@ -37,7 +45,9 @@ impl Detail {
     /// [theming.md](../../../../docs/spec/theming.md)'s "focus communicated by border colour":
     /// this is the one place two panels can be on screen together, so unlike `List` (which has
     /// had no second panel to be dimmer than) this reads a real focus flag rather than always
-    /// painting itself focused.
+    /// painting itself focused. `theme` is the live, loaded theme, not the compiled default:
+    /// a theme file's own colours must reach this pane the same as the palettes and the
+    /// status bar already do.
     pub fn draw(
         &self,
         frame: &mut Frame,
@@ -45,6 +55,7 @@ impl Detail {
         entity: &EntityState,
         glyphs: &'static GlyphSet,
         focused: bool,
+        theme: &Theme,
     ) {
         let border = glyphs.border;
         let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
@@ -61,44 +72,81 @@ impl Detail {
             horizontal_bottom: border.horizontal.encode_utf8(&mut hb),
         };
         let role = if focused {
-            theme::Role::BorderFocused
+            Role::BorderFocused
         } else {
-            theme::Role::Border
+            Role::Border
         };
         let block = Block::bordered()
             .border_set(border_set)
-            .border_style(theme::DEFAULT.style_for(role))
+            .border_style(theme.style_for(role))
             .title(" detail (esc closes) ");
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
         let buf = frame.buffer_mut();
-        draw_lines(buf, interior, &content_lines(entity), self.scroll);
+        draw_lines(
+            buf,
+            interior,
+            &styled_content_lines(entity),
+            self.scroll,
+            theme,
+        );
     }
 }
 
-/// Draws as many of `lines` as fit `area`, starting from `scroll`, one per row. `set_string`
-/// rather than `set_stringn`: a line longer than `area`'s width is ratatui's own clipping to
-/// worry about, the same choice [`crate::help::HelpOverlay::draw`] makes.
-fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[String], scroll: u16) {
+/// One piece of a content line's text paired with the theme role it paints in:
+/// [theming.md](../../../../docs/spec/theming.md)'s "the detail pane's labels are `dim` and
+/// its values take whichever role their meaning already has."
+type Span = (String, Role);
+
+/// A whole content line as the styled pieces [`draw_lines`] paints left to right, in the
+/// same run-based shape `list.rs`'s `sync` column already paints its own two-meaning cell
+/// with. [`content_lines`] flattens the same lines to plain text for every caller that only
+/// wants the words.
+type StyledLine = Vec<Span>;
+
+/// A line with no styled distinction of its own: theming.md names no meaning for it, so it
+/// takes `text`, the map's own default for a value named nowhere else.
+fn plain(text: String) -> StyledLine {
+    vec![(text, Role::Text)]
+}
+
+/// A label (always `dim`) followed by a value's own styled spans.
+fn labelled(label: &str, value: StyledLine) -> StyledLine {
+    let mut line = vec![(label.to_string(), Role::Dim)];
+    line.extend(value);
+    line
+}
+
+/// Draws as many of `lines` as fit `area`, starting from `scroll`, one per row, each line's
+/// spans painted left to right sharing one width budget the way [`super::list::write_cell_runs`]
+/// already paints the list's own multi-role `sync` cell, rather than a second answer for the
+/// same "more than one role in one string" shape.
+fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[StyledLine], scroll: u16, theme: &Theme) {
     for (row, line) in lines
         .iter()
         .skip(scroll as usize)
         .take(area.height as usize)
         .enumerate()
     {
-        buf.set_string(area.x, area.y + row as u16, line, Style::new());
+        let runs: Vec<(String, Style)> = line
+            .iter()
+            .map(|(text, role)| (text.clone(), theme.style_for(*role)))
+            .collect();
+        write_cell_runs(buf, area, area.x, area.y + row as u16, area.width, &runs);
     }
 }
 
 /// Every line the pane shows, in order: identity and path, one line per Cell's provenance in
 /// words plus age, any row-level failure the gutter's single `!` cannot itself distinguish, any
-/// in-progress operation, recent commits, and the last Action's own outcome.
+/// in-progress operation, recent commits, and the last Action's own outcome. Every caller that
+/// only wants the words reads [`content_lines`]; [`Detail::draw`] reads this directly so the
+/// label and each value keep the role theming.md's per-surface assignment gives them.
 ///
 /// Destructures `EntityState` exhaustively rather than naming six cells by hand: a Cell or
 /// fact added to the struct later fails to compile here instead of quietly never reaching the
 /// pane, the project's own recurring defect this ticket was asked to watch for.
-fn content_lines(entity: &EntityState) -> Vec<String> {
+fn styled_content_lines(entity: &EntityState) -> Vec<StyledLine> {
     let EntityState {
         key,
         name,
@@ -119,74 +167,102 @@ fn content_lines(entity: &EntityState) -> Vec<String> {
     } = entity;
 
     let mut lines = Vec::new();
-    lines.push(format!("{name}  {}", kind_word(*kind)));
-    lines.push(key.path().display().to_string());
-    lines.push(String::new());
+    lines.push(vec![
+        (name.to_string(), name_cell_meaning(*kind).role()),
+        (format!("  {}", kind_word(*kind)), Role::Dim),
+    ]);
+    lines.push(plain(key.path().display().to_string()));
+    lines.push(plain(String::new()));
 
-    lines.push(format!(
-        "branch          {}",
-        describe_cell(branch.settled(), head_word)
+    lines.push(labelled(
+        "branch          ",
+        describe_cell_spans(branch.settled(), head_word, |_| Meaning::FreshValue),
     ));
-    lines.push(format!(
-        "sync            {}",
-        describe_cell(sync.settled(), sync_word)
+    lines.push(labelled(
+        "sync            ",
+        describe_cell_spans(sync.settled(), sync_word, sync_meaning),
     ));
-    lines.push(format!(
-        "base            {}",
-        describe_cell(base.settled(), base_word)
+    lines.push(labelled(
+        "base            ",
+        describe_cell_spans(base.settled(), base_word, base_meaning),
     ));
-    lines.push(format!(
-        "dirty           {}",
-        describe_cell(dirty.settled(), dirty_word)
+    lines.push(labelled(
+        "dirty           ",
+        describe_cell_spans(dirty.settled(), dirty_word, dirty_meaning),
     ));
-    lines.push(format!(
-        "state           {}",
-        describe_cell(state.settled(), |value| worktree_state_word(value)
-            .to_string())
+    lines.push(labelled(
+        "state           ",
+        describe_cell_spans(
+            state.settled(),
+            |value| worktree_state_word(value).to_string(),
+            state_meaning,
+        ),
     ));
-    lines.push(format!(
-        "default branch  {}",
-        describe_cell(default_branch.settled(), default_branch_word)
+    lines.push(labelled(
+        "default branch  ",
+        describe_cell_spans(default_branch.settled(), default_branch_word, |_| {
+            Meaning::FreshValue
+        }),
     ));
     for diagnostic_line in default_branch_diagnostics_lines(diagnostics) {
-        lines.push(format!("                {diagnostic_line}"));
+        lines.push(plain(format!("                {diagnostic_line}")));
     }
 
     if let Some(reason) = row_level_failure(diagnostics, last_action) {
-        lines.push(String::new());
-        lines.push(reason);
+        lines.push(plain(String::new()));
+        lines.push(vec![(reason, Meaning::FailedProvenance.role())]);
     }
 
     if let Some(operation) = in_progress_operation {
-        lines.push(String::new());
-        lines.push(format!("in progress: {}", in_progress_word(*operation)));
+        lines.push(plain(String::new()));
+        lines.push(plain(format!(
+            "in progress: {}",
+            in_progress_word(*operation)
+        )));
     }
 
-    lines.push(String::new());
-    lines.push("recent".to_string());
+    lines.push(plain(String::new()));
+    lines.push(vec![("recent".to_string(), Meaning::ColumnHeader.role())]);
     if recent_commits.is_empty() {
-        lines.push("  no commits read yet".to_string());
+        lines.push(plain("  no commits read yet".to_string()));
     } else {
         for commit in recent_commits {
-            lines.push(format!("  {}  {}", commit.short_id, commit.summary));
+            lines.push(plain(format!("  {}  {}", commit.short_id, commit.summary)));
         }
     }
 
-    lines.push(String::new());
-    lines.push(match last_action {
-        Some(receipt) => format!("last action   {}", last_action_word(receipt)),
-        None => "last action   none yet".to_string(),
-    });
+    lines.push(plain(String::new()));
+    lines.push(labelled("last action   ", last_action_spans(last_action)));
 
     lines
 }
 
-/// The one word this pane shows for a finished receipt. Delegates to
-/// [`ActionReceipt::failed`], the classification chokepoint, rather than a wildcard arm of
-/// its own, so this can never quietly disagree with what the gutter's row summary already
-/// calls a failure.
-fn last_action_word(receipt: &ActionReceipt) -> &'static str {
-    if receipt.failed() { "failed" } else { "ok" }
+/// [`styled_content_lines`] flattened to plain text: every caller that only cares about the
+/// words, including this pane's own scroll-length count and its own test suite.
+fn content_lines(entity: &EntityState) -> Vec<String> {
+    styled_content_lines(entity)
+        .into_iter()
+        .map(|line| line.into_iter().map(|(text, _)| text).collect())
+        .collect()
+}
+
+/// The last Action's own outcome, in the role theming.md's map already gives that state: a
+/// succeeded step is `ok`, a failed one `danger`, and a receipt that never ran or was
+/// cancelled (there being none yet reads the same as one that was) is `dim`, the same role a
+/// column header or a Merged Worktree takes. Delegates to [`ActionReceipt::failed`], the
+/// classification chokepoint, rather than a wildcard arm of its own, so this can never
+/// quietly disagree with what the gutter's row summary already calls a failure.
+fn last_action_spans(last_action: &Option<ActionReceipt>) -> StyledLine {
+    match last_action {
+        Some(receipt) if receipt.failed() => {
+            vec![("failed".to_string(), Meaning::FailedActionStep.role())]
+        }
+        Some(_) => vec![("ok".to_string(), Meaning::SucceededActionStep.role())],
+        None => vec![(
+            "none yet".to_string(),
+            Meaning::ActionStepNotRunOrCancelled.role(),
+        )],
+    }
 }
 
 fn kind_word(kind: Kind) -> &'static str {
@@ -197,24 +273,69 @@ fn kind_word(kind: Kind) -> &'static str {
     }
 }
 
+/// `sync`'s own role in this pane: unlike the list's cell, which paints an ahead run and a
+/// behind run side by side, this pane spells both counts into one sentence, so there is only
+/// one role to give the whole value. A diverged value (both counts nonzero) takes the ahead
+/// count's role; the words themselves, not the colour, are what tells the two counts apart
+/// here, the same division of labour `describe_cell_spans`'s own age suffix already holds
+/// with its value.
+fn sync_meaning(value: &SyncState) -> Meaning {
+    match value {
+        SyncState::Tracking(counts) if counts.ahead > 0 => Meaning::AheadCount,
+        SyncState::Tracking(counts) if counts.behind > 0 => Meaning::BehindCount,
+        SyncState::Tracking(_) => Meaning::KnownZero,
+        SyncState::NoUpstream | SyncState::NoRemote => Meaning::FreshValue,
+    }
+}
+
 /// One Cell's whole provenance, spelled out in words, plus its age for a Known value: "fresh
 /// 9s ago", "stale 3m ago", "unknown: timed out", or a Failed cell's own probe message, which
 /// already reads as words (`ProbeError`'s `Display`). Exhaustive over `Option<&Settled<T>>`
 /// with no wildcard arm, the same discipline `list.rs`'s `render_cell` holds, so a `Settled`
 /// shape added later fails to compile here instead of falling through some default reading.
+/// [`styled_content_lines`] now reads [`describe_cell_spans`] directly; this stays as the
+/// plain-text oracle this module's own words-only tests check the formatting against,
+/// independent of colour.
+#[allow(dead_code)] // read only from `#[cfg(test)]` call sites
 fn describe_cell<T>(
     settled: Option<&Settled<T>>,
     format_value: impl FnOnce(&T) -> String,
 ) -> String {
+    describe_cell_spans(settled, format_value, |_| Meaning::FreshValue)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// [`describe_cell`]'s styled counterpart: the value takes `meaning_for_value`'s own role and
+/// the freshness annotation (or the Unknown, Failed, NotApplicable and Loading words) takes
+/// the role theming.md's map already gives that state, matching `list.rs`'s `cell_role`
+/// rather than inventing a second answer for the same `Settled` shape.
+fn describe_cell_spans<T>(
+    settled: Option<&Settled<T>>,
+    format_value: impl FnOnce(&T) -> String,
+    meaning_for_value: impl FnOnce(&T) -> Meaning,
+) -> StyledLine {
     match settled {
         Some(Settled::Known { value, at, stale }) => {
             let word = if *stale { "stale" } else { "fresh" };
-            format!("{}   {word} {}", format_value(value), format_age(*at))
+            vec![
+                (format_value(value), meaning_for_value(value).role()),
+                (
+                    format!("   {word} {}", format_age(*at)),
+                    Meaning::Age.role(),
+                ),
+            ]
         }
-        Some(Settled::Unknown(reason)) => format!("unknown: {}", describe_unknown(*reason)),
-        Some(Settled::Failed(error)) => error.to_string(),
-        Some(Settled::NotApplicable) => "not applicable".to_string(),
-        None => "loading".to_string(),
+        Some(Settled::Unknown(reason)) => vec![(
+            format!("unknown: {}", describe_unknown(*reason)),
+            Meaning::StaleOrUnknownGutterMark.role(),
+        )],
+        Some(Settled::Failed(error)) => {
+            vec![(error.to_string(), Meaning::FailedProvenance.role())]
+        }
+        Some(Settled::NotApplicable) => vec![("not applicable".to_string(), Role::Text)],
+        None => vec![("loading".to_string(), Meaning::LoadingSpinner.role())],
     }
 }
 
@@ -375,6 +496,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::theme;
 
     fn entity(name: &str) -> EntityState {
         EntityState::new(
@@ -1093,6 +1215,233 @@ mod tests {
         assert_ne!(
             base_line, dirty_line,
             "base and dirty must never read alike: {base_line:?} vs {dirty_line:?}"
+        );
+    }
+
+    // --- Criterion 3 (issue #75): "the detail pane's labels are dim and its values take
+    // whichever role their meaning already has" ---
+
+    #[test]
+    fn describe_cell_spans_gives_a_known_values_own_meaning_its_role_and_the_age_suffix_dim() {
+        let settled = Settled::Known {
+            value: 5u32,
+            at: Timestamp::now(),
+            stale: false,
+        };
+
+        let spans = describe_cell_spans(
+            Some(&settled),
+            |value| value.to_string(),
+            |_| Meaning::Dirty,
+        );
+
+        assert_eq!(spans[0], ("5".to_string(), Meaning::Dirty.role()));
+        assert_eq!(spans[1].1, Meaning::Age.role());
+        assert!(spans[1].0.contains("fresh"), "got {spans:?}");
+    }
+
+    #[test]
+    fn describe_cell_spans_colours_unknown_dim_failed_danger_not_applicable_text_and_loading_accent()
+     {
+        let unknown: Settled<u32> = Settled::Unknown(Unknown::TimedOut);
+        let failed: Settled<u32> = Settled::Failed(ProbeError::Read(Arc::from("boom")));
+        let not_applicable: Settled<u32> = Settled::NotApplicable;
+
+        assert_eq!(
+            describe_cell_spans(Some(&unknown), |v: &u32| v.to_string(), |_| Meaning::Dirty)[0].1,
+            Meaning::StaleOrUnknownGutterMark.role()
+        );
+        assert_eq!(
+            describe_cell_spans(Some(&failed), |v: &u32| v.to_string(), |_| Meaning::Dirty)[0].1,
+            Meaning::FailedProvenance.role()
+        );
+        assert_eq!(
+            describe_cell_spans(
+                Some(&not_applicable),
+                |v: &u32| v.to_string(),
+                |_| { Meaning::Dirty }
+            )[0]
+            .1,
+            Role::Text
+        );
+        assert_eq!(
+            describe_cell_spans(
+                None::<&Settled<u32>>,
+                |v: &u32| v.to_string(),
+                |_| Meaning::Dirty
+            )[0]
+            .1,
+            Meaning::LoadingSpinner.role()
+        );
+    }
+
+    #[test]
+    fn sync_meaning_gives_an_ahead_a_behind_a_known_zero_and_a_settled_absence_their_own_role() {
+        assert_eq!(
+            sync_meaning(&SyncState::Tracking(repon_core::AheadBehind {
+                ahead: 2,
+                behind: 0
+            })),
+            Meaning::AheadCount
+        );
+        assert_eq!(
+            sync_meaning(&SyncState::Tracking(repon_core::AheadBehind {
+                ahead: 0,
+                behind: 3
+            })),
+            Meaning::BehindCount
+        );
+        assert_eq!(
+            sync_meaning(&SyncState::Tracking(repon_core::AheadBehind {
+                ahead: 0,
+                behind: 0
+            })),
+            Meaning::KnownZero
+        );
+        assert_eq!(sync_meaning(&SyncState::NoUpstream), Meaning::FreshValue);
+        assert_eq!(sync_meaning(&SyncState::NoRemote), Meaning::FreshValue);
+    }
+
+    #[test]
+    fn last_action_spans_names_ok_failed_and_none_yet_through_their_own_role() {
+        assert_eq!(
+            last_action_spans(&Some(receipt(StepOutcome::Ok)))[0].1,
+            Meaning::SucceededActionStep.role()
+        );
+        assert_eq!(
+            last_action_spans(&Some(receipt(StepOutcome::Failed(1))))[0].1,
+            Meaning::FailedActionStep.role()
+        );
+        assert_eq!(
+            last_action_spans(&None)[0].1,
+            Meaning::ActionStepNotRunOrCancelled.role()
+        );
+    }
+
+    #[test]
+    fn styled_content_lines_gives_every_labels_own_span_the_dim_role() {
+        let lines = styled_content_lines(&entity("a"));
+
+        // Every per-cell line pushed through `labelled` opens with a `(label, Role::Dim)`
+        // span; the header, path and blank lines are not labelled and are excluded by their
+        // own shape (more than one word before any padding, or empty).
+        let labelled_lines = [3, 4, 5, 6, 7, 8];
+        for index in labelled_lines {
+            assert_eq!(
+                lines[index][0].1,
+                Role::Dim,
+                "line {index} {:?} must open with a dim label",
+                lines[index]
+            );
+        }
+    }
+
+    #[test]
+    fn styled_content_lines_gives_the_header_name_its_kind_cell_meaning_and_the_kind_word_dim() {
+        let repo = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("r"))),
+            Arc::from("r"),
+            Arc::from(Path::new("r")),
+            Kind::Repo,
+        );
+        let worktree = entity("wt");
+
+        let repo_header = &styled_content_lines(&repo)[0];
+        let worktree_header = &styled_content_lines(&worktree)[0];
+
+        assert_eq!(repo_header[0].1, Meaning::FreshValue.role());
+        assert_eq!(worktree_header[0].1, Meaning::WorktreeName.role());
+        assert_eq!(worktree_header[1].1, Role::Dim, "the kind word is dim");
+    }
+
+    #[test]
+    fn styled_content_lines_colours_the_recent_header_as_a_column_header_and_a_row_level_failure_danger()
+     {
+        let lines = styled_content_lines(&entity("a"));
+        let recent_line = lines
+            .iter()
+            .find(|line| line.first().is_some_and(|(text, _)| text == "recent"))
+            .expect("expected a 'recent' section header line");
+        assert_eq!(recent_line[0].1, Meaning::ColumnHeader.role());
+
+        let mut failing = entity("b");
+        failing.diagnostics.gitmodules_failed = Some(Arc::from("bad syntax"));
+        let failing_lines = styled_content_lines(&failing);
+        let failure_line = failing_lines
+            .iter()
+            .find(|line| {
+                line.first()
+                    .is_some_and(|(text, _)| text.contains(".gitmodules"))
+            })
+            .expect("expected the row-level failure line");
+        assert_eq!(failure_line[0].1, Meaning::FailedProvenance.role());
+    }
+
+    /// The border must take its role from the live theme handed to `draw`, not the compiled
+    /// default: before this ticket `draw` always painted through `theme::DEFAULT`, which
+    /// meant a theme file's own colours never reached this pane. A colour with no compiled
+    /// role reuses it (`Rgb(9, 8, 7)`, the same fixture `launcher_palette.rs`'s own version
+    /// of this test uses), so passing the compiled default through by mistake cannot pass by
+    /// coincidence.
+    #[test]
+    fn draw_paints_the_border_from_the_live_theme_not_the_compiled_default() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let live_theme = Theme {
+            border_focused: ratatui::style::Color::Rgb(9, 8, 7),
+            ..theme::DEFAULT
+        };
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let detail = Detail::default();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(frame, frame.area(), &entity("a"), glyphs, true, &live_theme);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].fg,
+            ratatui::style::Color::Rgb(9, 8, 7),
+            "expected the focused border painted in the live theme's own colour"
+        );
+    }
+
+    /// The rendering half of the criterion above: proves `draw` actually reads
+    /// `styled_content_lines` (dim label, meaning-coloured value) rather than the plain,
+    /// uncoloured `content_lines` this ticket's predecessor painted with `Style::new()`.
+    #[test]
+    fn draw_paints_the_header_lines_name_in_its_own_meaning_role() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let detail = Detail::default();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let worktree = entity("wt");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(
+                    frame,
+                    frame.area(),
+                    &worktree,
+                    glyphs,
+                    true,
+                    &theme::DEFAULT,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        // The interior starts one cell in from the border on both axes.
+        assert_eq!(
+            buf[(1, 1)].fg,
+            theme::DEFAULT.role_color(Meaning::WorktreeName.role()),
+            "expected the Worktree name painted in its own meaning's role, not left uncoloured"
         );
     }
 }

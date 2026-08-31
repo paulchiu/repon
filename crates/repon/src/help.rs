@@ -3,10 +3,11 @@
 //! `global`, scrolling, and closing on either of its two close keys. Content comes straight
 //! from [`BindingTable::describe`]; nothing here is transcribed.
 
-use ratatui::{Frame, layout::Rect, style::Style};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 
 use crate::keys::{Action, BindingTable, Context};
 use crate::scroll::scroll_after;
+use crate::theme::{Role, Theme};
 
 /// The overlay's own scroll position: how many of its content lines are scrolled past the
 /// top of its viewport. Owns no content of its own, since [`HelpOverlay::content`] derives
@@ -44,29 +45,51 @@ impl HelpOverlay {
     }
 
     /// Draws as many content lines as fit in `area`, starting from the current scroll
-    /// offset, each joined into one string only here, at the point of painting. Calls
-    /// `set_string`, never `set_stringn`: a line longer than `area`'s width is ratatui's own
-    /// clipping to worry about, not this ticket's width-budget concern, which is the
-    /// footer's alone.
+    /// offset, each line's keys painted in `accent` and its description in `dim`
+    /// ([theming.md](../../../../docs/spec/theming.md)'s per-surface assignment), the split
+    /// this struct's own `content` doc comment promises survives to here. Every write is
+    /// `set_stringn` against the buffer's own remaining width: a line longer than `area`'s
+    /// width still clips at its own right edge rather than spilling into the next column,
+    /// not this ticket's width-budget concern, which is the footer's alone.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
         area: Rect,
         context: Context,
         table: &BindingTable,
+        theme: &Theme,
     ) {
         let lines = Self::content(table, context);
         let buf = frame.buffer_mut();
+        let end = area.right();
         for (row, (keys_text, description)) in lines
             .iter()
             .skip(self.scroll as usize)
             .take(area.height as usize)
             .enumerate()
         {
-            let line = format!("{keys_text}  {description}");
-            buf.set_string(area.x, area.y + row as u16, &line, Style::new());
+            let y = area.y + row as u16;
+            let mut x = area.x;
+            paint_run(
+                buf,
+                &mut x,
+                y,
+                end,
+                keys_text,
+                theme.style_for(Role::Accent),
+            );
+            paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
+            paint_run(buf, &mut x, y, end, description, theme.style_for(Role::Dim));
         }
     }
+}
+
+/// Writes `text` at `(*x, y)` in `style`, clipped to the buffer's own right edge at `end`,
+/// and advances `*x` past what was actually written: `footer.rs`'s own `paint_run` has the
+/// same shape, reimplemented here since that copy is private to its module.
+fn paint_run(buf: &mut Buffer, x: &mut u16, y: u16, end: u16, text: &str, style: Style) {
+    let (next_x, _) = buf.set_stringn(*x, y, text, end.saturating_sub(*x) as usize, style);
+    *x = next_x;
 }
 
 #[cfg(test)]
@@ -219,5 +242,43 @@ mod tests {
         let scroll_before = overlay.scroll;
         overlay.apply(Action::Close, 20, 5);
         assert_eq!(overlay.scroll, scroll_before);
+    }
+
+    // --- Criterion 3 (issue #75): the overlay's keys/description split takes its colour
+    // from the theme's own accent/dim roles, theming.md's per-surface assignment ---
+
+    #[test]
+    fn draw_paints_a_lines_keys_in_accent_and_its_description_in_dim() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let overlay = HelpOverlay::default();
+        let table = default_table();
+        let theme = crate::theme::DEFAULT;
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                overlay.draw(frame, frame.area(), Context::List, &table, &theme);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let lines = HelpOverlay::content(&table, Context::List);
+        let (first_keys, first_description) = &lines[0];
+        assert!(!first_keys.is_empty(), "expected a non-empty first key");
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme.role_color(Role::Accent),
+            "expected the first line's keys painted in the theme's accent role"
+        );
+
+        let value_x = first_keys.chars().count() as u16 + 2;
+        assert!(!first_description.is_empty());
+        assert_eq!(
+            buf[(value_x, 0)].fg,
+            theme.role_color(Role::Dim),
+            "expected the first line's description painted in the theme's dim role"
+        );
     }
 }
