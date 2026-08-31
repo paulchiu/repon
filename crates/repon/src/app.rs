@@ -159,10 +159,10 @@ pub struct App {
     /// (naming the Set fallen back to). Replaced by the next such call; nothing else clears
     /// it yet.
     ///
-    // TODO(#119): the general Notice mechanism (its timeout, being cleared by the next
-    // keypress or a replacement, and the status row's full ordering ahead of a warning and
-    // the header) belongs to that ticket. This field only carries the two call sites #134
-    // needs.
+    // TODO(#119): the general Notice mechanism (its timeout, and the status row's full
+    // ordering ahead of a warning and the header) belongs to that ticket. Clearing on the
+    // next press is not deferred with it: this Notice displaces the warning slot, so one
+    // that never expires hides every warning for the rest of the run.
     notice: Option<String>,
     /// The description of the most recently pressed bound-but-unimplemented action
     /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
@@ -478,6 +478,9 @@ impl App {
     /// `dispatch(List | Detail, key)` ([`keys::BindingTable::dispatch`] never consults those
     /// three contexts for either).
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        // A Notice takes the status row from the warning slot, so one that outlives the press
+        // it answered hides every warning behind it for the rest of the run.
+        self.notice = None;
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
@@ -1644,7 +1647,7 @@ mod tests {
         }
     }
 
-    fn press(
+    pub(crate) fn press(
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) -> KeyEvent {

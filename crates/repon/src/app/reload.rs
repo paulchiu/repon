@@ -312,9 +312,11 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
 mod tests {
     use std::path::Path;
 
+    use crossterm::event::{KeyCode, KeyModifiers};
+
     use super::*;
     use crate::{
-        app::tests::{init_repo, test_app},
+        app::tests::{init_repo, press, test_app},
         keys::Context,
         test_support::capture_tracing,
     };
@@ -690,6 +692,54 @@ mod tests {
             app.notice(),
             Some("switched to `second`"),
             "expected a Notice naming the Set switched to"
+        );
+    }
+
+    /// A Notice takes the status row from the warning slot, so one that outlives the press it
+    /// answered hides every warning behind it for the rest of the run. It lasts until the next
+    /// press and no longer; the timeout that would also end it is not built yet.
+    #[test]
+    fn a_notice_lasts_until_the_next_press_so_it_cannot_hide_the_warning_slot_for_the_run() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+
+        let mut app = test_app(&root_a);
+        app.document.sets = vec![
+            matching_set_config(&root_a),
+            document::SetConfig {
+                name: toml::Spanned::new(0..0, "second".to_string()),
+                roots: vec![root_b.to_string_lossy().into_owned()],
+                include: None,
+                exclude: None,
+            },
+        ];
+
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("switch to the second Set");
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "the press that switches Sets must answer with a Notice"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the cursor");
+        assert_eq!(
+            app.notice(),
+            None,
+            "a Notice that survives the next press displaces the warning slot for the rest of \
+             the run"
         );
     }
 
