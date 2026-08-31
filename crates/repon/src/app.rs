@@ -1093,6 +1093,7 @@ impl App {
                 | Action::PreviousEntry
                 | Action::NextEntry
                 | Action::AcceptCompletion
+                | Action::DeletePreviousChar
                 | Action::DeletePreviousWord
                 | Action::ClearLine
                 | Action::OpenInEditor
@@ -1151,7 +1152,7 @@ impl App {
     /// Every key event while `self.action_palette` is `Some`, dispatched through
     /// `Context::Confirm` while it holds `Stage::Confirming` and `Context::Input`
     /// otherwise, per [keybindings.md](../../../docs/spec/keybindings.md)'s own contexts
-    /// table. `Context::Input` only ever hands back the nine variants named below or `Text`
+    /// table. `Context::Input` only ever hands back the ten variants named below or `Text`
     /// or `None` ([`keys::BindingTable::dispatch`]'s own doc comment on what `Input` can
     /// return), and `Context::Confirm` only ever hands back `Run`, `Decline` or `None`; the
     /// trailing `unreachable!` arm in each match is that proof made loud rather than a
@@ -1200,6 +1201,11 @@ impl App {
             Some(Action::Text(c)) => {
                 if let Some(palette) = &mut self.action_palette {
                     palette.type_char(c, &self.document.actions);
+                }
+            }
+            Some(Action::DeletePreviousChar) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.delete_previous_char(&self.document.actions);
                 }
             }
             Some(Action::DeletePreviousWord) => {
@@ -1296,6 +1302,11 @@ impl App {
                     line.type_char(c);
                 }
             }
+            Some(Action::DeletePreviousChar) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.delete_previous_char();
+                }
+            }
             Some(Action::DeletePreviousWord) => {
                 if let Some(line) = &mut self.filter_line {
                     line.delete_previous_word();
@@ -1335,6 +1346,11 @@ impl App {
             Some(Action::Text(c)) => {
                 if let Some(palette) = &mut self.launcher_palette {
                     palette.type_char(c, &launcher::resolve(&self.document));
+                }
+            }
+            Some(Action::DeletePreviousChar) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.delete_previous_char(&launcher::resolve(&self.document));
                 }
             }
             Some(Action::DeletePreviousWord) => {
@@ -5189,6 +5205,267 @@ mod tests {
             "dismissing must start no new Generation; one starting anyway is the tell that \
              a handoff ran despite nothing being chosen"
         );
+    }
+
+    // --- issue #176: Backspace in the Launcher palette, the Action palette and the Filter
+    // line, all through the one `Context::Input` binding table rather than a per-surface key
+    // check ---
+
+    /// Goes in through the real key event and `keys::BindingTable::dispatch`, not by calling
+    /// `LauncherPalette::delete_previous_char` directly: that would prove the method exists,
+    /// not that `Backspace` reaches it. The fixture types a query that matches nothing, then
+    /// deletes one character, so a build that re-filtered on the wrong buffer (or not at all)
+    /// is caught by the match list itself rather than by re-reading the buffer's own text.
+    #[test]
+    fn backspace_deletes_a_character_in_the_launcher_palette_and_re_filters_through_the_binding_table()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .launchers
+            .push(launcher_config("reinstall", vec!["true"], false));
+        app.document
+            .launchers
+            .push(launcher_config("deploy", vec!["true"], false));
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the launcher palette");
+        for c in "reinstallx".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a query matching no configured launcher");
+        }
+        let launchers = launcher::resolve(&app.document);
+        assert_eq!(
+            app.launcher_palette
+                .as_ref()
+                .map(|palette| palette.matches(&launchers).len()),
+            Some(0),
+            "\"reinstallx\" must match no configured launcher"
+        );
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace");
+
+        assert_eq!(
+            app.launcher_palette
+                .as_ref()
+                .map(|palette| palette.matches(&launchers).len()),
+            Some(1),
+            "removing the trailing \"x\" must restore the \"reinstall\" match"
+        );
+        assert!(
+            app.launcher_palette.is_some(),
+            "Backspace must not close the Launcher palette"
+        );
+    }
+
+    /// The empty-buffer half of the same criterion: `String::pop` on an empty `String` is a
+    /// documented no-op, never a panic, but a hand-rolled index (the kind [`delete_previous_char`]
+    /// deliberately avoids) is exactly where an off-by-one would surface. Asserts the palette
+    /// stays open rather than merely that the buffer is still empty, since the actual risk
+    /// named in the ticket is the surface closing, not the text.
+    #[test]
+    fn backspace_on_an_empty_launcher_palette_query_is_inert_and_does_not_close_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .launchers
+            .push(launcher_config("reinstall", vec!["true"], false));
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the launcher palette");
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace on an empty query");
+
+        assert!(
+            app.launcher_palette.is_some(),
+            "Backspace on an empty query must not close the Launcher palette"
+        );
+        let launchers = launcher::resolve(&app.document);
+        assert_eq!(
+            app.launcher_palette
+                .as_ref()
+                .map(|palette| palette.matches(&launchers).len()),
+            Some(launchers.len()),
+            "an empty query still matches every resolved launcher, the shipped defaults \
+             included"
+        );
+    }
+
+    /// The Action palette's own version of the same proof: `Backspace` through the key event
+    /// and the shared binding table, re-filtering a match list that genuinely differs before
+    /// and after the deletion.
+    #[test]
+    fn backspace_deletes_a_character_in_the_action_palette_and_re_filters_through_the_binding_table()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+        app.document.actions.push(slow_action("deploy"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the action palette");
+        for c in "reinstallx".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a query matching no configured action");
+        }
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .map(|palette| palette.matches(&app.document.actions).len()),
+            Some(0),
+            "\"reinstallx\" must match no configured action"
+        );
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace");
+
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .map(|palette| palette.matches(&app.document.actions).len()),
+            Some(1),
+            "removing the trailing \"x\" must restore the \"reinstall\" match"
+        );
+        assert!(
+            app.action_palette.is_some(),
+            "Backspace must not close the Action palette"
+        );
+    }
+
+    /// The Action palette's empty-buffer inertness: see
+    /// `backspace_on_an_empty_launcher_palette_query_is_inert_and_does_not_close_it`'s own doc
+    /// comment for why the surface staying open, not merely the buffer staying empty, is the
+    /// substance of this check.
+    #[test]
+    fn backspace_on_an_empty_action_palette_query_is_inert_and_does_not_close_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the action palette");
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace on an empty query");
+
+        assert!(
+            app.action_palette.is_some(),
+            "Backspace on an empty query must not close the Action palette"
+        );
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .map(|palette| palette.matches(&app.document.actions).len()),
+            Some(1),
+            "an empty query still matches every configured action"
+        );
+    }
+
+    /// The Filter line's own version: unlike the two palettes it holds no `Vec` of
+    /// candidates, so "the live candidate list" is `App::visible_keys`, read live off
+    /// `self.filter_line` while it is still open (`App::active_filter`'s own doc comment).
+    #[test]
+    fn backspace_deletes_a_character_in_the_filter_line_and_re_filters_the_live_list_through_the_binding_table()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("alpha"));
+        init_repo(&root.join("beta"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+        for c in "alphax".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a query matching neither repo");
+        }
+        assert_eq!(
+            app.visible_keys().len(),
+            0,
+            "\"alphax\" must match neither \"alpha\" nor \"beta\""
+        );
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace");
+
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "removing the trailing \"x\" must restore the \"alpha\" match"
+        );
+        assert!(
+            app.filter_line.is_some(),
+            "Backspace must not close the Filter line"
+        );
+    }
+
+    /// The Filter line's empty-buffer inertness: see
+    /// `backspace_on_an_empty_launcher_palette_query_is_inert_and_does_not_close_it`'s own doc
+    /// comment for why the surface staying open is the substance of this check.
+    #[test]
+    fn backspace_on_an_empty_filter_line_is_inert_and_does_not_close_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("dispatch backspace on an empty buffer");
+
+        assert!(
+            app.filter_line.is_some(),
+            "Backspace on an empty buffer must not close the Filter line"
+        );
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "an empty Filter still shows every row"
+        );
+    }
+
+    /// Criterion 4: the new action reaches all three surfaces through the one compiled
+    /// `Context::Input` binding rather than three separate key checks. A hand-rolled list of
+    /// "the three surfaces" here would be the same defect this ticket's brief warns against,
+    /// so this asserts the shape instead, over every context [`keys::Context`] names: exactly
+    /// one of the six dispatches `Backspace` to `DeletePreviousChar`, and it is `Input`; a
+    /// second context answering it too would mean a second, competing meaning for the same
+    /// physical key, the exact hazard the one shared binding table exists to rule out.
+    #[test]
+    fn backspace_dispatches_to_delete_previous_char_in_input_alone() {
+        let table = BindingTable::compiled_default();
+        let backspace = press(KeyCode::Backspace, KeyModifiers::NONE);
+        for context in [
+            keys::Context::Global,
+            keys::Context::List,
+            keys::Context::Detail,
+            keys::Context::Input,
+            keys::Context::Overlay,
+            keys::Context::Confirm,
+        ] {
+            let expected = if context == keys::Context::Input {
+                Some(Action::DeletePreviousChar)
+            } else {
+                None
+            };
+            assert_eq!(
+                table.dispatch(context, backspace),
+                expected,
+                "expected Backspace in {context:?} to dispatch {expected:?}"
+            );
+        }
     }
 
     /// Criterion 2: choosing a Launcher must reach `on_resume`'s own theme reread through
