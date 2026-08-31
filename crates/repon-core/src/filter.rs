@@ -640,6 +640,7 @@ mod tests {
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
+            running: None,
         });
         assert!(Filter::parse("action:none").matches(&untouched));
         assert!(!Filter::parse("action:none").matches(&failed_run));

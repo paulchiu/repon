@@ -265,6 +265,7 @@ pub struct StepResult {
 /// live elapsed time with [`Timestamp::elapsed`] on every draw instead of this value being
 /// rewritten every frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RunningStep {
     /// The step's argv, rendered for display, the same text [`StepResult::label`] carries
     /// once this step finishes.
@@ -307,6 +308,16 @@ pub struct ActionReceipt {
     /// ran, as for a `not_applicable` receipt). `Core::run_action` writes this receipt to
     /// the table once per step, so a reader sees it update as the run progresses rather
     /// than only once at the very end.
+    ///
+    /// The grain is the step, not the byte: a running step's own captured output is not
+    /// here, because `executor::run_step` returns it only once the child has exited. A
+    /// reader sees a step's label, its spinner and its live elapsed time immediately, and
+    /// its output the instant that step ends, rather than mid-step. Streaming that would
+    /// mean `drain_until_exit` publishing incremental snapshots.
+    ///
+    /// `steps` therefore holds only finished steps while this is `Some`, which is what
+    /// keeps [`ActionReceipt::failed`] honest mid-run. Nothing may read this receipt's
+    /// presence as "the run is over"; read `running.is_none()` for that.
     pub running: Option<RunningStep>,
 }
 
