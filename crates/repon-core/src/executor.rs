@@ -892,6 +892,52 @@ mod tests {
         );
     }
 
+    // --- `keepalive` must never reach the step's own program ---
+
+    /// The honest form of this claim is observed from inside the child, not by reading
+    /// `run_step`'s own `fcntl` flag back: a leaked `keepalive` would hand the step's own
+    /// program, and anything it backgrounds, an extra live reference onto the pty beyond
+    /// the two (stdout, stderr) it was deliberately given, which is exactly what would let
+    /// a backgrounded grandchild hold the pty open indefinitely after the step itself
+    /// exits. `master`'s own raw descriptor and `slave`'s and `slave_dup`'s own pre-`dup2`
+    /// numbers already leak into every step's program today, a separate, pre-existing gap
+    /// this ticket does not cover; matching by device against the child's own stdout
+    /// (`os.fstat(1).st_rdev`) excludes `master`, which is a distinct device, but still
+    /// counts those two unrelated leaks, so the bound below is an upper bound (2) rather
+    /// than an exact count, immune to that gap ever being closed separately. A leaked
+    /// `keepalive` adds a third.
+    #[test]
+    fn a_steps_own_program_gains_no_more_pty_references_than_the_two_it_was_given() {
+        let dir = tempdir();
+        let count_extra_pty_references = "\
+import os
+target = os.fstat(1).st_rdev
+def points_at_target(fd):
+    try:
+        return os.fstat(fd).st_rdev == target
+    except OSError:
+        return False
+extra = [
+    fd for fd in map(int, os.listdir('/dev/fd'))
+    if fd not in (0, 1, 2) and points_at_target(fd)
+]
+print(len(extra))";
+
+        let result = run(&["python3", "-c", count_extra_pty_references], dir.path());
+
+        assert_eq!(result.outcome, StepOutcome::Ok);
+        let extra_references: usize = String::from_utf8_lossy(&result.output)
+            .trim()
+            .parse()
+            .expect("the probe prints a single integer");
+        assert!(
+            extra_references <= 2,
+            "expected at most the two pre-existing, unrelated raw duplicates beyond \
+             stdout and stderr, got {extra_references} extra references onto the pty; \
+             a leaked keepalive descriptor would add a third"
+        );
+    }
+
     // --- Criterion 8: no per-step timeout, elapsed tracked ---
 
     #[test]
