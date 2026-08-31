@@ -911,16 +911,19 @@ mod tests {
         );
     }
 
-    /// The periodic-fetch ticket's own criterion: the only mutating git operations anywhere
-    /// in the program are the periodic fetch's own fetch-and-prune and the fast-forward-only
-    /// auto-update ADR 0002 names beside it. The auto-update does not exist yet (no
-    /// `fast_forward` or `ff_only` in either crate's source at the time this test was
-    /// written), so today's provable claim is the narrower half: no push-direction remote
-    /// operation, no commit, no merge, no rebase and no reset exists in production code
-    /// anywhere in the workspace. Each needle stops at its call's opening paren, or is a
-    /// parenthesis-free shape unique enough on its own (`Direction::Push`), per this module's
-    /// own convention: a call whose arguments wrap under rustfmt is still caught, and a
-    /// needle that reached past the paren would not be.
+    /// The periodic-fetch and auto-update tickets' shared criterion, now whole: the only
+    /// mutating git operations anywhere in the program are the periodic fetch's own
+    /// fetch-and-prune and the fast-forward-only auto-update ADR 0002 names beside it, and
+    /// both now exist (`fn fast_forward` in `repon-core/src/auto_update.rs` is what
+    /// [`the_fast_forward_only_auto_update_actually_exists`] proves below, closing the
+    /// narrower half an earlier version of this test recorded while the auto-update had
+    /// not yet been built). The claim this test asserts is the full one: no push-direction
+    /// remote operation, no commit, no merge, no rebase and no reset exists in production
+    /// code anywhere in the workspace, including inside the auto-update's own mutation.
+    /// Each needle stops at its call's opening paren, or is a parenthesis-free shape unique
+    /// enough on its own (`Direction::Push`), per this module's own convention: a call
+    /// whose arguments wrap under rustfmt is still caught, and a needle that reached past
+    /// the paren would not be.
     ///
     /// Deliberately not scanned here: a shelled-out `git` invocation. `repon-core`'s own
     /// `test_support.rs` is entirely git-fixture helpers with no internal `#[cfg(test)] mod
@@ -962,6 +965,21 @@ mod tests {
                  ticket's narrowest-safe-operation rule forbids outright: {offending:?}"
             );
         }
+    }
+
+    /// The presence half the claim above needs to be whole rather than vacuous: a crate
+    /// that never built the auto-update at all would also pass every needle above, so this
+    /// proves the mechanism the absence claim is actually about was built, by finding its
+    /// own function definition (not a doc comment naming it in prose, hence
+    /// [`production_lines_containing`] rather than a raw substring search) in `repon-core`.
+    #[test]
+    fn the_fast_forward_only_auto_update_actually_exists() {
+        let offending = production_lines_containing("fn fast_forward(");
+        assert!(
+            !offending.is_empty(),
+            "found no `fn fast_forward(` in repon-core; the mutating-operations scan above \
+             is only the whole claim while this mechanism actually exists"
+        );
     }
 
     /// `cancel_in_flight` is the one function that cancels a Generation, equally private to

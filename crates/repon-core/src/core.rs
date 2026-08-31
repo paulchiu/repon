@@ -208,6 +208,21 @@ pub struct FetchSpec {
     pub concurrency: usize,
 }
 
+/// The fast-forward-only auto-update's own crossing data
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// `[auto_update]` table): whether it runs at all.
+///
+/// Always present, regardless of the `fetch` cargo feature, for the same reason
+/// [`FetchSpec`] is: plain bounding data, not the mutating mechanism. Carries no
+/// interval or concurrency of its own, because it never ticks on its own clock; it
+/// rides the periodic fetch cycle [`FetchSpec`] already schedules; a build with the
+/// `fetch` feature off has `run_fetch_cycle`'s no-op stub, so `enabled: true` here is
+/// then inert the same way `FetchSpec::enabled` is.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoUpdateSpec {
+    pub enabled: bool,
+}
+
 /// Everything `Core::start` needs, handed as plain data. The core reads no file, no
 /// path and no environment variable: this is the whole crossing, per
 /// `docs/spec/core-api.md`'s "What crosses from config".
@@ -227,6 +242,11 @@ pub struct CoreSpec {
     /// The periodic fetch's own bounding data. See [`FetchSpec`]: always present,
     /// inert without the `fetch` cargo feature.
     pub fetch: FetchSpec,
+    /// The fast-forward-only auto-update's own bounding data. See [`AutoUpdateSpec`]:
+    /// always present, inert without the `fetch` cargo feature and while
+    /// `fetch.enabled` is itself `false` (`Warning::AutoUpdateWithoutFetch` is what
+    /// tells a config author that combination can never fire).
+    pub auto_update: AutoUpdateSpec,
 }
 
 /// One entity's in-flight probe: which Generation dispatched it, and the flag that
@@ -1787,11 +1807,13 @@ fn start_internal(
         dispatch_log: Arc::clone(&dispatch_log),
         phase_c_gates: Arc::clone(&phase_c_gates),
     };
+    let auto_update_enabled = spec.auto_update.enabled;
     let fetch_schedule = FetchSchedule {
         concurrency: fetch_concurrency,
         ticks: fetch_ticks,
         refresh: fetch_refresh_handles.clone(),
         cycle_count: Arc::clone(&fetch_cycle_count),
+        auto_update_enabled,
     };
 
     let clock_thread = spawn_clock_thread(
@@ -1819,7 +1841,13 @@ fn start_internal(
         let refresh = fetch_refresh_handles.clone();
         let cycle_count = Arc::clone(&fetch_cycle_count);
         thread::spawn(move || {
-            run_fetch_cycle(&table, fetch_concurrency, &refresh, &cycle_count);
+            run_fetch_cycle(
+                &table,
+                fetch_concurrency,
+                &refresh,
+                &cycle_count,
+                auto_update_enabled,
+            );
         });
     }
 
@@ -1887,6 +1915,10 @@ struct FetchSchedule {
     ticks: Receiver<Instant>,
     refresh: RefreshHandles,
     cycle_count: Arc<AtomicUsize>,
+    /// `CoreSpec::auto_update`'s own `enabled` flag, read once at `start` like every
+    /// other field on [`FetchSchedule`]: the fast-forward-only update carries no
+    /// interval of its own, so there is no separate tick to gate it on, only this.
+    auto_update_enabled: bool,
 }
 
 /// The dedicated thread's own control-plane wiring, bundled into one argument so
@@ -1955,7 +1987,13 @@ fn spawn_clock_thread(
                         break;
                     }
                     if !paused {
-                        run_fetch_cycle(&table, fetch.concurrency, &fetch.refresh, &fetch.cycle_count);
+                        run_fetch_cycle(
+                            &table,
+                            fetch.concurrency,
+                            &fetch.refresh,
+                            &fetch.cycle_count,
+                            fetch.auto_update_enabled,
+                        );
                     }
                 }
             }
@@ -1996,6 +2034,7 @@ fn run_fetch_cycle(
     concurrency: usize,
     refresh: &RefreshHandles,
     cycle_count: &Arc<AtomicUsize>,
+    auto_update_enabled: bool,
 ) {
     cycle_count.fetch_add(1, Ordering::Release);
 
@@ -2008,6 +2047,22 @@ fn run_fetch_cycle(
         // rather than aborting the whole cycle.
         let _ = crate::fetch::fetch_and_prune(&common_dir, &cancel);
     });
+
+    // The fast-forward-only auto-update rides this cycle rather than a timer of its
+    // own, per `docs/spec/config.md`'s "Refresh, fetch and auto-update": it can only
+    // ever act on what the fetch just above learned, so it runs here, after every
+    // fetch has settled and before the one Generation below reports the result.
+    // Sequential rather than `fetch::run_bounded`'s own concurrency, since this is a
+    // mutating pass over a Repo's own working tree and index, not a read against a
+    // remote: ADR 0002's narrowest-safe-operation rule favours a simple, serial pass
+    // over throughput a mutation has no need of.
+    if auto_update_enabled {
+        for repo_path in repos_eligible_for_auto_update_attempt(table) {
+            // One Repo's ineligibility or failure never stops another's: the same
+            // independence the fetch loop above already gives each repository.
+            let _ = crate::auto_update::attempt(&repo_path);
+        }
+    }
 
     let all_keys: Vec<EntityKey> = table
         .read()
@@ -2025,7 +2080,28 @@ fn run_fetch_cycle(
     _concurrency: usize,
     _refresh: &RefreshHandles,
     _cycle_count: &Arc<AtomicUsize>,
+    _auto_update_enabled: bool,
 ) {
+}
+
+/// Every non-excluded Repo's own working directory, one per distinct common dir the
+/// table currently knows: the auto-update acts on a Repo's own row, per
+/// `docs/spec/config.md`'s "acts only on a Repo", so a Worktree sharing that common
+/// dir is never a candidate here even though it is `distinct_fetchable_common_dirs`'s
+/// own definition of "fetchable" for the read-only fetch above. Listed, never
+/// operated on, mirrors the same `excluded` rule the fetch loop's own common-dir
+/// filter applies, checked here against the Repo entity's own flag rather than any
+/// Worktree that happens to share its common dir.
+#[cfg(feature = "fetch")]
+fn repos_eligible_for_auto_update_attempt(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
+    table
+        .read()
+        .unwrap()
+        .entities
+        .iter()
+        .filter(|entity| entity.kind == Kind::Repo && !entity.excluded)
+        .map(|entity| entity.key.path().to_path_buf())
+        .collect()
 }
 
 /// Every distinct git common dir a fetch cycle should fetch: deduplicated across
@@ -3385,6 +3461,14 @@ mod tests {
         }
     }
 
+    /// An `AutoUpdateSpec` that never fires on its own, the same reason
+    /// [`fetch_spec_for_test`] never does: every existing test that does not care
+    /// about the auto-update keeps behaving exactly as it did before this field
+    /// existed.
+    fn auto_update_spec_for_test() -> AutoUpdateSpec {
+        AutoUpdateSpec { enabled: false }
+    }
+
     fn spec(roots: Vec<PathBuf>) -> CoreSpec {
         CoreSpec {
             set: SetSpec {
@@ -3399,6 +3483,7 @@ mod tests {
             generation_deadline: Duration::from_secs(3600),
             show_submodules: false,
             fetch: fetch_spec_for_test(),
+            auto_update: auto_update_spec_for_test(),
         }
     }
 
@@ -3409,9 +3494,9 @@ mod tests {
     /// deliberately: it narrows probing and rendering, never what discovery bounds, so it
     /// is not the scoping field this test guards against
     /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
-    /// "narrows the view rather than bounding the work"). `fetch` is excluded from that
-    /// same guard for the same reason: it narrows what the periodic fetch touches, never
-    /// what discovery bounds.
+    /// "narrows the view rather than bounding the work"). `fetch` and `auto_update` are
+    /// excluded from that same guard for the same reason: they narrow what the periodic
+    /// fetch and the fast-forward-only update touch, never what discovery bounds.
     #[test]
     fn core_spec_carries_no_scoping_field_scope_is_never_a_dial() {
         let CoreSpec {
@@ -3422,6 +3507,7 @@ mod tests {
             generation_deadline: _,
             show_submodules: _,
             fetch: _,
+            auto_update: _,
         } = spec(Vec::new());
     }
 
@@ -8946,6 +9032,103 @@ mod tests {
         }
     }
 
+    /// The Worktree-reporting criterion: after a default branch moves, the Worktrees
+    /// now behind it are reported by name. `base` (the same "behind the default branch"
+    /// count [`base.rs`] computes and every row's own `name` already carries) is what
+    /// "reported by name" means in practice: a snapshot reader finds each Worktree by
+    /// the name on its row, not by position, so this test does the same, matching each
+    /// assertion to its own fixture's name rather than to "the first" or "the last"
+    /// entity.
+    ///
+    /// `wt-behind` is branched from the default branch's tip before it moves and is left
+    /// untouched, the same shape a fetch leaves an existing linked Worktree in; `wt-
+    /// caught-up` is branched from the tip *after* it moves, so it is unaffected. Two
+    /// Worktrees are required, not one: a test with only `wt-behind` would still pass
+    /// against an implementation that reports every Worktree as behind regardless of
+    /// whether it actually is, and a test that asserted only "something is reported"
+    /// would pass even if the names or the counts were swapped.
+    #[test]
+    fn worktrees_now_behind_a_moved_default_branch_are_reported_by_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha_a = head_sha(&repo);
+        add_origin_remote(&repo);
+        set_upstream(&repo, "main", &sha_a);
+
+        let behind_path = root.join("wt-behind");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic-behind",
+                behind_path.to_str().expect("utf8 path"),
+                "main",
+            ],
+        );
+
+        // Moves only the default branch's own remote-tracking ref, the same shape a
+        // fetch leaves behind: `repo`'s own checked-out `main` does not move, so this
+        // is deliberately not exercising the auto-update itself, only what a moved
+        // default branch does to every Worktree's own `base` count.
+        git(&repo, &["checkout", "-b", "scratch"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+        let sha_b = head_sha(&repo);
+        git(&repo, &["checkout", "main"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &sha_b]);
+        git(&repo, &["branch", "-D", "scratch"]);
+
+        // Branched from the plain commit sha, not `refs/remotes/origin/main` itself:
+        // starting a new branch from a remote-tracking ref makes git auto-configure it
+        // to track that same ref, which would make this row the default branch's own
+        // row (`base.rs`'s `branch_is_default_branchs_own_row`) and settle `base` as
+        // `NotApplicable` rather than the `0` this fixture means to prove.
+        let caught_up_path = root.join("wt-caught-up");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic-caught-up",
+                caught_up_path.to_str().expect("utf8 path"),
+                &sha_b,
+            ],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = refresh_and_settle(&core);
+
+        let base_of = |name: &str| -> u32 {
+            let entity = snapshot
+                .entities
+                .iter()
+                .find(|entity| &*entity.name == name)
+                .unwrap_or_else(|| panic!("no entity named {name} in {snapshot:?}"));
+            match entity.base.settled() {
+                Some(Settled::Known {
+                    value,
+                    at: _,
+                    stale: _,
+                }) => *value,
+                other => panic!("expected a known base count for {name}, got {other:?}"),
+            }
+        };
+
+        assert!(
+            base_of("wt-behind") > 0,
+            "a Worktree branched before the default branch moved must be reported behind"
+        );
+        assert_eq!(
+            base_of("wt-caught-up"),
+            0,
+            "a Worktree branched from the new tip must not be reported behind"
+        );
+    }
+
     /// The periodic fetch's own scheduler: criterion 3's five rules
     /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
     /// "The periodic fetch"). Every fixture here is a bare repo this test creates plus a
@@ -8982,6 +9165,7 @@ mod tests {
                 .status()
                 .expect("run git clone");
             assert!(status.success());
+            crate::test_support::set_identity(dest);
         }
 
         /// The scheduler's first rule: enabling the periodic fetch runs one cycle
@@ -9149,6 +9333,109 @@ mod tests {
                     .iter()
                     .map(|entity| (entity.kind, entity.state.settled().cloned()))
                     .collect::<Vec<_>>()
+            );
+        }
+
+        fn spec_with_auto_update(
+            fetch_enabled: bool,
+            auto_update_enabled: bool,
+            root: PathBuf,
+        ) -> CoreSpec {
+            let mut spec = fetch_spec(fetch_enabled, root);
+            spec.auto_update = AutoUpdateSpec {
+                enabled: auto_update_enabled,
+            };
+            spec
+        }
+
+        fn rev_parse(path: &Path, rev: &str) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", rev])
+                .output()
+                .expect("run git rev-parse");
+            assert!(output.status.success(), "git rev-parse {rev} failed");
+            String::from_utf8(output.stdout)
+                .expect("utf8 sha")
+                .trim()
+                .to_string()
+        }
+
+        /// Criterion 1's "off by default" half: `fetch.enabled` alone is not enough to
+        /// move a branch. `fetch_ticks` never fires, so the only cycle that can possibly
+        /// run is the immediate one `start_internal` dispatches on being enabled; that
+        /// cycle fetches (`fetch_cycle_count_for_test` proves it ran) and must still
+        /// leave the eligible local branch exactly where it was, since `auto_update`
+        /// carries its own, separate `enabled` flag this spec never turns on.
+        #[test]
+        fn auto_update_is_off_by_default_even_with_fetch_enabled() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+            let before = rev_parse(&parent, "refs/heads/main");
+
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(true, false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            );
+            let core = started.core;
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    core.fetch_cycle_count_for_test() >= 1
+                }),
+                "the periodic fetch must still have run its immediate cycle"
+            );
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before,
+                "an eligible branch must not move while auto_update.enabled is false, \
+                 even though fetch.enabled is true"
+            );
+        }
+
+        /// Criterion 1's "rides the fetch cycle with no timer of its own" half: the
+        /// remote is already ahead *before* `Core::start`, `fetch_ticks` is
+        /// `crossbeam_channel::never()` so no recurring tick ever fires, and yet the
+        /// eligible branch still moves, proving the auto-update ran on the same
+        /// immediate first cycle the periodic fetch itself uses rather than waiting on
+        /// any tick of its own.
+        #[test]
+        fn auto_update_enabled_rides_the_immediate_fetch_cycle_with_no_timer_of_its_own() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            let remote_tip = rev_parse(remote.path(), "refs/heads/main");
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(true, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            );
+            // Kept alive, unused otherwise: dropping `Core` joins its dedicated thread,
+            // which would stop the immediate cycle this test is waiting on.
+            let _core = started.core;
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    rev_parse(&parent, "refs/heads/main") == remote_tip
+                }),
+                "the eligible branch must fast-forward on the immediate cycle alone, \
+                 with no fetch tick and no auto-update tick of its own"
             );
         }
     }
