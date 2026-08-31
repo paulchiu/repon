@@ -1,0 +1,84 @@
+# Open questions register
+
+Every question the design deliberately left open, in one place, so a later reader
+cannot mistake a deferral for an oversight or rebuild something already refused on
+purpose. Each entry states the question, what kind of open it is, and its reopening
+condition where one exists; the reasoning behind the answer stays in the document
+that owns it. This register points outward on purpose: an entry that restated the
+reasoning would drift from the document the moment either one next changes, so read
+the link for the "why" and come back here only for the list.
+
+Nothing on this page is settled or built by it. An entry is removed once its owning
+document actually answers the question, not before.
+
+## A headless run verb
+
+Absent in the first version, so no exit code reports an Action's own failure; the
+only exit code `repon status` computes is over probes, and an Action's receipt is
+Repon's report of what it did, not a reading of the world. `StepOutcome::Failed`
+still carries the per-entity exit code so a headless consumer stays addable without
+redesigning it, which
+[`crates/repon/src/app/status.rs`](../crates/repon/src/app/status.rs)'s
+`a_failed_action_step_never_flips_the_probe_verdict_and_keeps_its_exit_code` proves
+directly: a `Failed` step never flips `entity_probe_failed`'s verdict, and the code
+it carried is still readable off the receipt afterwards.
+
+- **Reopens if**: a headless run verb is added.
+- **Owned by**: [`spec/actions.md`](spec/actions.md#open), whose "Open" list records
+  the gap, and [`spec/core-api.md`](spec/core-api.md), which owns the exit-code rule
+  such a verb would extend.
+
+## Per-Repo Action applicability
+
+The `[[action]]` schema has no way to compute how many of the selected Repos define
+a given Action, so the palette shows the Selection count instead. The dropped
+requirement was recorded as the single biggest usability gain over the CLI, which is
+why it stays open here rather than settled as never.
+
+- **Reopens if**: the schema grows a way to declare, per Action, which Repos it
+  applies to.
+- **Owned by**: [`spec/actions.md`](spec/actions.md#open). The promised count was
+  already removed from [`CONTEXT.md`](../CONTEXT.md)'s glossary; its `Action` entry
+  now says only "how many Repos it will run on", which is the Selection count the
+  confirm gate and the palette both already show.
+
+## Fold vocabulary for collapsing Worktrees under their Repo
+
+Out of scope for v1: the `show_worktrees` preference (`spec/config.md`) and a
+Worktrees Filter already give this need two routes, and a third (`za`, `zo`, `zc`,
+`zR`, `zM`) would need a multi-key sequence the rest of the binding map does not
+have.
+
+- **Reopens if**: the two existing routes turn out not to cover the need, or the
+  map grows multi-key sequences for an unrelated reason.
+- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open).
+
+## Mouse support
+
+A deliberate no, not a closed door. Mouse capture is held off for the whole run:
+[ADR 0024](adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)
+records why, and `spec/keybindings.md`'s terminal-state contract fixes it.
+[`crates/repon/src/tui.rs`](../crates/repon/src/tui.rs)'s
+`the_enter_and_restore_sequences_account_for_every_piece_the_spec_names` reads that
+contract's own table at test time and fails if mouse capture is ever enabled or
+released, so the no stays enforced rather than merely stated.
+
+- **Reopens if**: someone wants to try it.
+- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open), reasoning in
+  [ADR 0024](adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
+
+## Dismissing a Vanished row has no undo
+
+Genuinely unresolved rather than a deliberate no: whether the dismiss gesture needs
+an undo, or a Vanished row wants a Filter of its own, is still an open question. It
+sits beside a second open point on the same row, the gutter mark a Vanished row
+should carry, which
+[`crates/repon-core/src/entity.rs`](../crates/repon-core/src/entity.rs)'s
+`Presence` doc comment already records. The Filter half is already settled:
+`presence:vanished` exists ([`spec/filter.md`](spec/filter.md)) precisely because a
+Vanished row is one Repon cannot refresh, which is a different fact from a Stale
+one.
+
+- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open) (the undo
+  question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
+  (the gutter mark).

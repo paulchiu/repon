@@ -252,6 +252,8 @@ An unbound printable key is ignored in silence and never beeps, because a split 
 
 ## Open
 
-- Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have.
+Each item below is also listed, with its reopening condition, in [the open-questions register](../open-questions.md); that page points back here rather than restating the reasoning.
+
+- Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have. Reopenable if either existing route turns out not to cover the need, or if the map grows multi-key sequences for an unrelated reason.
 - Mouse support. Ruled out above for a stated reason rather than an absent one, and the reopening condition is someone wanting to try it.
 - The dismiss gesture has no undo. Whether it needs one, and whether a Vanished row wants a Filter of its own, is open in [layout-and-provenance.md](layout-and-provenance.md).

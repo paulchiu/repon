@@ -334,8 +334,9 @@ impl ActionReceipt {
 
 /// Whether an Entity was found by the Refresh that just ran.
 ///
-/// Open, recorded here as well as in the open-questions register: the gutter
-/// mark a Vanished row should carry. Every `Known` cell going stale folds
+/// Open, recorded here as well as in
+/// [the open-questions register](https://github.com/paulchiu/repon/blob/main/docs/open-questions.md):
+/// the gutter mark a Vanished row should carry. Every `Known` cell going stale folds
 /// today's rendered row to the ordinary stale mark whenever every cell has a
 /// value to force stale in the first place; while probing is still limited to
 /// `branch` and `default_branch`, a Vanished Entity's other, never-yet-probed
