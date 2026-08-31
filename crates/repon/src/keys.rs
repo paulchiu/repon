@@ -102,11 +102,12 @@ const fn binding(
     (context, code, modifiers, action)
 }
 
-/// The spec's own words for an action, read by [`BindingTable::describe`] for the help overlay and by
-/// this module's own spec-conformance test. Deriving it from the [`Action`] rather than
-/// storing it per row means a mislabelled binding permutes its description too, so neither
-/// reader can be fed a stale string.
-fn description(action: Action) -> &'static str {
+/// The spec's own words for an action, read by [`BindingTable::describe`] for the help overlay,
+/// by `App::notify_not_implemented` for the shared warning slot's "not implemented yet"
+/// message, and by this module's own spec-conformance test. Deriving it from the [`Action`]
+/// rather than storing it per row means a mislabelled binding permutes its description too, so
+/// no reader can be fed a stale string.
+pub(crate) fn description(action: Action) -> &'static str {
     match action {
         Action::OpenHelp => "Open the help overlay",
         Action::Quit => "Quit",
