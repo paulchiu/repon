@@ -8,17 +8,17 @@ use std::fmt;
 
 use ratatui::{Frame, layout::Rect, style::Style};
 
-use crate::keys::{Action, BindingTable, Context};
+use crate::{
+    degrade::{self, Priority},
+    keys::{Action, BindingTable, Context},
+};
 
-/// Where a hint sits in the drop order: lower drops first, and `Pinned` never drops, which
-/// is the escape hatch [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)
-/// requires for help. Items sharing a rank drop together as one atomic group (`! launcher`
-/// and `; action`), never one without the other.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum Priority {
-    Drop(u8),
-    Pinned,
-}
+// `Priority`'s own doc lives on `degrade::Priority`: lower drops first, `Pinned` never
+// drops, and items sharing a rank drop together as one atomic group (`! launcher` and
+// `; action` here), never one without the other. [header.rs](../header/index.html) shares
+// this same enum for the header's own five items, per
+// [0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)'s
+// citation of the footer's own mechanics rather than a second one.
 
 /// One hint's chord text and its label, kept as two fields rather than joined into one
 /// opaque string: [theming.md](../../../../docs/spec/theming.md) fixes the key's role as
@@ -213,11 +213,12 @@ impl fmt::Display for FooterLine {
 }
 
 /// Selects `items` into at most `width` ASCII columns, following
-/// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s four rules: every
-/// item is width-checked including the first (rule 4), the ellipsis is reserved inside the
-/// budget rather than appended once something already fits (rule 4), items sharing a
-/// [`Priority`] drop together (rule 3), and a [`Priority::Pinned`] item never drops; only
-/// the ellipsis drops from it (rule 4). Widths are ASCII byte counts, which is exactly
+/// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s four rules, encoded
+/// once in [`degrade::budget`] and shared with the header's own ladder: every item is
+/// width-checked including the first (rule 4), the ellipsis is reserved inside the budget
+/// rather than appended once something already fits (rule 4), items sharing a [`Priority`]
+/// drop together (rule 3), and a [`Priority::Pinned`] item never drops; only the ellipsis
+/// drops from it (rule 4). Widths are ASCII byte counts here, which is exactly
 /// `unicode-width`'s score for the vocabulary this module builds, per rule 1.
 fn budget(items: &[Item], width: usize) -> FooterLine {
     debug_assert!(
@@ -226,49 +227,17 @@ fn budget(items: &[Item], width: usize) -> FooterLine {
             .all(|item| item.hint.key.is_ascii() && item.hint.label.is_ascii()),
         "a footer item must be ASCII, or its byte length is not its display width"
     );
-    let mut current: Vec<&Item> = items.iter().collect();
-    loop {
-        let dropped = current.len() < items.len();
-        let joined = current
-            .iter()
-            .map(|item| item.hint.to_string())
-            .collect::<Vec<_>>()
-            .join(SEPARATOR);
-        let rendered_len = if dropped {
-            joined.len() + ELLIPSIS.len()
-        } else {
-            joined.len()
-        };
-        if rendered_len <= width {
-            return FooterLine {
-                hints: current.iter().map(|item| item.hint.clone()).collect(),
-                truncated: dropped,
-            };
-        }
-
-        let lowest_droppable = current
-            .iter()
-            .filter(|item| item.priority != Priority::Pinned)
-            .map(|item| item.priority)
-            .min();
-        match lowest_droppable {
-            Some(priority) => current.retain(|item| item.priority != priority),
-            None => {
-                // Nothing left that may drop; the ellipsis itself is what overruns, so it
-                // drops instead of the last surviving item.
-                return if joined.len() <= width {
-                    FooterLine {
-                        hints: current.iter().map(|item| item.hint.clone()).collect(),
-                        truncated: false,
-                    }
-                } else {
-                    FooterLine {
-                        hints: Vec::new(),
-                        truncated: false,
-                    }
-                };
-            }
-        }
+    let generic_items: Vec<degrade::Item<Hint>> = items
+        .iter()
+        .map(|item| degrade::Item {
+            content: item.hint.clone(),
+            priority: item.priority,
+        })
+        .collect();
+    let line = degrade::budget(&generic_items, width, SEPARATOR, ELLIPSIS);
+    FooterLine {
+        hints: line.items,
+        truncated: line.truncated,
     }
 }
 
