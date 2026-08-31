@@ -80,6 +80,25 @@ fn layout_state(width: u16, pane_open: bool) -> Layout3 {
     }
 }
 
+/// Cancelling an in-flight fan-out is the unwind stack's first and innermost level
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#esc): "If an Action is fanning
+/// out, Esc cancels it"), tried before the range anchor, the detail pane or a committed
+/// Filter and live only while [`Core::action_running`] is true.
+struct CancelActionOnUnwind<'a> {
+    core: &'a Core,
+}
+
+impl UnwindLevel for CancelActionOnUnwind<'_> {
+    fn unwind(&mut self) -> bool {
+        if self.core.action_running() {
+            self.core.stop_action();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Closing the detail pane is the unwind stack's second level
 /// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)'s fixed order: an in-flight
 /// fan-out, then a range anchor, then the detail pane, then a committed Filter), live only
@@ -292,6 +311,13 @@ pub struct App {
     /// overlay, since the list keeps narrowing live underneath it
     /// ([filter.md](../../../docs/spec/filter.md)).
     filter_line: Option<FilterLine>,
+    /// `true` while the quit confirm dialog has focus: `Action::Quit` raises this instead of
+    /// `Message::Quit` directly whenever `Core::action_running` is true, because quitting
+    /// mid-fan-out orphans the children ([keybindings.md](../../../docs/spec/keybindings.md)'s
+    /// "Quitting, suspending, confirming"). Dispatched through `Context::Confirm`, the same
+    /// `y`/`n`/Esc vocabulary [`Stage::Confirming`] uses; `Action::Suspend` is never gated
+    /// this way, since suspending is reversible where quitting is not.
+    quit_confirm: bool,
 }
 
 impl App {
@@ -405,6 +431,7 @@ impl App {
             cwd: config::document::working_directory(),
             filter: Filter::default(),
             filter_line: None,
+            quit_confirm: false,
         };
         app.restore_session_state(flag_filter.as_deref());
         Ok(app)
@@ -607,8 +634,13 @@ impl App {
             if self.should_suspend {
                 // refresh.md's "Suspension": all background work stops while the TUI is
                 // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
-                // Launcher's own handoff ([`Self::around_entity_handoff`]).
+                // Launcher's own handoff ([`Self::around_entity_handoff`]). `hold_action`
+                // is its own verb, a no-op with no fan-out live: Ctrl+Z stays ungated and
+                // SIGSTOPs a running fan-out's own step groups rather than orphaning them
+                // the way `pause` alone (probe cancellation only) would leave them running
+                // unattended (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
                 self.core.pause();
+                self.core.hold_action();
                 tui.suspend()?;
                 self.message_tx.send(Message::Resume)?;
                 self.message_tx.send(Message::ClearScreen)?;
@@ -691,6 +723,10 @@ impl App {
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
         self.notice_set_at = None;
+        if self.quit_confirm {
+            self.handle_quit_confirm_key(key);
+            return Ok(());
+        }
         if let Some(overlay) = &mut self.help {
             match self.bindings.dispatch(Context::Overlay, key) {
                 Some(Action::Close) => self.help = None,
@@ -736,7 +772,15 @@ impl App {
         // ends up living, and a marker that moves or is renamed fails the test loudly rather
         // than reading as "nothing found".
         let message = match self.bindings.dispatch(self.focus, key) {
-            Some(Action::Quit) => Some(Message::Quit),
+            // Gated behind a confirm dialog while a fan-out is in flight, because quitting
+            // orphans the children (keybindings.md's "Quitting, suspending, confirming");
+            // `Action::Suspend` just below is never gated the same way, since suspending
+            // is reversible where quitting is not.
+            Some(Action::Quit) if !self.action_running() => Some(Message::Quit),
+            Some(Action::Quit) => {
+                self.quit_confirm = true;
+                None
+            }
             Some(Action::Suspend) => Some(Message::Suspend),
             Some(Action::ReloadConfig) => {
                 if self.action_running() {
@@ -828,6 +872,7 @@ impl App {
                 None
             }
             Some(Action::Unwind) => {
+                let mut cancel_action = CancelActionOnUnwind { core: &self.core };
                 let mut close_pane = ClosePaneOnUnwind {
                     pane: &mut self.pane,
                     focus: &mut self.focus,
@@ -835,7 +880,12 @@ impl App {
                 let mut clear_filter = ClearFilterOnUnwind {
                     filter: &mut self.filter,
                 };
-                unwind::unwind_one(&mut [&mut self.selection, &mut close_pane, &mut clear_filter]);
+                unwind::unwind_one(&mut [
+                    &mut cancel_action,
+                    &mut self.selection,
+                    &mut close_pane,
+                    &mut clear_filter,
+                ]);
                 None
             }
             Some(Action::OpenHelp) => {
@@ -957,6 +1007,28 @@ impl App {
             self.message_tx.send(message)?;
         }
         Ok(())
+    }
+
+    /// Every key event while `self.quit_confirm` is `true`, dispatched through
+    /// `Context::Confirm`, the same `y`/`n`/Esc vocabulary the Action palette's own confirm
+    /// stage uses. `y` (`Action::Run`) sets `should_quit` directly rather than through
+    /// `Message::Quit`, mirroring `Self::handle_events`' own direct set when the event
+    /// thread is gone: `Action::Quit` already decided to quit by the time this dialog
+    /// opened, this is only that decision's confirmation. `n` or Esc (`Action::Decline`)
+    /// closes the dialog and leaves everything else untouched.
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) {
+        match self.bindings.dispatch(Context::Confirm, key) {
+            Some(Action::Run) => {
+                self.quit_confirm = false;
+                self.should_quit = true;
+            }
+            Some(Action::Decline) => self.quit_confirm = false,
+            None => {}
+            Some(other) => unreachable!(
+                "dispatch(Context::Confirm, _) only ever returns Run, Decline or None, got \
+                 {other:?}"
+            ),
+        }
     }
 
     /// Every key event while `self.action_palette` is `Some`, dispatched through
@@ -1505,6 +1577,12 @@ impl App {
     /// applies unchanged.
     fn on_resume(&mut self) {
         self.core.resume();
+        // `continue_action` undoes `hold_action`'s own SIGSTOP; called unconditionally, the
+        // same shape `resume` above already takes, since it is a no-op with no fan-out held
+        // (in particular, harmless here on the return path from a Launcher handoff, which
+        // never held one in the first place: `!` stays live during a run precisely because
+        // that handoff sends the fan-out's step groups no signal at all).
+        self.core.continue_action();
         self.core.refresh(&self.refresh_everything_order());
         self.reread_theme();
     }
@@ -1939,6 +2017,7 @@ mod tests {
             cwd: PathBuf::new(),
             filter: Filter::default(),
             filter_line: None,
+            quit_confirm: false,
         }
     }
 
@@ -2327,6 +2406,363 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || !app.core.action_running()),
             "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    /// The Launcher key is the one exception the ticket calls out by name: `!` stays live
+    /// while a fan-out is in flight, because handing one Repo to lazygit while another
+    /// installs is a thing a person may legitimately want
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// confirming"). A version of this gate that swept `!` in too would open the palette
+    /// nowhere and raise no Notice either, which is exactly what this test rules out.
+    #[test]
+    fn open_launcher_stays_live_while_an_action_is_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("press ! while an Action is fanning out");
+        assert!(
+            app.launcher_palette.is_some(),
+            "! must open the Launcher palette even while a fan-out is running"
+        );
+        assert_eq!(
+            app.notice(),
+            None,
+            "! must never answer with the inert-binding Notice the other four do"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !app.core.action_running()),
+            "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    /// Criterion 5's own "exactly four, no more": every call site that raises
+    /// `action_running_notice` across both crates, since a Launcher and an Action step's
+    /// executor both spawn child processes and a scan confined to one crate would be
+    /// exactly "a check that quietly stops checking"
+    /// ([`crate::test_support::workspace_crate_src_dirs`]'s own doc comment). Named against
+    /// the ticket's own four groups (`;`, `s`, `1`-`9`, `Ctrl+R`) rather than merely counted,
+    /// so a fifth call site that happened to reuse one of the four names could not slip
+    /// through as still reading "four".
+    #[test]
+    fn exactly_four_bindings_are_gated_on_action_running_and_no_more() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut call_sites = Vec::new();
+        for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
+            let source = crate::test_support::production_source_at(&path);
+            for line in source.lines() {
+                let Some((_, after)) = line.split_once("action_running_notice(\"") else {
+                    continue;
+                };
+                // Skips `action_running_notice`'s own definition line, `pub(crate) fn
+                // action_running_notice(what: &str) -> String`, which never itself calls
+                // the function and so never matches the `("` pattern above in the first
+                // place; this guard exists only so a future rename of the parameter can
+                // never accidentally create a false match here.
+                if line.contains("fn action_running_notice") {
+                    continue;
+                }
+                let label = after
+                    .split_once('"')
+                    .map(|(label, _)| label.to_string())
+                    .expect("a string literal argument");
+                call_sites.push(label);
+            }
+        }
+        call_sites.sort();
+        assert_eq!(
+            call_sites,
+            vec![
+                "Action palette",
+                "Reload config",
+                "Set picker",
+                "Set switch"
+            ],
+            "expected exactly the ticket's own four groups gated on action_running, no more \
+             and no fewer, found: {call_sites:?}"
+        );
+    }
+
+    // =====================================================================================
+    // Criterion 3: quitting is gated behind a confirm dialog while a fan-out is in flight,
+    // because quitting orphans the children; suspending is never gated the same way, since
+    // it is reversible.
+    // =====================================================================================
+
+    #[test]
+    fn q_and_ctrl_c_open_a_confirm_dialog_while_fanning_out_and_y_or_n_decide_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("press q while an Action is fanning out");
+        assert!(
+            app.quit_confirm,
+            "q must open the quit confirm dialog rather than quitting outright"
+        );
+        assert!(!app.should_quit, "opening the dialog must not itself quit");
+
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("decline the confirm");
+        assert!(!app.quit_confirm, "n must close the dialog");
+        assert!(!app.should_quit, "declining must never quit");
+
+        app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .expect("press ctrl+c while an Action is fanning out");
+        assert!(
+            app.quit_confirm,
+            "ctrl+c must open the same confirm dialog q does"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm the quit");
+        assert!(!app.quit_confirm);
+        assert!(app.should_quit, "confirming must actually quit");
+
+        // The fan-out this test started is still live; cancelled directly here rather than
+        // left running past the test, since a confirmed quit orphans it in production but
+        // this test's own `Core` still needs to drop cleanly.
+        app.core.stop_action();
+        assert!(wait_until(Duration::from_secs(5), || !app
+            .core
+            .action_running()));
+    }
+
+    /// Esc while the quit confirm dialog is open must decline it, never quit: `Context::Confirm`
+    /// binds Esc to `Action::Decline`, the same as `n`, so this is also a second, independent
+    /// proof of keybindings.md's "Esc never quits, at any depth" alongside the unwind-stack
+    /// tests, at a state those never reach.
+    #[test]
+    fn esc_declines_the_quit_confirm_dialog_rather_than_quitting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("open the quit confirm dialog");
+        assert!(app.quit_confirm, "sanity: the dialog must be open");
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("press esc against the confirm dialog");
+
+        assert!(!app.quit_confirm, "esc must close the dialog");
+        assert!(!app.should_quit, "esc must never quit, at any depth");
+
+        app.core.stop_action();
+        assert!(wait_until(Duration::from_secs(5), || !app
+            .core
+            .action_running()));
+    }
+
+    /// Ctrl+Z is deliberately never gated the way `q`/`Ctrl+C` are: suspending is reversible
+    /// where quitting is not ([keybindings.md](../../../docs/spec/keybindings.md)'s
+    /// "Quitting, suspending, confirming"). Checked at the same dispatch seam the quit gate
+    /// itself is proven at, with an Action genuinely fanning out, so this is the direct
+    /// negative of the test above rather than merely "Suspend still exists somewhere".
+    #[test]
+    fn suspend_is_never_gated_behind_a_confirm_while_an_action_is_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('z'), KeyModifiers::CONTROL))
+            .expect("press ctrl+z while an Action is fanning out");
+
+        assert!(
+            !app.quit_confirm,
+            "suspend must never open the quit confirm dialog"
+        );
+        assert_eq!(
+            app.notice(),
+            None,
+            "suspend must never answer with the inert-binding Notice either"
+        );
+        assert!(
+            matches!(app.message_rx.try_recv(), Ok(Message::Suspend)),
+            "ctrl+z must still raise Suspend while a fan-out is running"
+        );
+
+        app.core.stop_action();
+        assert!(wait_until(Duration::from_secs(5), || !app
+            .core
+            .action_running()));
+    }
+
+    // =====================================================================================
+    // Criterion 7: Escape's full four-level unwind, asserted as one stack in a fixed order:
+    // cancel a fan-out, cancel a range anchor, close the detail pane, clear a committed
+    // Filter. Every level lives at once in one fixture; each Escape press unwinds exactly
+    // one, and the levels not yet reached stay untouched.
+    // =====================================================================================
+
+    /// An Action whose one step never dies from its own accord (untrapped, so a single
+    /// SIGTERM from `stop_action` kills it almost immediately): long enough that this test
+    /// could never wait it out by accident, which is what makes "it finished because Esc
+    /// cancelled it" the only honest explanation for `action_running` going false during
+    /// this test's own bounded wait.
+    fn long_running_action_config(name: &str) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm: false,
+            concurrency: 1,
+        }
+    }
+
+    #[test]
+    fn escape_unwinds_all_four_levels_in_order_one_per_press_leaving_the_rest_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(long_running_action_config("hold"));
+        app.filter = Filter::parse("repo");
+
+        // Level 1 (innermost): an Action fanning out.
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        // Level 2: a range anchor.
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("drop a range anchor");
+        assert!(
+            app.selection.has_range_anchor(),
+            "sanity: the anchor must be live"
+        );
+
+        // Level 3: the detail pane, open beside the anchored row. Focus returns to the
+        // list right after (Tab, `Action::ReturnFocusToList`, which leaves the pane open):
+        // `Context::Detail` binds its own Esc straight to `ClosePane`, bypassing the shared
+        // Unwind stack entirely, and this fixture means to drive that shared stack, the
+        // path Esc takes while the list itself has focus.
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open the detail pane");
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("return focus to the list, leaving the pane open");
+        assert!(app.pane.is_some(), "sanity: the pane must be open");
+        assert_eq!(
+            app.focus,
+            Context::List,
+            "sanity: focus must be back on the list"
+        );
+
+        // Level 4: the committed Filter set up before any of this, still active.
+        assert!(
+            app.filter.is_active(),
+            "sanity: the Filter must be committed and active"
+        );
+
+        // Press 1: only the fan-out unwinds.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("first esc: cancel the fan-out");
+        assert!(
+            app.selection.has_range_anchor(),
+            "the range anchor must be untouched by the first press"
+        );
+        assert!(
+            app.pane.is_some(),
+            "the detail pane must be untouched by the first press"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter must be untouched by the first press"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !app.core.action_running()),
+            "the first press must actually have cancelled the fan-out"
+        );
+
+        // Press 2: only the range anchor unwinds.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("second esc: cancel the range anchor");
+        assert!(
+            !app.selection.has_range_anchor(),
+            "the second press must cancel the range anchor"
+        );
+        assert!(
+            app.pane.is_some(),
+            "the detail pane must be untouched by the second press"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter must be untouched by the second press"
+        );
+
+        // Press 3: only the detail pane unwinds.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("third esc: close the detail pane");
+        assert!(
+            app.pane.is_none(),
+            "the third press must close the detail pane"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter must be untouched by the third press"
+        );
+
+        // Press 4: only the committed Filter unwinds.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("fourth esc: clear the committed Filter");
+        assert!(
+            !app.filter.is_active(),
+            "the fourth press must clear the committed Filter, the last rung"
         );
     }
 

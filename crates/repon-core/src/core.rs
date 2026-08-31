@@ -357,6 +357,15 @@ pub struct Core {
     /// fan-out runs at a time, per [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
     /// "One Action runs at a time".
     action_running: Arc<AtomicBool>,
+    /// The current fan-out's own reach into its steps' children while `action_running` is
+    /// true, `None` otherwise: what [`Core::hold_action`], [`Core::continue_action`] and
+    /// [`Core::stop_action`] each look up before doing anything, so all three are no-ops
+    /// with no fan-out live. Deliberately its own field rather than folded into `pause`/
+    /// `resume`'s machinery, per [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// "Cancellation, suspend and quit": the core is contractually not told why background
+    /// work stopped, and a step's child needs SIGSTOP/SIGTERM/SIGKILL, information `pause`
+    /// must never carry.
+    action_control: Arc<Mutex<Option<Arc<executor::RunControl>>>>,
     /// Every key `refresh`'s own sequential dispatch loop iterated, in the order it iterated
     /// them, cleared at the start of every call: this is dispatch order, not completion
     /// order, recorded synchronously in the loop that decides it, before any `rayon::spawn`
@@ -787,6 +796,12 @@ impl Core {
         let table_handle = Arc::clone(&self.table);
         let action_running = Arc::clone(&self.action_running);
         let refresh_handles = self.refresh_handles();
+        // Built synchronously here, before this method ever returns, so a caller that
+        // calls `stop_action`/`hold_action` the instant `run_action` returns `true` never
+        // races an empty `action_control` against the fan-out thread below setting it.
+        let control = executor::RunControl::new();
+        *self.action_control.lock().unwrap() = Some(Arc::clone(&control));
+        let action_control = Arc::clone(&self.action_control);
         // At least one worker regardless of what `action.concurrency` says: 0 has no
         // sensible reading as "run nothing" here (the schema has no floor, only an
         // explicit absence of a *ceiling*, `docs/spec/actions.md`'s "The fan-out"), and
@@ -820,7 +835,8 @@ impl Core {
                                 table.entities[idx].last_action = Some(receipt);
                             }
                         };
-                        let receipt = run_action_for_entity(&entity, &action, &write_receipt);
+                        let receipt =
+                            run_action_for_entity(&entity, &action, &control, &write_receipt);
                         write_receipt(receipt);
                     });
                 });
@@ -835,6 +851,10 @@ impl Core {
             // have finished, panic or not; a second `run_action` racing in from here on
             // is racing the completion Generation below, never another fan-out.
             action_running.store(false, Ordering::Release);
+            // This run's own `RunControl` is done being reachable: `hold_action`,
+            // `continue_action` and `stop_action` all become no-ops again until the next
+            // `run_action` replaces this with a fresh one.
+            *action_control.lock().unwrap() = None;
 
             // A panicked fan-out never finished cleanly, so it earns no completion
             // Generation once the flag above is safely reset. Swallowed rather than
@@ -859,6 +879,40 @@ impl Core {
         });
 
         true
+    }
+
+    /// SIGSTOPs every currently live step's process group in the fan-out `run_action`
+    /// started, reversible with [`Self::continue_action`]: suspending a run is reversible,
+    /// where cancelling one is not
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "Cancellation, suspend and quit"). A no-op while no fan-out is running. Its own verb,
+    /// kept apart from [`Self::pause`], which stays ignorant of why background work stopped.
+    pub fn hold_action(&self) {
+        if let Some(control) = self.action_control.lock().unwrap().as_ref() {
+            control.hold();
+        }
+    }
+
+    /// SIGCONTs every currently live step's process group, undoing [`Self::hold_action`]. A
+    /// no-op while no fan-out is running.
+    pub fn continue_action(&self) {
+        if let Some(control) = self.action_control.lock().unwrap().as_ref() {
+            control.continue_run();
+        }
+    }
+
+    /// Cancels the fan-out `run_action` started: SIGTERM now to every step's process group
+    /// still live, SIGKILL after a grace to whichever of those have not exited by then,
+    /// because SIGTERM is trappable and SIGKILL is not. A step already running when this is
+    /// called becomes `Cancelled`; so does a step, or a whole entity's run, that had not
+    /// started, which stays distinct from `NotRun`
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "Cancellation, suspend and quit"). A no-op while no fan-out is running. Its own verb,
+    /// kept apart from [`Self::pause`] for the same reason [`Self::hold_action`] is.
+    pub fn stop_action(&self) {
+        if let Some(control) = self.action_control.lock().unwrap().as_ref() {
+            control.cancel();
+        }
     }
 
     /// Stops all background work: the dedicated thread stops ticking and every
@@ -1600,6 +1654,17 @@ impl Core {
 /// entity: [`Core::run_action`] gives those their `not_applicable` receipt itself and
 /// never reaches this function for them.
 ///
+/// `control` is the same `RunControl` every other entity's run in this fan-out shares:
+/// checked before every step starts, so a step not yet reached when `control.cancel` fires
+/// becomes `Cancelled` rather than ever spawning, and again the instant a spawned step's
+/// `run_step` call returns, so a step that was actually running when cancellation fired
+/// becomes `Cancelled` regardless of the exit `run_step` itself observed (a signalled child
+/// has no clean outcome of its own to report). `Cancelled` and `NotRun` are deliberately
+/// kept apart here: once cancellation is seen, every remaining step (including a step
+/// already past the "before it starts" check but not yet run) is `Cancelled`, never
+/// `NotRun`, which stays reserved for being blocked by an earlier failure
+/// (`docs/spec/actions.md`'s "Step outcomes").
+///
 /// `report` is called once per step, immediately before that step starts, with a receipt
 /// whose `running` names it: the caller writes this straight onto the table, which is what
 /// lets a still-running step's own label and elapsed time reach a reader before the whole
@@ -1608,16 +1673,23 @@ impl Core {
 fn run_action_for_entity(
     entity: &EntityState,
     action: &ActionSpec,
+    control: &executor::RunControl,
     report: &dyn Fn(ActionReceipt),
 ) -> ActionReceipt {
     let base_env = environment::environment(entity, action.name.as_deref());
     let mut failed = false;
+    let mut cancelled = false;
     let mut results: Vec<StepResult> = Vec::with_capacity(action.steps.len());
     for step in &action.steps {
-        if failed {
+        if failed || cancelled || control.is_cancelled() {
+            cancelled = cancelled || control.is_cancelled();
             results.push(StepResult {
                 label: Arc::from(step.argv.join(" ")),
-                outcome: StepOutcome::NotRun,
+                outcome: if cancelled {
+                    StepOutcome::Cancelled
+                } else {
+                    StepOutcome::NotRun
+                },
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::ZERO,
             });
@@ -1644,8 +1716,14 @@ fn run_action_for_entity(
                 .iter()
                 .map(|(name, value)| (name.clone(), Some(value.clone()))),
         );
-        let result = executor::run_step(&step.argv, step.shell, entity.key.path(), &env);
-        failed = result.outcome.is_failure();
+        let mut result =
+            executor::run_step(&step.argv, step.shell, entity.key.path(), &env, control);
+        if control.is_cancelled() {
+            result.outcome = StepOutcome::Cancelled;
+            cancelled = true;
+        } else {
+            failed = result.outcome.is_failure();
+        }
         results.push(result);
     }
     ActionReceipt {
@@ -1840,6 +1918,7 @@ fn start_internal(
             patch_identity_reads,
             patch_scan_bounds,
             action_running: Arc::new(AtomicBool::new(false)),
+            action_control: Arc::new(Mutex::new(None)),
             dispatch_log,
             phase_c_gates,
             status_stale_after: spec.status_stale_after,
@@ -4629,6 +4708,259 @@ mod tests {
         assert_eq!(
             &*receipt.label, "first",
             "the surviving receipt must be the accepted first run's, never the rejected second"
+        );
+    }
+
+    // =====================================================================================
+    // Criteria 3 and 4: `Core::hold_action`/`Core::continue_action` are their own verbs on
+    // the core, kept apart from the generic `pause`/`resume` the probes use, and suspending
+    // a fan-out is reversible: a held step's own progress genuinely pauses, and resumes
+    // exactly where it left off, rather than the run merely finishing on its own regardless.
+    // =====================================================================================
+
+    /// A black-box proof through the public API alone, with no reach into the step's own
+    /// pid: a one-second step, held for 1.5s (comfortably longer than the step would ever
+    /// take unheld) and then continued. If `hold_action` were a no-op, the step would
+    /// already have finished on its own well before this test ever calls
+    /// `continue_action`, and `action_running` would already read `false` at the
+    /// mid-hold checkpoint below; that is the exact mutation this test is written to catch.
+    #[test]
+    fn hold_action_genuinely_pauses_a_running_steps_progress_and_continue_action_resumes_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let two_seconds = action("brief", vec![step(&["sh", "-c", "sleep 2"])]);
+
+        assert!(core.run_action(two_seconds, std::slice::from_ref(&key)));
+        let started = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0]
+                .last_action
+                .as_ref()
+                .is_some_and(|receipt| receipt.running.is_some())
+        });
+        assert!(started, "the two-second step must actually start running");
+
+        // The receipt's own `running: Some(_)` is written just before `run_step` is even
+        // called, so it can race that call's own spawn, which is when the step's process
+        // group is actually registered. SIGSTOP is idempotent, so pulsing `hold_action`
+        // over a short bounded window (well inside the step's own 2s) is what makes that
+        // race resolve deterministically rather than flakily, without ever risking a hang:
+        // a stuck `hold_action` here fails this loop's own fixed iteration count, not this
+        // test's wall clock.
+        for _ in 0..20 {
+            core.hold_action();
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        thread::sleep(Duration::from_millis(1_800));
+        assert!(
+            core.action_running(),
+            "a genuinely held step must not have finished on its own well past its own 2s \
+             sleep; a no-op hold_action would already show this false here"
+        );
+
+        core.continue_action();
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
+        assert!(settled, "continue_action must let the held step finish");
+        let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
+        assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+    }
+
+    /// `hold_action`, `continue_action` and `stop_action` must all be safe to call with no
+    /// fan-out live: nothing to signal, so each is a plain no-op rather than a panic or a
+    /// stray signal to nothing.
+    #[test]
+    fn hold_continue_and_stop_action_are_no_ops_with_no_fan_out_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+
+        core.hold_action();
+        core.continue_action();
+        core.stop_action();
+
+        assert!(!core.action_running());
+    }
+
+    // =====================================================================================
+    // Criterion 1: Escape (`Core::stop_action`) cancels the fan-out with two signals, the
+    // terminating one and then the uncatchable one after a grace, because the first is
+    // trappable. Exercised through the real public seam, never by calling `RunControl`
+    // directly, so this is `stop_action` end to end rather than only its own primitive.
+    // =====================================================================================
+
+    /// A child that traps and ignores SIGTERM is the only fixture that actually
+    /// discriminates the two-signal design from a one-signal one: a child that dies on
+    /// SIGTERM alone would pass this test even if `stop_action` were mutated to drop its
+    /// own SIGKILL follow-up entirely, which is exactly the regression this criterion
+    /// exists to catch.
+    ///
+    /// Bounded so a regression fails rather than hangs: the step sleeps 30s, comfortably
+    /// longer than this test could ever wait on purpose, and every wait below has its own
+    /// timeout well under that, so a `stop_action` that stops working reads back as this
+    /// test's own `wait_until` returning `false`, never as the suite blocking on the child.
+    #[test]
+    fn stop_action_escalates_from_sigterm_to_sigkill_against_a_trapping_step() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let trapping = action(
+            "trapping",
+            vec![step(&["sh", "-c", "trap '' TERM; sleep 30"])],
+        );
+
+        assert!(core.run_action(trapping, std::slice::from_ref(&key)));
+        let started = wait_until(Duration::from_secs(5), || {
+            core.snapshot().entities[0]
+                .last_action
+                .as_ref()
+                .is_some_and(|receipt| receipt.running.is_some())
+        });
+        assert!(started, "the trapping step must actually start running");
+        // Gives the shell time to install its own trap before any signal can arrive; the
+        // outcome asserted below is the actual proof, not this fixed delay.
+        thread::sleep(Duration::from_millis(100));
+
+        core.stop_action();
+
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
+        assert!(
+            settled,
+            "a SIGTERM-trapping step must still come down from the follow-up SIGKILL"
+        );
+        let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
+        assert_eq!(receipt.steps.len(), 1);
+        assert_eq!(
+            receipt.steps[0].outcome,
+            StepOutcome::Cancelled,
+            "a step running when the run was cancelled must read Cancelled, never Failed"
+        );
+    }
+
+    // =====================================================================================
+    // Criterion 2: cancellation produces `Cancelled`, never `NotRun`, which stays reserved
+    // for being blocked by an earlier failure. Both outcomes are shown live in the same
+    // run, on different entities, so they can be told apart rather than merely observed
+    // one at a time.
+    // =====================================================================================
+
+    /// One Action, two entities, dispatched together at `concurrency: 2`: `fail`'s own
+    /// first step exits nonzero well before the run is ever cancelled, so its second step
+    /// is a genuine `NotRun`; `slow`'s own first step is still sleeping when
+    /// `stop_action` fires, so both of its steps read `Cancelled`. A test that only ever
+    /// produced one of the two outcomes could not prove they are told apart; this fixture
+    /// has both live in the same receipt set, so a mutation that collapsed one into the
+    /// other would be caught by whichever entity it broke.
+    #[test]
+    fn cancelled_and_not_run_are_distinct_outcomes_shown_together_in_one_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("fail"));
+        init_repo_with_a_commit(&root.join("slow"));
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let fail_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "fail")
+            .expect("the fail entity is present")
+            .key
+            .clone();
+        let slow_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| &*entity.name == "slow")
+            .expect("the slow entity is present")
+            .key
+            .clone();
+
+        // One step list run against both entities: behaviour branches on the entity's own
+        // directory name, which is `$PWD`'s basename in each entity's own working
+        // directory, so `fail` fails immediately and `slow` is still running when this
+        // test cancels the whole run.
+        let steps = vec![
+            step(&[
+                "sh",
+                "-c",
+                "case \"$(basename \"$PWD\")\" in fail) exit 1 ;; *) sleep 30 ;; esac",
+            ]),
+            step(&["true"]),
+        ];
+        let mut action_spec = action("mixed", steps);
+        action_spec.concurrency = 2;
+
+        assert!(core.run_action(action_spec, &[fail_key.clone(), slow_key.clone()]));
+
+        // `fail` must have already finished (both its steps recorded) while `slow` is
+        // still running its own first step: the two entities' own outcomes are captured
+        // at the same moment, which is what makes them "shown together".
+        let both_ready = wait_until(Duration::from_secs(5), || {
+            let snapshot = core.snapshot();
+            let fail_done = snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key == fail_key)
+                .and_then(|entity| entity.last_action.as_ref())
+                .is_some_and(|receipt| receipt.steps.len() == 2);
+            let slow_running = snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key == slow_key)
+                .and_then(|entity| entity.last_action.as_ref())
+                .is_some_and(|receipt| receipt.running.is_some());
+            fail_done && slow_running
+        });
+        assert!(
+            both_ready,
+            "expected `fail` finished and `slow` still running before cancelling"
+        );
+
+        core.stop_action();
+        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
+        assert!(settled, "the fan-out must finish once cancelled");
+
+        let snapshot = core.snapshot();
+        let fail_receipt = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key == fail_key)
+            .and_then(|entity| entity.last_action.clone())
+            .expect("fail's own receipt");
+        assert_eq!(fail_receipt.steps[0].outcome, StepOutcome::Failed(1));
+        assert_eq!(
+            fail_receipt.steps[1].outcome,
+            StepOutcome::NotRun,
+            "blocked by fail's own earlier failure, not by the later cancellation"
+        );
+
+        let slow_receipt = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key == slow_key)
+            .and_then(|entity| entity.last_action.clone())
+            .expect("slow's own receipt");
+        assert_eq!(
+            slow_receipt.steps[0].outcome,
+            StepOutcome::Cancelled,
+            "a step running when the run was cancelled must read Cancelled"
+        );
+        assert_eq!(
+            slow_receipt.steps[1].outcome,
+            StepOutcome::Cancelled,
+            "a step that had not started when the run was cancelled must also read \
+             Cancelled, never NotRun, which stays reserved for an earlier failure"
         );
     }
 
