@@ -36,6 +36,23 @@ pub(crate) fn head_sha(path: &Path) -> String {
         .to_string()
 }
 
+/// `HEAD`'s current branch's short name, read via `git symbolic-ref` so a test
+/// never has to hard-code (or guess) whatever name `git init` gave the branch
+/// it started on, which varies with the machine's own `init.defaultBranch`.
+pub(crate) fn current_branch(path: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .expect("run git symbolic-ref");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("utf8 branch name")
+        .trim()
+        .to_string()
+}
+
 /// Counts loose object files under `repo`'s `.git/objects`, excluding the `pack`
 /// and `info` housekeeping directories, so a test can assert a probe left the
 /// object database exactly as it found it.

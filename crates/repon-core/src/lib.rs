@@ -52,6 +52,7 @@
 #[cfg(not(unix))]
 compile_error!("repon-core requires a Unix target: see docs/spec/actions.md");
 
+mod base;
 mod cell;
 mod core;
 mod default_branch;
