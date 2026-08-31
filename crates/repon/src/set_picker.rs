@@ -53,7 +53,9 @@ impl SetPicker {
             Action::Bottom => last,
             Action::HalfPageDown => (self.cursor + half_page).min(last),
             Action::HalfPageUp => self.cursor.saturating_sub(half_page),
-            _ => self.cursor,
+            other => unreachable!(
+                "apply takes only the overlay context's movement actions, got {other:?}"
+            ),
         };
     }
 
