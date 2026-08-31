@@ -8,6 +8,7 @@ use repon_core::{Core, EntityKey, EntityState, Snapshot};
 use tracing::debug;
 
 use crate::{
+    action_palette::{ActionPalette, Decision, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     footer,
@@ -16,6 +17,7 @@ use crate::{
     keys::{self, Action, BindingTable, Context},
     message::Message,
     selection::Selection,
+    set_picker::SetPicker,
     theme::{self, Theme},
     tui::{Event, Tui},
     unwind::{self, UnwindLevel},
@@ -121,16 +123,31 @@ pub struct App {
     /// [`Self::current_warnings`] derives it fresh every frame the same way `help`'s content
     /// does.
     warning_overlay_open: bool,
+    /// `Some` while the Action palette has focus, opened by `Action::OpenActionPalette`
+    /// (`;`) and closed by `Action::Cancel` from its own `Stage::Choosing`
+    /// ([`ActionPalette::decline`] returns to `Choosing` instead of closing, from
+    /// `Stage::Confirming`). [ADR 0008](../../../docs/adr/0008-two-palettes-not-one.md)
+    /// keeps this on a key, and a struct, entirely separate from the Launcher palette
+    /// (`Action::OpenLauncher`, issue #98, not built yet), the safety boundary the two
+    /// palettes exist to hold.
+    action_palette: Option<ActionPalette>,
+    /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s`) and
+    /// closed by `Action::Close` (`Esc` or `q`,
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
+    /// touching the active Set or starting a Generation. Its own `Action::Choose` (`Enter`)
+    /// routes the highlighted row through [`Self::switch_to_set`], the exact path the
+    /// positional `1`-`9` keys already take, so this can never become a second
+    /// implementation of the same switch.
+    set_picker: Option<SetPicker>,
     /// The description of the most recently pressed bound-but-unimplemented action
     /// ([`Self::notify_not_implemented`]), read off [`keys::description`] so it names the
     /// action in the spec's own words. One of the four sources [`Self::current_warnings`]
-    /// folds into the shared warning slot ([`warnings::WarningSources`]): neither
-    /// keybindings.md nor layout-and-provenance.md settles a surface of its own for this, so
-    /// it shares the slot rather than inventing one. Replaced by the next such press; nothing
-    /// else clears it.
+    /// folds into the shared warning slot ([`warnings::WarningSources`]). Replaced by the
+    /// next such press; nothing else clears it.
     ///
-    // TODO(#106): sharing the slot is this code's choice, not a documented rule. That
-    // ticket decides where the notice belongs.
+    // TODO(#119): this whole field is on its way out. 0023 rules that an unbuilt binding is
+    // not advertised and so has nothing to say, and that the warning slot carries standing
+    // conditions only, so `Warning::NotImplemented` is deleted rather than relocated.
     unimplemented_action_notice: Option<&'static str>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
     /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
@@ -272,6 +289,8 @@ impl App {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            action_palette: None,
+            set_picker: None,
             unimplemented_action_notice: None,
             theme_warnings,
             config_warnings,
@@ -382,9 +401,11 @@ impl App {
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
-    /// `Context::Overlay` while the help overlay or the expanded warning list is open,
-    /// `self.focus` (`List` or `Detail`) otherwise, so `Global`'s bindings stay live from
-    /// either. `Quit` and `Suspend` raise a [`Message`], the movement and Selection actions
+    /// `Context::Overlay` while the help overlay, the expanded warning list or the Set
+    /// picker is open, [`Self::handle_action_palette_key`]'s own `Context::Input`/`Context::Confirm`
+    /// split while the Action palette is open, `self.focus` (`List` or `Detail`) otherwise,
+    /// so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
+    /// [`Message`], the movement and Selection actions
     /// mutate `cursor` and `selection` directly, `OpenDetail`/`ClosePane` open and close the
     /// pane, `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two
     /// without touching what the pane shows, `OpenHelp` opens the help overlay,
@@ -393,9 +414,10 @@ impl App {
     /// [`Self::switch_to_set`] and `Unwind` reaches [`unwind::unwind_one`] over the range
     /// anchor then the pane.
     ///
-    /// `OpenSetPicker` (`s`) is bound in [`keys`] per
-    /// [keybindings.md](../../../docs/spec/keybindings.md) and has its own arm below, doing
-    /// nothing until the overlay exists. `1` to `9` (`SwitchToSet`) do not depend on it.
+    /// `OpenSetPicker` (`s`) opens [`Self::set_picker`]
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context);
+    /// [`Self::handle_set_picker_key`] is what its own `Enter` routes through
+    /// [`Self::switch_to_set`], the same path `1` to `9` (`SwitchToSet`) already take.
     ///
     /// The match is exhaustive over every [`Action`] variant, with no catch-all: a variant
     /// this crate binds but has not built yet still gets its own arm, doing nothing beyond
@@ -425,6 +447,16 @@ impl App {
             if let Some(Action::Close) = self.bindings.dispatch(Context::Overlay, key) {
                 self.warning_overlay_open = false;
             }
+            return Ok(());
+        }
+
+        if self.action_palette.is_some() {
+            self.handle_action_palette_key(key);
+            return Ok(());
+        }
+
+        if self.set_picker.is_some() {
+            self.handle_set_picker_key(key);
             return Ok(());
         }
 
@@ -542,10 +574,8 @@ impl App {
                 self.switch_to_set(nth);
                 None
             }
-            // TODO(#94): the picker overlay does not exist yet. Named here rather than left
-            // to the catch-all, which would absorb the gap silently.
             Some(Action::OpenSetPicker) => {
-                self.notify_not_implemented(Action::OpenSetPicker);
+                self.set_picker = Some(SetPicker::new());
                 None
             }
             Some(Action::OpenLauncher) => {
@@ -559,9 +589,8 @@ impl App {
                 self.notify_not_implemented(Action::EnterFilter);
                 None
             }
-            // TODO(#64): the Action palette does not exist yet.
             Some(Action::OpenActionPalette) => {
-                self.notify_not_implemented(Action::OpenActionPalette);
+                self.action_palette = Some(ActionPalette::new());
                 None
             }
             // TODO(#65): RefreshAll does not call `core.refresh` yet.
@@ -642,6 +671,177 @@ impl App {
             self.message_tx.send(message)?;
         }
         Ok(())
+    }
+
+    /// Every key event while `self.action_palette` is `Some`, dispatched through
+    /// `Context::Confirm` while it holds `Stage::Confirming` and `Context::Input`
+    /// otherwise, per [keybindings.md](../../../docs/spec/keybindings.md)'s own contexts
+    /// table. `Context::Input` only ever hands back the nine variants named below or `Text`
+    /// or `None` ([`keys::BindingTable::dispatch`]'s own doc comment on what `Input` can
+    /// return), and `Context::Confirm` only ever hands back `Run`, `Decline` or `None`; the
+    /// trailing `unreachable!` arm in each match is that proof made loud rather than a
+    /// silently-absorbing wildcard, the same shape `Self::handle_key_event`'s own dispatch
+    /// uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
+    ///
+    /// `AcceptCompletion` (`Tab`) and `OpenInEditor` (`Ctrl+E`) belong to the ad hoc
+    /// command field issue #70 has not built yet (it is blocked by this ticket), so both
+    /// are inert here.
+    fn handle_action_palette_key(&mut self, key: KeyEvent) {
+        let Some(palette) = &self.action_palette else {
+            return;
+        };
+        if matches!(palette.stage(), Stage::Confirming(_)) {
+            match self.bindings.dispatch(Context::Confirm, key) {
+                Some(Action::Run) => {
+                    let spec = self
+                        .action_palette
+                        .as_ref()
+                        .and_then(ActionPalette::confirm_run);
+                    if let Some(spec) = spec {
+                        self.start_action(spec);
+                    }
+                    self.action_palette = None;
+                }
+                Some(Action::Decline) => {
+                    if let Some(palette) = &mut self.action_palette {
+                        palette.decline();
+                    }
+                }
+                None => {}
+                Some(other) => unreachable!(
+                    "dispatch(Context::Confirm, _) only ever returns Run, Decline or None, \
+                     got {other:?}"
+                ),
+            }
+            return;
+        }
+
+        match self.bindings.dispatch(Context::Input, key) {
+            Some(Action::Cancel) => self.action_palette = None,
+            Some(Action::Text(c)) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.type_char(c, &self.document.actions);
+                }
+            }
+            Some(Action::DeletePreviousWord) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.delete_previous_word(&self.document.actions);
+                }
+            }
+            Some(Action::ClearLine) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.clear_line(&self.document.actions);
+                }
+            }
+            Some(Action::PreviousEntry) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.move_highlight(-1, &self.document.actions);
+                }
+            }
+            Some(Action::NextEntry) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.move_highlight(1, &self.document.actions);
+                }
+            }
+            Some(Action::Apply) => self.choose_highlighted_action(),
+            Some(Action::AcceptCompletion | Action::OpenInEditor) => {}
+            None => {}
+            Some(other) => unreachable!(
+                "dispatch(Context::Input, _) only ever returns the input vocabulary or \
+                 Text, got {other:?}"
+            ),
+        }
+    }
+
+    /// Every key event while `self.set_picker` is `Some`, dispatched through
+    /// `Context::Overlay` per [keybindings.md](../../../docs/spec/keybindings.md)'s own
+    /// contexts table. `Choose` (`Enter`) reads the picker's own cursor and hands it to
+    /// [`Self::switch_to_set`] before closing the picker, the exact call the positional `1`
+    /// to `9` keys make, never a second implementation of the same switch; `Close` (`Esc` or
+    /// `q`) closes the picker with no such call at all, leaving the active Set and its
+    /// Generation untouched. The trailing `unreachable!` arm is the same proof-made-loud
+    /// shape [`Self::handle_action_palette_key`] already uses: `dispatch(Context::Overlay,
+    /// _)` can only ever return `Choose`, `Close`, one of the six scroll actions, or `None`.
+    fn handle_set_picker_key(&mut self, key: KeyEvent) {
+        match self.bindings.dispatch(Context::Overlay, key) {
+            Some(Action::Close) => self.set_picker = None,
+            Some(Action::Choose) => {
+                if let Some(picker) = &self.set_picker {
+                    let nth = u8::try_from(picker.cursor() + 1).unwrap_or(u8::MAX);
+                    self.switch_to_set(nth);
+                }
+                self.set_picker = None;
+            }
+            Some(
+                action @ (Action::ScrollDown
+                | Action::ScrollUp
+                | Action::Top
+                | Action::Bottom
+                | Action::HalfPageDown
+                | Action::HalfPageUp),
+            ) => {
+                let sets_len = self.document.sets.len();
+                if let Some(picker) = &mut self.set_picker {
+                    picker.apply(action, sets_len);
+                }
+            }
+            None => {}
+            Some(other) => unreachable!(
+                "dispatch(Context::Overlay, _) only ever returns Choose, Close, a scroll \
+                 action or None while the Set picker is open, got {other:?}"
+            ),
+        }
+    }
+
+    /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count
+    /// from `self.selection.targets(cursor)` through
+    /// [`repon_core::Core::operable_count`], the identical computation
+    /// [`Self::start_action`]'s own confirm dialog reads, then hands it to
+    /// [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
+    /// untouched, the same as choosing with no match at all.
+    /// How many entities a choice made right now would actually run against: the
+    /// Selection narrowed by [`repon_core::Core::operable_count`], which is the same
+    /// partition the fan-out itself uses, so the border title can never show a number a
+    /// real choice would not act on. `None` while no palette is open.
+    fn action_palette_operable_count(&self) -> Option<usize> {
+        self.action_palette.as_ref().map(|_| {
+            self.cursor_key()
+                .map(|key| self.core.operable_count(&self.selection.targets(&key)))
+                .unwrap_or(0)
+        })
+    }
+
+    fn choose_highlighted_action(&mut self) {
+        let Some(cursor_key) = self.cursor_key() else {
+            return;
+        };
+        let targets = self.selection.targets(&cursor_key);
+        let operable_count = self.core.operable_count(&targets);
+        let Some(palette) = &mut self.action_palette else {
+            return;
+        };
+        match palette.choose(&self.document.actions, operable_count) {
+            Some(Decision::RunImmediately(spec)) => {
+                self.start_action(spec);
+                self.action_palette = None;
+            }
+            Some(Decision::NeedsConfirm | Decision::Refused) | None => {}
+        }
+    }
+
+    /// Runs `spec` over the current Selection's targets ([`crate::selection::Selection::targets`]),
+    /// the seam every Action-running path in this file uses so a run started from the
+    /// confirm gate and one started by a `confirm = false` entry can never diverge in what
+    /// they act on. `Core::run_action`'s own `bool` (whether a second fan-out was rejected
+    /// because one is already live) is not surfaced here: making that visible, and making
+    /// the four keys `docs/spec/actions.md` names inert while a run is in flight, is issue
+    /// #69's own scope, blocked by this one.
+    fn start_action(&mut self, spec: repon_core::ActionSpec) {
+        let Some(cursor_key) = self.cursor_key() else {
+            return;
+        };
+        let targets = self.selection.targets(&cursor_key);
+        let _ = self.core.run_action(spec, &targets);
     }
 
     /// Every currently shown Entity's key, in the same grouped, Repo-then-its-own-children
@@ -806,13 +1006,15 @@ impl App {
 
     /// The already-scheduled render tick's one read of the Core's table: exactly one
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
-    /// The help overlay and the warning overlay, in that priority, each take the whole frame
-    /// in place of everything else when open; otherwise the status bar row shows the shared
-    /// warning slot ([`warnings::draw_slot`]), [`layout_state`] decides between the three
-    /// shapes [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)
-    /// fixes, and [`footer::draw`] renders the last row for whichever of `List` or `Detail`
-    /// is focused. There is no permanently pinned bottom output pane: an Action's own output,
-    /// once wired, lives inside the detail pane rather than a fourth region here.
+    /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
+    /// priority, each take the whole frame in place of everything else when open; otherwise
+    /// the status bar
+    /// row shows the shared warning slot ([`warnings::draw_slot`]), [`layout_state`] decides
+    /// between the three shapes
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
+    /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
+    /// There is no permanently pinned bottom output pane: an Action's own output, once
+    /// wired, lives inside the detail pane rather than a fourth region here.
     fn render(&mut self, tui: &mut Tui) -> Result<()> {
         let snapshot = self.core.snapshot();
         let pane_entity = self
@@ -820,6 +1022,10 @@ impl App {
             .as_ref()
             .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
         let warnings = self.current_warnings();
+        // The identical computation `Self::choose_highlighted_action` reads: read once,
+        // before the frame-drawing closure below borrows `self` immutably, so the border
+        // title can never show a different number than a real choice would act on.
+        let action_palette_operable_count = self.action_palette_operable_count();
         let mut error = None;
         tui.draw(|frame| {
             let area = frame.area();
@@ -829,6 +1035,20 @@ impl App {
             }
             if self.warning_overlay_open {
                 warnings::draw_overlay(frame, area, &warnings, &self.theme);
+                return;
+            }
+            if let Some(palette) = &self.action_palette {
+                palette.draw(
+                    frame,
+                    area,
+                    &self.theme,
+                    &self.document.actions,
+                    action_palette_operable_count.unwrap_or(0),
+                );
+                return;
+            }
+            if let Some(picker) = &self.set_picker {
+                picker.draw(frame, area, &self.document.sets, &self.active_set.name);
                 return;
             }
             let areas = Layout::vertical([
@@ -940,6 +1160,7 @@ fn dispatch_order(
 mod tests {
     use std::time::Duration;
 
+    use crossterm::event::{KeyCode, KeyModifiers};
     use repon_core::{CoreSpec, SetSpec};
 
     use super::*;
@@ -972,6 +1193,16 @@ mod tests {
     /// An `App` wired to a real `Core` over `root`, bypassing `App::new`'s config and
     /// discovery-dispatch side effects, which a cursor and Selection test has no need of.
     pub(crate) fn test_app(root: &std::path::Path) -> App {
+        test_app_with_overrides(root, Vec::new())
+    }
+
+    /// [`test_app`], with the `Core` started against `overrides` (an `[[repo]]`
+    /// `exclude = true` entry, most often), the one difference an Action confirm-gate test
+    /// needs and a plain cursor/Selection test does not.
+    pub(crate) fn test_app_with_overrides(
+        root: &std::path::Path,
+        overrides: Vec<repon_core::RepoOverride>,
+    ) -> App {
         let core = Core::start(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
@@ -979,7 +1210,7 @@ mod tests {
                 include: Vec::new(),
                 exclude: Vec::new(),
             },
-            overrides: Vec::new(),
+            overrides,
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
@@ -1001,6 +1232,8 @@ mod tests {
             focus: Context::List,
             help: None,
             warning_overlay_open: false,
+            action_palette: None,
+            set_picker: None,
             unimplemented_action_notice: None,
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
@@ -1994,10 +2227,12 @@ mod tests {
     /// synthetic one) and read the shared warning slot back through `current_warnings`, the
     /// same seam `Action::ExpandWarning`'s own tests already use. The expected text is read
     /// off `keys::description` rather than restated, so it can never drift from what the
-    /// footer and help overlay already show for the same action. The list is the nine named
-    /// in #97 plus `OpenSetPicker` (already unimplemented before #97, given its own arm
-    /// while closing #56) and List's own `Ctrl+D`/`Ctrl+U`, a gap this ticket's own
-    /// exhaustiveness requirement surfaced that no issue tracks.
+    /// footer and help overlay already show for the same action. The list was the nine
+    /// named in #97 plus List's own `Ctrl+D`/`Ctrl+U`, a gap this ticket's own exhaustiveness
+    /// requirement surfaced that no issue tracks; `OpenActionPalette` left this list once #64
+    /// gave it a real arm (its own tests live in `action_palette.rs` and below), and
+    /// `OpenSetPicker` leaves it here for the same reason once this ticket gave it one (its
+    /// own tests live in `set_picker.rs` and below).
     #[test]
     fn every_bound_but_unimplemented_action_tells_the_user_through_the_shared_warning_slot() {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -2009,16 +2244,6 @@ mod tests {
 
         let cases = [
             (KeyCode::Char('!'), KeyModifiers::NONE, Action::OpenLauncher),
-            (
-                KeyCode::Char('s'),
-                KeyModifiers::NONE,
-                Action::OpenSetPicker,
-            ),
-            (
-                KeyCode::Char(';'),
-                KeyModifiers::NONE,
-                Action::OpenActionPalette,
-            ),
             (KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterFilter),
             (KeyCode::Char('r'), KeyModifiers::NONE, Action::RefreshAll),
             (
@@ -2094,9 +2319,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
         };
 
-        let cases: [(&str, Option<u32>); 10] = [
+        let cases: [(&str, Option<u32>); 9] = [
             ("EnterFilter", Some(63)),
-            ("OpenActionPalette", Some(64)),
             ("RefreshAll", Some(65)),
             ("RefreshSelection", Some(65)),
             ("RederiveDefaultBranches", Some(73)),
@@ -2385,6 +2609,586 @@ mod tests {
             !manifest.contains("notify"),
             "expected no filesystem-watching dependency (e.g. the `notify` crate) in \
              Cargo.toml"
+        );
+    }
+
+    // --- issue #64: the Action palette ---
+
+    /// One `[[action]]` entry whose single step is real and observable (touches `marker`),
+    /// so a test can prove `run_action` actually ran rather than trusting a receipt alone.
+    fn action_config(
+        name: &str,
+        confirm: bool,
+        marker: &std::path::Path,
+    ) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: vec!["touch".to_string(), marker.to_string_lossy().into_owned()],
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm,
+            concurrency: 4,
+        }
+    }
+
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Criterion 1: two distinct keys, no shared entry point. `!` (OpenLauncher) must never
+    // touch the Action palette's own state, and `;` must never fall into OpenLauncher's
+    // still-unimplemented arm.
+    #[test]
+    fn open_launcher_and_open_action_palette_are_wholly_separate_keys_with_no_shared_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("handle !");
+        assert!(
+            app.action_palette.is_none(),
+            "OpenLauncher must never open the Action palette"
+        );
+        let warnings = app.current_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("Launcher palette")),
+            "OpenLauncher must still take its own unimplemented path, got: {warnings:?}"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("handle ;");
+        assert!(
+            app.action_palette.is_some(),
+            "OpenActionPalette must open the Action palette"
+        );
+    }
+
+    #[test]
+    fn cancel_closes_the_action_palette_without_choosing_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            &root.join("never-created"),
+        ));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel");
+
+        assert!(app.action_palette.is_none());
+        assert!(
+            !root.join("never-created").exists(),
+            "cancelling must never run anything"
+        );
+    }
+
+    /// Criterion 4, end to end: choosing the one configured Action moves to the confirm
+    /// stage, `y` runs it through `Core::run_action`, and the step's own real, observable
+    /// side effect (a touched file) proves the run actually happened rather than the
+    /// palette merely closing.
+    #[test]
+    fn choosing_a_configured_action_and_confirming_with_y_runs_it_through_core_run_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let marker = root.join("marker");
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("reinstall", true, &marker));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+        assert!(
+            matches!(
+                app.action_palette.as_ref().map(ActionPalette::stage),
+                Some(Stage::Confirming(_))
+            ),
+            "a single Repo and confirm = true must move to the confirm stage"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirm the run");
+
+        assert!(
+            app.action_palette.is_none(),
+            "the palette closes once the run is dispatched"
+        );
+        let ran = wait_until(Duration::from_secs(5), || marker.exists());
+        assert!(ran, "expected `touch marker` to have actually run");
+    }
+
+    #[test]
+    fn declining_the_confirm_gate_returns_to_the_palette_and_never_runs_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let marker = root.join("marker");
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("reinstall", true, &marker));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("decline");
+
+        assert!(
+            app.action_palette.is_some(),
+            "declining returns to the palette rather than closing it"
+        );
+        assert!(
+            matches!(
+                app.action_palette.as_ref().map(ActionPalette::stage),
+                Some(Stage::Choosing)
+            ),
+            "declining must land back in Stage::Choosing"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "declining must never run the Action");
+    }
+
+    /// The border title must carry the count of rows the run will *actually* touch, so an
+    /// excluded row in a wider Selection has to be subtracted rather than counted. A
+    /// single-row fixture cannot tell a correct count from one reporting the excluded rows
+    /// instead, since both read the same number when there is only one row.
+    #[test]
+    fn the_palettes_count_subtracts_excluded_rows_from_a_wider_selection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let excluded_repo = root.join("excluded");
+        init_repo(&excluded_repo);
+        init_repo(&root.join("kept-a"));
+        init_repo(&root.join("kept-b"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: excluded_repo,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+        app.selection.select_all_visible(&visible);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        assert_eq!(
+            app.action_palette_operable_count(),
+            Some(2),
+            "three selected rows with one excluded must count two, not three and not one"
+        );
+    }
+
+    /// Criterion 4's sharpest claim: a count of zero refuses even though the excluded row
+    /// is the cursor row and stays selectable. An `[[repo]]` `exclude = true` override is
+    /// the only real producer of a zero count with an otherwise-populated table.
+    #[test]
+    fn choosing_an_action_with_the_only_target_excluded_refuses_and_never_calls_run_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let excluded_repo = root.join("excluded");
+        init_repo(&excluded_repo);
+        let marker = root.join("marker");
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: excluded_repo,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        app.document
+            .actions
+            .push(action_config("reinstall", true, &marker));
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the fixture's one row must actually be excluded"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry, targeting the excluded cursor row");
+
+        assert!(
+            matches!(
+                app.action_palette.as_ref().map(ActionPalette::stage),
+                Some(Stage::Choosing)
+            ),
+            "a zero count must never reach the confirm stage"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a zero count must refuse to run rather than fanning out over nothing"
+        );
+    }
+
+    /// `confirm = false` skips the confirm stage outright: `y`/`n` never enter into it, and
+    /// the run starts the instant Enter chooses the entry.
+    #[test]
+    fn an_entry_with_confirm_false_runs_immediately_on_enter_with_no_confirm_stage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let marker = root.join("marker");
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("fetch", false, &marker));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+
+        assert!(
+            app.action_palette.is_none(),
+            "confirm = false must close the palette immediately rather than entering a \
+             confirm stage"
+        );
+        let ran = wait_until(Duration::from_secs(5), || marker.exists());
+        assert!(
+            ran,
+            "expected the confirm = false Action to have run without a gate"
+        );
+    }
+
+    // =====================================================================================
+    // The Set picker (issue #94): opens on `s`, lists every declared Set, switches through
+    // `App::switch_to_set` and closes on `Esc` or `q` without touching the active Set.
+    // =====================================================================================
+
+    fn set_config(name: &str, root: &std::path::Path) -> document::SetConfig {
+        document::SetConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+        }
+    }
+
+    #[test]
+    fn pressing_s_opens_the_set_picker_rather_than_the_not_implemented_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("handle s");
+
+        assert!(app.set_picker.is_some(), "s must open the Set picker");
+        let warnings = app.current_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("Set picker")),
+            "OpenSetPicker must no longer fall back to the not-implemented notice, got: \
+             {warnings:?}"
+        );
+    }
+
+    /// The risk this ticket names by name: dispatching the picker's own keys through the
+    /// wrong context would let `j` fall through to `List`'s own cursor movement underneath
+    /// it. Two declared Sets so `j` has somewhere real to move the picker's cursor to, and
+    /// `app.cursor` (the list's own field) is read back unchanged, not merely asserted
+    /// absent from view.
+    #[test]
+    fn j_moves_the_pickers_own_cursor_and_never_the_lists_cursor_underneath_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+        let list_cursor_before = app.cursor;
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the picker's cursor down");
+
+        assert_eq!(
+            app.cursor, list_cursor_before,
+            "j while the picker is open must never move the list's own cursor"
+        );
+        assert_eq!(
+            app.set_picker.as_ref().map(SetPicker::cursor),
+            Some(1),
+            "j must move the picker's own cursor onto the second declared Set"
+        );
+    }
+
+    /// The other half of the same risk: consulting `self.focus` (which falls back to
+    /// `Global`) instead of `Context::Overlay` would let `q` quit the application mid-picker.
+    /// `Action::Quit` never sets a field directly; it sends `Message::Quit` on the channel,
+    /// so the sharpest assertion is that channel staying empty, not merely that the picker
+    /// closed (which `Action::Close` would also do).
+    #[test]
+    fn q_closes_the_set_picker_through_overlays_own_close_rather_than_quitting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("press q");
+
+        assert!(app.set_picker.is_none(), "q must close the picker");
+        assert!(
+            app.message_rx.try_recv().is_err(),
+            "q must dispatch through the overlay context's own Close, never fall back to \
+             Global's Quit, while the picker is open"
+        );
+    }
+
+    /// `keybindings.md`'s "suspended entirely" reading of `global` while `overlay` is
+    /// focused: a positional digit is `global`'s own binding, so it must not reach
+    /// `SwitchToSet` while the picker sits on top of it.
+    #[test]
+    fn a_positional_digit_is_inert_while_the_set_picker_is_open() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+        let mut app = test_app(&root_a);
+        app.document.sets = vec![set_config("test", &root_a), set_config("second", &root_b)];
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("press 2 while the picker is open");
+
+        assert!(
+            app.set_picker.is_some(),
+            "an inert key must leave the picker open"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "the positional digit must not reach SwitchToSet while overlay suspends global"
+        );
+    }
+
+    /// Criterion 1's sharpest form: choosing the Set that is already active must take
+    /// `App::switch_to_set`'s own no-op-when-unchanged path, proven the same way
+    /// `app/reload.rs`'s own `switching_to_the_already_active_set_leaves_discovery_and_its_generation_untouched`
+    /// proves it for `1`-`9`, by a Generation identity a rebuild could not preserve. A second
+    /// implementation of the switch (one that reassigns `active_set` and rebuilds `Core`
+    /// itself rather than calling `switch_to_set`) would move the Generation here even
+    /// though the Set never changed; only routing through the shared, bounds-checked path
+    /// leaves it untouched.
+    #[test]
+    fn choosing_the_already_active_set_through_the_picker_leaves_the_generation_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        // Advance the Generation past what a rebuilt Core would start at, so an unwanted
+        // rebuild is distinguishable from the untouched case by more than luck.
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        app.core.refresh(&keys);
+        app.core.refresh(&keys);
+        let generation_before = app.core.snapshot().generation;
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the only, already-active Set");
+
+        assert!(app.set_picker.is_none(), "choosing must close the picker");
+        assert_eq!(
+            app.core.snapshot().generation,
+            generation_before,
+            "choosing the already-active Set through the picker must not rebuild Core or \
+             start a new Generation"
+        );
+    }
+
+    /// Criterion 1's positive half: moving the cursor onto the second declared Set and
+    /// choosing it must actually switch, discovering the second Set's own root and
+    /// discarding the first's, the same functional proof
+    /// `app/reload.rs`'s own `switching_to_a_different_declared_set_discards_discovery_and_starts_a_fresh_generation`
+    /// gives `1`-`9`.
+    #[test]
+    fn moving_the_cursor_then_choosing_switches_to_the_second_declared_set() {
+        let dir_a = tempfile::tempdir().expect("temp dir a");
+        let root_a = dir_a
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir a");
+        init_repo(&root_a.join("repo-a"));
+        let dir_b = tempfile::tempdir().expect("temp dir b");
+        let root_b = dir_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir b");
+        init_repo(&root_b.join("repo-b"));
+        let mut app = test_app(&root_a);
+        app.document.sets = vec![set_config("test", &root_a), set_config("second", &root_b)];
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the cursor to the second Set");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose it");
+
+        assert!(app.set_picker.is_none(), "choosing must close the picker");
+        assert_eq!(app.active_set.name, "second");
+        let after_names: Vec<String> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_string())
+            .collect();
+        assert!(
+            after_names.iter().any(|name| name == "repo-b"),
+            "expected discovery to re-run over the second Set's root, got {after_names:?}"
+        );
+        assert!(
+            !after_names.iter().any(|name| name == "repo-a"),
+            "expected the first Set's discovery to be discarded, got {after_names:?}"
+        );
+    }
+
+    /// Criterion 2, both close keys: a test that only reads the active Set back is half a
+    /// test per this ticket's own brief, since a picker that closed by calling
+    /// `switch_to_set` with the current index would still leave the active Set reading the
+    /// same. The Generation is the other half, and it is the half that catches that
+    /// mutation: `switch_to_set` only skips the rebuild when the chosen Set's bounds already
+    /// match, so a "dismiss via the current index" bug would still be a no-op-shaped call,
+    /// but a "dismiss via `apply_active_set` on cursor 0 after `j` moved it elsewhere" bug
+    /// would not be, which is why the cursor is moved before dismissing in both cases below.
+    #[test]
+    fn dismissing_with_esc_or_q_leaves_the_active_set_and_generation_untouched() {
+        for close_key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let dir_a = tempfile::tempdir().expect("temp dir a");
+            let root_a = dir_a
+                .path()
+                .canonicalize()
+                .expect("canonicalize temp dir a");
+            init_repo(&root_a.join("repo-a"));
+            let dir_b = tempfile::tempdir().expect("temp dir b");
+            let root_b = dir_b
+                .path()
+                .canonicalize()
+                .expect("canonicalize temp dir b");
+            init_repo(&root_b.join("repo-b"));
+            let mut app = test_app(&root_a);
+            app.document.sets = vec![set_config("test", &root_a), set_config("second", &root_b)];
+            let keys: Vec<_> = app
+                .core
+                .snapshot()
+                .entities
+                .iter()
+                .map(|entity| entity.key.clone())
+                .collect();
+            app.core.refresh(&keys);
+            app.core.refresh(&keys);
+            let generation_before = app.core.snapshot().generation;
+            let active_before = app.active_set.name.clone();
+
+            app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+                .expect("open the picker");
+            app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("move the cursor onto the other Set before dismissing");
+            app.handle_key_event(press(close_key, KeyModifiers::NONE))
+                .expect("dismiss");
+
+            assert!(
+                app.set_picker.is_none(),
+                "{close_key:?} must close the picker"
+            );
+            assert_eq!(
+                app.active_set.name, active_before,
+                "dismissing with {close_key:?} must not change the active Set"
+            );
+            assert_eq!(
+                app.core.snapshot().generation,
+                generation_before,
+                "dismissing with {close_key:?} must not touch the Generation"
+            );
+        }
+    }
+
+    /// The risk this ticket names: an empty declared-Set list. `Document::load` always
+    /// leaves at least one Set (`resolve_startup_set`'s own doc comment), so this can only
+    /// arise by a test forcing it, which is exactly what makes it worth pinning: `Choose`
+    /// must still close the picker and must not panic indexing into the empty slice.
+    #[test]
+    fn choosing_with_no_declared_sets_at_all_closes_the_picker_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = Vec::new();
+        let active_before = app.active_set.name.clone();
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move onto an empty list");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose from an empty list");
+
+        assert!(
+            app.set_picker.is_none(),
+            "Choose must still close the picker with nothing to choose"
+        );
+        assert_eq!(
+            app.active_set.name, active_before,
+            "choosing with no declared Sets must not change the active Set"
         );
     }
 }

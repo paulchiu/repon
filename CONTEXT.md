@@ -97,6 +97,26 @@ A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero
 **Environment contract**:
 The set-or-unset variable pairs a Launcher or an Action step's child receives, computed from an Entity's already-settled Cells as plain data. An Unknown or Not applicable value unsets its variable rather than setting it empty, and Repon exports none of its own Selection state.
 
+### The keyboard
+
+**Binding**:
+One chord in one context, paired with the action it fires. Every surface that teaches or accepts a key (the footer, the help overlay, the config merge) is derived from the one table of them.
+
+**Built**:
+Whether a Binding exists yet, fixed at compile time. An unbuilt Binding keeps its chord reserved but is absent from the footer and the help overlay, does not dispatch, and says nothing when pressed, because it was never offered.
+_Avoid_: Disabled, unimplemented (both blur Built into Available)
+
+**Available**:
+Whether a Built Binding can act on this keystroke, decided against the current state. An unavailable Binding stays advertised exactly as it always is and answers the press with a Notice.
+_Avoid_: Enabled, disabled (lazygit's word for this, which the same word for Built would collapse)
+
+**Notice**:
+A transient one-line message on the status row replying to a keystroke that could not act. The only thing on screen whose content the user caused, so it outranks everything else wanting that row, and it is gone in seconds. Never a Warning: it is not logged, not ranked, and not in the expanded warning list.
+_Avoid_: Toast, flash, advisory (advisory is the Filter line's `?` slot)
+
+**Warning**:
+A standing condition of this session that puts something already on screen in doubt: a theme that half-applied, a config key that fell back, an abandoned discovery. Continuously true until something changes it, reported both on screen and in the log, and ranked against the others so the most severe holds the slot.
+
 ### Refreshing
 
 **Refresh**:

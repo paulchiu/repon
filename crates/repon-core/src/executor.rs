@@ -65,7 +65,10 @@ pub(crate) fn run_step(
         Ok(fds) => fds,
         Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
     };
-    let slave_dup = match duplicate(&slave) {
+    // The child's own copy for stderr, dup2'd onto its 2 during exec setup; marked
+    // close-on-exec so this, the pre-dup2 descriptor, does not also survive into the
+    // child's own program (see `duplicate_cloexec`).
+    let slave_dup = match duplicate_cloexec(&slave) {
         Ok(fd) => fd,
         Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
     };
@@ -115,7 +118,12 @@ pub(crate) fn run_step(
 /// wrapper crate: the wrapper pulls a second `nix` version, `anyhow`, `filedescriptor`
 /// and more that a crate with no terminal of its own has no other reason to carry
 /// (`docs/spec/actions.md`'s "The PTY"). `width` is fixed at the slave's creation, so
-/// every program it runs sees the same terminal size for the life of the step.
+/// every program it runs sees the same terminal size for the life of the step. Both
+/// descriptors come back close-on-exec: `openpty` has no flag to request that at
+/// creation, so it is set right after, and propagated as a real error rather than
+/// best-effort, since a step's own program inheriting either past its `exec` is the
+/// leak this module exists to prevent (only the dup2'd copies `build_command` wires
+/// onto the child's stdout and stderr are meant to reach it).
 fn open_pty(width: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let winsize = libc::winsize {
         ws_row: 40,
@@ -141,20 +149,23 @@ fn open_pty(width: u16) -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `openpty` just handed back two freshly opened, uniquely owned descriptors.
-    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    set_cloexec_or_fail(&master)?;
+    set_cloexec_or_fail(&slave)?;
+    Ok((master, slave))
 }
 
-/// A second descriptor onto the same open slave, for the child's stderr: stdout and
-/// stderr each need their own `Stdio`, but both must resolve to the one PTY slave
-/// (`docs/spec/actions.md`'s "the same PTY slave" `docs/spec/actions.md`'s "The PTY").
-fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
+/// Marks `fd` close-on-exec, failing loudly on error: unlike [`set_cloexec`]'s
+/// best-effort use on the self-pipe, a step's own program inheriting `master` or the
+/// pre-`dup2` `slave` past `exec` is exactly the leak `open_pty` exists to prevent, so a
+/// failed `fcntl` here must fail the step rather than pass silently.
+fn set_cloexec_or_fail(fd: &OwnedFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
-    let duplicated = unsafe { libc::dup(fd.as_raw_fd()) };
-    if duplicated < 0 {
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if result == -1 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `dup` just handed back a freshly duplicated, uniquely owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+    Ok(())
 }
 
 /// Turns `shell = true`'s own convention, `argv` holding exactly one element with the
@@ -169,10 +180,13 @@ fn shell_argv(argv: &[String]) -> Vec<String> {
     vec![shell, "-c".to_string(), argv.join(" "), "repon".to_string()]
 }
 
-/// A second descriptor onto the same open slave, marked close-on-exec so the step's own
-/// program never inherits it past its `exec`: this is [`run_step`]'s `keepalive`, held
-/// only by this process for as long as [`drain_until_exit`] is draining, and it must never
-/// reach the child's program or a grandchild could hold the slave open indefinitely.
+/// A second descriptor onto the same open slave, marked close-on-exec at creation
+/// (`F_DUPFD_CLOEXEC`) so the step's own program never inherits it past its `exec`.
+/// [`run_step`] calls this twice, for different purposes: once for `slave_dup`, the
+/// child's own copy for stderr (dup2'd onto its 2 during exec setup, so only that copy,
+/// not this pre-`dup2` one, should reach the child), and once for `keepalive`, held only
+/// by this process for as long as [`drain_until_exit`] is draining and never handed to
+/// the child at all.
 fn duplicate_cloexec(fd: &OwnedFd) -> io::Result<OwnedFd> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
     let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -860,7 +874,7 @@ mod tests {
         let argv = vec!["true".to_string()];
 
         let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate(&slave).expect("duplicate the slave for stderr");
+        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
         let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
         let keepalive_fd = keepalive.as_raw_fd();
         let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the drain");
@@ -892,7 +906,7 @@ mod tests {
         let argv = vec!["definitely-not-a-real-repon-command".to_string()];
 
         let (_master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate(&slave).expect("duplicate the slave for stderr");
+        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
         let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
         let keepalive_fd = keepalive.as_raw_fd();
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
@@ -911,22 +925,25 @@ mod tests {
         );
     }
 
-    // --- `keepalive` must never reach the step's own program ---
+    // --- A step's own program sees the pty on stdout and stderr and nowhere else ---
 
     /// The honest form of this claim is observed from inside the child, not by reading
-    /// `run_step`'s own `fcntl` flag back: a leaked `keepalive` would hand the step's own
-    /// program, and anything it backgrounds, an extra live reference onto the pty beyond
-    /// the two (stdout, stderr) it was deliberately given, which is exactly what would let
-    /// a backgrounded grandchild hold the pty open indefinitely after the step itself
-    /// exits. `master`'s own raw descriptor and `slave`'s and `slave_dup`'s own pre-`dup2`
-    /// numbers already leak into every step's program today, a separate, pre-existing gap
-    /// this ticket does not cover; matching by device against the child's own stdout
-    /// (`os.fstat(1).st_rdev`) excludes `master`, which is a distinct device, but still
-    /// counts those two unrelated leaks, so the bound below is an upper bound (2) rather
-    /// than an exact count, immune to that gap ever being closed separately. A leaked
-    /// `keepalive` adds a third.
+    /// `run_step`'s own `fcntl` flags back: a leaked descriptor onto the pty's slave
+    /// side, whether `keepalive` or `slave`'s or `slave_dup`'s own pre-`dup2` numbers,
+    /// would hand the step's own program, and anything it backgrounds, a way to write
+    /// over Repon's own terminal or to hold the pty open past the step's own exit
+    /// (`docs/spec/actions.md`'s "The child" puts a step in its own session via
+    /// `setsid(2)` precisely so it cannot reach back into Repon's terminal). Matching by
+    /// device against the child's own stdout (`os.fstat(1).st_rdev`) is what makes this
+    /// specific to the slave side: `master` is a distinct character device, so a leaked
+    /// `master` would not raise this count at all, which is exactly why
+    /// [`a_steps_own_program_never_inherits_the_ptys_master_side`] below exists as a
+    /// separate, targeted test rather than folding into this one's number. This test used
+    /// to assert an upper bound of two, because `slave`'s and `slave_dup`'s pre-`dup2`
+    /// numbers used to leak in unconditionally; now that `duplicate_cloexec` marks both,
+    /// the true count is zero.
     #[test]
-    fn a_steps_own_program_gains_no_more_pty_references_than_the_two_it_was_given() {
+    fn a_steps_own_program_sees_the_pty_on_stdout_and_stderr_and_nowhere_else() {
         let dir = tempdir();
         let count_extra_pty_references = "\
 import os
@@ -956,11 +973,65 @@ print(len(extra))";
             .trim()
             .parse()
             .expect("the probe prints a single integer");
+        assert_eq!(
+            extra_references, 0,
+            "expected no descriptor onto the pty beyond the child's own stdout and \
+             stderr, got {extra_references} extra references"
+        );
+    }
+
+    /// `master` is never dup2'd onto any of the child's own stdio streams, so the
+    /// device-matching probe above, which only matches the child's own stdout, cannot see
+    /// a leaked `master`: the master and slave sides of a pty are two distinct character
+    /// devices. Proved directly instead: `master`'s own raw number and device are
+    /// recorded in the parent before spawning (replicating `run_step`'s own sequence, as
+    /// the `keepalive`-closing tests above do, since `run_step` does not hand this number
+    /// out), and the child is asked whether that exact descriptor number is still open
+    /// and still refers to that same device. A number closed by `exec` and later reused
+    /// by the interpreter's own startup would report a different device, not a false
+    /// match.
+    #[test]
+    fn a_steps_own_program_never_inherits_the_ptys_master_side() {
+        let dir = tempdir();
+
+        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
+        let master_fd = master.as_raw_fd();
+        let master_device = fd_device(master_fd).expect("master is open before spawning");
+        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
+        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+        let probe = format!(
+            "\
+import os
+fd = {master_fd}
+expected_device = {master_device}
+try:
+    inherited = os.fstat(fd).st_rdev == expected_device
+except OSError:
+    inherited = False
+print(1 if inherited else 0)"
+        );
+        let argv = vec!["python3".to_string(), "-c".to_string(), probe];
+        let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            // Names the interpreter, since this is the one test here that depends on
+            // something outside the repository and a bare spawn failure would not say so.
+            Err(error) => panic!("expected `python3` on PATH to spawn the probe: {error}"),
+        };
+        drop(command);
+
+        let (raw, status) = drain_until_exit(master, keepalive, child);
+
         assert!(
-            extra_references <= 2,
-            "expected at most the two pre-existing, unrelated raw duplicates beyond \
-             stdout and stderr, got {extra_references} extra references onto the pty; \
-             a leaked keepalive descriptor would add a third"
+            status.is_some_and(|status| status.success()),
+            "the probe step failed; it needs `python3` on PATH. output: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        let inherited = String::from_utf8_lossy(&raw).trim() == "1";
+        assert!(
+            !inherited,
+            "expected the pty's master side not to be inherited by the child, but fd \
+             {master_fd} was still open there and still pointed at it"
         );
     }
 

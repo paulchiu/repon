@@ -7,6 +7,7 @@ use crate::{
     cli::{Cli, Command},
 };
 
+mod action_palette;
 mod app;
 mod cli;
 mod components;
@@ -22,6 +23,7 @@ mod logging;
 mod message;
 mod scroll;
 mod selection;
+mod set_picker;
 mod sets;
 #[cfg(test)]
 mod test_support;
