@@ -220,7 +220,9 @@ impl App {
     /// non-zero on a missing name: since this runs before [`App::run`] ever constructs a
     /// [`Tui`], that exit happens before the terminal is claimed. `flag_set` is `--set`/`-s`,
     /// resolved against `REPON_SET` and the declared Sets by
-    /// [`reload::resolve_startup_set`], per config.md's "Selection order".
+    /// [`reload::resolve_startup_set`], per config.md's "Selection order": a name at either
+    /// rung that matches no declared Set exits non-zero the same way, before this function
+    /// ever returns.
     pub fn new(
         tick_rate: f64,
         frame_rate: f64,
@@ -264,7 +266,7 @@ impl App {
             &config.document.sets,
             flag_set.as_deref(),
             env_set.as_deref(),
-        );
+        )?;
         let active_set = ActiveSet::from_config(active_set_config);
 
         let core = Core::start(reload::core_spec(&config.document, &active_set));
