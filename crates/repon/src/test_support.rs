@@ -1,8 +1,10 @@
-//! Test-only helpers shared by this crate's source scans.
+//! Test-only helpers shared across this crate's own test modules.
 //!
 //! Several of this crate's invariants are absence claims, which a scan over the crate's own
-//! source is the honest form of. Every such scan needs the same two pieces, and each copy
-//! that drifted was a scan that quietly stopped scanning.
+//! source is the honest form of. Every such scan needs the same two pieces below, and each
+//! copy that drifted was a scan that quietly stopped scanning. [`capture_tracing`] is
+//! unrelated to scanning; it lives here anyway as this crate's one home for a test utility
+//! more than one test module needs, the same reason the two scan helpers do.
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +50,45 @@ pub(crate) fn production_source(source: &str) -> String {
 /// [`production_source`] for a file on disk.
 pub(crate) fn production_source_at(path: &Path) -> String {
     production_source(&std::fs::read_to_string(path).expect("read a crate source file"))
+}
+
+/// Runs `f` under a subscriber that captures every log line to a string, rather than the
+/// process-wide default `logging::init` installs (never called in a unit test):
+/// `tracing::subscriber::with_default` scopes the override to the current thread only, so
+/// this cannot race another test's own logging on a different thread.
+pub(crate) fn capture_tracing(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured-log mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+
+    let bytes = captured.0.lock().expect("captured-log mutex").clone();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]

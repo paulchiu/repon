@@ -111,6 +111,7 @@ impl App {
                     tracing::warn!("{warning}");
                 }
                 self.theme = loaded_theme.theme;
+                self.theme_warnings = loaded_theme.warnings;
             }
             Err(err) => {
                 tracing::error!("config reload failed to load theme `{theme_name}`: {err:#}");
@@ -120,6 +121,11 @@ impl App {
         if let Err(err) = self.list.register_config_handler(new_config.clone()) {
             tracing::error!("config reload failed to hand the new config to a component: {err:#}");
         }
+
+        // `new_config.warnings` was already logged inside `Config::new()`, which is what
+        // built it; nothing here re-logs it. Moved out last, after the whole-struct clone
+        // just above, since a partial move here would leave nothing left to clone.
+        self.config_warnings = new_config.warnings;
 
         self.reload_active_set(&new_config.document);
     }
@@ -163,6 +169,9 @@ impl App {
             self.core = Core::start(core_spec(document, &self.active_set));
             let keys = entity_keys(&self.core.snapshot());
             self.core.refresh(&keys);
+            // The new `Core` starts with no discovery warning of its own, so a warning the
+            // old one already logged must not suppress logging a fresh one from this one.
+            self.discovery_warning_logged = false;
         }
     }
 }
@@ -197,6 +206,7 @@ mod tests {
     use crate::{
         app::tests::{init_repo, test_app},
         keys::Context,
+        test_support::capture_tracing,
     };
 
     // =====================================================================================
@@ -395,44 +405,5 @@ mod tests {
             logs.contains("test") && logs.contains("renamed"),
             "expected the fallback announced naming both the vanished and the new Set, got: {logs:?}"
         );
-    }
-
-    /// Runs `f` under a subscriber that captures every log line to a string, rather than the
-    /// process-wide default `logging::init` installs (never called in a unit test):
-    /// `tracing::subscriber::with_default` scopes the override to the current thread only,
-    /// so this cannot race another test's own logging on a different thread.
-    fn capture_tracing(f: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("captured-log mutex")
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-
-        let bytes = captured.0.lock().expect("captured-log mutex").clone();
-        String::from_utf8_lossy(&bytes).into_owned()
     }
 }

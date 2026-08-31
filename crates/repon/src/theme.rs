@@ -44,8 +44,9 @@ macro_rules! enum_with_all {
 
 enum_with_all! {
     /// One of the nine named roles a theme corrects, per theming.md's "Roles" table;
-    /// `border_focused` and `dim` already have a reader in the repos list, the rest do not
-    /// yet.
+    /// `border_focused` and `dim` already have a reader in the repos list, `warn` in the
+    /// shared warning slot ([`crate::warnings`]) picks it directly the same way, the rest do
+    /// not yet.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[allow(dead_code)]
     pub enum Role {

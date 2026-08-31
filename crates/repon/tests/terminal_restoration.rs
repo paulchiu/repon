@@ -2,22 +2,23 @@
 //! symmetrically, even across a real panic, by running the real binary against a
 //! pseudo-terminal and reading back what it wrote. A `TestBackend` cannot exercise a real
 //! `termios` call or a real panic unwind, and no crate on the dependency allowlist opens a
-//! pty, so this reaches three POSIX functions directly via `extern "C"`.
+//! pty, so this reaches four POSIX functions directly via `extern "C"`.
 
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
-use std::os::fd::FromRawFd;
-use std::os::raw::{c_char, c_int};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::raw::{c_char, c_int, c_ulong};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 // Safety contract: every call site below passes a valid, currently-open fd and, for
-// `ptsname_r`, a buffer at least as long as the `buflen` it also passes. `waitpid`'s contract
-// is the same as its libc signature: `pid` names a still-live child of this process and
-// `status` is a valid out-pointer for the duration of the call.
+// `ptsname_r`, a buffer at least as long as the `buflen` it also passes; for `ioctl`, a
+// `Winsize` pointer valid for the duration of the call. `waitpid`'s contract is the same as
+// its libc signature: `pid` names a still-live child of this process and `status` is a valid
+// out-pointer for the duration of the call.
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn setpgid(pid: c_int, pgid: c_int) -> c_int;
@@ -25,6 +26,12 @@ unsafe extern "C" {
     fn unlockpt(fd: c_int) -> c_int;
     fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    // Declared variadic, matching libc's own `int ioctl(int, unsigned long, ...)`, rather
+    // than as a fixed three-argument function: Apple's arm64 ABI passes variadic arguments
+    // on the stack even where a fixed-arity call of the same shape would use a register, so
+    // a non-variadic declaration reads garbage for this pointer on Apple Silicon (observed
+    // as `ioctl` failing with `EFAULT` there, harmlessly correct on x86_64 by coincidence).
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
 /// POSIX-standard on both macOS and Linux: also report a stopped child, not only an exited
@@ -37,8 +44,26 @@ const O_NOCTTY: c_int = 0x0002_0000;
 #[cfg(target_os = "linux")]
 const O_NOCTTY: c_int = 0o400;
 
+/// `struct winsize` from `sys/ttycom.h` (macOS) and `asm-generic/termios.h` (Linux): the
+/// same four `unsigned short` fields on both, which is all `TIOCSWINSZ` reads.
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[cfg(target_os = "macos")]
+const TIOCSWINSZ: c_ulong = 0x8008_7467;
+#[cfg(target_os = "linux")]
+const TIOCSWINSZ: c_ulong = 0x5414;
+
 /// Opens a fresh pseudo-terminal pair and returns the master end, already unlocked and
-/// granted, plus the slave's device path.
+/// granted, plus the slave's device path. The window size is not set here: on this
+/// platform's pty implementation `TIOCSWINSZ` only succeeds once the slave end has actually
+/// been opened, which happens later in [`spawn_attached_to_pty_with`], the one place that
+/// sets it.
 fn open_pty() -> (File, String) {
     let master_fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
     assert!(master_fd >= 0, "posix_openpt failed");
@@ -75,6 +100,22 @@ fn spawn_attached_to_pty_with(
         .write(true)
         .open(slave_path)
         .expect("open pty slave for stdin");
+    // Sets a real window size on the now-opened slave, which every test before the shared
+    // warning slot's own tolerated leaving at the platform default of 0x0 (they only ever
+    // inspected ANSI mode sequences crossterm writes regardless of size, never drawn
+    // content): a 0x0 area is one ratatui draws nothing at all into, real content included.
+    let winsize = Winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { ioctl(stdin.as_raw_fd(), TIOCSWINSZ, &winsize as *const Winsize) },
+        0,
+        "ioctl TIOCSWINSZ failed: {:?}",
+        std::io::Error::last_os_error()
+    );
     let stdout = stdin.try_clone().expect("clone pty slave for stdout");
     let stderr = stdin.try_clone().expect("clone pty slave for stderr");
 
@@ -695,5 +736,142 @@ fn a_launcher_that_cannot_be_spawned_still_reclaims_the_terminal() {
         enter_at[0] < leave_at[0] && leave_at[0] < enter_at[1] && enter_at[1] < leave_at[1],
         "the terminal must be reclaimed (a second EnterAlternateScreen) even though the \
          child was never spawned: {output:?}"
+    );
+}
+
+/// config.md's shared warning slot reports every warning "twice: full detail to the log
+/// file... and one persistent on-screen slot", never through a raw `eprintln!`/`println!`
+/// once the terminal is claimed: `eprintln!` goes nowhere a user watching the alternate
+/// screen would read, but it would still show up as a bare newline byte reaching the pty,
+/// since ratatui's crossterm backend paints every row through absolute cursor positioning
+/// and never writes `\n` for content (crossterm also disables output post-processing as
+/// part of raw mode, so a real `println!`'s `\n` would reach the pty unmodified, not
+/// translated to `\r\n`). A non-zero exit and empty stdout is not evidence about anything
+/// happening after the terminal is claimed, so this attaches a real pty (the same technique
+/// the tests above use), lets the TUI run with a config warning outstanding, and asserts on
+/// the literal bytes: `EnterAlternateScreen` must appear (the terminal really was claimed
+/// and the app kept running, unlike the hard-error tests above), the warning's own message
+/// must appear (the slot actually painted it), and no `\n` not immediately preceded by `\r`
+/// may appear anywhere from that point on.
+#[test]
+fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claimed() {
+    let (master, slave_path) = open_pty();
+    let mut writer = master.try_clone().expect("clone pty master for writing");
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "bogus_top_level_key = \"x\"\n",
+    )
+    .expect("write a config.toml with an unknown top-level key");
+    let mut child = spawn_attached_to_pty_with(
+        &slave_path,
+        &[],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+
+    // Drains the pty on its own clone of the master fd, chunk by chunk over a channel rather
+    // than one final Vec: the main thread below needs to see the warning's own text land
+    // before it writes `q`, since writing any earlier risks two failure modes observed while
+    // writing this test. Too early, before the pty leaves canonical mode
+    // (`ECHO`/`ICANON` are default-on until the child's own `enable_raw_mode` turns them
+    // off), and the typed `q` echoes straight back into this same captured stream. Early but
+    // after raw mode, right after `EnterAlternateScreen` lands and before the first scheduled
+    // render paints anything, and `q` wins the race and quits the app before it ever draws
+    // the slot this test means to inspect.
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+    let reader = std::thread::spawn(move || {
+        let mut master = master;
+        loop {
+            let mut chunk = [0u8; 4096];
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if chunk_tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    // The readiness signal for sending `q`: the warning's own text having actually reached
+    // the screen, not merely `EnterAlternateScreen` having done so. `enter()` writes that
+    // sequence well before the first scheduled render paints anything, so waiting on it
+    // alone would let `q` win the race and quit the app before it ever draws the slot this
+    // test means to inspect.
+    let warning_text = "unknown config key `bogus_top_level_key`";
+    let mut output: Vec<u8> = Vec::new();
+    let mut sent_quit = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match chunk_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !sent_quit
+            && output
+                .windows(warning_text.len())
+                .any(|window| window == warning_text.as_bytes())
+        {
+            writer.write_all(b"q").expect("write q to the pty master");
+            sent_quit = true;
+        }
+        if child.try_wait().expect("poll child status").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "repon with an outstanding config warning did not exit within 5s{}; refusing \
+                 to trust a hung process's terminal state, output so far: {:?}",
+                if sent_quit {
+                    " after q was sent"
+                } else {
+                    " and the warning never reached the screen, so q was never sent"
+                },
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+    // Drain whatever the reader thread already queued between the last check above and the
+    // child actually exiting, and whatever it collects before the pty finally closes.
+    while let Ok(chunk) = chunk_rx.recv_timeout(Duration::from_millis(200)) {
+        output.extend_from_slice(&chunk);
+    }
+    let _ = reader.join();
+    let output = String::from_utf8_lossy(&output).into_owned();
+
+    assert!(
+        sent_quit,
+        "expected the terminal to be claimed before this test's 5s deadline, got: {output:?}"
+    );
+    let claimed_at = output
+        .find(&enter_alt)
+        .unwrap_or_else(|| panic!("expected the terminal to be claimed, got: {output:?}"));
+
+    assert!(
+        output.contains("unknown config key `bogus_top_level_key`"),
+        "expected the outstanding config warning's own message on screen, got: {output:?}"
+    );
+
+    let after_claim = &output.as_bytes()[claimed_at..];
+    let bare_newline_at = (0..after_claim.len()).find(|&index| {
+        after_claim[index] == b'\n' && (index == 0 || after_claim[index - 1] != b'\r')
+    });
+    assert!(
+        bare_newline_at.is_none(),
+        "found a bare newline (not preceded by \\r) after the terminal was claimed, at byte \
+         offset {bare_newline_at:?} past the claim; ratatui's own rendering never emits one, \
+         so this is the signature a raw println!/eprintln! reaching the terminal would leave: \
+         {after_claim:?}"
     );
 }

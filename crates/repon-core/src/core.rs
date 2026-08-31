@@ -172,7 +172,8 @@ enum ClockControl {
 /// Construction is `start`, never a plain constructor, because it spawns; `Drop`
 /// joins every thread it spawned. The public entry points are exactly `start`,
 /// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause`, `resume` and
-/// `run_action`, the last a seam only (see its own doc comment).
+/// `discovery_warning` and `run_action`, the last a seam only (see its own doc
+/// comment).
 pub struct Core {
     table: Arc<RwLock<Table>>,
     /// Resolved once at `start` and never mutated afterwards: overrides only
@@ -205,12 +206,10 @@ pub struct Core {
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
     /// Set by the dedicated thread's discovery-slow watcher if `start`'s one walk
-    /// ran a full second without finishing. No entry point reads this yet: the
-    /// warning's consumer-facing home is a later ticket's "one warning slot in the
-    /// status bar"; this is where the timer that has to watch the walk from
-    /// outside it, per [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md),
-    /// leaves what it found.
-    #[allow(dead_code)] // read only by discovery_warning_for_test until a warning slot exists
+    /// ran a full second without finishing, and by a later re-run's own abandon
+    /// path. Read through [`Core::discovery_warning`], the UI's shared warning
+    /// slot's one entry point onto discovery, per
+    /// [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md).
     discovery_warning: Arc<Mutex<Option<String>>>,
     /// Reset to zero at the start of every `refresh`, then incremented once per
     /// distinct common dir among that Generation's dispatched entities whose
@@ -632,6 +631,15 @@ impl Core {
     pub fn resume(&self) {
         let _ = self.control.send(ClockControl::Resume);
     }
+
+    /// The persistent warning a re-run discovery walk leaves behind once it abandons, or
+    /// `None` while none has. Never cleared once set, the same as `discovery_manual`: the
+    /// Set stays out of the automatic refresh path for the life of this `Core`. The UI's
+    /// shared warning slot polls this every frame, since it can turn from `None` to `Some`
+    /// at any point in the run with no reload involved.
+    pub fn discovery_warning(&self) -> Option<String> {
+        self.discovery_warning.lock().unwrap().clone()
+    }
 }
 
 impl Drop for Core {
@@ -727,12 +735,6 @@ impl Core {
     ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
         start_internal(spec, warn_after, discovery_abandon_after, ticks, alive)
-    }
-
-    /// Reads whatever the discovery-slow watcher last recorded, for a test to
-    /// check without a public entry point existing for it yet.
-    pub(crate) fn discovery_warning_for_test(&self) -> Option<String> {
-        self.discovery_warning.lock().unwrap().clone()
     }
 
     /// Whether an abandoned discovery has already taken this `Core` out of the
@@ -2555,7 +2557,7 @@ mod tests {
             "refresh's own rerun_discovery must abandon against the newly-grown \
              tree and take the Set manual, the same as an abandon at start does"
         );
-        let warning = core.discovery_warning_for_test();
+        let warning = core.discovery_warning();
         assert!(
             warning
                 .as_deref()
@@ -3676,7 +3678,7 @@ mod tests {
             .join()
             .expect("watcher thread should not panic");
 
-        assert!(started.core.discovery_warning_for_test().is_none());
+        assert!(started.core.discovery_warning().is_none());
     }
 
     /// The generic cancellation primitive stops a loop the instant `cancel` is
