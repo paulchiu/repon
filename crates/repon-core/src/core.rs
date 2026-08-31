@@ -55,6 +55,21 @@ use crate::landing;
 use crate::patch_equivalence;
 use crate::snapshot::Snapshot;
 
+/// Budget within which rows with names must be on screen at first frame
+/// (`docs/spec/refresh.md`'s "The first frame"). Nothing reads this yet; discovery's own
+/// wall time is the thing that would have to stay under it once first-frame timing is
+/// enforced rather than merely stated. Read only by
+/// `first_frame_budget_constants_match_the_spec_of_record`.
+#[allow(dead_code)] // read only by first_frame_budget_constants_match_the_spec_of_record
+const FIRST_FRAME_NAMES_BUDGET_MS: u64 = 50;
+
+/// Budget within which every cheap column (phase A/B) must be filled at first frame
+/// (`docs/spec/refresh.md`'s "The first frame"). Nothing reads this yet; the identity and
+/// comparison probes' combined wall time is what would have to stay under it. Read only by
+/// `first_frame_budget_constants_match_the_spec_of_record`.
+#[allow(dead_code)] // read only by first_frame_budget_constants_match_the_spec_of_record
+const FIRST_FRAME_CHEAP_COLUMNS_BUDGET_MS: u64 = 200;
+
 /// One Repo's config-level override, crossing from the consumer as plain data: no
 /// TOML type, no `~` expansion left undone. [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)
 /// owns parsing it; the core only ever receives the result, and resolves `path` to
@@ -2580,6 +2595,49 @@ mod tests {
             }) => {}
             other => panic!("expected an attached branch, got {other:?}"),
         }
+    }
+
+    // --- Single source of truth: read the first-frame budgets from the spec itself,
+    // the same pattern `executor.rs` already uses for its PTY width and capture bounds
+    // against `docs/spec/actions.md`. ---
+
+    fn spec_refresh_md() -> String {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(manifest_dir.join("../../docs/spec/refresh.md"))
+            .expect("read docs/spec/refresh.md")
+    }
+
+    fn spec_first_frame_budgets_ms(spec: &str) -> (u64, u64) {
+        let anchor = "rows with names on screen within ";
+        let after = spec
+            .split(anchor)
+            .nth(1)
+            .expect("the first-frame budget sentence is present");
+        let mut parts = after.splitn(2, "ms, every cheap column filled within ");
+        let names: u64 = parts
+            .next()
+            .expect("a names-on-screen budget")
+            .parse()
+            .expect("the names-on-screen budget is an integer");
+        let after_cheap = parts.next().expect("a cheap-column budget and beyond");
+        let cheap_columns: u64 = after_cheap
+            .split("ms,")
+            .next()
+            .expect("a cheap-column budget")
+            .parse()
+            .expect("the cheap-column budget is an integer");
+        (names, cheap_columns)
+    }
+
+    /// Criterion 1: the two budgets `refresh.md`'s "The first frame" states are declared
+    /// once as named constants and cross-checked against the spec sentence here, so the
+    /// spec and the code cannot drift apart silently.
+    #[test]
+    fn first_frame_budget_constants_match_the_spec_of_record() {
+        let spec = spec_refresh_md();
+        let (names_ms, cheap_columns_ms) = spec_first_frame_budgets_ms(&spec);
+        assert_eq!(names_ms, FIRST_FRAME_NAMES_BUDGET_MS);
+        assert_eq!(cheap_columns_ms, FIRST_FRAME_CHEAP_COLUMNS_BUDGET_MS);
     }
 
     /// Criterion 2: every entity a Generation is dispatched over gets its phase C read,
