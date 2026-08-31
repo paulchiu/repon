@@ -248,8 +248,9 @@ fn group_key(entity: &EntityState) -> &Path {
 /// order within its parent's group. Discovery returns one flat list with no such grouping
 /// ([discovery.md](../../../../docs/spec/discovery.md): "one combined entity list with
 /// nothing recording which half produced a given entry"), so this is the one place that
-/// turns it into what the table actually draws: a Repo row followed by its child rows, per
-/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The list".
+/// turns it into what the table actually draws, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The list":
+/// "each Repo is followed immediately by its own Worktrees and Submodules".
 /// A child whose own group's Repo is not present in `entities` at all (should not happen:
 /// discovery always finds a Worktree's or a Submodule's own parent boundary first) is
 /// appended at the end in its original relative order, rather than silently dropped.
@@ -1770,6 +1771,32 @@ mod tests {
             vec![1, 2, 4, 3, 0],
             "expected repo-a (1), then its own submodule (2) and worktree (4) in their \
              original relative order, then repo-b (3) and its own worktree (0)"
+        );
+    }
+
+    /// The orphan branch, which the grouping test above never reaches:
+    /// `layout-and-provenance.md` says a child whose parent is absent is appended rather
+    /// than dropped, so the row count must survive a list with no Repo in it at all.
+    #[test]
+    fn a_child_whose_parent_is_absent_is_appended_rather_than_dropped() {
+        let entities = vec![
+            entity_of_kind("orphan-worktree", Kind::Worktree, "/gone"),
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("orphan-submodule", Kind::Submodule, "/missing/modules/lib"),
+        ];
+
+        let order = grouped_row_order(&entities);
+
+        assert_eq!(
+            order,
+            vec![1, 0, 2],
+            "expected repo-a first, then both parentless children in their original \
+             relative order, with no row dropped"
+        );
+        assert_eq!(
+            order.len(),
+            entities.len(),
+            "every entity must reach the table exactly once"
         );
     }
 

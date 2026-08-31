@@ -127,7 +127,7 @@ pub enum Unknown {
 /// never be read as a default.
 #[derive(Debug, Clone)]
 pub enum Settled<T> {
-    /// Asked and got nothing back, for one of two closed reasons.
+    /// Asked and got nothing back, for one of [`Unknown`]'s closed reasons.
     Unknown(Unknown),
     /// A value as of `at`; `stale` means known to be old with nothing currently
     /// fixing it.
@@ -221,6 +221,56 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Pins [`Unknown`] to the table in `docs/spec/core-api.md`, the document that calls
+    /// this set closed. Without it the enum and the document drift apart silently, which is
+    /// how the third reason arrived with both the document and ADR 0013 still saying two.
+    #[test]
+    fn unknown_reasons_match_this_documents_own_table() {
+        let spec_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/core-api.md");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()));
+
+        let declaration = spec
+            .lines()
+            .find(|line| line.starts_with("pub enum Unknown {"))
+            .unwrap_or_else(|| panic!("no `pub enum Unknown` line in {}", spec_path.display()));
+        let documented: Vec<&str> = declaration
+            .trim_start_matches("pub enum Unknown {")
+            .trim_end_matches('}')
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        // Exhaustive rather than a list: a new variant fails to compile here, so this test
+        // cannot fall behind the enum the way the document did.
+        let in_code: Vec<&str> = [
+            Unknown::TimedOut,
+            Unknown::NoDefaultBranch,
+            Unknown::SubmoduleUninitialized,
+        ]
+        .iter()
+        .map(|reason| match reason {
+            Unknown::TimedOut => "TimedOut",
+            Unknown::NoDefaultBranch => "NoDefaultBranch",
+            Unknown::SubmoduleUninitialized => "SubmoduleUninitialized",
+        })
+        .collect();
+
+        assert_eq!(
+            in_code, documented,
+            "`Unknown`'s variants and core-api.md's own enum line disagree; amend the \
+             document's table and its closed-set sentence in the same change as the enum"
+        );
+        for reason in &in_code {
+            assert!(
+                spec.contains(&format!("| `{reason}` |")),
+                "core-api.md's reason table has no row for `{reason}`"
+            );
+        }
+    }
 
     #[test]
     fn re_probing_keeps_the_previous_value_instead_of_blanking() {
