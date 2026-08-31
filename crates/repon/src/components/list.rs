@@ -5,13 +5,14 @@
 //! branch 24, sync 9, base 6, dirty 6, state 10, left-packed behind a one-character gutter,
 //! single-space gaps, ninety columns before the filler column that absorbs the slack.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    Cell, DirtyCounts, EntityState, Head, RowSummary, Settled, Snapshot, SyncState, WorktreeState,
-    summary,
+    Cell, DirtyCounts, EntityState, Head, Kind, RowSummary, Settled, Snapshot, SyncState,
+    WorktreeState, summary,
 };
 
 use super::Component;
@@ -44,6 +45,26 @@ const STATE_X: u16 = DIRTY_X + DIRTY_WIDTH + GAP;
 const HEADER_ROW: u16 = 0;
 const FIRST_ENTITY_ROW: u16 = HEADER_ROW + 1;
 
+/// A child row's own one-character marker
+/// ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// "The child marker must be one character"): exactly one column, never two, because a
+/// two-character marker would truncate far more child names inside the name budget.
+const CHILD_ROW_MARKER_WIDTH: u16 = 1;
+/// Columns of indent before a child row's own marker, so the row reads as nested under its
+/// parent.
+const CHILD_ROW_INDENT_WIDTH: u16 = 4;
+/// The single-space gap between a child row's marker and its own name text, the same gap
+/// width every other column boundary uses.
+const CHILD_ROW_GAP_WIDTH: u16 = GAP;
+/// Every column the name field spends on a child row before its own name text starts: the
+/// indent, the marker and the gap. `child_name_budget_matches_the_adrs_own_arithmetic` reads
+/// ADR 0020's own "28 minus 6 = 22" sentence at test time and checks this figure against it,
+/// rather than restating "6" as a second literal the ADR's own number could drift from.
+const CHILD_ROW_PREFIX_WIDTH: u16 =
+    CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
+/// A child row's own name text budget: the name column's width, minus the prefix above.
+const CHILD_ROW_NAME_WIDTH: u16 = NAME_WIDTH - CHILD_ROW_PREFIX_WIDTH;
+
 /// The repos panel. Holds no row data of its own: every draw reads the [`Snapshot`] the
 /// caller hands it, cloned once from the Core for that render tick.
 pub struct List {
@@ -53,6 +74,13 @@ pub struct List {
     /// the predecessor's recorded defect
     /// (`docs/spec/refresh.md`'s "What the gutter and the cells show").
     started_at: Instant,
+    /// The show-submodules preference read at the last config handshake: `false`, matching
+    /// `Document::default`, until one arrives. Governs only which rows this draws
+    /// ([discovery.md](../../../../docs/spec/discovery.md)'s "Showing Submodules": "the flag
+    /// decides... whether they are rows"); `crate::app::App::visible_keys` reads the same
+    /// config field independently, through [`kind_is_visible`], so the two never disagree
+    /// about which rows exist.
+    show_submodules: bool,
 }
 
 impl Default for List {
@@ -60,6 +88,7 @@ impl Default for List {
         List {
             glyphs: None,
             started_at: Instant::now(),
+            show_submodules: false,
         }
     }
 }
@@ -112,7 +141,13 @@ impl List {
         if !compact {
             draw_header(buf, interior);
         }
-        for (offset, entity) in snapshot.entities.iter().enumerate() {
+        let row_order = grouped_row_order(&snapshot.entities);
+        for (offset, entity) in row_order
+            .into_iter()
+            .map(|index| &snapshot.entities[index])
+            .filter(|entity| kind_is_visible(entity.kind, self.show_submodules))
+            .enumerate()
+        {
             let Some(y) = interior.y.checked_add(first_row + offset as u16) else {
                 break;
             };
@@ -133,6 +168,7 @@ impl List {
 impl Component for List {
     fn register_config_handler(&mut self, config: Config) -> Result<()> {
         self.glyphs = Some(GlyphSet::for_config(config.document.glyphs));
+        self.show_submodules = config.document.show_submodules;
         Ok(())
     }
 
@@ -177,6 +213,136 @@ fn write_cell(
     }
     let max_width = width.min(interior.right() - x);
     buf.set_stringn(x, y, text, max_width as usize, style);
+}
+
+/// Whether `kind`'s row is ever drawn: a Repo or a Worktree always, a Submodule only while
+/// `show_submodules` is on
+/// ([discovery.md](../../../../docs/spec/discovery.md)'s "Showing Submodules": "the flag
+/// decides... whether they are rows"). Exhaustive over [`Kind`], and shared with
+/// `crate::app::App::visible_keys`, so the two never disagree about which rows exist.
+pub(crate) fn kind_is_visible(kind: Kind, show_submodules: bool) -> bool {
+    match kind {
+        Kind::Repo | Kind::Worktree => true,
+        Kind::Submodule => show_submodules,
+    }
+}
+
+/// A child entity's own group key: the common dir of the Repo (or Worktree) whose
+/// `.gitmodules` or worktree list named it. A Worktree shares its Repo's own `common_dir`
+/// outright, so it needs no key of its own; a Submodule's own `common_dir` is
+/// `<owner common dir>/modules/<name>` ([discovery.rs]'s `resolve`), so its owner's key is
+/// its own two directories up.
+fn group_key(entity: &EntityState) -> &Path {
+    match entity.kind {
+        Kind::Repo | Kind::Worktree => &entity.common_dir,
+        Kind::Submodule => entity
+            .common_dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&entity.common_dir),
+    }
+}
+
+/// Reorders `entities` so each Repo is immediately followed by its own Worktrees and
+/// Submodules, preserving each Repo's own relative order and each child's own relative
+/// order within its parent's group. Discovery returns one flat list with no such grouping
+/// ([discovery.md](../../../../docs/spec/discovery.md): "one combined entity list with
+/// nothing recording which half produced a given entry"), so this is the one place that
+/// turns it into what the table actually draws, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The list":
+/// "each Repo is followed immediately by its own Worktrees and Submodules".
+/// A child whose own group's Repo is not present in `entities` at all (should not happen:
+/// discovery always finds a Worktree's or a Submodule's own parent boundary first) is
+/// appended at the end in its original relative order, rather than silently dropped.
+/// Returns indices into `entities` rather than a reordered clone, so a caller filtering by
+/// visibility can do so on this order without a second allocation.
+pub(crate) fn grouped_row_order(entities: &[EntityState]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(entities.len());
+    let mut placed = vec![false; entities.len()];
+
+    for (index, entity) in entities.iter().enumerate() {
+        if !matches!(entity.kind, Kind::Repo) {
+            continue;
+        }
+        order.push(index);
+        placed[index] = true;
+        let repo_common_dir: &Path = &entity.common_dir;
+        for (child_index, child) in entities.iter().enumerate() {
+            if placed[child_index] || matches!(child.kind, Kind::Repo) {
+                continue;
+            }
+            if group_key(child) == repo_common_dir {
+                order.push(child_index);
+                placed[child_index] = true;
+            }
+        }
+    }
+    for (index, already_placed) in placed.into_iter().enumerate() {
+        if !already_placed {
+            order.push(index);
+        }
+    }
+    order
+}
+
+/// Whether `kind`'s row is drawn as a child, indented under its parent and marked with the
+/// active table's child-row glyph: a Worktree or a Submodule alike, per
+/// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "a Submodule
+/// row carries the same mark as a Worktree row rather than one of its own". Exhaustive over
+/// [`Kind`], so a fourth variant added later must be named here rather than falling in
+/// silently on either side.
+fn is_child_row(kind: Kind) -> bool {
+    match kind {
+        Kind::Repo => false,
+        Kind::Worktree | Kind::Submodule => true,
+    }
+}
+
+/// Draws the name cell: a top-level row's name at the column's own start, or a child row's
+/// name indented behind the active table's one-character child marker, in the reduced budget
+/// [`CHILD_ROW_NAME_WIDTH`] reserves for it. The one place [`is_child_row`] and the child-row
+/// geometry constants are read, so [`draw_row`] and [`draw_row_compact`] can never draw a
+/// child row two different ways.
+fn draw_name_cell(
+    buf: &mut Buffer,
+    interior: Rect,
+    y: u16,
+    entity: &EntityState,
+    glyphs: &'static GlyphSet,
+    style: Style,
+) {
+    if is_child_row(entity.kind) {
+        let marker_x = interior.x + NAME_X + CHILD_ROW_INDENT_WIDTH;
+        write_cell(
+            buf,
+            interior,
+            marker_x,
+            y,
+            CHILD_ROW_MARKER_WIDTH,
+            &glyphs.child_row.to_string(),
+            style,
+        );
+        let name_x = marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
+        write_cell(
+            buf,
+            interior,
+            name_x,
+            y,
+            CHILD_ROW_NAME_WIDTH,
+            &entity.name,
+            style,
+        );
+    } else {
+        write_cell(
+            buf,
+            interior,
+            interior.x + NAME_X,
+            y,
+            NAME_WIDTH,
+            &entity.name,
+            style,
+        );
+    }
 }
 
 fn draw_header(buf: &mut Buffer, interior: Rect) {
@@ -268,15 +434,7 @@ fn draw_row(
         &gutter,
         style,
     );
-    write_cell(
-        buf,
-        interior,
-        interior.x + NAME_X,
-        y,
-        NAME_WIDTH,
-        &entity.name,
-        style,
-    );
+    draw_name_cell(buf, interior, y, entity, glyphs, style);
     write_cell(
         buf,
         interior,
@@ -346,15 +504,7 @@ fn draw_row_compact(
         &gutter,
         style,
     );
-    write_cell(
-        buf,
-        interior,
-        interior.x + NAME_X,
-        y,
-        NAME_WIDTH,
-        &entity.name,
-        style,
-    );
+    draw_name_cell(buf, interior, y, entity, glyphs, style);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -660,6 +810,7 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -734,6 +885,7 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
         });
         let keys: Vec<_> = core
             .snapshot()
@@ -1579,6 +1731,527 @@ mod tests {
             offending_lines.is_empty(),
             "a column formatter must never read is_in_flight; only the row's gutter does, \
              found at: {offending_lines:?}"
+        );
+    }
+
+    // =====================================================================================
+    // Child rows: Worktrees and Submodules under their parent.
+    // =====================================================================================
+
+    fn entity_of_kind(name: &str, kind: Kind, common_dir: &str) -> EntityState {
+        EntityState::new(
+            EntityKey::new(Arc::from(Path::new(name))),
+            Arc::from(name),
+            Arc::from(Path::new(common_dir)),
+            kind,
+        )
+    }
+
+    /// [`grouped_row_order`] proven directly, independent of any rendering: a hand-built,
+    /// out-of-order entity list with two Repo groups interleaved, checked against a literal
+    /// expected order rather than one this test would derive by calling the function under
+    /// test a second time. `repo-a`'s Worktree and Submodule are each not adjacent to
+    /// `repo-a` in the input, and `repo-b`'s own child sits before both Repos, so an
+    /// implementation that merely returned the input unchanged, or one that only grouped
+    /// adjacent runs, could not pass this by accident.
+    #[test]
+    fn grouped_row_order_places_each_repos_children_immediately_after_it_in_original_order() {
+        let entities = vec![
+            entity_of_kind("worktree-b", Kind::Worktree, "/repo-b"),
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("submodule-a", Kind::Submodule, "/repo-a/modules/lib"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+            entity_of_kind("worktree-a", Kind::Worktree, "/repo-a"),
+        ];
+
+        let order = grouped_row_order(&entities);
+
+        assert_eq!(
+            order,
+            vec![1, 2, 4, 3, 0],
+            "expected repo-a (1), then its own submodule (2) and worktree (4) in their \
+             original relative order, then repo-b (3) and its own worktree (0)"
+        );
+    }
+
+    /// The orphan branch, which the grouping test above never reaches:
+    /// `layout-and-provenance.md` says a child whose parent is absent is appended rather
+    /// than dropped, so the row count must survive a list with no Repo in it at all.
+    #[test]
+    fn a_child_whose_parent_is_absent_is_appended_rather_than_dropped() {
+        let entities = vec![
+            entity_of_kind("orphan-worktree", Kind::Worktree, "/gone"),
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("orphan-submodule", Kind::Submodule, "/missing/modules/lib"),
+        ];
+
+        let order = grouped_row_order(&entities);
+
+        assert_eq!(
+            order,
+            vec![1, 0, 2],
+            "expected repo-a first, then both parentless children in their original \
+             relative order, with no row dropped"
+        );
+        assert_eq!(
+            order.len(),
+            entities.len(),
+            "every entity must reach the table exactly once"
+        );
+    }
+
+    fn worktree_add(parent: &Path, worktree: &Path, branch: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(parent)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                worktree.to_str().expect("utf8 path"),
+            ])
+            .status()
+            .expect("run git worktree add");
+        assert!(status.success());
+    }
+
+    fn write_gitmodules(parent: &Path, name: &str, relative_path: &str) {
+        std::fs::write(
+            parent.join(".gitmodules"),
+            format!(
+                "[submodule \"{name}\"]\n\tpath = {relative_path}\n\turl = \
+                 https://example.invalid/{name}.git\n"
+            ),
+        )
+        .expect("write .gitmodules");
+    }
+
+    /// A real disposable repo, committed, then checked out detached at that same commit:
+    /// the shape every Submodule in the measured population is in
+    /// (`docs/spec/discovery.md`'s "The Submodule row": "all 16 initialised Submodules...
+    /// are at a detached HEAD"). Returns the commit's abbreviated id, seven characters,
+    /// matching `format_head`'s own truncation, so a test can assert the exact text a real
+    /// probe settles rather than merely "some hex string".
+    fn init_detached_repo_with_a_commit(path: &Path) -> String {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", "main"])
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(["commit", "--allow-empty", "-m", "first"])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+        // A remote with no upstream configured for this branch, matching the measured
+        // population (`docs/spec/discovery.md`'s row spec: "sync | `-`, no upstream, for
+        // all 16"): every real Submodule declares a URL in `.gitmodules`, so `NoRemote`
+        // (`∅`) would be the wrong fact, distinct from `NoUpstream` (`-`).
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "add", "origin", "https://example.invalid/lib.git"])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(output.status.success());
+        let sha = String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["checkout", "--quiet", "--detach", &sha])
+            .status()
+            .expect("run git checkout --detach");
+        assert!(status.success());
+        sha.chars().take(7).collect()
+    }
+
+    /// A real, settled `Snapshot` off one Repo with a linked Worktree and a real,
+    /// initialised, detached Submodule both attached to it, `show_submodules` on: what
+    /// every test below needing a genuine child row of each kind, on screen together,
+    /// builds from. Returns the Submodule's own commit's abbreviated id too, for the
+    /// branch-column assertion.
+    fn settled_snapshot_with_a_worktree_and_a_submodule() -> (repon_core::Snapshot, String) {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo_on_branch(&parent, "main");
+        worktree_add(&parent, &root.join("feature-worktree"), "feature");
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        let submodule_short_id =
+            init_detached_repo_with_a_commit(&parent.join("vendor").join("lib"));
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: true,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        (core.settle(Duration::from_secs(5)), submodule_short_id)
+    }
+
+    /// A `List` that has been handed a config reading `show_submodules = true`, the same
+    /// handshake `App::new` and a reload give it in production
+    /// (`register_config_handler`), rather than a field poked directly from this crate.
+    fn list_showing_submodules() -> List {
+        let mut list = List::default();
+        list.register_config_handler(crate::config::Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document: crate::config::document::Document {
+                show_submodules: true,
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        })
+        .expect("register config");
+        list
+    }
+
+    /// The row position `List::render`'s own loop would give `name`, once
+    /// [`grouped_row_order`] has run: not the entity's raw index in `snapshot.entities`,
+    /// which discovery gives in walk-then-submodule-pass order rather than grouped order.
+    /// The absolute row `y` a real terminal would draw entity row `row` (0-indexed) at, in
+    /// the full (non-sidebar) list: one row for the top border, one more for the column
+    /// header, matching what `render_with_list`'s own `Block::bordered` and `draw_header`
+    /// already place there.
+    fn entity_row_y(row: usize) -> u16 {
+        1 + FIRST_ENTITY_ROW + row as u16
+    }
+
+    /// A column's own absolute buffer `x`, one column right of the constant above (which
+    /// is relative to `interior`) to account for the panel's own left border.
+    fn absolute_x(relative: u16) -> u16 {
+        1 + relative
+    }
+
+    fn find_entity_row<'a>(
+        snapshot: &'a repon_core::Snapshot,
+        name: &str,
+    ) -> (usize, &'a EntityState) {
+        grouped_row_order(&snapshot.entities)
+            .into_iter()
+            .map(|index| &snapshot.entities[index])
+            .enumerate()
+            .find(|(_, entity)| entity.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("no entity named {name:?} in the grouped row order"))
+    }
+
+    /// Criterion 1's positive half: a child row (a Worktree here) is indented behind the
+    /// active table's one-character marker, while the top-level Repo row right above it is
+    /// not. The mutation this rules out is a marker glyph drawn flush against the name
+    /// column's own start, which would make a child row and a top-level row's name text
+    /// begin at the same column.
+    #[test]
+    fn a_child_row_is_indented_and_marked_while_its_parent_row_is_not() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (repo_row, _) = find_entity_row(&snapshot, "parent");
+        let (worktree_row, _) = find_entity_row(&snapshot, "feature-worktree");
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        let repo_y = entity_row_y(repo_row);
+        let worktree_y = entity_row_y(worktree_row);
+
+        assert_eq!(
+            cell_text(buf, 3, repo_y, 6),
+            "parent",
+            "the top-level Repo row's name must start flush at the name column's own start"
+        );
+        assert_eq!(
+            cell_text(buf, 3, worktree_y, 4),
+            "    ",
+            "a child row's own indent must leave the name column's own start blank"
+        );
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, 7, worktree_y, 1),
+            glyphs.child_row.to_string(),
+            "expected the active table's own child marker, read from the table rather than \
+             restated"
+        );
+        assert_eq!(
+            cell_text(buf, 9, worktree_y, "feature-worktree".len() as u16),
+            "feature-worktree",
+            "expected the child's own name text right after the marker and its gap"
+        );
+    }
+
+    /// Criterion 2: a Submodule row carries the exact same marker character a Worktree row
+    /// uses, read from the table both rows share rather than two literals that could drift
+    /// apart. Proven under `ascii` too, since the two glyph tables pick different markers.
+    #[test]
+    fn a_submodule_row_and_a_worktree_row_share_the_same_child_marker_from_the_table() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (worktree_row, worktree_entity) = find_entity_row(&snapshot, "feature-worktree");
+        let (submodule_row, submodule_entity) = find_entity_row(&snapshot, "vendor/lib");
+        assert!(matches!(worktree_entity.kind, Kind::Worktree));
+        assert!(matches!(submodule_entity.kind, Kind::Submodule));
+
+        for (glyphs_config, table) in [
+            (
+                crate::config::document::Glyphs::Full,
+                GlyphSet::for_config(crate::config::document::Glyphs::Full),
+            ),
+            (
+                crate::config::document::Glyphs::Ascii,
+                GlyphSet::for_config(crate::config::document::Glyphs::Ascii),
+            ),
+        ] {
+            let mut list = list_showing_submodules();
+            list.register_config_handler(crate::config::Config {
+                config_dir: std::path::PathBuf::new(),
+                data_dir: std::path::PathBuf::new(),
+                document: crate::config::document::Document {
+                    show_submodules: true,
+                    glyphs: glyphs_config,
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            })
+            .expect("register config");
+            let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+            let buf = terminal.backend().buffer();
+
+            let worktree_y = entity_row_y(worktree_row);
+            let submodule_y = entity_row_y(submodule_row);
+            let worktree_marker = cell_text(buf, 7, worktree_y, 1);
+            let submodule_marker = cell_text(buf, 7, submodule_y, 1);
+
+            assert_eq!(
+                worktree_marker, submodule_marker,
+                "a Worktree and a Submodule row must share one marker under {glyphs_config:?}"
+            );
+            assert_eq!(
+                worktree_marker,
+                table.child_row.to_string(),
+                "expected the marker read off the active table itself"
+            );
+        }
+    }
+
+    /// Criterion 3's positive cells, at the list level rather than the detail pane: a real,
+    /// initialised, detached Submodule renders its relative path as the name, a
+    /// seven-character object id in branch, `-` (no upstream) in sync, and blank base and
+    /// state.
+    #[test]
+    fn a_shown_submodules_row_renders_its_path_a_short_id_and_blank_base_and_state() {
+        let (snapshot, short_id) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (row, entity) = find_entity_row(&snapshot, "vendor/lib");
+        assert!(matches!(entity.kind, Kind::Submodule));
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(row);
+
+        assert_eq!(
+            cell_text(buf, 9, y, "vendor/lib".len() as u16),
+            "vendor/lib",
+            "expected the submodule's declared relative path as its name"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(BRANCH_X), y, 7),
+            short_id,
+            "expected the real commit's own seven-character abbreviated id in branch"
+        );
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, absolute_x(SYNC_X), y, 1),
+            glyphs.no_upstream.to_string(),
+            "expected no-upstream in sync, since a detached Submodule has no branch at all"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(BASE_X), y, BASE_WIDTH),
+            " ".repeat(BASE_WIDTH as usize),
+            "base is Not applicable for a Submodule and must render blank"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(STATE_X), y, STATE_WIDTH),
+            " ".repeat(STATE_WIDTH as usize),
+            "state is Not applicable for a Submodule and must render blank"
+        );
+    }
+
+    /// Criterion 3's negative case: an uninitialised Submodule (declared in `.gitmodules`,
+    /// never `git submodule update --init`-ed) still renders a row, with every probed cell
+    /// blank and the unknown mark in the gutter, rather than no row at all. The trap this
+    /// guards against is "renders a row with every cell blank" being satisfied by rendering
+    /// no row whatsoever; `find_entity_row` panicking is exactly that failure mode.
+    #[test]
+    fn an_uninitialised_submodule_still_renders_a_row_with_blank_cells_and_the_unknown_mark() {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo_on_branch(&parent, "main");
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        // Deliberately never initialised: no directory at all at the declared path.
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: true,
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let snapshot = core.settle(Duration::from_secs(5));
+
+        // The row must exist at all: this lookup panicking is the "no row at all" failure
+        // mode criterion 3 forbids.
+        let (row, entity) = find_entity_row(&snapshot, "vendor/lib");
+        assert!(matches!(entity.kind, Kind::Submodule));
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(row);
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, absolute_x(GUTTER_X), y, 1),
+            glyphs.unknown.to_string(),
+            "expected the unknown gutter mark on an uninitialised Submodule's row"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(BRANCH_X), y, BRANCH_WIDTH),
+            " ".repeat(BRANCH_WIDTH as usize),
+            "branch must render blank rather than any value at all"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(SYNC_X), y, SYNC_WIDTH),
+            " ".repeat(SYNC_WIDTH as usize),
+            "sync must render blank rather than any value at all"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(DIRTY_X), y, DIRTY_WIDTH),
+            " ".repeat(DIRTY_WIDTH as usize),
+            "dirty must render blank rather than any value at all"
+        );
+    }
+
+    /// Criterion 4's rendering half: a hidden Submodule draws no row at all, while the very
+    /// same `Snapshot`, handed to a `List` reading `show_submodules = true`, draws it. The
+    /// two lists here read one `Snapshot`, proving the preference decides drawing rather
+    /// than discovery having found something different.
+    #[test]
+    fn hidden_submodules_draw_no_row_while_shown_ones_do_from_the_same_snapshot() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+
+        let hidden_terminal = render(140, 24, &snapshot);
+        let hidden_buf = hidden_terminal.backend().buffer();
+        let hidden_text: String = hidden_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            !hidden_text.contains("vendor/lib"),
+            "a hidden Submodule must draw no row at all"
+        );
+
+        let mut shown_list = list_showing_submodules();
+        let shown_terminal = render_with_list(&mut shown_list, 140, 24, &snapshot);
+        let shown_buf = shown_terminal.backend().buffer();
+        let shown_text: String = shown_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            shown_text.contains("vendor/lib"),
+            "the same Submodule, shown, must draw its row"
+        );
+    }
+
+    /// The name-column geometry ADR 0020 measures rather than this test restating: reads
+    /// "A child name gets 28 minus 6 = 22 columns behind a one-character marker" straight
+    /// out of the ADR file and checks this crate's own constants against those three
+    /// numbers, so a change to either side is what this test would catch, not a change to
+    /// only one of two copies of the same figure.
+    #[test]
+    fn child_name_budget_matches_the_adrs_own_arithmetic() {
+        let adr_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md");
+        let adr = std::fs::read_to_string(&adr_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", adr_path.display()));
+        let needle = "A child name gets ";
+        let start = adr
+            .find(needle)
+            .expect("expected the ADR to still state the child-name-budget sentence")
+            + needle.len();
+        let sentence = &adr[start..start + 40];
+        let numbers: Vec<u16> = sentence
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|token| !token.is_empty())
+            .map(|token| token.parse().expect("a numeric token"))
+            .take(3)
+            .collect();
+        let [total, cost, budget] = numbers[..] else {
+            panic!("expected exactly three numbers in {sentence:?}, got {numbers:?}");
+        };
+        assert_eq!(total - cost, budget, "the ADR's own arithmetic must hold");
+        assert_eq!(
+            NAME_WIDTH, total,
+            "the name column width must match the ADR's own figure"
+        );
+        assert_eq!(
+            CHILD_ROW_PREFIX_WIDTH, cost,
+            "the reserved prefix (indent, marker, gap) must match the ADR's own figure"
+        );
+        assert_eq!(
+            CHILD_ROW_NAME_WIDTH, budget,
+            "the child name budget must match the ADR's own figure"
         );
     }
 }

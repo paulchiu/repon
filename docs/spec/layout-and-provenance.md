@@ -16,6 +16,8 @@ The screen is a table of Repos and their Worktrees, a one-character provenance g
 
 Columns are left-packed rather than right-aligned to the frame edge: name 28, branch 24, sync 9, base 6, dirty 6, state 10, then a filler column absorbing the slack. With the gutter and single-space gaps that is 90 columns before the filler. The one-character gutter precedes the name and carries the row's least-settled provenance state.
 
+Rows are ordered by parent: each Repo is followed immediately by its own Worktrees and Submodules, the Repos keep the order discovery returned them in, and so do the children within one parent's group. Discovery returns one flat list with nothing recording which half produced a given entry ([discovery.md](discovery.md)), so the grouping is the consumer's to impose. A child whose parent is absent from the list is appended after every group rather than dropped, so a row can never vanish because its parent did.
+
 `sync` compares a branch against its upstream and `base` compares it against the Repo's default branch. They are different measurements, they coincide only on the default branch's own row, and they are separate provenance cells because they fail independently. `base` is specified in [default-branch.md](default-branch.md).
 
 Gutter glyphs:

@@ -52,6 +52,21 @@ impl Resolution {
         }
     }
 
+    /// A Submodule that has never been `git submodule update --init`-ed: opening it found
+    /// nothing there rather than something broken, so this settles `Unknown` rather than
+    /// `failed`'s genuine Probe error
+    /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "The Submodule row").
+    pub(crate) fn submodule_uninitialized() -> Self {
+        Resolution {
+            settled: Settled::Unknown(crate::cell::Unknown::SubmoduleUninitialized),
+            rung: 0,
+            disagreement: false,
+            stale_remote_head: false,
+            stopped: None,
+        }
+    }
+
     fn known(rung: u8, name: String, disagreement: bool, stale_remote_head: bool) -> Self {
         Resolution {
             settled: Settled::Known {

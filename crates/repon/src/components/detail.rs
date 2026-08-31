@@ -224,6 +224,7 @@ fn describe_unknown(reason: Unknown) -> &'static str {
     match reason {
         Unknown::TimedOut => "timed out",
         Unknown::NoDefaultBranch => "no default branch found",
+        Unknown::SubmoduleUninitialized => "not yet initialised",
     }
 }
 
@@ -539,18 +540,28 @@ mod tests {
         assert!(text.contains("failed to read HEAD"), "got {text:?}");
     }
 
-    // --- the two Unknown reasons, distinguished by name ---
+    // --- the three Unknown reasons, distinguished by name ---
 
     #[test]
-    fn the_two_unknown_reasons_read_as_distinct_words() {
-        assert_ne!(
-            describe_unknown(Unknown::TimedOut),
-            describe_unknown(Unknown::NoDefaultBranch)
-        );
+    fn the_three_unknown_reasons_read_as_distinct_words() {
+        let reasons = [
+            Unknown::TimedOut,
+            Unknown::NoDefaultBranch,
+            Unknown::SubmoduleUninitialized,
+        ];
+        for (index, a) in reasons.iter().enumerate() {
+            for b in &reasons[index + 1..] {
+                assert_ne!(describe_unknown(*a), describe_unknown(*b));
+            }
+        }
         assert_eq!(describe_unknown(Unknown::TimedOut), "timed out");
         assert_eq!(
             describe_unknown(Unknown::NoDefaultBranch),
             "no default branch found"
+        );
+        assert_eq!(
+            describe_unknown(Unknown::SubmoduleUninitialized),
+            "not yet initialised"
         );
     }
 
@@ -955,6 +966,9 @@ mod tests {
             poll_interval: Duration::from_secs(3600),
             status_stale_after: Duration::from_secs(3600),
             generation_deadline: Duration::from_secs(3600),
+            // Shown, so `refresh` below actually dispatches a probe against it: this test is
+            // about per-cell content, not about `show_submodules`'s own dispatch gate.
+            show_submodules: true,
         });
         let keys: Vec<_> = core
             .snapshot()

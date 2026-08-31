@@ -77,15 +77,16 @@ What [layout-and-provenance.md](layout-and-provenance.md) renders from each shap
 ### Unknown's reasons
 
 ```rust
-pub enum Unknown { TimedOut, NoDefaultBranch }
+pub enum Unknown { TimedOut, NoDefaultBranch, SubmoduleUninitialized }
 ```
 
 | reason | meaning |
 | --- | --- |
 | `TimedOut` | The Generation hit its deadline while this cell was still Loading |
 | `NoDefaultBranch` | The resolution chain reached rung 4 |
+| `SubmoduleUninitialized` | The Submodule has never been `git submodule update --init`-ed |
 
-All render `?`; the detail pane says which. This set is closed, per [0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s amendment to [0001](../adr/0001-per-cell-provenance.md). [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`: a branch that tracks nothing renders `-` and a Repo with no remote renders `∅`, both values behind a blank gutter, and `base` is already `NotApplicable` in the second case, so each was a settled fact wearing a missing one's mark and neither had a live case left.
+All render `?`; the detail pane says which. This set is closed, per [0013](../adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s amendment to [0001](../adr/0001-per-cell-provenance.md). `SubmoduleUninitialized` joined it for [discovery.md](discovery.md)'s "An uninitialised Submodule is a row with every cell blank and `?` in the gutter": the row is required, and neither existing reason is true of it, since nothing timed out and no resolution chain ran. Closed means the set changes only by amending this table, which `unknown_reasons_match_this_documents_own_table` enforces from the Rust side. [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`: a branch that tracks nothing renders `-` and a Repo with no remote renders `∅`, both values behind a blank gutter, and `base` is already `NotApplicable` in the second case, so each was a settled fact wearing a missing one's mark and neither had a live case left.
 
 ### Not applicable
 

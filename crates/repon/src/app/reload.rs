@@ -97,7 +97,10 @@ impl App {
     /// re-applied here: `Core` has no way to move to a new [`repon_core::CoreSpec`] short of
     /// rebuilding the whole thing, and rebuilding it for every reload regardless of relevance
     /// would restart discovery even for a reload that only changed the theme, which
-    /// config.md's Reload section does not ask for. `[[launcher]]` is read by
+    /// config.md's Reload section does not ask for. `show_submodules` is the one exception:
+    /// [`repon_core::Core::set_show_submodules`] updates it live with no rebuild at all, which
+    /// is what [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "toggling is instant" asks for. `[[launcher]]` is read by
     /// [`crate::launcher::resolve`], but `App` caches no resolved list to refresh, since no
     /// key dispatches to a Launcher yet; `[[action]]` needs no re-apply of its own, since
     /// nothing in this crate reads it yet.
@@ -167,6 +170,10 @@ impl App {
         // Stored after `reload_active_set` reads it by reference: `Action::SwitchToSet`
         // reads this copy afterwards to look up the Nth declared Set.
         self.document = new_config.document;
+        // Live, no rebuild: safe to call even when `reload_active_set` just rebuilt `self.core`
+        // outright, since the fresh `Core` already started with this same reading from
+        // `core_spec`.
+        self.core.set_show_submodules(self.document.show_submodules);
     }
 
     /// config.md's Reload section, the other half `reload_config` delegates to: resolves the
@@ -260,6 +267,7 @@ pub(crate) fn core_spec(document: &Document, active_set: &ActiveSet) -> CoreSpec
         poll_interval: document.refresh.poll_interval,
         status_stale_after: document.refresh.status_stale_after,
         generation_deadline: GENERATION_DEADLINE,
+        show_submodules: document.show_submodules,
     }
 }
 

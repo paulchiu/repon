@@ -106,6 +106,13 @@ pub(crate) struct DiscoveredEntity {
     /// `None` for a Submodule, which `resolve` names from `.gitmodules` without
     /// opening it, and for a boundary that would not even open in the first place.
     pub repo: Option<Arc<gix::ThreadSafeRepository>>,
+    /// The name to show, when it must be something other than the generic
+    /// basename-of-absolute-path every walked boundary gets: a Submodule's own
+    /// relative path as `.gitmodules` declares it (`vendor/lib`, never merely
+    /// `lib`), per [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "The Submodule row" ("`name` | the submodule path"). `None` for a walked
+    /// boundary, which keeps the generic fallback.
+    pub display_name_override: Option<Arc<str>>,
 }
 
 /// Discovery's second half: resolves every boundary's own Kind (Repo or Worktree)
@@ -186,6 +193,7 @@ pub(crate) fn resolve_with_cache(
             kind,
             common_dir: Arc::clone(&common_dir),
             repo,
+            display_name_override: None,
         });
 
         match submodules {
@@ -208,6 +216,9 @@ pub(crate) fn resolve_with_cache(
                         kind: Kind::Submodule,
                         common_dir: Arc::from(submodule_common_dir),
                         repo: None,
+                        display_name_override: Some(Arc::from(
+                            submodule.relative_path.to_string_lossy().as_ref(),
+                        )),
                     });
                 }
             }
@@ -852,6 +863,43 @@ mod tests {
             .find(|entity| matches!(entity.kind, Kind::Submodule))
             .expect("submodule entity present");
         assert!(submodule.repo.is_none());
+    }
+
+    /// A Submodule's name is its own relative path as `.gitmodules` declares it, not the
+    /// basename every walked boundary falls back to: [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "The Submodule row" fixes `name` as "the submodule path", and `vendor/lib`'s basename
+    /// alone, `lib`, would lose exactly the prefix that makes the name legible.
+    #[test]
+    fn a_submodules_display_name_is_its_relative_path_not_its_basename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let outer = root_dir.join("outer");
+        init_repo(&outer);
+        write_gitmodules(&outer, "lib", "vendor/lib");
+        fs::create_dir_all(outer.join("vendor").join("lib")).expect("create submodule dir");
+
+        let set = spec(vec![root_dir.clone()]);
+        let discovery = discover(&set);
+        let (entities, _) = resolve(&set, &discovery.entities);
+
+        let submodule = entities
+            .iter()
+            .find(|entity| matches!(entity.kind, Kind::Submodule))
+            .expect("submodule entity present");
+        assert_eq!(
+            submodule.display_name_override.as_deref(),
+            Some("vendor/lib"),
+            "expected the declared relative path, not the basename `lib`"
+        );
+
+        let parent = entities
+            .iter()
+            .find(|entity| entity.key.path() == outer)
+            .expect("parent entity present");
+        assert_eq!(
+            parent.display_name_override, None,
+            "a walked boundary keeps the generic basename fallback"
+        );
     }
 
     /// The defining behaviour: a Submodule is found by reading its parent's

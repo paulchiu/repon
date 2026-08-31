@@ -618,6 +618,7 @@ mod tests {
             poll_interval: std::time::Duration::from_secs(3600),
             status_stale_after: std::time::Duration::from_secs(3600),
             generation_deadline: std::time::Duration::from_secs(3600),
+            show_submodules: false,
         });
         let key = core.snapshot().entities[0].key.clone();
         let entity = core.probe_now(&key);
