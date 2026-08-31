@@ -117,6 +117,13 @@ _Avoid_: Toast, flash, advisory (advisory is the Filter line's `?` slot)
 **Warning**:
 A standing condition of this session that puts something already on screen in doubt: a theme that half-applied, a config key that fell back, an abandoned discovery. Continuously true until something changes it, reported both on screen and in the log, and ranked against the others so the most severe holds the slot.
 
+**Terminal state**:
+The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released.
+_Avoid_: "left exactly as found", "all five restored" (both promise a symmetry only four pieces have)
+
+**Residue**:
+Anything Repon enabled in the terminal that is still on after Repon has given the terminal back. The contract is that there is none; it is not that the terminal is as it was, since a state Repon turned off may legitimately stay off.
+
 ### Refreshing
 
 **Refresh**:

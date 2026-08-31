@@ -121,7 +121,7 @@ Every Launcher starts in the entity's own working directory. `cwd` is not a fiel
 
 Four Launchers ship as defaults: lazygit, tuicr, an editor via `from_env`, and a shell. Declaring a `[[launcher]]` with a shipped name replaces it in place; `disabled = true` drops it.
 
-Launchers suspend and exec in the same terminal, which must be left exactly as found. Five independent pieces of terminal state must be restored: raw mode, the alternate screen, mouse capture, bracketed paste and focus reporting. crossterm 0.29 documents all five as independent enable/disable pairs with no automatic restoration, and ratatui's own panic-hook example restores only the first two, so the recipe cannot be copied as written.
+Launchers suspend and exec in the same terminal. The terminal-state contract is [keybindings.md](keybindings.md#terminal-state)'s and lives there in full: five pieces claimed on entry, the four Repon enables released on every exit from the screen, and mouse capture held off and never released. It is not restated here, because a count kept in two places is how the two documents came to disagree ([0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)). What belongs to this document is the mechanics: crossterm 0.29 documents every piece as an independent enable/disable pair with no automatic restoration, and ratatui's own panic-hook example restores only the alternate screen and raw mode, so the recipe cannot be copied as written.
 
 ## The environment contract
 

@@ -234,15 +234,17 @@ The collision case is the one worth explaining. [theming.md](theming.md) refused
 
 ## Terminal state
 
-| state | setting | why |
-| --- | --- | --- |
-| Raw mode | on | `cfmakeraw` clears ISIG and IXON, so Ctrl+C, Ctrl+Z, Ctrl+S and Ctrl+Q all reach Repon |
-| Alternate screen | on | |
-| Bracketed paste | **on** | Without it a pasted two-line command arrives as Enter, then Ctrl+J, then the rest, so it submits itself halfway through |
-| Mouse capture | **off** | It takes the terminal's own select-and-copy away, and the screen is mostly Repo paths and branch names people copy out of it |
-| Focus reporting | on | [refresh.md](refresh.md) refreshes on focus gained |
+| state | setting | released | why |
+| --- | --- | --- | --- |
+| Raw mode | on | yes | `cfmakeraw` clears ISIG and IXON, so Ctrl+C, Ctrl+Z, Ctrl+S and Ctrl+Q all reach Repon |
+| Alternate screen | on | yes | |
+| Bracketed paste | **on** | yes | Without it a pasted two-line command arrives as Enter, then Ctrl+J, then the rest, so it submits itself halfway through |
+| Mouse capture | **off** | **no** | It takes the terminal's own select-and-copy away, and the screen is mostly Repo paths and branch names people copy out of it |
+| Focus reporting | on | yes | [refresh.md](refresh.md) refreshes on focus gained |
 
-All five are restored around a Launcher handoff, per [config.md](config.md).
+This is the terminal-state contract, stated here once and pointed at from [config.md](config.md#launchers) rather than counted again there. Repon claims all five on entry and leaves no residue: every piece it *enables* is released on every exit from the screen, which means a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike, not the handoff alone.
+
+Mouse capture is the one piece Repon *disables* rather than enables, so it has nothing to release. It is held off for the whole run and never written on the way out. The terminal cannot be asked what it was, and a terminal found with capture on is one some earlier program crashed out of rather than one anybody configured, so the unconditional disable on entry repairs that state instead of destroying it. The `released` column is the whole exception set, and a second `no` in it is a decision rather than an implementation detail: see [0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
 
 An unbound printable key is ignored in silence and never beeps, because a split escape sequence can leak a literal character through the parser and a beep would then fire on the terminal's own noise.
 
