@@ -925,7 +925,14 @@ print(len(extra))";
 
         let result = run(&["python3", "-c", count_extra_pty_references], dir.path());
 
-        assert_eq!(result.outcome, StepOutcome::Ok);
+        // Names the interpreter, since this is the one test here that depends on something
+        // outside the repository and a bare outcome mismatch would not say so.
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Ok,
+            "the probe step failed; it needs `python3` on PATH. output: {}",
+            String::from_utf8_lossy(&result.output)
+        );
         let extra_references: usize = String::from_utf8_lossy(&result.output)
             .trim()
             .parse()
