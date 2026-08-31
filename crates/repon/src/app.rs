@@ -1064,6 +1064,13 @@ impl App {
             Some(Action::DismissVanished) => {
                 unreachable!("DismissVanished is unbuilt; dispatch never returns an unbuilt action")
             }
+            // `OpenManagementPalette` is unbuilt for the same reason, and this arm exists for
+            // the same one: exhaustiveness, not reachability.
+            Some(Action::OpenManagementPalette) => {
+                unreachable!(
+                    "OpenManagementPalette is unbuilt; dispatch never returns an unbuilt action"
+                )
+            }
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
             // when they fire; this arm exists only because a match guard does not count
