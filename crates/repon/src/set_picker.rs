@@ -59,14 +59,13 @@ impl SetPicker {
         };
     }
 
-    /// One line per declared Set, in file order, the cursor row marked with `> ` and the
-    /// currently active Set named, so choosing without moving the cursor at least shows
-    /// which Set that would be.
-    ///
-    /// TODO(#134): each row also carries the `1` to `9` number that switches to it, which is
-    /// what makes this picker the tab strip
-    /// [0027](../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)
-    /// declines to draw on the screen. Rows past the ninth carry a name and no number.
+    /// One line per declared Set, in file order, the cursor row marked with `> `, its
+    /// one-indexed number ([`Self::number_for_row`]) beside the name, and the currently
+    /// active Set named, so choosing without moving the cursor at least shows which Set that
+    /// would be. This is what turns the picker into the teaching surface for the positional
+    /// `1` to `9` keys
+    /// ([0027](../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)):
+    /// [`crate::app::App::switch_to_set`] takes the same one-indexed number this draws.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -76,16 +75,28 @@ impl SetPicker {
     ) {
         for (row, set) in sets.iter().enumerate().take(area.height as usize) {
             let marker = if row == self.cursor { "> " } else { "  " };
+            let number = match Self::number_for_row(row) {
+                Some(n) => format!("{n} "),
+                None => String::new(),
+            };
             let active = if set.name.get_ref() == active_set_name {
                 " (active)"
             } else {
                 ""
             };
-            let line = format!("{marker}{}{active}", set.name.get_ref());
+            let line = format!("{marker}{number}{}{active}", set.name.get_ref());
             frame
                 .buffer_mut()
                 .set_string(area.x, area.y + row as u16, &line, Style::new());
         }
+    }
+
+    /// The one-indexed number a zero-indexed row draws, or `None` past the ninth row: the
+    /// positional keys stop at `9`
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)), so a tenth declared Set is only
+    /// ever reachable through the picker itself and carries no number to switch to it by.
+    fn number_for_row(row: usize) -> Option<u8> {
+        u8::try_from(row + 1).ok().filter(|n| *n <= 9)
     }
 }
 
@@ -171,9 +182,52 @@ mod tests {
         );
 
         let buf = draw_to_buffer(&picker, &sets, "alpha");
-        assert!(row_text(&buf, 2, 40).starts_with("> gamma"));
+        assert!(row_text(&buf, 2, 40).starts_with("> 3 gamma"));
         assert!(!row_text(&buf, 0, 40).contains('>'));
         assert!(!row_text(&buf, 1, 40).contains('>'));
+    }
+
+    // --- criterion 1: each row's own one-indexed number, not zero-indexed and not absent ---
+
+    /// This is the test the ticket names by name: a picker that numbers from zero (`0 alpha`)
+    /// or a picker that draws no numbers at all (`  alpha`) must both fail it, not merely a
+    /// picker that shows some digit somewhere. Asserted against the specific row a specific
+    /// digit belongs beside, since a bare "a digit renders somewhere" assertion cannot tell
+    /// zero-indexed numbering from one-indexed numbering.
+    #[test]
+    fn draw_shows_each_rows_one_indexed_number_beside_its_own_name() {
+        let sets = vec![set("alpha"), set("beta"), set("gamma")];
+        let picker = SetPicker::new();
+        let buf = draw_to_buffer(&picker, &sets, "alpha");
+
+        assert_eq!(row_text(&buf, 0, 40).trim_end(), "> 1 alpha (active)");
+        assert_eq!(row_text(&buf, 1, 40).trim_end(), "  2 beta");
+        assert_eq!(row_text(&buf, 2, 40).trim_end(), "  3 gamma");
+    }
+
+    /// The tenth row is the one place the numbering has to stop: the positional keys only
+    /// reach `1` to `9`, so a tenth declared Set is reachable through the picker alone and
+    /// its row carries a name with no number, distinct from every row above it which does.
+    #[test]
+    fn draw_gives_the_tenth_row_a_name_and_no_number() {
+        let names: Vec<String> = (1..=10).map(|n| format!("set{n}")).collect();
+        let sets: Vec<SetConfig> = names.iter().map(|name| set(name)).collect();
+        let picker = SetPicker::new();
+
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| picker.draw(frame, frame.area(), &sets, "set1"))
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer().clone();
+
+        for (row, name) in names.iter().enumerate().take(9) {
+            let marker = if row == 0 { "> " } else { "  " };
+            let active = if row == 0 { " (active)" } else { "" };
+            let expected = format!("{marker}{} {name}{active}", row + 1);
+            assert_eq!(row_text(&buf, row as u16, 40).trim_end(), expected);
+        }
+        assert_eq!(row_text(&buf, 9, 40).trim_end(), "  set10");
     }
 
     // --- cursor movement: clamped, not wrapped ---
