@@ -414,6 +414,26 @@ mod tests {
         assert!(!discovery.abandoned);
     }
 
+    /// `count` matches a Set against real, disposable repositories, each with a real commit
+    /// (so a probe finding one has something to actually read), plus a plain directory that
+    /// must not be counted. The number being right is only half the claim: the `repon` crate's
+    /// own `sets.rs` scans this file's production source for `Cell` and `EntityState`, which
+    /// is what proves nothing here ever probes one of these repositories to get this number.
+    #[test]
+    fn count_matches_a_set_against_real_disposable_repositories_with_commits() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root_dir = root_of(&dir);
+        let repo_a = root_dir.join("repo-a");
+        let repo_b = root_dir.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        crate::test_support::git(&repo_a, &["commit", "--allow-empty", "-m", "first"]);
+        crate::test_support::git(&repo_b, &["commit", "--allow-empty", "-m", "first"]);
+        fs::create_dir_all(root_dir.join("not-a-repo")).expect("create plain dir");
+
+        assert_eq!(count(&spec(vec![root_dir])), 2);
+    }
+
     /// The defining behaviour: the walk must never descend into a directory once it is
     /// recognised as a Repo. A count of discovered entities can pass this test while still
     /// walking everything underneath, so this asserts the stop itself: a directory placed

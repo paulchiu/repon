@@ -22,6 +22,7 @@ mod logging;
 mod message;
 mod scroll;
 mod selection;
+mod sets;
 #[cfg(test)]
 mod test_support;
 mod theme;
@@ -74,7 +75,7 @@ fn main() -> color_eyre::Result<()> {
     errors::init()?;
     logging::init()?;
     config::init(args.config);
-    App::new(args.tick_rate, args.frame_rate, args.theme)?.run()
+    App::new(args.tick_rate, args.frame_rate, args.theme, args.set)?.run()
 }
 
 /// Claims the terminal then panics, so a test can attach to a real process over a pty and
@@ -232,6 +233,11 @@ fn run_command(command: &Command, flag_config_file: Option<PathBuf>) -> color_ey
         Command::Config { example: false } => {
             config::init(flag_config_file);
             print_config_paths();
+        }
+        Command::Sets => {
+            config::init(flag_config_file);
+            let config = config::Config::new()?;
+            sets::print(&config.document);
         }
     }
     Ok(())

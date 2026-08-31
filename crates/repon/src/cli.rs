@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub theme: Option<String>,
 
+    /// Set to select, beating `REPON_SET`, per docs/spec/config.md's "Selection order".
+    #[arg(short = 's', long = "set", value_name = "NAME")]
+    pub set: Option<String>,
+
     /// Claims the terminal, then panics immediately, before the event loop starts.
     /// Debug-only: exists so a test can observe panic-time terminal restoration in a real
     /// process rather than describing it, and must not reach a release binary.
@@ -94,6 +98,8 @@ pub enum Command {
         #[arg(long)]
         example: bool,
     },
+    /// Lists every declared Set's name, roots and match count.
+    Sets,
 }
 
 /// A rate the event thread can honour. Rejected here so a typo reads as a usage error
