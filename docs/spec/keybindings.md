@@ -244,6 +244,8 @@ This is the terminal-state contract, stated here once and pointed at from [confi
 
 Mouse capture is the one piece Repon *disables* rather than enables, so it has nothing to release. It is held off for the whole run and never written on the way out. The terminal cannot be asked what it was, and a terminal found with capture on is one some earlier program crashed out of rather than one anybody configured, so the unconditional disable on entry repairs that state instead of destroying it. The `released` column is the whole exception set, and a second `no` in it is a decision rather than an implementation detail: see [0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
 
+`w` does two things with one press: it opens the expanded warning list, and opening it acknowledges every condition currently outstanding, which is what returns the status row to its indicator. The footer and the help overlay advertise the first, since that is what the user is reaching for; [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the second. It is not a dismissal and no key dismisses a warning: a standing condition leaves the row by ceasing to be true.
+
 An unbound printable key is ignored in silence and never beeps, because a split escape sequence can leak a literal character through the parser and a beep would then fire on the terminal's own noise.
 
 ## Open

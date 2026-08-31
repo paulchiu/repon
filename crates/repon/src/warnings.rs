@@ -12,6 +12,15 @@
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
 //! ([0001](../../../../docs/adr/0001-per-cell-provenance.md)).
+//!
+//! TODO(#131): [`draw_slot`] owns the whole status row, which is no longer the design of
+//! record.
+//! [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)
+//! makes the row one list of items sharing one drop table, in which a warning is an item
+//! beside the entity count and run progress rather than the row's sole occupant, its `!`
+//! indicator is reserved out of the budget before anything is laid out and can never be
+//! dropped, and `w` acknowledges ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
+//! This module becomes an item source; the layout moves out of it.
 
 use ratatui::{Frame, layout::Rect};
 
@@ -530,4 +539,92 @@ mod tests {
     // ranked, which `rank`'s own match (no wildcard arm) enforces at build time rather than
     // at test time. There is nothing a runtime test can assert about a variant that does not
     // exist yet; the guarantee lives in the match itself.
+
+    // --- the status row contract, pinned in the documents until #131 builds it ---
+
+    fn spec(name: &str) -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(manifest_dir.join("../../docs/spec").join(name))
+            .unwrap_or_else(|_| panic!("read docs/spec/{name}"))
+    }
+
+    /// [0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)
+    /// moved the row's composition into one document because the two that carried pieces of
+    /// it disagreed. A redirect that quietly rots back into a second copy is the same defect
+    /// again, so both the link and the absence of the old rules are asserted.
+    #[test]
+    fn the_status_row_contract_lives_in_one_document_and_the_others_redirect() {
+        let layout = spec("layout-and-provenance.md");
+        assert!(
+            layout.contains("## The status row"),
+            "layout-and-provenance.md owns the status row contract in full"
+        );
+
+        for (name, superseded) in [
+            ("theming.md", "then the header"),
+            ("actions.md", "Priority while a run is in flight"),
+        ] {
+            let text = spec(name);
+            assert!(
+                text.contains("layout-and-provenance.md#the-status-row"),
+                "{name} must redirect to the status row contract rather than drop the reader"
+            );
+            assert!(
+                !text.contains(superseded),
+                "{name} still states its own row priority (`{superseded}`), which is the \
+                 second copy 0026 removed"
+            );
+        }
+    }
+
+    /// The reserved indicator is the whole decision: a row too narrow for even the entity
+    /// count still says something is wrong. Reads the first ladder under `## The status row`
+    /// and checks both ends, plus that every rung's text measures exactly the width it is
+    /// filed under, which is the arithmetic the redirect above has no way to keep honest.
+    #[test]
+    fn the_status_row_ladder_floors_at_the_reserved_warning_indicator() {
+        let layout = spec("layout-and-provenance.md");
+        let section = layout
+            .split("## The status row")
+            .nth(1)
+            .expect("the status row section is present");
+        let ladder: Vec<(usize, &str)> = section
+            .split("```")
+            .nth(1)
+            .expect("the status row section carries a ladder")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (width, rendered) = line
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .expect("every rung is a width and the line it renders");
+                (
+                    width
+                        .parse::<usize>()
+                        .expect("the rung's width is a number"),
+                    rendered.trim(),
+                )
+            })
+            .collect();
+
+        for (width, rendered) in &ladder {
+            assert_eq!(
+                rendered.chars().count(),
+                *width,
+                "rung {width} renders {} columns: `{rendered}`",
+                rendered.chars().count()
+            );
+        }
+
+        let (floor_width, floor) = ladder.last().expect("the ladder has rungs");
+        assert!(
+            floor.starts_with('!') && floor.chars().count() == *floor_width,
+            "the narrowest rung is the reserved indicator alone, got `{floor}`"
+        );
+        assert!(
+            ladder.iter().all(|(_, rendered)| rendered.starts_with('!')),
+            "the indicator is reserved ahead of every item, so no rung may drop it"
+        );
+    }
 }
