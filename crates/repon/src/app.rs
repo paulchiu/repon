@@ -272,14 +272,10 @@ impl App {
         let core = Core::start(reload::core_spec(&config.document, &active_set));
         // Discovery already ran inside `Core::start`; dispatch the identity probe for every
         // row it found so the list fills in progressively rather than sitting on blank branch
-        // cells until something else asks for a refresh. This is `dispatch_order`'s only
-        // production call site today, and it is a no-op here: before the first frame there is
+        // cells until something else asks for a refresh (Generation 1, refresh.md's
+        // "Startup"). A no-op call to `dispatch_order` here: before the first frame there is
         // no rendered viewport to narrow `visible`, so cursor, visible and discovery order are
-        // all `keys` and the three-tier split returns its input unchanged. A call site with a
-        // real cursor and viewport would read them from `self.cursor_key()` and
-        // `self.visible_keys()`, which is what `Action::RefreshAll` and
-        // `Action::RefreshSelection` need once their own arms in `handle_key_event` actually
-        // call `core.refresh`; today each has its own arm (TODO(#65)) that does nothing yet.
+        // all `keys` and the three-tier split returns its input unchanged.
         let keys = entity_keys(&core.snapshot());
         core.refresh(&dispatch_order(keys.first(), &keys, &keys));
 
@@ -413,6 +409,7 @@ impl App {
                 self.message_tx.send(Message::Resize(columns, rows))?;
             }
             Event::Key(key) => self.handle_key_event(key)?,
+            Event::FocusGained => self.on_focus_gained(),
             Event::Error => self
                 .message_tx
                 .send(Message::Error("could not read a terminal event".into()))?,
@@ -627,14 +624,14 @@ impl App {
                 self.action_palette = Some(ActionPalette::new());
                 None
             }
-            // TODO(#65): RefreshAll does not call `core.refresh` yet.
             Some(Action::RefreshAll) => {
-                self.notify_not_implemented(Action::RefreshAll);
+                self.core.refresh(&self.refresh_everything_order());
                 None
             }
-            // TODO(#65): RefreshSelection does not call `core.refresh` yet.
             Some(Action::RefreshSelection) => {
-                self.notify_not_implemented(Action::RefreshSelection);
+                if let Some(order) = self.refresh_selection_order() {
+                    self.core.refresh(&order);
+                }
                 None
             }
             // TODO(#73): re-deriving default branches over the Selection is not wired up yet.
@@ -1090,15 +1087,59 @@ impl App {
         }
     }
 
-    /// Resumes background work and starts a normal Generation over every visible row, then
-    /// re-reads the theme file. Shared by every return from suspension: refresh.md's "On
-    /// resume ... a normal generation starts. Nothing is queued to fire on return," and
-    /// theming.md's theme-reread rule, both stated once for `SIGTSTP` and a Launcher's own
-    /// handoff alike.
+    /// The dispatch order every "over everything" Generation shares (refresh.md's "Scope and
+    /// order": cursor row first, then the remaining visible rows, then the rest in discovery
+    /// order), computed through [`dispatch_order`] rather than re-derived at each call site.
+    /// `Action::RefreshAll`, terminal focus gained (`Self::on_focus_gained`) and returning
+    /// from suspension (`Self::on_resume`) all read this rather than each carrying its own
+    /// tiering, which is criterion 4's "one seam" for the three triggers that share this
+    /// scope.
+    fn refresh_everything_order(&self) -> Vec<EntityKey> {
+        let keys = entity_keys(&self.core.snapshot());
+        dispatch_order(self.cursor_key().as_ref(), &self.visible_keys(), &keys)
+    }
+
+    /// `Action::RefreshSelection`'s own dispatch order (refresh.md's "Refreshing the
+    /// Selection"): the same cursor-first tiering as [`Self::refresh_everything_order`],
+    /// restricted to [`Selection::targets`]' own rows (the checked rows, or the cursor row
+    /// alone with none checked) rather than every known Entity. `None` with no cursor row to
+    /// default onto, which is what an empty table means.
+    fn refresh_selection_order(&self) -> Option<Vec<EntityKey>> {
+        let cursor_key = self.cursor_key()?;
+        let targets: std::collections::HashSet<EntityKey> =
+            self.selection.targets(&cursor_key).into_iter().collect();
+        let keys: Vec<EntityKey> = entity_keys(&self.core.snapshot())
+            .into_iter()
+            .filter(|key| targets.contains(key))
+            .collect();
+        Some(dispatch_order(
+            Some(&cursor_key),
+            &self.visible_keys(),
+            &keys,
+        ))
+    }
+
+    /// Terminal focus gained (refresh.md's "Terminal focus gained"): a new Generation over
+    /// everything, gated by `refresh.on_focus` so a terminal or multiplexer that never
+    /// reports focus, or a user who disabled the key, simply never fires this; nothing
+    /// degrades either way; crossterm only ever raises [`Event::FocusGained`] when the
+    /// terminal reported it.
+    fn on_focus_gained(&mut self) {
+        if self.document.refresh.on_focus {
+            self.core.refresh(&self.refresh_everything_order());
+        }
+    }
+
+    /// Resumes background work and starts a normal Generation over everything, then re-reads
+    /// the theme file. Shared by every return from suspension: refresh.md's "On resume ... a
+    /// normal generation starts. Nothing is queued to fire on return," and theming.md's
+    /// theme-reread rule, both stated once for `SIGTSTP` and a Launcher's own handoff alike.
+    /// The population and cursor are still the ones suspension found, since nothing about
+    /// discovery changes across a suspend, so [`Self::refresh_everything_order`]'s tiering
+    /// applies unchanged.
     fn on_resume(&mut self) {
         self.core.resume();
-        let keys = self.visible_keys();
-        self.core.refresh(&keys);
+        self.core.refresh(&self.refresh_everything_order());
         self.reread_theme();
     }
 
@@ -2369,6 +2410,257 @@ mod tests {
         }
     }
 
+    // --- Issue #65: the eight Refresh triggers. Startup (`App::new`'s own dispatch above),
+    // Launcher return (`returning_from_a_handoff_starts_a_new_generation_synchronously_with_
+    // nothing_queued` and its neighbours above), a Set switch
+    // (`app::reload::tests::switching_to_a_different_declared_set_discards_discovery_and_
+    // starts_a_fresh_generation`) and an Action starting and finishing
+    // (`repon-core`'s own `starting_an_action_cancels_any_generation_already_in_flight` and
+    // `a_finished_action_starts_exactly_one_generation_over_every_known_entity`) already had
+    // triggers and tests before this ticket. This section builds and tests the three this
+    // ticket adds: `Action::RefreshAll`, `Action::RefreshSelection` and terminal focus
+    // gained. The "exactly eight, and nothing else" absence claim lives in
+    // `test_support.rs`'s three source scans, not a ninth test here.
+
+    /// The branch name a probe actually wrote, or `None` while unsettled or detached: the
+    /// only way to observe which Generation last wrote a row from outside `repon-core`: its
+    /// own per-cell `Generation` is private, so a test tells "this row was re-probed" from
+    /// "this row still shows what it showed before" by giving each mutation below its own
+    /// unique branch name and reading it back.
+    fn branch_name(entity: &EntityState) -> Option<String> {
+        match entity.branch.settled() {
+            Some(repon_core::Settled::Known {
+                value: repon_core::Head::Branch { name, .. },
+                at: _,
+                stale: _,
+            }) => Some(name.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Checks out a brand new branch in `repo`, outside Repon's own view, the same pattern
+    /// [`returning_from_a_handoff_reprobes_the_entity_synchronously_before_returning`] uses:
+    /// a fresh name sidesteps the ambient default-branch-name question entirely, rather than
+    /// assuming what `git init` called the first branch on this machine.
+    fn checkout_new_branch(repo: &std::path::Path, branch: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["checkout", "-q", "-b", branch])
+            .status()
+            .expect("run git checkout");
+        assert!(status.success());
+    }
+
+    /// The Entity whose key resolves to `path`, read fresh off `snapshot`: `EntityKey::path`
+    /// is the one public way to tell two repos' keys apart without assuming discovery order.
+    fn entity_for<'a>(
+        snapshot: &'a repon_core::Snapshot,
+        path: &std::path::Path,
+    ) -> &'a EntityState {
+        snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == path)
+            .unwrap_or_else(|| panic!("no entity discovered at {}", path.display()))
+    }
+
+    /// Criterion 5, and criterion 2's first half (the plain key must never default to the
+    /// Selection): `Action::RefreshAll` (`r`) covers every known Entity, not only the cursor
+    /// row. Two repos, neither selected, cursor left on whichever happens to be first; both
+    /// must show their externally-made branch change after the key press. The mutation this
+    /// catches: a build that scoped the plain refresh key to the Selection (empty here,
+    /// which `Selection::targets` would default to the cursor row alone) would leave
+    /// whichever repo is not the cursor row on its original branch.
+    #[test]
+    fn refresh_all_covers_every_known_entity_not_only_the_cursor_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+
+        checkout_new_branch(&repo_a, "after-refresh-all-a");
+        checkout_new_branch(&repo_b, "after-refresh-all-b");
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        app.core.settle(Duration::from_secs(5));
+
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_a)).as_deref(),
+            Some("after-refresh-all-a")
+        );
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_b)).as_deref(),
+            Some("after-refresh-all-b"),
+            "RefreshAll must cover every known Entity, not only the cursor row"
+        );
+    }
+
+    /// Criterion 5's own discriminator, and criterion 2's second half (the Selection key
+    /// must never default to everything): a Selection-scoped refresh leaves the row it never
+    /// covered running on its older Generation. `repo-a` is the whole Selection; `repo-b` is
+    /// neither selected nor the cursor. Asserting only that `repo-a` picked up its new
+    /// branch would prove nothing, since a whole-table refresh also does that; asserting
+    /// `repo-b` is still on its *original* branch is what a whole-table-refresh
+    /// implementation fails, because that mutation refreshes `repo-b` too.
+    #[test]
+    fn refresh_selection_leaves_a_row_outside_the_selection_on_its_older_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+
+        let original_snapshot = app.core.snapshot();
+        let repo_b_original_branch = branch_name(entity_for(&original_snapshot, &repo_b))
+            .expect("repo-b has a settled branch before the Selection refresh");
+        let key_a = entity_for(&original_snapshot, &repo_a).key.clone();
+        app.selection.toggle(key_a);
+
+        checkout_new_branch(&repo_a, "after-refresh-selection-a");
+        checkout_new_branch(&repo_b, "after-refresh-selection-b");
+
+        app.handle_key_event(press(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .expect("handle RefreshSelection");
+        app.core.settle(Duration::from_secs(5));
+
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_a)).as_deref(),
+            Some("after-refresh-selection-a"),
+            "the Selection's own row must be covered by the new Generation"
+        );
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_b)).as_deref(),
+            Some(repo_b_original_branch.as_str()),
+            "a row the Selection never covered must still be running on its older \
+             Generation, i.e. still show its pre-refresh branch"
+        );
+    }
+
+    /// Criterion 3: terminal focus gained starts a Generation over everything when
+    /// `refresh.on_focus` is enabled (the default), the same "everything" scope
+    /// `Action::RefreshAll` covers, checked here against a second repo the cursor is not on.
+    #[test]
+    fn terminal_focus_gained_covers_everything_when_enabled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        assert!(
+            app.document.refresh.on_focus,
+            "on_focus defaults to true, per config.md"
+        );
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+
+        checkout_new_branch(&repo_a, "after-focus-gained-a");
+        checkout_new_branch(&repo_b, "after-focus-gained-b");
+
+        app.on_focus_gained();
+        app.core.settle(Duration::from_secs(5));
+
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_a)).as_deref(),
+            Some("after-focus-gained-a")
+        );
+        assert_eq!(
+            branch_name(entity_for(&snapshot, &repo_b)).as_deref(),
+            Some("after-focus-gained-b")
+        );
+    }
+
+    /// Criterion 3's gate: `refresh.on_focus = false` must actually stop terminal focus
+    /// gained from starting a Generation, not merely exist as an unread config field. The
+    /// mutation this catches: a build that reads `on_focus` only for a config-validation
+    /// warning, or not at all, would still refresh here.
+    #[test]
+    fn terminal_focus_gained_does_nothing_while_the_config_key_is_disabled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        app.document.refresh.on_focus = false;
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+
+        let original_branch = branch_name(entity_for(&app.core.snapshot(), &repo))
+            .expect("repo has a settled branch before the disabled focus event");
+        checkout_new_branch(&repo, "after-disabled-focus-gained");
+
+        app.on_focus_gained();
+        app.core.settle(Duration::from_millis(200));
+
+        assert_eq!(
+            branch_name(entity_for(&app.core.snapshot(), &repo)).as_deref(),
+            Some(original_branch.as_str()),
+            "refresh.on_focus = false must gate the trigger outright, not merely delay it"
+        );
+    }
+
+    /// Criterion 3's other half: "a terminal or multiplexer that never reports focus simply
+    /// never fires that trigger" and "nothing degrades because of it". `on_focus_gained` is
+    /// reachable only through `Event::FocusGained`
+    /// (`exactly_six_production_call_sites_call_core_refresh_from_the_repon_crate` in
+    /// `test_support.rs` is the absence half proving no other path reaches `core.refresh` at
+    /// all), so a terminal that never emits that crossterm event never calls it; this proves
+    /// the positive half, that ordinary input keeps working and starts no Generation of its
+    /// own with the trigger simply never invoked, which is what "nothing degrades" comes down
+    /// to once the wiring above rules out any other path to it.
+    #[test]
+    fn a_terminal_that_never_reports_focus_never_starts_a_generation_and_ordinary_input_still_works()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+        let generation_before = app.core.snapshot().generation;
+
+        // `Event::FocusGained` never arrives in this test, the same as a terminal or
+        // multiplexer that never reports focus; ordinary key handling is exercised instead.
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("handle MoveDown");
+
+        assert_eq!(
+            app.cursor, 0,
+            "a single-row list has nowhere for MoveDown to go"
+        );
+        assert_eq!(
+            app.core.snapshot().generation,
+            generation_before,
+            "with no focus event and no other trigger pressed, nothing should have started a \
+             Generation on its own"
+        );
+    }
+
     // --- `OpenLauncher` has its own arm rather than falling through `handle_key_event`'s
     // catch-all, the same exhaustiveness guarantee every other named arm carries (issue #97).
 
@@ -2414,12 +2706,6 @@ mod tests {
 
         let cases = [
             (KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterFilter),
-            (KeyCode::Char('r'), KeyModifiers::NONE, Action::RefreshAll),
-            (
-                KeyCode::Char('R'),
-                KeyModifiers::SHIFT,
-                Action::RefreshSelection,
-            ),
             (
                 KeyCode::Char('b'),
                 KeyModifiers::NONE,
@@ -2488,10 +2774,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected an arm for Action::{variant}"))
         };
 
-        let cases: [(&str, Option<u32>); 8] = [
+        let cases: [(&str, Option<u32>); 6] = [
             ("EnterFilter", Some(63)),
-            ("RefreshAll", Some(65)),
-            ("RefreshSelection", Some(65)),
             ("RederiveDefaultBranches", Some(73)),
             ("NextFailed", Some(78)),
             ("PreviousFailed", Some(78)),
