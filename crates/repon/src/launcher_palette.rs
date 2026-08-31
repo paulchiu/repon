@@ -397,6 +397,28 @@ mod tests {
         assert!(palette.choose(&launchers).is_none());
     }
 
+    // --- risk: a Launcher list with nothing in it (every shipped default disabled and
+    // nothing declared) must never panic and never move the cursor past it ---
+
+    #[test]
+    fn an_empty_launcher_list_leaves_the_cursor_at_zero_and_draws_nothing_for_every_movement_action()
+     {
+        let mut palette = LauncherPalette::new();
+        for delta in [-1isize, 0, 1] {
+            palette.move_highlight(delta, &[]);
+            assert!(palette.highlighted(&[]).is_none());
+        }
+        assert!(palette.choose(&[]).is_none());
+
+        let buf = draw_to_buffer(&palette, &[], &Theme::default(), "repo-a");
+        let interior_row: String = row_text(&buf, 1, 40).chars().skip(1).take(38).collect();
+        assert_eq!(
+            interior_row.trim(),
+            "",
+            "an empty Launcher list must render no rows inside the border"
+        );
+    }
+
     // --- legibility with colour stripped ---
 
     #[test]
