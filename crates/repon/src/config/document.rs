@@ -689,6 +689,20 @@ mod tests {
         assert!(message.contains("line 5"), "got: {message}");
     }
 
+    // A duplicate `[[launcher]]` name is rejected at load with the line number, the same
+    // uniqueness `reject_duplicate_names` already enforces for sets and repos.
+    #[test]
+    fn a_duplicate_launcher_name_is_rejected_with_a_line_number() {
+        let message = parse_err(
+            "[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n\n[[launcher]]\nname = \"lazygit\"\nargs = [\"lg\"]\n",
+        );
+        assert!(message.contains("duplicate launcher name"));
+        assert!(
+            message.contains("line 6"),
+            "expected the second declaration's line, got: {message}"
+        );
+    }
+
     // File order is preserved as tab and palette order: the array is not reordered.
     #[test]
     fn set_declaration_order_is_preserved() {

@@ -469,6 +469,11 @@ impl App {
                 }
                 None
             }
+            Some(Action::OpenLauncher) => {
+                // TODO(#97): route through the Launcher palette; `around_entity_handoff`
+                // is the seam it will call into.
+                None
+            }
             _ => None,
         };
         if let Some(message) = message {
@@ -1464,6 +1469,26 @@ mod tests {
         );
     }
 
+    // --- `OpenLauncher` has its own arm rather than falling through `handle_key_event`'s
+    // catch-all: the ticket's headline feature has no palette yet, and that gap must be
+    // visible in the dispatch itself, not absorbed silently alongside implemented actions.
+
+    /// `Action::OpenLauncher` is bound, has a footer hint and a help entry, but the palette
+    /// that would select a Launcher to hand off to is issue #97's, not this one's. Without
+    /// its own arm, pressing the bound key would fall into the wildcard next to every other
+    /// implemented action, indistinguishable from one that works.
+    #[test]
+    fn open_launcher_has_its_own_arm_in_handle_key_event_rather_than_the_catch_all() {
+        let source = production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        );
+        assert!(
+            source.contains("Some(Action::OpenLauncher) => {"),
+            "expected `OpenLauncher` to have its own explicit arm in `handle_key_event`, \
+             not the wildcard `_ => None`"
+        );
+    }
+
     // --- criterion 5: all background work stops while suspended; on return the handed-off
     // entity is re-probed synchronously first and only then does a normal Generation start,
     // with nothing queued to fire later; the theme file is re-read on return and on resume.
@@ -1559,8 +1584,13 @@ mod tests {
     }
 
     /// "Only then does a normal Generation start... nothing is queued to fire on return": the
-    /// Generation counter must already have advanced, and nothing sits on the app's own
-    /// message bus waiting for a future tick to do the work instead.
+    /// Generation counter must already have advanced, and nothing arrives later either, on
+    /// the message bus or as a further Generation. The mutation this catches: a build that
+    /// keeps every synchronous step exactly as it is but additionally spawns a thread that
+    /// sleeps briefly and calls `refresh` again passes an instantaneous check trivially, since
+    /// it never waits past its own synchronous return; this test looks past that return,
+    /// bounded so a passing run costs a fixed, small wait rather than a real sleep racing a
+    /// probabilistic outcome.
     #[test]
     fn returning_from_a_handoff_starts_a_new_generation_synchronously_with_nothing_queued() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1572,15 +1602,31 @@ mod tests {
 
         app.around_entity_handoff(&key, || {});
 
+        let generation_at_return = app.core.snapshot().generation;
         assert!(
-            app.core.snapshot().generation > generation_before,
+            generation_at_return > generation_before,
             "expected a new Generation to have started synchronously, with no further call \
              needed to trigger it"
         );
-        assert!(
-            app.message_rx.try_recv().is_err(),
-            "nothing should be queued on the message bus as a substitute for doing the \
-             refresh now"
+
+        // Drain the message bus over a bounded window rather than checking it once: a
+        // one-shot `try_recv` right after the synchronous return proves nothing about what
+        // arrives a moment later.
+        match app
+            .message_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+        {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            other => panic!(
+                "nothing should be queued on the message bus as a substitute for doing the \
+                 refresh now, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            app.core.snapshot().generation,
+            generation_at_return,
+            "expected no further Generation to start after the synchronous return; one \
+             started later instead"
         );
     }
 
