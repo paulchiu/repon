@@ -7,6 +7,7 @@ use crate::{
     cli::{Cli, Command},
 };
 
+mod action_palette;
 mod app;
 mod cli;
 mod components;

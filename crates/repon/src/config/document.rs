@@ -3,9 +3,10 @@
 //! `docs/spec/config.md` is the specification. This module implements the top-level bare
 //! keys, `[refresh]`, `[fetch]`, `[auto_update]`, the `[[set]]`, `[[launcher]]` and
 //! `[[action]]` fields in full. Turning a parsed `[[action]]` and its `[[action.steps]]`
-//! into something `repon_core::Core::run_action` can run (resolving `shell = true`,
-//! merging each step's `env` with the environment contract, the confirm gate, the
-//! palette) is a later ticket's crossing; this module only proves the schema.
+//! into something `repon_core::Core::run_action` can run is
+//! [`crate::action_palette::to_action_spec`]'s crossing; `shell = true` and merging a
+//! step's `env` with the environment contract stay unresolved across it, since resolving
+//! both is `executor::run_step`'s own job in `repon-core`.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -138,12 +139,11 @@ pub struct LauncherConfig {
 /// One `[[action.steps]]` table, per [config.md](../../../../docs/spec/config.md#actions):
 /// `args` is the argv vector (with `shell = true`, one element holding the command
 /// string, the same convention [`LauncherConfig`] already uses), `env` is merged over
-/// the guaranteed environment contract rather than replacing it. Turning this into
-/// something the core can run (resolving `shell = true`, merging `env` with the
-/// environment contract) is a later ticket's crossing, the same way
-/// [`crate::launcher::resolve`] is for a Launcher; this struct only proves the shape.
+/// the guaranteed environment contract rather than replacing it.
+/// [`crate::action_palette::to_action_spec`] turns this into a [`repon_core::Step`];
+/// `shell` and `env` cross over unresolved, the same way a Launcher's own `shell` and
+/// `env` do in [`crate::launcher`].
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // parsed in full; read once a later ticket resolves this into repon_core::Step
 pub struct StepConfig {
     pub args: Vec<String>,
     #[serde(default)]
@@ -171,10 +171,9 @@ fn default_action_concurrency() -> u32 {
 /// field table: a unique `name`, an optional `description`, the required ordered `steps`,
 /// `confirm` defaulting on, and `concurrency` defaulting to four with no schema maximum
 /// (`concurrency` is a bare `u32`, so the only ceiling is the type's own, never a
-/// deliberate one this schema imposes). Turning this, plus its `steps`, into
-/// `repon_core::ActionSpec` and `repon_core::Step` is a later ticket's crossing.
+/// deliberate one this schema imposes). [`crate::action_palette::to_action_spec`] turns
+/// this, plus its `steps`, into `repon_core::ActionSpec` and `repon_core::Step`.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // parsed in full; read once a later ticket resolves this into repon_core::ActionSpec
 pub struct ActionConfig {
     pub name: toml::Spanned<String>,
     #[serde(default)]

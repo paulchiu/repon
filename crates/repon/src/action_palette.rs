@@ -1,0 +1,840 @@
+//! The Action palette: `;` opens it
+//! ([keybindings.md](../../../docs/spec/keybindings.md)'s `Action::OpenActionPalette`),
+//! listing this run's `[[action]]` entries by name and turning the chosen one into a
+//! [`repon_core::ActionSpec`] `App` hands to [`repon_core::Core::run_action`].
+//!
+//! [ADR 0008](../../../docs/adr/0008-two-palettes-not-one.md) keeps this palette and
+//! [`crate::launcher`]'s on separate keys because one acts on a single Repo and hands over
+//! the terminal while the other acts on N Repos unattended and can do damage; merging them
+//! back into one would reopen the exact failure the split exists to prevent, "open a shell
+//! here" sliding into "run this across 99 repos". That is also why [`matching`] below has no
+//! counterpart shared with [`crate::launcher`]: each palette searches only its own list, by
+//! construction of its own function's parameter type, so a query typed into one has no path
+//! to an entry the other owns.
+//!
+//! The ad hoc typed-command field this palette will grow (issue #70, blocked by this one)
+//! does not exist yet: today the palette only ever lists named, configured Actions.
+
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Block};
+
+use repon_core::{ActionSpec, Step};
+
+use crate::{
+    config::document::{ActionConfig, StepConfig},
+    theme::{Meaning, Role, Theme},
+};
+
+/// Case-insensitive substring match against a `[[action]]` entry's own name, never its
+/// description: matching on the description would let a query naming an unrelated Action's
+/// stray word highlight the wrong entry, one keystroke short of the slip
+/// [0008](../../../docs/adr/0008-two-palettes-not-one.md) exists to prevent. An empty query
+/// matches every entry, which is what an just-opened palette shows before anything is typed.
+///
+/// This crate's Filter deliberately refuses fuzzy matching
+/// ([filter.md](../../../docs/spec/filter.md): "There is no ranking and no fuzzy matching")
+/// because a list that cannot reorder cannot show why a row matched; the same reasoning
+/// applies here; a palette list never reorders either, so this stays a plain substring test
+/// rather than a scored fuzzy one.
+pub(crate) fn matching<'a>(actions: &'a [ActionConfig], query: &str) -> Vec<&'a ActionConfig> {
+    let query = query.to_lowercase();
+    actions
+        .iter()
+        .filter(|action| action.name.get_ref().to_lowercase().contains(&query))
+        .collect()
+}
+
+/// `steps`, in file order, turned into what [`repon_core::Core::run_action`] runs. `shell`
+/// and `env` cross over unresolved: resolving `shell` into `$SHELL -c` is
+/// `executor::run_step`'s own job, per [`repon_core::Step`]'s own doc comment, and `env` is
+/// merged over the environment contract's guaranteed pairs there too.
+fn to_steps(steps: &[StepConfig]) -> Vec<Step> {
+    steps
+        .iter()
+        .map(|step| Step {
+            argv: step.args.clone(),
+            shell: step.shell,
+            env: step
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        })
+        .collect()
+}
+
+/// `config` turned into the plain data [`repon_core::Core::run_action`] receives. `name` is
+/// always `Some`: only an ad hoc run (issue #70, not built yet) ever leaves it unset, per
+/// [config.md](../../../docs/spec/config.md)'s "Actions" and the environment contract's
+/// `REPON_ACTION`.
+pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
+    let name: std::sync::Arc<str> = std::sync::Arc::from(config.name.get_ref().as_str());
+    ActionSpec {
+        label: std::sync::Arc::clone(&name),
+        name: Some(name),
+        steps: to_steps(&config.steps),
+        concurrency: config.concurrency,
+    }
+}
+
+/// Where the palette's own focus sits.
+/// [keybindings.md](../../../docs/spec/keybindings.md)'s `confirm` context is "The yes/no
+/// gate before an Action fans out", live only once an entry is chosen. `Confirming` carries
+/// the chosen entry by value rather than an index into the matched list, since a config
+/// reload can change that list's shape while the gate is open.
+#[derive(Debug, Clone)]
+pub(crate) enum Stage {
+    Choosing,
+    Confirming(ActionConfig),
+}
+
+/// What choosing the highlighted entry resolves to, for `App` to act on: this module only
+/// classifies, `App` is what actually calls `Core::run_action` or leaves the palette in its
+/// new `Stage`.
+#[derive(Debug, Clone)]
+pub(crate) enum Decision {
+    /// [actions.md](../../../docs/spec/actions.md): "A count of zero does not run and says
+    /// so, rather than fanning out over nothing." Carries the message
+    /// [`ActionPalette::refusal`] now shows.
+    Refused,
+    /// `confirm = false` on the chosen entry: [config.md](../../../docs/spec/config.md)'s
+    /// `confirm` field, "Ask before fanning out", already resolved as declined.
+    RunImmediately(ActionSpec),
+    /// `confirm = true` (the default): the palette has already moved itself to
+    /// `Stage::Confirming`; [`ActionPalette::confirm_run`] is what turns that into an
+    /// `ActionSpec` once `y` answers it.
+    NeedsConfirm,
+}
+
+/// The Action palette's own state: the typed query narrowing `Document::actions`, which of
+/// the (possibly narrowed) matches is highlighted, which [`Stage`] it is in, and a refusal
+/// message from the last time Enter found zero operable rows.
+#[derive(Debug, Clone)]
+pub(crate) struct ActionPalette {
+    query: String,
+    cursor: usize,
+    stage: Stage,
+    refusal: Option<String>,
+}
+
+impl ActionPalette {
+    pub(crate) fn new() -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            stage: Stage::Choosing,
+            refusal: None,
+        }
+    }
+
+    pub(crate) fn stage(&self) -> &Stage {
+        &self.stage
+    }
+
+    /// Not read outside tests until something other than [`Self::draw`] itself needs the
+    /// last refusal message; `App` never reaches this today, since the palette owns its own
+    /// drawing.
+    #[cfg(test)]
+    pub(crate) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    /// `actions` narrowed by the typed query, in `actions`' own order: never reordered, per
+    /// this module's own doc comment on why matching stays a plain substring test.
+    pub(crate) fn matches<'a>(&self, actions: &'a [ActionConfig]) -> Vec<&'a ActionConfig> {
+        matching(actions, &self.query)
+    }
+
+    /// The row the cursor currently sits on among `actions` narrowed by the query, if any
+    /// match at all.
+    pub(crate) fn highlighted<'a>(&self, actions: &'a [ActionConfig]) -> Option<&'a ActionConfig> {
+        self.matches(actions).into_iter().nth(self.cursor)
+    }
+
+    /// Clamps `self.cursor` back inside `actions`' current match count, called after every
+    /// edit to the query: typing can shrink the match list out from under a cursor sitting
+    /// past its new end.
+    fn clamp_cursor(&mut self, actions: &[ActionConfig]) {
+        let len = self.matches(actions).len();
+        self.cursor = if len == 0 {
+            0
+        } else {
+            self.cursor.min(len - 1)
+        };
+    }
+
+    pub(crate) fn type_char(&mut self, c: char, actions: &[ActionConfig]) {
+        self.query.push(c);
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
+    /// `Ctrl+W`: deletes one trailing whitespace-delimited word, the same shape
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
+    /// text field this table feeds.
+    pub(crate) fn delete_previous_word(&mut self, actions: &[ActionConfig]) {
+        let trimmed = self.query.trim_end();
+        let cut = trimmed
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.query.truncate(cut);
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
+    pub(crate) fn clear_line(&mut self, actions: &[ActionConfig]) {
+        self.query.clear();
+        self.refusal = None;
+        self.clamp_cursor(actions);
+    }
+
+    /// `Up`/`Down` (`PreviousEntry`/`NextEntry`): clamps rather than wraps, the same
+    /// convention `App::move_cursor` already uses for the list's own cursor.
+    pub(crate) fn move_highlight(&mut self, delta: isize, actions: &[ActionConfig]) {
+        let len = self.matches(actions).len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let moved = self.cursor as isize + delta;
+        self.cursor = moved.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// `Enter` (`Action::Apply`) on the highlighted entry, given `operable_count` (the
+    /// Selection's targets minus excluded rows, read from the identical computation
+    /// [`repon_core::Core::operable_count`] gives the confirm dialog). `None` with nothing
+    /// highlighted (an empty match list) leaves everything untouched.
+    pub(crate) fn choose(
+        &mut self,
+        actions: &[ActionConfig],
+        operable_count: usize,
+    ) -> Option<Decision> {
+        let entry = self.highlighted(actions)?.clone();
+        if operable_count == 0 {
+            self.refusal = Some(format!(
+                "\"{}\" targets 0 repos and was not run",
+                entry.name.get_ref()
+            ));
+            return Some(Decision::Refused);
+        }
+        self.refusal = None;
+        if entry.confirm {
+            self.stage = Stage::Confirming(entry);
+            Some(Decision::NeedsConfirm)
+        } else {
+            Some(Decision::RunImmediately(to_action_spec(&entry)))
+        }
+    }
+
+    /// `y` (`Action::Run`) in `Stage::Confirming`: the `ActionSpec` to run, or `None` if
+    /// called while still `Stage::Choosing` (never reached through `App`'s own dispatch,
+    /// which only calls this once `Context::Confirm` is live).
+    pub(crate) fn confirm_run(&self) -> Option<ActionSpec> {
+        match &self.stage {
+            Stage::Confirming(entry) => Some(to_action_spec(entry)),
+            Stage::Choosing => None,
+        }
+    }
+
+    /// `n` or Esc (`Action::Decline`): returns to `Stage::Choosing` with the query and
+    /// highlight untouched, rather than closing the palette outright.
+    pub(crate) fn decline(&mut self) {
+        self.stage = Stage::Choosing;
+    }
+
+    /// The border title theming.md fixes: "the Action palette ... puts the Selection count
+    /// in the border title, so it reads `run on 12 repos`" before anything is typed.
+    fn border_title(operable_count: usize) -> String {
+        format!(" run on {operable_count} repos ")
+    }
+
+    /// Takes the whole frame in place of everything else, the same priority
+    /// [`crate::help::HelpOverlay`] and the expanded warning list already claim (the
+    /// `App::render` method's own doc comment): [`Stage::Choosing`] lists the narrowed matches with the highlighted
+    /// row marked and any refusal message on its own last line; [`Stage::Confirming`] shows
+    /// [actions.md](../../../docs/spec/actions.md)'s own confirm sentence, `run "name" on N
+    /// repos?`.
+    pub(crate) fn draw(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        actions: &[ActionConfig],
+        operable_count: usize,
+    ) {
+        let block = Block::bordered()
+            .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
+            .title(Self::border_title(operable_count));
+        let interior = block.inner(area);
+        frame.render_widget(block, area);
+
+        match &self.stage {
+            Stage::Confirming(entry) => {
+                let line = format!(
+                    "run \"{}\" on {operable_count} repos?",
+                    entry.name.get_ref()
+                );
+                frame
+                    .buffer_mut()
+                    .set_string(interior.x, interior.y, &line, Style::new());
+                frame.buffer_mut().set_string(
+                    interior.x,
+                    interior.y + 1,
+                    "y run  n cancel",
+                    theme.style_for(Role::Dim),
+                );
+            }
+            Stage::Choosing => {
+                let matches = self.matches(actions);
+                for (row, entry) in matches.iter().enumerate().take(interior.height as usize) {
+                    let marker = if row == self.cursor { "> " } else { "  " };
+                    let description = entry.description.as_deref().unwrap_or("");
+                    let line = format!("{marker}{}  {description}", entry.name.get_ref());
+                    frame.buffer_mut().set_string(
+                        interior.x,
+                        interior.y + row as u16,
+                        &line,
+                        Style::new(),
+                    );
+                }
+                if let Some(refusal) = &self.refusal {
+                    let row = interior.y + interior.height.saturating_sub(1);
+                    frame.buffer_mut().set_string(
+                        interior.x,
+                        row,
+                        refusal,
+                        theme.style_for(Role::Danger),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action(name: &str, confirm: bool) -> ActionConfig {
+        ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![StepConfig {
+                args: vec!["true".to_string()],
+                shell: false,
+                env: Default::default(),
+            }],
+            confirm,
+            concurrency: 4,
+        }
+    }
+
+    // --- Criterion 1: no fuzzy-match path shared with the Launcher palette ---
+
+    /// The substance of criterion 1 is a negative claim: a query that would match an entry
+    /// in the *other* palette's own list must never match here, because this palette's
+    /// matching function never even sees that list. Constructed so the query really would
+    /// hit if the two were ever merged into one searchable list.
+    #[test]
+    fn a_query_naming_a_launcher_never_matches_any_action_palette_entry() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let launcher_only_name = "lazygit";
+
+        let matches = matching(&actions, launcher_only_name);
+
+        assert!(
+            matches.is_empty(),
+            "a Launcher's own name must not match anything in the Action palette's list, \
+             since the two palettes search two entirely separate lists"
+        );
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_substring_and_empty_query_matches_everything() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+
+        assert_eq!(
+            matching(&actions, "INSTALL")
+                .iter()
+                .map(|a| a.name.get_ref().as_str())
+                .collect::<Vec<_>>(),
+            vec!["reinstall"]
+        );
+        assert_eq!(matching(&actions, "").len(), 2);
+        assert!(matching(&actions, "nothing-named-this").is_empty());
+    }
+
+    // --- Criterion 3: the border title carries the Selection count ---
+
+    /// Pinned against [theming.md](../../../docs/spec/theming.md)'s own quoted example
+    /// rather than restated by hand: the doc's own sentence is `so it reads \`run on 12
+    /// repos\``, and this test reads that literal backtick-quoted phrase out of the file at
+    /// test time and asserts `border_title(12)` reproduces it exactly (trimmed of the
+    /// surrounding padding spaces this module's own title adds for the block border).
+    #[test]
+    fn border_title_matches_theming_mds_own_quoted_example_for_the_same_count() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let theming = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read docs/spec/theming.md");
+        let quoted = theming
+            .split("so it reads `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("theming.md still carries the quoted `run on 12 repos` example");
+
+        assert_eq!(ActionPalette::border_title(12).trim(), quoted);
+    }
+
+    // --- Criterion 4: the count subtracts excluded rows and a zero refuses ---
+
+    #[test]
+    fn choosing_an_entry_with_a_nonzero_operable_count_and_confirm_true_needs_confirmation() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+
+        let decision = palette.choose(&actions, 3);
+
+        assert!(matches!(decision, Some(Decision::NeedsConfirm)));
+        assert!(
+            matches!(palette.stage(), Stage::Confirming(entry) if entry.name.get_ref() == "reinstall")
+        );
+    }
+
+    #[test]
+    fn choosing_an_entry_with_confirm_false_runs_immediately_without_entering_the_confirm_stage() {
+        let actions = vec![action("fetch", false)];
+        let mut palette = ActionPalette::new();
+
+        let decision = palette.choose(&actions, 3);
+
+        assert!(matches!(decision, Some(Decision::RunImmediately(_))));
+        assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    /// The sharpest form of criterion 4: a count of zero refuses *even when* the chosen
+    /// entry has `confirm = false`, because the refusal is about there being nothing to
+    /// run at all, not about the confirm gate.
+    #[test]
+    fn a_zero_operable_count_refuses_regardless_of_the_entrys_own_confirm_flag() {
+        for confirm in [true, false] {
+            let actions = vec![action("reinstall", confirm)];
+            let mut palette = ActionPalette::new();
+
+            let decision = palette.choose(&actions, 0);
+
+            assert!(
+                matches!(decision, Some(Decision::Refused)),
+                "confirm={confirm} must not change a zero count's refusal"
+            );
+            assert!(matches!(palette.stage(), Stage::Choosing));
+            // The criterion is that it refuses *and says so*, so the message has to name
+            // the Action and the count. Asserting only that some message exists would pass
+            // with an empty one.
+            let refusal = palette.refusal().expect("a refusal message");
+            assert!(
+                refusal.contains("reinstall"),
+                "the refusal must name the Action the user chose, got {refusal:?}"
+            );
+            assert!(
+                refusal.contains('0'),
+                "the refusal must say how many repos it would have run against, got \
+                 {refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_with_no_match_at_all_returns_none_and_leaves_the_palette_untouched() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char('z', &actions);
+        palette.type_char('z', &actions);
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(decision.is_none());
+        assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    #[test]
+    fn confirm_run_reads_back_the_exact_entry_choose_moved_into_the_confirming_stage() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.choose(&actions, 7);
+
+        let spec = palette.confirm_run().expect("a chosen entry to confirm");
+
+        assert_eq!(&*spec.label, "reinstall");
+        assert_eq!(spec.name.as_deref(), Some("reinstall"));
+    }
+
+    #[test]
+    fn decline_returns_to_choosing_without_losing_the_typed_query() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char('r', &actions);
+        palette.choose(&actions, 7);
+        assert!(matches!(palette.stage(), Stage::Confirming(_)));
+
+        palette.decline();
+
+        assert!(matches!(palette.stage(), Stage::Choosing));
+        assert_eq!(
+            palette.matches(&actions).len(),
+            1,
+            "the query survives decline"
+        );
+    }
+
+    // --- Query editing ---
+
+    #[test]
+    fn delete_previous_word_removes_one_trailing_whitespace_delimited_word() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "re install".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.delete_previous_word(&actions);
+
+        assert_eq!(
+            palette.matches(&actions).len(),
+            0,
+            "query is now just \"re \""
+        );
+    }
+
+    #[test]
+    fn clear_line_empties_the_query_and_restores_every_match() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char('r', &actions);
+        assert_eq!(palette.matches(&actions).len(), 1);
+
+        palette.clear_line(&actions);
+
+        assert_eq!(palette.matches(&actions).len(), 2);
+    }
+
+    #[test]
+    fn move_highlight_clamps_at_both_ends_rather_than_wrapping() {
+        let actions = vec![action("a", true), action("b", true)];
+        let mut palette = ActionPalette::new();
+
+        palette.move_highlight(-1, &actions);
+        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "a");
+
+        palette.move_highlight(1, &actions);
+        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "b");
+
+        palette.move_highlight(1, &actions);
+        assert_eq!(
+            palette.highlighted(&actions).unwrap().name.get_ref(),
+            "b",
+            "moving past the last entry must clamp, not wrap back to the first"
+        );
+    }
+
+    #[test]
+    fn typing_a_character_that_narrows_the_match_list_clamps_a_cursor_sitting_past_the_new_end() {
+        let actions = vec![action("aa", true), action("ab", true), action("cc", true)];
+        let mut palette = ActionPalette::new();
+        palette.move_highlight(1, &actions); // cursor -> 1 ("ab"), among all three
+
+        palette.type_char('a', &actions); // narrows to ["aa", "ab"]; cursor 1 still valid
+        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "ab");
+
+        palette.type_char('b', &actions); // narrows to ["ab"] alone; cursor must clamp to 0
+        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "ab");
+    }
+
+    // --- to_action_spec / to_steps ---
+
+    #[test]
+    fn to_action_spec_carries_the_name_as_both_label_and_the_environments_action_name() {
+        let config = action("reinstall", true);
+
+        let spec = to_action_spec(&config);
+
+        assert_eq!(&*spec.label, "reinstall");
+        assert_eq!(spec.name.as_deref(), Some("reinstall"));
+        assert_eq!(spec.concurrency, 4);
+        assert_eq!(spec.steps.len(), 1);
+        assert_eq!(spec.steps[0].argv, vec!["true".to_string()]);
+        assert!(!spec.steps[0].shell);
+    }
+
+    #[test]
+    fn to_action_spec_carries_shell_and_env_through_unresolved() {
+        let mut config = action("deploy", true);
+        config.steps = vec![StepConfig {
+            args: vec!["deploy.sh --prod".to_string()],
+            shell: true,
+            env: std::collections::BTreeMap::from([("STAGE".to_string(), "prod".to_string())]),
+        }];
+
+        let spec = to_action_spec(&config);
+
+        assert!(spec.steps[0].shell);
+        assert_eq!(
+            spec.steps[0].env,
+            vec![("STAGE".to_string(), "prod".to_string())]
+        );
+    }
+
+    // --- Criterion 3: the border renders in the warning role ---
+
+    /// theming.md: "the Action palette's border is `warn`". Read through the same
+    /// `Meaning::ActionPaletteBorder.role()` map [`theme::tests::every_meanings_role_matches_theming_mds_map_from_meaning_to_role_in_both_directions`](crate::theme::tests)
+    /// already pins against the spec; this proves the border a real `draw` call paints
+    /// actually carries that role's colour, not merely that the map says it should.
+    #[test]
+    fn draw_paints_the_border_in_the_themes_warn_colour() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let theme = Theme {
+            warn: ratatui::style::Color::Rgb(1, 2, 3),
+            ..Theme::default()
+        };
+        let actions = vec![action("reinstall", true)];
+        let palette = ActionPalette::new();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &theme, &actions, 3);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        // The border's own top-left corner: whatever glyph draws there, its colour must be
+        // the theme's `warn`, never the default border colour a plain `Block` would fall
+        // back to.
+        assert_eq!(buf[(0, 0)].fg, theme.warn);
+    }
+
+    #[test]
+    fn draw_in_stage_choosing_marks_the_highlighted_row_and_lists_every_match() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        palette.move_highlight(1, &actions);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &theme, &actions, 2);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let row_text =
+            |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert!(row_text(1).contains("reinstall"));
+        assert!(row_text(2).contains("deploy"));
+        assert!(
+            row_text(2).contains("> deploy"),
+            "the highlighted row (index 1, \"deploy\") must carry the highlight marker: {:?}",
+            row_text(2)
+        );
+        assert!(
+            !row_text(1).contains('>'),
+            "only the highlighted row carries the marker: {:?}",
+            row_text(1)
+        );
+    }
+
+    #[test]
+    fn draw_in_stage_confirming_shows_the_actions_md_confirm_sentence() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.choose(&actions, 12);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &theme, &actions, 12);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let row_text =
+            |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert!(
+            row_text(1).contains("run \"reinstall\" on 12 repos?"),
+            "expected actions.md's own confirm sentence, got: {:?}",
+            row_text(1)
+        );
+    }
+
+    // --- Criterion 2: the refusal to merge, and its reason, recorded beside the code ---
+
+    /// A future reader who sees `matching`'s own substring test next to
+    /// `crate::launcher`'s and thinks "this is duplication worth removing" needs the reason
+    /// not to merge them sitting right here, not only in ADR 0008. Scans this file's own
+    /// module doc comment (`production_source_at` cuts at the `#[cfg(test)]` module the same
+    /// way every other absence scan in this crate does) for both halves of the claim: that
+    /// the two are deliberately never merged, and the specific failure that merging would
+    /// reopen.
+    #[test]
+    fn the_refusal_to_merge_the_two_palettes_and_its_reason_are_recorded_in_this_module() {
+        let source = crate::test_support::production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/action_palette.rs"),
+        );
+        assert!(
+            source.contains("reopen the exact failure the split exists to prevent"),
+            "expected this module's own doc comment to record the refusal to merge"
+        );
+        assert!(
+            source.contains("run this across 99 repos"),
+            "expected this module's own doc comment to name the specific failure mode \
+             merging would reopen, not merely gesture at ADR 0008"
+        );
+    }
+
+    // --- Criterion 5: no tenth theme role; both palettes still read with colour stripped ---
+
+    /// The absence half: this ticket adds no `Role` variant.
+    /// [`crate::theme::tests::the_compiled_default_theme_matches_theming_mds_own_table_of_exactly_nine_roles`]
+    /// already pins the count against theming.md project-wide; restated here as the count
+    /// this module's own border role (`Meaning::ActionPaletteBorder`) draws from, so a
+    /// reviewer reading this file alone sees the claim rather than having to trust a link.
+    #[test]
+    fn the_action_palette_reuses_an_existing_role_rather_than_a_new_tenth_one() {
+        assert_eq!(
+            Role::ALL.len(),
+            9,
+            "the Action palette's border must be one of theming.md's existing nine roles"
+        );
+    }
+
+    /// The legibility half, the one [`docs/spec/theming.md`] and this ticket's brief both
+    /// call out as the substance: with every role collapsed to the identical colour (the
+    /// `NO_COLOR` case, where colour carries no information at all), the palette must still
+    /// be readable by something other than colour. The highlight marker (`>` vs two spaces)
+    /// and the title text carry that, not a border colour a monochrome screen cannot show.
+    #[test]
+    fn stripped_of_colour_the_highlighted_row_is_still_distinguishable_by_its_own_marker() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let monochrome = Theme {
+            text: ratatui::style::Color::White,
+            dim: ratatui::style::Color::White,
+            accent: ratatui::style::Color::White,
+            ok: ratatui::style::Color::White,
+            warn: ratatui::style::Color::White,
+            danger: ratatui::style::Color::White,
+            behind: ratatui::style::Color::White,
+            border: ratatui::style::Color::White,
+            border_focused: ratatui::style::Color::White,
+            selection_bg: None,
+            selection_fg: None,
+        };
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        palette.move_highlight(1, &actions);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &monochrome, &actions, 2);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let row_text =
+            |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert!(
+            row_text(2).contains("> deploy"),
+            "with every colour identical, the highlighted row must still read as \
+             highlighted from its text alone: {:?}",
+            row_text(2)
+        );
+        assert!(
+            !row_text(1).contains('>'),
+            "and the non-highlighted row must still read as not highlighted: {:?}",
+            row_text(1)
+        );
+        assert!(
+            buf.area.width > 0,
+            "sanity: the border itself still drew something even with every role identical"
+        );
+    }
+
+    // --- Criterion 6: the per-Repo defining-Action count is not shown, not faked, and is
+    // recorded as an open want rather than settled as never ---
+
+    /// [`CONTEXT.md`]'s Action entry once promised a palette count of how many selected
+    /// Repos "define" a given Action; ADR 0018 corrected it to promise only the Selection
+    /// count. Read at test time rather than restated, per this ticket's brief on pinning a
+    /// claim to the document of record.
+    #[test]
+    fn context_mds_action_glossary_entry_no_longer_promises_a_per_repo_defining_count() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let context = std::fs::read_to_string(manifest_dir.join("../../CONTEXT.md"))
+            .expect("read CONTEXT.md");
+        let entry = context
+            .split("**Action**:")
+            .nth(1)
+            .and_then(|rest| rest.split("**Action spec**:").next())
+            .expect("CONTEXT.md still carries an Action glossary entry");
+
+        assert!(
+            !entry.to_lowercase().contains("define"),
+            "CONTEXT.md's Action entry must not promise a per-Repo \"defines it\" count \
+             the `[[action]]` schema cannot compute, got: {entry:?}"
+        );
+    }
+
+    /// The dropped requirement must stay recorded as an open want, not silently disappear:
+    /// [`docs/spec/actions.md`] carries it under "Not built" as something that "stays open
+    /// rather than settled as never."
+    #[test]
+    fn actions_md_still_records_the_per_repo_defining_count_as_an_open_want() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let actions_md = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read docs/spec/actions.md");
+        assert!(
+            actions_md.contains("Per-Repo Action applicability"),
+            "expected actions.md to still name the dropped requirement"
+        );
+        assert!(
+            actions_md.contains("stays open rather than settled as never"),
+            "expected actions.md to still record it as an open want, not settled as never"
+        );
+    }
+
+    /// The code half of the same criterion: no per-Action, per-Repo "how many define it"
+    /// count is computed or faked anywhere in either crate. A scan, the honest form of an
+    /// absence claim, using this crate's own shared scan helper
+    /// ([`crate::test_support::production_lines_containing`]) so it covers `repon-core` too,
+    /// not only this crate's own palette code.
+    #[test]
+    fn no_per_repo_action_defining_count_is_computed_or_faked_anywhere_in_either_crate() {
+        for needle in [
+            "repos_defining",
+            "defining_repos",
+            "applicable_repos",
+            "defines_action",
+            "action_applicability",
+        ] {
+            let offending = crate::test_support::production_lines_containing(needle);
+            assert!(
+                offending.is_empty(),
+                "found `{needle}`; the per-Repo Action-defining count is a dropped \
+                 requirement (docs/spec/actions.md's \"Not built\"), never smuggled back in \
+                 as a palette annotation, at: {offending:?}"
+            );
+        }
+    }
+}
