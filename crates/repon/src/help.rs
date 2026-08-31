@@ -118,6 +118,22 @@ mod tests {
         assert!(lines.iter().any(|(_, description)| *description == "Run"));
     }
 
+    /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
+    /// the help overlay carries only Built bindings. `EnterFilter` ('/') is currently unbuilt
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet)); its own
+    /// description must never appear in Global's content.
+    #[test]
+    fn content_excludes_a_currently_unbuilt_binding() {
+        let lines = HelpOverlay::content(&default_table(), Context::Global);
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, description)| *description == "Enter a Filter"),
+            "expected EnterFilter, unbuilt today, to be absent from the help overlay, got: \
+             {lines:?}"
+        );
+    }
+
     #[test]
     fn content_len_matches_content_without_building_any_of_it() {
         let table = default_table();
@@ -136,7 +152,7 @@ mod tests {
         // reload change the overlay by handing it a new table, with no code change here.
         let mut context_table = toml::Table::new();
         context_table.insert(
-            "dismiss_vanished".to_string(),
+            "anchor_range".to_string(),
             toml::Value::String("x".to_string()),
         );
         let mut document_keys = toml::Table::new();
@@ -146,12 +162,12 @@ mod tests {
 
         let rows = HelpOverlay::content(&rebound, Context::List);
         assert!(
-            rows.iter()
-                .any(|(keys, description)| keys == "x" && *description == "Dismiss a Vanished row"),
+            rows.iter().any(|(keys, description)| keys == "x"
+                && *description == "Anchor a range at the cursor, extended with `j` and `k`"),
             "expected the rebound key to appear in the overlay's own content, got: {rows:?}"
         );
         assert!(
-            !rows.iter().any(|(keys, _)| keys == "d"),
+            !rows.iter().any(|(keys, _)| keys == "v"),
             "the old default key must not still appear once it has been rebound, got: {rows:?}"
         );
     }

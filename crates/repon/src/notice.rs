@@ -2,11 +2,11 @@
 //! one-line message on the status row, the answer to a keystroke whose visible effect would
 //! otherwise say nothing about what changed.
 //!
-//! Only rendering lives here. The rest of what
-//! [0023](../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
-//! asks of a Notice, being cleared by its timeout or the next keypress, the `notice_timeout`
-//! config key, and the status row's full ordering ahead of a warning and the header, is
-//! issue #119's own scope and is not built yet.
+//! Only rendering lives here. Being cleared by its timeout, a replacement or the next
+//! keypress, the `notice_timeout` config key, and the status row's full ordering ahead of a
+//! warning and the header, all live in `crate::app::App`: its `notice_set_at` field and
+//! `notice()`'s own timeout read, `set_notice`, and `render`'s own match on `notice()` ahead
+//! of [`crate::warnings::draw_slot`].
 
 use ratatui::{Frame, layout::Rect};
 

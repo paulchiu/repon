@@ -196,6 +196,12 @@ pub struct Document {
     pub glyphs: Glyphs,
     pub show_worktrees: bool,
     pub show_submodules: bool,
+    /// How long a Notice ([theming.md](../../../../docs/spec/theming.md)'s "Warnings and
+    /// Notices") stays on the status row before its own timeout clears it. `"0s"` turns the
+    /// timer off rather than turning Notices off, leaving the next keypress or a replacement
+    /// as the only ways to clear one.
+    #[serde(with = "humantime_serde")]
+    pub notice_timeout: Duration,
     pub refresh: RefreshConfig,
     pub fetch: FetchConfig,
     pub auto_update: AutoUpdateConfig,
@@ -222,6 +228,7 @@ impl Default for Document {
             glyphs: Glyphs::default(),
             show_worktrees: true,
             show_submodules: false,
+            notice_timeout: Duration::from_secs(3),
             refresh: RefreshConfig::default(),
             fetch: FetchConfig::default(),
             auto_update: AutoUpdateConfig::default(),
@@ -588,7 +595,7 @@ mod tests {
             .to_string()
     }
 
-    // The four bare top-level keys parse with their exact stated defaults.
+    // The five bare top-level keys parse with their exact stated defaults.
     #[test]
     fn an_empty_file_carries_the_stated_top_level_defaults() {
         let loaded = parse_ok("");
@@ -596,6 +603,28 @@ mod tests {
         assert_eq!(loaded.document.glyphs, Glyphs::Full);
         assert!(loaded.document.show_worktrees);
         assert!(!loaded.document.show_submodules);
+        assert_eq!(loaded.document.notice_timeout, Duration::from_secs(3));
+    }
+
+    /// `"0s"` turns the Notice timer off, per this field's own doc comment and
+    /// [theming.md](../../../../docs/spec/theming.md); it is a humantime string like every
+    /// other duration in this schema, never a bare integer.
+    #[test]
+    fn notice_timeout_parses_as_humantime_and_zero_seconds_is_a_valid_value() {
+        let loaded = parse_ok("notice_timeout = \"10s\"\n");
+        assert_eq!(loaded.document.notice_timeout, Duration::from_secs(10));
+
+        let loaded = parse_ok("notice_timeout = \"0s\"\n");
+        assert_eq!(loaded.document.notice_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_bare_integer_notice_timeout_is_a_bad_value() {
+        let message = parse_err("notice_timeout = 3\n");
+        assert!(
+            message.contains("duration"),
+            "expected a duration type error, got: {message}"
+        );
     }
 
     // Every duration is a humantime string; the disabled poll is "0s", not a bare integer.
@@ -1083,11 +1112,11 @@ mod tests {
             ),
             None
         );
-        // "unbind it entirely": dismiss_vanished no longer fires on `d`.
+        // "unbind it entirely": anchor_range no longer fires on `v`.
         assert_eq!(
             bindings.dispatch(
                 crate::keys::Context::List,
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)
             ),
             None
         );

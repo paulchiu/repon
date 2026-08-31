@@ -526,11 +526,16 @@ const _: () = {
 /// Consults `bindings` alone: [`PERMANENTLY_UNBINDABLE`] is refused for every row of
 /// [`BINDINGS`] at build time (see the `const _` assertion above), but a user-merged table is
 /// built at runtime and gets no such guarantee for free; [`merge`] is what refuses it there.
+///
+/// Skips a row whose `built` flag is false: an unbuilt binding was never offered
+/// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)),
+/// so its chord dispatches nothing, the same as if no row claimed it at all. This is the one
+/// place that rule is enforced; every caller of [`BindingTable::dispatch`] gets it for free.
 fn lookup(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Action> {
     bindings
         .iter()
-        .find(|(row_context, code, modifiers, _, _)| {
-            *row_context == context && *code == key.code && *modifiers == key.modifiers
+        .find(|(row_context, code, modifiers, _, built)| {
+            *row_context == context && *code == key.code && *modifiers == key.modifiers && *built
         })
         .map(|(_, _, _, action, _)| *action)
 }
@@ -628,12 +633,31 @@ impl BindingTable {
             .map(|(_, code, modifiers, _, _)| (*code, *modifiers))
     }
 
+    /// Whether `action` is Built in `context`
+    /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// static property): `false` both for a row marked unbuilt and for no row at all, since
+    /// either way nothing should advertise it. The footer's own item construction reads
+    /// this to decide whether a hint belongs in the finished ladder it derives from.
+    pub(crate) fn is_built(&self, context: Context, action: Action) -> bool {
+        self.0
+            .iter()
+            .find(|(row_context, _, _, row_action, _)| {
+                *row_context == context && *row_action == action
+            })
+            .is_some_and(|(_, _, _, _, built)| *built)
+    }
+
     /// Every distinct action live in `context`, as `(keys, description)`, current context
     /// first then `global` where it is live alongside it
     /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)). A row bound to
     /// more than one key (`` `j`, `Down` ``) collapses to one entry, its keys joined with `, `
     /// in table order, because the help overlay shows one line per action, not per key. The
     /// help overlay's only source of content: nothing here is transcribed.
+    ///
+    /// Carries only Built bindings
+    /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
+    /// an unbuilt row is skipped here the same way [`lookup`] skips it for dispatch, so the
+    /// help overlay, this method's only reader, never advertises a key that does nothing.
     pub(crate) fn describe(&self, context: Context) -> Vec<(String, &'static str)> {
         let mut contexts = vec![context];
         if matches!(context, Context::List | Context::Detail) {
@@ -644,8 +668,8 @@ impl BindingTable {
         let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
             std::collections::HashMap::new();
         for ctx in contexts {
-            for &(row_context, code, modifiers, action, _) in &self.0 {
-                if row_context != ctx {
+            for &(row_context, code, modifiers, action, built) in &self.0 {
+                if row_context != ctx || !built {
                     continue;
                 }
                 let desc = description(action);
@@ -837,6 +861,12 @@ pub(crate) enum KeysWarning {
     UnknownContext(String),
     /// A key inside a known `[keys.<context>]` table that names no action of that context's.
     UnknownAction { context: String, action: String },
+    /// A known action, named in this crate's own enum, that is not Built yet
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#configuration)'s "A known
+    /// action that is not Built"): the name is not a typo, so this warns "not built yet"
+    /// rather than reusing [`Self::UnknownAction`]'s "unknown" wording, and the binding is
+    /// ignored.
+    NotBuilt { context: String, action: String },
 }
 
 impl std::fmt::Display for KeysWarning {
@@ -848,6 +878,10 @@ impl std::fmt::Display for KeysWarning {
             KeysWarning::UnknownAction { context, action } => write!(
                 f,
                 "unknown config key `keys.{context}.{action}`: no such action in that context"
+            ),
+            KeysWarning::NotBuilt { context, action } => write!(
+                f,
+                "config key `keys.{context}.{action}` names an action that is not built yet"
             ),
         }
     }
@@ -982,6 +1016,16 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
                 });
                 continue;
             };
+            if !built {
+                // ADR 0023: an unbuilt action is not a typo (the name is real, in this
+                // crate's own enum and in the spec), so the binding is ignored rather than
+                // applied, and the message says not built yet rather than unknown.
+                warnings.push(KeysWarning::NotBuilt {
+                    context: context_name_text.clone(),
+                    action: action_name_text.clone(),
+                });
+                continue;
+            }
             let Some(key_text) = key_value.as_str() else {
                 return Err(eyre!(
                     "keys.{context_name_text}.{action_name_text} must be a string"
@@ -1858,6 +1902,50 @@ mod tests {
         }
     }
 
+    // --- issue #119: an unbuilt binding dispatches nothing and advertises nowhere ---
+
+    /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
+    /// an unbuilt binding "does not dispatch". Every row `unbuilt_bindings` names, pressed at
+    /// its own context, must come back `None`, the same as if the chord claimed no row at
+    /// all; a `List` or `Detail` row must also not fall through to `Global`, since none of
+    /// today's unbuilt chords are bound there either.
+    #[test]
+    fn dispatch_never_fires_a_chord_bound_only_to_an_unbuilt_binding() {
+        let unbuilt = unbuilt_bindings();
+        assert!(
+            !unbuilt.is_empty(),
+            "no unbuilt binding left to prove dispatch filters one out; revisit this test \
+             once keybindings.md's \"Not built yet\" list is empty"
+        );
+        let table = BindingTable::compiled_default();
+        for (context, code, modifiers, action) in unbuilt {
+            assert_eq!(
+                table.dispatch(context, press(code, modifiers)),
+                None,
+                "{action:?} is unbuilt in {context:?}, but its chord still dispatched"
+            );
+        }
+    }
+
+    /// [`BindingTable::describe`] is the help overlay's only source of content; an unbuilt
+    /// action must never appear in it, in any context that binds it.
+    #[test]
+    fn describe_excludes_every_currently_unbuilt_binding() {
+        let unbuilt = unbuilt_bindings();
+        assert!(
+            !unbuilt.is_empty(),
+            "no unbuilt binding left to prove describe() filters one out; revisit this test \
+             once keybindings.md's \"Not built yet\" list is empty"
+        );
+        for (context, _, _, action) in unbuilt {
+            let rows = describe(context);
+            assert!(
+                !rows.iter().any(|(_, desc)| *desc == description(action)),
+                "{action:?} is unbuilt in {context:?} but still appears in describe(): {rows:?}"
+            );
+        }
+    }
+
     // =====================================================================================
     // User-configurable rebinding: `merge`, `BindingTable`, `parse_chord`, collisions.
     // =====================================================================================
@@ -1960,28 +2048,28 @@ mod tests {
     /// The mutation this guards: a merge keyed on the *key* being assigned, rather than the
     /// action being rebound, would look for an existing row already holding the new key to
     /// evict and find none (since "x" starts out unbound), so it would only ever add a row
-    /// and never remove `dismiss_vanished`'s old one. The old key would then still fire the
+    /// and never remove `anchor_range`'s old one. The old key would then still fire the
     /// action it used to.
     #[test]
     fn rebinding_an_action_removes_its_old_key_rather_than_only_adding_the_new_one() {
-        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "x")])]);
+        let (bindings, warnings) = merge_ok(&[("list", &[("anchor_range", "x")])]);
         assert!(warnings.is_empty(), "got: {warnings:?}");
 
         assert_eq!(
             bindings.dispatch(Context::List, press(KeyCode::Char('x'), NONE)),
-            Some(Action::DismissVanished),
+            Some(Action::AnchorRange),
             "the new key must fire the rebound action"
         );
         assert_eq!(
-            bindings.dispatch(Context::List, press(KeyCode::Char('d'), NONE)),
+            bindings.dispatch(Context::List, press(KeyCode::Char('v'), NONE)),
             None,
-            "the old default key must no longer fire anything, not still fire DismissVanished"
+            "the old default key must no longer fire anything, not still fire AnchorRange"
         );
     }
 
     #[test]
     fn rebinding_one_action_leaves_every_other_binding_in_the_same_context_intact() {
-        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "x")])]);
+        let (bindings, warnings) = merge_ok(&[("list", &[("anchor_range", "x")])]);
         assert!(warnings.is_empty(), "got: {warnings:?}");
 
         // Untouched List bindings still dispatch exactly as the compiled default does.
@@ -1990,12 +2078,12 @@ mod tests {
             Some(Action::MoveDown)
         );
         assert_eq!(
-            bindings.dispatch(Context::List, press(KeyCode::Char('n'), NONE)),
-            Some(Action::NextFailed)
+            bindings.dispatch(Context::List, press(KeyCode::Char('g'), NONE)),
+            Some(Action::FirstRow)
         );
         assert_eq!(
-            bindings.dispatch(Context::List, press(KeyCode::Char('N'), SHIFT)),
-            Some(Action::PreviousFailed)
+            bindings.dispatch(Context::List, press(KeyCode::Char('G'), SHIFT)),
+            Some(Action::LastRow)
         );
         // A different context's bindings are untouched too.
         assert_eq!(
@@ -2011,7 +2099,7 @@ mod tests {
         // accidentally cross-wire contexts either.
         let (bindings, warnings) = merge_ok(&[
             ("global", &[("refresh_all", "f5")]),
-            ("list", &[("dismiss_vanished", "x")]),
+            ("list", &[("anchor_range", "x")]),
         ]);
         assert!(warnings.is_empty(), "got: {warnings:?}");
         assert_eq!(
@@ -2025,7 +2113,7 @@ mod tests {
         );
         assert_eq!(
             bindings.dispatch(Context::List, press(KeyCode::Char('x'), NONE)),
-            Some(Action::DismissVanished)
+            Some(Action::AnchorRange)
         );
         assert_eq!(
             bindings.dispatch(Context::Global, press(KeyCode::Char('R'), SHIFT)),
@@ -2036,10 +2124,10 @@ mod tests {
 
     #[test]
     fn binding_an_action_to_the_empty_string_unbinds_it() {
-        let (bindings, warnings) = merge_ok(&[("list", &[("dismiss_vanished", "")])]);
+        let (bindings, warnings) = merge_ok(&[("list", &[("anchor_range", "")])]);
         assert!(warnings.is_empty(), "got: {warnings:?}");
         assert_eq!(
-            bindings.dispatch(Context::List, press(KeyCode::Char('d'), NONE)),
+            bindings.dispatch(Context::List, press(KeyCode::Char('v'), NONE)),
             None
         );
     }
@@ -2048,9 +2136,9 @@ mod tests {
     fn unbinding_an_action_leaves_its_former_key_bound_to_nothing_rather_than_falling_back_to_the_default()
      {
         // A build that "unbinds" by merely skipping the override (leaving the compiled row in
-        // place) would still dispatch DismissVanished here; the correct behaviour removes the
+        // place) would still dispatch AnchorRange here; the correct behaviour removes the
         // row outright.
-        let (bindings, _) = merge_ok(&[("list", &[("dismiss_vanished", "")])]);
+        let (bindings, _) = merge_ok(&[("list", &[("anchor_range", "")])]);
         for context in [
             Context::Global,
             Context::List,
@@ -2059,7 +2147,7 @@ mod tests {
             Context::Confirm,
         ] {
             assert_eq!(
-                bindings.dispatch(context, press(KeyCode::Char('d'), NONE)),
+                bindings.dispatch(context, press(KeyCode::Char('v'), NONE)),
                 None,
                 "{context:?} must not resurrect the unbound key via any fallback"
             );
@@ -2071,7 +2159,7 @@ mod tests {
 
     #[test]
     fn an_unknown_context_warns_naming_its_dotted_path_and_continues() {
-        let (_, warnings) = merge_ok(&[("frobnicate", &[("dismiss_vanished", "x")])]);
+        let (_, warnings) = merge_ok(&[("frobnicate", &[("anchor_range", "x")])]);
         assert_eq!(
             warnings,
             vec![KeysWarning::UnknownContext("keys.frobnicate".to_string())]
@@ -2096,11 +2184,46 @@ mod tests {
         );
     }
 
+    /// A known action that is not Built yet: warns naming the dotted path, says "not built
+    /// yet" rather than "unknown" (the name is real, in this crate's own enum), and the
+    /// binding is ignored outright, leaving the action's reserved chord exactly as
+    /// unreachable as it was before this entry was ever read.
+    #[test]
+    fn a_known_action_that_is_not_built_yet_warns_saying_so_rather_than_unknown_and_is_ignored() {
+        let (bindings, warnings) = merge_ok(&[("global", &[("enter_filter", "f5")])]);
+        assert_eq!(
+            warnings,
+            vec![KeysWarning::NotBuilt {
+                context: "global".to_string(),
+                action: "enter_filter".to_string(),
+            }]
+        );
+        let message = warnings[0].to_string();
+        assert!(
+            message.contains("not built yet"),
+            "expected \"not built yet\" wording, got: {message:?}"
+        );
+        assert!(
+            !message.contains("unknown"),
+            "must not read as an unknown action, got: {message:?}"
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::F(5), NONE)),
+            None,
+            "the ignored binding must never dispatch"
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('/'), NONE)),
+            None,
+            "the action's own reserved chord must stay unbuilt, not become reachable"
+        );
+    }
+
     #[test]
     fn an_unparseable_key_name_is_a_hard_error_rather_than_a_warning() {
         let result = merge(&keys_block(&[(
             "list",
-            &[("dismiss_vanished", "not-a-real-chord")],
+            &[("anchor_range", "not-a-real-chord")],
         )]));
         let message = result
             .expect_err("an unparseable key name must be a hard error")
@@ -2113,7 +2236,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_rebind_raises_no_warning_and_does_not_error() {
-        let result = merge(&keys_block(&[("list", &[("dismiss_vanished", "x")])]));
+        let result = merge(&keys_block(&[("list", &[("anchor_range", "x")])]));
         let (_, warnings) = result.expect("a well-formed rebind must not error");
         assert!(
             warnings.is_empty(),
@@ -2134,7 +2257,7 @@ mod tests {
     #[test]
     fn an_action_value_that_is_not_a_string_is_a_hard_error() {
         let mut context_table = toml::Table::new();
-        context_table.insert("dismiss_vanished".to_string(), toml::Value::Integer(5));
+        context_table.insert("anchor_range".to_string(), toml::Value::Integer(5));
         let mut document_keys = toml::Table::new();
         document_keys.insert("list".to_string(), toml::Value::Table(context_table));
         assert!(merge(&document_keys).is_err());
@@ -2338,24 +2461,24 @@ mod tests {
         let message = merge(&keys_block(&[(
             "list",
             &[
-                ("dismiss_vanished", "z"),
-                ("next_failed", "z"),
-                ("previous_failed", "z"),
+                ("anchor_range", "z"),
+                ("toggle_selection", "z"),
+                ("select_all_visible", "z"),
             ],
         )]))
         .expect_err("expected a collision error")
         .to_string();
         assert!(
-            message.contains("dismiss_vanished"),
-            "expected DismissVanished named, got: {message}"
+            message.contains("anchor_range"),
+            "expected AnchorRange named, got: {message}"
         );
         assert!(
-            message.contains("next_failed"),
-            "expected NextFailed named, got: {message}"
+            message.contains("toggle_selection"),
+            "expected ToggleSelection named, got: {message}"
         );
         assert!(
-            message.contains("previous_failed"),
-            "expected PreviousFailed named, got: {message}"
+            message.contains("select_all_visible"),
+            "expected SelectAllVisible named, got: {message}"
         );
     }
 
@@ -2365,8 +2488,8 @@ mod tests {
         let message = merge(&keys_block(&[(
             "list",
             &[
-                ("dismiss_vanished", "z"),
-                ("next_failed", "z"),
+                ("anchor_range", "z"),
+                ("toggle_selection", "z"),
                 ("select_all_visible", "y"),
                 ("clear_selection", "y"),
             ],
@@ -2376,7 +2499,7 @@ mod tests {
         assert!(message.contains('z'), "expected `z` named, got: {message}");
         assert!(message.contains('y'), "expected `y` named, got: {message}");
         assert!(
-            message.contains("dismiss_vanished") && message.contains("next_failed"),
+            message.contains("anchor_range") && message.contains("toggle_selection"),
             "expected both of z's colliding actions named, got: {message}"
         );
         assert!(
@@ -2391,12 +2514,12 @@ mod tests {
         // because both entries in this file land on the same key.
         let message = merge(&keys_block(&[(
             "list",
-            &[("dismiss_vanished", "z"), ("next_failed", "z")],
+            &[("anchor_range", "z"), ("toggle_selection", "z")],
         )]))
         .expect_err("expected a collision error")
         .to_string();
-        assert!(message.contains("dismiss_vanished"));
-        assert!(message.contains("next_failed"));
+        assert!(message.contains("anchor_range"));
+        assert!(message.contains("toggle_selection"));
     }
 
     // --- the debug-build check over the bare compiled default ---

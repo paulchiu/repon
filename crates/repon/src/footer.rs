@@ -44,85 +44,105 @@ impl fmt::Display for Hint {
 struct Item {
     hint: Hint,
     priority: Priority,
+    /// Whether the action(s) `hint` names are Built
+    /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
+    /// [`footer_line`] drops every item with `built: false` before the width budget ever
+    /// runs: an unbuilt action was never offered, at any width. `list_items` and
+    /// `detail_items` still carry it as an `Item` regardless, since the documented
+    /// degradation table describes the finished keyboard and the algorithm proof reads
+    /// against that full ladder; only the actual render path filters on this field.
+    built: bool,
 }
 
 /// One item's chord, read from `table` rather than typed here, paired with its short label.
-/// Panics naming the gap if `action` is not actually bound in `context`, since that is a
-/// wiring bug in this module, not a state the footer should render around.
-fn hint(table: &BindingTable, context: Context, action: Action, label: &str) -> Hint {
+/// Panics naming the gap if `action` is not bound at all in `context`, since that is a wiring
+/// bug in this module; an action bound but unbuilt is not a panic; `built` on the returned
+/// [`Item`] carries that instead, and [`footer_line`] is what acts on it.
+fn hint_item(table: &BindingTable, context: Context, action: Action, label: &str) -> (Hint, bool) {
     let (code, modifiers) = table.primary_chord(context, action).unwrap_or_else(|| {
         panic!("{action:?} is not bound in {context:?}, but the footer names it")
     });
-    Hint {
-        key: crate::keys::chord_label(code, modifiers),
-        label: label.to_string(),
-    }
+    (
+        Hint {
+            key: crate::keys::chord_label(code, modifiers),
+            label: label.to_string(),
+        },
+        table.is_built(context, action),
+    )
 }
 
 /// Two actions' chords joined with `/` as one key, e.g. `j/k`, paired with a combined label
-/// like `move`.
-fn combined_hint(
+/// like `move`. Built only when both halves are: a combined hint hiding either action's own
+/// built state would let one leak past [`footer_line`]'s filter riding on the other's back.
+fn combined_hint_item(
     table: &BindingTable,
     context: Context,
     first: Action,
     second: Action,
     label: &str,
-) -> Hint {
+) -> (Hint, bool) {
     let chord = |action| {
         let (code, modifiers) = table
             .primary_chord(context, action)
             .unwrap_or_else(|| panic!("{action:?} is not bound in {context:?}"));
         crate::keys::chord_label(code, modifiers)
     };
-    Hint {
+    let hint = Hint {
         key: format!("{}/{}", chord(first), chord(second)),
         label: label.to_string(),
-    }
+    };
+    let built = table.is_built(context, first) && table.is_built(context, second);
+    (hint, built)
 }
 
 /// [keybindings.md](../../../../docs/spec/keybindings.md#the-footer)'s list-context content,
 /// in display order. Drop order: refresh first, movement second, then `enter detail`,
 /// `/ filter`, `space select`, the launcher/action pair, and `? help` pinned last.
 fn list_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
     vec![
-        Item {
-            hint: combined_hint(
+        item(
+            combined_hint_item(
                 table,
                 Context::List,
                 Action::MoveDown,
                 Action::MoveUp,
                 "move",
             ),
-            priority: Priority::Drop(2),
-        },
-        Item {
-            hint: hint(table, Context::List, Action::ToggleSelection, "select"),
-            priority: Priority::Drop(5),
-        },
-        Item {
-            hint: hint(table, Context::List, Action::OpenDetail, "detail"),
-            priority: Priority::Drop(3),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::EnterFilter, "filter"),
-            priority: Priority::Drop(4),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenLauncher, "launcher"),
-            priority: Priority::Drop(6),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenActionPalette, "action"),
-            priority: Priority::Drop(6),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::RefreshAll, "refresh"),
-            priority: Priority::Drop(1),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenHelp, "help"),
-            priority: Priority::Pinned,
-        },
+            Priority::Drop(2),
+        ),
+        item(
+            hint_item(table, Context::List, Action::ToggleSelection, "select"),
+            Priority::Drop(5),
+        ),
+        item(
+            hint_item(table, Context::List, Action::OpenDetail, "detail"),
+            Priority::Drop(3),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::EnterFilter, "filter"),
+            Priority::Drop(4),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenLauncher, "launcher"),
+            Priority::Drop(6),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenActionPalette, "action"),
+            Priority::Drop(6),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::RefreshAll, "refresh"),
+            Priority::Drop(1),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenHelp, "help"),
+            Priority::Pinned,
+        ),
     ]
 }
 
@@ -130,37 +150,42 @@ fn list_items(table: &BindingTable) -> Vec<Item> {
 /// content: the same shape as [`list_items`] with `scroll` standing in for `move` and no
 /// `select`/`detail` hints, since neither action exists while the detail pane is focused.
 fn detail_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
     vec![
-        Item {
-            hint: combined_hint(
+        item(
+            combined_hint_item(
                 table,
                 Context::Detail,
                 Action::ScrollDown,
                 Action::ScrollUp,
                 "scroll",
             ),
-            priority: Priority::Drop(2),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::EnterFilter, "filter"),
-            priority: Priority::Drop(3),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenLauncher, "launcher"),
-            priority: Priority::Drop(4),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenActionPalette, "action"),
-            priority: Priority::Drop(4),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::RefreshAll, "refresh"),
-            priority: Priority::Drop(1),
-        },
-        Item {
-            hint: hint(table, Context::Global, Action::OpenHelp, "help"),
-            priority: Priority::Pinned,
-        },
+            Priority::Drop(2),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::EnterFilter, "filter"),
+            Priority::Drop(3),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenLauncher, "launcher"),
+            Priority::Drop(4),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenActionPalette, "action"),
+            Priority::Drop(4),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::RefreshAll, "refresh"),
+            Priority::Drop(1),
+        ),
+        item(
+            hint_item(table, Context::Global, Action::OpenHelp, "help"),
+            Priority::Pinned,
+        ),
     ]
 }
 
@@ -168,15 +193,20 @@ fn detail_items(table: &BindingTable) -> Vec<Item> {
 /// content: both hints pinned, since its whole footer is documented at 15 columns, short
 /// enough to survive almost any frame.
 fn confirm_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
     vec![
-        Item {
-            hint: hint(table, Context::Confirm, Action::Run, "run"),
-            priority: Priority::Pinned,
-        },
-        Item {
-            hint: hint(table, Context::Confirm, Action::Decline, "cancel"),
-            priority: Priority::Pinned,
-        },
+        item(
+            hint_item(table, Context::Confirm, Action::Run, "run"),
+            Priority::Pinned,
+        ),
+        item(
+            hint_item(table, Context::Confirm, Action::Decline, "cancel"),
+            Priority::Pinned,
+        ),
     ]
 }
 
@@ -283,6 +313,12 @@ fn footer_line(table: &BindingTable, context: Context, width: u16) -> FooterLine
         Context::Confirm => confirm_items(table),
         other => panic!("no footer content is defined yet for {other:?}"),
     };
+    // Carries only Built bindings ([ADR
+    // 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
+    // an unbuilt item never enters the width budget at all, dropped unconditionally rather
+    // than at some particular width, since it was never offered regardless of how much room
+    // there is.
+    let items: Vec<Item> = items.into_iter().filter(|item| item.built).collect();
     budget(&items, width as usize)
 }
 
@@ -338,10 +374,12 @@ mod tests {
             Item {
                 hint: bare("XXXXXXXXXX"),
                 priority: Priority::Drop(1),
+                built: true,
             },
             Item {
                 hint: bare("Y"),
                 priority: Priority::Pinned,
+                built: true,
             },
         ];
         let rendered = budget(&items, 5).to_string();
@@ -358,14 +396,17 @@ mod tests {
             Item {
                 hint: bare("AAAA"),
                 priority: Priority::Drop(1),
+                built: true,
             },
             Item {
                 hint: bare("BB"),
                 priority: Priority::Drop(2),
+                built: true,
             },
             Item {
                 hint: bare("C"),
                 priority: Priority::Pinned,
+                built: true,
             },
         ];
         let rendered = budget(&items, 8).to_string();
@@ -379,10 +420,12 @@ mod tests {
             Item {
                 hint: bare("AAAA"),
                 priority: Priority::Drop(1),
+                built: true,
             },
             Item {
                 hint: bare("BB"),
                 priority: Priority::Pinned,
+                built: true,
             },
         ];
         assert_eq!(budget(&items, 5).to_string(), "BB");
@@ -393,6 +436,7 @@ mod tests {
         let items = [Item {
             hint: bare("BB"),
             priority: Priority::Pinned,
+            built: true,
         }];
         assert_eq!(budget(&items, 1).to_string(), "");
     }
@@ -407,14 +451,17 @@ mod tests {
             Item {
                 hint: bare("LAUNCHER"),
                 priority: Priority::Drop(1),
+                built: true,
             },
             Item {
                 hint: bare("ACTION"),
                 priority: Priority::Drop(1),
+                built: true,
             },
             Item {
                 hint: bare("HELP"),
                 priority: Priority::Pinned,
+                built: true,
             },
         ];
         assert_eq!(budget(&items, 16).to_string(), "HELP ...");
@@ -431,8 +478,12 @@ mod tests {
     #[test]
     fn launcher_and_action_hints_are_never_present_without_each_other_at_any_width() {
         let table = default_table();
-        let launcher = hint(&table, Context::Global, Action::OpenLauncher, "launcher").to_string();
-        let action = hint(&table, Context::Global, Action::OpenActionPalette, "action").to_string();
+        let launcher = hint_item(&table, Context::Global, Action::OpenLauncher, "launcher")
+            .0
+            .to_string();
+        let action = hint_item(&table, Context::Global, Action::OpenActionPalette, "action")
+            .0
+            .to_string();
         for (context, items) in [
             (Context::List, list_items(&table)),
             (Context::Detail, detail_items(&table)),
@@ -520,6 +571,17 @@ mod tests {
             .expect("read the keybinding spec")
     }
 
+    /// The documented tables describe the finished keyboard
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "The footer": "The drop
+    /// tables below describe the finished keyboard; today's footer is the same ladder over
+    /// whichever subset is Built"), so these two tests prove [`budget`]'s drop algorithm
+    /// against the full item list `list_items`/`detail_items` build, deliberately bypassing
+    /// [`footer_line`]'s Built filter rather than [`render`]: today's `EnterFilter` is
+    /// unbuilt, and comparing the real, filtered footer against a table that assumes it is
+    /// built would fail the moment this test ran, for a reason that has nothing to do with
+    /// the drop algorithm this test exists to check.
+    /// [`list_footer_never_advertises_an_unbuilt_binding_at_any_width`] below is what proves
+    /// the Built filter itself, against the real `render`.
     #[test]
     fn list_footer_matches_the_documented_degradation_table_at_every_named_width() {
         let spec = read_spec();
@@ -528,9 +590,10 @@ mod tests {
             "The list context's footer is 87 columns at full width",
         );
         assert!(!rows.is_empty(), "expected at least one documented width");
+        let table = default_table();
         for row in rows {
             assert_eq!(
-                render(&default_table(), Context::List, row.width),
+                budget(&list_items(&table), row.width as usize).to_string(),
                 row.expected,
                 "list footer mismatch at width {}",
                 row.width
@@ -546,13 +609,58 @@ mod tests {
             "The detail context's footer is 61 columns at full width",
         );
         assert!(!rows.is_empty(), "expected at least one documented width");
+        let table = default_table();
         for row in rows {
             assert_eq!(
-                render(&default_table(), Context::Detail, row.width),
+                budget(&detail_items(&table), row.width as usize).to_string(),
                 row.expected,
                 "detail footer mismatch at width {}",
                 row.width
             );
+        }
+    }
+
+    // --- issue #119: the real footer, unlike the ladder above, carries only Built bindings ---
+
+    /// The mutation this catches: deleting `footer_line`'s `.filter(|item| item.built)` line.
+    /// Scans every width from 0 up to the full unfiltered ladder's own length, in both
+    /// contexts, for the literal hint text of every currently-unbuilt item `list_items` and
+    /// `detail_items` would otherwise have offered; none of it may ever appear in the real,
+    /// filtered `render` output.
+    #[test]
+    fn list_and_detail_footers_never_advertise_an_unbuilt_binding_at_any_width() {
+        let table = default_table();
+        for (context, items) in [
+            (Context::List, list_items(&table)),
+            (Context::Detail, detail_items(&table)),
+        ] {
+            let unbuilt_hints: Vec<String> = items
+                .iter()
+                .filter(|item| !item.built)
+                .map(|item| item.hint.to_string())
+                .collect();
+            assert!(
+                !unbuilt_hints.is_empty(),
+                "no unbuilt hint left in {context:?}'s own item list to prove render() filters \
+                 one out; revisit this test once keybindings.md's \"Not built yet\" list no \
+                 longer touches this footer"
+            );
+            let full_width: usize = items
+                .iter()
+                .map(|item| item.hint.to_string())
+                .collect::<Vec<_>>()
+                .join(SEPARATOR)
+                .len();
+            for width in 0..=full_width {
+                let rendered = render(&table, context, width as u16);
+                for hint_text in &unbuilt_hints {
+                    assert!(
+                        !rendered.contains(hint_text.as_str()),
+                        "{context:?} footer at width {width} advertises the unbuilt hint \
+                         {hint_text:?}: {rendered:?}"
+                    );
+                }
+            }
         }
     }
 
