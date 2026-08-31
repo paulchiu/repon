@@ -1218,7 +1218,7 @@ mod tests {
         );
     }
 
-    // --- Criterion 3 (issue #75): "the detail pane's labels are dim and its values take
+    // --- Criterion 3: "the detail pane's labels are dim and its values take
     // whichever role their meaning already has" ---
 
     #[test]

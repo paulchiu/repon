@@ -780,7 +780,7 @@ mod tests {
         );
     }
 
-    // --- Criterion 1 (issue #75): the audit. Every colour-bearing `Meaning` names its own
+    // --- Criterion 1: the audit. Every colour-bearing `Meaning` names its own
     // redundant, non-colour signal, so a tenth meaning added later fails to compile here
     // until someone writes down where its own signal lives, rather than shipping with
     // colour as its only carrier. ---
@@ -978,7 +978,7 @@ mod tests {
         );
     }
 
-    // --- Criterion 3 (issue #75): every surface takes its colour from a `Role`, never a
+    // --- Criterion 3: every surface takes its colour from a `Role`, never a
     // hardcoded `Color`. `theme.rs` is the one place theming.md allows a bare `Color` value:
     // the compiled-in default and the loader that resolves a theme file's own strings into
     // one. Every other production line in either crate must read a colour only through
@@ -1065,7 +1065,7 @@ mod tests {
         assert!(offending[0].contains("offender.rs:2"), "got {offending:?}");
     }
 
-    // --- Criterion 4 (issue #75): the terminal library strips colour, never Repon itself.
+    // --- Criterion 4: the terminal library strips colour, never Repon itself.
     // theming.md: "crossterm honours `NO_COLOR` automatically inside `SetForegroundColor`,
     // so `NO_COLOR=1 repon` drops every colour with no code of ours involved." A second
     // implementation of that rule here would risk disagreeing with crossterm's own, which is

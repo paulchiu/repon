@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(overlay.scroll, scroll_before);
     }
 
-    // --- Criterion 3 (issue #75): the overlay's keys/description split takes its colour
+    // --- Criterion 3: the overlay's keys/description split takes its colour
     // from the theme's own accent/dim roles, theming.md's per-surface assignment ---
 
     #[test]

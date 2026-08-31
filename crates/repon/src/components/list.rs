@@ -2322,7 +2322,7 @@ mod tests {
         );
     }
 
-    /// Criterion 2 (issue #75): theming.md's "the four Worktree states have a text column" is
+    /// Criterion 2: theming.md's "the four Worktree states have a text column" is
     /// the claim that colour is never the only thing telling the four states apart, so this
     /// checks the words themselves, independent of `state_meaning`'s own colour above. The
     /// four variants named by hand mirror `state_meaning`'s own match, which has no wildcard
@@ -3573,7 +3573,7 @@ mod tests {
         );
     }
 
-    // --- Criterion 2 (issue #75): every colour-carried pair theming.md names still reads
+    // --- Criterion 2: every colour-carried pair theming.md names still reads
     // distinct once colour is set aside. `NO_COLOR` strips colour only, never glyphs
     // (theming.md's own "Colour is never the only carrier"), so the honest proof reads each
     // pair's plain text (`cell_text`, which never looks at `.fg`) rather than swapping in a
