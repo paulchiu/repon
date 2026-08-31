@@ -562,6 +562,164 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
     );
 }
 
+/// Criterion 2: an unresolvable `--set` exits before the terminal is claimed, naming the flag
+/// and the value given. Uses [`run_over_pty`] rather than the inline reader loop the two tests
+/// above use, the same technique proving the same property (a non-zero exit and empty stdout
+/// alone would not distinguish this from a mutant that claims the terminal and then fails
+/// elsewhere).
+#[test]
+fn an_unmatched_set_flag_exits_before_the_terminal_is_claimed_naming_the_flag_and_value() {
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "[[set]]\nname = \"work\"\nroots = [\"/dev/null\"]\n",
+    )
+    .expect("write a config.toml declaring one real Set");
+
+    let (status, output) = run_over_pty(
+        &["--set", "nonexistent-set-xyz"],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected a non-zero exit, got: {output:?}"
+    );
+    assert!(
+        output.contains("--set") && output.contains("nonexistent-set-xyz"),
+        "expected the flag and its value named in the error, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once --set names no declared Set, but \
+         EnterAlternateScreen appeared: {output:?}"
+    );
+}
+
+/// Criterion 3: an unresolvable `REPON_SET` exits the same way, naming the variable and its
+/// value. A real declared Set sits in the config so this cannot pass by there being no Set to
+/// fail to match at all.
+#[test]
+fn an_unmatched_repon_set_exits_before_the_terminal_is_claimed_naming_the_variable_and_value() {
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "[[set]]\nname = \"work\"\nroots = [\"/dev/null\"]\n",
+    )
+    .expect("write a config.toml declaring one real Set");
+
+    let (status, output) = run_over_pty(
+        &[],
+        &[
+            (
+                "REPON_CONFIG",
+                config_dir
+                    .path()
+                    .to_str()
+                    .expect("tempdir path must be utf-8"),
+            ),
+            ("REPON_SET", "nonexistent-set-xyz"),
+        ],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected a non-zero exit, got: {output:?}"
+    );
+    assert!(
+        output.contains("REPON_SET") && output.contains("nonexistent-set-xyz"),
+        "expected the variable and its value named in the error, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once REPON_SET names no declared Set, but \
+         EnterAlternateScreen appeared: {output:?}"
+    );
+}
+
+/// Criterion 5: a `--config` file that does not exist exits before the terminal is claimed,
+/// naming the flag and the path given. `REPON_CONFIG` is pointed at a real, empty directory so
+/// this cannot pass because of an unrelated `REPON_CONFIG` failure.
+#[test]
+fn a_missing_config_flag_file_exits_before_the_terminal_is_claimed_naming_the_flag_and_path() {
+    let repon_config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    let flag_dir = tempfile::tempdir().expect("create tempdir for the --config path");
+    let missing_file = flag_dir.path().join("missing.toml");
+
+    let (status, output) = run_over_pty(
+        &[
+            "--config",
+            missing_file.to_str().expect("path must be utf-8"),
+        ],
+        &[(
+            "REPON_CONFIG",
+            repon_config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected a non-zero exit, got: {output:?}"
+    );
+    assert!(
+        output.contains("--config") && output.contains("missing.toml"),
+        "expected the flag and its path named in the error, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once --config names a file that does not exist, \
+         but EnterAlternateScreen appeared: {output:?}"
+    );
+}
+
+/// Criterion 6: a `REPON_CONFIG` directory that does not exist exits before the terminal is
+/// claimed, naming the variable and the path given.
+#[test]
+fn a_missing_repon_config_directory_exits_before_the_terminal_is_claimed_naming_the_variable_and_path()
+ {
+    let parent = tempfile::tempdir().expect("create tempdir");
+    let missing_dir = parent.path().join("does-not-exist");
+
+    let (status, output) = run_over_pty(
+        &[],
+        &[(
+            "REPON_CONFIG",
+            missing_dir.to_str().expect("path must be utf-8"),
+        )],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected a non-zero exit, got: {output:?}"
+    );
+    assert!(
+        output.contains("REPON_CONFIG") && output.contains("does-not-exist"),
+        "expected the variable and its path named in the error, got: {output:?}"
+    );
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        !output.contains(&enter_alt),
+        "the terminal must never be claimed once REPON_CONFIG names a directory that does not \
+         exist, but EnterAlternateScreen appeared: {output:?}"
+    );
+}
+
 /// Criterion 2's clean path for the Launcher caller: a non-zero exit plus empty stdout is not
 /// evidence about ordering, so this asserts on the literal `EnterAlternateScreen` and
 /// `LeaveAlternateScreen` byte sequences and on a marker only the handed-off child could have
