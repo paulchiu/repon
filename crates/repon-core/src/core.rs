@@ -527,7 +527,9 @@ impl Core {
     /// common dir for the life of this `Core`. Without the feature, only the
     /// local chain runs, the same "inert" shape the periodic fetch itself takes.
     ///
-    /// Returns immediately: the probes run on a plain thread, never rayon's
+    /// Returns immediately, which is also why a stalled remote has nothing to end
+    /// it here: the deadline sweep is per entity, not per cell, so this is on the
+    /// open-questions register rather than closed. The probes run on a plain thread, never rayon's
     /// global pool, for the reason `fetch::run_bounded`'s own doc comment gives
     /// the periodic fetch's identical choice: a remote blocked on the network
     /// for seconds must never take a worker away from the pool every other

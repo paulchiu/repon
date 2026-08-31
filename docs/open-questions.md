@@ -11,6 +11,21 @@ the link for the "why" and come back here only for the list.
 Nothing on this page is settled or built by it. An entry is removed once its owning
 document actually answers the question, not before.
 
+## A hung rederive has no deadline of its own
+
+`b` runs its network probe on a plain thread and returns immediately, so the
+Generation deadline sweep, which is per entity rather than per cell, never covers it.
+A remote that accepts a connection and then stalls leaves that row's
+`default_branch` in flight with nothing to end it, where the same stall inside an
+ordinary Generation would settle as `Unknown::TimedOut`. Every other failure shape
+is already closed: credentials fail closed, and an unreachable host errors rather
+than waits.
+
+- **Reopens if**: the deadline sweep gains a per-cell notion, or a rederive is
+  observed hanging in practice.
+- **Owned by**: [`spec/refresh.md`](spec/refresh.md), which owns the deadline, and
+  [`spec/default-branch.md`](spec/default-branch.md), which owns what `b` promises.
+
 ## A headless run verb
 
 Absent in the first version, so no exit code reports an Action's own failure; the
