@@ -22,8 +22,10 @@ use crate::{
 /// The dedicated thread's metadata-poll-and-deadline cadence has no config key yet
 /// ([core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
 /// own doc comment fixes it at thirty seconds); this is that same figure, named here rather
-/// than left as a bare literal at the one call site that needs it.
-const GENERATION_DEADLINE: Duration = Duration::from_secs(30);
+/// than left as a bare literal at the one call site that needs it. `pub(crate)` so
+/// [`super::status`]'s own `settle` deadline can build on the same number rather than
+/// carrying a second, independent thirty.
+pub(crate) const GENERATION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The Set [`App::core`] is currently running over, and exactly the fields
 /// [`App::reload_active_set`] needs to decide whether a reload's Set changed: its name (for

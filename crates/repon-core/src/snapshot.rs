@@ -175,6 +175,7 @@ pub fn summary(entity: &EntityState) -> RowSummary {
 /// crate's public surface: a consumer reads a `Snapshot` when it decides to, it
 /// never gets pushed one.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Snapshot {
     pub generation: Generation,
     pub discovered_at: Timestamp,

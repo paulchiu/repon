@@ -22,6 +22,7 @@ use crate::git::{InProgressOperation, RecentCommit};
 /// new rather than renamed, the same trade session state already takes when it
 /// restores the Selection by name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct EntityKey(Arc<Path>);
 
 impl EntityKey {
@@ -38,6 +39,7 @@ impl EntityKey {
 
 /// Which of the three domain objects an Entity is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Kind {
     Repo,
     Worktree,
@@ -52,6 +54,7 @@ pub enum Kind {
 /// contract's `REPON_HEAD` needs the resolved commit on this shape too, not only
 /// on `Detached`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Head {
     /// Attached to a branch, which points at a commit.
     Branch {
@@ -66,6 +69,7 @@ pub enum Head {
 
 /// Commit counts ahead and behind an Entity's branch's upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AheadBehind {
     pub ahead: u32,
     pub behind: u32,
@@ -77,6 +81,7 @@ pub struct AheadBehind {
 /// the same as counting, and a boolean cannot answer the untracked count at all, so this
 /// carries all three rather than folding them into one number at the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DirtyCounts {
     /// Tracked paths whose content, mode or type changed against the index.
     pub modified: u32,
@@ -101,6 +106,7 @@ impl DirtyCounts {
 /// ([layout-and-provenance.md](https://github.com/paulchiu/repon/blob/main/docs/spec/layout-and-provenance.md)'s
 /// "Glyphs").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum SyncState {
     /// A live upstream: its ahead/behind counts.
     Tracking(AheadBehind),
@@ -114,6 +120,7 @@ pub enum SyncState {
 /// The four mutually exclusive Worktree states, proven by ancestry or patch
 /// equivalence. `Dirty` is a separate, orthogonal cell, not a fifth arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum WorktreeState {
     Merged,
     Gone,
@@ -127,6 +134,7 @@ pub enum WorktreeState {
 /// [`Diagnostics`], not here, because those are facts about how the value was
 /// obtained rather than the value itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DefaultBranch(Arc<str>);
 
 impl DefaultBranch {
@@ -145,6 +153,7 @@ impl DefaultBranch {
 /// already has at no extra cost: which of gix's own remote enumeration, or rung
 /// 3's own name list, came up empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum DefaultBranchStopped {
     /// The repository has no remote at all.
     NoRemote,
@@ -165,6 +174,7 @@ pub enum DefaultBranchStopped {
 /// the row summary fold, describing how a value was obtained rather than a value
 /// that can itself fail; `gitmodules_failed` is the one exception the fold reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Diagnostics {
     /// The rung (1 to 4) that resolved the default branch, once resolution has run.
     pub default_branch_rung: Option<u8>,
@@ -194,6 +204,7 @@ pub struct Diagnostics {
 /// name each one rather than borrow this method to skip a step, since the two calls answer
 /// different questions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum StepOutcome {
     /// Ran and exited zero.
     Ok,
@@ -229,6 +240,7 @@ impl StepOutcome {
 /// every text-bearing value on [`EntityState`] is: `Core::snapshot` clones the whole table
 /// every frame, and an `Arc` clone is a refcount bump rather than a copy of the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct StepResult {
     /// The step's argv, rendered for display.
     pub label: Arc<str>,
@@ -256,6 +268,7 @@ pub struct StepResult {
 /// configurable-expiry half of the recorded requirement is dropped outright on the startup-cost
 /// grounds `docs/spec/actions.md` measures, not deferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ActionReceipt {
     /// The Action's name, or the typed command string.
     pub label: Arc<str>,
@@ -291,6 +304,7 @@ impl ActionReceipt {
 /// wants an undo gesture or a Filter of its own, and the exact progressive-fill
 /// timing targets a Vanished row's redraw should honour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Presence {
     #[default]
     Present,
@@ -300,6 +314,7 @@ pub enum Presence {
 /// One Entity's state: a struct of named Cells rather than a map, because the
 /// grid is not rectangular and each column carries its own payload type.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct EntityState {
     pub key: EntityKey,
     pub name: Arc<str>,

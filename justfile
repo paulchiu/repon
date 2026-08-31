@@ -40,43 +40,73 @@ docs:
 # it is allowed, and the comparison set is derived from that pairing, so a crate
 # cannot be added here without recording why.
 #
-# One later addition is already known and belongs here when it lands:
-#   - the wire format, for the settled document on stdout
+# Checked twice, once per state of the `serde` feature: off (the default a
+# published consumer builds against) and on (what `repon` itself turns on for the
+# settled document's wire format, ADR 0015). `cargo tree -p repon-core` alone
+# only ever resolves the default feature set, so an allowlist that skipped the
+# "on" pass would never see `serde` join the tree at all, and one that only ever
+# ran with the feature on would let it (or anything else the feature happens to
+# pull in as a direct dependency) into the default build unnoticed.
 # The terminal and rendering crates never belong here.
 check-core-isolation:
     #!/usr/bin/env bash
     set -euo pipefail
-    allowed_with_reasons=(
+
+    check_isolation() {
+        local label="$1"
+        local features="$2"
+        shift 2
+        local -a allowed_with_reasons=("$@")
+
+        local allowed_names=()
+        for entry in "${allowed_with_reasons[@]}"; do
+            name="${entry%%:*}"
+            reason="${entry#*:}"
+            if [ -z "$name" ] || [ "$name" = "$entry" ] || [ -z "$reason" ]; then
+                echo "malformed allowlist entry: '$entry' (expected 'crate:reason')" >&2
+                exit 1
+            fi
+            allowed_names+=("$name")
+        done
+        local allowed
+        allowed=$(printf '%s\n' "${allowed_names[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//')
+        local actual
+        # `$features` is passed unquoted and deliberately left out of `--features` entirely
+        # when empty, rather than kept in a bash array: an empty array expanded under `set -u`
+        # is a portability trap on bash 3.2 (macOS's own `/bin/bash`), which reads it as an
+        # unbound variable rather than as nothing.
+        if [ -n "$features" ]; then
+            actual=$(cargo tree -p repon-core --edges normal --depth 1 --prefix none --features "$features" \
+                | awk 'NR > 1 && NF { print $1 }' | sort -u | tr '\n' ' ' | sed 's/ $//')
+        else
+            actual=$(cargo tree -p repon-core --edges normal --depth 1 --prefix none \
+                | awk 'NR > 1 && NF { print $1 }' | sort -u | tr '\n' ' ' | sed 's/ $//')
+        fi
+        if [ "$actual" != "$allowed" ]; then
+            echo "repon-core's direct dependencies changed ($label)" >&2
+            echo "allowed, with reasons:" >&2
+            for entry in "${allowed_with_reasons[@]}"; do
+                echo "  ${entry%%:*}: ${entry#*:}" >&2
+            done
+            echo "actual: $actual" >&2
+            echo "an undeclared crate was added or removed; add it above with its reason, or remove it" >&2
+            exit 1
+        fi
+        echo "repon-core ($label) depends on nothing beyond: $allowed"
+    }
+
+    base_allowed_with_reasons=(
         "crossbeam-channel:the fan-out result channel between rayon workers and the core"
         "globset:Set include/exclude glob matching in the discovery walk"
         "gix:the git backend this crate wraps"
         "libc:setsid(2) and openpty(3) for an Action step's PTY-backed child, per ADR 0018"
         "rayon:the probe phases' worker pool"
     )
-    allowed_names=()
-    for entry in "${allowed_with_reasons[@]}"; do
-        name="${entry%%:*}"
-        reason="${entry#*:}"
-        if [ -z "$name" ] || [ "$name" = "$entry" ] || [ -z "$reason" ]; then
-            echo "malformed allowlist entry: '$entry' (expected 'crate:reason')" >&2
-            exit 1
-        fi
-        allowed_names+=("$name")
-    done
-    allowed=$(printf '%s\n' "${allowed_names[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//')
-    actual=$(cargo tree -p repon-core --edges normal --depth 1 --prefix none \
-        | awk 'NR > 1 && NF { print $1 }' | sort -u | tr '\n' ' ' | sed 's/ $//')
-    if [ "$actual" != "$allowed" ]; then
-        echo "repon-core's direct dependencies changed" >&2
-        echo "allowed, with reasons:" >&2
-        for entry in "${allowed_with_reasons[@]}"; do
-            echo "  ${entry%%:*}: ${entry#*:}" >&2
-        done
-        echo "actual: $actual" >&2
-        echo "an undeclared crate was added or removed; add it above with its reason, or remove it" >&2
-        exit 1
-    fi
-    echo "repon-core depends on nothing beyond: $allowed"
+
+    check_isolation "serde feature off, the default build" "" "${base_allowed_with_reasons[@]}"
+    check_isolation "serde feature on, the settled document's wire format" serde \
+        "${base_allowed_with_reasons[@]}" \
+        "serde:the settled document's wire format on stdout, off by default (ADR 0015)"
 
 # Build and test against the declared floor
 #

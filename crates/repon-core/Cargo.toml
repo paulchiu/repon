@@ -23,6 +23,11 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 # feature from its production build.
 [features]
 test-util = []
+# Off by default, per ADR 0015: derives `Serialize` on this crate's own public types for the
+# settled document `repon status` prints, rather than a consumer-side wire struct. Also turns
+# on gix's own `serde` feature (needed for `gix::ObjectId` on a settled `Head`) and serde's
+# `rc` feature, without which `Arc<str>` does not implement `Serialize` at all.
+serde = ["dep:serde", "gix/serde"]
 
 [dependencies]
 crossbeam-channel.workspace = true
@@ -43,6 +48,9 @@ gix = { version = "0.87.1", default-features = false, features = [
 # makes a direct dependency of a crate that already resolved it explicit.
 libc = "0.2.189"
 rayon = "1.12.0"
+# The settled document's wire format on stdout (ADR 0015), behind the `serde` feature above
+# and off by default: `repon` is the one consumer that turns it on.
+serde = { version = "1.0.229", optional = true, features = ["derive", "rc"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
