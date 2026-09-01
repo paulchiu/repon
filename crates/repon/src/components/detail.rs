@@ -891,7 +891,7 @@ mod tests {
 
     use repon_core::{
         CaptureElision, Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec, StepOutcome,
-        StepResult,
+        StepResult, liveness::wait_for,
     };
 
     use super::*;
@@ -2702,8 +2702,7 @@ mod tests {
             std::slice::from_ref(&key),
         );
         assert!(started, "expected the flooding Action to start");
-        let finished = wait_until(Duration::from_secs(15), || !core.action_running());
-        assert!(finished, "expected the flooding step to actually finish");
+        wait_for("the flooding step to finish", || !core.action_running());
 
         let entity = core.snapshot().entities[0].clone();
         let glyphs = full_glyphs();
@@ -2734,22 +2733,6 @@ mod tests {
             dropped_count > 0 && dropped_count < 3_000,
             "expected a plausible dropped-line count between 0 and 3,000, got {dropped_count}"
         );
-    }
-
-    /// A local `wait_until`, the same shape `app.rs`'s own test module already carries: this
-    /// module has no reason to import that one across a module boundary just to poll a
-    /// `bool`-returning condition on its own thread.
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if condition() {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     // --- Criterion 2: the child's own colour is parsed at render time, in this crate ---

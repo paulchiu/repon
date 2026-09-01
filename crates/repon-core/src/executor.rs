@@ -825,6 +825,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::liveness::{BACKSTOP, FIXTURE_LIFETIME, wait_for};
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -857,7 +858,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(BACKSTOP)
             .expect("a child reading a null stdin must terminate rather than hang");
 
         assert_eq!(result.outcome, StepOutcome::Ok);
@@ -977,23 +978,6 @@ mod tests {
             .next()
     }
 
-    /// Polls [`process_state`] until it matches `wanted` or `timeout` elapses, since a
-    /// signal this test just sent has not necessarily already landed the instant `kill`
-    /// returns. Bounded so a regression (the signal never lands, or lands as the wrong one)
-    /// fails this test rather than hanging it.
-    fn wait_for_process_state(pid: libc::pid_t, wanted: char, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if process_state(pid) == Some(wanted) {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Spawns `argv` under a real PTY and `setsid`, exactly as [`run_step`] would, but
     /// returns the raw pieces rather than blocking to completion, so a test can act on the
     /// live child before it exits.
@@ -1015,19 +999,22 @@ mod tests {
     /// were mutated to send only SIGTERM, which is exactly the regression this criterion
     /// exists to catch; trapping TERM here is what rules that mutation out.
     ///
-    /// Bounded end to end by `recv_timeout` on a real child spawned to sleep 30s: the grace
-    /// plus SIGKILL together take well under a second, so a regression that drops the
-    /// SIGKILL follow-up fails this test's own timeout rather than hanging the suite for
-    /// 30s or forever.
+    /// Bounded end to end by `recv_timeout` at [`BACKSTOP`], against a child spawned to
+    /// sleep [`FIXTURE_LIFETIME`], ten times that: the grace plus SIGKILL together take well
+    /// under a second, and the fixture cannot end on its own inside the receive, so a
+    /// regression that drops the SIGKILL follow-up fails this test's own bound rather than
+    /// being waited out by a child that finished by itself.
     #[test]
     fn a_child_that_traps_sigterm_still_dies_once_cancel_escalates_to_sigkill() {
         let dir = tempdir();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let (master, keepalive, child, pgid) = spawn_controlled(
-                &["sh", "-c", "trap '' TERM; echo ready; sleep 30"],
-                dir.path(),
+            let sleep_past_the_backstop = format!(
+                "trap '' TERM; echo ready; sleep {}",
+                FIXTURE_LIFETIME.as_secs()
             );
+            let (master, keepalive, child, pgid) =
+                spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
             let control = RunControl::new();
             control.register(pgid);
 
@@ -1049,7 +1036,7 @@ mod tests {
         });
 
         let status = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(BACKSTOP)
             .expect("a TERM-trapping child must still die once cancel escalates to SIGKILL");
         assert!(
             status.is_some_and(|status| !status.success()),
@@ -1069,16 +1056,19 @@ mod tests {
         control.register(pgid);
 
         control.hold();
-        assert!(
-            wait_for_process_state(pgid, 'T', Duration::from_secs(2)),
-            "SIGSTOP must leave the child's own process state Stopped"
+        // A signal just sent has not necessarily landed by the time `kill` returns, so both
+        // waits below are on the state itself. One predicate over both live states rather
+        // than a wait per state: the second of two sequential waits would only ever be
+        // reached after the first had run its whole backstop out.
+        wait_for(
+            "SIGSTOP to leave the child's own process state Stopped",
+            || process_state(pgid) == Some('T'),
         );
 
         control.continue_run();
-        assert!(
-            wait_for_process_state(pgid, 'S', Duration::from_secs(2))
-                || wait_for_process_state(pgid, 'R', Duration::from_secs(2)),
-            "SIGCONT must move the child back out of the Stopped state"
+        wait_for(
+            "SIGCONT to move the child back out of the Stopped state",
+            || matches!(process_state(pgid), Some('S') | Some('R')),
         );
 
         control.deregister(pgid);
