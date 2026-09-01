@@ -232,7 +232,7 @@ Help opens in reading mode, `overlay`'s own original shape: `q` and `Esc` close 
 
 The expanded warning list and the Set picker are unaffected: `Action::Search` is help's own addition to `overlay`'s vocabulary, and neither of the other two reads it out of their own key handler, so it does nothing for either.
 
-Backspace is not bound anywhere yet (tracked separately, on another branch); until it lands, `Esc` then `/` again is the only way to redo a query from scratch.
+Backspace edits the query, looked up in `input`'s own table rather than added to `overlay`'s, so help's query deletes a character through the one compiled row every other text surface reads. It is checked before the printable test for the same reason the printable test comes before `overlay`'s own bindings: while the query is open, an editing key belongs to it. On an empty query it does nothing, so it is not a second way out of search mode.
 
 ### The help overlay's own chrome
 
@@ -286,4 +286,3 @@ Each item below is also listed, with its reopening condition, in [the open-quest
 - Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have. Reopenable if either existing route turns out not to cover the need, or if the map grows multi-key sequences for an unrelated reason.
 - Mouse support. Ruled out above for a stated reason rather than an absent one, and the reopening condition is someone wanting to try it.
 - The dismiss gesture has no undo. Whether it needs one, and whether a Vanished row wants a Filter of its own, is open in [layout-and-provenance.md](layout-and-provenance.md).
-- The help overlay's search has no Backspace. Open in [the open-questions register](../open-questions.md#helps-search-has-no-backspace).

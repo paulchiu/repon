@@ -330,6 +330,14 @@ impl HelpOverlay {
         self.scroll = 0;
     }
 
+    /// `Backspace`: drops the last character of the query, the same
+    /// `Context::Input`/`DeletePreviousChar` row every other text surface reads. Inert on an
+    /// empty query, which keeps it from being a second way to leave search mode.
+    pub(crate) fn pop_query_char(&mut self) {
+        self.query.pop();
+        self.scroll = 0;
+    }
+
     /// Folds one of the overlay's own scroll actions into the current offset, clamped so it
     /// can never scroll past the last line reaching `viewport_height`. Every other action
     /// (`Choose`, `Close`) is the caller's concern: `Close` unmounts this overlay entirely,

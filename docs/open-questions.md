@@ -115,18 +115,3 @@ in common.
 - **Owned by**: [`spec/repo-management.md`](spec/repo-management.md), which owns the
   write, and [`adr/0028-repon-writes-the-repo-entries-it-owns.md`](adr/0028-repon-writes-the-repo-entries-it-owns.md),
   which records the trade.
-
-## Help's search has no Backspace
-
-Help's search mode is `overlay`'s own addition rather than a switch to `input`
-(`spec/keybindings.md`'s own "The help overlay is searchable"), so its query is
-edited with whatever a plain append-only buffer allows: typing extends it, and
-`Esc` clears it outright by leaving search mode entirely. There is no
-per-character delete, because no context anywhere in the compiled binding table
-has a Backspace row yet; a mistyped character cannot be fixed without starting
-the query over.
-
-- **Reopens if**: a context gains a Backspace binding elsewhere in the table
-  first, at which point help's own query can adopt the same one-character-delete
-  behaviour deliberately rather than waiting on it by accident.
-- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#the-help-overlay).

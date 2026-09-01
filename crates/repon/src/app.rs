@@ -827,7 +827,17 @@ impl App {
                 overlay.apply(action, content_len, viewport_height);
             };
             if overlay.is_searching() {
-                if let Some(c) = keys::printable(key) {
+                // Backspace is looked up in `Context::Input` so the query shares the one
+                // compiled row every other text surface edits through, rather than growing a
+                // second Backspace of its own. It is checked before `printable` for the same
+                // reason `printable` is checked before `Context::Overlay`: an editing key
+                // belongs to the query while the query is open.
+                if matches!(
+                    self.bindings.dispatch(Context::Input, key),
+                    Some(Action::DeletePreviousChar)
+                ) {
+                    overlay.pop_query_char();
+                } else if let Some(c) = keys::printable(key) {
                     overlay.push_query_char(c);
                 } else {
                     match self.bindings.dispatch(Context::Overlay, key) {
@@ -2797,6 +2807,73 @@ mod tests {
             "expected search mode to still be active"
         );
         assert_eq!(overlay.query(), "q");
+    }
+
+    /// Backspace edits help's own query through the same `Context::Input` row the palettes
+    /// and the Filter line read, rather than a second one of help's own. Asserted on the
+    /// query the surface actually holds, and on the rendered content length, so a Backspace
+    /// that edited the buffer without re-filtering would fail here.
+    #[test]
+    fn backspace_deletes_one_character_of_helps_query_and_re_filters() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "movex".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the query");
+        }
+        let narrowed_to_nothing = {
+            let overlay = app.help.as_ref().expect("help is open");
+            assert_eq!(overlay.query(), "movex");
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query()).len()
+        };
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("backspace");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(
+            overlay.is_searching(),
+            "backspace must not leave search mode"
+        );
+        assert_eq!(overlay.query(), "move");
+        let widened =
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query())
+                .len();
+        assert!(
+            widened > narrowed_to_nothing,
+            "deleting the trailing \"x\" must widen the filtered list: \
+             {narrowed_to_nothing} lines before, {widened} after"
+        );
+    }
+
+    /// Backspace on an empty query is inert, and specifically is not a second way out of
+    /// search mode or out of help.
+    #[test]
+    fn backspace_on_an_empty_help_query_is_inert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("backspace on an empty query");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(
+            overlay.is_searching(),
+            "backspace on an empty query must not leave search mode"
+        );
+        assert_eq!(overlay.query(), "");
     }
 
     /// The two-level unwind `Esc` walks inside help's own search: the first press leaves
