@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect, Size},
 };
-use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Snapshot};
+use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot};
 use tracing::debug;
 
 use crate::{
@@ -51,6 +51,12 @@ const NARROW_BREAKPOINT: u16 = 100;
 /// gutter reads Failed, [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
 /// unavailable case for a Built binding with nothing to do.
 const NO_FAILED_ROWS_NOTICE: &str = "no row has failed";
+
+/// The Notice [`Action::DismissVanished`] raises when the cursor row is not Vanished (or the
+/// list is empty): the glossary scopes a Notice to a keystroke that could not act, and `d`'s
+/// own successful case ([`App::dismiss_vanished_at_cursor`]) never raises one
+/// ([#171](https://github.com/paulchiu/repon/issues/171)).
+const CURSOR_NOT_VANISHED_NOTICE: &str = "cursor row is not Vanished";
 
 /// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
 /// `pub(crate)` so `list.rs`'s own sidebar tests render at this constant rather than a
@@ -251,11 +257,11 @@ pub struct App {
     /// when `notice` is `None`.
     notice_set_at: Option<std::time::Instant>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
-    /// `Action::ReloadConfig`. One of the three sources [`Self::current_warnings`] folds into
+    /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
     /// the shared warning slot ([`warnings::WarningSources`]).
     theme_warnings: Vec<theme::ThemeWarning>,
     /// Config warnings raised at the last load, the same lifecycle as `theme_warnings` and
-    /// the second of the three sources.
+    /// the second of the four sources.
     config_warnings: Vec<config::document::Warning>,
     /// Whether the abandoned-discovery warning has already been logged to `repon.log` for
     /// `self.core`'s lifetime: `Core` never clears the warning once a walk abandons, so this
@@ -576,26 +582,43 @@ impl App {
     }
 
     /// The shared warning slot's whole current population, folded once from every source
-    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the three sources by
+    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the four sources by
     /// hand. `self.core`'s own abandoned-discovery warning is read fresh here rather than
     /// cached, since it can turn from `None` to `Some` at any point in the run with no reload
     /// involved; the first time it does, this also logs it to `repon.log`
     /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
     /// reported twice" (the theme and config halves already log at the point their own load
-    /// raises them). A live Notice is never folded in here: it is not a standing condition of
-    /// the session, and [theming.md](../../../docs/spec/theming.md) keeps the two apart.
+    /// raises them). The Vanished count is read fresh from the live snapshot the same way,
+    /// with nothing latched: the condition clears itself the moment the count returns to zero
+    /// ([#171](https://github.com/paulchiu/repon/issues/171)). A live Notice is never folded
+    /// in here: it is not a standing condition of the session, and
+    /// [theming.md](../../../docs/spec/theming.md) keeps the two apart.
     fn current_warnings(&mut self) -> Vec<Warning> {
         let discovery_abandoned = self.core.discovery_warning();
         warnings::log_discovery_warning_once(
             discovery_abandoned.as_ref(),
             &mut self.discovery_warning_logged,
         );
+        let vanished = self.vanished_count();
         WarningSources {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             discovery_abandoned,
+            vanished,
         }
         .into_warnings()
+    }
+
+    /// How many Entities in the current Snapshot are Vanished right now
+    /// ([#171](https://github.com/paulchiu/repon/issues/171)), read fresh rather than cached:
+    /// [`Self::current_warnings`]'s own doc comment says why nothing here is latched.
+    fn vanished_count(&self) -> usize {
+        self.core
+            .snapshot()
+            .entities
+            .iter()
+            .filter(|entity| entity.presence == Presence::Vanished)
+            .count()
     }
 
     /// The status row's own content for this frame: the active Set's name, `snapshot`'s
@@ -1138,15 +1161,9 @@ impl App {
                 }
                 None
             }
-            // `DismissVanished` is still unbuilt (keybindings.md's "Not built yet").
-            // `keys::BindingTable::dispatch` never returns an unbuilt action
-            // ([`keys::lookup`]'s own doc comment), so `self.bindings.dispatch(self.focus,
-            // key)` above can never produce one; this arm exists only because the match
-            // itself has to name every `Action` variant, the same proof-made-loud shape the
-            // `unreachable!` arm just below already uses for
-            // `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
             Some(Action::DismissVanished) => {
-                unreachable!("DismissVanished is unbuilt; dispatch never returns an unbuilt action")
+                self.dismiss_vanished_at_cursor();
+                None
             }
             // `m`: the same palette `;` opens, filtered to the built-in management operations
             // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"). Gated
@@ -1798,6 +1815,35 @@ impl App {
             index.min(visible.len() - 1)
         };
         self.follow_cursor();
+    }
+
+    /// `d`'s whole effect ([keybindings.md](../../../docs/spec/keybindings.md)): drops the
+    /// cursor row from the table via [`repon_core::Core::dismiss`] if it is Vanished, then
+    /// re-clamps the cursor onto the table the removal just shrank
+    /// ([`Self::set_cursor`]). Pressing `d` on a row that is not Vanished, or with the list
+    /// empty, is the glossary's Notice case: a keystroke that could not act
+    /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// unavailable case for a Built binding). A successful dismissal never raises a Notice,
+    /// the decision on [#171](https://github.com/paulchiu/repon/issues/171) refuses widening
+    /// the Notice definition to cover a success.
+    fn dismiss_vanished_at_cursor(&mut self) {
+        let Some(key) = self.cursor_key() else {
+            self.set_notice(CURSOR_NOT_VANISHED_NOTICE.to_string());
+            return;
+        };
+        let vanished = self
+            .core
+            .snapshot()
+            .entities
+            .into_iter()
+            .find(|entity| entity.key == key)
+            .is_some_and(|entity| entity.presence == Presence::Vanished);
+        if !vanished {
+            self.set_notice(CURSOR_NOT_VANISHED_NOTICE.to_string());
+            return;
+        }
+        self.core.dismiss(&key);
+        self.set_cursor(self.cursor);
     }
 
     /// Every currently visible row's failed state, in the same order [`Self::visible_keys`]
@@ -3368,7 +3414,7 @@ mod tests {
     // =====================================================================================
 
     /// [theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices": `current_warnings`
-    /// folds only the three standing sources, so a live Notice, even alongside a real
+    /// folds only the four standing sources, so a live Notice, even alongside a real
     /// warning, never joins its population. `w`'s expanded list ([`warnings::draw_overlay`])
     /// reads this exact same population, so this one assertion covers both the slot and the
     /// expanded list.
@@ -5054,6 +5100,163 @@ mod tests {
             "no failed row exists anywhere, so the cursor must not move"
         );
         assert_eq!(app.notice(), Some(NO_FAILED_ROWS_NOTICE));
+    }
+
+    // --- `d` builds `DismissVanished` (#171) ---
+
+    /// Deletes `repo`'s working tree and starts a fresh Generation over `app`'s `Core`,
+    /// settling it so `repo`'s row reads Vanished: the same recipe
+    /// `repon_core::core::tests::a_repo_removed_from_disk_stays_in_the_table_vanished_with_its_last_values`
+    /// uses, proven end to end through a real discovery pass rather than reaching into the
+    /// entity to flip its `presence` by hand.
+    fn vanish(app: &App, repo: &std::path::Path) {
+        std::fs::remove_dir_all(repo).expect("remove the repo from disk");
+        app.core.refresh(&[]);
+        app.core.settle(Duration::from_secs(5));
+    }
+
+    /// `d`'s successful case: the cursor sits on a Vanished row, so the row leaves the table
+    /// via `repon_core::Core::dismiss`, the cursor stays valid over the now-shorter table,
+    /// and, per the decision on
+    /// [#171](https://github.com/paulchiu/repon/issues/171), no Notice is raised for a
+    /// success.
+    #[test]
+    fn d_dismisses_the_cursor_row_when_it_is_vanished_and_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+        vanish(&app, &repo_a);
+
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "a Vanished row must stay listed until dismissed"
+        );
+        let vanished_index = snapshot
+            .entities
+            .iter()
+            .position(|entity| entity.presence == Presence::Vanished)
+            .expect("expected repo-a's row to have vanished");
+        app.set_cursor(vanished_index);
+
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("dismiss");
+
+        let after = app.core.snapshot();
+        assert_eq!(
+            after.entities.len(),
+            1,
+            "the Vanished row must leave the table"
+        );
+        assert!(
+            after
+                .entities
+                .iter()
+                .all(|entity| entity.key.path() != repo_a),
+            "the dismissed row must be repo-a's, not some other row"
+        );
+        assert_eq!(
+            app.notice(),
+            None,
+            "a successful dismissal must not raise a Notice (#171's own constraint)"
+        );
+    }
+
+    /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+    /// unavailable case: `d` is Built but the cursor row is not Vanished, so it answers with
+    /// a Notice and leaves the table untouched, the glossary's Notice scope (a keystroke that
+    /// could not act) rather than the widened definition #171 refuses.
+    #[test]
+    fn d_on_a_row_that_is_not_vanished_raises_a_notice_and_dismisses_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("dismiss");
+
+        assert_eq!(
+            app.core.snapshot().entities.len(),
+            1,
+            "a row that is not Vanished must not be dismissed"
+        );
+        assert_eq!(app.notice(), Some(CURSOR_NOT_VANISHED_NOTICE));
+    }
+
+    /// The same unavailable case with no row at all under the cursor: an empty table is not
+    /// a Vanished row either.
+    #[test]
+    fn d_with_an_empty_table_raises_a_notice_rather_than_panicking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("dismiss");
+
+        assert_eq!(app.notice(), Some(CURSOR_NOT_VANISHED_NOTICE));
+    }
+
+    /// [`CURSOR_NOT_VANISHED_NOTICE`]'s own budget, the same 44-column rule
+    /// `no_failed_rows_notice_fits_44_columns` pins `NO_FAILED_ROWS_NOTICE` against.
+    #[test]
+    fn cursor_not_vanished_notice_fits_44_columns() {
+        assert!(
+            !CURSOR_NOT_VANISHED_NOTICE.is_empty(),
+            "expected a real reason, not an empty string"
+        );
+        assert!(
+            CURSOR_NOT_VANISHED_NOTICE.len() <= 44,
+            "{CURSOR_NOT_VANISHED_NOTICE:?} is {} columns, over the 44-column budget",
+            CURSOR_NOT_VANISHED_NOTICE.len()
+        );
+    }
+
+    /// The Warning half of the same decision: `current_warnings` is built fresh every frame
+    /// from the live snapshot rather than latched, so dismissing the last Vanished row clears
+    /// the condition on its own with no acknowledgement or dismissal of the warning itself
+    /// involved ([#171](https://github.com/paulchiu/repon/issues/171)).
+    #[test]
+    fn dismissing_the_last_vanished_row_clears_the_warning_with_nothing_further_pressed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle(Duration::from_secs(5));
+        vanish(&app, &repo);
+
+        assert!(
+            app.current_warnings()
+                .iter()
+                .any(|warning| matches!(warning, warnings::Warning::Vanished(_))),
+            "expected a Vanished warning while the row is still listed"
+        );
+
+        app.set_cursor(0);
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("dismiss");
+
+        assert!(
+            !app.current_warnings()
+                .iter()
+                .any(|warning| matches!(warning, warnings::Warning::Vanished(_))),
+            "expected the Vanished warning to clear itself once the last Vanished row is gone"
+        );
     }
 
     /// The open pane is otherwise frozen at whatever row opened it
