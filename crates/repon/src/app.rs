@@ -2175,7 +2175,7 @@ impl App {
             return None;
         }
         if self.warning_overlay_open {
-            warnings::draw_overlay(frame, area, &warnings, &self.theme);
+            warnings::draw_overlay(frame, area, &warnings, &self.theme, self.glyphs);
             return None;
         }
         if let Some(palette) = &self.action_palette {

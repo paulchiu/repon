@@ -23,10 +23,11 @@
 //! class of quiet lie per-cell provenance exists to prevent
 //! ([0001](../../../../docs/adr/0001-per-cell-provenance.md)).
 
-use ratatui::{Frame, layout::Rect};
+use ratatui::{Frame, layout::Rect, text::Line};
 
 use crate::{
     config,
+    glyphs::{BorderScratch, GlyphSet},
     keys::{self, BindingTable},
     theme::{self, Theme},
 };
@@ -157,18 +158,49 @@ pub(crate) fn slot_line(warnings: &[Warning], bindings: &BindingTable) -> Option
     ))
 }
 
-/// Draws every outstanding warning, one per line, most severe first, in the same role
-/// [`crate::status_row`] paints the reserved indicator: `Action::ExpandWarning`'s whole
+/// The overlay's own top title, in the style of every other full-frame surface's border
+/// ([`crate::help::BORDER_TITLE`], [`crate::set_picker::BORDER_TITLE`]).
+pub(crate) const BORDER_TITLE: &str = " warnings ";
+
+/// The overlay's bottom-right title: the way out, since a full-frame surface with a border
+/// and no way out advertised is what this module used to be.
+pub(crate) const CLOSE_HINT: &str = " esc closes ";
+
+/// Draws every outstanding warning, one per line, most severe first, inside the same
+/// house-style bordered block every other full-frame surface draws
+/// ([`crate::help::HelpOverlay::draw`], [`crate::set_picker::SetPicker::draw`],
+/// [`crate::action_palette::ActionPalette::draw`]), in the `warn` role
+/// [`crate::status_row`] paints the reserved indicator in: `Action::ExpandWarning`'s whole
 /// reason to exist.
-pub(crate) fn draw_overlay(frame: &mut Frame, area: Rect, warnings: &[Warning], theme: &Theme) {
+pub(crate) fn draw_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    warnings: &[Warning],
+    theme: &Theme,
+    glyphs: &'static GlyphSet,
+) {
     let style = theme.style_for(theme::Role::Warn);
+    let mut scratch = BorderScratch::new();
+    let block = glyphs
+        .bordered_block(&mut scratch)
+        .border_style(style)
+        .title(BORDER_TITLE)
+        .title_bottom(Line::from(CLOSE_HINT).right_aligned());
+    let interior = block.inner(area);
+    frame.render_widget(block, area);
+
     let buf = frame.buffer_mut();
     for (row, warning) in sorted_by_severity(warnings)
         .iter()
-        .take(area.height as usize)
+        .take(interior.height as usize)
         .enumerate()
     {
-        buf.set_string(area.x, area.y + row as u16, warning.to_string(), style);
+        buf.set_string(
+            interior.x,
+            interior.y + row as u16,
+            warning.to_string(),
+            style,
+        );
     }
 }
 
@@ -394,13 +426,16 @@ mod tests {
 
     const RENDER_WIDTH: u16 = 100;
 
+    /// Draws into a frame `height` rows tall, the house-style border included: the caller
+    /// gets `height - 2` interior rows to place content in, the same subtraction
+    /// [`draw_overlay`] itself makes.
     fn render_overlay(warnings: &[Warning], height: u16) -> Vec<String> {
         let backend = TestBackend::new(RENDER_WIDTH, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_overlay(frame, area, warnings, &theme::DEFAULT);
+                draw_overlay(frame, area, warnings, &theme::DEFAULT, &crate::glyphs::FULL);
             })
             .expect("draw the overlay");
         let buffer = terminal.backend().buffer().clone();
@@ -421,11 +456,13 @@ mod tests {
             config_set_named_all(),
         ];
 
-        let lines = render_overlay(&warnings, 3);
+        // Three interior rows need a five-row frame once the border claims the top and
+        // bottom: `render_overlay`'s own doc comment.
+        let lines = render_overlay(&warnings, 5);
 
         assert!(
-            lines[0].contains(&discovery_abandoned(5).to_string()),
-            "expected the most severe condition on the first line, got: {lines:?}"
+            lines[1].contains(&discovery_abandoned(5).to_string()),
+            "expected the most severe condition on the first interior row, got: {lines:?}"
         );
         assert!(
             lines
@@ -439,6 +476,126 @@ mod tests {
                 .any(|line| line.contains("unknown theme key `a`")),
             "expected the theme warning listed, got: {lines:?}"
         );
+    }
+
+    /// The other half of "still truncate to the available height": the height that bounds
+    /// truncation is the interior's, not the whole frame's. A frame tall enough to hold every
+    /// warning before the border was added must still drop the ones that no longer fit once
+    /// two rows go to the border.
+    #[test]
+    fn the_expansion_truncates_to_the_interior_height_not_the_whole_frame_height() {
+        let warnings = vec![
+            theme_unknown_key("a"),
+            theme_unknown_key("b"),
+            theme_unknown_key("c"),
+            theme_unknown_key("d"),
+        ];
+
+        // A five-row frame has room for all four warnings before the border is drawn, and
+        // room for only three of them once the top and bottom rows are the border instead.
+        let lines = render_overlay(&warnings, 5);
+        let interior = &lines[1..4];
+
+        // Checked against the whole frame, border rows included: truncating against
+        // `area.height` instead of the interior's would still keep the fourth warning off
+        // the three rows checked above by spilling it onto the bottom border row instead,
+        // which a check scoped to `interior` alone would never see.
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(&theme_unknown_key("d").to_string())),
+            "expected the fourth warning dropped entirely once the border leaves only three \
+             interior rows, got: {lines:?}"
+        );
+        for (warning, row) in ["a", "b", "c"].iter().zip(interior) {
+            assert!(
+                row.contains(&theme_unknown_key(warning).to_string()),
+                "expected warning {warning:?} still drawn in the available interior rows, got: \
+                 {lines:?}"
+            );
+        }
+    }
+
+    /// theming.md's "panel border" role: the overlay frames itself with the active glyph
+    /// table's own characters and its own top and bottom titles, the same house style
+    /// `help.rs`, `set_picker.rs` and `action_palette.rs` each draw, and degrades with the
+    /// table under `glyphs = "ascii"`. Follows `set_picker.rs`'s
+    /// `draw_frames_the_picker_with_the_active_glyph_tables_own_border`, extended for the
+    /// second title this overlay carries.
+    #[test]
+    fn draw_overlay_frames_itself_in_the_active_glyph_tables_own_border_with_both_titles() {
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let warnings = vec![theme_unknown_key("a")];
+            let area = ratatui::layout::Rect::new(0, 0, RENDER_WIDTH, 5);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| draw_overlay(frame, frame.area(), &warnings, &theme::DEFAULT, glyphs))
+                .expect("draw the overlay");
+            let buf = terminal.backend().buffer().clone();
+            let border = glyphs.border;
+
+            assert_eq!(
+                buf[(0, 0)].symbol(),
+                border.top_left.to_string(),
+                "expected the top-left corner from the active glyph table"
+            );
+            assert_eq!(
+                buf[(area.width - 1, 0)].symbol(),
+                border.top_right.to_string(),
+                "expected the top-right corner from the active glyph table"
+            );
+            assert_eq!(
+                buf[(0, area.height - 1)].symbol(),
+                border.bottom_left.to_string(),
+                "expected the bottom-left corner from the active glyph table"
+            );
+            assert_eq!(
+                buf[(area.width - 1, area.height - 1)].symbol(),
+                border.bottom_right.to_string(),
+                "expected the bottom-right corner from the active glyph table"
+            );
+
+            let top_row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+            let expected_top_head = format!("{}{BORDER_TITLE}", border.top_left);
+            assert!(
+                top_row.starts_with(&expected_top_head),
+                "expected the top title right after the top-left corner, got {top_row:?}"
+            );
+
+            let bottom_row: String = (0..area.width)
+                .map(|x| buf[(x, area.height - 1)].symbol())
+                .collect();
+            let expected_bottom_tail = format!("{CLOSE_HINT}{}", border.bottom_right);
+            assert!(
+                bottom_row.ends_with(&expected_bottom_tail),
+                "expected the close hint right-aligned against the bottom-right corner, got \
+                 {bottom_row:?}"
+            );
+        }
+    }
+
+    /// The border must actually carry the `warn` role's colour, not merely the map saying it
+    /// should: the same proof `action_palette.rs`'s
+    /// `draw_paints_the_border_in_the_themes_warn_colour` makes for its own border.
+    #[test]
+    fn draw_overlay_paints_the_border_in_the_themes_warn_colour() {
+        let theme = Theme {
+            warn: ratatui::style::Color::Rgb(1, 2, 3),
+            ..Theme::default()
+        };
+        let warnings = vec![theme_unknown_key("a")];
+        let backend = TestBackend::new(RENDER_WIDTH, 5);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                draw_overlay(frame, frame.area(), &warnings, &theme, &crate::glyphs::FULL);
+            })
+            .expect("draw the overlay");
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].fg, theme.warn);
     }
 
     // --- criterion: every warning is reported twice, full detail to the log file. The
