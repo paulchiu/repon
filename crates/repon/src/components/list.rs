@@ -183,7 +183,7 @@ impl List {
         let mut scratch = BorderScratch::new();
         let mut block = glyphs
             .bordered_block(&mut scratch)
-            .border_style(theme::DEFAULT.style_for(theme::Role::BorderFocused))
+            .border_style(self.theme.style_for(theme::Role::BorderFocused))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
         if let Some(counter) =
@@ -199,7 +199,7 @@ impl List {
         // immediately below the border, not one row down as the full list's do.
         let first_row = if compact { 0 } else { FIRST_ENTITY_ROW };
         if !compact {
-            draw_header(buf, interior);
+            draw_header(buf, interior, &self.theme);
         }
         if row_order.is_empty() {
             // Nothing to draw below the header: say so rather than leaving a bordered box
@@ -219,7 +219,7 @@ impl List {
                     y,
                     interior.width,
                     message,
-                    theme::DEFAULT.style_for(theme::Role::Dim),
+                    self.theme.style_for(theme::Role::Dim),
                 );
             }
         }
@@ -229,6 +229,11 @@ impl List {
         // leaving at least the last row drawn whenever there is any row at all.
         let skip = row_order.len().saturating_sub(1).min(self.offset);
         let cursor_screen_row = self.cursor_screen_row(skip);
+        let ctx = RowContext {
+            glyphs,
+            loading_frame,
+            theme: &self.theme,
+        };
         for (screen_row, entity) in row_order
             .into_iter()
             .skip(skip)
@@ -245,9 +250,9 @@ impl List {
             }
             let checked = self.selection.contains(&entity.key);
             if compact {
-                draw_row_compact(buf, interior, y, entity, glyphs, loading_frame, checked);
+                draw_row_compact(buf, interior, y, entity, checked, &ctx);
             } else {
-                draw_row(buf, interior, y, entity, glyphs, loading_frame, checked);
+                draw_row(buf, interior, y, entity, checked, &ctx);
             }
             // Painted after the row's own cells, over the row's full interior width, so it
             // reaches every column and every gap between them rather than only the cells a
@@ -563,8 +568,9 @@ fn draw_name_cell(
     y: u16,
     entity: &EntityState,
     glyphs: &'static GlyphSet,
+    theme: &Theme,
 ) {
-    let name_style = theme::DEFAULT.style_for(name_cell_meaning(entity.kind).role());
+    let name_style = theme.style_for(name_cell_meaning(entity.kind).role());
     if is_child_row(entity.kind) {
         let marker_x = interior.x + NAME_X + CHILD_ROW_INDENT_WIDTH;
         write_cell(
@@ -599,11 +605,11 @@ fn draw_name_cell(
     }
 }
 
-fn draw_header(buf: &mut Buffer, interior: Rect) {
+fn draw_header(buf: &mut Buffer, interior: Rect, theme: &Theme) {
     let y = interior.y + HEADER_ROW;
     // A column header is `dim` per theming.md's meaning-to-role map, a foreground colour
     // rather than the DIM text attribute this used to draw with.
-    let style = theme::DEFAULT.style_for(theme::Role::Dim);
+    let style = theme.style_for(theme::Role::Dim);
     write_cell(
         buf,
         interior,
@@ -662,17 +668,17 @@ fn draw_header(buf: &mut Buffer, interior: Rect) {
 
 /// Writes the Selection's own marker at [`SELECTED_X`]: `glyphs.checked` for a checked row,
 /// a blank cell otherwise. Shared by [`draw_row`] and [`draw_row_compact`] so the full list
-/// and the sidebar can never disagree about which rows carry it. [`Theme::checked_style`]
-/// names no colour, so this reads `theme::DEFAULT` the same way every other free-function
-/// cell style in this file does rather than threading a live `Theme` through, which is what
-/// keeps `List::set_theme` reaching only [`Theme::selection_style`]
-/// (this module's own "Criterion 2" test notes the gap).
+/// and the sidebar can never disagree about which rows carry it. Takes the live `theme` the
+/// same way every other free-function cell style in this file now does, even though
+/// [`Theme::checked_style`] names no colour today: a theme file reaching every cell means
+/// every cell, this one included, rather than one glyph left on `theme::DEFAULT`.
 fn draw_selected_marker(
     buf: &mut Buffer,
     interior: Rect,
     y: u16,
     checked: bool,
     glyphs: &'static GlyphSet,
+    theme: &Theme,
 ) {
     let marker = if checked {
         glyphs.checked.to_string()
@@ -686,8 +692,21 @@ fn draw_selected_marker(
         y,
         SELECTED_WIDTH,
         &marker,
-        theme::DEFAULT.checked_style(),
+        theme.checked_style(),
     );
+}
+
+/// What every row drawn this tick shares: the active glyph table, this frame's own loading
+/// mark and the live theme. Bundled into one argument rather than three so this crate's own
+/// `clippy::too_many_arguments` budget has room for `entity` and `checked` alongside the
+/// row's own geometry, the same reason `action_palette.rs`'s own `Run` bundles its fields.
+/// Built once per frame in [`List::render`], not held on `List`: `loading_frame` is this
+/// tick's own spinner frame, recomputed on every draw.
+#[derive(Clone, Copy)]
+struct RowContext<'a> {
+    glyphs: &'static GlyphSet,
+    loading_frame: char,
+    theme: &'a Theme,
 }
 
 fn draw_row(
@@ -695,10 +714,14 @@ fn draw_row(
     interior: Rect,
     y: u16,
     entity: &EntityState,
-    glyphs: &'static GlyphSet,
-    loading_frame: char,
     checked: bool,
+    ctx: &RowContext,
 ) {
+    let RowContext {
+        glyphs,
+        loading_frame,
+        theme,
+    } = *ctx;
     let row_summary = summary(entity);
     let gutter = gutter_glyph_for(row_summary, glyphs, loading_frame).to_string();
     // While the row holds no value at all, its one spinner already lives in the gutter
@@ -721,8 +744,8 @@ fn draw_row(
         &gutter,
         Style::new(),
     );
-    draw_selected_marker(buf, interior, y, checked, glyphs);
-    draw_name_cell(buf, interior, y, entity, glyphs);
+    draw_selected_marker(buf, interior, y, checked, glyphs, theme);
+    draw_name_cell(buf, interior, y, entity, glyphs, theme);
     write_cell(
         buf,
         interior,
@@ -730,7 +753,7 @@ fn draw_row(
         y,
         BRANCH_WIDTH,
         &format_head(&entity.branch, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.branch.settled(),
             |_| Meaning::FreshValue,
             cell_loading_glyph,
@@ -744,7 +767,7 @@ fn draw_row(
         SYNC_WIDTH,
         &sync_cell_runs(&entity.sync, glyphs, cell_loading_glyph)
             .into_iter()
-            .map(|(text, role)| (text, theme::DEFAULT.style_for(role)))
+            .map(|(text, role)| (text, theme.style_for(role)))
             .collect::<Vec<_>>(),
     );
     write_cell(
@@ -754,7 +777,7 @@ fn draw_row(
         y,
         BASE_WIDTH,
         &format_base(&entity.base, glyphs, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.base.settled(),
             base_meaning,
             cell_loading_glyph,
@@ -767,7 +790,7 @@ fn draw_row(
         y,
         DIRTY_WIDTH,
         &format_dirty(&entity.dirty, glyphs, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.dirty.settled(),
             dirty_meaning,
             cell_loading_glyph,
@@ -780,7 +803,7 @@ fn draw_row(
         y,
         STATE_WIDTH,
         &format_state(&entity.state, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.state.settled(),
             state_meaning,
             cell_loading_glyph,
@@ -800,10 +823,14 @@ fn draw_row_compact(
     interior: Rect,
     y: u16,
     entity: &EntityState,
-    glyphs: &'static GlyphSet,
-    loading_frame: char,
     checked: bool,
+    ctx: &RowContext,
 ) {
+    let RowContext {
+        glyphs,
+        loading_frame,
+        theme,
+    } = *ctx;
     let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
     write_cell(
         buf,
@@ -814,8 +841,8 @@ fn draw_row_compact(
         &gutter,
         Style::new(),
     );
-    draw_selected_marker(buf, interior, y, checked, glyphs);
-    draw_name_cell(buf, interior, y, entity, glyphs);
+    draw_selected_marker(buf, interior, y, checked, glyphs, theme);
+    draw_name_cell(buf, interior, y, entity, glyphs, theme);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -2785,6 +2812,59 @@ mod tests {
         );
     }
 
+    // --- the list's own live-theme reach: `List::set_theme` used to reach only
+    // `Theme::selection_style` for the cursor row, leaving the border, the header and every
+    // value cell painted through `theme::DEFAULT` regardless of what was loaded. Following
+    // `components/detail.rs`'s own `draw_paints_the_border_from_the_live_theme_not_the_
+    // compiled_default`: distinct `Rgb` colours the compiled default never uses, so a call
+    // site that still read `theme::DEFAULT` by mistake could not pass by coincidence.
+
+    /// Criterion 3, done: a theme file's own colours reach the border, the column header and
+    /// a value cell alike.
+    #[test]
+    fn a_live_themes_own_colours_reach_the_border_the_column_header_and_a_value_cell() {
+        let snapshot = settled_snapshot_with_an_ahead_and_behind_sync();
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        let live_theme = Theme {
+            border_focused: Color::Rgb(9, 8, 7),
+            dim: Color::Rgb(11, 22, 33),
+            text: Color::Rgb(44, 55, 66),
+            ok: Color::Rgb(77, 88, 99),
+            ..Theme::default()
+        };
+        let mut list = List::default();
+        list.set_theme(live_theme);
+        // Off the cursor row, the same way the ahead/behind test above is: the cursor's own
+        // reverse-video highlight would otherwise force a uniform foreground onto row 0
+        // before this test ever gets to read it.
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            live_theme.border_focused,
+            "the border must read the live theme, not theme::DEFAULT"
+        );
+        assert_eq!(
+            buf[(absolute_x(NAME_X), 1)].fg,
+            live_theme.dim,
+            "the column header must read the live theme"
+        );
+        assert_eq!(
+            buf[(absolute_x(NAME_X), y)].fg,
+            live_theme.text,
+            "the name cell must read the live theme"
+        );
+        assert_eq!(
+            buf[(absolute_x(SYNC_X), y)].fg,
+            live_theme.ok,
+            "the ahead count cell must read the live theme"
+        );
+    }
+
     #[test]
     fn sync_value_runs_gives_an_ahead_and_a_behind_count_each_their_own_meaning_in_one_cell() {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
@@ -4348,11 +4428,9 @@ mod tests {
     // distinct once colour is set aside. `NO_COLOR` strips colour only, never glyphs
     // (theming.md's own "Colour is never the only carrier"), so the honest proof reads each
     // pair's plain text (`cell_text`, which never looks at `.fg`) rather than swapping in a
-    // monochrome `Theme`: every per-`Meaning` role in `draw_row` still paints through
-    // `theme::DEFAULT` unconditionally rather than a live theme `App` threads through
-    // (`List::set_theme` only reaches `Theme::selection_style` for the cursor row), a
-    // pre-existing gap this ticket leaves for whichever ticket finishes wiring a live theme
-    // into the rest of this component.
+    // monochrome `Theme`. `draw_row` now paints every per-`Meaning` role through `self.theme`,
+    // the live theme `App` threads through: see the test proving that reach, further down
+    // this file, under "the list's own live-theme reach".
 
     #[test]
     fn ahead_and_behind_read_as_distinct_counts_once_colour_is_set_aside() {
