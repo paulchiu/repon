@@ -626,11 +626,19 @@ fn delete_one(
             })
         }
         Kind::Worktree => {
+            // Read before either removal runs: once the working tree is gone, its own
+            // `.git` file is gone with it and the admin dir can no longer be found.
             let admin_dir = worktree_admin_dir(&target.key);
+            // The working tree first, the admin dir second: the same order
+            // `git worktree remove` itself uses, so a failure part-way through (a
+            // permissions error inside `remove_dir_all`, say) leaves the parent still
+            // knowing about a Worktree whose own directory is gone, never the reverse:
+            // a directory on disk the parent has already forgotten and whose `.git`
+            // file now dangles, which `git worktree repair` cannot fix.
+            remove_working_tree(target.key.path())?;
             if let Some(admin_dir) = &admin_dir {
                 let _ = fs::remove_dir_all(admin_dir);
             }
-            remove_working_tree(target.key.path())?;
             let config_entry_removed =
                 repo_entry::write(config_file, target.key.path(), Edit::Remove)?;
             Ok(if admin_dir.is_some() {
@@ -892,6 +900,42 @@ mod tests {
             Outcome::WorktreeRemoved {
                 config_entry_removed: false
             }
+        );
+    }
+
+    /// The order matters, not just the end state: `git worktree remove` itself removes the
+    /// working tree before the administrative entry, so a failure part-way leaves the
+    /// parent still knowing about a Worktree whose own directory is gone, never the
+    /// reverse. The two orders produce the same end state on the happy path and differ
+    /// only when the working tree's own removal fails, which is what this pins.
+    #[test]
+    fn deleting_a_worktree_removes_the_working_tree_before_the_admin_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        // No `.git` marker: `remove_working_tree`'s own guard refuses this path outright,
+        // so the working tree's own removal fails before anything is deleted.
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("create a worktree fixture with no .git marker");
+        let admin_dir = dir.path().join("admin");
+        std::fs::create_dir_all(&admin_dir).expect("create the admin dir fixture");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+        );
+
+        assert!(
+            matches!(report.records[0].outcome, Outcome::Failed(_)),
+            "the working tree's own removal must fail first, got {:?}",
+            report.records[0].outcome
+        );
+        assert!(
+            admin_dir.exists(),
+            "the admin dir must still be there: removing the working tree comes first, and \
+             it never got the chance to succeed"
         );
     }
 
