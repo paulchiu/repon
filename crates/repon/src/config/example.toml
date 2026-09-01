@@ -28,12 +28,14 @@ enabled = true             # fast-forward only, rides the fetch cycle
 name = "dev"
 roots = ["~/dev", "~/dev-misc"]
 
-# One client, minus the graveyard. Globs are case-sensitive.
+# One client, minus the graveyard. Globs are case-sensitive. Its own on_refresh
+# runs reinstall instead of the top-level sync while this Set is active.
 [[set]]
 name = "work"
 roots = ["~/dev"]
 include = ["**/acme/**"]
 exclude = ["**/archive/**", "**/node_modules/**"]
+on_refresh = "reinstall"
 
 # origin/HEAD on this one still says master; pin it.
 [[repo]]
