@@ -6,7 +6,7 @@
 
 **2. Pull the issue and work in a worktree.** Read it with `gh issue view <number> --comments`, then branch into a worktree of its own rather than working in place. Reach for the cheapest subagent that can do the job, and a workflow only when the work genuinely fans out.
 
-**3. Ship it.** Once `just ci` passes, push, open the PR, merge. Then either publish a new version or install locally so it can be tried.
+**3. Ship it.** Once `just ci` passes, push, open the PR, merge. On `main`, after the merge, bump the patch version with `cargo set-version --workspace 0.1.<n>` and commit it: this is the ship step's job, not the feature branch's, since every branch working off the same `main` would otherwise bump to the same number and collide on `Cargo.toml` and `Cargo.lock` for no reason. Then either publish a new version or install locally so it can be tried.
 
 ## What you need to know first
 
