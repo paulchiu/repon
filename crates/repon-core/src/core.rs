@@ -981,6 +981,29 @@ impl Core {
         })
     }
 
+    /// The administrative directory `git worktree remove` deletes for `key`'s own linked
+    /// Worktree, read fresh right now. `Err` when `key`'s own path cannot even be opened as
+    /// a git repository, which is what "the parent Repo is gone or unreadable" means for a
+    /// `delete` on a Worktree row
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "What `delete` does to a Worktree"): the caller falls back to removing the working
+    /// directory alone.
+    pub fn worktree_admin_dir(&self, key: &EntityKey) -> Result<PathBuf, git::ProbeError> {
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        Ok(git::worktree_admin_dir(&repo))
+    }
+
+    /// Every linked Worktree's own working directory pointing into `key`'s Repo, read
+    /// fresh right now: what deleting a Repo needs to also remove, since each linked
+    /// Worktree's directory sits outside the Repo's own and is untouched by removing that
+    /// alone
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "Deleting a Repo also takes its linked Worktrees with it").
+    pub fn linked_worktree_paths(&self, key: &EntityKey) -> Result<Vec<PathBuf>, git::ProbeError> {
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        git::linked_worktree_paths(&repo)
+    }
+
     /// Drops one entity from the table, cancelling any probe in flight against it.
     pub fn dismiss(&self, key: &EntityKey) {
         let mut table = self.table.write().unwrap();
@@ -11905,5 +11928,123 @@ mod tests {
                 linked_worktrees: 0,
             }
         );
+    }
+
+    // =====================================================================================
+    // `worktree_admin_dir` and `linked_worktree_paths`: what `delete` needs to remove a
+    // linked Worktree the way `git worktree remove` does, and to take a Repo's own linked
+    // Worktrees with it. Every repository here is built in a temp directory this test owns.
+    // =====================================================================================
+
+    /// The administrative directory named for a Worktree row is the one `git worktree list`
+    /// stops naming once it is gone, proven by removing exactly that directory by hand.
+    #[test]
+    fn worktree_admin_dir_names_the_entry_git_worktree_list_forgets_once_it_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let worktree = root.join("sidecar");
+        crate::test_support::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sidecar",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let key = core
+            .settle(Duration::from_secs(10))
+            .entities
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Worktree)
+            .expect("the Worktree row is discovered")
+            .key;
+
+        let admin_dir = core.worktree_admin_dir(&key).expect("read the admin dir");
+        fs::remove_dir_all(&admin_dir).expect("remove the admin dir by hand");
+
+        let reopened = git::open_thread_safe(&repo)
+            .expect("reopen the repo")
+            .to_thread_local();
+        assert_eq!(
+            git::linked_worktrees(&reopened).expect("count"),
+            0,
+            "removing the admin dir alone must be what git's own register stops naming"
+        );
+    }
+
+    /// A Worktree whose own path is not a git repository at all (the fixture for "the parent
+    /// Repo is gone or unreadable"): the read errors rather than naming a directory that was
+    /// never a Worktree's own administrative entry.
+    #[test]
+    fn worktree_admin_dir_errors_when_the_path_cannot_be_opened_as_a_repository() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let not_a_repo = root.join("plain-directory");
+        fs::create_dir_all(&not_a_repo).expect("create it");
+
+        let core = Core::start_discovered(spec(vec![root]));
+        core.settle(Duration::from_secs(10));
+        let key = EntityKey::new(Arc::from(not_a_repo.as_path()));
+
+        assert!(core.worktree_admin_dir(&key).is_err());
+    }
+
+    /// Every linked Worktree's own working directory, named by path rather than merely
+    /// counted, for the Repo deletion cascade to remove.
+    #[test]
+    fn linked_worktree_paths_names_every_linked_worktrees_own_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let first = root.join("first-worktree");
+        let second = root.join("second-worktree");
+        crate::test_support::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "one",
+                first.to_str().expect("utf8 path"),
+            ],
+        );
+        crate::test_support::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "two",
+                second.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let key = core
+            .settle(Duration::from_secs(10))
+            .entities
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Repo)
+            .expect("the Repo row is discovered")
+            .key;
+
+        let mut paths = core
+            .linked_worktree_paths(&key)
+            .expect("read the linked worktree paths");
+        paths.sort();
+        let mut expected = vec![
+            first.canonicalize().expect("canonicalize first"),
+            second.canonicalize().expect("canonicalize second"),
+        ];
+        expected.sort();
+
+        assert_eq!(paths, expected);
     }
 }

@@ -570,7 +570,7 @@ pub(crate) fn dirty_counts(
 
 /// How many linked Worktrees point into `repo`, read from git's own
 /// `<common dir>/worktrees` register rather than from any table of discovered entities: one
-/// living outside the active Set's roots is still orphaned by deleting the Repo it is linked
+/// living outside the active Set's roots is still destroyed by deleting the Repo it is linked
 /// from ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
 /// confirm gate). The main worktree is never among them, which is why a Repo with no linked
 /// Worktree at all counts zero.
@@ -578,6 +578,34 @@ pub(crate) fn linked_worktrees(repo: &gix::Repository) -> Result<u32, ProbeError
     repo.worktrees()
         .map(|worktrees| worktrees.len() as u32)
         .map_err(|error| ProbeError::Read(error.to_string().into()))
+}
+
+/// Every linked Worktree's own working directory pointing into `repo`, read the same way
+/// [`linked_worktrees`] counts them. A base that will not read (a corrupt `gitdir` file) is
+/// dropped rather than failing the whole list, since a Worktree this broken cannot be acted
+/// on by path anyway.
+///
+/// What deleting a Repo needs to also remove
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "Deleting a Repo also takes its linked Worktrees with it"): each linked Worktree's own
+/// directory sits outside the Repo's, so removing the Repo's working tree alone never
+/// touches it.
+pub(crate) fn linked_worktree_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>, ProbeError> {
+    Ok(repo
+        .worktrees()
+        .map_err(|error| ProbeError::Read(error.to_string().into()))?
+        .into_iter()
+        .filter_map(|worktree| worktree.base().ok())
+        .collect())
+}
+
+/// The administrative directory `git worktree remove` deletes for the linked Worktree
+/// `repo` was opened from: its own git dir, distinct from [`gix::Repository::common_dir`],
+/// which names the shared object store instead
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "What `delete` does to a Worktree").
+pub(crate) fn worktree_admin_dir(repo: &gix::Repository) -> PathBuf {
+    repo.git_dir().to_path_buf()
 }
 
 /// Whether `repo`'s index differs from `HEAD`: the half [`dirty_counts`] deliberately does
@@ -946,6 +974,72 @@ mod tests {
         assert!(matches!(worktree_resolved.kind, Kind::Worktree));
         assert!(matches!(parent_resolved.kind, Kind::Repo));
         assert_eq!(worktree_resolved.common_dir, parent_resolved.common_dir);
+    }
+
+    /// [`linked_worktree_paths`] names the same Worktree [`linked_worktrees`] merely
+    /// counts, opened from either side of the pair: the parent Repo and one of its own
+    /// linked Worktrees share one `<common dir>/worktrees` register.
+    #[test]
+    fn linked_worktree_paths_names_the_worktree_linked_worktrees_counts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree = root.join("worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let repo = open_thread_safe(&parent).expect("open parent");
+        let repo = repo.to_thread_local();
+
+        assert_eq!(linked_worktrees(&repo).expect("count"), 1);
+        assert_eq!(linked_worktree_paths(&repo).expect("paths"), vec![worktree]);
+    }
+
+    /// The one fact that tells a Worktree's own administrative entry apart from the
+    /// shared object store: `git_dir()` names the former, `common_dir()` the latter, and
+    /// only the former is what `git worktree remove` deletes for one Worktree alone.
+    #[test]
+    fn worktree_admin_dir_is_the_worktrees_own_git_dir_not_the_shared_common_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let parent = dir.path().join("parent");
+        init_repo_with_a_commit(&parent);
+        let worktree = dir.path().join("worktree");
+        git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let repo = open_thread_safe(&worktree).expect("open worktree");
+        let repo = repo.to_thread_local();
+
+        let admin_dir = worktree_admin_dir(&repo)
+            .canonicalize()
+            .expect("canonicalize admin dir");
+        let common_dir = repo
+            .common_dir()
+            .canonicalize()
+            .expect("canonicalize common dir");
+        assert_ne!(admin_dir, common_dir);
+        assert!(
+            admin_dir.starts_with(common_dir.join("worktrees")),
+            "expected {admin_dir:?} under {:?}",
+            common_dir.join("worktrees")
+        );
     }
 
     #[test]
