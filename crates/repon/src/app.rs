@@ -911,16 +911,22 @@ impl App {
                 overlay.apply(action, content_len, viewport_height);
             };
             if overlay.is_searching() {
-                // Backspace is looked up in `Context::Input` so the query shares the one
-                // compiled row every other text surface edits through, rather than growing a
-                // second Backspace of its own. It is checked before `printable` for the same
-                // reason `printable` is checked before `Context::Overlay`: an editing key
-                // belongs to the query while the query is open.
-                if matches!(
-                    self.bindings.dispatch(Context::Input, key),
-                    Some(Action::DeletePreviousChar)
-                ) {
+                // Backspace and Ctrl+W are looked up in `Context::Input` so the query shares
+                // the one compiled row every other text surface edits through, rather than
+                // growing a second copy of either of its own. Neither is a `match` over the
+                // full input vocabulary: help's query answers only these two chords through
+                // this row, never `Apply`/`Cancel`/`ClearLine` and the rest, so it stays
+                // outside `app.rs`'s own input-handler exhaustiveness scan
+                // (`every_input_handler_names_every_action_the_input_context_dispatches`),
+                // which is reserved for a surface's full editing vocabulary. Both are checked
+                // before `printable` for the same reason `printable` is checked before
+                // `Context::Overlay`: an editing key belongs to the query while the query is
+                // open.
+                let input_action = self.bindings.dispatch(Context::Input, key);
+                if matches!(input_action, Some(Action::DeletePreviousChar)) {
                     overlay.pop_query_char();
+                } else if matches!(input_action, Some(Action::DeletePreviousWord)) {
+                    overlay.delete_previous_word();
                 } else if let Some(c) = keys::printable(key) {
                     overlay.push_query_char(c);
                 } else {
@@ -3434,6 +3440,70 @@ mod tests {
         assert!(
             overlay.is_searching(),
             "backspace on an empty query must not leave search mode"
+        );
+        assert_eq!(overlay.query(), "");
+    }
+
+    /// `Ctrl+W` edits help's own query through the same `Context::Input` row Backspace
+    /// already reads, cutting a whole trailing word rather than one character. Asserted on
+    /// the query the surface actually holds, and on the rendered content length, so a
+    /// `Ctrl+W` that edited the buffer without re-filtering would fail here.
+    #[test]
+    fn ctrl_w_deletes_one_word_of_helps_query_and_re_filters() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "move extra".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the query");
+        }
+        let narrowed_to_nothing = {
+            let overlay = app.help.as_ref().expect("help is open");
+            assert_eq!(overlay.query(), "move extra");
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query()).len()
+        };
+
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("ctrl+w");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(overlay.is_searching(), "ctrl+w must not leave search mode");
+        assert_eq!(overlay.query(), "move ");
+        let widened =
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query())
+                .len();
+        assert!(
+            widened > narrowed_to_nothing,
+            "deleting the trailing \"extra\" must widen the filtered list: \
+             {narrowed_to_nothing} lines before, {widened} after"
+        );
+    }
+
+    /// `Ctrl+W` on an empty query is inert, and specifically is not a second way out of
+    /// search mode or out of help.
+    #[test]
+    fn ctrl_w_on_an_empty_help_query_is_inert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("ctrl+w on an empty query");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(
+            overlay.is_searching(),
+            "ctrl+w on an empty query must not leave search mode"
         );
         assert_eq!(overlay.query(), "");
     }

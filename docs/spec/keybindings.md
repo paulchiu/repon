@@ -231,7 +231,7 @@ Help opens in reading mode, `overlay`'s own original shape: `q` and `Esc` close 
 
 The expanded warning list and the Set picker are unaffected: `Action::Search` is help's own addition to `overlay`'s vocabulary, and neither of the other two reads it out of their own key handler, so it does nothing for either.
 
-Backspace edits the query, looked up in `input`'s own table rather than added to `overlay`'s, so help's query deletes a character through the one compiled row every other text surface reads. It is checked before the printable test for the same reason the printable test comes before `overlay`'s own bindings: while the query is open, an editing key belongs to it. On an empty query it does nothing, so it is not a second way out of search mode.
+Backspace and `Ctrl+W` edit the query, looked up in `input`'s own table rather than added to `overlay`'s, so help's query deletes a character or a word through the one compiled row every other text surface reads. This borrows two of `input`'s chords without making help an `input`-context surface itself: the overlay's own context stays `overlay` throughout, so it is not counted among the surfaces the contexts table names for `input` above. Both are checked before the printable test for the same reason the printable test comes before `overlay`'s own bindings: while the query is open, an editing key belongs to it. Neither reaches for the rest of `input`'s vocabulary: `Ctrl+D` and `Ctrl+U` keep their `overlay` half-page meaning rather than becoming Clear the line, so the query has no `Ctrl+U` shortcut of its own yet. On an empty query, Backspace and `Ctrl+W` both do nothing, so neither is a second way out of search mode.
 
 ### The help overlay's own chrome
 

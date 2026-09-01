@@ -30,6 +30,7 @@ use ratatui::{
     text::Line,
 };
 
+use crate::edit_buffer;
 use crate::glyphs::{BorderScratch, GlyphSet, Meaning, bordered_interior};
 use crate::keys::{Action, BindingTable, Context};
 use crate::scroll::scroll_after;
@@ -431,6 +432,13 @@ impl HelpOverlay {
     /// empty query, which keeps it from being a second way to leave search mode.
     pub(crate) fn pop_query_char(&mut self) {
         self.query.pop();
+        self.scroll = 0;
+    }
+
+    /// `Ctrl+W`: deletes one trailing whitespace-delimited word from the query, the same
+    /// `Context::Input`/`DeletePreviousWord` row every other text surface reads.
+    pub(crate) fn delete_previous_word(&mut self) {
+        edit_buffer::delete_previous_word(&mut self.query);
         self.scroll = 0;
     }
 
@@ -1150,6 +1158,73 @@ mod tests {
         assert_eq!(overlay.scroll, 1);
         overlay.enter_search();
         overlay.push_query_char('m');
+        assert_eq!(overlay.scroll, 0);
+    }
+
+    // --- Criterion: `Ctrl+W` removes one trailing whitespace-delimited word from the query,
+    // the same pair `filter_line.rs` proves its own `delete_previous_word` with ---
+
+    #[test]
+    fn delete_previous_word_removes_one_trailing_whitespace_delimited_word() {
+        let mut overlay = HelpOverlay::default();
+        overlay.enter_search();
+        for c in "kind:worktree is:dirty".chars() {
+            overlay.push_query_char(c);
+        }
+
+        overlay.delete_previous_word();
+
+        assert_eq!(overlay.query(), "kind:worktree ");
+    }
+
+    /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
+    /// three, so a cut derived by adding one byte to the separator's start lands inside a
+    /// character; the accented letters pin that a multi-byte *non*-whitespace character
+    /// before the cut survives it.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let mut overlay = HelpOverlay::default();
+        overlay.enter_search();
+        for c in "café\u{00A0}naïve".chars() {
+            overlay.push_query_char(c);
+        }
+
+        overlay.delete_previous_word();
+
+        assert_eq!(overlay.query(), "café\u{00A0}");
+
+        for c in "naïve\u{2003}encore".chars() {
+            overlay.push_query_char(c);
+        }
+
+        overlay.delete_previous_word();
+
+        assert_eq!(overlay.query(), "café\u{00A0}naïve\u{2003}");
+    }
+
+    #[test]
+    fn delete_previous_word_on_an_empty_query_leaves_it_empty_and_does_not_panic() {
+        let mut overlay = HelpOverlay::default();
+        overlay.enter_search();
+
+        overlay.delete_previous_word();
+
+        assert_eq!(overlay.query(), "");
+        assert!(overlay.is_searching());
+    }
+
+    #[test]
+    fn delete_previous_word_snaps_the_scroll_back_to_the_top() {
+        let mut overlay = HelpOverlay::default();
+        overlay.enter_search();
+        for c in "move extra".chars() {
+            overlay.push_query_char(c);
+        }
+        overlay.apply(Action::ScrollDown, 20, 5);
+        assert_eq!(overlay.scroll, 1);
+
+        overlay.delete_previous_word();
+
         assert_eq!(overlay.scroll, 0);
     }
 
