@@ -195,9 +195,9 @@ The anchors are measured. Boundary-stop discovery costs 0.19s over `~/dev` (309 
 
 ## State
 
-`state.toml` lives in the data directory, never in the config directory. It is a map of scope to state, where the scope is the active Set's name, or the absolute working directory when running zero-config, so two contexts cannot restore each other's Selection. Each scope holds `selection` (a list of names) and `filter` (a string).
+`state.toml` lives in the data directory, never in the config directory. It is a map of scope to state, where the scope is the active Set's name, or the absolute working directory when running zero-config, so two contexts cannot restore each other's Selection. Each scope holds `selection` (a list of names), `filter` (a string) and `sort` (the chosen column and direction, or `Natural`, absent for a scope nothing has ever sorted).
 
-Any parse failure or unreadable file is treated as absent with no warning, because deleting it is a supported reset ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Selection restores by name and unknown names drop silently. A restored Filter announces its match count.
+Any parse failure or unreadable file is treated as absent with no warning, because deleting it is a supported reset ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Selection restores by name and unknown names drop silently. A restored Filter announces its match count. A scope with no `sort` recorded, whether the file predates the field or was never written, opens sorted by name ascending rather than the natural grouped order ([0030](../adr/0030-the-table-has-an-order-the-user-chooses.md)'s amendment).
 
 Across all 403 boundary-stopped entities in the two measured roots, zero names collide, so name-keying is unambiguous there. It is not unambiguous in general, which is why the scope key exists.
 

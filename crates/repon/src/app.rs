@@ -436,11 +436,14 @@ pub struct App {
     /// session, then never cleared: a later refresh key press replaces it rather than
     /// leaving a gap.
     refresh_run: Option<RefreshRun>,
-    /// The order the table is listed in. Session state, never persisted and never read from
-    /// config: a restart opens on the natural grouped order
-    /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
-    /// Nothing but `Action::SortNatural` and the six column actions writes it, so a Refresh,
-    /// a Filter and a Set switch all leave it standing.
+    /// The order the table is listed in. Session state, restored at startup and persisted to
+    /// `state.toml` on quit beside the Selection and the Filter
+    /// ([`Self::restore_session_state`], [`Self::persist_state`]); never read from config. A
+    /// restart with nothing stored opens name ascending, `RowOrder::cold_start`, not the
+    /// natural grouped order
+    /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+    /// amendment). Nothing but `Action::SortNatural` and the six column actions writes it in
+    /// session, so a Refresh, a Filter and a Set switch all leave it standing.
     row_order: RowOrder,
     /// `true` while the sort menu has focus, opened by `Action::OpenSortMenu` (`o`) and
     /// closed by any of its own keys. The table keeps its current order underneath, so
@@ -634,6 +637,7 @@ impl App {
             Some(text) => Filter::parse(text),
             None => Filter::parse(&scope_state.filter),
         };
+        self.row_order = scope_state.sort.unwrap_or_else(RowOrder::cold_start);
         if self.filter.is_active() {
             let match_count = self.visible_keys().len();
             self.set_notice(restored_filter_notice(&self.filter, match_count));
@@ -641,8 +645,8 @@ impl App {
     }
 
     /// Writes this scope's whole session state to `state.toml`, leaving every other scope's
-    /// own entry untouched: the checked rows by name and the committed Filter's own
-    /// expression, nothing `self.core` computed from git
+    /// own entry untouched: the checked rows by name, the committed Filter's own expression,
+    /// and the table's `RowOrder`, nothing `self.core` computed from git
     /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Called
     /// on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the same
     /// grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session is
@@ -653,6 +657,7 @@ impl App {
         let scope_state = state::ScopeState {
             selection: self.selection.names(entities),
             filter: self.filter.as_str().to_string(),
+            sort: Some(self.row_order),
         };
         let mut file = state::load(&self.data_dir);
         file.set_scope(self.scope_key(), scope_state);
@@ -11166,7 +11171,7 @@ refresh_all = "z""#,
     /// content rather than a round trip that would pass just as happily if a git-derived
     /// field were also written.
     #[test]
-    fn persisting_writes_only_the_selection_names_and_the_filter_string() {
+    fn persisting_writes_only_the_selection_names_the_filter_string_and_the_sort() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -11177,14 +11182,20 @@ refresh_all = "z""#,
         let repo_a_key = app.core.snapshot().entities[0].key.clone();
         app.selection.toggle(repo_a_key);
         app.filter = Filter::parse("kind:worktree");
+        app.row_order = RowOrder::By {
+            column: SortColumn::Dirty,
+            direction: crate::sort::Direction::Descending,
+        };
         app.persist_state();
 
         let text =
             std::fs::read_to_string(state_dir.path().join("state.toml")).expect("read state.toml");
         assert_eq!(
             text.trim(),
-            "[test]\nselection = [\"repo-a\"]\nfilter = \"kind:worktree\"",
-            "expected exactly the Selection's names and the Filter string, nothing else: {text:?}"
+            "[test]\nselection = [\"repo-a\"]\nfilter = \"kind:worktree\"\n\n\
+             [test.sort.by]\ncolumn = \"dirty\"\ndirection = \"descending\"",
+            "expected exactly the Selection's names, the Filter string and the sort, nothing \
+             else: {text:?}"
         );
     }
 
@@ -11411,5 +11422,110 @@ refresh_all = "z""#,
         app.restore_session_state(None);
 
         assert_eq!(app.notice(), None);
+    }
+
+    /// The issue's own first Done-when: a cold start with no `state.toml` at all sorts by
+    /// name ascending rather than opening on the natural grouped order
+    /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+    /// amendment).
+    #[test]
+    fn a_cold_start_with_no_state_toml_sorts_by_name_ascending() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("temp dir with no state.toml");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.restore_session_state(None);
+
+        assert_eq!(
+            app.row_order,
+            RowOrder::By {
+                column: SortColumn::Name,
+                direction: crate::sort::Direction::Ascending,
+            }
+        );
+    }
+
+    /// A `state.toml` written by an older build, with `selection` and `filter` but no `sort`
+    /// key at all, loads and gets the same new default rather than failing or reading back
+    /// as `Natural`.
+    #[test]
+    fn an_older_builds_state_toml_with_no_sort_recorded_gets_the_new_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+        std::fs::write(
+            state_dir.path().join("state.toml"),
+            "[test]\nselection = []\nfilter = \"\"\n",
+        )
+        .expect("write a pre-sort state.toml");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.restore_session_state(None);
+
+        assert_eq!(
+            app.row_order,
+            RowOrder::By {
+                column: SortColumn::Name,
+                direction: crate::sort::Direction::Ascending,
+            }
+        );
+    }
+
+    /// The chosen column and direction round-trip through `state.toml`, per scope, next to
+    /// `selection` and `filter`: persisting a non-default sort and restoring a fresh `App`
+    /// over the same scope must come back with that exact column and direction.
+    #[test]
+    fn the_chosen_column_and_direction_round_trip_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.row_order = RowOrder::By {
+            column: SortColumn::Sync,
+            direction: crate::sort::Direction::Ascending,
+        };
+        app.persist_state();
+
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert_eq!(
+            app_again.row_order,
+            RowOrder::By {
+                column: SortColumn::Sync,
+                direction: crate::sort::Direction::Ascending,
+            }
+        );
+    }
+
+    /// `0`'s own `Natural` choice is not indistinguishable from nothing ever having been
+    /// chosen: persisting it and restoring a fresh `App` over the same scope must come back
+    /// `Natural` too, not the cold-start default.
+    #[test]
+    fn an_explicit_natural_choice_also_round_trips_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.row_order = RowOrder::Natural;
+        app.persist_state();
+
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert_eq!(app_again.row_order, RowOrder::Natural);
     }
 }
