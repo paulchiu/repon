@@ -319,7 +319,9 @@ impl std::fmt::Display for Warning {
             Warning::FetchEnabledButNotBuilt => write!(
                 f,
                 "fetch.enabled is true but this build carries no fetch mechanism, so nothing \
-                 is ever fetched; rebuild with the `fetch` feature to turn it on"
+                 is ever fetched; install with `cargo install --git \
+                 https://github.com/paulchiu/repon --locked --features fetch repon` to turn \
+                 it on"
             ),
             Warning::AutoUpdateWithoutFetch => write!(
                 f,
@@ -1457,6 +1459,30 @@ mod tests {
                 .warnings
                 .contains(&Warning::FetchEnabledButNotBuilt),
             "a key left off is not a key that cannot act"
+        );
+    }
+
+    /// `Warning::FetchEnabledButNotBuilt` must name a command a user can actually type,
+    /// per the issue this warning text was written to close: "rebuild with the `fetch`
+    /// feature" tells nobody what to type. Read out of `docs/spec/releasing.md`'s own
+    /// fetch-enabled install line rather than hand-copied, so the warning and the spec
+    /// cannot silently drift apart.
+    #[test]
+    fn fetch_enabled_but_not_built_names_releasings_own_fetch_install_command() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let releasing = std::fs::read_to_string(manifest_dir.join("../../docs/spec/releasing.md"))
+            .expect("read docs/spec/releasing.md");
+        let command = releasing
+            .lines()
+            .find(|line| line.starts_with("cargo install") && line.contains("--features fetch"))
+            .expect("releasing.md must carry a fetch-enabled `cargo install` line")
+            .trim();
+
+        let message = Warning::FetchEnabledButNotBuilt.to_string();
+        assert!(
+            message.contains(command),
+            "the warning must name releasing.md's own fetch-enabled install command \
+             verbatim; warning was: {message}"
         );
     }
 

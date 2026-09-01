@@ -25,6 +25,14 @@ Measured, that costs 44.9 seconds and produces a 1,599,200 byte binary. A cold r
 
 The channel has one measured wart. On a machine whose git config rewrites GitHub HTTPS to SSH (`url.ssh://git@github.com/.insteadOf https://github.com/`), cargo's built-in git transport fails with "no authentication methods succeeded". `CARGO_NET_GIT_FETCH_WITH_CLI=true` fixes it with the rewrite still in place, because the git CLI holds the SSH credentials cargo's own transport cannot reach. The README carries the same advice, because the README is where a failing user is standing when it happens.
 
+The plain command above builds `repon-core` without its `fetch` feature, so [`FETCH_AVAILABLE`](../../crates/repon-core/src/lib.rs) is false and [refresh.md](refresh.md)'s periodic fetch and fast-forward-only auto-update stay inert: `fetch.enabled = true` in `config.toml` is accepted and does nothing. A user who wants that mechanism installs with the `fetch` feature instead:
+
+```sh
+cargo install --git https://github.com/paulchiu/repon --locked --features fetch repon
+```
+
+`crates/repon/Cargo.toml` forwards this to `repon-core/fetch`, the one deliberately mutating path this crate carries ([0015](../adr/0015-the-core-owns-the-table.md)); it stays out of `default` for the reason recorded on that dependency line, so the plain command above is unaffected and pulls in none of it. This is the exact command the `fetch.enabled` warning names when it fires against a build that lacks the feature.
+
 ## Platform support
 
 Repon runs on macOS and Linux, and never on Windows. That is a decision, not a current limitation: the workspace compiles clean for `x86_64-pc-windows-msvc` today (a 27.2 second `cargo check`), and [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) is what closes that window, because [actions.md](actions.md) puts `setsid(2)` in `pre_exec`, opens the capture channel with `openpty(3)` through libc and hands the child `/dev/null` on stdin, and Windows has none of the three.

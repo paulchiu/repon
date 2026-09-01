@@ -150,6 +150,8 @@ Computed git state is never cached ([0006](../adr/0006-no-git-state-cache-sessio
 
 Off by default. When `fetch.enabled` is true it runs every `fetch.interval` (default 5 minutes) and fires immediately on being enabled rather than waiting for the first tick; the predecessor waited five minutes for its first cycle and that 'reads as a dead key'.
 
+This mechanism is gated behind `repon-core`'s own `fetch` cargo feature (Fetch available, in the glossary), which the plain install in [releasing.md](releasing.md) does not turn on. `fetch.enabled = true` against that build is accepted and does nothing; [releasing.md](releasing.md)'s "Where Repon can be installed from" names the `cargo install --features fetch` command that produces a binary where it does.
+
 Four rules govern it:
 
 - It always prunes, because `Gone` only appears after a prune and a plain fetch never produces it.
