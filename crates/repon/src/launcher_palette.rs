@@ -19,11 +19,11 @@
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Position, Rect},
     style::Style,
     widgets::Clear,
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
     edit_buffer,
@@ -54,6 +54,12 @@ pub(crate) const NO_LAUNCHERS_CONFIGURED_MESSAGE: &str = "no launchers; see [[la
 /// [`crate::action_palette::QUERY_PLACEHOLDER`] and [`crate::filter_line::QUERY_PLACEHOLDER`],
 /// each the prompt character, a verb, then what it acts on.
 pub(crate) const QUERY_PLACEHOLDER: &str = "! filter launchers";
+
+/// `! ` plus the space after it: the caret's own column while [`LauncherPalette::query`] is
+/// empty, since nothing has been painted yet to measure a cursor position off. Once there is
+/// typed text [`LauncherPalette::draw`] reads the caret's column back from what it painted
+/// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
+const PROMPT_WIDTH: u16 = 2;
 
 /// Case-insensitive substring match against a Launcher's own name, the same convention
 /// [`crate::action_palette::entries`] uses and for the same reason: a plain substring test
@@ -242,23 +248,47 @@ impl LauncherPalette {
         let interior = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let (query_line, query_style) = if self.query.is_empty() {
-            (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
+        let row_right = interior.x + interior.width;
+        let caret_x = if self.query.is_empty() {
+            frame.buffer_mut().set_stringn(
+                interior.x,
+                interior.y,
+                QUERY_PLACEHOLDER,
+                interior.width as usize,
+                theme.style_for(Role::Dim),
+            );
+            // Nothing has been painted for the query itself yet, so there is no paint to
+            // read a column back from: the placeholder text is not the query, and
+            // [`PROMPT_WIDTH`] is a fixed constant rather than a restated measurement.
+            (interior.x + PROMPT_WIDTH).min(row_right)
         } else {
-            (format!("! {}", self.query), theme.style_for(Role::Text))
+            // The caret sits at the query's own end, "! " plus whatever has been typed, not
+            // at the end of whichever placeholder text an empty query is showing in its
+            // place: this is where the next keystroke would land. Read back from
+            // `set_stringn`'s own return, the same technique
+            // [`crate::filter_line::FilterLine::draw`] uses, rather than adding a separately
+            // measured query width to a literal prefix width: a changed prefix or a wide
+            // character can then never drift the caret from the text it follows.
+            let buf: &mut Buffer = frame.buffer_mut();
+            let (x, _) = buf.set_stringn(
+                interior.x,
+                interior.y,
+                "! ",
+                row_right.saturating_sub(interior.x) as usize,
+                theme.style_for(Role::Text),
+            );
+            let (x, _) = buf.set_stringn(
+                x,
+                interior.y,
+                &self.query,
+                row_right.saturating_sub(x) as usize,
+                theme.style_for(Role::Text),
+            );
+            x.min(row_right)
         };
-        frame
-            .buffer_mut()
-            .set_string(interior.x, interior.y, &query_line, query_style);
-        // The caret sits at the query's own end, "! " plus whatever has been typed, not at
-        // the end of whichever placeholder text an empty query is showing in its place: this
-        // is where the next keystroke would land. ratatui shows the caret only on a frame
-        // where a position was set, so this is the one call that puts one on this palette's
-        // query row at all.
-        frame.set_cursor_position(Position::new(
-            interior.x + 2 + UnicodeWidthStr::width(self.query.as_str()) as u16,
-            interior.y,
-        ));
+        // ratatui shows the caret only on a frame where a position was set, so this is the
+        // one call that puts one on this palette's query row at all.
+        frame.set_cursor_position(Position::new(caret_x, interior.y));
 
         let matches = self.matches(launchers);
         let rows_below_query = interior.height.saturating_sub(1) as usize;
