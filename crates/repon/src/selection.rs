@@ -1,6 +1,6 @@
 //! [`Selection`]: the rows an Action or Launcher will act on, per
 //! [keybindings.md](../../../../docs/spec/keybindings.md#the-selection) and
-//! [CONTEXT.md](../../../../CONTEXT.md)'s "Selection". Lives here rather than in
+//! [GLOSSARY.md](../../../../GLOSSARY.md)'s "Selection". Lives here rather than in
 //! `repon-core`, which deliberately refuses to give an empty Selection any meaning; the
 //! consumer-side default onto the cursor row is this module's job.
 

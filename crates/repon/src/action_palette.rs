@@ -1104,24 +1104,24 @@ mod tests {
     // --- Criterion 6: the per-Repo defining-Action count is not shown, not faked, and is
     // recorded as an open want rather than settled as never ---
 
-    /// [`CONTEXT.md`]'s Action entry once promised a palette count of how many selected
+    /// [`GLOSSARY.md`]'s Action entry once promised a palette count of how many selected
     /// Repos "define" a given Action; ADR 0018 corrected it to promise only the Selection
     /// count. Read at test time rather than restated, per this ticket's brief on pinning a
     /// claim to the document of record.
     #[test]
-    fn context_mds_action_glossary_entry_no_longer_promises_a_per_repo_defining_count() {
+    fn the_glossarys_action_entry_no_longer_promises_a_per_repo_defining_count() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let context = std::fs::read_to_string(manifest_dir.join("../../CONTEXT.md"))
-            .expect("read CONTEXT.md");
-        let entry = context
+        let glossary = std::fs::read_to_string(manifest_dir.join("../../GLOSSARY.md"))
+            .expect("read GLOSSARY.md");
+        let entry = glossary
             .split("**Action**:")
             .nth(1)
             .and_then(|rest| rest.split("**Action spec**:").next())
-            .expect("CONTEXT.md still carries an Action glossary entry");
+            .expect("GLOSSARY.md still carries an Action glossary entry");
 
         assert!(
             !entry.to_lowercase().contains("define"),
-            "CONTEXT.md's Action entry must not promise a per-Repo \"defines it\" count \
+            "GLOSSARY.md's Action entry must not promise a per-Repo \"defines it\" count \
              the `[[action]]` schema cannot compute, got: {entry:?}"
         );
     }

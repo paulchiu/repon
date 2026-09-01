@@ -229,7 +229,7 @@ pub struct App {
     /// positional `1`-`9` keys already take, so this can never become a second
     /// implementation of the same switch.
     set_picker: Option<SetPicker>,
-    /// The live Notice ([CONTEXT.md](../../../CONTEXT.md)'s glossary entry), if any: raised
+    /// The live Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
     /// declared when the pressed digit names none), by `reload.rs`'s own reload fallback
     /// (naming the Set fallen back to), and by each of the four bindings ADR 0023 names
@@ -307,7 +307,7 @@ pub struct App {
     /// once at startup ([`config::document::working_directory`]) rather than re-read per
     /// call, since a session never changes directory mid-run.
     cwd: PathBuf,
-    /// The committed Filter narrowing the list ([CONTEXT.md](../../../CONTEXT.md)'s
+    /// The committed Filter narrowing the list ([GLOSSARY.md](../../../GLOSSARY.md)'s
     /// "Committed Filter"): applied while `self.filter_line` is `None`, and what `Esc`
     /// restores when an edit is abandoned. Session state, persisted to `state.toml` on quit
     /// ([`Self::persist_state`]) and restored at startup
