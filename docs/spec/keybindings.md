@@ -35,11 +35,11 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `R` | Refresh the Selection |
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
-| `s` | Open the Set picker |
+| `s`, `Tab` | Open the Set picker |
 | `1` to `9` | Switch to the Nth declared Set |
 | `Ctrl+R` | Reload config |
 | `e` | Edit config.toml in `$EDITOR` |
-| `Tab` | Move focus between list and detail |
+| `Shift+Tab` | Move focus between list and detail |
 | `Esc` | Unwind one level |
 
 ### list
@@ -155,9 +155,13 @@ The Ctrl chords all sit inside the set that survives zellij 0.45.0 (which takes 
 
 `F5` fires the same `Action::RefreshAll` as `r` rather than a binding of its own, because it is the refresh key across other software and a user reaching for it out of habit should get a refresh with no config edit. It is a second chord on the same action rather than a replacement for `r`, since macOS claims F5 for Dictation before the terminal ever sees it: a user on that platform still has `r`, and one whose terminal or window manager leaves F5 alone gets both.
 
+`Tab` opens the Set picker, reported from manual use: the picker is the strip a user tabs through, so Tab is the key a hand reaches for first, and moving focus between list and detail is the rarer of the two gestures. `s` keeps its old meaning too, so nothing already learned stops working. The rarer gesture moves to `Shift+Tab` rather than losing its key outright; `Tab` keeps its `detail` meaning (return focus to the list) and its `input` meaning (accept a completion), since neither collides with the Set picker and completion has no other key to take.
+
 ## Modifiers and matching
 
 crossterm reports an uppercase character with the SHIFT modifier set, so `R`, `G` and `A` must be matched as `Char('R')` with SHIFT, and a match on NONE never fires. Ctrl chords arrive as the lowercase char with CONTROL. Ctrl+Shift+letter is not distinguishable from Ctrl+letter on four of the five macOS terminals and is not used. `KeyEventKind::Release` is filtered before dispatch, which the skeleton already does at crates/repon/src/tui.rs:217.
+
+Shift+Tab is the one further exception: crossterm reports it as its own `KeyCode::BackTab`, with no SHIFT modifier set, rather than as `Tab` with SHIFT the way an uppercase letter arrives. It is matched as `BackTab` against NONE, and the table above writes it `Shift+Tab` for readability rather than `BackTab`, which is crossterm's own name and not this map's spelling for anything else.
 
 ## Esc
 
@@ -283,7 +287,7 @@ Mouse capture is the one piece Repon *disables* rather than enables, so it has n
 
 A Launcher declaring `takes_terminal = false` ([config.md](config.md#launchers)) is the one handoff that never leaves the screen, and it is not an exception to any of the above. All five pieces stay exactly as claimed for the whole of its child's run and nothing is released, because releasing is what leaving the screen means and this handoff does not leave it. The child is given `/dev/null` for stdin, stdout and stderr instead of the terminal Repon is still holding, so it cannot write into the frame and cannot read the input the event thread owns. A child that tries to be interactive anyway finds no terminal on any of the three, and fails to initialise rather than fighting for the screen.
 
-`s` opens the Set picker, and the picker is the tab strip [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) named: one row per declared Set in file order, each carrying the `1` to `9` number that switches to it, the active one marked. Rows past the ninth carry a name and no number, because the keys stop at `9` and the picker is the only way to reach a tenth Set. Nothing is drawn behind it, because there is no strip on the screen ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)); the active Set's name is the status row's first item, which [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns.
+`s` and `Tab` both open the Set picker, and the picker is the tab strip [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) named: one row per declared Set in file order, each carrying the `1` to `9` number that switches to it, the active one marked. Rows past the ninth carry a name and no number, because the keys stop at `9` and the picker is the only way to reach a tenth Set. Nothing is drawn behind it, because there is no strip on the screen ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)); the active Set's name is the status row's first item, which [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns.
 
 The picker's own chrome is recorded here for the same reason the help overlay's is above: this spec fixed the picker's content and behaviour and said nothing about its presentation, which used to mean it drew its rows flush with no border at all while every panel around it was framed. That is a presentation decision, not a spec violation. The picker draws in the house style, a bordered block taking its characters from the active glyph set exactly as the list and detail panes do, titled ` sets `, and its rows sit one cell inset from the border rather than flush against the border characters themselves. A Set name too long for that interior is clamped to it, so a user-supplied name can never paint over the frame's own right border.
 
