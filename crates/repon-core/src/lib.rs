@@ -114,7 +114,7 @@ pub use entity::StepResult;
 pub use entity::SyncState;
 pub use entity::WorktreeState;
 pub use environment::environment;
-pub use filter::Filter;
+pub use filter::{Applicability, Filter};
 pub use git::{InProgressOperation, ProbeError, RecentCommit};
 pub use snapshot::{RowSummary, Snapshot, summary};
 #[cfg(feature = "serde")]

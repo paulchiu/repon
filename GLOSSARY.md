@@ -72,6 +72,9 @@ A command fanned out across the Selection, either named in config or typed into 
 **Action spec**:
 An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps and its concurrency, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.
 
+**Applicability**:
+How an Action's `when` predicate divides the rows it would operate on, after excluded rows are already subtracted: applicable, inapplicable, and unresolved because a Cell the predicate reads has not settled. Three counts and no verdict, since an unresolved row is not an inapplicable one and folding it into either side is an absent value becoming a zero. It narrows what the palette reports, never which Repos the Action fans out over.
+
 **Step**:
 One act in an Action's ordered list: either a command as the core receives it, its argv already split rather than a shell string with any per-step environment overrides already resolved, or one act Repon performs itself with no child process at all, which is what a Management operation's single Step is. Distinct from a Step result, which is what running one produces.
 

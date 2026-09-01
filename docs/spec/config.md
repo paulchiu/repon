@@ -162,8 +162,11 @@ Repon exports nothing of its own selection state. `REPON_SET` stays an input var
 | `steps` | ordered list of step tables, required | Each step has `args`, and optionally `shell` and `env` |
 | `confirm` | bool, default `true` | Ask before fanning out |
 | `concurrency` | integer, default `4` | Entities in flight at once |
+| `when` | string, optional | A predicate in the Filter grammar ([filter.md](filter.md)), evaluated over already-settled Cells: how many of the Selection the palette counts this Action as applicable to ([actions.md](actions.md)) |
 
 Steps run in order and stop at the first failure, where failure is a nonzero exit. Gating is implicit, following GitHub Actions' shape: there is no `on_success` field to write, and a later step that ran is proof the earlier ones succeeded.
+
+`when` reuses [filter.md](filter.md)'s language rather than extending it, and is never a load error of any grade: that grammar is total, so an unrecognised term inside a `when` is advisory exactly as it is on the Filter line, and there is no entry for it under "Cross-key validity" below. An entry with no `when` is applicable everywhere, which is what an Action without one already meant. It narrows the count the palette shows and not the set the fan-out acts on; [actions.md](actions.md) settles the readings of the border title that count produces.
 
 `confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable. The fan-out runs on its own pool rather than rayon's global one, because a step blocked in `wait()` removes a worker from that pool and a `concurrency` at or above the pool's thread count stops the refresh entirely; [actions.md](actions.md) carries the measurement.
 

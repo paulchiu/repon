@@ -27,7 +27,7 @@
 
 use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 
-use repon_core::{ActionSpec, Step};
+use repon_core::{ActionSpec, Applicability, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
@@ -314,8 +314,36 @@ pub(crate) struct ActionPalette {
 /// every field is a read of live state a frame must not cache.
 pub(crate) struct Run<'a> {
     pub(crate) actions: &'a [ActionConfig],
-    pub(crate) operable_count: usize,
+    pub(crate) count: Count,
     pub(crate) management_lines: &'a [String],
+}
+
+/// What the border title counts this frame: how many rows a choice made right now would run
+/// against, and, when the entry in hand declares a `when`, how that predicate divides those
+/// same rows ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Count {
+    pub(crate) operable: usize,
+    pub(crate) narrowed: Option<Narrowed>,
+}
+
+/// One entry's own `when` applied to the operable rows: the name the title says it by, and
+/// the three counts that predicate produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Narrowed {
+    pub(crate) label: String,
+    pub(crate) applicability: Applicability,
+}
+
+impl Count {
+    /// The Selection count alone, which is what the title reads with nothing to narrow it:
+    /// nothing chosen, a built-in, or an entry declaring no `when`.
+    pub(crate) fn selection(operable: usize) -> Self {
+        Count {
+            operable,
+            narrowed: None,
+        }
+    }
 }
 
 impl ActionPalette {
@@ -540,10 +568,50 @@ impl ActionPalette {
         self.stage = Stage::Choosing;
     }
 
-    /// The border title theming.md fixes: "the Action palette ... puts the Selection count
-    /// in the border title, so it reads `run on 12 repos`" before anything is typed.
-    pub(crate) fn border_title(operable_count: usize) -> String {
-        format!(" run on {operable_count} repos ")
+    /// The entry whose own `when` narrows the border title: the one a live gate is asking
+    /// about, and otherwise the highlighted row. A built-in has no config entry to declare a
+    /// `when` in and neither does an ad hoc command, so both leave the title unnarrowed.
+    pub(crate) fn narrowing_entry<'a>(
+        &'a self,
+        actions: &'a [ActionConfig],
+    ) -> Option<&'a ActionConfig> {
+        match &self.stage {
+            Stage::Confirming(Chosen::Configured(entry)) => Some(entry),
+            Stage::Confirming(Chosen::Management(_)) => None,
+            Stage::Choosing => match self.highlighted(actions)? {
+                Entry::Configured(action) => Some(action),
+                Entry::Builtin(_) => None,
+            },
+        }
+    }
+
+    /// The border title, in the three readings
+    /// [actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate" fixes: the
+    /// Selection count alone with nothing to narrow it, the applicable count once an entry's
+    /// own `when` narrows it, and that same count with the unresolved tail the predicate
+    /// could not settle. The tail is absent rather than written as zero, since a zero tail is
+    /// nothing to report.
+    pub(crate) fn border_title(count: &Count) -> String {
+        let Count { operable, narrowed } = count;
+        match narrowed {
+            None => format!(" run on {operable} repos "),
+            Some(Narrowed {
+                label,
+                applicability,
+            }) => {
+                let Applicability {
+                    applicable,
+                    inapplicable: _,
+                    unresolved,
+                } = *applicability;
+                let tail = if unresolved == 0 {
+                    String::new()
+                } else {
+                    format!(", {unresolved} unresolved")
+                };
+                format!(" run \"{label}\" on {applicable} of {operable} selected{tail} ")
+            }
+        }
     }
 
     /// Takes the whole frame in place of everything else. [`Stage::Choosing`]'s first
@@ -560,14 +628,15 @@ impl ActionPalette {
     ) {
         let Run {
             actions,
-            operable_count,
+            count,
             management_lines,
         } = run;
+        let operable_count = count.operable;
         let mut scratch = BorderScratch::new();
         let block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
-            .title(Self::border_title(operable_count));
+            .title(Self::border_title(&count));
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -682,6 +751,7 @@ mod tests {
             }],
             confirm,
             concurrency: 4,
+            when: None,
         }
     }
 
@@ -753,7 +823,152 @@ mod tests {
             .and_then(|rest| rest.split('`').next())
             .expect("theming.md still carries the quoted `run on 12 repos` example");
 
-        assert_eq!(ActionPalette::border_title(12).trim(), quoted);
+        assert_eq!(
+            ActionPalette::border_title(&Count::selection(12)).trim(),
+            quoted
+        );
+    }
+
+    /// Every reading [actions.md](../../../docs/spec/actions.md)'s own border-title table
+    /// fixes, in the order the table lists them: each row's last backticked cell is the
+    /// title, so the wording lives in the document alone and this test carries none of it.
+    /// A table naming fewer than the three readings panics rather than asserting less.
+    fn border_title_readings_actions_md_fixes() -> Vec<String> {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let actions_md = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read docs/spec/actions.md");
+        let table = actions_md
+            .split("| the border title reads |")
+            .nth(1)
+            .expect("actions.md must carry the border-title table");
+        let readings: Vec<String> = table
+            .lines()
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            .filter(|line| !line.contains("---"))
+            .map(|line| {
+                let mut cells = line.rsplit('`');
+                cells.next();
+                cells
+                    .next()
+                    .expect("every body row must quote its own title in backticks")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            readings.len(),
+            3,
+            "actions.md's border-title table no longer fixes three readings, so this test \
+             would assert less than the document says: {readings:?}"
+        );
+        readings
+    }
+
+    fn narrowed(applicable: usize, inapplicable: usize, unresolved: usize) -> Count {
+        Count {
+            operable: applicable + inapplicable + unresolved,
+            narrowed: Some(Narrowed {
+                label: "reinstall".to_string(),
+                applicability: Applicability {
+                    applicable,
+                    inapplicable,
+                    unresolved,
+                },
+            }),
+        }
+    }
+
+    /// The three readings of the border title, each asserted against actions.md's own quoted
+    /// cell rather than a phrase written here. The middle and last rows differ only in where
+    /// the four rows the predicate did not prove went: settled inapplicable in one, unsettled
+    /// in the other, which is exactly the distinction a folded count would erase.
+    #[test]
+    fn the_border_title_reproduces_every_reading_actions_md_fixes() {
+        let readings = border_title_readings_actions_md_fixes();
+
+        assert_eq!(
+            ActionPalette::border_title(&Count::selection(12)).trim(),
+            readings[0]
+        );
+        assert_eq!(
+            ActionPalette::border_title(&narrowed(8, 4, 0)).trim(),
+            readings[1]
+        );
+        assert_eq!(
+            ActionPalette::border_title(&narrowed(8, 1, 3)).trim(),
+            readings[2]
+        );
+    }
+
+    /// The narrowed title on a real frame rather than only as a string: ratatui clips a
+    /// title the border cannot hold, so a reading that fits the assertion above can still
+    /// reach the screen with its tail cut off. Drawn 80 columns wide, which is what the
+    /// longest of the three readings needs.
+    #[test]
+    fn the_narrowed_title_and_its_unresolved_tail_reach_the_drawn_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let actions = vec![action("reinstall", true)];
+        let expected = border_title_readings_actions_md_fixes()[2].clone();
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 6)).expect("create the test terminal");
+
+        terminal
+            .draw(|frame| {
+                ActionPalette::new().draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: narrowed(8, 1, 3),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the frame");
+
+        let top: String = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            top.contains(&expected),
+            "the drawn border must carry the whole reading {expected:?}, got: {top:?}"
+        );
+    }
+
+    /// The entry whose `when` narrows the title: a built-in declares none, and a live gate
+    /// answers with the entry it is asking about rather than with whatever the cursor has
+    /// since been left on.
+    #[test]
+    fn only_a_configured_entry_narrows_the_title_and_a_live_gate_names_its_own() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        assert_eq!(
+            palette
+                .narrowing_entry(&actions)
+                .map(|entry| entry.name.get_ref().as_str()),
+            Some("reinstall")
+        );
+
+        palette.move_highlight(2, &actions);
+        assert!(
+            matches!(palette.highlighted(&actions), Some(Entry::Builtin(_))),
+            "the fixture must leave a built-in highlighted for the claim below to mean \
+             anything"
+        );
+        assert!(palette.narrowing_entry(&actions).is_none());
+
+        let mut confirming = ActionPalette::new();
+        confirming.move_highlight(1, &actions);
+        confirming.choose(&actions, 3);
+        assert_eq!(
+            confirming
+                .narrowing_entry(&actions)
+                .map(|entry| entry.name.get_ref().as_str()),
+            Some("deploy"),
+            "a live gate narrows by the entry it is asking about"
+        );
     }
 
     // --- Criterion 4: the count subtracts excluded rows and a zero refuses ---
@@ -1179,7 +1394,7 @@ mod tests {
                         &Theme::default(),
                         Run {
                             actions: &actions,
-                            operable_count: 3,
+                            count: Count::selection(3),
                             management_lines: &[],
                         },
                         glyphs,
@@ -1191,7 +1406,7 @@ mod tests {
                 terminal.backend().buffer(),
                 Rect::new(0, 0, 40, 10),
                 glyphs.border,
-                &ActionPalette::border_title(3),
+                &ActionPalette::border_title(&Count::selection(3)),
                 "the Action palette's frame",
             );
         }
@@ -1224,7 +1439,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        operable_count: 3,
+                        count: Count::selection(3),
                         management_lines: &[],
                     },
                     &crate::glyphs::FULL,
@@ -1258,7 +1473,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        operable_count: 2,
+                        count: Count::selection(2),
                         management_lines: &[],
                     },
                     &crate::glyphs::FULL,
@@ -1303,7 +1518,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        operable_count: 12,
+                        count: Count::selection(12),
                         management_lines: &[],
                     },
                     &crate::glyphs::FULL,
@@ -1387,7 +1602,7 @@ mod tests {
                     &crate::theme::DEFAULT,
                     Run {
                         actions: &[],
-                        operable_count: 25,
+                        count: Count::selection(25),
                         management_lines: &lines,
                     },
                     &crate::glyphs::FULL,
@@ -1480,7 +1695,7 @@ mod tests {
                     &crate::theme::DEFAULT,
                     Run {
                         actions: &[],
-                        operable_count: 1,
+                        count: Count::selection(1),
                         management_lines: &lines,
                     },
                     &crate::glyphs::FULL,
@@ -1537,7 +1752,7 @@ mod tests {
                     &monochrome,
                     Run {
                         actions: &actions,
-                        operable_count: 2,
+                        count: Count::selection(2),
                         management_lines: &[],
                     },
                     &crate::glyphs::FULL,
@@ -1662,7 +1877,7 @@ mod tests {
         palette: &ActionPalette,
         actions: &[ActionConfig],
         theme: &Theme,
-        operable_count: usize,
+        count: Count,
     ) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(40, 10);
@@ -1675,7 +1890,7 @@ mod tests {
                     theme,
                     Run {
                         actions,
-                        operable_count,
+                        count,
                         management_lines: &[],
                     },
                     &crate::glyphs::FULL,
@@ -1694,7 +1909,7 @@ mod tests {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
 
-        let empty = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let empty = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
         assert!(
             !row_text(&empty, 1, 40).contains("zzq"),
             "an unopened query must not already show text nobody typed"
@@ -1703,7 +1918,7 @@ mod tests {
         for c in "zzq".chars() {
             palette.type_char(c, &actions);
         }
-        let typed = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let typed = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
         assert!(
             row_text(&typed, 1, 40).contains("zzq"),
             "expected the typed query on the interior's first row: {:?}",
@@ -1711,7 +1926,7 @@ mod tests {
         );
 
         palette.delete_previous_word(&actions);
-        let cleared = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let cleared = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
         assert!(
             !row_text(&cleared, 1, 40).contains("zzq"),
             "removing the typed characters must remove them from the query row too: {:?}",
@@ -1729,7 +1944,7 @@ mod tests {
             palette.type_char(c, &actions);
         }
 
-        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
 
         assert!(
             row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
@@ -1748,7 +1963,7 @@ mod tests {
     fn no_actions_configured_at_all_says_so_and_names_where_to_declare_one() {
         let palette = ActionPalette::new();
 
-        let buf = draw_to_buffer(&palette, &[], &Theme::default(), 0);
+        let buf = draw_to_buffer(&palette, &[], &Theme::default(), Count::selection(0));
 
         // Below the three built-ins rather than in place of them: the list is never empty
         // any more, so the hint that names where an `[[action]]` is declared follows them.
@@ -1772,8 +1987,9 @@ mod tests {
         }
         let nothing_configured = ActionPalette::new();
 
-        let no_match_buf = draw_to_buffer(&no_match, &some_actions, &theme, 3);
-        let nothing_configured_buf = draw_to_buffer(&nothing_configured, &[], &theme, 0);
+        let no_match_buf = draw_to_buffer(&no_match, &some_actions, &theme, Count::selection(3));
+        let nothing_configured_buf =
+            draw_to_buffer(&nothing_configured, &[], &theme, Count::selection(0));
 
         assert_ne!(
             all_rows(&no_match_buf),
@@ -1790,13 +2006,15 @@ mod tests {
         let theme = Theme::default();
         let actions = vec![action("reinstall", true)];
 
-        let matching_state = draw_to_buffer(&ActionPalette::new(), &actions, &theme, 3);
+        let matching_state =
+            draw_to_buffer(&ActionPalette::new(), &actions, &theme, Count::selection(3));
         let mut no_match = ActionPalette::new();
         for c in "zzq".chars() {
             no_match.type_char(c, &actions);
         }
-        let no_match_state = draw_to_buffer(&no_match, &actions, &theme, 3);
-        let nothing_configured_state = draw_to_buffer(&ActionPalette::new(), &[], &theme, 0);
+        let no_match_state = draw_to_buffer(&no_match, &actions, &theme, Count::selection(3));
+        let nothing_configured_state =
+            draw_to_buffer(&ActionPalette::new(), &[], &theme, Count::selection(0));
 
         // Read over the whole render rather than one row: the built-ins are listed in every
         // state now, so each state's own distinguishing text can legitimately sit below them.
@@ -1822,12 +2040,12 @@ mod tests {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
         palette.type_char('r', &actions);
-        let narrowed = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let narrowed = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
         assert!(!row_text(&narrowed, 2, 40).contains("deploy"));
 
         palette.clear_line(&actions);
 
-        let restored = draw_to_buffer(&palette, &actions, &Theme::default(), 3);
+        let restored = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
         assert!(row_text(&restored, 2, 40).contains("reinstall"));
         assert!(row_text(&restored, 3, 40).contains("deploy"));
     }
@@ -1886,7 +2104,7 @@ mod tests {
             launcher_palette.popup_area(Rect::new(0, 0, 40, 10), &launchers, "repo-a");
         let launcher_message_row = launcher_popup.y + 2; // +1 past the border, +1 past the query line
 
-        let action_buf = draw_to_buffer(&action_palette, &actions, &theme, 3);
+        let action_buf = draw_to_buffer(&action_palette, &actions, &theme, Count::selection(3));
         let action_message_row = 2; // the Action palette's border sits at row 0 in this branch
 
         assert!(
