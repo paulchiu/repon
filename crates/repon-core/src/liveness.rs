@@ -42,8 +42,8 @@
 //!   five seconds. The short `recv_timeout` calls that poll for the next chunk of pty
 //!   output are intervals, not deadlines, and are left alone.
 //! - **`Core::settle` awaiting a Generation the caller already dispatched** (most of its
-//!   call sites, 82 of them): at risk, and not fixed here. `Core::settle` discards the
-//!   `WaitTimeoutResult` its own `wait_timeout_while` returns, so an expiry is
+//!   call sites, 82 of them): at risk, and not fixed here. `Core::settle` (`core.rs:826`)
+//!   discards the `WaitTimeoutResult` its own `wait_timeout_while` returns, so an expiry is
 //!   indistinguishable from a settle and comes back as an unsettled snapshot the caller
 //!   then reports as a wrong value several steps downstream, with nothing naming the wait.
 //!   That is this ticket's defect exactly, at forty-four call sites bounded at 500ms.

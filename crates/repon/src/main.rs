@@ -296,8 +296,11 @@ fn existence(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use crate::test_support::{
-        all_lines_where, production_source_at, rust_source_files, workspace_rust_source_dirs,
+        SourceLine, all_lines_where, production_lines_under_containing, production_source_at,
+        rust_source_files, workspace_crate_src_dirs, workspace_rust_source_dirs,
     };
 
     /// A wall clock read, as it reads in source. One half of a deadline: the other is the
@@ -357,40 +360,93 @@ mod tests {
             .any(|comparison| without_arrows.contains(comparison.spelling()))
     }
 
-    /// Every line matching [`is_a_deadline_shape`] that is *not* a test waiting on a liveness
-    /// property, each named by the text of the line itself and the reason it is allowed.
+    /// One line matching [`is_a_deadline_shape`] that is *not* a test waiting on a liveness
+    /// property: the text of the line, the file and the enclosing item it was written for,
+    /// and last the reason it is allowed, recorded for a reader rather than read by code.
+    type NonWaitDeadline = (String, &'static str, &'static str, &'static str);
+
+    /// Every deadline in this workspace that bounds something other than a test's wait.
     ///
     /// An allowlist rather than a denylist, the same shape `check-core-isolation` takes:
     /// a deadline cannot join this workspace without someone writing down what it bounds,
     /// which is exactly what nobody did for the forty that made tests flaky under load.
     /// Matched on the trimmed line text, not a line number, so ordinary edits above it do
-    /// not silently rebind an entry to a different line. Entries name single lines rather
-    /// than files: excluding one legitimate deadline is right, excluding the file it sits in
-    /// is how a scan quietly stops checking.
-    fn non_wait_deadlines() -> Vec<(String, &'static str)> {
+    /// not silently rebind an entry to a different line.
+    ///
+    /// Each entry is bound to the file and the enclosing item it was written for, all three
+    /// of which must match. Text alone made every entry global: the one written for
+    /// `liveness::wait_within` blessed `if start.elapsed() >= deadline {` anywhere in the
+    /// workspace, so a hand-rolled wait re-added to the pty harness passed the scan as long
+    /// as it spelled its bound `deadline`. Binding is still per line, never per file:
+    /// excluding one legitimate deadline is right, excluding the file it sits in is how a
+    /// scan quietly stops checking.
+    fn non_wait_deadlines() -> Vec<NonWaitDeadline> {
         let elapsed_ge = format!("{}{}", WALL_CLOCK_READS[0], " >=");
         vec![
             (
                 format!("if set_at{elapsed_ge} self.document.notice_timeout {{"),
+                "repon/src/app.rs",
+                "notice",
                 "production: a Notice expiring on screen",
             ),
             (
                 format!("&& at{elapsed_ge} threshold"),
+                "repon-core/src/cell.rs",
+                "age_into_stale",
                 "production: a status Cell ageing into Stale",
             ),
             (
                 format!("if started{elapsed_ge} abandon_after {{"),
+                "repon-core/src/discovery.rs",
+                "walk",
                 "production: discovery abandoning a walk that will not finish",
             ),
             (
                 format!("assert!(past{elapsed_ge} Duration::from_secs(90));"),
+                "repon-core/src/cell.rs",
+                "elapsed_reads_a_positive_duration_for_a_timestamp_in_the_past",
                 "a claim about a fabricated Timestamp's own arithmetic, not a wait on anything",
             ),
             (
                 format!("if start{elapsed_ge} deadline {{"),
+                "repon-core/src/liveness.rs",
+                "wait_within",
                 "`liveness::wait_within`, the one polling wait every other wait goes through",
             ),
         ]
+    }
+
+    /// The name in the nearest `fn` declaration at or above `number` in `path`, or `None`
+    /// for a line inside no function at all.
+    ///
+    /// What binds an allowlist entry to the item it was written for. A comment line is
+    /// skipped, so prose naming a function above the real declaration cannot stand in for
+    /// it; nothing else about the enclosing scope is read, since the nearest declaration
+    /// above is already enough to tell one file's two deadlines apart.
+    fn enclosing_item(path: &Path, number: usize) -> Option<String> {
+        let source = std::fs::read_to_string(path).expect("read a workspace source file");
+        let lines: Vec<&str> = source.lines().collect();
+        lines[..number.min(lines.len())]
+            .iter()
+            .rev()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .find_map(|line| {
+                let after = line.split_once("fn ")?.1;
+                let name = after
+                    .split(['(', '<', ' ', '\t'])
+                    .next()
+                    .filter(|name| !name.is_empty())?;
+                Some(name.to_string())
+            })
+    }
+
+    /// True if `line` is the allowlist entry `allowed`: same text, same file, same
+    /// enclosing item.
+    fn is_the_allowed_deadline(line: &SourceLine, allowed: &NonWaitDeadline) -> bool {
+        let (text, file, item, _reason) = allowed;
+        *text == line.text
+            && line.path.ends_with(file)
+            && enclosing_item(&line.path, line.number).as_deref() == Some(*item)
     }
 
     /// The survey behind this scan, kept true rather than only written down: a test waiting
@@ -416,7 +472,11 @@ mod tests {
 
         let offending: Vec<String> = all_lines_where(&dirs, is_a_deadline_shape)
             .into_iter()
-            .filter(|line| !allowed.iter().any(|(text, _)| *text == line.text))
+            .filter(|line| {
+                !allowed
+                    .iter()
+                    .any(|entry| is_the_allowed_deadline(line, entry))
+            })
             .map(|line| format!("{}:{}: {}", line.path.display(), line.number, line.text))
             .collect();
 
@@ -541,12 +601,17 @@ mod tests {
             .any(|word| word.eq_ignore_ascii_case("test") || word.eq_ignore_ascii_case("tests"))
     }
 
-    /// True if `name` reads as used somewhere in `source`, in whichever shapes its own
-    /// [`PublicItem`] kind takes.
-    fn is_used_in(source: &str, kind: PublicItem, name: &str) -> bool {
+    /// True if `name` reads as used in the production source under `dirs`, in whichever
+    /// shapes its own [`PublicItem`] kind takes.
+    ///
+    /// Through [`production_lines_under_containing`] rather than a `contains` over the
+    /// concatenated files, because that helper excludes comment lines: one intra-doc link
+    /// to `crate::liveness::wait_for` is a mention, not a use site, and reading it as one
+    /// would let the gate this test watches be deleted in silence.
+    fn is_used_under(dirs: &[PathBuf], kind: PublicItem, name: &str) -> bool {
         kind.use_shapes(name)
             .iter()
-            .any(|shape| source.contains(shape))
+            .any(|shape| !production_lines_under_containing(dirs, shape).is_empty())
     }
 
     /// The criterion #83 asks for beyond its one fix: a check that fails if another test-only
@@ -559,7 +624,8 @@ mod tests {
     /// an item that only ever needed to exist for a test. Both crates' production source is
     /// read through [`rust_source_files`] and [`production_source_at`], the pair this crate's
     /// every other scan already shares, so the cut can never quietly stop at a file's first
-    /// `#[cfg(test)]`.
+    /// `#[cfg(test)]`; the use site itself is looked for through [`is_used_under`], so a
+    /// comment naming the item is a mention rather than a use.
     ///
     /// What this catches: an ungated `pub fn`, `pub const` or `pub mod` whose own doc comment
     /// names `test`/`tests` and whose only real uses, if any, would read textually in the
@@ -574,21 +640,12 @@ mod tests {
     fn every_pub_item_documented_as_test_only_is_either_gated_or_has_a_production_use_site() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let core_src = manifest_dir.join("../repon-core/src");
-        let repon_src = manifest_dir.join("src");
-
-        let mut all_production = String::new();
-        for path in rust_source_files(&core_src)
-            .into_iter()
-            .chain(rust_source_files(&repon_src))
-        {
-            all_production.push_str(&production_source_at(&path));
-            all_production.push('\n');
-        }
+        let production_dirs = workspace_crate_src_dirs();
 
         let mut unguarded = Vec::new();
         for path in rust_source_files(&core_src) {
             for (kind, name) in undocumented_test_only_public_items(&production_source_at(&path)) {
-                if !is_used_in(&all_production, kind, &name) {
+                if !is_used_under(&production_dirs, kind, &name) {
                     unguarded.push(format!("{}: {name}", path.display()));
                 }
             }
