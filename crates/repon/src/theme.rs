@@ -167,9 +167,21 @@ impl Theme {
     /// The selected row's style: reversed video while both selection keys are unset, the two
     /// colours once a theme sets them. Read by [`crate::components::list::List`] for the
     /// cursor row.
+    ///
+    /// `Buffer::set_style` patches rather than replaces, so plain `Modifier::REVERSED` alone
+    /// would leave each cell's own role foreground standing and reversal would promote that
+    /// per-cell foreground to a per-cell background: a row of bands, not a bar.
+    /// Patching every cell's foreground to `reset` first, in the same style that adds the
+    /// modifier, is what makes reversal uniform: with no colour named, crossterm swaps
+    /// whichever default foreground and background the terminal itself already uses, so the
+    /// bar's colours are exactly that terminal's own text-on-background pair, inverted. That
+    /// holds on a light terminal exactly as it holds on a dark one, since the pair being
+    /// swapped is the terminal's own rather than one this crate picked.
     pub fn selection_style(&self) -> Style {
         match (self.selection_fg, self.selection_bg) {
-            (None, None) => Style::new().add_modifier(Modifier::REVERSED),
+            (None, None) => Style::new()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::REVERSED),
             (fg, bg) => {
                 let mut style = Style::new();
                 if let Some(fg) = fg {
@@ -181,6 +193,16 @@ impl Theme {
                 style
             }
         }
+    }
+
+    /// The Selection's own per-row treatment: the rows [`crate::selection::Selection`] holds
+    /// checked, marked with space, per theming.md's "The Selection". Underlines the row
+    /// across the same interior width the cursor row's own highlight covers
+    /// ([`crate::components::list::List`]), and names no colour at all, so it needs no role,
+    /// composes with the cursor highlight rather than replacing it, and keeps working under
+    /// `NO_COLOR`, since crossterm strips colour escape codes and never a text attribute.
+    pub fn checked_style(&self) -> Style {
+        Style::new().add_modifier(Modifier::UNDERLINED)
     }
 }
 
@@ -521,10 +543,18 @@ mod tests {
     }
 
     #[test]
-    fn unset_selection_colours_render_reversed_with_no_explicit_colour_set() {
+    fn unset_selection_colours_force_a_uniform_reset_foreground_before_reversing() {
         let style = DEFAULT.selection_style();
-        assert!(style.fg.is_none(), "expected no explicit foreground");
-        assert!(style.bg.is_none(), "expected no explicit background");
+        assert_eq!(
+            style.fg,
+            Some(Color::Reset),
+            "expected every cell's own role foreground patched to a uniform reset before \
+             reversal, which is what keeps the bar from banding per role colour"
+        );
+        assert!(
+            style.bg.is_none(),
+            "expected no explicit background: every cell's background is already reset"
+        );
         assert!(
             style.add_modifier.contains(Modifier::REVERSED),
             "expected the reversed-video fallback, got {:?}",
