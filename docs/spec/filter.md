@@ -155,7 +155,7 @@ Two properties fall out. The filter applies **after** `settle`, so the probe sti
 - [actions.md](actions.md) promises a `failed` Filter term. It is `action:failed` for the receipt and `row:failed` for the gutter's fold, which are different sets.
 - [refresh.md](refresh.md) says Unknown's reasons are "timed out, no upstream, no default branch, no remote". [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote` and core-api.md records the set as closed at two.
 - [config.md](config.md)'s Worktrees-only Filter is `kind:worktree`.
-- [layout-and-provenance.md](layout-and-provenance.md) leaves open whether a Vanished row wants a Filter of its own. It does: `presence:vanished`. A Vanished row is all-Stale, but `row:stale` is not a substitute, because a Stale row is one Repon will refresh and a Vanished row is one it cannot. The gutter mark for a Vanished row is still open and stays with that spec.
+- [layout-and-provenance.md](layout-and-provenance.md) leaves open whether a Vanished row wants a Filter of its own. It does: `presence:vanished`. A Vanished row is all-Stale, but `row:stale` is not a substitute, because a Stale row is one Repon will refresh and a Vanished row is one it cannot. The gutter mark for a Vanished row is settled there too: it keeps `~`, and the condition is carried by a Warning rather than a fifth mark ([#171](https://github.com/paulchiu/repon/issues/171)).
 - [keybindings.md](keybindings.md)'s `Ctrl+J`/`Ctrl+K` are no longer "palettes only".
 
 ## Refused
@@ -170,5 +170,5 @@ Two properties fall out. The filter applies **after** `settle`, so the probe sti
 
 ## Not settled here
 
-- The gutter mark for a Vanished row, which stays with [layout-and-provenance.md](layout-and-provenance.md) because it is bound up with [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness rule and has nothing to do with the language.
+- The gutter mark for a Vanished row, which stayed with [layout-and-provenance.md](layout-and-provenance.md) because it is bound up with [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness rule and has nothing to do with the language. Settled there: the gutter keeps `~` and a Warning carries the condition.
 - `ProbeError`'s variants, which [core-api.md](core-api.md) owns. `failed:<variant>` is reserved for them.
