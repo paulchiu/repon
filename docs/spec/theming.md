@@ -152,6 +152,7 @@ One switch, two vetted sets, no way to mix them:
 | n changed files | `●n` | `*n` |
 | child row | `└` | `` ` `` |
 | checked (the Selection's own marker) | `✓` | `+` |
+| truncated name | `$` | `$` |
 | panel border | `╭╮╰╯─│` | `+ + + + - |` |
 | capture elision | `···` | `...` |
 

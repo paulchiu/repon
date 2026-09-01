@@ -68,11 +68,15 @@ impl Detail {
 
     /// Draws the pane's border and content into `area`. `focused` picks the border role,
     /// [theming.md](../../../../docs/spec/theming.md)'s "focus communicated by border colour":
-    /// this is the one place two panels can be on screen together, so unlike `List` (which has
-    /// had no second panel to be dimmer than) this reads a real focus flag rather than always
-    /// painting itself focused. `theme` is the live, loaded theme, not the compiled default:
+    /// this is the one place two panels can be on screen together, so `List` reads the same
+    /// real focus flag through [`crate::components::Component::draw`] rather than either
+    /// panel always painting itself focused. `theme` is the live, loaded theme, not the
+    /// compiled default:
     /// a theme file's own colours must reach this pane the same as the palettes and the
-    /// status bar already do.
+    /// status bar already do. The top title names `entity`, following the superfile research's
+    /// own "the panel title, path, mode, and cursor position in the border itself" import; the
+    /// close hint moves to a right-aligned `title_bottom`, sharing `warnings.rs`'s own
+    /// [`crate::warnings::CLOSE_HINT`] rather than a second copy of the same words.
     pub fn draw(
         &self,
         frame: &mut Frame,
@@ -91,7 +95,8 @@ impl Detail {
         let block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(role))
-            .title(" detail (esc closes) ");
+            .title(format!(" {} ", entity.name))
+            .title_bottom(ratatui::text::Line::from(crate::warnings::CLOSE_HINT).right_aligned());
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -2015,6 +2020,40 @@ mod tests {
         assert_eq!(failure_line.spans()[0].1, Meaning::FailedProvenance.role());
     }
 
+    /// Defect 2 (the detail half): the top title names the Entity `draw` was handed, not a
+    /// fixed word, so a caller cycling through rows sees which one it is looking at without
+    /// opening a second surface.
+    #[test]
+    fn draw_titles_the_top_border_with_the_entitys_own_name() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(
+                    frame,
+                    frame.area(),
+                    &entity("distinctive-repo-name"),
+                    glyphs,
+                    true,
+                    &theme::DEFAULT,
+                );
+            })
+            .expect("draw the frame");
+
+        let top_row: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            top_row.contains("distinctive-repo-name"),
+            "expected the entity's own name in the top border, got: {top_row:?}"
+        );
+    }
+
     /// The border must take its role from the live theme handed to `draw`, not the compiled
     /// default: before this ticket `draw` always painted through `theme::DEFAULT`, which
     /// meant a theme file's own colours never reached this pane. A colour with no compiled
@@ -2074,12 +2113,28 @@ mod tests {
                 })
                 .expect("draw the frame");
 
-            crate::test_support::assert_frame_drawn_with(
+            // Not `assert_frame_drawn_with`: the bottom border now carries the close hint
+            // rather than a plain dash run, the same reason `warnings.rs`'s own frame test
+            // reads the top and the bottom separately.
+            crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
                 terminal.backend().buffer(),
                 Rect::new(0, 0, 40, 10),
                 glyphs.border,
-                " detail (esc closes) ",
+                " a ",
                 "the detail pane's frame",
+            );
+            let bottom_row: String = (0..40)
+                .map(|x| terminal.backend().buffer()[(x, 9)].symbol())
+                .collect();
+            let expected_tail = format!(
+                "{}{}",
+                crate::warnings::CLOSE_HINT,
+                glyphs.border.bottom_right
+            );
+            assert!(
+                bottom_row.ends_with(&expected_tail),
+                "expected the close hint right-aligned against the bottom-right corner, got \
+                 {bottom_row:?}"
             );
         }
     }

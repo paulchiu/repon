@@ -2307,7 +2307,10 @@ impl App {
         );
         match layout_state(content_area.width, pane_entity.is_some()) {
             Layout3::ListOnly => {
-                if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
+                if let Err(err) =
+                    self.list
+                        .draw(frame, content_area, &snapshot, self.focus == Context::List)
+                {
                     error = Some(err);
                 }
             }
@@ -2315,7 +2318,12 @@ impl App {
                 let columns =
                     Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
                         .split(content_area);
-                if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
+                if let Err(err) = self.list.draw_sidebar(
+                    frame,
+                    columns[0],
+                    &snapshot,
+                    self.focus == Context::List,
+                ) {
                     error = Some(err);
                 }
                 if let Some(entity) = pane_entity {
@@ -5908,6 +5916,45 @@ mod tests {
             footer::render(&app.bindings, Context::List, 80),
             "the detail footer's own content must differ from the list's, which is what a \
              hardcoded Context::List would fail to produce"
+        );
+    }
+
+    /// The list's own defect 4: `draw_frame`'s two `self.list.draw`/`draw_sidebar` call sites
+    /// must hand `self.focus == Context::List` rather than a fixed `true`, so the sidebar's
+    /// border actually dims once the detail pane takes the keyboard. Driven through the real
+    /// `draw_frame` (`render_app_frame`), the same workaround the glyph-table tests above use,
+    /// rather than `List::draw` directly, since the risk is in the call site's own wiring.
+    #[test]
+    fn draw_frame_dims_the_lists_border_once_the_detail_pane_is_focused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        let key = app.visible_keys()[0].clone();
+        app.pane = Some(key);
+        // Wide enough for `SideBySide`, per `layout_state`'s own breakpoint, so both panels
+        // are on screen and the list's own border is the sidebar's.
+        let (width, height) = (140u16, 24u16);
+        // The list pane sits one row below the status row, so its own top border is at y=1.
+        let list_border_y = 1;
+
+        app.focus = Context::List;
+        let buf = render_app_frame(&mut app, width, height);
+        assert_eq!(
+            buf[(0, list_border_y)].fg,
+            ratatui::style::Color::LightBlue,
+            "expected the list's border focused (theming.md's border_focused default) while \
+             List holds the keyboard"
+        );
+
+        app.focus = Context::Detail;
+        let buf = render_app_frame(&mut app, width, height);
+        assert_eq!(
+            buf[(0, list_border_y)].fg,
+            ratatui::style::Color::DarkGray,
+            "expected the list's border to dim to Role::Border once Detail holds the \
+             keyboard instead, which is what a hardcoded `true` would fail to produce"
         );
     }
 

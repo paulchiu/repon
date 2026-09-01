@@ -48,6 +48,16 @@ const BRANCH_CELL_OBJECT_ID_WIDTH: usize = 9;
 /// puts between every column, gutter included.
 const GAP: u16 = 1;
 
+/// Shown in place of the row list once `row_order` is empty and no Filter is narrowing the
+/// view: nothing was discovered, rather than everything being filtered out
+/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "An empty result says so rather
+/// than rendering blank", which both palettes already follow for their own empty state).
+const NO_REPOS_MESSAGE: &str = "no repos";
+/// The same row's text once an active Filter matches nothing: the same word the Launcher and
+/// Action palettes already use for their own zero-match state
+/// ([filter.md](../../../../docs/spec/filter.md): "zero matches is legal and not an error").
+const NO_MATCHES_MESSAGE: &str = "no matches";
+
 const GUTTER_X: u16 = 0;
 const SELECTED_X: u16 = GUTTER_X + GUTTER_WIDTH + GAP;
 const NAME_X: u16 = SELECTED_X + SELECTED_WIDTH + GAP;
@@ -150,7 +160,14 @@ impl List {
             .unwrap_or_else(|| GlyphSet::for_config(crate::config::document::Glyphs::default()))
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, snapshot: &Snapshot, compact: bool) {
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+        compact: bool,
+        focused: bool,
+    ) {
         let glyphs = self.glyphs();
         // One clock read per draw, shared by every row this tick: still "one moving
         // character per row" (`docs/spec/refresh.md`), since each row's own gutter and cells
@@ -161,12 +178,34 @@ impl List {
             FULL_SPINNER_INTERVAL,
             self.started_at.elapsed(),
         );
+        // Computed ahead of the block below so the bottom border's own position counter can
+        // read `row_order.len()` before the block is built, rather than after.
+        let row_order = visible_row_order(
+            &snapshot.entities,
+            self.show_worktrees,
+            self.show_submodules,
+            &self.filter,
+        );
+
+        // `Component::draw`'s own doc comment: focus is communicated by border colour
+        // (theming.md's "focus communicated by border colour"), the same choice
+        // `Detail::draw` already makes for its own border.
+        let border_role = if focused {
+            theme::Role::BorderFocused
+        } else {
+            theme::Role::Border
+        };
         let mut scratch = BorderScratch::new();
-        let block = glyphs
+        let mut block = glyphs
             .bordered_block(&mut scratch)
-            .border_style(theme::DEFAULT.style_for(theme::Role::BorderFocused))
+            .border_style(self.theme.style_for(border_role))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
+        if let Some(counter) =
+            position_counter(row_order.len(), self.cursor, self.selection.count())
+        {
+            block = block.title_bottom(ratatui::text::Line::from(counter).right_aligned());
+        }
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -175,20 +214,41 @@ impl List {
         // immediately below the border, not one row down as the full list's do.
         let first_row = if compact { 0 } else { FIRST_ENTITY_ROW };
         if !compact {
-            draw_header(buf, interior);
+            draw_header(buf, interior, &self.theme);
         }
-        let row_order = visible_row_order(
-            &snapshot.entities,
-            self.show_worktrees,
-            self.show_submodules,
-            &self.filter,
-        );
+        if row_order.is_empty() {
+            // Nothing to draw below the header: say so rather than leaving a bordered box
+            // with no rows, indistinguishable from a hang. Which sentence depends on whether
+            // a Filter is the reason nothing is showing.
+            let message = if self.filter.is_active() {
+                NO_MATCHES_MESSAGE
+            } else {
+                NO_REPOS_MESSAGE
+            };
+            let y = interior.y + first_row;
+            if y < interior.bottom() {
+                write_cell(
+                    buf,
+                    interior,
+                    interior.x,
+                    y,
+                    interior.width,
+                    message,
+                    self.theme.style_for(theme::Role::Dim),
+                );
+            }
+        }
         // Clamped against the real row count rather than trusted as-is: a stale `self.offset`
         // (computed against a wider table, before a filter narrowed this one) must never
         // blank the list, so this stops one row short of `row_order.len()` rather than at it,
         // leaving at least the last row drawn whenever there is any row at all.
         let skip = row_order.len().saturating_sub(1).min(self.offset);
         let cursor_screen_row = self.cursor_screen_row(skip);
+        let ctx = RowContext {
+            glyphs,
+            loading_frame,
+            theme: &self.theme,
+        };
         for (screen_row, entity) in row_order
             .into_iter()
             .skip(skip)
@@ -205,9 +265,9 @@ impl List {
             }
             let checked = self.selection.contains(&entity.key);
             if compact {
-                draw_row_compact(buf, interior, y, entity, glyphs, loading_frame, checked);
+                draw_row_compact(buf, interior, y, entity, checked, &ctx);
             } else {
-                draw_row(buf, interior, y, entity, glyphs, loading_frame, checked);
+                draw_row(buf, interior, y, entity, checked, &ctx);
             }
             // Painted after the row's own cells, over the row's full interior width, so it
             // reaches every column and every gap between them rather than only the cells a
@@ -244,8 +304,14 @@ impl Component for List {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) -> Result<()> {
-        self.render(frame, area, snapshot, false);
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+        focused: bool,
+    ) -> Result<()> {
+        self.render(frame, area, snapshot, false, focused);
         Ok(())
     }
 }
@@ -257,13 +323,16 @@ impl List {
     /// the gutter and the name column, and no header row (there is nothing left to label).
     /// Reads the same [`Snapshot`] the full list does, so the rows, their order and whichever
     /// row the caller has as the cursor are exactly what the full list would have shown.
+    /// `focused` is whether the keyboard is on the list rather than the detail pane beside
+    /// it, [`Component::draw`]'s own doc comment.
     pub fn draw_sidebar(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         snapshot: &Snapshot,
+        focused: bool,
     ) -> Result<()> {
-        self.render(frame, area, snapshot, true);
+        self.render(frame, area, snapshot, true, focused);
         Ok(())
     }
 
@@ -302,9 +371,19 @@ impl List {
     }
 }
 
-/// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge. Buffer
-/// clipping alone is not enough: it only stops at the *frame's* edge, one column past
+/// The clamp [`write_cell`] and [`write_truncating_cell`] share: `x` past `interior`'s own
+/// right edge draws nothing, and `width` never reaches past that edge either. Buffer clipping
+/// alone is not enough for either: it only stops at the *frame*'s edge, one column past
 /// `interior`'s own, which is the panel's right border.
+fn clipped_cell_width(interior: Rect, x: u16, width: u16) -> Option<u16> {
+    if x >= interior.right() {
+        None
+    } else {
+        Some(width.min(interior.right() - x))
+    }
+}
+
+/// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge.
 fn write_cell(
     buf: &mut Buffer,
     interior: Rect,
@@ -314,11 +393,76 @@ fn write_cell(
     text: &str,
     style: Style,
 ) {
-    if x >= interior.right() {
+    let Some(max_width) = clipped_cell_width(interior, x, width) else {
         return;
-    }
-    let max_width = width.min(interior.right() - x);
+    };
     buf.set_stringn(x, y, text, max_width as usize, style);
+}
+
+/// [`write_cell`]'s counterpart for text that must say when it has been cut short: when
+/// `text` would not otherwise fit, the cell's own last column is reserved for `mark` rather
+/// than letting [`Buffer::set_stringn`]'s silent cut at a grapheme boundary
+/// (`keybindings.md`'s own words for what it does un-aided) leave a truncated name looking
+/// exactly like a whole one
+/// ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// tenth value meaning, `Truncated`; ADR 0027's "a rendered `wo` names neither of them while
+/// looking exactly like a name"). Used by [`draw_name_cell`] alone: every other column this
+/// crate draws is bounded well inside its own width by the values it can legitimately hold
+/// (ADR 0020's own sweep puts `sync`'s worst case at five of its nine columns), so a name is
+/// the one cell long enough to need this.
+/// The text a [`write_truncating_cell`] call writes, paired with its own truncation mark:
+/// bundled into one argument rather than two so this crate's own
+/// `clippy::too_many_arguments` budget has room for it alongside the geometry
+/// [`write_cell`]'s own seven parameters already spend, the same reason `action_palette.rs`'s
+/// own `Run` bundles its fields.
+struct TruncatingText<'a> {
+    text: &'a str,
+    mark: char,
+}
+
+fn write_truncating_cell(
+    buf: &mut Buffer,
+    interior: Rect,
+    x: u16,
+    y: u16,
+    width: u16,
+    content: TruncatingText,
+    style: Style,
+) {
+    let Some(max_width) = clipped_cell_width(interior, x, width) else {
+        return;
+    };
+    let content = truncate_with_mark(content.text, max_width, content.mark);
+    buf.set_stringn(x, y, &content, max_width as usize, style);
+}
+
+/// `text`, unchanged if it already fits `max_width` columns; otherwise cut to `max_width - 1`
+/// columns at a grapheme boundary, plus `mark` as the last character. Measured with
+/// [`ratatui::text::Span::width`], the same `UnicodeWidthStr::width()` function
+/// `Buffer::set_stringn` itself budgets with (ADR 0020), so this can never disagree with what
+/// the renderer was about to cut anyway.
+fn truncate_with_mark(text: &str, max_width: u16, mark: char) -> std::borrow::Cow<'_, str> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if ratatui::text::Span::raw(text).width() <= max_width as usize {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    if max_width == 0 {
+        return std::borrow::Cow::Borrowed("");
+    }
+    let budget = (max_width - 1) as usize;
+    let mut kept = String::new();
+    let mut column = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = ratatui::text::Span::raw(grapheme).width();
+        if column + grapheme_width > budget {
+            break;
+        }
+        column += grapheme_width;
+        kept.push_str(grapheme);
+    }
+    kept.push(mark);
+    std::borrow::Cow::Owned(kept)
 }
 
 /// [`write_cell`]'s counterpart for a cell that carries more than one role at once: writes
@@ -347,6 +491,26 @@ pub(crate) fn write_cell_runs(
         let (next_x, _) = buf.set_stringn(cursor, y, text, (end - cursor) as usize, *style);
         cursor = next_x;
     }
+}
+
+/// The list's own `title_bottom` text: the cursor's 1-indexed position among `total` visible
+/// rows, plus a third `/`-separated number for the Selection's own count once it is
+/// non-empty. `None` once `total` is zero, since the empty-state message above already says
+/// there is nothing to number.
+///
+/// [ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// "Digits and `/` only, no new glyph" is why the checked count is a third plain number
+/// rather than a word or an icon.
+fn position_counter(total: usize, cursor: usize, checked: usize) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let position = cursor.saturating_add(1).min(total);
+    Some(if checked > 0 {
+        format!("{position}/{total}/{checked}")
+    } else {
+        format!("{position}/{total}")
+    })
 }
 
 /// Whether `kind`'s row is ever drawn: a Repo always, a Worktree while `show_worktrees` is
@@ -503,8 +667,9 @@ fn draw_name_cell(
     y: u16,
     entity: &EntityState,
     glyphs: &'static GlyphSet,
+    theme: &Theme,
 ) {
-    let name_style = theme::DEFAULT.style_for(name_cell_meaning(entity.kind).role());
+    let name_style = theme.style_for(name_cell_meaning(entity.kind).role());
     if is_child_row(entity.kind) {
         let marker_x = interior.x + NAME_X + CHILD_ROW_INDENT_WIDTH;
         write_cell(
@@ -517,33 +682,39 @@ fn draw_name_cell(
             Style::new(),
         );
         let name_x = marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
-        write_cell(
+        write_truncating_cell(
             buf,
             interior,
             name_x,
             y,
             CHILD_ROW_NAME_WIDTH,
-            &entity.name,
+            TruncatingText {
+                text: &entity.name,
+                mark: glyphs.truncated,
+            },
             name_style,
         );
     } else {
-        write_cell(
+        write_truncating_cell(
             buf,
             interior,
             interior.x + NAME_X,
             y,
             NAME_WIDTH,
-            &entity.name,
+            TruncatingText {
+                text: &entity.name,
+                mark: glyphs.truncated,
+            },
             name_style,
         );
     }
 }
 
-fn draw_header(buf: &mut Buffer, interior: Rect) {
+fn draw_header(buf: &mut Buffer, interior: Rect, theme: &Theme) {
     let y = interior.y + HEADER_ROW;
     // A column header is `dim` per theming.md's meaning-to-role map, a foreground colour
     // rather than the DIM text attribute this used to draw with.
-    let style = theme::DEFAULT.style_for(theme::Role::Dim);
+    let style = theme.style_for(theme::Role::Dim);
     write_cell(
         buf,
         interior,
@@ -602,17 +773,17 @@ fn draw_header(buf: &mut Buffer, interior: Rect) {
 
 /// Writes the Selection's own marker at [`SELECTED_X`]: `glyphs.checked` for a checked row,
 /// a blank cell otherwise. Shared by [`draw_row`] and [`draw_row_compact`] so the full list
-/// and the sidebar can never disagree about which rows carry it. [`Theme::checked_style`]
-/// names no colour, so this reads `theme::DEFAULT` the same way every other free-function
-/// cell style in this file does rather than threading a live `Theme` through, which is what
-/// keeps `List::set_theme` reaching only [`Theme::selection_style`]
-/// (this module's own "Criterion 2" test notes the gap).
+/// and the sidebar can never disagree about which rows carry it. Takes the live `theme` the
+/// same way every other free-function cell style in this file now does, even though
+/// [`Theme::checked_style`] names no colour today: a theme file reaching every cell means
+/// every cell, this one included, rather than one glyph left on `theme::DEFAULT`.
 fn draw_selected_marker(
     buf: &mut Buffer,
     interior: Rect,
     y: u16,
     checked: bool,
     glyphs: &'static GlyphSet,
+    theme: &Theme,
 ) {
     let marker = if checked {
         glyphs.checked.to_string()
@@ -626,8 +797,21 @@ fn draw_selected_marker(
         y,
         SELECTED_WIDTH,
         &marker,
-        theme::DEFAULT.checked_style(),
+        theme.checked_style(),
     );
+}
+
+/// What every row drawn this tick shares: the active glyph table, this frame's own loading
+/// mark and the live theme. Bundled into one argument rather than three so this crate's own
+/// `clippy::too_many_arguments` budget has room for `entity` and `checked` alongside the
+/// row's own geometry, the same reason `action_palette.rs`'s own `Run` bundles its fields.
+/// Built once per frame in [`List::render`], not held on `List`: `loading_frame` is this
+/// tick's own spinner frame, recomputed on every draw.
+#[derive(Clone, Copy)]
+struct RowContext<'a> {
+    glyphs: &'static GlyphSet,
+    loading_frame: char,
+    theme: &'a Theme,
 }
 
 fn draw_row(
@@ -635,10 +819,14 @@ fn draw_row(
     interior: Rect,
     y: u16,
     entity: &EntityState,
-    glyphs: &'static GlyphSet,
-    loading_frame: char,
     checked: bool,
+    ctx: &RowContext,
 ) {
+    let RowContext {
+        glyphs,
+        loading_frame,
+        theme,
+    } = *ctx;
     let row_summary = summary(entity);
     let gutter = gutter_glyph_for(row_summary, glyphs, loading_frame).to_string();
     // While the row holds no value at all, its one spinner already lives in the gutter
@@ -661,8 +849,8 @@ fn draw_row(
         &gutter,
         Style::new(),
     );
-    draw_selected_marker(buf, interior, y, checked, glyphs);
-    draw_name_cell(buf, interior, y, entity, glyphs);
+    draw_selected_marker(buf, interior, y, checked, glyphs, theme);
+    draw_name_cell(buf, interior, y, entity, glyphs, theme);
     write_cell(
         buf,
         interior,
@@ -670,7 +858,7 @@ fn draw_row(
         y,
         BRANCH_WIDTH,
         &format_head(&entity.branch, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.branch.settled(),
             |_| Meaning::FreshValue,
             cell_loading_glyph,
@@ -684,7 +872,7 @@ fn draw_row(
         SYNC_WIDTH,
         &sync_cell_runs(&entity.sync, glyphs, cell_loading_glyph)
             .into_iter()
-            .map(|(text, role)| (text, theme::DEFAULT.style_for(role)))
+            .map(|(text, role)| (text, theme.style_for(role)))
             .collect::<Vec<_>>(),
     );
     write_cell(
@@ -694,7 +882,7 @@ fn draw_row(
         y,
         BASE_WIDTH,
         &format_base(&entity.base, glyphs, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.base.settled(),
             base_meaning,
             cell_loading_glyph,
@@ -707,7 +895,7 @@ fn draw_row(
         y,
         DIRTY_WIDTH,
         &format_dirty(&entity.dirty, glyphs, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.dirty.settled(),
             dirty_meaning,
             cell_loading_glyph,
@@ -720,7 +908,7 @@ fn draw_row(
         y,
         STATE_WIDTH,
         &format_state(&entity.state, cell_loading_glyph),
-        theme::DEFAULT.style_for(cell_role(
+        theme.style_for(cell_role(
             entity.state.settled(),
             state_meaning,
             cell_loading_glyph,
@@ -740,10 +928,14 @@ fn draw_row_compact(
     interior: Rect,
     y: u16,
     entity: &EntityState,
-    glyphs: &'static GlyphSet,
-    loading_frame: char,
     checked: bool,
+    ctx: &RowContext,
 ) {
+    let RowContext {
+        glyphs,
+        loading_frame,
+        theme,
+    } = *ctx;
     let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
     write_cell(
         buf,
@@ -754,8 +946,8 @@ fn draw_row_compact(
         &gutter,
         Style::new(),
     );
-    draw_selected_marker(buf, interior, y, checked, glyphs);
-    draw_name_cell(buf, interior, y, entity, glyphs);
+    draw_selected_marker(buf, interior, y, checked, glyphs, theme);
+    draw_name_cell(buf, interior, y, entity, glyphs, theme);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -1128,7 +1320,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, snapshot).expect("draw the list");
+                // `true`: every caller of this helper predates the focus flag and expects
+                // the border it always drew, `BorderFocused`. The two tests exercising
+                // `focused: false` call `list.draw`/`draw_sidebar` directly instead.
+                list.draw(frame, area, snapshot, true)
+                    .expect("draw the list");
             })
             .expect("draw the frame");
         terminal
@@ -1149,7 +1345,8 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw_sidebar(frame, area, snapshot)
+                // `true`, for the same reason `render_with_list` above passes it.
+                list.draw_sidebar(frame, area, snapshot, true)
                     .expect("draw the sidebar");
             })
             .expect("draw the frame");
@@ -1995,8 +2192,13 @@ mod tests {
 
         // The name column is 28 wide starting at x=5 (see the header test above), so its
         // last character sits at x=32, the single-space gap before branch is at x=33, and
-        // branch itself starts at x=34.
-        assert_eq!(cell_text(buf, 5, 2, 28), "n".repeat(28));
+        // branch itself starts at x=34. Defect 5: the cut reserves the column's own last
+        // character for the truncation mark rather than filling all 28 with the name's own
+        // text, so a truncated name never looks exactly like a whole one (ADR 0020's tenth
+        // value meaning).
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let expected = format!("{}{}", "n".repeat(27), glyphs.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 28), expected);
         assert_eq!(
             cell_text(buf, 33, 2, 1),
             " ",
@@ -2006,6 +2208,101 @@ mod tests {
             cell_text(buf, 34, 2, 1),
             " ",
             "the branch column must not carry name overflow"
+        );
+    }
+
+    /// A name exactly as wide as its column fits with no mark: the mark is reserved only
+    /// when a cut actually happens, never appended just because a name reaches the edge.
+    #[test]
+    fn a_name_exactly_as_wide_as_its_column_carries_no_truncation_mark() {
+        let exact_name = "n".repeat(NAME_WIDTH as usize);
+        let terminal = render(140, 24, &snapshot(vec![entity(&exact_name)]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(cell_text(buf, 5, 2, NAME_WIDTH), exact_name);
+    }
+
+    /// The ascii table's own truncation mark, `$` per ADR 0020's tenth value meaning, the
+    /// same character the full table uses (`GlyphSet::for_config` is the seam that would
+    /// diverge if a future ascii-only fallback were ever added).
+    #[test]
+    fn a_truncated_name_carries_the_ascii_tables_own_mark_under_glyphs_ascii() {
+        let mut list = List::default();
+        list.register_config_handler(crate::config::Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document: crate::config::document::Document {
+                glyphs: crate::config::document::Glyphs::Ascii,
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+            zero_config: false,
+        })
+        .expect("register config");
+        let long_name = "n".repeat(40);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![entity(&long_name)]));
+        let buf = terminal.backend().buffer();
+
+        let ascii = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+        let expected = format!("{}{}", "n".repeat(27), ascii.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 28), expected);
+    }
+
+    /// A child row's own reduced name budget ([`CHILD_ROW_NAME_WIDTH`]) truncates the same
+    /// way the top-level name column does: the mark comes out of the child's own budget, not
+    /// appended past it.
+    #[test]
+    fn a_truncated_child_row_name_also_carries_the_mark_inside_its_own_reduced_budget() {
+        let long_branch_name = "b".repeat(40);
+        let parent = entity("parent-repo");
+        let mut child = entity(&long_branch_name);
+        child.kind = Kind::Worktree;
+        let terminal = render(140, 24, &snapshot(vec![parent, child]));
+        let buf = terminal.backend().buffer();
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        // Indent (4) + marker (1) + gap (1) = 6 columns before the child's own name text
+        // starts, per `CHILD_ROW_PREFIX_WIDTH`; its own budget is `NAME_WIDTH - 6` = 22.
+        let child_name_x =
+            5 + CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
+        let expected = format!(
+            "{}{}",
+            "b".repeat(CHILD_ROW_NAME_WIDTH as usize - 1),
+            glyphs.truncated
+        );
+        assert_eq!(
+            cell_text(buf, child_name_x, entity_row_y(1), CHILD_ROW_NAME_WIDTH),
+            expected
+        );
+    }
+
+    /// [`truncate_with_mark`] proven directly, independent of any rendering: the pure
+    /// function every render-level test above exercises end to end.
+    #[test]
+    fn truncate_with_mark_reserves_the_last_column_only_when_a_cut_actually_happens() {
+        assert_eq!(
+            truncate_with_mark("short", 10, '$'),
+            std::borrow::Cow::Borrowed("short"),
+            "text that already fits must be returned unchanged, with no mark appended"
+        );
+        assert_eq!(
+            truncate_with_mark("exact", 5, '$'),
+            std::borrow::Cow::Borrowed("exact"),
+            "text exactly as wide as the budget must not be treated as needing a cut"
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 5, '$'),
+            "nnnn$".to_string()
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 1, '$'),
+            "$".to_string(),
+            "a one-column budget spends its whole column on the mark, keeping nothing"
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 0, '$'),
+            "",
+            "a zero-column budget has no room for the mark either"
         );
     }
 
@@ -2043,6 +2340,54 @@ mod tests {
         );
     }
 
+    /// Defect 4: with the keyboard on the detail pane instead, the list's own border must
+    /// dim to `Role::Border` rather than staying `Role::BorderFocused` regardless, so the
+    /// frame actually says where the keyboard is.
+    #[test]
+    fn the_list_border_dims_to_role_border_once_another_panel_is_focused() {
+        let mut list = List::default();
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw(frame, area, &snapshot(vec![]), false)
+                    .expect("draw the list");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme::DEFAULT.role_color(Role::Border),
+            "expected the list's border to dim to Role::Border while another panel holds the \
+             keyboard, not stay BorderFocused regardless"
+        );
+    }
+
+    /// The sidebar seam for the same defect: `draw_sidebar` must dim exactly the way `draw`
+    /// does, since both take `focused` through the same `List::render`.
+    #[test]
+    fn the_sidebars_border_also_dims_to_role_border_once_another_panel_is_focused() {
+        let mut list = List::default();
+        let backend = TestBackend::new(SIDEBAR_WIDTH, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw_sidebar(frame, area, &snapshot(vec![]), false)
+                    .expect("draw the sidebar");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme::DEFAULT.role_color(Role::Border),
+            "expected the sidebar's border to dim the same way the full list's does"
+        );
+    }
+
     /// The counterpart to the rounded-corners test above, under the other table: the panel's
     /// frame degrades with `glyphs = "ascii"` like everything else this key governs, rather
     /// than being the one surface pinned to the full table's characters.
@@ -2072,6 +2417,115 @@ mod tests {
         );
     }
 
+    /// The bottom border's own row, read the way `warnings.rs`'s own `CLOSE_HINT` test reads
+    /// its bottom row: the corner comes from the glyph table, the counter sits right against
+    /// it.
+    fn bottom_row_text(buf: &Buffer, area: Rect) -> String {
+        (area.x..area.right())
+            .map(|x| buf[(x, area.bottom() - 1)].symbol())
+            .collect()
+    }
+
+    /// Defect 2 (the list half): the bottom border carries the cursor's 1-indexed position
+    /// among the visible rows and the total, right-aligned against the bottom-right corner.
+    #[test]
+    fn the_bottom_border_carries_the_cursors_position_and_the_total_visible_rows() {
+        let mut list = List::default();
+        list.set_cursor(1);
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render_with_list(
+            &mut list,
+            area.width,
+            area.height,
+            &snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]),
+        );
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_tail = format!("2/3{}", border.bottom_right);
+        assert!(
+            bottom_row_text(buf, area).ends_with(&expected_tail),
+            "expected the cursor's position (2) and the total (3) right-aligned against the \
+             bottom-right corner, got: {:?}",
+            bottom_row_text(buf, area)
+        );
+    }
+
+    /// The other half: once the Selection is non-empty, a third `/`-separated number joins
+    /// the counter, digits and `/` only per ADR 0020.
+    #[test]
+    fn the_bottom_border_also_carries_the_checked_count_once_the_selection_is_non_empty() {
+        let mut list = List::default();
+        list.set_cursor(1);
+        let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
+        let checked_key = entities[0].key.clone();
+        list.set_selection(checked_selection([checked_key]));
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render_with_list(&mut list, area.width, area.height, &snapshot(entities));
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_tail = format!("2/3/1{}", border.bottom_right);
+        assert!(
+            bottom_row_text(buf, area).ends_with(&expected_tail),
+            "expected the checked count to join the counter as a third number, got: {:?}",
+            bottom_row_text(buf, area)
+        );
+    }
+
+    /// The counter must not appear at all once there is nothing to number: an empty list
+    /// already says so on its own first row (defect 1), and a plain dash run must still fill
+    /// the bottom border rather than a stray `0/0`.
+    #[test]
+    fn the_bottom_border_carries_no_counter_when_the_list_is_empty() {
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render(area.width, area.height, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_bottom = format!(
+            "{}{}{}",
+            border.bottom_left,
+            border
+                .horizontal
+                .to_string()
+                .repeat(area.width as usize - 2),
+            border.bottom_right
+        );
+        assert_eq!(
+            bottom_row_text(buf, area),
+            expected_bottom,
+            "expected a plain dash run with no counter when there is nothing to number"
+        );
+    }
+
+    /// [`position_counter`] proven directly, independent of any rendering: the pure function
+    /// the two render-level tests above exercise end to end.
+    #[test]
+    fn position_counter_reads_cursor_and_selection_into_one_slash_separated_string() {
+        assert_eq!(
+            position_counter(0, 0, 0),
+            None,
+            "nothing to number when total is zero"
+        );
+        assert_eq!(position_counter(5, 0, 0), Some("1/5".to_string()));
+        assert_eq!(
+            position_counter(5, 4, 0),
+            Some("5/5".to_string()),
+            "0-indexed cursor 4 of 5 rows is position 5"
+        );
+        assert_eq!(
+            position_counter(5, 99, 0),
+            Some("5/5".to_string()),
+            "a cursor past the row count must clamp to the last row rather than overrun it"
+        );
+        assert_eq!(
+            position_counter(5, 2, 3),
+            Some("3/5/3".to_string()),
+            "a non-empty Selection appends its count as a third number"
+        );
+    }
+
     #[test]
     fn the_panel_title_renders_inline_in_the_top_border_row_rather_than_a_separate_row() {
         let terminal = render(140, 24, &snapshot(vec![]));
@@ -2081,6 +2535,63 @@ mod tests {
         assert!(
             top_row.contains("repos"),
             "expected the title inline in the top border row, got: {top_row:?}"
+        );
+    }
+
+    /// Defect 1: nothing discovered (an empty snapshot, no Filter) reads distinctly from
+    /// everything being filtered out, both against the design of record's own rule
+    /// (keybindings.md's "An empty result says so rather than rendering blank").
+    #[test]
+    fn an_empty_snapshot_says_so_rather_than_rendering_an_empty_box() {
+        let terminal = render(140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(
+                buf,
+                absolute_x(0),
+                entity_row_y(0),
+                NO_REPOS_MESSAGE.len() as u16
+            ),
+            NO_REPOS_MESSAGE,
+            "an empty snapshot with no Filter must say so on the first row below the header"
+        );
+    }
+
+    /// The other half of defect 1: a Filter narrowing the view to zero rows must say a
+    /// different thing than an empty snapshot, per filter.md's "zero matches is legal and
+    /// not an error": the two are different facts and the row must not conflate them.
+    #[test]
+    fn a_filter_matching_nothing_says_so_distinctly_from_an_empty_snapshot() {
+        let mut list = List::default();
+        list.set_filter(Filter::parse("name:does-not-exist-anywhere"));
+        let snap = snapshot(vec![entity("alpha")]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(
+                buf,
+                absolute_x(0),
+                entity_row_y(0),
+                NO_MATCHES_MESSAGE.len() as u16
+            ),
+            NO_MATCHES_MESSAGE,
+            "a Filter matching zero rows must say so, distinctly from the no-filter empty state"
+        );
+    }
+
+    /// The sidebar shares the same empty-state draw as the full list: proven separately since
+    /// the sidebar has no header row, so its own first row sits one line higher.
+    #[test]
+    fn the_sidebar_also_says_so_when_nothing_is_discovered() {
+        let terminal = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 1, 1, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE,
+            "the sidebar must show the same empty-state message, one row higher (no header)"
         );
     }
 
@@ -2556,6 +3067,59 @@ mod tests {
             behind_fg,
             theme::DEFAULT.role_color(role_named_in_theming_md("Behind count")),
             "the behind count keeps its own role rather than the cell settling on one"
+        );
+    }
+
+    // --- the list's own live-theme reach: `List::set_theme` used to reach only
+    // `Theme::selection_style` for the cursor row, leaving the border, the header and every
+    // value cell painted through `theme::DEFAULT` regardless of what was loaded. Following
+    // `components/detail.rs`'s own `draw_paints_the_border_from_the_live_theme_not_the_
+    // compiled_default`: distinct `Rgb` colours the compiled default never uses, so a call
+    // site that still read `theme::DEFAULT` by mistake could not pass by coincidence.
+
+    /// Criterion 3, done: a theme file's own colours reach the border, the column header and
+    /// a value cell alike.
+    #[test]
+    fn a_live_themes_own_colours_reach_the_border_the_column_header_and_a_value_cell() {
+        let snapshot = settled_snapshot_with_an_ahead_and_behind_sync();
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        let live_theme = Theme {
+            border_focused: Color::Rgb(9, 8, 7),
+            dim: Color::Rgb(11, 22, 33),
+            text: Color::Rgb(44, 55, 66),
+            ok: Color::Rgb(77, 88, 99),
+            ..Theme::default()
+        };
+        let mut list = List::default();
+        list.set_theme(live_theme);
+        // Off the cursor row, the same way the ahead/behind test above is: the cursor's own
+        // reverse-video highlight would otherwise force a uniform foreground onto row 0
+        // before this test ever gets to read it.
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            live_theme.border_focused,
+            "the border must read the live theme, not theme::DEFAULT"
+        );
+        assert_eq!(
+            buf[(absolute_x(NAME_X), 1)].fg,
+            live_theme.dim,
+            "the column header must read the live theme"
+        );
+        assert_eq!(
+            buf[(absolute_x(NAME_X), y)].fg,
+            live_theme.text,
+            "the name cell must read the live theme"
+        );
+        assert_eq!(
+            buf[(absolute_x(SYNC_X), y)].fg,
+            live_theme.ok,
+            "the ahead count cell must read the live theme"
         );
     }
 
@@ -4122,11 +4686,9 @@ mod tests {
     // distinct once colour is set aside. `NO_COLOR` strips colour only, never glyphs
     // (theming.md's own "Colour is never the only carrier"), so the honest proof reads each
     // pair's plain text (`cell_text`, which never looks at `.fg`) rather than swapping in a
-    // monochrome `Theme`: every per-`Meaning` role in `draw_row` still paints through
-    // `theme::DEFAULT` unconditionally rather than a live theme `App` threads through
-    // (`List::set_theme` only reaches `Theme::selection_style` for the cursor row), a
-    // pre-existing gap this ticket leaves for whichever ticket finishes wiring a live theme
-    // into the rest of this component.
+    // monochrome `Theme`. `draw_row` now paints every per-`Meaning` role through `self.theme`,
+    // the live theme `App` threads through: see the test proving that reach, further down
+    // this file, under "the list's own live-theme reach".
 
     #[test]
     fn ahead_and_behind_read_as_distinct_counts_once_colour_is_set_aside() {
@@ -4493,7 +5055,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, &snap).expect("draw the list");
+                list.draw(frame, area, &snap, true).expect("draw the list");
             })
             .expect("draw the frame");
         {
@@ -4512,7 +5074,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, &snap).expect("draw the list");
+                list.draw(frame, area, &snap, true).expect("draw the list");
             })
             .expect("draw the frame");
         let buf = terminal.backend().buffer();
@@ -4572,7 +5134,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    list.draw_sidebar(frame, area, &snap)
+                    list.draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
@@ -4628,7 +5190,7 @@ mod tests {
                 .draw(|frame| {
                     let area = frame.area();
                     sidebar_list
-                        .draw_sidebar(frame, area, &snap)
+                        .draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
@@ -4837,7 +5399,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    list.draw_sidebar(frame, area, &snap)
+                    list.draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
