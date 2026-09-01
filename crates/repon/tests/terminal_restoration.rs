@@ -41,6 +41,11 @@ unsafe extern "C" {
 /// one.
 const WUNTRACED: c_int = 2;
 
+/// POSIX-standard on both macOS and Linux (`errno.h`): what a pty master read reports once its
+/// last slave descriptor has closed, on Linux. macOS reports the same condition as `Ok(0)`
+/// instead; see [`DrainEnd::EofViaEio`].
+const EIO: i32 = 5;
+
 const O_RDWR: c_int = 2;
 #[cfg(target_os = "macos")]
 const O_NOCTTY: c_int = 0x0002_0000;
@@ -245,24 +250,43 @@ fn wifstopped(status: c_int) -> bool {
 }
 
 /// Why a pty drain's reader thread stopped reading from the master.
+///
+/// Both platforms agree only that a slave-less pty read must stop the drain; they report the
+/// same condition through different results, so this names both explicitly rather than folding
+/// one into the other. Do not collapse `Eof` and `EofViaEio` back into one variant: that would
+/// erase the platform difference this comment exists to record.
 #[derive(Debug)]
 enum DrainEnd {
-    /// The master reported end of file. With a parent-held slave kept open for the whole
-    /// drain, this fires only once every slave descriptor, that one included, has closed:
-    /// a real end of file rather than a race against the child's own exit.
+    /// The master reported `Ok(0)`: what macOS returns once every slave descriptor, including
+    /// this process's own held one, has closed.
     Eof,
-    /// The read syscall itself failed.
+    /// The master's read failed with `EIO`: what Linux returns for the same fully-closed
+    /// condition `Eof` reports on macOS, not a fault distinct from it.
+    EofViaEio,
+    /// The read syscall failed for any other reason, which is a real failure on both platforms.
     Err(std::io::Error),
+}
+
+/// Classifies one `read` result from a pty master: more bytes to accumulate, or the
+/// [`DrainEnd`] the drain loop should stop with. A free function, rather than inline in the
+/// loop, so the classification itself is unit-testable without a real pty.
+fn classify_pty_read(result: std::io::Result<usize>) -> Result<usize, DrainEnd> {
+    match result {
+        Ok(0) => Err(DrainEnd::Eof),
+        Ok(n) => Ok(n),
+        Err(error) if error.raw_os_error() == Some(EIO) => Err(DrainEnd::EofViaEio),
+        Err(error) => Err(DrainEnd::Err(error)),
+    }
 }
 
 /// Starts a thread draining `master` to completion, returning a `JoinHandle` and a channel
 /// that reports the bytes read and why the loop stopped.
 ///
 /// The caller must open a parent-held slave ([`open_parent_held_slave`]) before spawning the
-/// child this drains, and must not drop it until the child has been reaped: otherwise, once the
-/// child exits, the pty can go slave-less while this thread is still mid-drain, and on macOS a
-/// read against a slave-less pty fails with `EIO` whether or not bytes are still buffered,
-/// silently discarding whatever the child wrote.
+/// child this drains, and must not drop it until the child has been reaped: while it stays
+/// open, the pty by construction still has a slave, so neither `Ok(0)` nor `EIO` can occur here
+/// and this thread simply blocks waiting for more bytes. Only after the caller drops it does a
+/// read here report a real end of file, as `Eof` or `EofViaEio` depending on the platform.
 fn spawn_pty_reader(
     mut master: File,
 ) -> (
@@ -274,10 +298,9 @@ fn spawn_pty_reader(
         let mut output = Vec::new();
         let end = loop {
             let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) => break DrainEnd::Eof,
-                Err(error) => break DrainEnd::Err(error),
+            match classify_pty_read(master.read(&mut chunk)) {
                 Ok(n) => output.extend_from_slice(&chunk[..n]),
+                Err(end) => break end,
             }
         };
         let _ = tx.send((output, end));
@@ -286,8 +309,8 @@ fn spawn_pty_reader(
 }
 
 /// Waits for a [`spawn_pty_reader`] drain to report back, joins its thread, and asserts it
-/// stopped on a real end of file rather than an error masking lost output. `what` names the
-/// drain, so a hang or a masked error names which one.
+/// stopped on a real end of file (`Eof` or `EofViaEio`, both legitimate) rather than an error
+/// masking lost output. `what` names the drain, so a hang or a masked error names which one.
 fn expect_eof(
     reader: std::thread::JoinHandle<()>,
     rx: mpsc::Receiver<(Vec<u8>, DrainEnd)>,
@@ -298,7 +321,7 @@ fn expect_eof(
         .unwrap_or_else(|_| panic!("{what}: pty reader thread did not report back"));
     let _ = reader.join();
     match end {
-        DrainEnd::Eof => String::from_utf8_lossy(&output).into_owned(),
+        DrainEnd::Eof | DrainEnd::EofViaEio => String::from_utf8_lossy(&output).into_owned(),
         DrainEnd::Err(error) => panic!(
             "{what}: pty read stopped on an error rather than end of file ({error}); output \
              captured before that: {:?}",
@@ -1088,9 +1111,7 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
         let mut master = master;
         loop {
             let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) => break DrainEnd::Eof,
-                Err(error) => break DrainEnd::Err(error),
+            match classify_pty_read(master.read(&mut chunk)) {
                 Ok(n) => {
                     // Nothing drops `chunk_rx` before this loop stops on its own, so a failed
                     // send would mean a bug in this test rather than a real drain outcome.
@@ -1098,6 +1119,7 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
                         .send(chunk[..n].to_vec())
                         .expect("chunk receiver dropped before the reader stopped");
                 }
+                Err(end) => break end,
             }
         }
     });
@@ -1165,7 +1187,7 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
     }
     let end = reader.join().expect("pty reader thread panicked");
     assert!(
-        matches!(end, DrainEnd::Eof),
+        matches!(end, DrainEnd::Eof | DrainEnd::EofViaEio),
         "expected the pty drain to end on a real end of file, got {end:?}; output so far: {:?}",
         String::from_utf8_lossy(&output)
     );
@@ -1222,5 +1244,32 @@ fn a_child_that_writes_and_exits_immediately_has_its_output_captured_in_full() {
     assert!(
         output.contains(MARKER),
         "expected the fast-exiting child's full output, got: {output:?}"
+    );
+}
+
+/// Locks in the classification [`spawn_pty_reader`] depends on: `EIO` is what Linux reports for
+/// the same fully-closed pty condition macOS reports as `Ok(0)`, so it must classify as a
+/// legitimate end rather than a failure that would mask a fast-exiting child's captured output.
+/// Exercises the pure classifier directly, since macOS itself never produces a real `EIO` here
+/// to drive this through the pty tests above.
+#[test]
+fn classify_pty_read_treats_eio_as_a_legitimate_end_not_a_failure() {
+    let result = Err(std::io::Error::from_raw_os_error(EIO));
+    assert!(
+        matches!(classify_pty_read(result), Err(DrainEnd::EofViaEio)),
+        "EIO must classify as EofViaEio, the Linux-shaped half of a legitimate end"
+    );
+}
+
+/// The other half of the same distinction: an error that is not `EIO` must still classify as a
+/// failure, so `DrainEnd::Err` keeps naming a real problem rather than folding every error into
+/// "the pty closed".
+#[test]
+fn classify_pty_read_still_treats_a_non_eio_error_as_a_failure() {
+    const EBADF: i32 = 9; // POSIX-standard on both macOS and Linux; deliberately not EIO.
+    let result = Err(std::io::Error::from_raw_os_error(EBADF));
+    assert!(
+        matches!(classify_pty_read(result), Err(DrainEnd::Err(_))),
+        "a non-EIO error must still classify as a failure"
     );
 }
