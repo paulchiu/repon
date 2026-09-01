@@ -43,20 +43,6 @@ it carried is still readable off the receipt afterwards.
   the gap, and [`spec/core-api.md`](spec/core-api.md), which owns the exit-code rule
   such a verb would extend.
 
-## Per-Repo Action applicability
-
-The `[[action]]` schema has no way to compute how many of the selected Repos define
-a given Action, so the palette shows the Selection count instead. The dropped
-requirement was recorded as the single biggest usability gain over the CLI, which is
-why it stays open here rather than settled as never.
-
-- **Reopens if**: the schema grows a way to declare, per Action, which Repos it
-  applies to.
-- **Owned by**: [`spec/actions.md`](spec/actions.md#open). The promised count was
-  already removed from [`CONTEXT.md`](../CONTEXT.md)'s glossary; its `Action` entry
-  now says only "how many Repos it will run on", which is the Selection count the
-  confirm gate and the palette both already show.
-
 ## Fold vocabulary for collapsing Worktrees under their Repo
 
 Out of scope for v1: the `show_worktrees` preference (`spec/config.md`) and a
@@ -81,22 +67,6 @@ released, so the no stays enforced rather than merely stated.
 - **Reopens if**: someone wants to try it.
 - **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open), reasoning in
   [ADR 0024](adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
-
-## Dismissing a Vanished row has no undo
-
-Genuinely unresolved rather than a deliberate no: whether the dismiss gesture needs
-an undo, or a Vanished row wants a Filter of its own, is still an open question. It
-sits beside a second open point on the same row, the gutter mark a Vanished row
-should carry, which
-[`crates/repon-core/src/entity.rs`](../crates/repon-core/src/entity.rs)'s
-`Presence` doc comment already records. The Filter half is already settled:
-`presence:vanished` exists ([`spec/filter.md`](spec/filter.md)) precisely because a
-Vanished row is one Repon cannot refresh, which is a different fact from a Stale
-one.
-
-- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open) (the undo
-  question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
-  (the gutter mark).
 
 ## Two writers to `config.toml`
 

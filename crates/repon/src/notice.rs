@@ -1,4 +1,4 @@
-//! The Notice ([CONTEXT.md](../../../CONTEXT.md)'s own glossary entry): a transient
+//! The Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s own glossary entry): a transient
 //! one-line message on the status row, the answer to a keystroke whose visible effect would
 //! otherwise say nothing about what changed.
 //!

@@ -86,7 +86,7 @@ The cost, stated plainly: while a Filter is active the indent and the `└` mark
 
 A Filter never reorders. There is no ranking and no fuzzy matching: rows keep discovery order, minus the ones that did not match. Fuzzy was refused because a list that cannot reorder cannot show why a row matched, and because it makes the header's match count untrustworthy while [actions.md](actions.md) puts that count on screen under a contract.
 
-A Filter never mutates the Selection ([CONTEXT.md](../../CONTEXT.md)), so a selected row hidden by a Filter is still acted on. Where that makes the confirm gate's count unverifiable against the screen, the gate names the difference: `run "reinstall" on 12 repos? (3 not visible)`, and the parenthetical is absent when nothing is hidden. This is [config.md](config.md)'s `worktrees: 161 (preference off)` pattern: where an explicit gesture produces a count that disagrees with what is on screen, the disagreement is named rather than hidden.
+A Filter never mutates the Selection ([GLOSSARY.md](../../GLOSSARY.md)), so a selected row hidden by a Filter is still acted on. Where that makes the confirm gate's count unverifiable against the screen, the gate names the difference: `run "reinstall" on 12 repos? (3 not visible)`, and the parenthetical is absent when nothing is hidden. This is [config.md](config.md)'s `worktrees: 161 (preference off)` pattern: where an explicit gesture produces a count that disagrees with what is on screen, the disagreement is named rather than hidden.
 
 ## The input line
 
@@ -155,7 +155,7 @@ Two properties fall out. The filter applies **after** `settle`, so the probe sti
 - [actions.md](actions.md) promises a `failed` Filter term. It is `action:failed` for the receipt and `row:failed` for the gutter's fold, which are different sets.
 - [refresh.md](refresh.md) says Unknown's reasons are "timed out, no upstream, no default branch, no remote". [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote` and core-api.md records the set as closed at two.
 - [config.md](config.md)'s Worktrees-only Filter is `kind:worktree`.
-- [layout-and-provenance.md](layout-and-provenance.md) leaves open whether a Vanished row wants a Filter of its own. It does: `presence:vanished`. A Vanished row is all-Stale, but `row:stale` is not a substitute, because a Stale row is one Repon will refresh and a Vanished row is one it cannot. The gutter mark for a Vanished row is still open and stays with that spec.
+- [layout-and-provenance.md](layout-and-provenance.md) leaves open whether a Vanished row wants a Filter of its own. It does: `presence:vanished`. A Vanished row is all-Stale, but `row:stale` is not a substitute, because a Stale row is one Repon will refresh and a Vanished row is one it cannot. The gutter mark for a Vanished row is settled there too: it keeps `~`, and the condition is carried by a Warning rather than a fifth mark ([#171](https://github.com/paulchiu/repon/issues/171)).
 - [keybindings.md](keybindings.md)'s `Ctrl+J`/`Ctrl+K` are no longer "palettes only".
 
 ## Refused
@@ -165,10 +165,10 @@ Two properties fall out. The filter applies **after** `settle`, so the probe sti
 - **A boolean expression grammar** with parentheses and `or`. Composition nobody asked for, at the cost of a parser whose failure modes need a report designed for them, on a line where a half-typed expression is the normal state.
 - **Bare reserved words.** They make the reserved list a permanent tax: adding `dirty` later would retroactively change what an already-typed Filter means.
 - **Repeated keys that OR** (`kind:repo kind:worktree`). It makes composition depend on whether two keys happen to coincide, so `is:dirty is:ahead` would OR while `is:dirty kind:repo` ANDs, one keystroke apart with nothing on screen to say which you got. The comma does the same job explicitly and locally.
-- **`is:selected`.** It puts the Filter and the Selection in a loop with `a`, and CONTEXT.md's "a Filter never mutates the Selection" is worth keeping obviously true rather than subtly true.
+- **`is:selected`.** It puts the Filter and the Selection in a loop with `a`, and GLOSSARY.md's "a Filter never mutates the Selection" is worth keeping obviously true rather than subtly true.
 - **Quoting**, **live-data completion**, **a `reason:` substring key** and the **warning-sign icon**, each above.
 
 ## Not settled here
 
-- The gutter mark for a Vanished row, which stays with [layout-and-provenance.md](layout-and-provenance.md) because it is bound up with [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness rule and has nothing to do with the language.
+- The gutter mark for a Vanished row, which stayed with [layout-and-provenance.md](layout-and-provenance.md) because it is bound up with [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness rule and has nothing to do with the language. Settled there: the gutter keeps `~` and a Warning carries the condition.
 - `ProbeError`'s variants, which [core-api.md](core-api.md) owns. `failed:<variant>` is reserved for them.
