@@ -42,14 +42,21 @@ impl Config {
     pub fn new() -> Result<Self> {
         let resolved = resolved_config();
         check_named_paths_exist(resolved)?;
-        let dir = resolved.dir.clone();
-        let path = resolved.file.clone();
-        let loaded = document::load(&path)?;
+        Self::at(resolved.dir.clone(), resolved.file.clone())
+    }
+
+    /// [`Config::new`] with the two resolved paths passed in rather than read from the
+    /// process-wide `OnceLock` [`init`] fixes, which cannot be pointed at a tempdir per test:
+    /// this is what lets a whole write-then-reload round trip run against a directory a test
+    /// owns. Skips [`check_named_paths_exist`], whose subject is a path the user named on the
+    /// command line or in the environment, not one already resolved.
+    pub fn at(config_dir: PathBuf, config_file: PathBuf) -> Result<Self> {
+        let loaded = document::load(&config_file)?;
         for warning in &loaded.warnings {
             warn!("{warning}");
         }
         Ok(Self {
-            config_dir: dir,
+            config_dir,
             data_dir: data_dir(),
             document: loaded.document,
             warnings: loaded.warnings,

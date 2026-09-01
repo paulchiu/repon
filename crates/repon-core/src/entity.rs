@@ -343,8 +343,11 @@ impl ActionReceipt {
 /// gate names with no risk line of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteRisk {
-    /// The working tree has changes against the index: any modified, untracked or deleted
-    /// path at all.
+    /// Work that is not in a commit: anything [`DirtyCounts`] counts between the index and
+    /// the working tree, or anything staged between `HEAD` and the index. The second half is
+    /// what the dirty column does not ask about and what a `delete` most easily loses
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// confirm gate).
     pub uncommitted: bool,
     /// Commits on this Repo's own local branches that no remote-tracking ref carries.
     pub unpushed_commits: u32,

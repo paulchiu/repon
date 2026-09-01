@@ -566,6 +566,49 @@ pub(crate) fn dirty_counts(
     Ok(counts)
 }
 
+/// How many linked Worktrees point into `repo`, read from git's own
+/// `<common dir>/worktrees` register rather than from any table of discovered entities: one
+/// living outside the active Set's roots is still orphaned by deleting the Repo it is linked
+/// from ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// confirm gate). The main worktree is never among them, which is why a Repo with no linked
+/// Worktree at all counts zero.
+pub(crate) fn linked_worktrees(repo: &gix::Repository) -> Result<u32, ProbeError> {
+    repo.worktrees()
+        .map(|worktrees| worktrees.len() as u32)
+        .map_err(|error| ProbeError::Read(error.to_string().into()))
+}
+
+/// Whether `repo`'s index differs from `HEAD`: the half [`dirty_counts`] deliberately does
+/// not run, and the one a `git add` with no commit lands in
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// confirm gate: staged work is "the case most easily lost, because it looks clean to any
+/// check that compares only the index against the worktree").
+///
+/// Stops at the first change rather than counting, since the gate asks a yes-or-no question;
+/// an unborn `HEAD` compares against the empty tree, so the first `git add` in a repository
+/// with no commit yet answers `true` rather than erroring.
+pub(crate) fn staged_changes(repo: &gix::Repository) -> Result<bool, ProbeError> {
+    let head_tree = repo
+        .head_tree_id_or_empty()
+        .map_err(|error| ProbeError::Status(error.to_string().into()))?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|error| ProbeError::Status(error.to_string().into()))?;
+    let mut staged = false;
+    repo.tree_index_status(
+        &head_tree,
+        &index,
+        None,
+        gix::status::tree_index::TrackRenames::Disabled,
+        |_, _, _| {
+            staged = true;
+            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+        },
+    )
+    .map_err(|error| ProbeError::Status(error.to_string().into()))?;
+    Ok(staged)
+}
+
 /// Folds one [`gix::status::index_worktree::Item`] into `counts`. Exhaustive over the
 /// item shape and, for a tracked change, over [`gix::status::plumbing::index_as_worktree::EntryStatus`]
 /// and its own [`gix::status::plumbing::index_as_worktree::Change`]: a variant gix adds to

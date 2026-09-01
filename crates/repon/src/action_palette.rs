@@ -25,7 +25,12 @@
 //! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
 //! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
-use ratatui::{Frame, layout::Rect, style::Style, widgets::Block};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::Style,
+    widgets::{Block, Paragraph},
+};
 
 use repon_core::{ActionSpec, Step};
 
@@ -40,11 +45,66 @@ use crate::{
 /// [`crate::launcher_palette::NO_MATCHES_MESSAGE`] so both palettes read the same.
 pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 
-/// [`Stage::Choosing`]'s second row when `actions` itself is empty: `ActionConfig`'s
-/// document field defaults to `Vec::new()` and no `[[action]]` entries ship, unlike
-/// Launcher's four shipped defaults. Names where to fix that, since a user who has never
-/// configured an Action has no reason to know where one is declared.
+/// The row [`Stage::Choosing`] adds below the built-ins when `actions` itself is empty:
+/// `ActionConfig`'s document field defaults to `Vec::new()` and no `[[action]]` entries ship,
+/// unlike Launcher's four shipped defaults. The three built-ins are always listed, so this
+/// follows them rather than replacing them. Names where to fix that, since a user who has
+/// never configured an Action has no reason to know where one is declared.
 pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
+
+/// The last interior row of [`Stage::Confirming`], always drawn: the gate's own answer
+/// vocabulary, which [repo-management.md](../../../docs/spec/repo-management.md) requires be
+/// on screen whatever the Selection's length.
+pub(crate) const CONFIRM_HINT: &str = "y run  n cancel";
+
+/// The line [`fit_confirm_rows`] puts in place of the per-Repo lines it could not fit, so a
+/// gate that does not fit says how many rows it is not showing rather than dropping them
+/// silently ([repo-management.md](../../../docs/spec/repo-management.md): "A refusal is
+/// reported and counted in the confirm gate, never silent").
+fn elided_line(hidden: usize) -> String {
+    format!("{hidden} more not shown")
+}
+
+/// `lines` narrowed to `height` rows without dropping either end. The first line carries the
+/// headline count and the last, for a `delete`, is the sentence saying there is no undo and
+/// no trash, which [repo-management.md](../../../docs/spec/repo-management.md) makes
+/// mandatory; the per-Repo lines between them are what gives way, replaced by one line
+/// naming how many were not shown.
+///
+/// At two rows only the two ends survive, and the headline's own count is then the whole
+/// report; below that there is no room for a gate at all.
+fn fit_confirm_rows(lines: &[String], height: usize) -> Vec<String> {
+    if lines.len() <= height {
+        return lines.to_vec();
+    }
+    let last = || lines[lines.len() - 1].clone();
+    match height {
+        0 => Vec::new(),
+        1 => vec![last()],
+        2 => vec![lines[0].clone(), last()],
+        _ => {
+            let shown_middle = height - 3;
+            let mut fitted = vec![lines[0].clone()];
+            fitted.extend(lines[1..1 + shown_middle].iter().cloned());
+            fitted.push(elided_line(lines.len() - 2 - shown_middle));
+            fitted.push(last());
+            fitted
+        }
+    }
+}
+
+/// One interior row, `row` rows down, drawn through a [`Paragraph`] rather than
+/// [`ratatui::buffer::Buffer::set_string`]: `set_string` clips at the buffer's edge, which is
+/// the whole terminal, so a line longer than the palette paints over its own right border,
+/// and the gate's per-Repo lines are long by construction. A widget clips at the `Rect` it is
+/// given instead.
+fn draw_row(frame: &mut Frame, interior: Rect, row: u16, line: &str, style: Style) {
+    if row >= interior.height {
+        return;
+    }
+    let area = Rect::new(interior.x, interior.y + row, interior.width, 1);
+    frame.render_widget(Paragraph::new(line.to_string()).style(style), area);
+}
 
 /// The suffix a built-in management operation's row carries, so it is told apart from a
 /// config-defined Action by its text and not only by its colour
@@ -401,34 +461,34 @@ impl ActionPalette {
         operable_count: usize,
     ) -> Option<Decision> {
         match self.highlighted(actions) {
-            Some(entry) => {
+            // A built-in always asks, and asks even at a count of zero: `delete` destroys
+            // work permanently, `ignore`/`unignore` use the ordinary gate, and every row the
+            // operation will not act on is named with its reason inside that gate rather than
+            // collapsed into a bare count out here
+            // ([repo-management.md](../../../docs/spec/repo-management.md)'s "A refusal is
+            // reported and counted in the confirm gate, never silent"). There is no
+            // `confirm = false` to opt out with either, since a built-in has no config entry
+            // to declare one in.
+            Some(Entry::Builtin(operation)) => {
+                self.refusal = None;
+                self.stage = Stage::Confirming(Chosen::Management(operation));
+                Some(Decision::NeedsConfirm)
+            }
+            Some(Entry::Configured(action)) => {
                 if operable_count == 0 {
                     self.refusal = Some(format!(
                         "\"{}\" targets 0 repos and was not run",
-                        entry.name()
+                        action.name.get_ref()
                     ));
                     return Some(Decision::Refused);
                 }
                 self.refusal = None;
-                match entry {
-                    // A built-in always asks: `delete` destroys work permanently, and
-                    // `ignore`/`unignore` use the ordinary gate
-                    // ([repo-management.md](../../../docs/spec/repo-management.md)'s "The
-                    // confirm gate"). There is no `confirm = false` to opt out with, since a
-                    // built-in has no config entry to declare one in.
-                    Entry::Builtin(operation) => {
-                        self.stage = Stage::Confirming(Chosen::Management(operation));
-                        Some(Decision::NeedsConfirm)
-                    }
-                    Entry::Configured(action) => {
-                        let action = action.clone();
-                        if action.confirm {
-                            self.stage = Stage::Confirming(Chosen::Configured(action));
-                            Some(Decision::NeedsConfirm)
-                        } else {
-                            Some(Decision::RunImmediately(to_action_spec(&action)))
-                        }
-                    }
+                let action = action.clone();
+                if action.confirm {
+                    self.stage = Stage::Confirming(Chosen::Configured(action));
+                    Some(Decision::NeedsConfirm)
+                } else {
+                    Some(Decision::RunImmediately(to_action_spec(&action)))
                 }
             }
             None => {
@@ -505,7 +565,7 @@ impl ActionPalette {
 
         match &self.stage {
             Stage::Confirming(chosen) => {
-                let mut rows: Vec<String> = match chosen {
+                let rows: Vec<String> = match chosen {
                     Chosen::Configured(entry) => vec![format!(
                         "run \"{}\" on {operable_count} repos?",
                         entry.name.get_ref()
@@ -516,20 +576,22 @@ impl ActionPalette {
                     // worded gate here.
                     Chosen::Management(_) => management_lines.to_vec(),
                 };
-                rows.push("y run  n cancel".to_string());
-                let last = rows.len().saturating_sub(1);
-                for (row, line) in rows.iter().enumerate() {
-                    if row as u16 >= interior.height {
-                        break;
-                    }
-                    let style = if row == last {
-                        theme.style_for(Role::Dim)
-                    } else {
-                        Style::new()
-                    };
-                    frame
-                        .buffer_mut()
-                        .set_string(interior.x, interior.y + row as u16, line, style);
+                // The hint owns the last interior row outright, and the gate's own lines are
+                // fitted into whatever is left: a Selection long enough to fill the palette
+                // must never be what pushes either the hint or the no-undo sentence off
+                // screen ([repo-management.md](../../../docs/spec/repo-management.md)).
+                let body_height = interior.height.saturating_sub(1) as usize;
+                for (row, line) in fit_confirm_rows(&rows, body_height).iter().enumerate() {
+                    draw_row(frame, interior, row as u16, line, Style::new());
+                }
+                if interior.height > 0 {
+                    draw_row(
+                        frame,
+                        interior,
+                        interior.height - 1,
+                        CONFIRM_HINT,
+                        theme.style_for(Role::Dim),
+                    );
                 }
             }
             Stage::Choosing => {
@@ -1201,6 +1263,125 @@ mod tests {
             9,
             "the Action palette's border must be one of theming.md's existing nine roles"
         );
+    }
+
+    /// A gate whose Selection is longer than the palette is tall: the two rows
+    /// [repo-management.md](../../../docs/spec/repo-management.md) makes mandatory, the
+    /// sentence about there being no undo and the answer vocabulary, are the two that must
+    /// never be what falls off, and what does fall off says how many rows it was. On an
+    /// ordinary 80x24 terminal a `delete` over twenty-five Repos used to hide both.
+    #[test]
+    fn a_gate_taller_than_the_palette_keeps_its_no_undo_sentence_its_hint_and_a_count() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut lines = vec!["delete on 25 repos?".to_string()];
+        lines.extend((0..25).map(|nth| format!("repo-{nth}: uncommitted changes")));
+        lines.push(crate::management::NO_UNDO.to_string());
+        let mut palette = ActionPalette::management();
+        palette.choose(&[], 25);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &crate::theme::DEFAULT, &[], 25, &lines);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("delete on 25 repos?"),
+            "the headline's own count survives, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(crate::management::NO_UNDO),
+            "the gate must say there is no undo and no trash in as many words, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(CONFIRM_HINT),
+            "and must say how to answer it, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("more not shown"),
+            "the rows that did not fit are counted rather than dropped silently, got:\n\
+             {rendered}"
+        );
+    }
+
+    /// [`fit_confirm_rows`] at the exact boundary either side: one row too many is where the
+    /// elision starts, and a list that fits is passed through untouched. A separator, not a
+    /// middle sample: an off-by-one here is what puts the no-undo sentence off screen.
+    #[test]
+    fn fit_confirm_rows_elides_only_once_the_lines_outnumber_the_rows() {
+        let lines: Vec<String> = (0..6).map(|nth| format!("line-{nth}")).collect();
+
+        assert_eq!(
+            fit_confirm_rows(&lines, 6),
+            lines,
+            "exactly as many rows as lines is not a truncation"
+        );
+
+        let fitted = fit_confirm_rows(&lines, 5);
+        assert_eq!(
+            fitted,
+            vec![
+                "line-0".to_string(),
+                "line-1".to_string(),
+                "line-2".to_string(),
+                elided_line(2),
+                "line-5".to_string(),
+            ],
+            "one row short keeps both ends and counts what it dropped"
+        );
+        assert_eq!(fitted.len(), 5, "and fills the rows it was given exactly");
+    }
+
+    /// A line longer than the palette's interior stops at the interior, never painting over
+    /// the block's own right border: the gate's per-Repo lines are long by construction
+    /// ("repo: uncommitted changes, 12 commits unpushed on 3 branches").
+    #[test]
+    fn a_line_longer_than_the_interior_never_paints_over_the_right_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let long = "repo-a: uncommitted changes, 12 commits unpushed on 3 branches, 2 linked \
+                    worktrees"
+            .to_string();
+        let lines = vec![
+            "delete on 1 repos?".to_string(),
+            long,
+            "no undo".to_string(),
+        ];
+        let mut palette = ActionPalette::management();
+        palette.choose(&[], 1);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(frame, frame.area(), &crate::theme::DEFAULT, &[], 1, &lines);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        for y in 1..9 {
+            assert_eq!(
+                buf[(39, y)].symbol(),
+                "\u{2502}",
+                "row {y}'s right border column must still hold the border, got {:?}",
+                (0..40)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            );
+        }
     }
 
     /// The legibility half, the one [`docs/spec/theming.md`] and this ticket's brief both

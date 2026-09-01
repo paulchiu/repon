@@ -98,6 +98,29 @@ one.
   question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
   (the gutter mark).
 
+## A management result has no receipt of its own
+
+[`spec/repo-management.md`](spec/repo-management.md)'s "Receipts" asks for a
+management result to be a receipt in [`spec/actions.md`](spec/actions.md)'s own
+sense, naming per Repo what was done or why it was refused. What ships instead is a
+log line per row and a one-line Notice carrying the counts: the confirm gate names
+and counts every refusal before the gesture is accepted, and nothing reaches the
+detail pane afterwards. The obstacle is vocabulary, not wiring. An `ActionReceipt`
+carries its result in `StepResult::outcome`, whose set
+[`spec/actions.md`](spec/actions.md#step-outcomes) declares "a closed set of four",
+and every one of the four is a child process's: `Failed` carries an exit code,
+`NotRun` means an earlier step failed, `Cancelled` means a run was interrupted. A
+management operation runs no child process, so a refusal and a write that would not
+write both have to borrow an outcome that means something else, and a fabricated
+exit code in the detail pane is worse than the gap.
+
+- **Reopens if**: `StepOutcome` gains a fifth outcome for work Repon did itself,
+  which is the change that closes this, or `ActionReceipt` grows a result that is
+  not a step's.
+- **Owned by**: [`spec/actions.md`](spec/actions.md), which owns the outcome set,
+  and [`spec/repo-management.md`](spec/repo-management.md), which asks for the
+  receipt.
+
 ## Two writers to `config.toml`
 
 Repon now writes `[[repo]]` entries, and it takes no lock and runs no watcher, so a

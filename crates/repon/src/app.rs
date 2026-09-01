@@ -239,8 +239,9 @@ pub struct App {
     /// The live Notice ([CONTEXT.md](../../../CONTEXT.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
     /// declared when the pressed digit names none), by `reload.rs`'s own reload fallback
-    /// (naming the Set fallen back to), and by each of the four bindings ADR 0023 names
-    /// inert while an Action is fanning out. Cleared by [`Self::notice`]'s own timeout read,
+    /// (naming the Set fallen back to), and by each of the surfaces
+    /// [keybindings.md](../../../docs/spec/keybindings.md) names inert while an Action is
+    /// fanning out. Cleared by [`Self::notice`]'s own timeout read,
     /// by a replacement (any later call to [`Self::set_notice`]), or by the next keypress,
     /// whichever comes first ([theming.md](../../../docs/spec/theming.md)'s "Warnings and
     /// Notices").
@@ -306,6 +307,14 @@ pub struct App {
     /// a test can point it at a tempdir ([`Self::persist_state`],
     /// [`Self::restore_session_state`]).
     data_dir: PathBuf,
+    /// The `config.toml` this session reads and the directory it sits in, fixed at
+    /// construction from [`config::config_file`] and [`config::config_dir`] and kept as
+    /// fields for the same reason `data_dir` is: a management write
+    /// ([`Self::run_management`]) and the reload that follows it
+    /// ([`Self::reload_config`]) both go through these, so a test can drive the whole
+    /// round trip against a directory it owns rather than the user's own configuration.
+    config_dir: PathBuf,
+    config_file: PathBuf,
     /// Whether this run has no config at all: the default path absent, or a `REPON_CONFIG`
     /// directory holding no `config.toml` ([`config::document::Loaded::zero_config`]). Read
     /// by [`Self::scope_key`], which is the only thing that reads it.
@@ -462,6 +471,8 @@ impl App {
             active_set,
             document: config.document,
             data_dir: config.data_dir,
+            config_dir: config::config_dir(),
+            config_file: config::config_file(),
             zero_config: config.zero_config,
             cwd: config::document::working_directory(),
             filter: Filter::default(),
@@ -1532,10 +1543,11 @@ impl App {
             self.management_plan_for(operation, &targets)
                 .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
         });
-        let operable_count = match &plan {
-            Some(plan) => plan.eligible_count(),
-            None => self.core.operable_count(&targets),
-        };
+        // Read for a config-defined Action and an ad hoc command alone: those two are
+        // refused at a count of zero, where a built-in enters its own gate instead and names
+        // and counts each ineligible row there
+        // ([repo-management.md](../../../docs/spec/repo-management.md)).
+        let operable_count = self.core.operable_count(&targets);
         let Some(palette) = &mut self.action_palette else {
             return;
         };
@@ -1568,22 +1580,21 @@ impl App {
     /// config reaches the running app one way and a write cannot produce a state the file
     /// alone would not reproduce. Nothing here touches `self.document`.
     ///
-    /// Two things the write does not reach, recorded here rather than worked around, because
-    /// closing either means changing a document this implements rather than owns.
+    /// An `ignore` takes effect in this same frame: the reload re-applies `exclude` live
+    /// through [`repon_core::Core::set_exclusions`], so the row it named is subtracted from
+    /// the Action confirm gate's count and from every operation's eligible set with no
+    /// refresh and no restart
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config").
+    /// `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and
+    /// still needs a rebuilt `Core`; Repon never writes it.
     ///
-    /// The table's `excluded` flag: the reload deliberately does not re-apply `[[repo]]`
-    /// (`reload::App::reload_config`'s own doc comment says so, and
-    /// `reload::App::apply_active_set` rebuilds the `Core` only when the active Set's bounds
-    /// move), because a `Core` cannot take a new [`repon_core::CoreSpec`] short of being
-    /// rebuilt. So an `ignore` written here is on disk and in `self.document`, but
-    /// [`repon_core::EntityState::excluded`] keeps whatever the `Core` started with until the
-    /// next run or the next Set switch.
-    ///
-    /// A deleted Repo's row: no Generation starts here, so a row whose directory this just
-    /// removed keeps its last known values until the next one. `docs/spec/refresh.md`'s
-    /// Triggers table is a closed list and names no management trigger, so starting one here
-    /// would be a ninth trigger that document does not have; `r` is what settles those rows
-    /// Vanished today.
+    /// One thing the write does not reach, recorded here rather than worked around, because
+    /// closing it means changing a document this implements rather than owns. A deleted
+    /// Repo's row: no Generation starts here, so a row whose directory this just removed
+    /// keeps its last known values until the next one. `docs/spec/refresh.md`'s Triggers
+    /// table is a closed list and names no management trigger, so starting one here would be
+    /// a ninth trigger that document does not have; `r` is what settles those rows Vanished
+    /// today.
     fn run_management(&mut self, operation: management::Operation) {
         // scan: management_write_reload begin -- criterion 8: everything between this pair is
         // what a management write does after the gate is accepted, and the test over this
@@ -1601,7 +1612,7 @@ impl App {
             );
             return;
         }
-        let report = management::run(&plan, &config::config_file());
+        let report = management::run(&plan, &self.config_file);
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
         }
@@ -1615,7 +1626,7 @@ impl App {
     /// confirm gate and one started by a `confirm = false` entry can never diverge in what
     /// they act on. `Core::run_action`'s own `bool` (whether a second fan-out was rejected
     /// because one is already live) is not surfaced here: making that visible, and making
-    /// the four keys `docs/spec/actions.md` names inert while a run is in flight, is issue
+    /// the keys `docs/spec/actions.md` names inert while a run is in flight, is issue
     /// #69's own scope, blocked by this one.
     fn start_action(&mut self, spec: repon_core::ActionSpec) {
         let Some(cursor_key) = self.cursor_key() else {
@@ -1950,7 +1961,14 @@ impl App {
     /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
     /// There is no permanently pinned bottom output pane: an Action's own output, once
     /// wired, lives inside the detail pane rather than a fourth region here.
-    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+    ///
+    /// Returns the drawing error a component reported, if any, for [`Self::render`] to turn
+    /// into a `Message::Error`. A method taking a `Frame` rather than the body of
+    /// `render`'s own `tui.draw` closure, so a test can drive a real frame with a
+    /// `ratatui::backend::TestBackend` and no [`Tui`] at all: `Tui::new` asks the terminal
+    /// for its size and fails with `EAGAIN` where there is no controlling one, so nothing
+    /// inside that closure could otherwise be asserted about at all.
+    fn draw_frame(&mut self, frame: &mut Frame) -> Option<color_eyre::Report> {
         let snapshot = self.core.snapshot();
         let pane_entity = self
             .pane
@@ -1981,143 +1999,151 @@ impl App {
                 .unwrap_or_default();
             (launchers, entity_name)
         });
-        let mut error = None;
         // TODO: `self.quit_confirm` has no draw branch here yet, so the dialog
         // `handle_quit_confirm_key` gates on has no on-screen representation: the frame
         // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
         // `y`/`n`/Esc. The behaviour is complete and tested; a themed modal matching
         // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
-        tui.draw(|frame| {
-            let area = frame.area();
-            // Help is a reading surface, not a chooser, so unlike a palette it always takes
-            // the whole frame rather than leaving anything visible around it
-            // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
-            if let Some(overlay) = &self.help {
-                overlay.draw(
-                    frame,
-                    area,
-                    self.focus,
-                    &self.bindings,
-                    &self.theme,
-                    self.glyphs,
-                );
-                return;
-            }
-            if self.warning_overlay_open {
-                warnings::draw_overlay(frame, area, &warnings, &self.theme);
-                return;
-            }
-            if let Some(palette) = &self.action_palette {
-                palette.draw(
-                    frame,
-                    area,
-                    &self.theme,
-                    &self.document.actions,
-                    action_palette_operable_count.unwrap_or(0),
-                    &management_lines,
-                );
-                return;
-            }
-            if let Some(picker) = &self.set_picker {
-                picker.draw(frame, area, &self.document.sets, &self.active_set.name);
-                return;
-            }
-            // The Filter narrowing this frame's list, live while `self.filter_line` is open
-            // ([`Self::active_filter`]), read once and handed to `self.list` before either of
-            // its own draw methods runs below.
-            let filter = self.active_filter();
-            self.list.set_filter(filter);
-            // The cursor, its viewport offset and the loaded theme, handed to `self.list`
-            // the same per-frame way as `filter` above, so the cursor row's highlight
-            // ([`theme::Theme::selection_style`]) and the window it is drawn in always
-            // reflect this tick's cursor and this run's resolved theme rather than whatever
-            // `List` was constructed with.
-            self.list.set_cursor(self.cursor);
-            self.list.set_offset(self.list_offset);
-            self.list.set_theme(self.theme);
-            // A row for the Filter line takes real height only while it is open, shifting
-            // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
-            // screen: a change on a mode switch takes a real row").
-            let filter_row_height = if self.filter_line.is_some() { 1 } else { 0 };
-            let areas = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(filter_row_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            let status_area = areas[0];
-            let content_area = areas[1];
-            let filter_area = areas[2];
-            let footer_area = areas[3];
-            let status_row_content = self.status_row_content(&snapshot, &warnings);
-            draw_status_row(
+        let mut error = None;
+        let area = frame.area();
+        // Help is a reading surface, not a chooser, so unlike a palette it always takes
+        // the whole frame rather than leaving anything visible around it
+        // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
+        if let Some(overlay) = &self.help {
+            overlay.draw(
                 frame,
-                status_area,
-                self.notice(),
-                &status_row_content,
+                area,
+                self.focus,
                 &self.bindings,
                 &self.theme,
+                self.glyphs,
             );
-            match layout_state(content_area.width, pane_entity.is_some()) {
-                Layout3::ListOnly => {
-                    if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
-                        error = Some(err);
-                    }
-                }
-                Layout3::SideBySide => {
-                    let columns =
-                        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
-                            .split(content_area);
-                    if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
-                        error = Some(err);
-                    }
-                    if let Some(entity) = pane_entity {
-                        self.detail.draw(
-                            frame,
-                            columns[1],
-                            entity,
-                            self.glyphs,
-                            self.focus == Context::Detail,
-                            &self.theme,
-                        );
-                    }
-                }
-                Layout3::DetailOnly => {
-                    if let Some(entity) = pane_entity {
-                        self.detail.draw(
-                            frame,
-                            content_area,
-                            entity,
-                            self.glyphs,
-                            self.focus == Context::Detail,
-                            &self.theme,
-                        );
-                    }
-                }
-            }
-            if let Some(line) = &self.filter_line {
-                line.draw(frame, filter_area, &self.theme);
-            }
-            footer::draw(
+            return None;
+        }
+        if self.warning_overlay_open {
+            warnings::draw_overlay(frame, area, &warnings, &self.theme);
+            return None;
+        }
+        if let Some(palette) = &self.action_palette {
+            palette.draw(
                 frame,
-                footer_area,
-                self.footer_context(),
-                &self.bindings,
+                area,
                 &self.theme,
+                &self.document.actions,
+                action_palette_operable_count.unwrap_or(0),
+                &management_lines,
             );
+            return None;
+        }
+        if let Some(picker) = &self.set_picker {
+            picker.draw(frame, area, &self.document.sets, &self.active_set.name);
+            return None;
+        }
+        // The Filter narrowing this frame's list, live while `self.filter_line` is open
+        // ([`Self::active_filter`]), read once and handed to `self.list` before either of
+        // its own draw methods runs below.
+        let filter = self.active_filter();
+        self.list.set_filter(filter);
+        // The cursor, its viewport offset and the loaded theme, handed to `self.list`
+        // the same per-frame way as `filter` above, so the cursor row's highlight
+        // ([`theme::Theme::selection_style`]) and the window it is drawn in always
+        // reflect this tick's cursor and this run's resolved theme rather than whatever
+        // `List` was constructed with.
+        self.list.set_cursor(self.cursor);
+        self.list.set_offset(self.list_offset);
+        self.list.set_theme(self.theme);
+        // A row for the Filter line takes real height only while it is open, shifting
+        // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
+        // screen: a change on a mode switch takes a real row").
+        let filter_row_height = if self.filter_line.is_some() { 1 } else { 0 };
+        let areas = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(filter_row_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let status_area = areas[0];
+        let content_area = areas[1];
+        let filter_area = areas[2];
+        let footer_area = areas[3];
+        let status_row_content = self.status_row_content(&snapshot, &warnings);
+        draw_status_row(
+            frame,
+            status_area,
+            self.notice(),
+            &status_row_content,
+            &self.bindings,
+            &self.theme,
+        );
+        match layout_state(content_area.width, pane_entity.is_some()) {
+            Layout3::ListOnly => {
+                if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
+                    error = Some(err);
+                }
+            }
+            Layout3::SideBySide => {
+                let columns =
+                    Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+                        .split(content_area);
+                if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
+                    error = Some(err);
+                }
+                if let Some(entity) = pane_entity {
+                    self.detail.draw(
+                        frame,
+                        columns[1],
+                        entity,
+                        self.glyphs,
+                        self.focus == Context::Detail,
+                        &self.theme,
+                    );
+                }
+            }
+            Layout3::DetailOnly => {
+                if let Some(entity) = pane_entity {
+                    self.detail.draw(
+                        frame,
+                        content_area,
+                        entity,
+                        self.glyphs,
+                        self.focus == Context::Detail,
+                        &self.theme,
+                    );
+                }
+            }
+        }
+        if let Some(line) = &self.filter_line {
+            line.draw(frame, filter_area, &self.theme);
+        }
+        footer::draw(
+            frame,
+            footer_area,
+            self.footer_context(),
+            &self.bindings,
+            &self.theme,
+        );
 
-            // The Launcher palette overlays the base frame just drawn above, as a centred
-            // popup, rather than replacing it the way the three early returns above do
-            // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
-            // "The Launcher palette popup"): choosing a Launcher is a decision about the row
-            // under the cursor, and that row has to stay on screen while choosing.
-            if let Some(palette) = &self.launcher_palette {
-                let (launchers, entity_name) = launcher_palette_view
-                    .as_ref()
-                    .expect("computed above whenever launcher_palette is Some");
-                palette.draw(frame, area, &self.theme, launchers, entity_name);
-            }
+        // The Launcher palette overlays the base frame just drawn above, as a centred
+        // popup, rather than replacing it the way the three early returns above do
+        // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
+        // "The Launcher palette popup"): choosing a Launcher is a decision about the row
+        // under the cursor, and that row has to stay on screen while choosing.
+        if let Some(palette) = &self.launcher_palette {
+            let (launchers, entity_name) = launcher_palette_view
+                .as_ref()
+                .expect("computed above whenever launcher_palette is Some");
+            palette.draw(frame, area, &self.theme, launchers, entity_name);
+        }
+        error
+    }
+
+    /// One render tick: claims the terminal's back buffer and hands it to
+    /// [`Self::draw_frame`], which is where the whole frame is composed.
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut error = None;
+        tui.draw(|frame| {
+            error = self.draw_frame(frame);
         })?;
         if let Some(err) = error {
             self.message_tx
@@ -2355,6 +2381,11 @@ mod tests {
             // shape `themes_dir` above already takes; a test exercising `persist_state` or
             // `restore_session_state` points `data_dir` at a real tempdir first.
             data_dir: PathBuf::new(),
+            // Pointed at a real tempdir by any test that drives a write or a reload;
+            // an empty, never-created path is inert for every other test, the same shape
+            // `data_dir` and `themes_dir` above already take.
+            config_dir: PathBuf::new(),
+            config_file: PathBuf::new(),
             zero_config: false,
             cwd: PathBuf::new(),
             filter: Filter::default(),
@@ -2884,7 +2915,7 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 9: `;`, `s` and `Ctrl+R` are three of the four bindings inert while an Action
+    // Criterion 9: `;`, `m`, `s` and `Ctrl+R` are the surfaces inert while an Action
     // is fanning out (`1` to `9`'s own coverage lives in reload.rs, beside `switch_to_set`'s
     // other tests). Each answers with a Notice instead of the silence it gives today.
     // =====================================================================================
@@ -2956,6 +2987,123 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || !app.core.action_running()),
             "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    /// `m` is the fifth key that goes inert while a fan-out is in flight, for the same reason
+    /// `;` is: it opens the same palette
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// confirming"). Asserted on the palette itself, not on the Notice alone: a guard that
+    /// raised the Notice and opened the palette anyway would satisfy the Notice half.
+    #[test]
+    fn m_is_inert_while_an_action_is_fanning_out_and_answers_with_the_same_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m while an Action is fanning out");
+
+        assert!(
+            app.action_palette.is_none(),
+            "m must not open the Action palette while an Action is running"
+        );
+        assert_eq!(app.notice(), Some("Action palette: Action already running"));
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !app.core.action_running()),
+            "the fan-out must finish before this test's own Core is dropped"
+        );
+    }
+
+    /// A built-in counts its own eligible rows, never the Action gate's operable count, and
+    /// `unignore` is the case that proves it: its eligible set is exactly the excluded rows,
+    /// which [`repon_core::Core::operable_count`] subtracts to zero. Read from the palette's
+    /// own border title on a real frame, which is the number the user is shown.
+    #[test]
+    fn unignore_over_an_excluded_row_counts_it_rather_than_subtracting_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "sanity: the row starts excluded"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("highlight unignore");
+        let choosing = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            choosing.contains("run on 1 repos"),
+            "the border title counts the excluded row unignore would act on, got:\n{choosing}"
+        );
+
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+
+        assert!(
+            app.management_plan.is_some(),
+            "Enter must reach the confirm gate rather than being refused as targeting 0 repos"
+        );
+        let confirming = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            confirming.contains("unignore on 1 repos?"),
+            "and the gate itself counts it too, got:\n{confirming}"
+        );
+    }
+
+    /// The mirror of the above: `ignore` over a row that is already excluded is refused, and
+    /// the refusal is named and counted in the gate rather than collapsing into a bare "0
+    /// repos" ([repo-management.md](../../../docs/spec/repo-management.md): "A refusal is
+    /// reported and counted in the confirm gate, never silent"). Every row of the Selection
+    /// being ineligible is the case that used to close the palette with a count and no reason.
+    #[test]
+    fn a_gate_whose_every_row_is_refused_still_names_each_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+
+        open_the_management_gate(&mut app, management::Operation::Ignore);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("ignore on 0 repos, 1 refused?"),
+            "the headline counts the refusal, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("repo-a: refused, already ignored"),
+            "and the row is named with its reason, got:\n{frame}"
         );
     }
 
@@ -3124,6 +3272,296 @@ mod tests {
         );
     }
 
+    /// [`test_app`] pointed at a real `config.toml` in `config_dir`, declaring the same Set
+    /// `test_app` wires the `App` to so a reload finds it and rebuilds nothing. This is what
+    /// lets a whole write-then-reload round trip run against a directory the test owns rather
+    /// than the process-wide path [`crate::config::config_file`] fixes once and for all.
+    fn test_app_with_config(root: &std::path::Path, config_dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(config_dir).expect("create the config dir");
+        let config_file = config_dir.join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "# a comment the write must not eat\n[[set]]\nname = \"test\"\nroots = [\"{}\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config.toml");
+        let mut app = test_app(root);
+        app.config_dir = config_dir.to_path_buf();
+        app.config_file = config_file;
+        app
+    }
+
+    /// Opens the management palette, chooses the operation named `operation` and accepts the
+    /// gate, all through `handle_key_event`: the production key path and nothing beside it,
+    /// so a `y` that stopped running the plan fails every test built on this rather than
+    /// passing a scan over the callee it no longer calls.
+    fn press_through_the_management_gate(app: &mut App, operation: management::Operation) {
+        open_the_management_gate(app, operation);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+    }
+
+    /// [`press_through_the_management_gate`] stopped one press short, with the gate open and
+    /// nothing run yet: what a test asserting about the gate on screen needs.
+    fn open_the_management_gate(app: &mut App, operation: management::Operation) {
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+        let index = crate::management::OPERATIONS
+            .iter()
+            .position(|candidate| *candidate == operation)
+            .expect("the operation is one of the built-ins");
+        for _ in 0..index {
+            app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move the highlight");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+    }
+
+    /// One whole frame of `app` at `width` by `height`, rendered through
+    /// [`App::draw_frame`] itself, as lines. The production frame and nothing beside it: a
+    /// component this stopped handing its content to shows up here as missing text.
+    fn render_to_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("create the test terminal");
+        terminal
+            .draw(|frame| {
+                app.draw_frame(frame);
+            })
+            .expect("draw a frame");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The whole gesture, end to end through the real key path: `m`, `Enter`, `y`, and then a
+    /// `[[repo]]` entry on disk carrying `exclude = true`, the row subtracted from what any
+    /// operation may reach in the very same frame, and a Notice saying what happened. A `y`
+    /// that ran nothing fails all three ([repo-management.md](../../../docs/spec/repo-management.md)'s
+    /// "Writing config": an `ignore` "takes effect immediately ... without a refresh and
+    /// without a restart").
+    #[test]
+    fn y_on_the_ignore_gate_writes_the_entry_and_subtracts_the_row_in_the_same_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let key = app.core.snapshot().entities[0].key.clone();
+        assert_eq!(
+            app.core.operable_count(std::slice::from_ref(&key)),
+            1,
+            "the row starts operable"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        let written = std::fs::read_to_string(&app.config_file).expect("read config.toml back");
+        assert!(
+            written.contains("exclude = true"),
+            "the write reached the file, got: {written:?}"
+        );
+        assert!(
+            written.contains(&repo.display().to_string()),
+            "the entry names the Repo the gate named, got: {written:?}"
+        );
+        assert!(
+            written.contains("# a comment the write must not eat"),
+            "the hand-written comment survived, got: {written:?}"
+        );
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the row is excluded in the very next snapshot, with no refresh and no restart"
+        );
+        assert_eq!(
+            app.core.operable_count(&[key]),
+            0,
+            "and is subtracted from what an operation may reach"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("ignore: 1 done"),
+            "the run answers with a Notice naming what it did"
+        );
+    }
+
+    /// `unignore` immediately after, in the same session: the entry it wrote is the entry it
+    /// removes, and the row is operable again in the same frame. This is the half
+    /// [repo-management.md](../../../docs/spec/repo-management.md) says `ignore` alone cannot
+    /// prove, since a row that was never subtracted would also read as unsubtracted here.
+    #[test]
+    fn unignore_in_the_same_session_returns_the_row_and_the_file_to_where_they_started() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let key = app.core.snapshot().entities[0].key.clone();
+        let before = std::fs::read_to_string(&app.config_file).expect("read config.toml");
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the ignore took effect first"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Unignore);
+
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
+            before,
+            "a file that had no `[[repo]]` array is byte for byte what it started as"
+        );
+        assert!(
+            !app.core.snapshot().entities[0].excluded,
+            "the row is operable again in the very same frame"
+        );
+        assert_eq!(
+            app.core.operable_count(&[key]),
+            1,
+            "and is no longer subtracted"
+        );
+        assert_eq!(app.notice(), Some("unignore: 1 done"));
+    }
+
+    /// `delete`'s second half, which the operations table names and no test reached before:
+    /// the working tree goes, and the entity's own `[[repo]]` entry goes with it. Built with
+    /// the entry already in the file, since a Repo Repon never ignored has none to remove.
+    #[test]
+    fn y_on_the_delete_gate_removes_the_working_tree_and_the_entrys_own_config_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        std::fs::write(
+            &app.config_file,
+            format!(
+                "# a comment the write must not eat\n[[set]]\nname = \"test\"\nroots = \
+                 [\"{root}\"]\n\n# pinned by hand\n[[repo]]\npath = \"{repo}\"\ndefault_branch \
+                 = \"main\"\n",
+                root = root.display(),
+                repo = repo.display(),
+            ),
+        )
+        .expect("write config.toml with an entry of its own");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(
+            !repo.exists(),
+            "the working tree the gate named is gone from disk"
+        );
+        let written = std::fs::read_to_string(&app.config_file).expect("read config.toml back");
+        assert!(
+            !written.contains("[[repo]]"),
+            "the entity's own `[[repo]]` entry went with it, got: {written:?}"
+        );
+        assert!(
+            written.contains("[[set]]"),
+            "and nothing else in the file was touched, got: {written:?}"
+        );
+        assert_eq!(app.notice(), Some("delete: 1 done"));
+    }
+
+    /// `delete` on a Repo with no `[[repo]]` entry of its own: the working tree still goes,
+    /// and the report says there was no entry rather than claiming one was removed. The
+    /// negative half of the test above, so neither branch of `config_entry_removed` can be
+    /// hard-coded.
+    #[test]
+    fn delete_on_a_repo_with_no_entry_of_its_own_removes_the_tree_and_says_there_was_no_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let before = std::fs::read_to_string(&app.config_file).expect("read config.toml");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(!repo.exists(), "the working tree is gone");
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
+            before,
+            "a file with no entry for it is left exactly as it was"
+        );
+        assert_eq!(app.notice(), Some("delete: 1 done"));
+    }
+
+    /// The `delete` gate on screen: its headline, the per-Repo risk line computed from the
+    /// real git read, and the sentence saying there is no undo, all reaching a real frame
+    /// through `App`'s own render. Nothing short of that proves the gate a user is about to
+    /// answer says anything at all
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "The confirm gate").
+    #[test]
+    fn the_delete_gates_computed_lines_reach_the_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        std::fs::write(repo.join("stray.txt"), "not committed\n").expect("write a stray file");
+        let mut app = test_app(&root);
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("delete on 1 repos?"),
+            "the headline names the operation and the count, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("repo-a: uncommitted changes"),
+            "the row's own computed risk is on screen, got:\n{frame}"
+        );
+        assert!(
+            frame.contains(crate::management::NO_UNDO),
+            "the sentence about there being no undo is on screen, got:\n{frame}"
+        );
+        assert!(
+            frame.contains(crate::action_palette::CONFIRM_HINT),
+            "and the answer vocabulary with it, got:\n{frame}"
+        );
+    }
+
+    /// The refusal half of the same frame: a Selection carrying a linked Worktree names it
+    /// and its reason on screen rather than dropping it, and the headline's own count says
+    /// how many were subtracted ([repo-management.md](../../../docs/spec/repo-management.md):
+    /// "A refusal is reported and counted in the confirm gate, never silent").
+    #[test]
+    fn a_refused_row_is_named_with_its_reason_on_the_gates_own_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("sidecar"), "sidecar");
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("delete on 1 repos, 1 refused?"),
+            "the headline counts the refusal as well as the eligible rows, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("sidecar: refused, removing a linked Worktree"),
+            "the refused row is named with its reason, got:\n{frame}"
+        );
+    }
+
     /// Criterion 6's "computed, not stubbed" half at the call site: the gate's risk comes
     /// from [`repon_core::Core::delete_risk`], the real git read, and not from a literal this
     /// crate could hand [`crate::management::Plan::with_risk`] instead. What that read
@@ -3198,16 +3636,17 @@ mod tests {
         );
     }
 
-    /// Criterion 5's own "exactly four, no more": every call site that raises
+    /// Criterion 5's own "and no more": every call site that raises
     /// `action_running_notice` across both crates, since a Launcher and an Action step's
     /// executor both spawn child processes and a scan confined to one crate would be
     /// exactly "a check that quietly stops checking"
     /// ([`crate::test_support::workspace_crate_src_dirs`]'s own doc comment). Named against
-    /// the ticket's own four groups (`;`, `s`, `1`-`9`, `Ctrl+R`) rather than merely counted,
-    /// so a fifth call site that happened to reuse one of the four names could not slip
-    /// through as still reading "four".
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s own four surfaces (the Action
+    /// palette, the Set picker, a Set switch and a config reload) rather than merely counted,
+    /// so a call site that happened to reuse one of those names could not slip through as
+    /// still reading the same.
     #[test]
-    fn exactly_four_bindings_are_gated_on_action_running_and_no_more() {
+    fn exactly_the_four_declared_surfaces_are_gated_on_action_running_and_no_more() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut call_sites = Vec::new();
         for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
@@ -3245,7 +3684,7 @@ mod tests {
                 "Set picker",
                 "Set switch"
             ],
-            "expected exactly the four surfaces gated on action_running, no more and no \
+            "expected exactly the four surfaces keybindings.md names, no more and no \
              fewer, found: {call_sites:?}"
         );
     }

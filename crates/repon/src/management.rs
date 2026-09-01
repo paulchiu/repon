@@ -11,13 +11,15 @@
 //! [actions.md](../../../docs/spec/actions.md)'s own sense, which is a
 //! [`repon_core::ActionReceipt`] per Entity. Its step outcomes are a child process's
 //! (`StepOutcome::Failed` carries an exit code, `NotRun` means an earlier step failed,
-//! `Cancelled` means a run was interrupted), and a management operation runs no child
-//! process, so a refusal has no honest outcome to take and writing one would put a
-//! fabricated exit code in the detail pane. What this module does instead: the confirm gate
-//! names and counts every refusal before the gesture is accepted, which is where
-//! repo-management.md's own "What `delete` refuses" puts it, and [`Report`] carries the
-//! per-Repo result out to a Notice and to the log afterwards. Widening `StepOutcome` (or
-//! `ActionReceipt`) to carry a refusal is what closing that gap needs.
+//! `Cancelled` means a run was interrupted), and actions.md calls that set closed at four,
+//! so a management operation, which runs no child process, has no honest outcome to take and
+//! writing one would put a fabricated exit code in the detail pane. What this module does
+//! instead: the confirm gate names and counts every refusal before the gesture is accepted,
+//! which is where repo-management.md's own "What `delete` refuses" puts it, and [`Report`]
+//! carries the per-Repo result out to a Notice and to the log afterwards. Widening
+//! `StepOutcome` (or `ActionReceipt`) to carry work Repon did itself is what closing that gap
+//! needs; the gap is in `docs/open-questions.md` under "A management result has no receipt of
+//! its own".
 
 use std::{fs, path::Path, sync::Arc};
 
@@ -404,7 +406,14 @@ impl Report {
         let mut failed = 0usize;
         for record in &self.records {
             match record.outcome {
-                Outcome::Ignored | Outcome::Unignored | Outcome::Deleted { .. } => done += 1,
+                Outcome::Ignored
+                | Outcome::Unignored
+                | Outcome::Deleted {
+                    config_entry_removed: true,
+                }
+                | Outcome::Deleted {
+                    config_entry_removed: false,
+                } => done += 1,
                 Outcome::ExcludedByAnInheritedEntry => unchanged += 1,
                 Outcome::Refused(_) => refused += 1,
                 Outcome::Failed(_) => failed += 1,
@@ -743,6 +752,29 @@ mod tests {
         assert!(
             line.contains("could not be read") && line.contains("the refs would not list"),
             "got {line:?}"
+        );
+    }
+
+    /// The sentence itself is repo-management.md's, read at test time rather than restated
+    /// here: the constant may be reworded, but never away from the document that requires it
+    /// ("There is no undo and no trash, which the gate says in as many words").
+    #[test]
+    fn the_no_undo_sentence_is_repo_management_mds_own_words() {
+        let spec = spec_source();
+        let sentence = spec
+            .split("A Repo with none of the three is listed plainly. ")
+            .nth(1)
+            .and_then(|rest| rest.split(", which the gate says in as many words").next())
+            .expect("repo-management.md still names the sentence the gate must say");
+        let mut characters = sentence.chars();
+        let lowercased = match characters.next() {
+            Some(first) => first.to_lowercase().to_string() + characters.as_str(),
+            None => String::new(),
+        };
+
+        assert_eq!(
+            NO_UNDO, lowercased,
+            "the constant must be the specification's own sentence"
         );
     }
 
