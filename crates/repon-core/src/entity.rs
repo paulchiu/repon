@@ -360,17 +360,18 @@ pub struct DeleteRisk {
 
 /// Whether an Entity was found by the Refresh that just ran.
 ///
-/// Open, recorded here as well as in
-/// [the open-questions register](https://github.com/paulchiu/repon/blob/main/docs/open-questions.md):
-/// the gutter mark a Vanished row should carry. Every `Known` cell going stale folds
-/// today's rendered row to the ordinary stale mark whenever every cell has a
-/// value to force stale in the first place; while probing is still limited to
-/// `branch` and `default_branch`, a Vanished Entity's other, never-yet-probed
-/// cells fold as Unknown instead and can outrank that stale mark, so the row
-/// may render `?` rather than `~` until every phase is probing. Two further
-/// open points from the same design gap: whether dismissing a Vanished row
-/// wants an undo gesture or a Filter of its own, and the exact progressive-fill
-/// timing targets a Vanished row's redraw should honour.
+/// A Vanished row keeps `~`: every `Known` cell goes stale, which is both what
+/// the fold already produces and true, since those values are old and nothing
+/// will fix them. The condition itself is carried by a Warning rather than a
+/// fifth gutter mark, because the gutter summarises provenance rather than
+/// presence, and because a mark on a row cannot tell a reader the row is there.
+/// While probing is still limited to `branch` and `default_branch`, a Vanished
+/// Entity's other, never-yet-probed cells fold as Unknown instead and can
+/// outrank that stale mark, so the row may render `?` rather than `~` until
+/// every phase is probing; that is a transient of incomplete probing, not a
+/// second answer. Dismissal needs no undo, since session state never persists
+/// and a Repo that returns is rediscovered. Still open: the progressive-fill
+/// timing a Vanished row's redraw should honour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Presence {

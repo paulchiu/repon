@@ -1442,43 +1442,54 @@ mod tests {
     // --- Criterion 6: the per-Repo defining-Action count is not shown, not faked, and is
     // recorded as an open want rather than settled as never ---
 
-    /// [`CONTEXT.md`]'s Action entry once promised a palette count of how many selected
+    /// [`GLOSSARY.md`]'s Action entry once promised a palette count of how many selected
     /// Repos "define" a given Action; ADR 0018 corrected it to promise only the Selection
     /// count. Read at test time rather than restated, per this ticket's brief on pinning a
     /// claim to the document of record.
     #[test]
-    fn context_mds_action_glossary_entry_no_longer_promises_a_per_repo_defining_count() {
+    fn the_glossarys_action_entry_no_longer_promises_a_per_repo_defining_count() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let context = std::fs::read_to_string(manifest_dir.join("../../CONTEXT.md"))
-            .expect("read CONTEXT.md");
-        let entry = context
+        let glossary = std::fs::read_to_string(manifest_dir.join("../../GLOSSARY.md"))
+            .expect("read GLOSSARY.md");
+        let entry = glossary
             .split("**Action**:")
             .nth(1)
             .and_then(|rest| rest.split("**Action spec**:").next())
-            .expect("CONTEXT.md still carries an Action glossary entry");
+            .expect("GLOSSARY.md still carries an Action glossary entry");
 
         assert!(
             !entry.to_lowercase().contains("define"),
-            "CONTEXT.md's Action entry must not promise a per-Repo \"defines it\" count \
+            "GLOSSARY.md's Action entry must not promise a per-Repo \"defines it\" count \
              the `[[action]]` schema cannot compute, got: {entry:?}"
         );
     }
 
-    /// The dropped requirement must stay recorded as an open want, not silently disappear:
-    /// [`docs/spec/actions.md`] carries it under "Not built" as something that "stays open
-    /// rather than settled as never."
+    /// The dropped requirement must not silently disappear. It is no longer an open want:
+    /// applicability returns as a predicate in the Filter grammar, so actions.md records the
+    /// answer rather than the gap, and the register entry that tracked it is gone.
     #[test]
-    fn actions_md_still_records_the_per_repo_defining_count_as_an_open_want() {
+    fn actions_md_records_the_settled_answer_for_per_repo_applicability() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let actions_md = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
             .expect("read docs/spec/actions.md");
         assert!(
-            actions_md.contains("Per-Repo Action applicability"),
-            "expected actions.md to still name the dropped requirement"
+            actions_md.contains("Per-Repo applicability"),
+            "expected actions.md to still name the requirement"
         );
         assert!(
-            actions_md.contains("stays open rather than settled as never"),
-            "expected actions.md to still record it as an open want, not settled as never"
+            actions_md.contains("Filter grammar"),
+            "expected actions.md to name the Filter grammar as where applicability comes from"
+        );
+        assert!(
+            !actions_md.contains("stays open rather than settled as never"),
+            "actions.md still records applicability as an open want, which it no longer is"
+        );
+
+        let register = std::fs::read_to_string(manifest_dir.join("../../docs/open-questions.md"))
+            .expect("read docs/open-questions.md");
+        assert!(
+            !register.contains("## Per-Repo Action applicability"),
+            "the register keeps an entry its owning document has now answered"
         );
     }
 

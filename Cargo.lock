@@ -3258,6 +3258,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
