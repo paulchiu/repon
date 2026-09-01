@@ -9,7 +9,7 @@ use std::time::Duration;
 use color_eyre::eyre::{Result, eyre};
 use repon_core::{Core, CoreSpec, SetSpec};
 
-use super::{App, entity_keys};
+use super::App;
 use crate::{
     components::Component,
     config::{
@@ -344,8 +344,9 @@ impl App {
 
         if bounds_changed {
             self.core = Core::start(core_spec(document, &self.active_set, self.no_fetch));
-            let keys = entity_keys(&self.core.snapshot());
-            self.core.refresh(&keys);
+            // Everything the new `Core`'s own discovery finds: it has not run yet, so
+            // there is nothing in its table to order.
+            self.core.refresh_all();
             // The new `Core` starts with no discovery warning of its own, so a warning the
             // old one already logged must not suppress logging a fresh one from this one.
             self.discovery_warning_logged = false;
@@ -569,6 +570,16 @@ mod tests {
         });
 
         app.reload_active_set(&document);
+
+        // A Set switch rebuilds the `Core`, whose discovery runs on a thread of its own, so
+        // the new root's rows land after the switch returns rather than inside it.
+        wait_for("the rebuilt Core's own discovery to land", || {
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "repo-b")
+        });
 
         let after_names: Vec<String> = app
             .core
@@ -808,6 +819,16 @@ mod tests {
         ];
 
         app.switch_to_set(2);
+
+        // A Set switch rebuilds the `Core`, whose discovery runs on a thread of its own, so
+        // the new root's rows land after the switch returns rather than inside it.
+        wait_for("the rebuilt Core's own discovery to land", || {
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "repo-b")
+        });
 
         let after_names: Vec<String> = app
             .core

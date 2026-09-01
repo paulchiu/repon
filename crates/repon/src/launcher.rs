@@ -672,7 +672,7 @@ mod tests {
         let hostile_branch = "feature/$(touch__pwn_c);`touch__pwn_d`";
         run_git(&repo_path, &["checkout", "-q", "-b", hostile_branch]);
 
-        let core = repon_core::Core::start(repon_core::CoreSpec {
+        let core = repon_core::Core::start_discovered(repon_core::CoreSpec {
             set: repon_core::SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.clone()],

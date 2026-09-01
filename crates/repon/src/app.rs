@@ -427,14 +427,12 @@ impl App {
             &active_set,
             flag_no_fetch,
         ));
-        // Discovery already ran inside `Core::start`; dispatch the identity probe for every
-        // row it found so the list fills in progressively rather than sitting on blank branch
-        // cells until something else asks for a refresh (Generation 1, refresh.md's
-        // "Startup"). A no-op call to `dispatch_order` here: before the first frame there is
-        // no rendered viewport to narrow `visible`, so cursor, visible and discovery order are
-        // all `keys` and the three-tier split returns its input unchanged.
-        let keys = entity_keys(&core.snapshot());
-        core.refresh(&dispatch_order(keys.first(), &keys, &keys));
+        // Generation 1 over everything discovery finds (refresh.md's "Startup"). Not
+        // `refresh` with an order of this instant's keys: `Core::start` returns before its
+        // discovery has finished, so there are none yet to name. Nothing is ordered away by
+        // that, since before the first frame there is no rendered viewport to narrow
+        // `visible`, and `dispatch_order`'s three-tier split returns its input unchanged.
+        core.refresh_all();
 
         let mut list = List::default();
         list.register_config_handler(config.clone())?;
@@ -2480,7 +2478,7 @@ mod tests {
         root: &std::path::Path,
         overrides: Vec<repon_core::RepoOverride>,
     ) -> App {
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.to_path_buf()],
@@ -5301,6 +5299,33 @@ mod tests {
             "a row that is not Vanished must not be dismissed"
         );
         assert_eq!(app.notice(), Some(CURSOR_NOT_VANISHED_NOTICE));
+    }
+
+    /// The consumer half of "`Core::start` returns before discovery has finished": the
+    /// first frame is drawn from `core.snapshot()`, which at launch is the empty table
+    /// `Core::start` hands back before its own walk has landed, so drawing it must produce
+    /// a real frame naming the active Set and a count of zero rather than panicking on a
+    /// table with nothing in it. The rows arrive on a later frame, when the startup
+    /// Generation lands them.
+    #[test]
+    fn the_first_frame_draws_against_the_empty_table_start_returns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let mut app = test_app(&root);
+        assert!(
+            app.core.snapshot().entities.is_empty(),
+            "this fixture's root holds no Repo, so the table stands in for the one a launch \
+             draws its first frame against"
+        );
+
+        let buf = render_app_frame(&mut app, 80, 12);
+        let status_row: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+
+        assert!(
+            status_row.contains("test 0 entities"),
+            "the first frame must name the active Set and its count against an empty table, \
+             got {status_row:?}"
+        );
     }
 
     /// The same unavailable case with no row at all under the cursor: an empty table is not
@@ -8244,6 +8269,16 @@ mod tests {
 
         assert!(app.set_picker.is_none(), "choosing must close the picker");
         assert_eq!(app.active_set.name, "second");
+        // A Set switch rebuilds the `Core`, whose discovery runs on a thread of its own, so
+        // the new root's rows land after the switch returns rather than inside it.
+        wait_for("the rebuilt Core's own discovery to land", || {
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "repo-b")
+        });
+
         let after_names: Vec<String> = app
             .core
             .snapshot()

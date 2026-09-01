@@ -396,7 +396,7 @@ pub struct Core {
     /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
     /// "Showing Submodules": "toggling is instant, because nothing needs discovering").
     show_submodules: Arc<AtomicBool>,
-    settle_gate: Arc<(Mutex<usize>, Condvar)>,
+    settle_gate: Arc<SettleGate>,
     control: Sender<ClockControl>,
     clock_thread: Option<JoinHandle<()>>,
     /// Set by the dedicated thread's discovery-slow watcher if `start`'s one walk
@@ -512,6 +512,11 @@ pub struct Core {
     /// writes to it, so a lookup here always misses, the same "inert" shape
     /// [`FetchSpec`] already takes.
     network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
+    /// Orders every spawned dispatch body this `Core` starts; see
+    /// [`DispatchTurnstile`].
+    turnstile: Arc<DispatchTurnstile>,
+    /// See [`DiscoveryGate`]. `None` on every production path.
+    discovery_gate: Option<DiscoveryGate>,
 }
 
 /// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
@@ -533,9 +538,21 @@ struct PhaseCGate {
 type PhaseCGateHandle = Arc<(Mutex<PhaseCGate>, Condvar)>;
 
 impl Core {
-    /// Spawns the dedicated thread, runs one discovery walk to build the initial
-    /// table, and returns a running core.
+    /// Spawns the dedicated thread, starts the first discovery walk on a thread of
+    /// its own, and returns a running core at once.
+    ///
+    /// The table it returns is empty: discovery lands its rows afterwards, which is what
+    /// lets a consumer claim the terminal and draw a first frame without waiting out a
+    /// walk (refresh.md's "The first frame"). It starts no Generation of its own, so a
+    /// consumer that wants its rows probed calls [`Self::refresh_all`], which resolves its
+    /// order after its own discovery rather than from a table nobody can name yet.
+    /// [`Self::settle`] waits for this walk the way it waits for a probe.
     pub fn start(spec: CoreSpec) -> Core {
+        Self::start_watched(spec).core
+    }
+
+    /// [`Self::start`], keeping the handles `start_internal` hands back.
+    fn start_watched(spec: CoreSpec) -> StartForTest {
         let interval = spec.poll_interval.max(Duration::from_nanos(1));
         let ticks = crossbeam_channel::tick(interval);
         let alive = Arc::new(AtomicBool::new(true));
@@ -559,8 +576,29 @@ impl Core {
             ticks,
             fetch_start,
             alive,
+            None,
         )
-        .core
+    }
+
+    /// [`Self::start`], blocked until the first discovery has landed on the table.
+    ///
+    /// For a test, and for nothing else: `start` returns against an empty table
+    /// now, so a test that reads the table straight afterwards needs this
+    /// rendezvous. It is a join on the discovery thread rather than a poll or a
+    /// sleep, so it carries no deadline of its own.
+    ///
+    /// Gated behind `test-util` (on by default under `cfg(test)` for this crate's own
+    /// tests) so a test-only affordance never ships on the default published surface,
+    /// per [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_discovered(spec: CoreSpec) -> Core {
+        let mut started = Self::start_watched(spec);
+        if let Some(handle) = started.initial_discovery.take() {
+            handle
+                .join()
+                .expect("the first discovery thread should not panic");
+        }
+        started.core
     }
 
     /// Starts a new Generation, dispatching a probe for every key in `order` that
@@ -569,6 +607,21 @@ impl Core {
     /// probes run on rayon's global pool.
     pub fn refresh(&self, order: &[EntityKey]) -> Generation {
         self.refresh_handles().dispatch(order)
+    }
+
+    /// Starts a new Generation over every entity this Generation's own discovery
+    /// leaves in the table, in discovery order.
+    ///
+    /// Startup's Generation, per
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Startup": a caller that has not seen a Snapshot yet has no order to compute
+    /// and no keys to name, since discovery runs on a thread of its own now and the
+    /// table is empty until it lands. Unlike [`Self::refresh`], which resolves the
+    /// order the caller handed it, this resolves the order after discovery has run,
+    /// which is what lets it cover rows the caller could not have named. Returns
+    /// immediately, the same way `refresh` does.
+    pub fn refresh_all(&self) -> Generation {
+        self.refresh_handles().dispatch_over_everything()
     }
 
     /// Re-derives `default_branch` alone for every key in `keys` already known to
@@ -633,10 +686,7 @@ impl Core {
             return generation;
         }
 
-        {
-            let (lock, _cvar) = &*self.settle_gate;
-            *lock.lock().unwrap() += dispatched.len();
-        }
+        begin_probes_owed(&self.settle_gate, dispatched.len());
 
         let table = Arc::clone(&self.table);
         let settle_gate = Arc::clone(&self.settle_gate);
@@ -720,6 +770,8 @@ impl Core {
             dispatch_log: Arc::clone(&self.dispatch_log),
             phase_c_gates: Arc::clone(&self.phase_c_gates),
             network_default_branch: Arc::clone(&self.network_default_branch),
+            turnstile: Arc::clone(&self.turnstile),
+            discovery_gate: self.discovery_gate.clone(),
         }
     }
 
@@ -895,7 +947,7 @@ impl Core {
         let (lock, cvar) = &*self.settle_gate;
         let guard = lock.lock().unwrap();
         let _ = cvar
-            .wait_timeout_while(guard, within, |count| *count > 0)
+            .wait_timeout_while(guard, within, |counts| !counts.is_settled())
             .unwrap();
         self.snapshot()
     }
@@ -1323,7 +1375,7 @@ struct RefreshHandles {
     discovery_abandon_after: Arc<AtomicU64>,
     discovery_warning: Arc<Mutex<Option<String>>>,
     show_submodules: Arc<AtomicBool>,
-    settle_gate: Arc<(Mutex<usize>, Condvar)>,
+    settle_gate: Arc<SettleGate>,
     default_branch_chain_reads: Arc<AtomicUsize>,
     patch_identity_reads: Arc<AtomicUsize>,
     patch_scan_bounds: Arc<Mutex<Vec<Option<gix::ObjectId>>>>,
@@ -1333,12 +1385,146 @@ struct RefreshHandles {
     /// into it once a fetch's own handshake advertises a HEAD, and this
     /// dispatch's own default-branch probes read it back the same Generation.
     network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
+    /// [`Core::turnstile`]'s own clone, so every dispatch this `Core` starts,
+    /// wherever it is called from, queues in the one order.
+    turnstile: Arc<DispatchTurnstile>,
+    /// [`Core::discovery_gate`]'s own clone; `None` on every production path.
+    discovery_gate: Option<DiscoveryGate>,
+}
+
+/// Runs the spawned dispatch bodies in the order their Generations were reserved.
+///
+/// Reserving the number is what a caller waits for; everything after it happens on
+/// a thread of its own, and two of those threads reaching the table out of order
+/// would let an older Generation cancel a newer one's in-flight entries and then
+/// record itself as the live one, which is refresh.md's supersession rule read
+/// backwards. A ticket taken under the same lock that mints the Generation, and
+/// served in ticket order, is what stops that.
+#[derive(Default)]
+struct DispatchTurnstile {
+    /// The ticket whose body may run, and the [`Condvar`] every waiting body sleeps on.
+    serving: Mutex<u64>,
+    ready: Condvar,
+    /// The next ticket to hand out. Only ever read under the table write lock
+    /// [`RefreshHandles::reserve_generation`] holds, so tickets and Generations
+    /// are issued in the one order.
+    next: AtomicU64,
+}
+
+impl DispatchTurnstile {
+    fn reserve(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Blocks until `ticket` is the one being served. The returned guard releases
+    /// the next ticket when it drops, panic included, so one body that unwinds
+    /// cannot wedge every dispatch after it.
+    fn take(&self, ticket: u64) -> DispatchTurn<'_> {
+        let serving = self.serving.lock().unwrap();
+        drop(
+            self.ready
+                .wait_while(serving, |serving| *serving != ticket)
+                .unwrap(),
+        );
+        DispatchTurn {
+            turnstile: self,
+            ticket,
+        }
+    }
+}
+
+/// One body's turn at the [`DispatchTurnstile`], held for as long as that body runs.
+struct DispatchTurn<'a> {
+    turnstile: &'a DispatchTurnstile,
+    ticket: u64,
+}
+
+impl Drop for DispatchTurn<'_> {
+    fn drop(&mut self) {
+        let mut serving = self.turnstile.serving.lock().unwrap();
+        *serving = self.ticket + 1;
+        self.turnstile.ready.notify_all();
+    }
 }
 
 impl RefreshHandles {
     /// `Core::refresh`'s whole body, moved here so `run_action`'s completion can call
     /// the identical dispatch from a thread that owns no reference to `Core` itself.
+    ///
+    /// Reserves this Generation's number and its turnstile place on the calling
+    /// thread and does everything else, discovery's own walk included, on a thread
+    /// of its own, the shape [`Core::rederive_default_branches`] already takes: no
+    /// caller waits out a walk, and every one of them is fire and forget past the
+    /// number this returns.
     fn dispatch(&self, order: &[EntityKey]) -> Generation {
+        let (generation, ticket) = self.reserve_generation();
+        begin_dispatch(&self.settle_gate);
+        let handles = self.clone();
+        let order = order.to_vec();
+        thread::spawn(move || {
+            let _turn = handles.turnstile.take(ticket);
+            handles.run_generation(&order, generation);
+            finish_dispatch(&handles.settle_gate);
+        });
+        generation
+    }
+
+    /// [`Core::refresh_all`]'s whole body: the same reservation and the same spawned
+    /// shape as [`Self::dispatch`], with the order read off the table this
+    /// Generation's own discovery just reconciled rather than taken from a caller.
+    fn dispatch_over_everything(&self) -> Generation {
+        let (generation, ticket) = self.reserve_generation();
+        begin_dispatch(&self.settle_gate);
+        let handles = self.clone();
+        thread::spawn(move || {
+            let _turn = handles.turnstile.take(ticket);
+            handles.rediscover();
+            let order: Vec<EntityKey> = handles
+                .table
+                .read()
+                .unwrap()
+                .entities
+                .iter()
+                .map(|entity| entity.key.clone())
+                .collect();
+            handles.dispatch_probes(&order, generation);
+            finish_dispatch(&handles.settle_gate);
+        });
+        generation
+    }
+
+    /// Takes this Generation's number and its turnstile ticket under one hold of
+    /// the table lock, so the two orders can never disagree.
+    fn reserve_generation(&self) -> (Generation, u64) {
+        let mut table = self.table.write().unwrap();
+        table.generation += 1;
+        (Generation::new(table.generation), self.turnstile.reserve())
+    }
+
+    /// [`Self::dispatch`]'s spawned body: both halves of discovery, then the probe
+    /// fan-out for `order`.
+    fn run_generation(&self, order: &[EntityKey], generation: Generation) {
+        self.rediscover();
+        self.dispatch_probes(order, generation);
+    }
+
+    /// Both halves of discovery at the head of one Generation, per refresh.md and
+    /// discovery.md: an entity no longer found becomes Vanished, and one found again
+    /// (new, or previously Vanished) is Present. Skipped once an earlier walk has
+    /// abandoned, which takes the Set out of this automatic path until a fresh `Core`
+    /// starts over different roots.
+    fn rediscover(&self) {
+        if !self.discovery_manual.load(Ordering::Acquire) {
+            self.rerun_discovery();
+        }
+    }
+
+    /// The probe fan-out alone, against the table as it stands: one rayon task per
+    /// dispatched entity, exactly as before this Generation's discovery moved off
+    /// the calling thread. Split out from [`Self::run_generation`] so
+    /// [`Self::dispatch_over_everything`], which has to resolve its order between the walk
+    /// and the fan-out, shares this body rather than keeping a second copy of it.
+    fn dispatch_probes(&self, order: &[EntityKey], generation: Generation) {
         // Scoped to this one Generation, per default-branch.md's "memoised per
         // common dir within a single refresh generation": a fresh cache every
         // call, never carried over, never touched by the previous Generation's
@@ -1348,23 +1534,11 @@ impl RefreshHandles {
         self.patch_scan_bounds.lock().unwrap().clear();
         self.dispatch_log.lock().unwrap().clear();
 
-        // Both halves of discovery re-run at the head of every Generation, per
-        // refresh.md and discovery.md: an entity no longer found becomes
-        // Vanished, and one found again (new, or previously Vanished) is
-        // Present. Skipped once an earlier walk has abandoned, which takes the
-        // Set out of this automatic path until a fresh `Core` starts over
-        // different roots.
-        if !self.discovery_manual.load(Ordering::Acquire) {
-            self.rerun_discovery();
-        }
-
+        let generation_number = generation.value();
         let mut table = self.table.write().unwrap();
-        table.generation += 1;
-        let generation_number = table.generation;
         table
             .generation_started_at
             .insert(generation_number, Instant::now());
-        let generation = Generation::new(generation_number);
 
         let show_submodules = self.show_submodules.load(Ordering::Acquire);
         let mut dispatched = Vec::new();
@@ -1394,13 +1568,10 @@ impl RefreshHandles {
         }
 
         if dispatched.is_empty() {
-            return generation;
+            return;
         }
 
-        {
-            let (lock, _cvar) = &*self.settle_gate;
-            *lock.lock().unwrap() += dispatched.len();
-        }
+        begin_probes_owed(&self.settle_gate, dispatched.len());
         let repos: Vec<Option<Arc<gix::ThreadSafeRepository>>> = dispatched
             .iter()
             .map(|(key, _)| table.repos.get(key).cloned())
@@ -1614,8 +1785,6 @@ impl RefreshHandles {
                 }
             });
         }
-
-        generation
     }
 
     /// Re-runs both halves of discovery over `self.set` and reconciles the
@@ -1630,10 +1799,18 @@ impl RefreshHandles {
         let repos_cache: HashMap<EntityKey, Arc<gix::ThreadSafeRepository>> =
             self.table.read().unwrap().repos.clone();
 
-        let (discovery, _watcher) = run_watched_discovery(
-            &self.set,
+        wait_for_discovery_gate(self.discovery_gate.as_ref());
+        // The watcher is left detached, as it always has been here: nothing on this
+        // path reads its handle.
+        let (watch, _watcher) = spawn_discovery_watcher(
+            self.set.roots.clone(),
             &self.discovery_warning,
             self.discovery_warn_after,
+        );
+        let discovery = run_watched_discovery(
+            &watch,
+            &self.set,
+            &self.discovery_warning,
             Duration::from_nanos(self.discovery_abandon_after.load(Ordering::Acquire)),
         );
         if discovery.abandoned {
@@ -1669,9 +1846,9 @@ impl Drop for Core {
     }
 }
 
-/// `start_internal`'s result: the running core, plus the two handles a test needs
+/// `start_internal`'s result: the running core, plus the three handles a test needs
 /// to make its threading deterministic instead of sleeping. `Core::start` only
-/// ever reads `core` out of it; the other two fields exist for
+/// ever reads `core` out of it; the other three fields exist for
 /// `Core::start_for_test`.
 pub(crate) struct StartForTest {
     pub core: Core,
@@ -1679,6 +1856,26 @@ pub(crate) struct StartForTest {
     pub clock_alive: Arc<AtomicBool>,
     #[allow(dead_code)] // read only by tests; the plain lib target never builds them
     pub discovery_watcher: JoinHandle<()>,
+    /// The thread the first discovery runs on. Joining it is the rendezvous that
+    /// says the walk finished and its rows reached the table, with no sleep and no
+    /// poll anywhere in the wait.
+    #[allow(dead_code)] // read only by tests; the plain lib target never builds them
+    pub initial_discovery: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl StartForTest {
+    /// Blocks until the first discovery has landed on the table, then hands this
+    /// back so a test reads a populated table rather than the empty one `start`
+    /// itself returns.
+    fn discovered(mut self) -> Self {
+        if let Some(handle) = self.initial_discovery.take() {
+            handle
+                .join()
+                .expect("the first discovery thread should not panic");
+        }
+        self
+    }
 }
 
 impl Core {
@@ -1711,8 +1908,7 @@ impl Core {
                 cancel: Arc::clone(&cancel),
             },
         );
-        let (lock, _cvar) = &*self.settle_gate;
-        *lock.lock().unwrap() += 1;
+        begin_probes_owed(&self.settle_gate, 1);
         cancel
     }
 }
@@ -1855,11 +2051,24 @@ impl Core {
         drop(cvar.wait_while(guard, |state| !state.finished).unwrap());
     }
 
+    /// Blocks the calling thread, with no sleep and no poll, until every Generation
+    /// reserved so far has finished dispatching: what a test waits on before reading
+    /// a count a dispatch raises, now that a Generation reserves its number on the
+    /// calling thread and raises that count on one of its own.
+    pub(crate) fn wait_dispatched_for_test(&self) {
+        let (lock, cvar) = &*self.settle_gate;
+        let guard = lock.lock().unwrap();
+        drop(
+            cvar.wait_while(guard, |counts| counts.dispatches > 0)
+                .unwrap(),
+        );
+    }
+
     /// The settle gate's raw outstanding count, so a test can prove a single
     /// dispatched entity's split write decrements it exactly once overall,
     /// neither twice (an early `settle`) nor zero times (a `settle` that hangs).
     pub(crate) fn settle_gate_count_for_test(&self) -> usize {
-        *self.settle_gate.0.lock().unwrap()
+        self.settle_gate.0.lock().unwrap().probes
     }
 
     /// `start`, with the tick source and the discovery-slow warning's threshold
@@ -1890,6 +2099,19 @@ impl Core {
         discovery_abandon_after: Duration,
         ticks: Receiver<Instant>,
     ) -> StartForTest {
+        Self::start_for_test_gated(spec, warn_after, discovery_abandon_after, ticks, None)
+    }
+
+    /// `start_for_test_with_discovery_abandon`, with the discovery gate injected: with a
+    /// closed one, every walk this `Core` starts blocks before it begins, so a caller's own
+    /// return is observed against a walk that provably has not run.
+    pub(crate) fn start_for_test_gated(
+        spec: CoreSpec,
+        warn_after: Duration,
+        discovery_abandon_after: Duration,
+        ticks: Receiver<Instant>,
+        discovery_gate: Option<DiscoveryGate>,
+    ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
         start_internal(
             spec,
@@ -1902,6 +2124,7 @@ impl Core {
                 ticks: crossbeam_channel::never(),
             },
             alive,
+            discovery_gate,
         )
     }
 
@@ -1930,6 +2153,7 @@ impl Core {
             ticks,
             fetch_start,
             alive,
+            None,
         )
     }
 
@@ -2118,24 +2342,50 @@ fn run_action_for_entity(
     }
 }
 
-/// Runs one discovery boundary walk against `set`, watched by a background
-/// thread that leaves the still-walking warning behind in `discovery_warning`
-/// if the walk outruns `warn_after`, and the abandoned-discovery warning there
-/// instead if the walk itself abandons past `abandon_after`. Shared by
-/// `start_internal`'s first walk and `rerun_discovery`'s later ones, so a
-/// refresh-triggered abandon runs the same wiring `start`'s own walk does,
-/// never a parallel copy of it. The watcher thread's handle comes back too,
-/// since `start_internal`'s test double joins it to make an assertion
-/// deterministic; `rerun_discovery` lets it run detached, as it always has.
-fn run_watched_discovery(
-    set: &SetSpec,
+/// A gate a test closes to hold every discovery walk this `Core` starts, at the
+/// point before the walk begins, so a caller's own return can be observed against a
+/// walk that provably has not run. `None` on every production path, the same way
+/// `Core::phase_c_gates` is empty on one.
+type DiscoveryGate = Arc<(Mutex<bool>, Condvar)>;
+
+/// Blocks while `gate` is closed, and returns at once when there is none, which is
+/// every production path.
+fn wait_for_discovery_gate(gate: Option<&DiscoveryGate>) {
+    let Some(gate) = gate else {
+        return;
+    };
+    let (lock, cvar) = &**gate;
+    let open = lock.lock().unwrap();
+    drop(cvar.wait_while(open, |open| !*open).unwrap());
+}
+
+/// Opens or closes a [`DiscoveryGate`], waking whatever walk is held on it.
+#[cfg(test)]
+fn set_discovery_gate(gate: &DiscoveryGate, open: bool) {
+    let (lock, cvar) = &**gate;
+    *lock.lock().unwrap() = open;
+    cvar.notify_all();
+}
+
+/// What one watched discovery walk and the thread watching it share: the counter
+/// the walk bumps as it goes, and the flag it sets on finishing.
+struct DiscoveryWatch {
+    progress: Arc<AtomicUsize>,
+    finished: Arc<AtomicBool>,
+}
+
+/// Arms the still-walking watcher for a walk that has not started yet, leaving the
+/// still-walking warning behind in `discovery_warning` if that walk outruns
+/// `warn_after`. Separate from [`run_watched_discovery`] so `start_internal` can arm
+/// it on the calling thread, and hand a test its handle, while the walk it watches
+/// runs on a thread of its own.
+fn spawn_discovery_watcher(
+    roots: Vec<PathBuf>,
     discovery_warning: &Arc<Mutex<Option<String>>>,
     warn_after: Duration,
-    abandon_after: Duration,
-) -> (discovery::Discovery, JoinHandle<()>) {
+) -> (DiscoveryWatch, JoinHandle<()>) {
     let progress = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicBool::new(false));
-    let roots = set.roots.clone();
     let watcher = thread::spawn({
         let progress = Arc::clone(&progress);
         let finished = Arc::clone(&finished);
@@ -2146,21 +2396,34 @@ fn run_watched_discovery(
             }
         }
     });
+    (DiscoveryWatch { progress, finished }, watcher)
+}
 
+/// Runs one discovery boundary walk against `set` under an already-armed `watch`,
+/// leaving the abandoned-discovery warning in `discovery_warning` if the walk
+/// abandons past `abandon_after`. Shared by `start_internal`'s first walk and
+/// `rerun_discovery`'s later ones, so a refresh-triggered abandon runs the same
+/// wiring `start`'s own walk does, never a parallel copy of it.
+fn run_watched_discovery(
+    watch: &DiscoveryWatch,
+    set: &SetSpec,
+    discovery_warning: &Arc<Mutex<Option<String>>>,
+    abandon_after: Duration,
+) -> discovery::Discovery {
     let discovery =
-        discovery::discover_watched_with_deadline(set, Arc::clone(&progress), abandon_after);
-    finished.store(true, Ordering::Release);
+        discovery::discover_watched_with_deadline(set, Arc::clone(&watch.progress), abandon_after);
+    watch.finished.store(true, Ordering::Release);
 
     if discovery.abandoned {
         *discovery_warning.lock().unwrap() =
             Some(abandoned_discovery_message(discovery.directories_visited));
     }
 
-    (discovery, watcher)
+    discovery
 }
 
-/// Shared body of `start` and `start_for_test`: runs discovery once, builds the
-/// table, and spawns the dedicated thread.
+/// Shared body of `start` and `start_for_test`: builds the empty table, spawns the
+/// dedicated thread, and starts the first discovery on a thread of its own.
 fn start_internal(
     spec: CoreSpec,
     warn_after: Duration,
@@ -2168,6 +2431,7 @@ fn start_internal(
     ticks: Receiver<Instant>,
     fetch_start: FetchStart,
     alive: Arc<AtomicBool>,
+    discovery_gate: Option<DiscoveryGate>,
 ) -> StartForTest {
     let FetchStart {
         enabled: fetch_enabled,
@@ -2175,22 +2439,11 @@ fn start_internal(
         ticks: fetch_ticks,
     } = fetch_start;
     let discovery_warning = Arc::new(Mutex::new(None));
-    let (discovery, discovery_watcher) = run_watched_discovery(
-        &spec.set,
-        &discovery_warning,
-        warn_after,
-        discovery_abandon_after,
-    );
-    let discovery_manual = Arc::new(AtomicBool::new(discovery.abandoned));
+    let discovery_manual = Arc::new(AtomicBool::new(false));
 
-    // Discovery's second half: every boundary the walk just found becomes a Repo
-    // or a Worktree, and each one's own `.gitmodules` (never recursed into) names
-    // its Submodules. One combined list, with nothing recording which half
-    // produced a given entry.
-    let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
     let (overrides, resolved_exclusions) = resolve_entries(&spec.overrides);
     let overrides = Arc::new(overrides);
-    let exclusions = Arc::new(RwLock::new(resolved_exclusions.clone()));
+    let exclusions = Arc::new(RwLock::new(resolved_exclusions));
     let show_submodules = Arc::new(AtomicBool::new(spec.show_submodules));
 
     let table = Arc::new(RwLock::new(Table {
@@ -2203,20 +2456,9 @@ fn start_internal(
         repos: HashMap::new(),
         poll_fingerprints: HashMap::new(),
     }));
-    {
-        let mut table = table.write().unwrap();
-        // A fresh table has nothing in flight yet, so nothing here is ever
-        // cancelled: the same reconciliation `refresh` uses later, run once
-        // against an empty starting point.
-        merge_discovery(
-            &mut table,
-            &resolved_exclusions,
-            discovered,
-            gitmodules_failures,
-        );
-    }
 
-    let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let settle_gate: Arc<SettleGate> =
+        Arc::new((Mutex::new(SettleCounts::default()), Condvar::new()));
     let poll_reprobed = Arc::new(Mutex::new(Vec::new()));
     let poll_sweep_count = Arc::new(AtomicUsize::new(0));
     let network_default_branch = Arc::new(Mutex::new(HashMap::new()));
@@ -2240,6 +2482,7 @@ fn start_internal(
     let dispatch_log = Arc::new(Mutex::new(Vec::new()));
     let phase_c_gates = Arc::new(Mutex::new(HashMap::new()));
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
+    let turnstile = Arc::new(DispatchTurnstile::default());
 
     let fetch_refresh_handles = RefreshHandles {
         table: Arc::clone(&table),
@@ -2258,6 +2501,8 @@ fn start_internal(
         dispatch_log: Arc::clone(&dispatch_log),
         phase_c_gates: Arc::clone(&phase_c_gates),
         network_default_branch: Arc::clone(&network_default_branch),
+        turnstile: Arc::clone(&turnstile),
+        discovery_gate: discovery_gate.clone(),
     };
     let auto_update_enabled = spec.auto_update.enabled;
     let fetch_schedule = FetchSchedule {
@@ -2281,27 +2526,79 @@ fn start_internal(
         },
     );
 
-    // "Fires immediately on being enabled rather than waiting for the first
-    // tick" ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
-    // "The periodic fetch"): the recurring cadence above only ever fires after a
-    // full `fetch.interval` has elapsed, so the first cycle is dispatched here,
-    // once, on its own plain thread rather than on the dedicated clock thread,
-    // which must stay free to keep polling and sweeping deadlines while this
-    // cycle runs.
-    if fetch_enabled {
+    // Discovery runs here rather than on the calling thread, so `Core::start`
+    // returns against the empty table above and the consumer can claim the terminal
+    // and draw before the walk has finished (ADR 0015's "a constructor that spawns
+    // threads is not a surprise"). It starts no Generation of its own; the consumer's
+    // own `refresh_all` is Generation 1 and walks again for itself, concurrently with
+    // this one rather than after it, which is where the two sequential walks a launch
+    // used to pay went. The debt is recorded before the spawn, so a `settle` called in
+    // between waits for this walk rather than returning on an empty table.
+    begin_dispatch(&settle_gate);
+    let (watch, discovery_watcher) =
+        spawn_discovery_watcher(spec.set.roots.clone(), &discovery_warning, warn_after);
+    let initial_discovery = thread::spawn({
+        let set = spec.set.clone();
+        let discovery_warning = Arc::clone(&discovery_warning);
+        let discovery_manual = Arc::clone(&discovery_manual);
+        let exclusions = Arc::clone(&exclusions);
         let table = Arc::clone(&table);
-        let refresh = fetch_refresh_handles.clone();
-        let cycle_count = Arc::clone(&fetch_cycle_count);
-        thread::spawn(move || {
-            run_fetch_cycle(
-                &table,
-                fetch_concurrency,
-                &refresh,
-                &cycle_count,
-                auto_update_enabled,
-            );
-        });
-    }
+        let settle_gate = Arc::clone(&settle_gate);
+        let fetch_refresh_handles = fetch_refresh_handles.clone();
+        let fetch_cycle_count = Arc::clone(&fetch_cycle_count);
+        let discovery_gate = discovery_gate.clone();
+        move || {
+            wait_for_discovery_gate(discovery_gate.as_ref());
+            let discovery =
+                run_watched_discovery(&watch, &set, &discovery_warning, discovery_abandon_after);
+            if discovery.abandoned {
+                discovery_manual.store(true, Ordering::Release);
+            }
+
+            // Discovery's second half: every boundary the walk just found becomes a
+            // Repo or a Worktree, and each one's own `.gitmodules` (never recursed
+            // into) names its Submodules. One combined list, with nothing recording
+            // which half produced a given entry.
+            let (discovered, gitmodules_failures) = discovery::resolve(&set, &discovery.entities);
+            let resolved_exclusions = exclusions.read().unwrap().clone();
+            {
+                let mut table = table.write().unwrap();
+                // A fresh table has nothing in flight yet, so nothing here is ever
+                // cancelled: the same reconciliation `refresh` uses later, run once
+                // against an empty starting point.
+                merge_discovery(
+                    &mut table,
+                    &resolved_exclusions,
+                    discovered,
+                    gitmodules_failures,
+                );
+                table.discovered_at = Timestamp::now();
+            }
+            finish_dispatch(&settle_gate);
+
+            // "Fires immediately on being enabled rather than waiting for the first
+            // tick" ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+            // "The periodic fetch"): the recurring cadence only ever fires after a full
+            // `fetch.interval` has elapsed, so the first cycle is dispatched here, once,
+            // on its own plain thread rather than on the dedicated clock thread, which
+            // must stay free to keep polling and sweeping deadlines while this cycle
+            // runs. From inside this thread rather than beside it, because a cycle reads
+            // the table to know what to fetch and the walk above is what puts anything
+            // in it.
+            if fetch_enabled {
+                let table = Arc::clone(&table);
+                thread::spawn(move || {
+                    run_fetch_cycle(
+                        &table,
+                        fetch_concurrency,
+                        &fetch_refresh_handles,
+                        &fetch_cycle_count,
+                        auto_update_enabled,
+                    );
+                });
+            }
+        }
+    });
 
     StartForTest {
         core: Core {
@@ -2330,9 +2627,12 @@ fn start_internal(
             #[cfg(feature = "fetch")]
             fetch_cycle_count,
             network_default_branch,
+            turnstile,
+            discovery_gate,
         },
         clock_alive: alive,
         discovery_watcher,
+        initial_discovery: Some(initial_discovery),
     }
 }
 
@@ -2405,7 +2705,7 @@ fn spawn_clock_thread(
     table: Arc<RwLock<Table>>,
     poll: PollHandles,
     fetch: FetchSchedule,
-    settle_gate: Arc<(Mutex<usize>, Condvar)>,
+    settle_gate: Arc<SettleGate>,
     generation_deadline: Duration,
     channels: ClockChannels,
 ) -> JoinHandle<()> {
@@ -2812,7 +3112,7 @@ fn run_poll_sweep(
 /// which is what suspension does: the in-flight Generation is cancelled outright
 /// rather than left to finish. Releases a pending `settle` too, since nothing is
 /// now going to finish it.
-fn cancel_in_flight(table: &Arc<RwLock<Table>>, settle_gate: &Arc<(Mutex<usize>, Condvar)>) {
+fn cancel_in_flight(table: &Arc<RwLock<Table>>, settle_gate: &Arc<SettleGate>) {
     let mut table = table.write().unwrap();
     let cancelled = table.in_flight.len();
     for in_flight in table.in_flight.values() {
@@ -2852,11 +3152,7 @@ impl<T> TimeoutableCell for Cell<T> {
 /// per [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md):
 /// there is no per-cell timeout, only this sweep, and it never interrupts the
 /// underlying probe, which keeps running; the sweep only stops waiting on it.
-fn sweep_deadline(
-    table: &Arc<RwLock<Table>>,
-    settle_gate: &Arc<(Mutex<usize>, Condvar)>,
-    deadline: Duration,
-) {
+fn sweep_deadline(table: &Arc<RwLock<Table>>, settle_gate: &Arc<SettleGate>, deadline: Duration) {
     let mut table = table.write().unwrap();
     let now = Instant::now();
     let mut timed_out = Vec::new();
@@ -2958,15 +3254,71 @@ fn begin_probes(entity: &mut EntityState) {
     }
 }
 
-fn complete_one(settle_gate: &(Mutex<usize>, Condvar)) {
+/// What [`Core::settle`] waits on, and the one lock every count it waits on lives
+/// under, so a settle can never observe one of them without the other.
+type SettleGate = (Mutex<SettleCounts>, Condvar);
+
+/// The two outstanding counts [`Core::settle`] blocks on.
+///
+/// `dispatches` exists because a Generation reserves its number on the calling
+/// thread and does everything else on one of its own: between those two moments
+/// `probes` has not been raised yet, so a settle reading `probes` alone would
+/// return on a table nothing has started writing to.
+#[derive(Default)]
+struct SettleCounts {
+    /// Dispatched entities that have yet to land a phase C/D outcome, be cancelled
+    /// or time out.
+    probes: usize,
+    /// Generations whose number is reserved and whose own dispatch body has not
+    /// finished raising `probes` for what it dispatches.
+    dispatches: usize,
+}
+
+impl SettleCounts {
+    /// Whether nothing this `Core` has started is still owed to the table.
+    ///
+    /// An exhaustive destructure: a third count added to this struct must be named here
+    /// or this fails to compile, rather than being silently left out of what a settle
+    /// waits for.
+    fn is_settled(&self) -> bool {
+        let SettleCounts { probes, dispatches } = self;
+        *probes == 0 && *dispatches == 0
+    }
+}
+
+/// Records one reserved Generation as owed, before the thread that will dispatch
+/// it has started. Paired with exactly one [`finish_dispatch`].
+fn begin_dispatch(settle_gate: &SettleGate) {
+    let (lock, _cvar) = settle_gate;
+    lock.lock().unwrap().dispatches += 1;
+}
+
+/// Releases the debt [`begin_dispatch`] recorded, once that Generation's own
+/// dispatch has raised `probes` for everything it dispatched.
+fn finish_dispatch(settle_gate: &SettleGate) {
+    let (lock, cvar) = settle_gate;
+    let mut counts = lock.lock().unwrap();
+    counts.dispatches = counts.dispatches.saturating_sub(1);
+    drop(counts);
+    // Unconditionally, unlike `complete_many`: a waiter watching `dispatches` alone
+    // would never be woken by a change that leaves `probes` outstanding.
+    cvar.notify_all();
+}
+
+fn begin_probes_owed(settle_gate: &SettleGate, owed: usize) {
+    let (lock, _cvar) = settle_gate;
+    lock.lock().unwrap().probes += owed;
+}
+
+fn complete_one(settle_gate: &SettleGate) {
     complete_many(settle_gate, 1);
 }
 
-fn complete_many(settle_gate: &(Mutex<usize>, Condvar), finished: usize) {
+fn complete_many(settle_gate: &SettleGate, finished: usize) {
     let (lock, cvar) = settle_gate;
-    let mut count = lock.lock().unwrap();
-    *count = count.saturating_sub(finished);
-    if *count == 0 {
+    let mut counts = lock.lock().unwrap();
+    counts.probes = counts.probes.saturating_sub(finished);
+    if counts.is_settled() {
         cvar.notify_all();
     }
 }
@@ -3760,7 +4112,7 @@ struct ProbeOutcomes {
 /// `probe_patch_equivalence` was itself cancelled before answering, still shows.
 fn apply_probe_outcome(
     table: &Arc<RwLock<Table>>,
-    settle_gate: &Arc<(Mutex<usize>, Condvar)>,
+    settle_gate: &Arc<SettleGate>,
     key: &EntityKey,
     generation: Generation,
     outcomes: ProbeOutcomes,
@@ -4189,7 +4541,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -4271,7 +4623,7 @@ mod tests {
             init_repo_with_a_commit(&root.join(format!("repo-{index}")));
         }
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -4316,7 +4668,7 @@ mod tests {
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("repo"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.hold_phase_c_for_test(&key);
@@ -4385,7 +4737,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("a"));
         init_repo_with_a_commit(&root.join("b"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let key_a = snapshot
             .entities
@@ -4405,6 +4757,10 @@ mod tests {
         core.hold_phase_c_for_test(&key_a);
         core.hold_phase_c_for_test(&key_b);
         core.refresh(&[key_a.clone(), key_b.clone()]);
+        // A Generation reserves its number on this thread and raises the gate on one of
+        // its own, so this is the rendezvous that says the raise has happened. A join,
+        // never a sleep.
+        core.wait_dispatched_for_test();
         assert_eq!(
             core.settle_gate_count_for_test(),
             2,
@@ -4461,7 +4817,7 @@ mod tests {
             init_repo_with_a_commit(&root.join(format!("repo-{index}")));
         }
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let discovery_order: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -4515,7 +4871,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let before = core
             .cached_repo_handle_for_test(&key)
@@ -4545,7 +4901,7 @@ mod tests {
 
         // A core discovering an unrelated, empty root, so `repo` is never cached.
         let empty_root = root_of(&tempfile::tempdir().expect("temp dir"));
-        let core = Core::start(spec(vec![empty_root]));
+        let core = Core::start_discovered(spec(vec![empty_root]));
         let key = EntityKey::new(Arc::from(repo.as_path()));
         assert!(core.cached_repo_handle_for_test(&key).is_none());
 
@@ -4568,7 +4924,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         core.refresh(&[]);
         let settled = core.settle(Duration::from_millis(50));
 
@@ -4586,7 +4942,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         let entity = core.probe_now(&key);
@@ -4614,7 +4970,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         let entity = core.probe_now(&key);
@@ -4656,7 +5012,7 @@ mod tests {
         git(&repo, &["reset", "--hard", &root_sha]);
         git(&repo, &["update-ref", "refs/remotes/origin/main", &tip_sha]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -4690,7 +5046,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
         fs::write(repo.join("untracked.txt"), "x").expect("write untracked file");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         let entity = core.probe_now(&key);
@@ -4720,7 +5076,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         let entity = core.probe_now(&key);
@@ -4747,7 +5103,7 @@ mod tests {
         let repo = root.join("named-repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let discovered = core.snapshot().entities[0].clone();
         assert_eq!(&*discovered.name, "named-repo");
 
@@ -4770,7 +5126,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.dismiss(&key);
@@ -4798,7 +5154,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
         let marker = repo.join("step-three-ran");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let steps = vec![
             step(&["true"]),
@@ -4843,7 +5199,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
         let order_log = repo.join("order.log");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let steps = vec![
             step(&["sh", "-c", "printf 1 >> order.log"]),
@@ -4893,7 +5249,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let steps = vec![step(&["true"]), step(&["sh", "-c", "sleep 0.5"])];
 
@@ -4958,7 +5314,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let steps = vec![shell_step("echo \"[$0]\"")];
 
@@ -4989,7 +5345,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let cancels = core.begin_shared_generation_for_test(std::slice::from_ref(&key));
         let cancel = cancels
@@ -5033,7 +5389,7 @@ mod tests {
         init_repo_with_a_commit(&acted_on);
         init_repo_with_a_commit(&untouched);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let before = core.snapshot();
         assert_eq!(before.generation, Generation::default());
         let acted_key = before
@@ -5087,7 +5443,7 @@ mod tests {
         init_repo_with_a_commit(&excluded_repo);
         init_repo_with_a_commit(&normal_repo);
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: excluded_repo.clone(),
@@ -5169,7 +5525,7 @@ mod tests {
         init_repo_with_a_commit(&excluded_repo);
         init_repo_with_a_commit(&normal_repo);
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: excluded_repo.clone(),
@@ -5248,7 +5604,7 @@ mod tests {
         init_repo_with_a_commit(&excluded_repo);
         init_repo_with_a_commit(&normal_repo);
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: excluded_repo.clone(),
@@ -5291,7 +5647,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let real_key = core.snapshot().entities[0].key.clone();
         let unknown_key = EntityKey::new(Arc::from(dir.path().join("never-discovered")));
 
@@ -5308,7 +5664,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let slow = action("first", vec![step(&["sh", "-c", "sleep 0.3"])]);
         let fast = action("second", vec![step(&["true"])]);
@@ -5351,7 +5707,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let two_seconds = action("brief", vec![step(&["sh", "-c", "sleep 2"])]);
 
@@ -5400,7 +5756,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
 
         core.hold_action();
         core.continue_action();
@@ -5437,7 +5793,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let sleep_past_the_backstop = format!("trap '' TERM; sleep {}", FIXTURE_LIFETIME.as_secs());
         let trapping = action(
@@ -5492,7 +5848,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("fail"));
         init_repo_with_a_commit(&root.join("slow"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let fail_key = snapshot
             .entities
@@ -5604,7 +5960,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         // A step slow enough that the fan-out's own write of `last_action` cannot have
@@ -5694,7 +6050,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
         let before = core.settle(Duration::from_millis(500));
@@ -5730,7 +6086,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let receipt = crate::entity::ActionReceipt {
             label: Arc::from("reinstall"),
@@ -5770,7 +6126,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         let receipt = crate::entity::ActionReceipt {
             label: Arc::from("reinstall"),
@@ -5833,7 +6189,7 @@ mod tests {
         // it: this test is about the Vanished rule, not about `show_submodules` gating.
         let mut core_spec = spec(vec![root]);
         core_spec.show_submodules = true;
-        let core = Core::start(core_spec);
+        let core = Core::start_discovered(core_spec);
         let snapshot = core.snapshot();
         let submodule_key = snapshot
             .entities
@@ -5887,13 +6243,13 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let first_core = Core::start(spec(vec![root.clone()]));
+        let first_core = Core::start_discovered(spec(vec![root.clone()]));
         let key = first_core.snapshot().entities[0].key.clone();
         first_core.dismiss(&key);
         assert!(first_core.snapshot().entities.is_empty());
         drop(first_core);
 
-        let second_core = Core::start(spec(vec![root]));
+        let second_core = Core::start_discovered(spec(vec![root]));
         let snapshot = second_core.snapshot();
 
         assert_eq!(
@@ -5919,7 +6275,7 @@ mod tests {
         let original_path = root.join("original-name");
         init_repo_with_a_commit(&original_path);
 
-        let core = Core::start(spec(vec![root.clone()]));
+        let core = Core::start_discovered(spec(vec![root.clone()]));
         let original_key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&original_key));
         let before = core.settle(Duration::from_millis(500));
@@ -5969,7 +6325,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         fs::remove_dir_all(&repo).expect("remove the repo from disk");
@@ -6008,7 +6364,7 @@ mod tests {
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("first"));
 
-        let core = Core::start(spec(vec![root.clone()]));
+        let core = Core::start_discovered(spec(vec![root.clone()]));
         assert_eq!(core.snapshot().entities.len(), 1);
 
         init_repo_with_a_commit(&root.join("second"));
@@ -6079,7 +6435,8 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_micros(500),
             tick_rx,
-        );
+        )
+        .discovered();
         let core = started.core;
         assert!(
             core.discovery_manual_for_test(),
@@ -6133,16 +6490,17 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             tick_rx,
-        );
+        )
+        .discovered();
         let core = started.core;
         assert!(
             !core.discovery_manual_for_test(),
             "an hour-long deadline must leave the first walk automatic"
         );
 
-        // Grown only after `start` has already returned, so this fan of decoys is
-        // invisible to the first walk and can only be reached by a walk `refresh`
-        // triggers itself.
+        // Grown only after the first walk has finished (`discovered` above joined it),
+        // so this fan of decoys is invisible to that walk and can only be reached by a
+        // walk `refresh` triggers itself.
         let decoys = root.join("decoys");
         for i in 0..4_000 {
             fs::create_dir(decoys.join(format!("decoy-{i}")))
@@ -6152,6 +6510,9 @@ mod tests {
         core.set_discovery_abandon_after_for_test(Duration::from_micros(500));
 
         core.refresh(&[]);
+        // `refresh` returns the moment it has reserved its Generation; this is the
+        // rendezvous that says its own walk has run.
+        core.wait_dispatched_for_test();
 
         assert!(
             core.discovery_manual_for_test(),
@@ -6184,7 +6545,8 @@ mod tests {
             Duration::from_secs(3600),
             Duration::ZERO,
             tick_rx,
-        );
+        )
+        .discovered();
         started.core.refresh(&[]);
         started.core.settle(Duration::from_millis(500));
         assert!(
@@ -6196,7 +6558,7 @@ mod tests {
         let fresh_dir = tempfile::tempdir().expect("temp dir");
         let fresh_root = root_of(&fresh_dir);
         init_repo_with_a_commit(&fresh_root.join("first"));
-        let fresh_core = Core::start(spec(vec![fresh_root.clone()]));
+        let fresh_core = Core::start_discovered(spec(vec![fresh_root.clone()]));
         assert_eq!(fresh_core.snapshot().entities.len(), 1);
 
         init_repo_with_a_commit(&fresh_root.join("second"));
@@ -6221,7 +6583,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
 
-        let started = Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx);
+        let started =
+            Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx).discovered();
         assert!(started.clock_alive.load(Ordering::Acquire));
 
         drop(started.core);
@@ -6247,7 +6610,7 @@ mod tests {
 
         let mut spec = spec(vec![root]);
         spec.generation_deadline = Duration::ZERO;
-        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let key = core.snapshot().entities[0].key.clone();
 
@@ -6285,7 +6648,8 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let started = Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx);
+        let started =
+            Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let key = core.snapshot().entities[0].key.clone();
 
@@ -6330,7 +6694,7 @@ mod tests {
         init_repo_with_a_commit(&repo_a);
         init_repo_with_a_commit(&repo_b);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let key_a = snapshot
             .entities
@@ -6449,7 +6813,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         backdate_polled_entries(&repo);
         core.poll_once_for_test();
@@ -6506,7 +6870,7 @@ mod tests {
             .expect("run git worktree add");
         assert!(status.success());
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let worktree_key = snapshot
             .entities
@@ -6567,7 +6931,7 @@ mod tests {
 
         let mut short_lived = spec(vec![root]);
         short_lived.status_stale_after = Duration::from_nanos(1);
-        let core = Core::start(short_lived);
+        let core = Core::start_discovered(short_lived);
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
         core.settle(Duration::from_secs(2));
@@ -6596,7 +6960,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
         core.settle(Duration::from_secs(2));
@@ -6633,7 +6997,7 @@ mod tests {
 
         let mut hidden_spec = spec(vec![root.clone()]);
         hidden_spec.show_submodules = false;
-        let hidden_core = Core::start(hidden_spec);
+        let hidden_core = Core::start_discovered(hidden_spec);
         // Discovery's own pass always runs regardless of the flag
         // (discovery.md's "Showing Submodules": "the pass always runs, so
         // Submodules are always known"), so the row exists; only probing and the
@@ -6661,7 +7025,7 @@ mod tests {
 
         let mut shown_spec = spec(vec![root]);
         shown_spec.show_submodules = true;
-        let shown_core = Core::start(shown_spec);
+        let shown_core = Core::start_discovered(shown_spec);
         let submodule_key = shown_core
             .snapshot()
             .entities
@@ -6694,7 +7058,8 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let started = Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx);
+        let started =
+            Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let key = core.snapshot().entities[0].key.clone();
         let cancel = core.begin_untracked_probe_for_test(&key);
@@ -6734,7 +7099,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("a"));
         init_repo_with_a_commit(&root.join("b"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let key_a = snapshot
             .entities
@@ -6869,7 +7234,7 @@ mod tests {
 
         let mut spec = spec(vec![root]);
         spec.generation_deadline = Duration::ZERO;
-        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let snapshot = core.snapshot();
         let key_a = snapshot
@@ -6977,7 +7342,7 @@ mod tests {
 
         let mut spec = spec(vec![root]);
         spec.generation_deadline = Duration::ZERO;
-        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let snapshot = core.snapshot();
         let repo_key = snapshot
@@ -7046,7 +7411,7 @@ mod tests {
 
         let mut spec = spec(vec![root]);
         spec.generation_deadline = Duration::ZERO;
-        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx);
+        let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
         let key = core.snapshot().entities[0].key.clone();
 
@@ -7181,7 +7546,7 @@ mod tests {
             .expect("run git worktree add");
         assert!(status.success());
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
 
         assert_eq!(
@@ -7286,7 +7651,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -7380,7 +7745,7 @@ mod tests {
             &["update-ref", "refs/remotes/origin/feature", &feature_sha],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -7446,7 +7811,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -7540,7 +7905,7 @@ mod tests {
             &["update-ref", "refs/remotes/origin/feature", &feature_sha],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -7635,7 +8000,7 @@ mod tests {
             &["update-ref", "refs/remotes/origin/feature", &feature_sha],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -7684,7 +8049,7 @@ mod tests {
         .expect("write .gitmodules");
         fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
 
         assert!(
@@ -7735,7 +8100,7 @@ mod tests {
         // this test is about `probes_base`'s own gate, not about `show_submodules`'s.
         let mut core_spec = spec(vec![root]);
         core_spec.show_submodules = true;
-        let core = Core::start(core_spec);
+        let core = Core::start_discovered(core_spec);
         let key = core
             .snapshot()
             .entities
@@ -7790,7 +8155,7 @@ mod tests {
         .expect("write .gitmodules");
         fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let submodule = core
             .snapshot()
             .entities
@@ -7829,7 +8194,7 @@ mod tests {
 
         let mut core_spec = spec(vec![root]);
         core_spec.show_submodules = true;
-        let core = Core::start(core_spec);
+        let core = Core::start_discovered(core_spec);
         let key = core
             .snapshot()
             .entities
@@ -7897,7 +8262,7 @@ mod tests {
         init_repo_with_a_commit(&parent.join("vendor").join("lib"));
 
         // `spec`'s own default: `show_submodules: false`.
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core
             .snapshot()
             .entities
@@ -7958,7 +8323,7 @@ mod tests {
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("repo-a"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let before = core.snapshot().generation;
 
         core.set_show_submodules(true);
@@ -7994,7 +8359,7 @@ mod tests {
         )
         .expect("write malformed .gitmodules");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core
             .snapshot()
             .entities
@@ -8084,13 +8449,241 @@ mod tests {
         init_repo_with_a_commit(&root.join("repo"));
         let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
 
-        let started = Core::start_for_test(spec(vec![root]), Duration::from_millis(1), tick_rx);
+        let started =
+            Core::start_for_test(spec(vec![root]), Duration::from_millis(1), tick_rx).discovered();
         started
             .discovery_watcher
             .join()
             .expect("watcher thread should not panic");
 
         assert!(started.core.discovery_warning().is_none());
+    }
+
+    /// A [`DiscoveryGate`] starting `open`, and the channel that opens it once the call
+    /// under test has returned.
+    ///
+    /// The gate is what makes "before its walk has run" a rendezvous rather than a
+    /// margin. The channel is what makes an implementation that walks inline fail its
+    /// assertion instead of wedging the run: nothing else would ever open the gate for
+    /// it, so the backstop below is its only release, and the assertion then reports.
+    fn gate_opened_on_signal(open: bool) -> (DiscoveryGate, Sender<()>, JoinHandle<()>) {
+        let gate: DiscoveryGate = Arc::new((Mutex::new(open), Condvar::new()));
+        let (returned_tx, returned_rx) = crossbeam_channel::bounded::<()>(1);
+        let opener = thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                let _ = returned_rx.recv_timeout(crate::liveness::BACKSTOP);
+                set_discovery_gate(&gate, true);
+            }
+        });
+        (gate, returned_tx, opener)
+    }
+
+    /// Criterion 1: `Core::start` returns before discovery has finished, and the rows
+    /// land when discovery does.
+    ///
+    /// The walk is held closed before the `Core` is built, so the empty table below is
+    /// the table `start` actually returned rather than one this test raced it to. Joining
+    /// the harness's own `initial_discovery` handle afterwards is the rendezvous that says
+    /// the walk landed: no sleep and no poll on either side.
+    #[test]
+    fn start_returns_against_an_empty_table_and_the_rows_land_when_discovery_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+        let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let (gate, start_returned, opener) = gate_opened_on_signal(false);
+
+        let started = Core::start_for_test_gated(
+            spec(vec![root]),
+            Duration::from_secs(3600),
+            discovery::ABANDON_AFTER,
+            tick_rx,
+            Some(Arc::clone(&gate)),
+        );
+        let at_start = started.core.snapshot();
+        start_returned.send(()).expect("the opener is listening");
+        opener.join().expect("the opener thread should not panic");
+        let started = started.discovered();
+
+        assert!(
+            at_start.entities.is_empty(),
+            "`Core::start` must return before discovery has finished, against the empty \
+             table a consumer draws its first frame from, got {:?}",
+            at_start
+                .entities
+                .iter()
+                .map(|entity| entity.name.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let landed = started.core.snapshot();
+        assert_eq!(
+            landed
+                .entities
+                .iter()
+                .map(|entity| entity.name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["repo".to_string()],
+            "the row must land on the table as soon as discovery does"
+        );
+        assert!(
+            landed.entities[0].branch.settled().is_none(),
+            "discovery lands the row alone: its Cells stay unsettled until a Generation \
+             probes them, which is what the spinner sits behind"
+        );
+    }
+
+    /// Criterion 2: the Generation a consumer starts at launch covers every row
+    /// discovery found, including the ones it could not have named, and fills their
+    /// Cells.
+    ///
+    /// `refresh_all` rather than `refresh`, because a caller holding the empty table
+    /// `start` returned has no key to order by; the row below is discovered by this
+    /// Generation's own walk and probed by the same Generation.
+    #[test]
+    fn refresh_all_covers_every_row_its_own_discovery_found() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let core = Core::start_discovered(spec(vec![root.clone()]));
+        // Created after the first walk finished, so this row exists in no snapshot the
+        // caller could have read: only a Generation that resolves its own order after its
+        // own discovery reaches it.
+        init_repo_with_a_commit(&root.join("late"));
+
+        assert_eq!(core.refresh_all(), Generation::new(1));
+        let settled = core.settle(Duration::from_secs(5));
+
+        let mut named: Vec<String> = settled
+            .entities
+            .iter()
+            .filter(|entity| entity.branch.settled().is_some())
+            .map(|entity| entity.name.to_string())
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            vec!["late".to_string(), "repo".to_string()],
+            "the startup Generation must cover every row its own discovery found, including \
+             one the caller had no key for"
+        );
+    }
+
+    /// Criterion 3: `r`, focus gained and resume all reach `Core::refresh`, and it
+    /// returns before its own Generation's discovery has run, so none of them holds the
+    /// event loop for the length of a walk.
+    ///
+    /// `late` is created after the first walk has already finished, so only this
+    /// `refresh`'s own walk could ever find it: its absence from the table `refresh`
+    /// returned against is what says that walk had not run. Opening the gate afterwards
+    /// lets the same Generation finish, which is what proves the work was deferred rather
+    /// than dropped.
+    #[test]
+    fn refresh_returns_before_its_own_generations_discovery_has_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+        let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let (gate, walk_may_run, opener) = gate_opened_on_signal(true);
+
+        let started = Core::start_for_test_gated(
+            spec(vec![root.clone()]),
+            Duration::from_secs(3600),
+            discovery::ABANDON_AFTER,
+            tick_rx,
+            Some(Arc::clone(&gate)),
+        )
+        .discovered();
+        let core = started.core;
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        init_repo_with_a_commit(&root.join("late"));
+
+        set_discovery_gate(&gate, false);
+        let generation = core.refresh(&keys);
+        let while_held = core.snapshot();
+        let dispatched_while_held = core.settle_gate_count_for_test();
+        walk_may_run.send(()).expect("the opener is listening");
+        opener.join().expect("the opener thread should not panic");
+
+        assert_eq!(
+            generation,
+            Generation::new(1),
+            "`refresh` must return its own Generation's number before that Generation has \
+             done any of its work"
+        );
+        assert!(
+            !while_held
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "late"),
+            "`refresh` must return before its own Generation's walk has run, so a Repo \
+             created after the previous walk is not on the table it returned against"
+        );
+        assert_eq!(
+            dispatched_while_held, 0,
+            "`refresh` returned before its Generation reached the table at all, so nothing \
+             is dispatched yet"
+        );
+
+        core.wait_dispatched_for_test();
+        let settled = core.settle(Duration::from_secs(5));
+
+        assert!(
+            settled
+                .entities
+                .iter()
+                .any(|entity| &*entity.name == "late"),
+            "the deferred Generation must still run its own walk once it is let through: \
+             deferred, never dropped"
+        );
+    }
+
+    /// The turnstile's whole claim: a Generation reserved second cannot reach the table
+    /// before the one reserved first, whatever the two threads' own scheduling does.
+    ///
+    /// Without it a `refresh` whose walk finished quickly could insert its in-flight
+    /// entries ahead of an older Generation's, leaving the older one to cancel the newer
+    /// one and record itself as the live one, which is
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Supersession" read backwards. The later ticket is taken on this thread, so it can
+    /// only ever record itself after the earlier body has recorded and released; an
+    /// implementation that did not wait would record the later one first.
+    #[test]
+    fn a_dispatch_body_waits_for_every_earlier_reserved_generation() {
+        let turnstile = Arc::new(DispatchTurnstile::default());
+        let earlier = turnstile.reserve();
+        let later = turnstile.reserve();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let earlier_body = thread::spawn({
+            let turnstile = Arc::clone(&turnstile);
+            let order = Arc::clone(&order);
+            move || {
+                let _turn = turnstile.take(earlier);
+                order.lock().unwrap().push(earlier);
+            }
+        });
+
+        {
+            let _turn = turnstile.take(later);
+            order.lock().unwrap().push(later);
+        }
+        earlier_body
+            .join()
+            .expect("the earlier body should not panic");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![earlier, later],
+            "a dispatch body must run in the order its Generation was reserved"
+        );
     }
 
     /// The generic cancellation primitive stops a loop the instant `cancel` is
@@ -8397,7 +8990,7 @@ mod tests {
         )
         .expect("write HEAD");
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: repo.clone(),
@@ -8440,7 +9033,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: repo.clone(),
@@ -8475,7 +9068,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8514,7 +9107,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8548,7 +9141,7 @@ mod tests {
         let sha = head_sha(&repo);
         git(&repo, &["update-ref", "refs/remotes/origin/feature", &sha]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8571,7 +9164,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8620,7 +9213,7 @@ mod tests {
         )
         .expect("write HEAD");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8674,7 +9267,7 @@ mod tests {
         )
         .expect("write HEAD");
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
@@ -8706,7 +9299,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: parent.clone(),
@@ -8762,7 +9355,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![
                 RepoOverride {
@@ -8818,7 +9411,7 @@ mod tests {
         .expect("write .gitmodules");
         fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: parent.clone(),
@@ -8878,7 +9471,7 @@ mod tests {
         let other_repo = root.join("other");
         init_repo_with_a_commit(&other_repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -9034,7 +9627,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let keys: Vec<EntityKey> = core
             .snapshot()
             .entities
@@ -9201,7 +9794,7 @@ mod tests {
             );
         }
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let deep_key = snapshot
             .entities
@@ -9489,7 +10082,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.snapshot();
         let worktree_key = snapshot
             .entities
@@ -9605,7 +10198,7 @@ mod tests {
         set_upstream(&repo, "main", &fork_sha);
         git(&repo, &["commit", "--allow-empty", "-m", "local work"]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &repo) {
@@ -9636,7 +10229,7 @@ mod tests {
         add_origin_remote(&repo);
         set_upstream(&repo, "main", &upstream_sha);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &repo) {
@@ -9663,7 +10256,7 @@ mod tests {
         add_origin_remote(&repo);
         set_upstream(&repo, "main", &sha);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &repo) {
@@ -9691,7 +10284,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
         add_origin_remote(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &repo) {
@@ -9717,7 +10310,7 @@ mod tests {
         git(&repo, &["checkout", "--detach", &first_sha]);
         add_origin_remote(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &repo) {
@@ -9752,7 +10345,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         assert_eq!(
@@ -9825,7 +10418,7 @@ mod tests {
         git(&behind_worktree, &["reset", "--hard", "HEAD~1"]);
         set_upstream(&parent, "feature-behind", &ahead_of_behind_sha);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let settled = refresh_and_settle(&core);
 
         match sync_of(&settled, &ahead_worktree) {
@@ -9869,7 +10462,7 @@ mod tests {
         add_origin_remote(&repo);
         set_upstream(&repo, "main", &fork_sha);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let first = refresh_and_settle(&core);
         match sync_of(&first, &repo) {
             Some(Settled::Known {
@@ -9977,7 +10570,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = refresh_and_settle(&core);
 
         let base_of = |name: &str| -> u32 {
@@ -10066,7 +10659,8 @@ mod tests {
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 fetch_ticks,
-            );
+            )
+            .discovered();
             let core = started.core;
 
             wait_for(
@@ -10091,7 +10685,8 @@ mod tests {
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 fetch_tick_rx,
-            );
+            )
+            .discovered();
             let core = started.core;
 
             wait_for("the immediate cycle to have run first", || {
@@ -10176,7 +10771,8 @@ mod tests {
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 fetch_ticks,
-            );
+            )
+            .discovered();
             let core = started.core;
 
             wait_for_or(
@@ -10260,7 +10856,8 @@ mod tests {
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 fetch_ticks,
-            );
+            )
+            .discovered();
             let core = started.core;
 
             wait_for(
@@ -10298,7 +10895,8 @@ mod tests {
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 fetch_ticks,
-            );
+            )
+            .discovered();
             // Kept alive, unused otherwise: dropping `Core` joins its dedicated thread,
             // which would stop the immediate cycle this test is waiting on.
             let _core = started.core;
@@ -10395,7 +10993,7 @@ mod tests {
             git(remote.path(), &["branch", "trunk"]);
             set_remote_head(remote.path(), "trunk");
 
-            let core = Core::start(spec(vec![root_path]));
+            let core = Core::start_discovered(spec(vec![root_path]));
             let key = core.snapshot().entities[0].key.clone();
 
             core.refresh(std::slice::from_ref(&key));
@@ -10441,7 +11039,7 @@ mod tests {
             set_remote_head(remote.path(), "trunk");
             let before_tracking = rev_parse(&selected_path, "refs/remotes/origin/main");
 
-            let core = Core::start(spec(vec![root_path]));
+            let core = Core::start_discovered(spec(vec![root_path]));
             let snapshot = core.snapshot();
             let selected_key = snapshot
                 .entities
@@ -10520,7 +11118,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let snapshot = core.settle(Duration::from_secs(10));
         let key = snapshot.entities[0].key.clone();
         let generation_before = snapshot.generation;
@@ -10561,7 +11159,7 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start(spec_with_overrides(
+        let core = Core::start_discovered(spec_with_overrides(
             vec![root],
             vec![RepoOverride {
                 path: repo.clone(),
@@ -10594,7 +11192,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
         crate::test_support::git(&repo, &["branch", "trunk"]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
         let before = format!(
@@ -10635,7 +11233,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("repo-a"));
         init_repo_with_a_commit(&root.join("repo-b"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let entities = core.settle(Duration::from_secs(10)).entities;
         let named = entities
             .iter()
@@ -10689,7 +11287,7 @@ mod tests {
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("repo-a"));
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let entities = core.settle(Duration::from_secs(10)).entities;
         let stranger = EntityKey::new(Arc::from(std::path::Path::new("/nowhere/at/all")));
 
@@ -10728,7 +11326,7 @@ mod tests {
             &["worktree", "add", "-b", "sidecar", "../sidecar-worktree"],
         );
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         // Settled first, so the startup Generation's own phase C is no longer reading this
         // same repository while the line below reads it: two concurrent gix statuses over one
         // working tree is a race in the harness, not in `delete_risk`.
@@ -10782,7 +11380,7 @@ mod tests {
                 other => unreachable!("unhandled kind {other}"),
             }
 
-            let core = Core::start(spec(vec![root]));
+            let core = Core::start_discovered(spec(vec![root]));
             let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
 
             let risk = core.delete_risk(&key).expect("read the risk");
@@ -10811,7 +11409,7 @@ mod tests {
         fs::write(repo.join("staged.txt"), "staged\n").expect("write a new file");
         crate::test_support::git(&repo, &["add", "staged.txt"]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
 
         let opened = git::open_thread_safe(repo.as_path())
@@ -10850,7 +11448,7 @@ mod tests {
         }
         crate::test_support::git(&repo, &["checkout", "."]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
 
         let risk = core.delete_risk(&key).expect("read the risk");
@@ -10884,7 +11482,7 @@ mod tests {
         );
 
         // Bounded by `inside` alone, so the Worktree is not a row in this Core's own table.
-        let core = Core::start(spec(vec![inside]));
+        let core = Core::start_discovered(spec(vec![inside]));
         let snapshot = core.settle(Duration::from_secs(10));
         assert!(
             snapshot
@@ -10922,7 +11520,7 @@ mod tests {
         let sha = crate::test_support::head_sha(&repo);
         crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
 
-        let core = Core::start(spec(vec![root]));
+        let core = Core::start_discovered(spec(vec![root]));
         let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
 
         let risk = core.delete_risk(&key).expect("read the risk");

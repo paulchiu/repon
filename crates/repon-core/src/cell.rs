@@ -22,6 +22,12 @@ impl Generation {
     pub(crate) fn new(value: u64) -> Self {
         Generation(value)
     }
+
+    /// The raw counter this wraps, for the one place that keys by it: the table's
+    /// own per-Generation start times and in-flight records.
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// A wall-clock moment, RFC 3339 on request via [`std::fmt::Display`].

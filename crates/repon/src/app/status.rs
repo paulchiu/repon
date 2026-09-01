@@ -64,13 +64,9 @@ fn settle_document(
         &active_set,
         flag_no_fetch,
     ));
-    let keys: Vec<_> = core
-        .snapshot()
-        .entities
-        .iter()
-        .map(|entity| entity.key.clone())
-        .collect();
-    core.refresh(&keys);
+    // Everything discovery finds, rather than this instant's keys: `Core::start` returns
+    // before its own discovery has landed, so there are none to name yet.
+    core.refresh_all();
     let snapshot = core.settle(reload::GENERATION_DEADLINE + SETTLE_DEADLINE_SLACK);
 
     let any_failed = any_probe_failed(&snapshot);
@@ -247,7 +243,7 @@ mod tests {
         git(&root, &["add", "staged.txt"]);
         fs::write(root.join("untracked.txt"), "untracked\n").expect("write file");
 
-        let core = Core::start(repon_core::CoreSpec {
+        let core = Core::start_discovered(repon_core::CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -320,7 +316,7 @@ mod tests {
         )
         .expect("corrupt HEAD");
 
-        let core = Core::start(repon_core::CoreSpec {
+        let core = Core::start_discovered(repon_core::CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],

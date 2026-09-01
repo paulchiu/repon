@@ -117,7 +117,10 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
     init_repo_with_a_commit(&probed);
 
     let core = Core::start(spec(vec![root.clone()]));
-    let snapshot = core.snapshot();
+    // `Core::start` returns before its own discovery has finished, so the table is
+    // empty until it lands; `settle` is what waits for it. Ten seconds is the same
+    // loose backstop against a hang the settle below carries, not a margin.
+    let snapshot = core.settle(Duration::from_secs(10));
     let key_of = |path: &Path| {
         snapshot
             .entities
