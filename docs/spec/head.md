@@ -58,7 +58,7 @@ Merged needs a commit and a default branch, not a branch name, so it stays prova
 
 Measured: 2 of the 125 detached entities are ancestors of the default branch, and a further 53 are patch-equivalent to a commit on it, so 55 of 125 read Merged. Across the whole list that takes the `state` column from 42 to 96 of 403 rows carrying a value, and makes 54 of 163 Worktrees read Merged.
 
-The Submodule row is the exception, and it states its own reason: [discovery.md](discovery.md) keeps `state` and `base` Not applicable there, not because a Submodule is detached but because [default-branch.md](default-branch.md) records that population's default branch as known-wrong with no local detector, so a proof computed against it would be a confident lie. The rule is "no trustworthy default branch, so no proof", and it survives this spec unchanged.
+The Submodule row is the exception, and it states its own reason: [discovery.md](discovery.md) keeps `state` and `base` blank there too, not because a Submodule is detached but because [default-branch.md](default-branch.md) records that population's default branch as known-wrong with no local detector, so a proof computed against it would be a confident lie. The rule is "no trustworthy default branch, so no proof", and it survives this spec unchanged. What changed is the variant carrying it: a question with no meaning on the row is `NotApplicable`, but this is a question that applies and has no answer Repon can stand behind, which is `Unknown` instead. `state` and `base` move together rather than settling on different variants for the one reason ([ADR 0017](../adr/0017-discovery-stops-at-the-repo-boundary.md)'s "Amended by #173"). The consequence lands in the gutter, not the cell: `Unknown` still renders blank exactly like `NotApplicable` did, but it folds into the row summary instead of being excluded from it, so with the periodic fetch off (the default) a Submodule row now carries `?` where it carried a space, a cost 0017 accepts for the 16 of 403 entities hidden by default.
 
 ## The branch cell
 
@@ -72,7 +72,7 @@ The abbreviation is nine characters, fixed, rather than git's own. `core.abbrev 
 
 ## The gutter
 
-A detached row whose `state` is Not applicable folds to Fresh, because Not applicable cells are excluded from the fold, so the gutter renders a space. That is accepted rather than worked around: a Repo row already does exactly this on 240 rows, since its `state` is Not applicable by kind. The gutter summarises provenance, not completeness. Marking these rows `?` instead would put an unknown mark on 125 of 403 rows for a settled fact.
+A detached row whose `state` is Not applicable folds to Fresh, because Not applicable cells are excluded from the fold, so the gutter renders a space. That is accepted rather than worked around: a Repo row already does exactly this on 240 rows, since its `state` is Not applicable by kind. The gutter summarises provenance, not completeness. Marking these rows `?` instead would put an unknown mark on 125 of 403 rows for a settled fact. The Submodule row is a different population answering a different question: its `state` is a settled fact nowhere here, it is `Unknown`, so it earns the `?` this section refuses the other 125 rows, exactly because the two are not the same claim.
 
 ## In-progress operations
 
