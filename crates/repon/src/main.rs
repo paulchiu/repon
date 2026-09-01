@@ -33,6 +33,7 @@ mod scroll;
 mod selection;
 mod set_picker;
 mod sets;
+mod sort;
 mod state;
 mod status_row;
 #[cfg(test)]

@@ -11,6 +11,7 @@ use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use crate::{
     degrade::{self, Priority},
     keys::{Action, BindingTable, Context},
+    sort::SortColumn,
     theme::{Role, Theme},
 };
 
@@ -232,6 +233,44 @@ fn filter_items(table: &BindingTable) -> Vec<Item> {
     ]
 }
 
+/// The sort menu's own footer
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): the six column keys
+/// in the order the table draws the columns, then the way back to the natural order and the
+/// way out. The column hints are given up right to left, which is the order the table's own
+/// columns are clipped off a narrowing frame, so the footer stops teaching a sort for a
+/// column that is no longer on screen before it stops teaching one that is. `0 natural`
+/// outlasts every column key, since it is the way back out of a sort, and `esc cancel` is
+/// pinned.
+fn sort_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
+    let columns = SortColumn::ALL;
+    let mut items: Vec<Item> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            item(
+                hint_item(table, Context::Sort, column.action(), column.label()),
+                // Right to left: the rightmost column key is given up first, and `name`, the
+                // one column the table never clips, is the last one to go.
+                Priority::Drop((columns.len() - index) as u8),
+            )
+        })
+        .collect();
+    items.push(item(
+        hint_item(table, Context::Sort, Action::SortNatural, "natural"),
+        Priority::Drop((columns.len() + 1) as u8),
+    ));
+    items.push(item(
+        hint_item(table, Context::Sort, Action::CloseSortMenu, "cancel"),
+        Priority::Pinned,
+    ));
+    items
+}
+
 /// The ASCII ellipsis [keybindings.md](../../../../docs/spec/keybindings.md#the-footer) rule
 /// 1 fixes: a space then three dots, never unicode's `…`, because `unicode-width` scores
 /// that as 2 under `width_cjk` while every other footer glyph scores 1.
@@ -304,6 +343,7 @@ fn footer_line(table: &BindingTable, context: Context, width: u16) -> FooterLine
         Context::Detail => detail_items(table),
         Context::Confirm => confirm_items(table),
         Context::Input => filter_items(table),
+        Context::Sort => sort_items(table),
         Context::Global | Context::Overlay => {
             panic!("no footer content is defined yet for {context:?}")
         }
@@ -662,6 +702,39 @@ mod tests {
                 row.expected,
                 "detail footer mismatch at width {}",
                 row.width
+            );
+        }
+    }
+
+    #[test]
+    fn sort_footer_matches_the_documented_degradation_table_at_every_named_width() {
+        let spec = read_spec();
+        let rows = parse_degradation_table(
+            &spec,
+            "The sort context's footer is 73 columns at full width",
+        );
+        assert!(!rows.is_empty(), "expected at least one documented width");
+        let table = default_table();
+        for row in rows {
+            assert_eq!(
+                budget(&sort_items(&table), row.width as usize).to_string(),
+                row.expected,
+                "sort footer mismatch at width {}",
+                row.width
+            );
+        }
+    }
+
+    /// The menu is useless without a way out, so `esc cancel` is the one hint that survives
+    /// every width the footer renders anything at all in.
+    #[test]
+    fn the_sort_footers_way_out_is_the_last_hint_to_go() {
+        let table = default_table();
+        for width in 10..=80u16 {
+            let rendered = render(&table, Context::Sort, width);
+            assert!(
+                rendered.contains("esc cancel"),
+                "width {width} drew {rendered:?} with no way out of the menu"
             );
         }
     }

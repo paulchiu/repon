@@ -37,10 +37,11 @@ Priority, after the indicator is reserved:
 | 1 | the active Set's name and the entity count | [config.md](config.md), [core-api.md](core-api.md) |
 | 2 | the most severe warning's message, plus `(+N more, w to expand)` while more stand | [theming.md](theming.md) |
 | 3 | the current Refresh's own state | [refresh.md](refresh.md) |
-| 4 | run progress | [actions.md](actions.md) |
-| 5 | the Filter's match count | [filter.md](filter.md) |
-| 6 | the worktrees note | [config.md](config.md) |
-| 7 | timing | [actions.md](actions.md) |
+| 4 | the sort, while the table is in one | [0030](../adr/0030-the-table-has-an-order-the-user-chooses.md) |
+| 5 | run progress | [actions.md](actions.md) |
+| 6 | the Filter's match count | [filter.md](filter.md) |
+| 7 | the worktrees note | [config.md](config.md) |
+| 8 | timing | [actions.md](actions.md) |
 
 The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
 
@@ -49,6 +50,8 @@ Rank 3 answers "did my keypress land" for the refresh key alone (`r`, `F5`, `R`,
 Vanished entities are the mirror of an abandoned discovery and stand as a warning for the same reason ([#171](https://github.com/paulchiu/repon/issues/171)): rows are present that no longer exist, and their values are frozen. This is also what makes a Vanished row discoverable at all, which the gutter structurally cannot do, since a mark on a row does not tell a user the row is there. The condition announces itself here, `presence:vanished` is the way in, and `d` is the way out.
 
 Rank 1 names the **active Set**, where the program's own name used to sit: `work 403 entities`, and `all 403 entities` running zero-config. A Set bounds the work rather than the view ([config.md](config.md)), so the count is the size of what the Set bounds and the two are one item rather than two, which is also what stops a count surviving on a row its own name has dropped from. The name is never truncated: the item renders whole or drops whole, because a Set name is user-supplied, two Sets can share a prefix, and a cut name reads exactly like a name ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)). There is no tab strip. `s` and `Tab` open the Set picker, numbered in file order, and [keybindings.md](keybindings.md) carries it along with what a switch says.
+
+Rank 4 is the **sort**: `sort dirty ↓`, the sorted column's own header text and the same arrow that column's header carries. It is absent in the natural grouped order, which is the absence of a sort rather than a sort by discovery, so a session that has never opened the sort menu spends no columns on it. It is text here and a glyph there for one reason: the sorted column can be off screen, clipped off a narrow frame or hidden behind the detail pane, and an order nothing on the row names is an order the user cannot check. It ranks above run progress, which is a fact about a fan-out rather than about the table, and below rank 3 for the one reason that separates the two: a Refresh's state has no other surface on the screen at all, where a sort still has its own arrow on the sorted column's header at every width that column survives. This row is the sort's second witness and the Refresh's only one. Session state, never persisted ([0030](../adr/0030-the-table-has-an-order-the-user-chooses.md)).
 
 `w` **acknowledges**. Opening the expanded list marks every currently outstanding condition seen, and the row falls back to the indicator alone, freeing the message's columns for the items below it. A condition arriving that has not been seen expands the row again. Acknowledgement is not dismissal: the indicator keeps its full count either way, and a condition leaves the row only by ceasing to be true. It is session state and never persists ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)).
 
@@ -91,6 +94,18 @@ Everything a frame leaves past those 92 columns is one slack pool, and `name` an
 The order is measured rather than a matter of taste, over a read-only sweep of 527 entities under two roots (195 Repos and 332 Worktrees, 280 of them carrying a branch rather than a detached HEAD). Names are unimodal and short: 15 of 527 exceed 28 columns, none exceeds 40, so twelve columns above the minimum takes every name in the population whole. Branch names are bimodal: 175 of 280 are `main`, and the rest cluster at 70 to 75 columns, agent and ticket branches like `feature/rr-213-loyalty-integrations-document-which-toggle-burn-counters`, so `branch` buys almost nothing until it is nearly fifty columns above its own minimum. Counting truncated cells over that population at frame widths from 100 to 300, filling `name` first is never worse than an even split or a split proportional to the minimums, and beats all of them on a narrow frame: at 100 columns it truncates 86 cells where an even split truncates 92, because the three columns an even split hands `branch` there buy zero whole branch names while costing six whole repo names. Filling `branch` first is the only rule that loses badly: it holds `name` at 28 until the pool passes 51 columns, so it truncates all 15 long names on every frame narrower than 146, which costs it 13 cells at 100 and 10 at 120 and gains it exactly one at 140. The caps are that population's own maxima, 40 and 75, so a frame with 155 columns of interior truncates nothing it measured.
 
 Rows are ordered by parent: each Repo is followed immediately by its own Worktrees and Submodules, the Repos keep the order discovery returned them in, and so do the children within one parent's group. Discovery returns one flat list with nothing recording which half produced a given entry ([discovery.md](discovery.md)), so the grouping is the consumer's to impose. A child whose parent is absent from the list is appended after every group rather than dropped, so a row can never vanish because its parent did.
+
+### The order the user chooses
+
+That parent grouping is the table's **natural order** and what a session opens on. `o` opens a sort menu over it, and one column key puts the table in that column's order; [0030](../adr/0030-the-table-has-an-order-the-user-chooses.md) settles the model and [keybindings.md](keybindings.md#sort) the keys. Grouping is not a thing a sort can undo: a sort reorders the Repos among themselves and each Repo's own Worktrees and Submodules within that Repo, and a child never leaves its parent, whichever column and direction are in force. A child whose parent is absent still trails every group, exactly as it does unsorted.
+
+Each column opens at its own natural direction the first time it is chosen, and the same key again reverses it. One rule fixes all six: **`name` and `branch` open ascending, A to Z, and the four columns that count trouble, `sync`, `base`, `dirty` and `state`, open descending, because the reason to sort by a count of trouble is to bring the worst rows to the top.** `sync` and `state` have no count to rank by directly, so [0030](../adr/0030-the-table-has-an-order-the-user-chooses.md) writes their orders out. A column chosen while another one is active opens at its own natural direction and never inherits the previous column's.
+
+The sorted column's header carries an arrow, `↑` ascending or `↓` descending (`^` and `v` under `ascii`, [theming.md](theming.md)'s "The two sets"), and no other header carries a glyph at all. The arrow is appended to the header text with no space before it, `dirty↓` rather than `dirty ↓`, because `base` and `dirty` are six columns wide and a space would cost exactly those two columns their arrow. The status row says the same thing in words, so a sort survives a frame too narrow to show the column it names.
+
+A cell that has settled no value sorts last in both directions: Unknown, Failed, Not applicable and a cell nothing has probed yet alike. This is [0001](../adr/0001-per-cell-provenance.md)'s three-valued provenance reaching the order. An unknown value is not a low value, and reversing the direction must not turn it into a high one, so the direction reverses the value and never the absence.
+
+Rows a column cannot separate keep the order they came in, which is discovery's own.
 
 `sync` compares a branch against its upstream and `base` compares it against the Repo's default branch. They are different measurements, they coincide only on the default branch's own row, and they are separate provenance cells because they fail independently. `base` is specified in [default-branch.md](default-branch.md).
 

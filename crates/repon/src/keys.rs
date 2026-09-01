@@ -6,9 +6,9 @@
 use color_eyre::eyre::{Result, eyre};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// The six named contexts [keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)
+/// The seven named contexts [keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)
 /// fixes. `Global` is live only while `List` or `Detail` has focus;
-/// [`BindingTable::dispatch`] suspends it entirely for the other three.
+/// [`BindingTable::dispatch`] suspends it entirely for the other four.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Context {
     Global,
@@ -17,6 +17,11 @@ pub(crate) enum Context {
     Input,
     Overlay,
     Confirm,
+    /// The sort menu, open over the table and waiting on one column key. Its own context so
+    /// the column keys are never `Global` rows: a letter meaning "sort by name" inside the
+    /// menu must not reorder the table from underneath the list when pressed outside it
+    /// ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+    Sort,
 }
 
 /// What a key press means, independent of how it is bound. One variant per distinct
@@ -38,6 +43,7 @@ pub(crate) enum Action {
     RederiveDefaultBranches,
     ExpandWarning,
     OpenSetPicker,
+    OpenSortMenu,
     /// `1` to `9`: which Set to switch to.
     SwitchToSet(u8),
     ReloadConfig,
@@ -95,6 +101,16 @@ pub(crate) enum Action {
     // confirm
     Run,
     Decline,
+
+    // sort (the menu's own column keys, bound in `Context::Sort` and nowhere else)
+    SortByName,
+    SortByBranch,
+    SortBySync,
+    SortByBase,
+    SortByDirty,
+    SortByState,
+    SortNatural,
+    CloseSortMenu,
 }
 
 /// One row of the compiled table: a context, the chord that fires in it, the action it
@@ -157,6 +173,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::RederiveDefaultBranches => "Re-derive default branches over the Selection",
         Action::ExpandWarning => "Expand the warning slot",
         Action::OpenSetPicker => "Open the Set picker",
+        Action::OpenSortMenu => "Open the sort menu",
         Action::SwitchToSet(_) => "Switch to the Nth declared Set",
         Action::ReloadConfig => "Reload config",
         Action::EditConfig => "Edit config.toml in `$EDITOR`",
@@ -200,6 +217,14 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::Search => "Search",
         Action::Run => "Run",
         Action::Decline => "Decline",
+        Action::SortByName => "Sort by name",
+        Action::SortByBranch => "Sort by branch",
+        Action::SortBySync => "Sort by sync",
+        Action::SortByBase => "Sort by base",
+        Action::SortByDirty => "Sort by dirty",
+        Action::SortByState => "Sort by state",
+        Action::SortNatural => "Restore the natural grouped order",
+        Action::CloseSortMenu => "Close the sort menu without reordering",
     }
 }
 
@@ -351,6 +376,12 @@ const BINDINGS: &[Binding] = &[
         Action::OpenSetPicker,
     ),
     binding(Context::Global, KeyCode::Tab, NONE, Action::OpenSetPicker),
+    binding(
+        Context::Global,
+        KeyCode::Char('o'),
+        NONE,
+        Action::OpenSortMenu,
+    ),
     binding(
         Context::Global,
         KeyCode::Char('1'),
@@ -566,6 +597,28 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Confirm, KeyCode::Char('y'), NONE, Action::Run),
     binding(Context::Confirm, KeyCode::Char('n'), NONE, Action::Decline),
     binding(Context::Confirm, KeyCode::Esc, NONE, Action::Decline),
+    // sort (every other key is `dispatch`'s fallback of "nothing happens", not a row here).
+    // These six letters are rows of this context and of no other, which is what lets `b`,
+    // `s`, `n`, `d` and `a` keep every meaning they already have everywhere else.
+    binding(Context::Sort, KeyCode::Char('n'), NONE, Action::SortByName),
+    binding(
+        Context::Sort,
+        KeyCode::Char('b'),
+        NONE,
+        Action::SortByBranch,
+    ),
+    binding(Context::Sort, KeyCode::Char('s'), NONE, Action::SortBySync),
+    binding(Context::Sort, KeyCode::Char('a'), NONE, Action::SortByBase),
+    binding(Context::Sort, KeyCode::Char('d'), NONE, Action::SortByDirty),
+    binding(Context::Sort, KeyCode::Char('t'), NONE, Action::SortByState),
+    binding(Context::Sort, KeyCode::Char('0'), NONE, Action::SortNatural),
+    binding(Context::Sort, KeyCode::Esc, NONE, Action::CloseSortMenu),
+    binding(
+        Context::Sort,
+        KeyCode::Char('o'),
+        NONE,
+        Action::CloseSortMenu,
+    ),
 ];
 
 /// `const fn` equality for the one shape [`PERMANENTLY_UNBINDABLE`] ever names, a `Char`; a
@@ -701,7 +754,9 @@ impl BindingTable {
             Context::Input => {
                 lookup(&self.0, Context::Input, key).or_else(|| printable(key).map(Action::Text))
             }
-            Context::Global | Context::Overlay | Context::Confirm => lookup(&self.0, context, key),
+            Context::Global | Context::Overlay | Context::Confirm | Context::Sort => {
+                lookup(&self.0, context, key)
+            }
         }
     }
 
@@ -829,6 +884,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::RederiveDefaultBranches => "rederive_default_branches",
         Action::ExpandWarning => "expand_warning",
         Action::OpenSetPicker => "open_set_picker",
+        Action::OpenSortMenu => "open_sort_menu",
         Action::SwitchToSet(_) => return None,
         Action::ReloadConfig => "reload_config",
         Action::EditConfig => "edit_config",
@@ -869,6 +925,14 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::Search => "search",
         Action::Run => "run",
         Action::Decline => "decline",
+        Action::SortByName => "sort_by_name",
+        Action::SortByBranch => "sort_by_branch",
+        Action::SortBySync => "sort_by_sync",
+        Action::SortByBase => "sort_by_base",
+        Action::SortByDirty => "sort_by_dirty",
+        Action::SortByState => "sort_by_state",
+        Action::SortNatural => "sort_natural",
+        Action::CloseSortMenu => "close_sort_menu",
     })
 }
 
@@ -903,6 +967,7 @@ fn context_name(context: Context) -> &'static str {
         Context::Input => "input",
         Context::Overlay => "overlay",
         Context::Confirm => "confirm",
+        Context::Sort => "sort",
     }
 }
 
@@ -916,6 +981,7 @@ fn parse_context_name(name: &str) -> Option<Context> {
         "input" => Some(Context::Input),
         "overlay" => Some(Context::Overlay),
         "confirm" => Some(Context::Confirm),
+        "sort" => Some(Context::Sort),
         _ => None,
     }
 }
@@ -985,7 +1051,7 @@ fn function_key(base: &str) -> Option<KeyCode> {
 /// document-level field name has no business growing variants for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeysWarning {
-    /// A `[keys.<name>]` table whose `<name>` is not one of the six contexts.
+    /// A `[keys.<name>]` table whose `<name>` is not one of the seven contexts.
     UnknownContext(String),
     /// A key inside a known `[keys.<context>]` table that names no action of that context's.
     UnknownAction { context: String, action: String },
@@ -1799,6 +1865,7 @@ mod tests {
                     "input" => "input",
                     "overlay" => "overlay",
                     "confirm" => "confirm",
+                    "sort" => "sort",
                     other => panic!("unrecognised context heading in the spec: {other:?}"),
                 });
                 continue;
@@ -2251,7 +2318,7 @@ mod tests {
     // --- context_name / parse_context_name ---
 
     #[test]
-    fn parse_context_name_is_the_inverse_of_context_name_for_all_six_contexts() {
+    fn parse_context_name_is_the_inverse_of_context_name_for_all_seven_contexts() {
         for context in [
             Context::Global,
             Context::List,
@@ -2259,13 +2326,14 @@ mod tests {
             Context::Input,
             Context::Overlay,
             Context::Confirm,
+            Context::Sort,
         ] {
             assert_eq!(parse_context_name(context_name(context)), Some(context));
         }
     }
 
     #[test]
-    fn parse_context_name_rejects_anything_not_one_of_the_six() {
+    fn parse_context_name_rejects_anything_not_one_of_the_seven() {
         assert_eq!(parse_context_name("frobnicate"), None);
     }
 

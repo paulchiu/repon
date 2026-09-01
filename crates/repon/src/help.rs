@@ -127,7 +127,7 @@ fn meaning_text(meaning: Meaning) -> &'static str {
 }
 
 /// The current-context section's own heading text
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts) names the six
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts) names the seven
 /// contexts this matches). No `_` arm: a context added to [`Context`] fails to compile here
 /// until this overlay says what its own section is called, rather than falling back to
 /// something generic no reader asked for.
@@ -139,6 +139,7 @@ fn context_heading(context: Context) -> &'static str {
         Context::Input => "Input",
         Context::Overlay => "Overlay",
         Context::Confirm => "Confirm",
+        Context::Sort => "Sort",
     }
 }
 
@@ -824,10 +825,10 @@ mod tests {
     /// Pinned to [theming.md](../../../../docs/spec/theming.md)'s own "The two sets" table,
     /// read at test time rather than restated: every meaning that table names must appear in
     /// the legend with exactly its own wording, and the legend must name nothing the table
-    /// does not. `border`/`panel border` and `capture elision` are the table's own two rows
-    /// outside the row interior ([`crate::glyphs`]'s own module doc: they are declared
-    /// outside the `glyph_set!` macro and carry no `Meaning`), excluded here on the same
-    /// terms.
+    /// does not. `panel border`, `capture elision` and the header's own `sort arrow` are the
+    /// table's rows outside the row interior ([`crate::glyphs`]'s own module doc: they are
+    /// declared outside the `glyph_set!` macro and carry no `Meaning`), excluded here on the
+    /// same terms.
     #[test]
     fn glyph_legend_prose_matches_theming_mds_own_two_sets_table() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -860,7 +861,12 @@ mod tests {
                     .trim_matches('`')
                     .to_string()
             })
-            .filter(|meaning| meaning != "panel border" && meaning != "capture elision")
+            .filter(|meaning| {
+                !matches!(
+                    meaning.as_str(),
+                    "panel border" | "capture elision" | "sort arrow (ascending, descending)"
+                )
+            })
             .collect();
 
         let legend_meanings: Vec<&'static str> =

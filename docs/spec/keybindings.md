@@ -4,7 +4,7 @@ The map is context-sensitive per pane, after lazygit: a key means what the focus
 
 ## The contexts
 
-Six named contexts. `global` is live in `list` and `detail` only, and is suspended entirely in the other four.
+Seven named contexts. `global` is live in `list` and `detail` only, and is suspended entirely in the other five.
 
 | context | what it is |
 | --- | --- |
@@ -14,8 +14,11 @@ Six named contexts. `global` is live in `list` and `detail` only, and is suspend
 | `input` | The Filter line, the Launcher palette, the Action palette, and the ad hoc command field |
 | `overlay` | The help overlay, the expanded warning list, and the Set picker |
 | `confirm` | The yes/no gate before an Action fans out |
+| `sort` | The sort menu, open over the table and waiting on one column key |
 
 An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
+
+`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every visible row. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those five letters keep every meaning they already have.
 
 ## The default map
 
@@ -36,6 +39,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
 | `s`, `Tab` | Open the Set picker |
+| `o` | Open the sort menu |
 | `1` to `9` | Switch to the Nth declared Set |
 | `Ctrl+R` | Reload config |
 | `e` | Edit config.toml in `$EDITOR` |
@@ -114,6 +118,23 @@ out of their own key handler, so it does nothing for either.
 | `y` | Run |
 | `n`, `Esc` | Decline |
 | every other key | Ignored |
+
+### sort
+
+The sort menu swallows every key it does not bind, `q` included: it is one keypress deep and
+`Esc` is always the way out. Every key below closes it, and only a column key or `0` changes
+the order.
+
+| key | action |
+| --- | --- |
+| `n` | Sort by name |
+| `b` | Sort by branch |
+| `s` | Sort by sync |
+| `a` | Sort by base |
+| `d` | Sort by dirty |
+| `t` | Sort by state |
+| `0` | Restore the natural grouped order |
+| `Esc`, `o` | Close the sort menu without reordering |
 
 ## Built and available
 
@@ -230,7 +251,23 @@ The detail context's footer is 61 columns at full width and follows the same rul
   6  ? help
 ```
 
+The sort context's footer is 73 columns at full width. Its column hints are given up right to left, the order the table's own columns are clipped off a narrowing frame, so the footer stops teaching a sort for a column that has already gone off screen before it stops teaching one still on it. `0 natural`, the way back out of a sort, outlasts every column key, and `esc cancel` is pinned. It degrades like this:
+
+```
+ 73  n name  b branch  s sync  a base  d dirty  t state  0 natural  esc cancel
+ 68  n name  b branch  s sync  a base  d dirty  0 natural  esc cancel ...
+ 59  n name  b branch  s sync  a base  0 natural  esc cancel ...
+ 51  n name  b branch  s sync  0 natural  esc cancel ...
+ 43  n name  b branch  0 natural  esc cancel ...
+ 33  n name  0 natural  esc cancel ...
+ 25  0 natural  esc cancel ...
+ 14  esc cancel ...
+ 10  esc cancel
+```
+
 The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+
+`o` itself is not in the list or detail footer. Both are already at their documented full widths with no room for a ninth hint, and `o` is a `global` binding, so the help overlay already lists it in its `global` section wherever it is open from. The column keys are taught by the menu's own footer at the one moment they mean anything.
 
 ## The help overlay
 

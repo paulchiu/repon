@@ -87,6 +87,12 @@ macro_rules! glyph_set {
             /// Loading: in the gutter while a row holds no values, in a cell once some do
             /// ([ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)).
             pub loading: &'static [char],
+            /// The arrow the sorted column's header carries and the status row's own sort
+            /// label repeats. Outside the row interior, so exempt from the disjointness
+            /// obligation this macro's own fields carry, the same way `border` and
+            /// `capture_elision` below are.
+            pub sort_ascending: char,
+            pub sort_descending: char,
             pub border: Border,
             pub capture_elision: &'static str,
         }
@@ -140,6 +146,7 @@ macro_rules! glyph_set {
                 let mut glyphs: Vec<char> =
                     self.row_interior().into_iter().map(|(_, c)| c).collect();
                 glyphs.extend(self.border.chars());
+                glyphs.extend([self.sort_ascending, self.sort_descending]);
                 glyphs.extend(self.capture_elision.chars());
                 glyphs
             }
@@ -224,6 +231,12 @@ pub const FULL: GlyphSet = GlyphSet {
     // `less(1)` and GNU `nano`, which both mark a line continuing past the visible width
     // with `$` at the boundary.
     truncated: '$',
+    // The same two arrows this table already draws for ahead and behind, permitted on the
+    // same terms the border's own characters are: the header row and the status row sit
+    // outside the row interior the disjointness rule covers, and a header arrow is read
+    // against a column label rather than decoded as a value inside a row.
+    sort_ascending: '\u{2191}',
+    sort_descending: '\u{2193}',
     border: Border {
         top_left: '╭',
         top_right: '╮',
@@ -266,6 +279,11 @@ pub const ASCII: GlyphSet = GlyphSet {
     // one truncation mark, unchanged by which table is live, rather than a second ascii-only
     // choice. Distinct from every other glyph in this table.
     truncated: '$',
+    // `^` and `v`, the ascii pair no other glyph in this table claims: `>` and `<` are
+    // already ahead and behind here, and reusing them for the header would put a value
+    // glyph in a label's place.
+    sort_ascending: '^',
+    sort_descending: 'v',
     border: Border {
         top_left: '+',
         top_right: '+',
@@ -965,6 +983,54 @@ mod tests {
                 "the {label} table's frame disagrees with theming.md's panel border row"
             );
         }
+    }
+
+    /// Reads `docs/spec/theming.md`'s own "sort arrow" row at test time and compares both
+    /// cells against both tables, the same way the panel border row above is compared, so
+    /// the header's own arrows can never drift from the design of record.
+    #[test]
+    fn both_tables_sort_arrows_match_theming_mds_own_sort_arrow_row() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let row = spec
+            .lines()
+            .find(|line| line.trim_start().starts_with("| sort arrow"))
+            .expect("theming.md's \"The two sets\" table names a `sort arrow` row");
+        let cells: Vec<String> = row
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|cell| cell.replace(' ', ""))
+            .collect();
+        let [full_cell, ascii_cell] = cells.as_slice() else {
+            panic!("expected exactly two code spans in theming.md's sort arrow row: {row:?}");
+        };
+
+        for (label, cell, table) in [("full", full_cell, &FULL), ("ascii", ascii_cell, &ASCII)] {
+            let drawn: String = [table.sort_ascending, table.sort_descending]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                &drawn, cell,
+                "the {label} table's sort arrows disagree with theming.md's sort arrow row"
+            );
+        }
+    }
+
+    /// The full table's header arrows are the same two characters it already draws for ahead
+    /// and behind. Permitted on the same terms the frame's own collisions are: both sit
+    /// outside the row interior. Recorded by name so a future change to either pair fails a
+    /// named test rather than silently curing or reintroducing the overlap.
+    #[test]
+    fn the_full_tables_sort_arrows_repeat_its_ahead_and_behind_marks_and_that_is_permitted() {
+        assert_eq!(FULL.sort_ascending, FULL.ahead);
+        assert_eq!(FULL.sort_descending, FULL.behind);
+        assert!(
+            !ASCII.value_core().contains(&ASCII.sort_ascending)
+                && !ASCII.value_core().contains(&ASCII.sort_descending),
+            "the ascii table's own arrows introduce no such overlap"
+        );
     }
 
     /// The eight slots of the [`border::Set`] `bordered_block` fills, counted on screen rather
