@@ -195,14 +195,14 @@ impl Theme {
         }
     }
 
-    /// The Selection's own per-row treatment: the rows [`crate::selection::Selection`] holds
-    /// checked, marked with space, per theming.md's "The Selection". Underlines the row
-    /// across the same interior width the cursor row's own highlight covers
-    /// ([`crate::components::list::List`]), and names no colour at all, so it needs no role,
-    /// composes with the cursor highlight rather than replacing it, and keeps working under
-    /// `NO_COLOR`, since crossterm strips colour escape codes and never a text attribute.
+    /// The Selection's own per-row treatment: the style
+    /// [`crate::components::list::List`] draws a checked row's own marker glyph with, per
+    /// theming.md's "The Selection". Names no colour and no modifier at all, so the mark
+    /// needs no role, composes with the cursor row's reverse-video highlight rather than
+    /// being erased by it (the glyph is a value the row draws, not a style patched across
+    /// it), and keeps working under `NO_COLOR`, since crossterm strips colour escape codes.
     pub fn checked_style(&self) -> Style {
-        Style::new().add_modifier(Modifier::UNDERLINED)
+        Style::new()
     }
 }
 

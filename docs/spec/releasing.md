@@ -2,6 +2,10 @@
 
 Repon's release channels are whatever its tag pipeline publishes, and nothing is published by hand; the reasoning is in [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md). This spec carries what that decision leaves open: the channels and their triggers, the platform claim, the metadata, the CI gates, the publish rehearsal and the checklist the first crates.io release must clear. Every measurement in it was hand-run on 2026-08-30 on macOS with rustc 1.95.0 and cargo 1.95.0.
 
+## A version move is not a release
+
+`Cargo.toml`'s version is a build marker, not a release: it moves on every shipped change, on `main` after that change merges rather than on the branch that carried it, with `cargo set-version --workspace 0.1.<n>`, the same command that moves both crates and the pinned inter-crate `repon-core` dependency together that [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s `prepare` job already runs. That move publishes nothing, tags nothing and opens no channel, so [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) stands exactly as written. The tag is the release; until a tag exists, the version in `Cargo.toml` and a release are simply unrelated. What the marker buys is that installing a build locally to try it, which `AGENTS.md`'s dev loop already asks for after every merge, produces a binary that can say which change it is.
+
 ## Where Repon can be installed from
 
 | channel | status | trigger |

@@ -184,6 +184,7 @@ glyph_set! {
         Behind: behind,
         Changed: changed,
         ChildRow: child_row,
+        Checked: checked,
     },
 }
 
@@ -211,6 +212,11 @@ pub const FULL: GlyphSet = GlyphSet {
     behind: '↓',
     changed: '●',
     child_row: '└',
+    // 2 of 5 surveyed faces (SF Mono, Menlo), the same coverage tier as the panel border's
+    // own corners just below, not the pathological one-of-five or zero-of-five tier that
+    // singled the braille spinner out as ADR 0020's one open defect. Not one glance from any
+    // other value glyph in this table.
+    checked: '✓',
     border: Border {
         top_left: '╭',
         top_right: '╮',
@@ -244,6 +250,11 @@ pub const ASCII: GlyphSet = GlyphSet {
     behind: '<',
     changed: '*',
     child_row: '`',
+    // Repeats the border's own corner character below, permitted on the same terms this
+    // table's `-` already repeats the border's horizontal rule: the frame is exempt from
+    // the row interior's disjointness rule, and a border is read as a region around the
+    // panel rather than decoded character by character inside one row.
+    checked: '+',
     border: Border {
         top_left: '+',
         top_right: '+',
@@ -516,6 +527,20 @@ mod tests {
         );
     }
 
+    /// A second, independent instance of the same permitted class: the Selected marker's own
+    /// `+` repeats the ascii border's (collapsed) corner character. Recorded the same way the
+    /// horizontal-rule collision above is, so a future change to either glyph fails a named
+    /// test rather than silently curing or reintroducing it.
+    #[test]
+    fn the_ascii_border_shares_its_corner_glyph_with_the_checked_value_mark_and_that_is_permitted()
+    {
+        assert_eq!(
+            ASCII.border.top_left, ASCII.checked,
+            "the specific known collision the frame's exemption from row-interior \
+             disjointness covers"
+        );
+    }
+
     /// ADR 0020: line art need not stay injective the way the row interior's vocabulary must,
     /// because a border is read as a region rather than decoded character by character. The
     /// ascii set exercises that liberty fully: all four corners collapse onto one `+`.
@@ -623,9 +648,10 @@ mod tests {
     /// table at test time and compares it against the full glyph table in both directions:
     /// a meaning the spec names and the code does not implement fails here, as does a value
     /// meaning the code implements and the spec's table does not name, and a meaning both
-    /// sides name but render with a different character also fails here. `ChildRow` is
-    /// excluded on the code side: it marks a row's shape (a nested Worktree or Submodule
-    /// line), specified in its own paragraph, not an in-cell value this table covers.
+    /// sides name but render with a different character also fails here. `ChildRow` and
+    /// `Checked` are excluded on the code side: each marks a row's shape or state (a nested
+    /// Worktree or Submodule line, a row the Selection holds), specified in its own
+    /// paragraph, not an in-cell value this table covers.
     ///
     /// If the spec gains a seventh glyph, this test fails two different ways depending on
     /// what the code does: an unrecognised meaning phrase panics inside
@@ -672,6 +698,7 @@ mod tests {
                         | Meaning::Failed
                         | Meaning::Loading
                         | Meaning::ChildRow
+                        | Meaning::Checked
                 )
             })
             .collect();
