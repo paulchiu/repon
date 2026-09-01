@@ -8,7 +8,12 @@
 
 use ratatui::{Frame, layout::Rect, style::Style};
 
-use crate::{config::document::SetConfig, keys::Action};
+use crate::{
+    config::document::SetConfig,
+    glyphs::{BorderScratch, GlyphSet},
+    keys::Action,
+    theme::{Role, Theme},
+};
 
 /// The picker's own cursor over the declared Sets' file order. Carries no copy of the Sets
 /// themselves: [`crate::app::App`] hands [`Self::apply`] and [`Self::draw`] the live
@@ -66,14 +71,29 @@ impl SetPicker {
     /// `1` to `9` keys
     /// ([0027](../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)):
     /// [`crate::app::App::switch_to_set`] takes the same one-indexed number this draws.
+    ///
+    /// The rows sit inside the house-style frame every other panel and overlay draws, its
+    /// characters taken from `glyphs` rather than ratatui's own default set.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
         area: Rect,
         sets: &[SetConfig],
         active_set_name: &str,
+        theme: &Theme,
+        glyphs: &'static GlyphSet,
     ) {
-        for (row, set) in sets.iter().enumerate().take(area.height as usize) {
+        let mut scratch = BorderScratch::new();
+        // Always painted focused, like `List` and the help overlay: the picker is the only
+        // thing on screen while it is open, so there is no dimmer panel to contrast it with.
+        let block = glyphs
+            .bordered_block(&mut scratch)
+            .border_style(theme.style_for(Role::BorderFocused))
+            .title(" sets ");
+        let interior = block.inner(area);
+        frame.render_widget(block, area);
+
+        for (row, set) in sets.iter().enumerate().take(interior.height as usize) {
             let marker = if row == self.cursor { "> " } else { "  " };
             let number = match Self::number_for_row(row) {
                 Some(n) => format!("{n} "),
@@ -85,9 +105,15 @@ impl SetPicker {
                 ""
             };
             let line = format!("{marker}{number}{}{active}", set.name.get_ref());
-            frame
-                .buffer_mut()
-                .set_string(area.x, area.y + row as u16, &line, Style::new());
+            // Clamped to the interior, not the buffer: a Set name is user-supplied and
+            // unbounded, and a long one must not paint over the frame's right border.
+            frame.buffer_mut().set_stringn(
+                interior.x,
+                interior.y + row as u16,
+                &line,
+                interior.width as usize,
+                Style::new(),
+            );
         }
     }
 
@@ -113,9 +139,21 @@ mod tests {
         }
     }
 
-    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
-        (0..width)
-            .map(|x| buf[(x, y)].symbol().to_string())
+    /// The `TestBackend` area every test below draws into, named once so a test reading a
+    /// row through [`row_text`] and the draw it reads agree on the frame.
+    const FRAME: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 14,
+    };
+
+    /// Row `row` of the picker's own interior, inside the frame the border draws: the
+    /// picker's first Set is row 0 here, one cell in and one row down from the frame itself.
+    fn row_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
+        let interior = crate::glyphs::bordered_interior(FRAME);
+        (interior.x..interior.right())
+            .map(|x| buf[(x, interior.y + row)].symbol().to_string())
             .collect()
     }
 
@@ -123,14 +161,54 @@ mod tests {
         picker: &SetPicker,
         sets: &[SetConfig],
         active: &str,
+        glyphs: &'static GlyphSet,
     ) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(40, 10);
+        let backend = TestBackend::new(FRAME.width, FRAME.height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| picker.draw(frame, frame.area(), sets, active))
+            .draw(|frame| picker.draw(frame, frame.area(), sets, active, &Theme::default(), glyphs))
             .expect("draw the frame");
         terminal.backend().buffer().clone()
+    }
+
+    // --- The frame's own characters come from the glyph table, not ratatui's default ---
+
+    /// theming.md's "panel border" row: the picker frames itself with the active table's own
+    /// characters, the set the list and detail panes already draw, and degrades with them
+    /// under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded rounded
+    /// set would satisfy neither.
+    #[test]
+    fn draw_frames_the_picker_with_the_active_glyph_tables_own_border() {
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let sets = vec![set("alpha")];
+            let picker = SetPicker::new();
+            let buf = draw_to_buffer(&picker, &sets, "alpha", glyphs);
+            let border = glyphs.border;
+
+            for (x, y, expected, corner) in [
+                (FRAME.x, FRAME.y, border.top_left, "top left"),
+                (FRAME.right() - 1, FRAME.y, border.top_right, "top right"),
+                (
+                    FRAME.x,
+                    FRAME.bottom() - 1,
+                    border.bottom_left,
+                    "bottom left",
+                ),
+                (
+                    FRAME.right() - 1,
+                    FRAME.bottom() - 1,
+                    border.bottom_right,
+                    "bottom right",
+                ),
+            ] {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    expected.to_string(),
+                    "the picker's {corner} corner must be the glyph table's own"
+                );
+            }
+        }
     }
 
     // --- criterion 1: every declared Set is listed, in file order, none dropped or doubled ---
@@ -143,9 +221,9 @@ mod tests {
     fn draw_lists_every_declared_set_in_file_order_with_none_dropped_or_duplicated() {
         let sets = vec![set("alpha"), set("beta"), set("gamma"), set("delta")];
         let picker = SetPicker::new();
-        let buf = draw_to_buffer(&picker, &sets, "alpha");
+        let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
 
-        let rendered: Vec<String> = (0..6).map(|y| row_text(&buf, y, 40)).collect();
+        let rendered: Vec<String> = (0..6).map(|y| row_text(&buf, y)).collect();
         let occurrences = |name: &str| rendered.iter().filter(|line| line.contains(name)).count();
 
         for name in ["alpha", "beta", "gamma", "delta"] {
@@ -181,10 +259,10 @@ mod tests {
             "two ScrollDowns must land on the third row"
         );
 
-        let buf = draw_to_buffer(&picker, &sets, "alpha");
-        assert!(row_text(&buf, 2, 40).starts_with("> 3 gamma"));
-        assert!(!row_text(&buf, 0, 40).contains('>'));
-        assert!(!row_text(&buf, 1, 40).contains('>'));
+        let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
+        assert!(row_text(&buf, 2).starts_with("> 3 gamma"));
+        assert!(!row_text(&buf, 0).contains('>'));
+        assert!(!row_text(&buf, 1).contains('>'));
     }
 
     // --- criterion 1: each row's own one-indexed number, not zero-indexed and not absent ---
@@ -198,11 +276,11 @@ mod tests {
     fn draw_shows_each_rows_one_indexed_number_beside_its_own_name() {
         let sets = vec![set("alpha"), set("beta"), set("gamma")];
         let picker = SetPicker::new();
-        let buf = draw_to_buffer(&picker, &sets, "alpha");
+        let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
 
-        assert_eq!(row_text(&buf, 0, 40).trim_end(), "> 1 alpha (active)");
-        assert_eq!(row_text(&buf, 1, 40).trim_end(), "  2 beta");
-        assert_eq!(row_text(&buf, 2, 40).trim_end(), "  3 gamma");
+        assert_eq!(row_text(&buf, 0).trim_end(), "> 1 alpha (active)");
+        assert_eq!(row_text(&buf, 1).trim_end(), "  2 beta");
+        assert_eq!(row_text(&buf, 2).trim_end(), "  3 gamma");
     }
 
     /// The tenth row is the one place the numbering has to stop: the positional keys only
@@ -214,20 +292,15 @@ mod tests {
         let sets: Vec<SetConfig> = names.iter().map(|name| set(name)).collect();
         let picker = SetPicker::new();
 
-        let backend = ratatui::backend::TestBackend::new(40, 10);
-        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
-        terminal
-            .draw(|frame| picker.draw(frame, frame.area(), &sets, "set1"))
-            .expect("draw the frame");
-        let buf = terminal.backend().buffer().clone();
+        let buf = draw_to_buffer(&picker, &sets, "set1", &crate::glyphs::FULL);
 
         for (row, name) in names.iter().enumerate().take(9) {
             let marker = if row == 0 { "> " } else { "  " };
             let active = if row == 0 { " (active)" } else { "" };
             let expected = format!("{marker}{} {name}{active}", row + 1);
-            assert_eq!(row_text(&buf, row as u16, 40).trim_end(), expected);
+            assert_eq!(row_text(&buf, row as u16).trim_end(), expected);
         }
-        assert_eq!(row_text(&buf, 9, 40).trim_end(), "  set10");
+        assert_eq!(row_text(&buf, 9).trim_end(), "  set10");
     }
 
     // --- cursor movement: clamped, not wrapped ---
@@ -282,9 +355,9 @@ mod tests {
             );
         }
 
-        let buf = draw_to_buffer(&picker, &[], "irrelevant");
+        let buf = draw_to_buffer(&picker, &[], "irrelevant", &crate::glyphs::FULL);
         assert_eq!(
-            row_text(&buf, 0, 40).trim(),
+            row_text(&buf, 0).trim(),
             "",
             "an empty document must render no rows"
         );
@@ -306,8 +379,8 @@ mod tests {
             assert_eq!(picker.cursor(), 0);
         }
 
-        let buf = draw_to_buffer(&picker, &sets, "only");
-        assert!(row_text(&buf, 0, 40).contains("only"));
-        assert!(row_text(&buf, 0, 40).contains("(active)"));
+        let buf = draw_to_buffer(&picker, &sets, "only", &crate::glyphs::FULL);
+        assert!(row_text(&buf, 0).contains("only"));
+        assert!(row_text(&buf, 0).contains("(active)"));
     }
 }

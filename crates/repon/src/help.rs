@@ -10,9 +10,9 @@
 //! reading surface, not a chooser, so the popup treatment [0008](../../../../docs/adr/0008-two-palettes-not-one.md)
 //! reserves for the palettes does not apply here.
 
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 
-use crate::glyphs::GlyphSet;
+use crate::glyphs::{BorderScratch, GlyphSet, bordered_interior};
 use crate::keys::{Action, BindingTable, Context};
 use crate::scroll::scroll_after;
 use crate::theme::{Role, Theme};
@@ -61,7 +61,7 @@ impl HelpLayout {
     /// which draws no border to be inset from.
     pub(crate) fn content_area(self, frame_area: Rect) -> Rect {
         match self {
-            HelpLayout::Bordered => Block::bordered().inner(frame_area),
+            HelpLayout::Bordered => bordered_interior(frame_area),
             HelpLayout::Degraded => frame_area,
         }
     }
@@ -125,25 +125,12 @@ impl HelpOverlay {
         let lines = Self::content(table, context);
         let layout = HelpLayout::compute(frame_area);
         if layout == HelpLayout::Bordered {
-            let border_glyphs = glyphs.border;
-            let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
-                [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
-            );
-            let border_set = border::Set {
-                top_left: border_glyphs.top_left.encode_utf8(&mut tl),
-                top_right: border_glyphs.top_right.encode_utf8(&mut tr),
-                bottom_left: border_glyphs.bottom_left.encode_utf8(&mut bl),
-                bottom_right: border_glyphs.bottom_right.encode_utf8(&mut br),
-                vertical_left: border_glyphs.vertical.encode_utf8(&mut vl),
-                vertical_right: border_glyphs.vertical.encode_utf8(&mut vr),
-                horizontal_top: border_glyphs.horizontal.encode_utf8(&mut ht),
-                horizontal_bottom: border_glyphs.horizontal.encode_utf8(&mut hb),
-            };
             // Like `List`'s own border, always painted focused: help is the only thing on
             // screen while it is open, so there is no second, dimmer panel to contrast it
             // against.
-            let block = Block::bordered()
-                .border_set(border_set)
+            let mut scratch = BorderScratch::new();
+            let block = glyphs
+                .bordered_block(&mut scratch)
                 .border_style(theme.style_for(Role::BorderFocused))
                 .title(" help (esc or q closes) ");
             frame.render_widget(block, frame_area);

@@ -1887,11 +1887,19 @@ impl App {
                     &self.theme,
                     &self.document.actions,
                     action_palette_operable_count.unwrap_or(0),
+                    self.glyphs,
                 );
                 return;
             }
             if let Some(picker) = &self.set_picker {
-                picker.draw(frame, area, &self.document.sets, &self.active_set.name);
+                picker.draw(
+                    frame,
+                    area,
+                    &self.document.sets,
+                    &self.active_set.name,
+                    &self.theme,
+                    self.glyphs,
+                );
                 return;
             }
             // The Filter narrowing this frame's list, live while `self.filter_line` is open
@@ -1988,7 +1996,14 @@ impl App {
                 let (launchers, entity_name) = launcher_palette_view
                     .as_ref()
                     .expect("computed above whenever launcher_palette is Some");
-                palette.draw(frame, area, &self.theme, launchers, entity_name);
+                palette.draw(
+                    frame,
+                    area,
+                    &self.theme,
+                    launchers,
+                    entity_name,
+                    self.glyphs,
+                );
             }
         })?;
         if let Some(err) = error {

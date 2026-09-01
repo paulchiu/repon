@@ -25,12 +25,13 @@
 //! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
 //! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
-use ratatui::{Frame, layout::Rect, style::Style, widgets::Block};
+use ratatui::{Frame, layout::Rect, style::Style};
 
 use repon_core::{ActionSpec, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
+    glyphs::{BorderScratch, GlyphSet},
     theme::{Meaning, Role, Theme},
 };
 
@@ -393,8 +394,11 @@ impl ActionPalette {
         theme: &Theme,
         actions: &[ActionConfig],
         operable_count: usize,
+        glyphs: &'static GlyphSet,
     ) {
-        let block = Block::bordered()
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
             .title(Self::border_title(operable_count));
         let interior = block.inner(area);
@@ -911,6 +915,45 @@ mod tests {
         );
     }
 
+    // --- The frame's own characters come from the glyph table, not ratatui's default ---
+
+    /// theming.md's "panel border" row: the palette frames itself with the active table's
+    /// own characters, the set the list and detail panes already draw, and degrades with
+    /// them under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded
+    /// rounded set would satisfy neither.
+    #[test]
+    fn draw_frames_the_palette_with_the_active_glyph_tables_own_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let actions = vec![action("reinstall", true)];
+            let palette = ActionPalette::new();
+            let backend = TestBackend::new(40, 10);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+            terminal
+                .draw(|frame| {
+                    palette.draw(frame, frame.area(), &Theme::default(), &actions, 3, glyphs);
+                })
+                .expect("draw the frame");
+
+            let buf = terminal.backend().buffer();
+            let border = glyphs.border;
+            for (x, y, expected, corner) in [
+                (0, 0, border.top_left, "top left"),
+                (39, 0, border.top_right, "top right"),
+                (0, 9, border.bottom_left, "bottom left"),
+                (39, 9, border.bottom_right, "bottom right"),
+            ] {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    expected.to_string(),
+                    "the palette's {corner} corner must be the glyph table's own"
+                );
+            }
+        }
+    }
+
     // --- Criterion 3: the border renders in the warning role ---
 
     /// theming.md: "the Action palette's border is `warn`". Read through the same
@@ -932,7 +975,14 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 3);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    3,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -956,7 +1006,14 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 2);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    2,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -991,7 +1048,14 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 12);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    12,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1076,7 +1140,14 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &monochrome, &actions, 2);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &monochrome,
+                    &actions,
+                    2,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1186,7 +1257,16 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), theme, actions, operable_count))
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    theme,
+                    actions,
+                    operable_count,
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the frame");
         terminal.backend().buffer().clone()
     }
@@ -1369,7 +1449,16 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| launcher_palette.draw(frame, frame.area(), &theme, &launchers, "repo-a"))
+            .draw(|frame| {
+                launcher_palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the launcher palette");
         let launcher_buf = terminal.backend().buffer().clone();
         // Issue 162 turned the Launcher palette into a centred popup, so its border no
