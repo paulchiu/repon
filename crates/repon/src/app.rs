@@ -2334,9 +2334,13 @@ impl App {
 
     /// One whole frame, and the tick's one read of the Core's table: exactly one
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
-    /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
-    /// priority, each take the whole frame in place of everything else when open; otherwise
-    /// the status bar row shows a live Notice ([`notice::draw`]) alone, or
+    /// The help overlay, the warning overlay and the Action palette, in that priority, each
+    /// take the whole frame in place of everything else when open. The Set picker and the
+    /// Launcher palette instead overlay the base frame as a centred popup, drawn after the
+    /// footer once everything underneath is on screen
+    /// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
+    /// Launcher palette popup", the shape the Set picker now shares); otherwise the status
+    /// bar row shows a live Notice ([`notice::draw`]) alone, or
     /// [`status_row::draw`]'s own one list of items with no Notice live,
     /// [`layout_state`] decides between the three shapes
     /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) fixes, and
@@ -2417,17 +2421,6 @@ impl App {
                     count: action_palette_count.unwrap_or_else(|| Count::selection(0)),
                     management_lines: &management_lines,
                 },
-                self.glyphs,
-            );
-            return None;
-        }
-        if let Some(picker) = &self.set_picker {
-            picker.draw(
-                frame,
-                area,
-                &self.document.sets,
-                &self.active_set.name,
-                &self.theme,
                 self.glyphs,
             );
             return None;
@@ -2546,6 +2539,23 @@ impl App {
             &self.bindings,
             &self.theme,
         );
+
+        // The Set picker overlays the base frame just drawn above, as a centred popup, the
+        // same shape the Launcher palette below already takes
+        // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
+        // Launcher palette popup"): the table the Set is about to replace stays on screen
+        // while choosing, rather than the picker blanking it the way the three early
+        // returns above still do.
+        if let Some(picker) = &self.set_picker {
+            picker.draw(
+                frame,
+                area,
+                &self.document.sets,
+                &self.active_set.name,
+                &self.theme,
+                self.glyphs,
+            );
+        }
 
         // The Launcher palette overlays the base frame just drawn above, as a centred
         // popup, rather than replacing it the way the three early returns above do
@@ -3361,11 +3371,13 @@ mod tests {
             );
             app.action_palette = None;
 
-            app.set_picker = Some(SetPicker::new());
+            let picker = SetPicker::new();
+            let popup = picker.popup_area(whole_frame, &app.document.sets, &app.active_set.name);
+            app.set_picker = Some(picker);
             let buf = render_app_frame(&mut app, width, height);
             crate::test_support::assert_frame_drawn_with(
                 &buf,
-                whole_frame,
+                popup,
                 glyphs.border,
                 crate::set_picker::BORDER_TITLE,
                 "the Set picker App drew",

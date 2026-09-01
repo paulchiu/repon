@@ -185,7 +185,7 @@ pub(crate) fn slot_line(warnings: &[Warning], bindings: &BindingTable) -> Option
 }
 
 /// The overlay's own top title, in the style of every other full-frame surface's border
-/// ([`crate::help::BORDER_TITLE`], [`crate::set_picker::BORDER_TITLE`]).
+/// ([`crate::help::BORDER_TITLE`], [`crate::action_palette::ActionPalette::border_title`]).
 pub(crate) const BORDER_TITLE: &str = " warnings ";
 
 /// The overlay's bottom-right title: the way out, since a full-frame surface with a border
@@ -194,8 +194,8 @@ pub(crate) const CLOSE_HINT: &str = " esc closes ";
 
 /// Draws every outstanding warning, one per line, most severe first, inside the same
 /// house-style bordered block every other full-frame surface draws
-/// ([`crate::help::HelpOverlay::draw`], [`crate::set_picker::SetPicker::draw`],
-/// [`crate::action_palette::ActionPalette::draw`]), in the `warn` role
+/// ([`crate::help::HelpOverlay::draw`], [`crate::action_palette::ActionPalette::draw`]), in
+/// the `warn` role
 /// [`crate::status_row`] paints the reserved indicator in: `Action::ExpandWarning`'s whole
 /// reason to exist.
 pub(crate) fn draw_overlay(
