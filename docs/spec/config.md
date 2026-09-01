@@ -48,10 +48,12 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | key | type | default | meaning |
 | --- | --- | --- | --- |
 | `theme` | string | `"default"` | Names `themes/<name>.toml`; `default` is reserved for the compiled-in theme ([theming.md](theming.md)) |
-| `glyphs` | `"full"` or `"ascii"` | `"full"` | The vetted glyph set; describes the terminal, not taste |
+| `glyphs` | `"full"` or `"ascii"` | `"ascii"` on `TERM=linux`, `"full"` otherwise | The vetted glyph set; describes the terminal, not taste |
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
 | `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
 | `notice_timeout` | humantime string | `"3s"` | How long a Notice stays on the status row ([theming.md](theming.md)). `"0s"` turns the timer off, not Notices: the next keypress or a replacement still clears one. There is no key that disables Notices, since a refusal nobody is told about is the defect [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) exists to remove |
+
+`glyphs`'s default is the one conditional value on this page: `ascii` when the process environment has `TERM=linux`, `full` for every other value, absent included. An explicit `glyphs` in the file always wins over the conditional default, in both directions, since pinning it either way is the whole point of writing it down. The signal is capped at this one check on purpose: the Linux console's own fallback substitution table is fixed and knowable ([0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)), where a terminal emulator's is not, so no table of emulator names is ever read to make this decision.
 
 The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter, `kind:worktree` in [filter.md](filter.md), beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
 
