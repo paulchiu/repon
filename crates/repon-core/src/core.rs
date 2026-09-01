@@ -462,10 +462,10 @@ pub struct Core {
     /// dispatch loop's state and dirty probes open after that same entity's cheap
     /// outcomes (branch, sync, default branch) have already landed on the table,
     /// so [`refresh`]'s two applies can be proven independent with a blocking wait
-    /// rather than a sleep. Always present and normally empty: the dispatch loop
-    /// checks it for every entity, and an entity never registered here finds
-    /// nothing and proceeds exactly as if this field did not exist. Registered and
-    /// read only by the `_for_test` methods below.
+    /// rather than a sleep. Always present and normally empty: a Generation reads it
+    /// once per entity as it dispatches that entity, and one never registered here
+    /// resolves to nothing and proceeds exactly as if this field did not exist.
+    /// Registered and read only by the `_for_test` methods below.
     #[allow(dead_code)] // populated and read only by tests
     phase_c_gates: Arc<Mutex<HashMap<EntityKey, PhaseCGateHandle>>>,
     /// The age past which a `Known` `dirty` or `state` cell reads Stale even though
@@ -1669,7 +1669,11 @@ impl RefreshHandles {
             let patch_reads = Arc::clone(&self.patch_identity_reads);
             let patch_scan_bounds = Arc::clone(&self.patch_scan_bounds);
             let bound_gates = Arc::clone(&bound_gates);
-            let phase_c_gates = Arc::clone(&self.phase_c_gates);
+            // Resolved once here and moved into the task, which holds no handle on the
+            // map itself: a probe signals the gate its own Generation was dispatched
+            // against, so one still running from an earlier Generation can never signal a
+            // gate registered after that Generation dispatched.
+            let held_gate = self.phase_c_gates.lock().unwrap().get(&key).cloned();
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), kind, &cancel);
                 let sync_outcome = probe_sync(
@@ -1726,15 +1730,9 @@ impl RefreshHandles {
                 // Test-only: let a test hold phase C and D open here, after the cheap
                 // outcomes above are already visible on the table, so the two applies'
                 // independence can be proven by blocking on a Condvar rather than by racing
-                // a sleep against a probe. The lookup is its own statement, not the
-                // scrutinee of the `if let` below: an `if let`'s scrutinee temporaries live
-                // for the whole arm, so folding the lock into the condition would hold
-                // `phase_c_gates`'s own mutex for as long as this block blocks on
-                // `may_proceed`, deadlocking `release_phase_c_for_test`'s later attempt to
-                // lock that same map.
-                let held_gate = phase_c_gates.lock().unwrap().get(&key).cloned();
-                if let Some(gate) = held_gate {
-                    let (lock, cvar) = &*gate;
+                // a sleep against a probe.
+                if let Some(gate) = &held_gate {
+                    let (lock, cvar) = &**gate;
                     let mut state = lock.lock().unwrap();
                     state.cheap_landed = true;
                     cvar.notify_all();
@@ -1776,9 +1774,10 @@ impl RefreshHandles {
                     },
                 );
 
-                let held_gate = phase_c_gates.lock().unwrap().get(&key).cloned();
-                if let Some(gate) = held_gate {
-                    let (lock, cvar) = &*gate;
+                // The same handle the cheap gate above blocked on, never a second lookup:
+                // see where it is resolved.
+                if let Some(gate) = &held_gate {
+                    let (lock, cvar) = &**gate;
                     let mut state = lock.lock().unwrap();
                     state.finished = true;
                     cvar.notify_all();
@@ -2014,8 +2013,8 @@ impl Core {
     /// Registers a closed phase C/D gate for `key`, so the next `refresh` that
     /// dispatches it will land its cheap outcomes, then block before touching
     /// phase C or D until [`Core::release_phase_c_for_test`] opens the gate.
-    /// Must be called before the dispatching `refresh`, since the dispatch loop
-    /// only consults this map once, right after the cheap outcomes are applied.
+    /// Must be called before the dispatching `refresh`, since a Generation resolves
+    /// each entity's gate as it dispatches it and its probes signal that one alone.
     pub(crate) fn hold_phase_c_for_test(&self, key: &EntityKey) {
         self.phase_c_gates.lock().unwrap().insert(
             key.clone(),
@@ -4884,6 +4883,70 @@ mod tests {
             core.settle_gate_count_for_test(),
             0,
             "both entities finished, so the gate must be fully drained"
+        );
+    }
+
+    /// The gate [`Core::hold_phase_c_for_test`] last registered for `key`, so a test can
+    /// still name one a later registration for the same entity has replaced in the map.
+    fn registered_gate(core: &Core, key: &EntityKey) -> PhaseCGateHandle {
+        core.phase_c_gates
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .expect("hold_phase_c_for_test must be called before reading its gate")
+    }
+
+    /// Opens `gate` directly rather than through [`Core::release_phase_c_for_test`], which
+    /// resolves by key and so cannot name a gate a later registration has replaced.
+    fn release_gate(gate: &PhaseCGateHandle) {
+        let (lock, cvar) = &**gate;
+        lock.lock().unwrap().may_proceed = true;
+        cvar.notify_all();
+    }
+
+    fn gate_is_finished(gate: &PhaseCGateHandle) -> bool {
+        gate.0.lock().unwrap().finished
+    }
+
+    /// A probe signals the phase C gate its own Generation was dispatched against, never
+    /// whatever gate the map holds by the time that probe finishes.
+    ///
+    /// Reading the map twice per probe, once before phase C and once after, made the gate
+    /// a probe signalled a function of when it got there: a probe from an already-settled
+    /// Generation, past its own first read but not yet past its second, would find a gate
+    /// registered in between and mark it finished, so the wait a later Generation was
+    /// making returned before that Generation had applied anything or touched the settle
+    /// gate. Registering a second gate for the same entity while the first is still held
+    /// open is that interleaving with the timing taken out of it: the parked probe took
+    /// the first gate, and the map holds the second by the time it finishes.
+    #[test]
+    fn a_probe_signals_the_phase_c_gate_its_own_generation_was_dispatched_against() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
+
+        core.hold_phase_c_for_test(&key);
+        let dispatched_against = registered_gate(&core, &key);
+        core.refresh(std::slice::from_ref(&key));
+        core.wait_phase_c_landed_for_test(&key);
+
+        core.hold_phase_c_for_test(&key);
+        let registered_later = registered_gate(&core, &key);
+        release_gate(&dispatched_against);
+
+        wait_for(
+            "the held probe to signal the gate its own Generation was dispatched against",
+            || gate_is_finished(&dispatched_against),
+        );
+        assert!(
+            !gate_is_finished(&registered_later),
+            "a gate registered after this Generation dispatched must never be marked \
+             finished by it: a test waiting on that gate would return before this \
+             Generation had applied its outcome or decremented the settle gate"
         );
     }
 
