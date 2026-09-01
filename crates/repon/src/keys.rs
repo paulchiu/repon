@@ -322,6 +322,10 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::RefreshAll,
     ),
+    // F5 is the refresh key across other software, so it fires the same Action as `r`
+    // rather than a variant of its own; a user with no config still refreshes everything
+    // from either key, and one whose OS eats F5 (macOS Dictation) still has `r`.
+    binding(Context::Global, KeyCode::F(5), NONE, Action::RefreshAll),
     binding(
         Context::Global,
         KeyCode::Char('R'),
@@ -958,8 +962,8 @@ fn named_key_code(base: &str) -> Option<KeyCode> {
 }
 
 /// `"f1"` through `"f24"`, case-sensitive lowercase to match [`chord_label`]'s own rendering;
-/// crossterm's own `KeyCode::F` range, unused by [`BINDINGS`] itself but real enough that
-/// config.md's own shipped example rebinds an action to `"F5"`.
+/// crossterm's own `KeyCode::F` range. `BINDINGS` uses `f5` for `Action::RefreshAll`; the
+/// rest of the range is free for a user's own rebind.
 fn function_key(base: &str) -> Option<KeyCode> {
     let digits = base.strip_prefix('f')?;
     let n: u8 = digits.parse().ok()?;
@@ -1871,6 +1875,10 @@ mod tests {
             "PageUp" => (KeyCode::PageUp, NONE),
             "PageDown" => (KeyCode::PageDown, NONE),
             "Space" => (KeyCode::Char(' '), NONE),
+            _ if token.starts_with('F') && token[1..].chars().all(|c| c.is_ascii_digit()) => {
+                let n: u8 = token[1..].parse().expect("digits after F parse as u8");
+                (KeyCode::F(n), NONE)
+            }
             _ if token.chars().count() == 1 => {
                 let c = token.chars().next().unwrap();
                 if c.is_ascii_uppercase() {
@@ -2204,11 +2212,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_chord_reads_a_function_key_not_used_by_any_compiled_binding() {
-        // config.md's own shipped example rebinds an action to "F5", a chord no default
-        // binding uses; chord_label must render it back the same way.
+    fn parse_chord_reads_a_function_key_including_one_a_compiled_binding_uses() {
+        // "f5" is `Action::RefreshAll`'s own compiled chord; chord_label must render it
+        // back the same way regardless.
         assert_eq!(parse_chord("f5"), Some((KeyCode::F(5), NONE)));
         assert_eq!(chord_label(KeyCode::F(5), NONE), "f5");
+        // "f24" is the top of crossterm's own range and no default binding uses it.
         assert_eq!(parse_chord("f24"), Some((KeyCode::F(24), NONE)));
         assert_eq!(
             parse_chord("f25"),
@@ -2437,9 +2446,12 @@ mod tests {
             action_name(unbuilt_action).expect("an unbuilt action must still have a config name");
         let context_name_text = context_name(unbuilt_context);
 
+        // "f6" rather than "f5": f5 is Action::RefreshAll's own compiled Global chord, and
+        // Global falls through under List/Detail, so it would dispatch regardless of this
+        // rebind and defeat the assertion below.
         let (bindings, warnings) = merge_over(
             &base,
-            &keys_block(&[(context_name_text, &[(action_name, "f5")])]),
+            &keys_block(&[(context_name_text, &[(action_name, "f6")])]),
         )
         .expect("expected the keys block to merge");
         assert_eq!(
@@ -2459,7 +2471,7 @@ mod tests {
             "must not read as an unknown action, got: {message:?}"
         );
         assert_eq!(
-            bindings.dispatch(unbuilt_context, press(KeyCode::F(5), NONE)),
+            bindings.dispatch(unbuilt_context, press(KeyCode::F(6), NONE)),
             None,
             "the ignored binding must never dispatch"
         );

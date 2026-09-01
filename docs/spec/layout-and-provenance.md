@@ -36,12 +36,15 @@ Priority, after the indicator is reserved:
 | --- | --- | --- |
 | 1 | the active Set's name and the entity count | [config.md](config.md), [core-api.md](core-api.md) |
 | 2 | the most severe warning's message, plus `(+N more, w to expand)` while more stand | [theming.md](theming.md) |
-| 3 | run progress | [actions.md](actions.md) |
-| 4 | the Filter's match count | [filter.md](filter.md) |
-| 5 | the worktrees note | [config.md](config.md) |
-| 6 | timing | [actions.md](actions.md) |
+| 3 | the current Refresh's own state | [refresh.md](refresh.md) |
+| 4 | run progress | [actions.md](actions.md) |
+| 5 | the Filter's match count | [filter.md](filter.md) |
+| 6 | the worktrees note | [config.md](config.md) |
+| 7 | timing | [actions.md](actions.md) |
 
 The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
+
+Rank 3 answers "did my keypress land" for the refresh key alone (`r`, `F5`, `R`, or a user's own rebind of either): `refreshing all 403` or `refreshing selection 5` while [`Core::refresh_running`](core-api.md) still reads true for the Refresh that key dispatched, `refreshed all 403` once it settles. It ranks below the warning message for the same reason the message outranks everything under it, and above run progress because a Refresh in flight is the more immediate fact; the two rarely overlap in practice, since starting an Action cancels any Refresh already running ([refresh.md](refresh.md)'s "Starting an Action"). It carries no fraction of entities settled: phases A and B cover the whole population in about 0.15 seconds ([refresh.md](refresh.md)'s "The phases"), so a live count would jump from nothing landed to everything landed with no readable state between, the defect refresh.md already recorded once for a static per-row spinner. It persists once settled, unlike run progress, which is the point: a Refresh over an already-populated table commonly finishes inside the frame that started it, and the settled text is what a user pressing `r` on such a table actually gets to read. It appears from the moment the refresh key first fires this session and is replaced, never cleared, by the next dispatch.
 
 Vanished entities are the mirror of an abandoned discovery and stand as a warning for the same reason ([#171](https://github.com/paulchiu/repon/issues/171)): rows are present that no longer exist, and their values are frozen. This is also what makes a Vanished row discoverable at all, which the gutter structurally cannot do, since a mark on a row does not tell a user the row is there. The condition announces itself here, `presence:vanished` is the way in, and `d` is the way out.
 
@@ -63,6 +66,19 @@ One warning outstanding and unacknowledged, a run in flight, so every item is li
 ```
 
 Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted four columns by the reserved indicator: 97, 91, 57, 36, 25, 21, and the same 3-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
+
+One warning outstanding and unacknowledged, a Refresh in progress, nothing from the header live:
+
+```
+103  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · refreshing all 403
+102  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist ...
+ 85  [1] work 403 entities ...
+ 25  [1] work 403 entities ...
+ 21  [1] work 403 entities
+  3  [1]
+```
+
+Rank 3 drops first: at 102 the refresh item is gone and the warning message alone still fits, one column short of the full line. It drops the same way every other item on this row does, whole rather than truncated, and its own settled text (`refreshed all 403`) takes exactly the same room once the Refresh it names has finished, so a table that settles inside one frame narrows and widens the row no differently than one still running.
 
 ## The list
 
