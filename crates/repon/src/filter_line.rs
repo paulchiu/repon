@@ -13,6 +13,7 @@
 use ratatui::{Frame, buffer::Buffer, layout::Rect};
 use repon_core::Filter;
 
+use crate::edit_buffer;
 use crate::theme::{Role, Theme};
 
 /// The Filter line's own edit buffer: append-only text, the same shape
@@ -45,12 +46,7 @@ impl FilterLine {
 
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word.
     pub(crate) fn delete_previous_word(&mut self) {
-        let trimmed = self.input.trim_end();
-        let cut = trimmed
-            .rfind(char::is_whitespace)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.input.truncate(cut);
+        edit_buffer::delete_previous_word(&mut self.input);
     }
 
     /// `Ctrl+U`: clears the line, the fastest way back to an unfiltered list while editing.
@@ -134,6 +130,30 @@ mod tests {
         }
         line.delete_previous_word();
         assert_eq!(line.live_filter().as_str(), "kind:worktree ");
+    }
+
+    /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
+    /// three, so a cut derived by adding one byte to the separator's start lands inside a
+    /// character; the accented letters pin that a multi-byte *non*-whitespace character
+    /// before the cut survives it.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let mut line = FilterLine::new(&committed(""));
+        for c in "café\u{00A0}naïve".chars() {
+            line.type_char(c);
+        }
+
+        line.delete_previous_word();
+
+        assert_eq!(line.live_filter().as_str(), "café\u{00A0}");
+
+        for c in "naïve\u{2003}encore".chars() {
+            line.type_char(c);
+        }
+
+        line.delete_previous_word();
+
+        assert_eq!(line.live_filter().as_str(), "café\u{00A0}naïve\u{2003}");
     }
 
     #[test]
