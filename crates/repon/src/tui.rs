@@ -116,9 +116,9 @@ impl Tui {
     }
 
     /// Hands the terminal to `command` and takes it back: the shared machinery a Launcher
-    /// and the ad hoc command field's `$EDITOR` handoff both stand on
-    /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspend and exec in the
-    /// same terminal"). Restores the five pieces [`Tui::exit`] restores, runs `command` to
+    /// that takes the terminal and the ad hoc command field's `$EDITOR` handoff both stand on
+    /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspends and execs in the
+    /// same one"). Restores the five pieces [`Tui::exit`] restores, runs `command` to
     /// completion with the terminal's own stdio (the default, since this does not touch
     /// `command`'s stdio handles), then claims them again with [`Tui::enter`] regardless of
     /// whether the child could even be spawned, so a spawn failure still returns control to
@@ -137,6 +137,30 @@ impl Tui {
         let status = command.status();
         self.enter()?;
         Ok(status?)
+    }
+
+    /// Runs `command` to completion without ever leaving the screen: the other half of
+    /// [`Self::suspend_for_child`], for a Launcher that
+    /// [config.md](../../../../docs/spec/config.md#launchers) declares does not take the
+    /// terminal. All five pieces stay exactly as claimed for the whole run, which is not an
+    /// exception to
+    /// [keybindings.md](../../../docs/spec/keybindings.md#terminal-state)'s contract but its
+    /// plainest case: releasing is what leaving the screen means, and this never leaves it.
+    ///
+    /// The child is handed `/dev/null` on all three streams instead of the terminal Repon is
+    /// still holding, so a byte it writes cannot land inside the frame and a read cannot
+    /// steal input from the event thread that owns that stream. Waiting is the contract
+    /// rather than an implementation detail: the exit status is a Launcher's only report of
+    /// failure once its own output goes nowhere.
+    pub fn keep_screen_for_child(
+        &mut self,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus> {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        Ok(command.status()?)
     }
 
     /// Blocks until the next event, or returns `None` once the event thread has stopped.

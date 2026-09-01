@@ -198,6 +198,7 @@ fn panic_after_launcher_handoff() -> color_eyre::Result<()> {
         name: "test".to_string(),
         source: launcher::Source::Args(vec!["true".to_string()]),
         shell: false,
+        takes_terminal: true,
         env: Default::default(),
     };
     launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
@@ -218,6 +219,7 @@ fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
         name: "test".to_string(),
         source: launcher::Source::Args(vec!["repon-test-binary-that-does-not-exist".to_string()]),
         shell: false,
+        takes_terminal: true,
         env: Default::default(),
     };
     launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;

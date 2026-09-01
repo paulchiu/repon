@@ -130,10 +130,21 @@ pub struct LauncherConfig {
     pub from_env: Option<String>,
     #[serde(default)]
     pub shell: bool,
+    #[serde(default = "default_launcher_takes_terminal")]
+    pub takes_terminal: bool,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+}
+
+/// `true`, [config.md](../../../../docs/spec/config.md#launchers)'s stated default for
+/// `takes_terminal`: every shipped default takes the terminal, so an entry that says nothing
+/// gets the suspend-and-exec handoff. Read by `LauncherConfig::takes_terminal`'s
+/// `#[serde(default = ...)]` rather than derived from `bool::default()`, since that would
+/// silently keep the screen for a command that is about to draw over it.
+fn default_launcher_takes_terminal() -> bool {
+    true
 }
 
 /// One `[[action.steps]]` table, per [config.md](../../../../docs/spec/config.md#actions):
@@ -1066,21 +1077,24 @@ mod tests {
         assert_eq!(names, vec!["zeta", "alpha"]);
     }
 
-    // [[launcher]]'s full field schema (name, args, from_env, shell, env, disabled) parses
-    // with no unknown-key warnings, and each field's value lands where declared.
+    // [[launcher]]'s full field schema (name, args, from_env, shell, takes_terminal, env,
+    // disabled) parses with no unknown-key warnings, and each field's value lands where
+    // declared.
     #[test]
     fn a_launcher_entrys_full_field_schema_parses_with_no_unknown_keys() {
         let text = "[[launcher]]\n\
                      name = \"lazygit\"\n\
                      args = [\"lazygit\"]\n\
                      shell = false\n\
+                     takes_terminal = true\n\
                      disabled = false\n\
                      [launcher.env]\n\
                      FOO = \"bar\"\n\
                      \n\
                      [[launcher]]\n\
                      name = \"editor\"\n\
-                     from_env = \"EDITOR\"\n";
+                     from_env = \"EDITOR\"\n\
+                     takes_terminal = false\n";
         let loaded = parse_ok(text);
         assert!(
             !loaded
@@ -1098,12 +1112,18 @@ mod tests {
         );
         assert_eq!(lazygit.from_env, None);
         assert!(!lazygit.shell);
+        assert!(lazygit.takes_terminal);
         assert!(!lazygit.disabled);
         assert_eq!(lazygit.env.get("FOO").map(String::as_str), Some("bar"));
 
         let editor = &loaded.document.launchers[1];
         assert_eq!(editor.from_env.as_deref(), Some("EDITOR"));
         assert_eq!(editor.args, None);
+        assert!(
+            !editor.takes_terminal,
+            "an entry declaring `takes_terminal = false` must keep it, whichever argv form it \
+             uses"
+        );
     }
 
     // A genuinely unknown [[launcher]] key still warns now that the real schema is
@@ -1142,6 +1162,80 @@ mod tests {
         );
     }
 
+    /// Every row of config.md's "Launchers" field table, as `(field, type cell)` pairs.
+    /// Scoped to that section, so a same-named row in another table cannot stand in for one
+    /// here.
+    fn spec_launcher_field_rows(spec: &str) -> Vec<(String, String)> {
+        const ANCHOR: &str = "## Launchers";
+        let after = spec
+            .split(ANCHOR)
+            .nth(1)
+            .expect("the Launchers section is present");
+        after
+            .lines()
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            .filter(|line| !line.starts_with("| ---"))
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                let (field, kind) = (cells[1].trim_matches('`'), cells[2]);
+                (field != "field").then(|| (field.to_string(), kind.to_string()))
+            })
+            .collect()
+    }
+
+    /// The default a bool row's own type cell states, or `None` for a row that is not a bool
+    /// with a stated default.
+    fn spec_declared_bool_default(kind: &str) -> Option<bool> {
+        let stated = kind.strip_prefix("bool, default ")?;
+        match stated.trim_matches('`') {
+            "true" => Some(true),
+            "false" => Some(false),
+            other => panic!("unexpected bool default {other:?} in the Launchers field table"),
+        }
+    }
+
+    /// Every bool key in config.md's Launchers table, read at test time, defaults to the
+    /// value the table itself states when an entry omits it. `takes_terminal` is the one that
+    /// cannot come from `bool::default()`, so restating its default in Rust is exactly the
+    /// "single source of truth shared by production and its tests" trap: the whole table is
+    /// walked here instead, and a bool key added to it without being wired up panics on its
+    /// own row rather than passing unnoticed.
+    #[test]
+    fn every_bool_launcher_key_defaults_to_what_the_spec_states_when_an_entry_omits_it() {
+        let spec = read_config_spec();
+        let mut loaded = parse_ok("[[launcher]]\nname = \"lazygit\"\nargs = [\"lazygit\"]\n");
+        let launcher = loaded
+            .document
+            .launchers
+            .pop()
+            .expect("one parsed [[launcher]] entry");
+
+        let mut checked = Vec::new();
+        for (field, kind) in spec_launcher_field_rows(&spec) {
+            let Some(expected) = spec_declared_bool_default(&kind) else {
+                continue;
+            };
+            let actual = match field.as_str() {
+                "shell" => launcher.shell,
+                "takes_terminal" => launcher.takes_terminal,
+                "disabled" => launcher.disabled,
+                other => panic!("no `LauncherConfig` field is wired to the spec's `{other}`"),
+            };
+            assert_eq!(
+                actual, expected,
+                "`{field}` must default to the spec's own stated default"
+            );
+            checked.push(field);
+        }
+        assert_eq!(
+            checked,
+            vec!["shell", "takes_terminal", "disabled"],
+            "the Launchers table's bool rows, in its own order; a parse that stops finding \
+             them would otherwise leave this test asserting nothing"
+        );
+    }
+
     /// Criterion 3's schema-shape half, the exhaustive-destructure guard this ticket's brief
     /// warns about: hand-enumerating the fields a caller reads (`config.args`, `config.shell`,
     /// ...) lets a new field, such as a working-directory one, compile silently. This
@@ -1158,6 +1252,7 @@ mod tests {
             args: _,
             from_env: _,
             shell: _,
+            takes_terminal: _,
             env: _,
             disabled: _,
         } = loaded

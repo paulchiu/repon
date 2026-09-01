@@ -64,7 +64,7 @@ Two halves returning one Entity list. The boundary-stop walk turns a Set's roots
 ## Acting
 
 **Launcher**:
-A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an argv vector rather than a shell string. Repo context reaches it through the environment, never interpolated into a command. Not a Handoff, which names the act rather than the thing.
+A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an argv vector rather than a shell string. Repo context reaches it through the environment, never interpolated into a command. Each one declares whether it takes over the terminal; one that does not is run with the screen still held and with no terminal of its own on any of its three streams. Not a Handoff, which names the act rather than the thing.
 
 **Action**:
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
@@ -127,7 +127,7 @@ The one line above the frame. It carries a Notice alone, or otherwise one list o
 The record that the user has read the outstanding Warnings, made by opening the expanded list. It frees the Warning's message from the Status row and leaves the indicator, a `!` and a count, which is reserved ahead of every item and is the one thing on that row that never drops.
 
 **Terminal state**:
-The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
+The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff that takes the terminal, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
 
 **Residue**:
 Anything Repon enabled in the terminal that is still on after Repon has given the terminal back. The contract is that there is none; it is not that the terminal is as it was, since a state Repon turned off may legitimately stay off.

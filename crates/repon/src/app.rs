@@ -1532,11 +1532,17 @@ impl App {
     /// one, so a test that builds a real one passes on a developer's machine and cannot run
     /// on CI at all; `launcher::run` under a real terminal is covered by the pty harness in
     /// `tests/terminal_restoration.rs`, the one place allowed to drive one.
-    fn run_handoff_over_entity<T>(
+    ///
+    /// A Launcher that kept the screen also gets its failure raised as a Notice
+    /// ([config.md](../../../docs/spec/config.md#launchers)): its child's own output went to
+    /// `/dev/null`, so nothing else would ever tell the user it failed. One that took the
+    /// terminal wrote its error onto the terminal the user was watching, and gets the log
+    /// line alone.
+    fn run_handoff_over_entity(
         &mut self,
         entity_key: &EntityKey,
         chosen: &Launcher,
-        handoff: impl FnOnce(&EntityState) -> Result<T>,
+        handoff: impl FnOnce(&EntityState) -> Result<std::process::ExitStatus>,
     ) {
         let Some(entity) = self
             .core
@@ -1548,8 +1554,13 @@ impl App {
             return;
         };
         let result = self.around_entity_handoff(entity_key, || handoff(&entity));
-        if let Err(err) = result {
+        if let Err(err) = &result {
             tracing::error!("Launcher {:?} failed: {err:#}", chosen.name);
+        }
+        if let Some(failure) = handoff_failure(&result)
+            && !chosen.takes_terminal
+        {
+            self.set_notice(kept_screen_launcher_failure_notice(&chosen.name, &failure));
         }
     }
 
@@ -2243,6 +2254,24 @@ impl App {
         }
         error
     }
+}
+
+/// The one-line failure text a handoff's outcome carries, or `None` for a child that ran and
+/// exited zero. A child that could not be spawned and one that ran and failed are the same
+/// answer to the only question a Launcher's caller asks of it.
+fn handoff_failure(result: &Result<std::process::ExitStatus>) -> Option<String> {
+    match result {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(status.to_string()),
+        Err(err) => Some(err.to_string()),
+    }
+}
+
+/// The Notice a failed Launcher that kept the screen raises
+/// ([config.md](../../../docs/spec/config.md#launchers)): the only channel it has, since its
+/// child wrote to `/dev/null` and Repon's own screen never left.
+fn kept_screen_launcher_failure_notice(name: &str, failure: &str) -> String {
+    format!("launcher `{name}` failed: {failure}")
 }
 
 /// The Notice [`App::restore_session_state`] raises for a Filter that restores active,
@@ -6694,6 +6723,7 @@ mod tests {
             args: Some(args.into_iter().map(str::to_string).collect()),
             from_env: None,
             shell: false,
+            takes_terminal: true,
             env: Default::default(),
             disabled,
         }
@@ -7167,6 +7197,111 @@ mod tests {
             "expected the branch the Launcher checked out to already be visible with no \
              sleep and no settle, got: {:?}",
             entity.branch.settled()
+        );
+    }
+
+    /// A resolved Launcher with a literal argv, its terminal declaration the one thing a
+    /// caller varies.
+    fn resolved_launcher(name: &str, args: Vec<&str>, takes_terminal: bool) -> Launcher {
+        Launcher {
+            name: name.to_string(),
+            source: launcher::Source::Args(args.into_iter().map(str::to_string).collect()),
+            shell: false,
+            takes_terminal,
+            env: Default::default(),
+        }
+    }
+
+    /// Runs `chosen`'s handoff over the first row of an `App` on a fresh repository and
+    /// returns the Notice it left behind. The child's argv reaches a real process; only the
+    /// terminal-owning half is stood in for, since `Tui::new` cannot be built without a
+    /// controlling terminal.
+    fn notice_after_handoff(root: &std::path::Path, chosen: &Launcher) -> Option<String> {
+        let mut app = test_app(root);
+        let entity_key = app
+            .core
+            .snapshot()
+            .entities
+            .first()
+            .expect("one discovered row")
+            .key
+            .clone();
+        app.run_handoff_over_entity(&entity_key, chosen, |entity| {
+            Ok(launcher::build_command(chosen, entity).status()?)
+        });
+        app.notice().map(str::to_string)
+    }
+
+    // config.md's "Launchers": a Launcher that kept the screen wrote its own output to
+    // /dev/null, so its failure has no other channel and Repon raises a Notice naming it and
+    // its exit status.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_failed_raises_a_notice_naming_it_and_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("pane", vec!["false"], false))
+            .expect("a failed launcher that kept the screen must raise a Notice");
+
+        assert!(
+            notice.contains("pane"),
+            "the Notice must name the Launcher that failed, got: {notice:?}"
+        );
+        assert!(
+            notice.contains('1'),
+            "the Notice must carry the child's own exit status, got: {notice:?}"
+        );
+    }
+
+    // The same failure, on a Launcher that took the terminal: no Notice, because the child
+    // wrote its error onto the terminal the user was watching. Proven separately, so a build
+    // that raised the Notice for every failure would still fail here.
+    #[test]
+    fn a_launcher_that_took_the_terminal_and_failed_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("shell", vec!["false"], true));
+
+        assert_eq!(
+            notice, None,
+            "a Launcher that took the terminal showed the user its own error already"
+        );
+    }
+
+    // A Launcher that kept the screen and exited zero says nothing: the Notice reports a
+    // failure, not a run.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_succeeded_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("pane", vec!["true"], false));
+
+        assert_eq!(notice, None, "a successful run is not a failure to report");
+    }
+
+    // A child that could never be spawned is the same answer as one that ran and failed, and
+    // reaches the user the same way: the terminal was never handed over either time, so the
+    // spawn error itself has nowhere else to appear.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_could_not_be_spawned_raises_the_same_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(
+            &root,
+            &resolved_launcher("pane", vec!["repon-test-binary-that-does-not-exist"], false),
+        )
+        .expect("a launcher that could not be spawned must raise a Notice too");
+
+        assert!(
+            notice.contains("pane"),
+            "the Notice must name the Launcher that failed, got: {notice:?}"
         );
     }
 
