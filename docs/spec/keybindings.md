@@ -119,7 +119,7 @@ An **unavailable** binding is Built, is advertised exactly as it always is, and 
 
 The reason is computed at the point of refusal rather than fixed per action, since `;` refusing because no Actions are configured and `;` refusing because none of the selected Repos define one are different facts. Each reason's static text is authored to fit 44 columns, half the narrow screen, and a test asserts the budget rather than the renderer truncating to it.
 
-Four bindings are already conditional in this way. While an Action is fanning out, `;`, `s`, `1` to `9` and `Ctrl+R` are inert, and each now answers with a Notice rather than the silence it gives today.
+Four surfaces are already conditional in this way. While an Action is fanning out, the Action palette (`;`, and `m`, which opens the same palette filtered to the management operations), `s`, `1` to `9` and `Ctrl+R` are inert, and each now answers with a Notice rather than the silence it gives today.
 
 ### Not built yet
 
@@ -128,7 +128,6 @@ The bindings below are reserved and specified but not built: `crates/repon/src/k
 Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, though pressing it now produces nothing: [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) deleted the "not implemented" warning this section used to describe. Wiring the footer and the help overlay to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
 - `d` dismiss a Vanished row
-- `m` open the Action palette filtered to management operations
 
 ## Why these keys and not others
 
@@ -158,7 +157,7 @@ Esc-twice gestures were measured safe against human typing: crossterm collapses 
 
 ## Quitting, suspending, confirming
 
-`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;` and `m`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
 
 The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
 

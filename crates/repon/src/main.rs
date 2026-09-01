@@ -25,6 +25,7 @@ mod launcher;
 mod launcher_palette;
 mod list_viewport;
 mod logging;
+mod management;
 mod message;
 mod notice;
 mod scroll;

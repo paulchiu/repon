@@ -15,6 +15,7 @@ use etcetera::{BaseStrategy, choose_base_strategy};
 use tracing::warn;
 
 pub mod document;
+pub mod repo_entry;
 
 pub use document::{Document, Warning};
 

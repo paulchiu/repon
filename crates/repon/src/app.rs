@@ -11,7 +11,7 @@ use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Snapshot};
 use tracing::debug;
 
 use crate::{
-    action_palette::{ActionPalette, Decision, Stage},
+    action_palette::{ActionPalette, Decision, Entry, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
@@ -24,6 +24,7 @@ use crate::{
     launcher::{self, Launcher},
     launcher_palette::LauncherPalette,
     list_viewport::{half_page_cursor, offset_following_cursor},
+    management::{self, Plan},
     message::Message,
     notice,
     selection::Selection,
@@ -203,6 +204,12 @@ pub struct App {
     /// keeps this on a key, and a struct, entirely separate from `launcher_palette`, the
     /// safety boundary the two palettes exist to hold.
     action_palette: Option<ActionPalette>,
+    /// The built-in management operation's own confirm gate, `Some` only while
+    /// [`ActionPalette`] holds `Stage::Confirming` over a built-in. Built once when the gate
+    /// opens rather than per frame, since a `delete` gate reads every target Repo's working
+    /// tree and refs ([`repon_core::Core::delete_risk`]); the rows it names are the rows the
+    /// run then acts on, so the count on screen and the run cannot disagree.
+    management_plan: Option<Plan>,
     /// `Some` while the Launcher palette has focus, opened by `Action::OpenLauncher` (`!`)
     /// and closed by `Action::Cancel` (`Esc`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context, the same one
@@ -434,6 +441,7 @@ impl App {
             warning_overlay_open: false,
             acknowledged_warnings: Vec::new(),
             action_palette: None,
+            management_plan: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
@@ -1064,12 +1072,16 @@ impl App {
             Some(Action::DismissVanished) => {
                 unreachable!("DismissVanished is unbuilt; dispatch never returns an unbuilt action")
             }
-            // `OpenManagementPalette` is unbuilt for the same reason, and this arm exists for
-            // the same one: exhaustiveness, not reachability.
+            // `m`: the same palette `;` opens, filtered to the built-in management operations
+            // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"). Gated
+            // while a fan-out is in flight for the same reason `;` is: it is the same palette.
             Some(Action::OpenManagementPalette) => {
-                unreachable!(
-                    "OpenManagementPalette is unbuilt; dispatch never returns an unbuilt action"
-                )
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Action palette"));
+                } else {
+                    self.action_palette = Some(ActionPalette::management());
+                }
+                None
             }
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
@@ -1177,15 +1189,25 @@ impl App {
                         .action_palette
                         .as_ref()
                         .and_then(ActionPalette::confirm_run);
+                    let management = self
+                        .action_palette
+                        .as_ref()
+                        .and_then(ActionPalette::confirm_management);
+                    // Exactly one of the two is ever `Some`: `Stage::Confirming` carries one
+                    // `Chosen`, and each accessor answers for its own arm alone.
                     if let Some(spec) = spec {
                         self.start_action(spec);
                     }
-                    self.action_palette = None;
+                    if let Some(operation) = management {
+                        self.run_management(operation);
+                    }
+                    self.close_action_palette();
                 }
                 Some(Action::Decline) => {
                     if let Some(palette) = &mut self.action_palette {
                         palette.decline();
                     }
+                    self.management_plan = None;
                 }
                 None => {}
                 Some(other) => unreachable!(
@@ -1197,7 +1219,7 @@ impl App {
         }
 
         match self.bindings.dispatch(Context::Input, key) {
-            Some(Action::Cancel) => self.action_palette = None,
+            Some(Action::Cancel) => self.close_action_palette(),
             Some(Action::Text(c)) => {
                 if let Some(palette) = &mut self.action_palette {
                     palette.type_char(c, &self.document.actions);
@@ -1465,11 +1487,31 @@ impl App {
     /// partition the fan-out itself uses, so the border title can never show a number a
     /// real choice would not act on. `None` while no palette is open.
     fn action_palette_operable_count(&self) -> Option<usize> {
-        self.action_palette.as_ref().map(|_| {
-            self.cursor_key()
-                .map(|key| self.core.operable_count(&self.selection.targets(&key)))
-                .unwrap_or(0)
+        let palette = self.action_palette.as_ref()?;
+        // A live gate's own count, so the border and the gate can never name two numbers.
+        if let Some(plan) = &self.management_plan {
+            return Some(plan.eligible_count());
+        }
+        let Some(cursor_key) = self.cursor_key() else {
+            return Some(0);
+        };
+        let targets = self.selection.targets(&cursor_key);
+        Some(match palette.highlighted(&self.document.actions) {
+            // A built-in subtracts its own ineligible rows rather than the excluded ones
+            // `operable_count` subtracts: `unignore`'s eligible set is exactly the
+            // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
+            // operations table), which the Action gate's own subtraction would zero.
+            Some(Entry::Builtin(operation)) => self
+                .management_plan_for(operation, &targets)
+                .eligible_count(),
+            Some(Entry::Configured(_)) | None => self.core.operable_count(&targets),
         })
+    }
+
+    /// The cheap half of a built-in's gate: eligibility read from the snapshot, with no risk
+    /// read at all. [`Self::choose_highlighted_action`] is what adds the risk, once.
+    fn management_plan_for(&self, operation: management::Operation, targets: &[EntityKey]) -> Plan {
+        Plan::new(operation, &self.core.snapshot().entities, targets)
     }
 
     fn choose_highlighted_action(&mut self) {
@@ -1477,17 +1519,95 @@ impl App {
             return;
         };
         let targets = self.selection.targets(&cursor_key);
-        let operable_count = self.core.operable_count(&targets);
+        let chosen_builtin = self.action_palette.as_ref().and_then(|palette| {
+            match palette.highlighted(&self.document.actions) {
+                Some(Entry::Builtin(operation)) => Some(operation),
+                Some(Entry::Configured(_)) | None => None,
+            }
+        });
+        // Read once, here, rather than per frame: `delete_risk` opens each target Repo and
+        // walks its refs. A plan with nothing eligible reads nothing, since `with_risk` only
+        // fills the rows the run would act on.
+        let plan = chosen_builtin.map(|operation| {
+            self.management_plan_for(operation, &targets)
+                .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
+        });
+        let operable_count = match &plan {
+            Some(plan) => plan.eligible_count(),
+            None => self.core.operable_count(&targets),
+        };
         let Some(palette) = &mut self.action_palette else {
             return;
         };
         match palette.choose(&self.document.actions, operable_count) {
             Some(Decision::RunImmediately(spec)) => {
                 self.start_action(spec);
-                self.action_palette = None;
+                self.close_action_palette();
             }
-            Some(Decision::NeedsConfirm | Decision::Refused) | None => {}
+            Some(Decision::NeedsConfirm) => self.management_plan = plan,
+            Some(Decision::Refused) | None => {}
         }
+    }
+
+    /// Closes the Action palette and drops whatever gate it was holding, so a plan built for
+    /// one gesture can never be read by the next.
+    fn close_action_palette(&mut self) {
+        self.action_palette = None;
+        self.management_plan = None;
+    }
+
+    /// `y` over a built-in's confirm gate: runs [`Self::management_plan`] against the config
+    /// file, announces what it did and reloads.
+    ///
+    /// The plan is the one the gate was built from, so the rows named on screen are the rows
+    /// acted on. `operation` is checked against it rather than trusted: the two come from the
+    /// palette and from this struct, and a mismatch means a gate outlived its own plan.
+    ///
+    /// The reload is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config"), so
+    /// config reaches the running app one way and a write cannot produce a state the file
+    /// alone would not reproduce. Nothing here touches `self.document`.
+    ///
+    /// Two things the write does not reach, recorded here rather than worked around, because
+    /// closing either means changing a document this implements rather than owns.
+    ///
+    /// The table's `excluded` flag: the reload deliberately does not re-apply `[[repo]]`
+    /// (`reload::App::reload_config`'s own doc comment says so, and
+    /// `reload::App::apply_active_set` rebuilds the `Core` only when the active Set's bounds
+    /// move), because a `Core` cannot take a new [`repon_core::CoreSpec`] short of being
+    /// rebuilt. So an `ignore` written here is on disk and in `self.document`, but
+    /// [`repon_core::EntityState::excluded`] keeps whatever the `Core` started with until the
+    /// next run or the next Set switch.
+    ///
+    /// A deleted Repo's row: no Generation starts here, so a row whose directory this just
+    /// removed keeps its last known values until the next one. `docs/spec/refresh.md`'s
+    /// Triggers table is a closed list and names no management trigger, so starting one here
+    /// would be a ninth trigger that document does not have; `r` is what settles those rows
+    /// Vanished today.
+    fn run_management(&mut self, operation: management::Operation) {
+        // scan: management_write_reload begin -- criterion 8: everything between this pair is
+        // what a management write does after the gate is accepted, and the test over this
+        // region asserts it reaches config through `reload_config` and touches no in-memory
+        // document of its own. A marker that moves or is renamed fails that test loudly rather
+        // than reading as "nothing found".
+        let Some(plan) = self.management_plan.take() else {
+            return;
+        };
+        if plan.operation != operation {
+            tracing::error!(
+                "the confirm gate named `{}` but its plan was built for `{}`; nothing ran",
+                operation.name(),
+                plan.operation.name()
+            );
+            return;
+        }
+        let report = management::run(&plan, &config::config_file());
+        for record in &report.records {
+            tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
+        }
+        self.reload_config();
+        // scan: management_write_reload end
+        self.set_notice(report.summary());
     }
 
     /// Runs `spec` over the current Selection's targets ([`crate::selection::Selection::targets`]),
@@ -1841,6 +1961,13 @@ impl App {
         // before the frame-drawing closure below borrows `self` immutably, so the border
         // title can never show a different number than a real choice would act on.
         let action_palette_operable_count = self.action_palette_operable_count();
+        // Read from the plan the gate was built with, never rebuilt here: a `delete` gate's
+        // own risk read costs a git read per Repo, and a frame must not pay it.
+        let management_lines: Vec<String> = self
+            .management_plan
+            .as_ref()
+            .map(Plan::confirm_lines)
+            .unwrap_or_default();
         // The identical read `Self::choose_highlighted_launcher` does: the resolved Launcher
         // list and the cursor row's own name, computed once here for the same reason
         // `action_palette_operable_count` is, so the border title can never name a different
@@ -1887,6 +2014,7 @@ impl App {
                     &self.theme,
                     &self.document.actions,
                     action_palette_operable_count.unwrap_or(0),
+                    &management_lines,
                 );
                 return;
             }
@@ -2185,6 +2313,7 @@ mod tests {
             warning_overlay_open: false,
             acknowledged_warnings: Vec::new(),
             action_palette: None,
+            management_plan: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
@@ -2871,6 +3000,204 @@ mod tests {
         );
     }
 
+    // =====================================================================================
+    // Criteria 8 and 9: `m` and `;` over the one palette, and the one way a write reaches the
+    // running app.
+    // =====================================================================================
+
+    /// Criterion 9, first half: `m` opens the palette filtered to the built-ins, so a
+    /// config-defined Action declared on the same run is not among its rows.
+    #[test]
+    fn m_opens_the_action_palette_filtered_to_the_built_in_management_operations() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+
+        let palette = app
+            .action_palette
+            .as_ref()
+            .expect("m must open the Action palette");
+        let listed: Vec<String> = palette
+            .matches(&app.document.actions)
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            crate::management::OPERATIONS
+                .iter()
+                .map(|operation| operation.name().to_string())
+                .collect::<Vec<_>>(),
+            "m lists the built-ins and nothing else"
+        );
+    }
+
+    /// Criterion 9, second half: `;` still opens the same palette unfiltered, with both kinds
+    /// of row listed and the built-ins distinguished by text rather than by colour alone
+    /// ([0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md)).
+    #[test]
+    fn semicolon_still_opens_the_palette_unfiltered_with_the_built_ins_distinguished() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("press ;");
+
+        let palette = app
+            .action_palette
+            .as_ref()
+            .expect("; must open the Action palette");
+        let listed: Vec<String> = palette
+            .matches(&app.document.actions)
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        assert!(
+            listed.contains(&"reinstall".to_string()),
+            "the config-defined Action is still listed, got {listed:?}"
+        );
+        for operation in crate::management::OPERATIONS {
+            assert!(
+                listed.contains(&operation.name().to_string()),
+                "the built-in `{}` is listed alongside it, got {listed:?}",
+                operation.name()
+            );
+        }
+
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 10)).expect("create the test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &app.theme,
+                    &app.document.actions,
+                    1,
+                    &[],
+                )
+            })
+            .expect("draw the palette");
+        let rendered: String = (0..10)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let built_in_rows: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                crate::management::OPERATIONS
+                    .iter()
+                    .any(|operation| line.contains(operation.name()))
+            })
+            .collect();
+        assert_eq!(
+            built_in_rows.len(),
+            crate::management::OPERATIONS.len(),
+            "every built-in has a row of its own, got {rendered:?}"
+        );
+        for row in &built_in_rows {
+            assert!(
+                row.contains(crate::action_palette::BUILT_IN_MARK),
+                "a built-in row must say so in its own text, not only in its colour: {row:?}"
+            );
+        }
+        let configured_row = rendered
+            .lines()
+            .find(|line| line.contains("reinstall"))
+            .expect("the config-defined Action has a row");
+        assert!(
+            !configured_row.contains(crate::action_palette::BUILT_IN_MARK),
+            "a config-defined Action must not carry the built-in mark: {configured_row:?}"
+        );
+    }
+
+    /// Criterion 6's "computed, not stubbed" half at the call site: the gate's risk comes
+    /// from [`repon_core::Core::delete_risk`], the real git read, and not from a literal this
+    /// crate could hand [`crate::management::Plan::with_risk`] instead. What that read
+    /// actually reads is `repon-core`'s own `delete_risk_reads_all_three_facts_the_confirm_gate_names`;
+    /// this holds the wiring between the two.
+    #[test]
+    fn the_delete_gate_reads_its_risk_from_the_core_rather_than_a_literal() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+
+        let call_sites: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(".with_risk("))
+            .collect();
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "expected exactly one place a gate's risk is filled in, found: {call_sites:?}"
+        );
+        assert!(
+            source.contains("self.core.delete_risk(key)"),
+            "the one call must read the risk off the Core"
+        );
+    }
+
+    /// Criterion 8, first half: nothing anywhere in this workspace assigns the in-memory
+    /// document except the reload path itself, so a write can only reach the running app by
+    /// being read back off disk. Scanned over every workspace crate's `src`, not this file
+    /// alone, since a second assignment is as possible in `app/reload.rs` or a module added
+    /// later as it is here.
+    #[test]
+    fn nothing_assigns_the_in_memory_document_outside_the_reload_path() {
+        let assignments = crate::test_support::production_lines_containing("self.document = ");
+
+        assert_eq!(
+            assignments.len(),
+            1,
+            "expected exactly one assignment of the in-memory document, found: {assignments:?}"
+        );
+        assert!(
+            assignments[0].contains("app/reload.rs"),
+            "the one assignment must be the reload path's own, found: {assignments:?}"
+        );
+    }
+
+    /// Criterion 8, second half: after a management write, config reaches the running app
+    /// through [`App::reload_config`], the identical path `Action::ReloadConfig` dispatches
+    /// to, and the write path itself touches no in-memory state of its own. Read over
+    /// `run_management`'s own marked region rather than the whole file, since
+    /// `reload_config` is legitimately called from elsewhere and `self.document` is
+    /// legitimately read all over this one.
+    #[test]
+    fn a_management_write_reaches_the_running_app_through_the_reload_config_path_alone() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+        let region = crate::test_support::source_region(&source, "management_write_reload")
+            .expect("run_management's own scan markers are still in place");
+
+        assert!(
+            region.contains("self.reload_config()"),
+            "a management write must reload through the same path Action::ReloadConfig runs,              got: {region}"
+        );
+        assert!(
+            !region.contains("self.document"),
+            "a management write must never touch the in-memory document, got: {region}"
+        );
+        let dispatch = crate::test_support::source_region(&source, "key_event_dispatch")
+            .expect("the key dispatch's own scan markers are still in place");
+        assert!(
+            dispatch.contains("self.reload_config()"),
+            "the claim is that both reach the same call; if Action::ReloadConfig stopped              calling it, this test would otherwise still pass: {dispatch}"
+        );
+    }
+
     /// Criterion 5's own "exactly four, no more": every call site that raises
     /// `action_running_notice` across both crates, since a Launcher and an Action step's
     /// executor both spawn child processes and a scan confined to one crate would be
@@ -2908,13 +3235,18 @@ mod tests {
         assert_eq!(
             call_sites,
             vec![
+                // Twice, and one surface: `;` and `m` both open the Action palette, `m`
+                // filtered to the built-in management operations
+                // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"), so
+                // both are inert for the identical reason and say the identical thing.
+                "Action palette",
                 "Action palette",
                 "Reload config",
                 "Set picker",
                 "Set switch"
             ],
-            "expected exactly the ticket's own four groups gated on action_running, no more \
-             and no fewer, found: {call_sites:?}"
+            "expected exactly the four surfaces gated on action_running, no more and no \
+             fewer, found: {call_sites:?}"
         );
     }
 
@@ -5366,8 +5698,8 @@ mod tests {
             app.action_palette
                 .as_ref()
                 .map(|palette| palette.matches(&app.document.actions).len()),
-            Some(1),
-            "an empty query still matches every configured action"
+            Some(1 + crate::management::OPERATIONS.len()),
+            "an empty query still matches every configured action, and the built-ins"
         );
     }
 

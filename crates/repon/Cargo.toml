@@ -60,6 +60,16 @@ signal-hook = "0.4.4"
 # `editor::edit` writes and rereads one in production.
 tempfile = "3.27.0"
 toml = "1.1.4"
+# The read-modify-write of `config.toml` behind the `[[repo]]` entries Repon owns
+# (ADR 0028): `toml` above deserialises into this crate's own structs and cannot round-trip a
+# hand-edited document without dropping every comment, which is the file's whole value under
+# ADR 0014. Kept alongside `toml` rather than replacing it, since the schema, the four failure
+# grades and the unknown-key warning are all built on serde deserialisation this does not do.
+# It shares `indexmap`, `serde_spanned`, `toml_datetime`, `toml_parser`, `toml_writer` and
+# `winnow` with the `toml` already here, so it adds one package to the lockfile. Not a core
+# dependency: nothing in `repon-core` reads or writes a file, so `check-core-isolation`'s
+# allowlist is untouched.
+toml_edit = "0.25.13"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

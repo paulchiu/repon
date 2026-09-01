@@ -41,6 +41,9 @@ pub enum ProbeError {
     /// Phase C's status read could not run: a platform that would not build, or
     /// an iterator that errored partway through.
     Status(Arc<str>),
+    /// The unpushed-commit count behind a `delete` confirm gate could not run: refs that
+    /// would not list, or a missing or corrupt commit, never a stand-in for zero.
+    Unpushed(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -63,6 +66,9 @@ impl std::fmt::Display for ProbeError {
                 )
             }
             ProbeError::Status(message) => write!(f, "failed to read status: {message}"),
+            ProbeError::Unpushed(message) => {
+                write!(f, "failed to count unpushed commits: {message}")
+            }
         }
     }
 }
@@ -213,6 +219,85 @@ pub(crate) fn resolve_sync(
     ahead_behind(repo, *commit, upstream)
         .map(SyncState::Tracking)
         .map_err(|error| ProbeError::AheadBehind(error.into()))
+}
+
+/// Every commit on one of `repo`'s own local branches that no remote-tracking ref already
+/// carries, and how many local branches carry at least one: `git log --branches --not
+/// --remotes`, counted whole and again per branch.
+///
+/// Read against the remote-tracking refs rather than each branch's configured upstream, so a
+/// branch that was never pushed and has no upstream at all counts every commit of its own
+/// rather than none. A Repo with no remote therefore has its whole history unpushed, which is
+/// exactly the case [ADR 0028](https://github.com/paulchiu/repon/blob/main/docs/adr/0028-repon-writes-the-repo-entries-it-owns.md)
+/// names as the one that actually loses work when a working tree is deleted.
+pub(crate) fn unpushed(repo: &gix::Repository) -> Result<(u32, u32), ProbeError> {
+    let remote_tips = branch_tips(repo, Branches::Remote)?;
+    let local_tips = branch_tips(repo, Branches::Local)?;
+    if local_tips.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut branches = 0u32;
+    for tip in &local_tips {
+        if commits_not_carried_by(repo, &[*tip], &remote_tips)? > 0 {
+            branches += 1;
+        }
+    }
+    let commits = commits_not_carried_by(repo, &local_tips, &remote_tips)?;
+    Ok((commits, branches))
+}
+
+/// Which half of the ref namespace [`branch_tips`] reads.
+#[derive(Debug, Clone, Copy)]
+enum Branches {
+    Local,
+    Remote,
+}
+
+/// Every commit `tips` reaches that `hidden` does not, the same shape as `git rev-list tips
+/// --not hidden --count`. An empty `hidden` hides nothing, which is what makes a Repo with no
+/// remote count its whole history.
+fn commits_not_carried_by(
+    repo: &gix::Repository,
+    tips: &[gix::ObjectId],
+    hidden: &[gix::ObjectId],
+) -> Result<u32, ProbeError> {
+    let walk = repo
+        .rev_walk(tips.iter().copied())
+        .with_hidden(hidden.iter().copied())
+        .all()
+        .map_err(|error| ProbeError::Unpushed(error.to_string().into()))?;
+    let mut count = 0u32;
+    for info in walk {
+        info.map_err(|error| ProbeError::Unpushed(error.to_string().into()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// The commit every branch in one half of the ref namespace points at. A ref that will not
+/// peel (a symbolic `refs/remotes/origin/HEAD`, or a tag object where a commit was expected)
+/// is skipped rather than failing the whole read: it names a commit some other ref in the
+/// same half already names.
+fn branch_tips(repo: &gix::Repository, which: Branches) -> Result<Vec<gix::ObjectId>, ProbeError> {
+    let platform = repo
+        .references()
+        .map_err(|error| ProbeError::Unpushed(error.to_string().into()))?;
+    let iter = match which {
+        Branches::Local => platform.local_branches(),
+        Branches::Remote => platform.remote_branches(),
+    }
+    .map_err(|error| ProbeError::Unpushed(error.to_string().into()))?;
+
+    let mut tips = Vec::new();
+    for reference in iter {
+        let mut reference =
+            reference.map_err(|error| ProbeError::Unpushed(error.to_string().into()))?;
+        if let Ok(id) = reference.peel_to_id() {
+            tips.push(id.detach());
+        }
+    }
+    Ok(tips)
 }
 
 /// One of the ten shapes an in-progress git operation can take, one to one with
@@ -1228,5 +1313,85 @@ mod tests {
             "expected the pre-set cancel flag to stop the read rather than complete it, got \
              {result:?}"
         );
+    }
+
+    // --- the `delete` confirm gate's unpushed count (docs/spec/repo-management.md) ---
+
+    /// A repository with one commit and nothing under `refs/remotes/`, built in a temp
+    /// directory of this test's own making: no path from config, no environment variable and
+    /// no working directory reaches here.
+    fn repository_with_one_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+        git(dir.path(), &["commit", "--allow-empty", "-m", "first"]);
+        dir
+    }
+
+    fn opened(path: &Path) -> gix::Repository {
+        open_thread_safe(path).expect("open").to_thread_local()
+    }
+
+    /// The case ADR 0028 names as the one that actually loses work: a Repo whose commits sit
+    /// on no remote at all. Every commit is unpushed, on the one branch carrying them.
+    #[test]
+    fn a_repository_with_no_remote_ref_at_all_has_every_commit_unpushed() {
+        let dir = repository_with_one_commit();
+
+        let (commits, branches) = unpushed(&opened(dir.path())).expect("count unpushed");
+
+        assert_eq!((commits, branches), (1, 1));
+    }
+
+    /// A remote-tracking ref carrying the same commit leaves nothing unpushed, which is the
+    /// "listed plainly" half of the gate.
+    #[test]
+    fn a_commit_a_remote_tracking_ref_already_carries_is_not_unpushed() {
+        let dir = repository_with_one_commit();
+        let sha = head_sha(dir.path());
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &sha],
+        );
+
+        let (commits, branches) = unpushed(&opened(dir.path())).expect("count unpushed");
+
+        assert_eq!((commits, branches), (0, 0));
+    }
+
+    /// The count is per commit and per branch, and a commit reachable from two local branches
+    /// is one unpushed commit on two branches rather than two commits.
+    #[test]
+    fn unpushed_counts_commits_once_and_names_every_branch_carrying_one() {
+        let dir = repository_with_one_commit();
+        let sha = head_sha(dir.path());
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &sha],
+        );
+        git(dir.path(), &["commit", "--allow-empty", "-m", "second"]);
+        git(dir.path(), &["branch", "sidecar"]);
+        git(dir.path(), &["checkout", "sidecar"]);
+        git(dir.path(), &["commit", "--allow-empty", "-m", "third"]);
+
+        let (commits, branches) = unpushed(&opened(dir.path())).expect("count unpushed");
+
+        assert_eq!(
+            (commits, branches),
+            (2, 2),
+            "the commit both branches carry counts once, not once per branch, and both \
+             branches carrying one are named"
+        );
+    }
+
+    /// An unborn HEAD has no local branch to walk, and answering zero there is a fact rather
+    /// than a fallback: there is nothing committed to lose.
+    #[test]
+    fn an_unborn_repository_has_nothing_unpushed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("init");
+
+        let (commits, branches) = unpushed(&opened(dir.path())).expect("count unpushed");
+
+        assert_eq!((commits, branches), (0, 0));
     }
 }

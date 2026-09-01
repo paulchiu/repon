@@ -7,7 +7,7 @@
 //! [`crate::launcher`]'s on separate keys because one acts on a single Repo and hands over
 //! the terminal while the other acts on N Repos unattended and can do damage; merging them
 //! back into one would reopen the exact failure the split exists to prevent, "open a shell
-//! here" sliding into "run this across 99 repos". That is also why [`matching`] below has no
+//! here" sliding into "run this across 99 repos". That is also why [`entries`] below has no
 //! counterpart shared with [`crate::launcher`]: each palette searches only its own list, by
 //! construction of its own function's parameter type, so a query typed into one has no path
 //! to an entry the other owns.
@@ -31,6 +31,7 @@ use repon_core::{ActionSpec, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
+    management::{self, Operation},
     theme::{Meaning, Role, Theme},
 };
 
@@ -45,22 +46,77 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 /// configured an Action has no reason to know where one is declared.
 pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
 
-/// Case-insensitive substring match against a `[[action]]` entry's own name, never its
-/// description: matching on the description would let a query naming an unrelated Action's
-/// stray word highlight the wrong entry, one keystroke short of the slip
+/// The suffix a built-in management operation's row carries, so it is told apart from a
+/// config-defined Action by its text and not only by its colour
+/// ([0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md) forbids meaning
+/// carried by colour alone).
+pub(crate) const BUILT_IN_MARK: &str = "(built-in)";
+
+/// Which entries the palette lists. One palette, two ways in
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"): `;` opens it
+/// unfiltered, and `m` opens the same palette filtered to the built-in management
+/// operations, which is a filter over the one list rather than a second chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Everything,
+    ManagementOnly,
+}
+
+/// One row of the palette: a built-in management operation or a config-defined `[[action]]`.
+/// The config-defined entries come first, in file order, and the built-ins after them in
+/// their own fixed order: the row `Enter` targets with nothing typed is then still the first
+/// `[[action]]` a user declared, so gaining three built-ins (one of them destructive) does not
+/// move what an existing gesture does.
+#[derive(Debug, Clone)]
+pub(crate) enum Entry<'a> {
+    Builtin(Operation),
+    Configured(&'a ActionConfig),
+}
+
+impl Entry<'_> {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Entry::Builtin(operation) => operation.name(),
+            Entry::Configured(action) => action.name.get_ref(),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Entry::Builtin(operation) => operation.description(),
+            Entry::Configured(action) => action.description.as_deref().unwrap_or(""),
+        }
+    }
+}
+
+/// `actions` and the built-ins together, narrowed by `scope` and then by `query`, in the one
+/// order the palette ever lists them in.
+///
+/// A case-insensitive substring match against a row's own name, never its description:
+/// matching on the description would let a query naming an unrelated Action's stray word
+/// highlight the wrong entry, one keystroke short of the slip
 /// [0008](../../../docs/adr/0008-two-palettes-not-one.md) exists to prevent. An empty query
-/// matches every entry, which is what an just-opened palette shows before anything is typed.
+/// matches every entry, which is what a just-opened palette shows before anything is typed.
 ///
 /// This crate's Filter deliberately refuses fuzzy matching
 /// ([filter.md](../../../docs/spec/filter.md): "There is no ranking and no fuzzy matching")
 /// because a list that cannot reorder cannot show why a row matched; the same reasoning
 /// applies here; a palette list never reorders either, so this stays a plain substring test
 /// rather than a scored fuzzy one.
-pub(crate) fn matching<'a>(actions: &'a [ActionConfig], query: &str) -> Vec<&'a ActionConfig> {
+pub(crate) fn entries<'a>(
+    actions: &'a [ActionConfig],
+    scope: Scope,
+    query: &str,
+) -> Vec<Entry<'a>> {
     let query = query.to_lowercase();
-    actions
-        .iter()
-        .filter(|action| action.name.get_ref().to_lowercase().contains(&query))
+    let configured: Vec<Entry<'a>> = match scope {
+        Scope::Everything => actions.iter().map(Entry::Configured).collect(),
+        Scope::ManagementOnly => Vec::new(),
+    };
+    configured
+        .into_iter()
+        .chain(management::OPERATIONS.into_iter().map(Entry::Builtin))
+        .filter(|entry| entry.name().to_lowercase().contains(&query))
         .collect()
 }
 
@@ -149,7 +205,18 @@ fn to_ad_hoc_action_spec(text: &str, steps: Vec<Step>) -> ActionSpec {
 #[derive(Debug, Clone)]
 pub(crate) enum Stage {
     Choosing,
-    Confirming(ActionConfig),
+    Confirming(Chosen),
+}
+
+/// The entry a live confirm gate is asking about, by value rather than by index into the
+/// matched list, since a config reload can change that list's shape while the gate is open.
+#[derive(Debug, Clone)]
+pub(crate) enum Chosen {
+    Configured(ActionConfig),
+    /// A built-in management operation. The rows it will act on, and what accepting
+    /// destroys, are `App`'s own [`crate::management::Plan`]: this palette carries which
+    /// operation was chosen and nothing about the world.
+    Management(Operation),
 }
 
 /// What choosing the highlighted entry resolves to, for `App` to act on: this module only
@@ -181,15 +248,27 @@ pub(crate) struct ActionPalette {
     cursor: usize,
     stage: Stage,
     refusal: Option<String>,
+    scope: Scope,
 }
 
 impl ActionPalette {
+    /// `;`: every entry, the built-ins listed alongside the config-defined Actions.
     pub(crate) fn new() -> Self {
+        Self::scoped(Scope::Everything)
+    }
+
+    /// `m`: the same palette filtered to the built-in management operations.
+    pub(crate) fn management() -> Self {
+        Self::scoped(Scope::ManagementOnly)
+    }
+
+    fn scoped(scope: Scope) -> Self {
         Self {
             query: String::new(),
             cursor: 0,
             stage: Stage::Choosing,
             refusal: None,
+            scope,
         }
     }
 
@@ -205,19 +284,19 @@ impl ActionPalette {
         self.refusal.as_deref()
     }
 
-    /// `actions` narrowed by the typed query, in `actions`' own order: never reordered, per
-    /// this module's own doc comment on why matching stays a plain substring test.
-    pub(crate) fn matches<'a>(&self, actions: &'a [ActionConfig]) -> Vec<&'a ActionConfig> {
-        matching(actions, &self.query)
+    /// The built-ins and `actions` narrowed by this palette's scope and the typed query, in
+    /// that one order: never reordered, per this module's own doc comment on why matching
+    /// stays a plain substring test.
+    pub(crate) fn matches<'a>(&self, actions: &'a [ActionConfig]) -> Vec<Entry<'a>> {
+        entries(actions, self.scope, &self.query)
     }
 
-    /// The row the cursor currently sits on among `actions` narrowed by the query, if any
-    /// match at all.
-    pub(crate) fn highlighted<'a>(&self, actions: &'a [ActionConfig]) -> Option<&'a ActionConfig> {
+    /// The row the cursor currently sits on among the matches, if any match at all.
+    pub(crate) fn highlighted<'a>(&self, actions: &'a [ActionConfig]) -> Option<Entry<'a>> {
         self.matches(actions).into_iter().nth(self.cursor)
     }
 
-    /// Clamps `self.cursor` back inside `actions`' current match count, called after every
+    /// Clamps `self.cursor` back inside the current match count, called after every
     /// edit to the query: typing can shrink the match list out from under a cursor sitting
     /// past its new end.
     fn clamp_cursor(&mut self, actions: &[ActionConfig]) {
@@ -323,20 +402,33 @@ impl ActionPalette {
     ) -> Option<Decision> {
         match self.highlighted(actions) {
             Some(entry) => {
-                let entry = entry.clone();
                 if operable_count == 0 {
                     self.refusal = Some(format!(
                         "\"{}\" targets 0 repos and was not run",
-                        entry.name.get_ref()
+                        entry.name()
                     ));
                     return Some(Decision::Refused);
                 }
                 self.refusal = None;
-                if entry.confirm {
-                    self.stage = Stage::Confirming(entry);
-                    Some(Decision::NeedsConfirm)
-                } else {
-                    Some(Decision::RunImmediately(to_action_spec(&entry)))
+                match entry {
+                    // A built-in always asks: `delete` destroys work permanently, and
+                    // `ignore`/`unignore` use the ordinary gate
+                    // ([repo-management.md](../../../docs/spec/repo-management.md)'s "The
+                    // confirm gate"). There is no `confirm = false` to opt out with, since a
+                    // built-in has no config entry to declare one in.
+                    Entry::Builtin(operation) => {
+                        self.stage = Stage::Confirming(Chosen::Management(operation));
+                        Some(Decision::NeedsConfirm)
+                    }
+                    Entry::Configured(action) => {
+                        let action = action.clone();
+                        if action.confirm {
+                            self.stage = Stage::Confirming(Chosen::Configured(action));
+                            Some(Decision::NeedsConfirm)
+                        } else {
+                            Some(Decision::RunImmediately(to_action_spec(&action)))
+                        }
+                    }
                 }
             }
             None => {
@@ -365,8 +457,18 @@ impl ActionPalette {
     /// which only calls this once `Context::Confirm` is live).
     pub(crate) fn confirm_run(&self) -> Option<ActionSpec> {
         match &self.stage {
-            Stage::Confirming(entry) => Some(to_action_spec(entry)),
-            Stage::Choosing => None,
+            Stage::Confirming(Chosen::Configured(entry)) => Some(to_action_spec(entry)),
+            Stage::Confirming(Chosen::Management(_)) | Stage::Choosing => None,
+        }
+    }
+
+    /// `y` (`Action::Run`) in `Stage::Confirming` over a built-in: which management operation
+    /// the gate was asking about. `App` is what runs it, since running one reads and writes
+    /// files this module knows nothing about.
+    pub(crate) fn confirm_management(&self) -> Option<Operation> {
+        match &self.stage {
+            Stage::Confirming(Chosen::Management(operation)) => Some(*operation),
+            Stage::Confirming(Chosen::Configured(_)) | Stage::Choosing => None,
         }
     }
 
@@ -393,6 +495,7 @@ impl ActionPalette {
         theme: &Theme,
         actions: &[ActionConfig],
         operable_count: usize,
+        management_lines: &[String],
     ) {
         let block = Block::bordered()
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
@@ -401,20 +504,33 @@ impl ActionPalette {
         frame.render_widget(block, area);
 
         match &self.stage {
-            Stage::Confirming(entry) => {
-                let line = format!(
-                    "run \"{}\" on {operable_count} repos?",
-                    entry.name.get_ref()
-                );
-                frame
-                    .buffer_mut()
-                    .set_string(interior.x, interior.y, &line, Style::new());
-                frame.buffer_mut().set_string(
-                    interior.x,
-                    interior.y + 1,
-                    "y run  n cancel",
-                    theme.style_for(Role::Dim),
-                );
+            Stage::Confirming(chosen) => {
+                let mut rows: Vec<String> = match chosen {
+                    Chosen::Configured(entry) => vec![format!(
+                        "run \"{}\" on {operable_count} repos?",
+                        entry.name.get_ref()
+                    )],
+                    // The built-in's own gate is `App`'s [`crate::management::Plan`], which
+                    // already carries the headline, the per-Repo lines and the no-undo
+                    // sentence; this draws them rather than composing a second, differently
+                    // worded gate here.
+                    Chosen::Management(_) => management_lines.to_vec(),
+                };
+                rows.push("y run  n cancel".to_string());
+                let last = rows.len().saturating_sub(1);
+                for (row, line) in rows.iter().enumerate() {
+                    if row as u16 >= interior.height {
+                        break;
+                    }
+                    let style = if row == last {
+                        theme.style_for(Role::Dim)
+                    } else {
+                        Style::new()
+                    };
+                    frame
+                        .buffer_mut()
+                        .set_string(interior.x, interior.y + row as u16, line, style);
+                }
             }
             Stage::Choosing => {
                 let query_line = format!("; {}", self.query);
@@ -428,29 +544,52 @@ impl ActionPalette {
                 let matches = self.matches(actions);
                 let rows_below_query = interior.height.saturating_sub(1) as usize;
                 if matches.is_empty() {
-                    let message = if actions.is_empty() {
-                        NO_ACTIONS_CONFIGURED_MESSAGE
-                    } else {
-                        NO_MATCHES_MESSAGE
-                    };
                     frame.buffer_mut().set_string(
                         interior.x,
                         interior.y + 1,
-                        message,
+                        NO_MATCHES_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
                 } else {
                     for (row, entry) in matches.iter().enumerate().take(rows_below_query) {
                         let marker = if row == self.cursor { "> " } else { "  " };
-                        let description = entry.description.as_deref().unwrap_or("");
-                        let line = format!("{marker}{}  {description}", entry.name.get_ref());
+                        let line = format!(
+                            "{marker}{}  {}{}",
+                            entry.name(),
+                            entry.description(),
+                            match entry {
+                                Entry::Builtin(_) => format!("  {BUILT_IN_MARK}"),
+                                Entry::Configured(_) => String::new(),
+                            }
+                        );
+                        // The built-ins are told apart by the mark in that text and by
+                        // `Role::Accent`, never by the colour alone
+                        // ([0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md)).
+                        let style = match entry {
+                            Entry::Builtin(_) => theme.style_for(Role::Accent),
+                            Entry::Configured(_) => Style::new(),
+                        };
                         frame.buffer_mut().set_string(
                             interior.x,
                             interior.y + 1 + row as u16,
                             &line,
-                            Style::new(),
+                            style,
                         );
                     }
+                }
+                // The three built-ins are always listed, so an unconfigured run is never an
+                // empty list any more; the hint that names where an `[[action]]` is declared
+                // follows them instead of replacing them.
+                if self.scope == Scope::Everything
+                    && actions.is_empty()
+                    && matches.len() < rows_below_query
+                {
+                    frame.buffer_mut().set_string(
+                        interior.x,
+                        interior.y + 1 + matches.len() as u16,
+                        NO_ACTIONS_CONFIGURED_MESSAGE,
+                        theme.style_for(Role::Dim),
+                    );
                 }
                 if let Some(refusal) = &self.refusal {
                     let row = interior.y + interior.height.saturating_sub(1);
@@ -495,7 +634,7 @@ mod tests {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let launcher_only_name = "lazygit";
 
-        let matches = matching(&actions, launcher_only_name);
+        let matches = entries(&actions, Scope::Everything, launcher_only_name);
 
         assert!(
             matches.is_empty(),
@@ -504,19 +643,34 @@ mod tests {
         );
     }
 
+    /// How many rows a query matching `configured` of the `[[action]]` entries lists: the
+    /// built-ins are always among them, counted from `OPERATIONS` itself rather than from a
+    /// literal three, so adding a fourth built-in does not need every count below rewritten.
+    fn listed(configured: usize) -> usize {
+        configured + management::OPERATIONS.len()
+    }
+
+    fn names(entries: &[Entry<'_>]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect()
+    }
+
     #[test]
     fn matching_is_case_insensitive_substring_and_empty_query_matches_everything() {
         let actions = vec![action("reinstall", true), action("deploy", true)];
 
         assert_eq!(
-            matching(&actions, "INSTALL")
-                .iter()
-                .map(|a| a.name.get_ref().as_str())
-                .collect::<Vec<_>>(),
+            names(&entries(&actions, Scope::Everything, "INSTALL")),
             vec!["reinstall"]
         );
-        assert_eq!(matching(&actions, "").len(), 2);
-        assert!(matching(&actions, "nothing-named-this").is_empty());
+        assert_eq!(
+            names(&entries(&actions, Scope::Everything, "")),
+            vec!["reinstall", "deploy", "ignore", "unignore", "delete"],
+            "an empty query lists everything, config-defined first and the built-ins after"
+        );
+        assert!(entries(&actions, Scope::Everything, "nothing-named-this").is_empty());
     }
 
     // --- Criterion 3: the border title carries the Selection count ---
@@ -551,7 +705,7 @@ mod tests {
 
         assert!(matches!(decision, Some(Decision::NeedsConfirm)));
         assert!(
-            matches!(palette.stage(), Stage::Confirming(entry) if entry.name.get_ref() == "reinstall")
+            matches!(palette.stage(), Stage::Confirming(Chosen::Configured(entry)) if entry.name.get_ref() == "reinstall")
         );
     }
 
@@ -771,10 +925,10 @@ mod tests {
         palette.decline();
 
         assert!(matches!(palette.stage(), Stage::Choosing));
-        assert_eq!(
-            palette.matches(&actions).len(),
-            1,
-            "the query survives decline"
+        assert_eq!(palette.text(), "r", "the query survives decline");
+        assert!(
+            palette.matches(&actions).len() < listed(1),
+            "and still narrows the list it survived into"
         );
     }
 
@@ -811,7 +965,7 @@ mod tests {
 
         assert_eq!(
             palette.matches(&actions).len(),
-            1,
+            listed(1),
             "an empty query still matches everything"
         );
     }
@@ -838,28 +992,31 @@ mod tests {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
         palette.type_char('r', &actions);
-        assert_eq!(palette.matches(&actions).len(), 1);
+        let narrowed = palette.matches(&actions).len();
+        assert!(narrowed < listed(2), "the query has to narrow something");
 
         palette.clear_line(&actions);
 
-        assert_eq!(palette.matches(&actions).len(), 2);
+        assert_eq!(palette.matches(&actions).len(), listed(2));
     }
 
     #[test]
     fn move_highlight_clamps_at_both_ends_rather_than_wrapping() {
-        let actions = vec![action("a", true), action("b", true)];
-        let mut palette = ActionPalette::new();
+        // Scoped to the built-ins, so the list under test has a known end: `;`'s own list
+        // ends with them either way, and clamping is about the end, not about which rows.
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::management();
 
         palette.move_highlight(-1, &actions);
-        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "a");
+        assert_eq!(palette.highlighted(&actions).unwrap().name(), "ignore");
 
         palette.move_highlight(1, &actions);
-        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "b");
+        assert_eq!(palette.highlighted(&actions).unwrap().name(), "unignore");
 
-        palette.move_highlight(1, &actions);
+        palette.move_highlight(2, &actions);
         assert_eq!(
-            palette.highlighted(&actions).unwrap().name.get_ref(),
-            "b",
+            palette.highlighted(&actions).unwrap().name(),
+            "delete",
             "moving past the last entry must clamp, not wrap back to the first"
         );
     }
@@ -871,10 +1028,10 @@ mod tests {
         palette.move_highlight(1, &actions); // cursor -> 1 ("ab"), among all three
 
         palette.type_char('a', &actions); // narrows to ["aa", "ab"]; cursor 1 still valid
-        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "ab");
+        assert_eq!(palette.highlighted(&actions).unwrap().name(), "ab");
 
         palette.type_char('b', &actions); // narrows to ["ab"] alone; cursor must clamp to 0
-        assert_eq!(palette.highlighted(&actions).unwrap().name.get_ref(), "ab");
+        assert_eq!(palette.highlighted(&actions).unwrap().name(), "ab");
     }
 
     // --- to_action_spec / to_steps ---
@@ -932,7 +1089,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 3);
+                palette.draw(frame, frame.area(), &theme, &actions, 3, &[]);
             })
             .expect("draw the frame");
 
@@ -956,7 +1113,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 2);
+                palette.draw(frame, frame.area(), &theme, &actions, 2, &[]);
             })
             .expect("draw the frame");
 
@@ -991,7 +1148,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 12);
+                palette.draw(frame, frame.area(), &theme, &actions, 12, &[]);
             })
             .expect("draw the frame");
 
@@ -1076,7 +1233,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &monochrome, &actions, 2);
+                palette.draw(frame, frame.area(), &monochrome, &actions, 2, &[]);
             })
             .expect("draw the frame");
 
@@ -1176,6 +1333,12 @@ mod tests {
             .collect()
     }
 
+    /// Every row of a rendered palette as one string, for a claim about text that can
+    /// legitimately land on a different row as the list grows.
+    fn all_rows(buf: &ratatui::buffer::Buffer) -> String {
+        (0..10).map(|y| row_text(buf, y, 40)).collect()
+    }
+
     fn draw_to_buffer(
         palette: &ActionPalette,
         actions: &[ActionConfig],
@@ -1186,7 +1349,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), theme, actions, operable_count))
+            .draw(|frame| palette.draw(frame, frame.area(), theme, actions, operable_count, &[]))
             .expect("draw the frame");
         terminal.backend().buffer().clone()
     }
@@ -1256,10 +1419,12 @@ mod tests {
 
         let buf = draw_to_buffer(&palette, &[], &Theme::default(), 0);
 
+        // Below the three built-ins rather than in place of them: the list is never empty
+        // any more, so the hint that names where an `[[action]]` is declared follows them.
         assert!(
-            row_text(&buf, 2, 40).contains(NO_ACTIONS_CONFIGURED_MESSAGE),
+            all_rows(&buf).contains(NO_ACTIONS_CONFIGURED_MESSAGE),
             "expected the nothing-configured message naming `[[action]]`, got: {:?}",
-            row_text(&buf, 2, 40)
+            all_rows(&buf)
         );
     }
 
@@ -1280,8 +1445,8 @@ mod tests {
         let nothing_configured_buf = draw_to_buffer(&nothing_configured, &[], &theme, 0);
 
         assert_ne!(
-            row_text(&no_match_buf, 2, 40),
-            row_text(&nothing_configured_buf, 2, 40),
+            all_rows(&no_match_buf),
+            all_rows(&nothing_configured_buf),
             "a query matching nothing and an empty Action list must render differently"
         );
     }
@@ -1302,21 +1467,22 @@ mod tests {
         let no_match_state = draw_to_buffer(&no_match, &actions, &theme, 3);
         let nothing_configured_state = draw_to_buffer(&ActionPalette::new(), &[], &theme, 0);
 
-        let second_row = |buf: &ratatui::buffer::Buffer| row_text(buf, 2, 40);
+        // Read over the whole render rather than one row: the built-ins are listed in every
+        // state now, so each state's own distinguishing text can legitimately sit below them.
         assert!(
-            second_row(&matching_state).contains("reinstall"),
+            all_rows(&matching_state).contains("reinstall"),
             "the matches state must list the configured entry"
         );
-        assert!(second_row(&no_match_state).contains(NO_MATCHES_MESSAGE));
-        assert!(second_row(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
-        assert_ne!(second_row(&matching_state), second_row(&no_match_state));
+        assert!(all_rows(&no_match_state).contains(NO_MATCHES_MESSAGE));
+        assert!(all_rows(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
+        assert_ne!(all_rows(&matching_state), all_rows(&no_match_state));
         assert_ne!(
-            second_row(&matching_state),
-            second_row(&nothing_configured_state)
+            all_rows(&matching_state),
+            all_rows(&nothing_configured_state)
         );
         assert_ne!(
-            second_row(&no_match_state),
-            second_row(&nothing_configured_state)
+            all_rows(&no_match_state),
+            all_rows(&nothing_configured_state)
         );
     }
 

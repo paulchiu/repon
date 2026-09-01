@@ -104,13 +104,12 @@ fn no_such_set_notice(declared: usize) -> String {
     format!("only {declared} Set{plural} declared; press s to pick one")
 }
 
-/// The Notice each of the four bindings
+/// The Notice each binding inert while an Action is fanning out
 /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
-/// confirming") raises while an Action is fanning out, in place of the silence they answer
-/// with today: `what` names the thing the press would otherwise have opened or done, read at
-/// the point of refusal rather than a table keyed on the action, so a later fifth inert
-/// binding costs one call site, not a new case in a lookup this function would otherwise
-/// need.
+/// confirming") raises, in place of the silence they answer with today: `what` names the
+/// thing the press would otherwise have opened or done, read at the point of refusal rather
+/// than a table keyed on the action, which is what let `m` join them for one call site rather
+/// than a new case in a lookup this function would otherwise need.
 pub(crate) fn action_running_notice(what: &str) -> String {
     format!("{what}: Action already running")
 }

@@ -352,6 +352,7 @@ fn parse(text: &str, path: &Path) -> Result<Loaded> {
     .map_err(|err| render_error(path, text, &err))?;
 
     reject_duplicate_names(&document, text, path)?;
+    reject_reserved_action_names(&document, text, path)?;
     reject_launchers_declaring_both_argv_forms(&document, text, path)?;
 
     let mut warnings: Vec<Warning> = unknown_paths.into_iter().map(Warning::UnknownKey).collect();
@@ -433,7 +434,7 @@ fn reject_duplicate_names(document: &Document, input: &str, path: &Path) -> Resu
         return Err(parse_error(
             path,
             input,
-            &format!("duplicate set name `{value}`"),
+            &duplicate_message("set name", &value),
             Some(span),
         ));
     }
@@ -441,7 +442,7 @@ fn reject_duplicate_names(document: &Document, input: &str, path: &Path) -> Resu
         return Err(parse_error(
             path,
             input,
-            &format!("duplicate repo path `{value}`"),
+            &duplicate_message("repo path", &value),
             Some(span),
         ));
     }
@@ -449,7 +450,7 @@ fn reject_duplicate_names(document: &Document, input: &str, path: &Path) -> Resu
         return Err(parse_error(
             path,
             input,
-            &format!("duplicate launcher name `{value}`"),
+            &duplicate_message("launcher name", &value),
             Some(span),
         ));
     }
@@ -457,9 +458,36 @@ fn reject_duplicate_names(document: &Document, input: &str, path: &Path) -> Resu
         return Err(parse_error(
             path,
             input,
-            &format!("duplicate action name `{value}`"),
+            &duplicate_message("action name", &value),
             Some(span),
         ));
+    }
+    Ok(())
+}
+
+/// The one sentence every duplicate-identity failure in this file is written from, so a
+/// second producer of the same grade cannot phrase it differently.
+fn duplicate_message(what: &str, value: &str) -> String {
+    format!("duplicate {what} `{value}`")
+}
+
+/// The three built-in management operations' names are reserved
+/// ([repo-management.md](../../../../docs/spec/repo-management.md)): a config-defined
+/// `[[action]]` taking one fails the load rather than one shadowing the other, and it fails
+/// with the message a second `[[action]]` of the same name already produces, since a name
+/// already taken is what has gone wrong either way. The reserved set is
+/// [`crate::management::OPERATIONS`] itself, never a second list here.
+fn reject_reserved_action_names(document: &Document, input: &str, path: &Path) -> Result<()> {
+    for action in &document.actions {
+        let name = action.name.get_ref();
+        if crate::management::Operation::from_name(name).is_some() {
+            return Err(parse_error(
+                path,
+                input,
+                &duplicate_message("action name", name),
+                Some(action.name.span()),
+            ));
+        }
     }
     Ok(())
 }
@@ -1432,6 +1460,56 @@ mod tests {
             message.contains("line 8"),
             "expected the second declaration's line, got: {message}"
         );
+    }
+
+    /// Criterion 7: a config-defined `[[action]]` may not take a built-in management
+    /// operation's name, and the load fails with the message shape a second `[[action]]` of
+    /// an already-taken name produces rather than one shadowing the other
+    /// ([repo-management.md](../../../../docs/spec/repo-management.md)'s "The operations").
+    ///
+    /// The expected message is built from a real duplicate's own, with the name substituted,
+    /// so this cannot pass against a differently-worded message that merely happens to carry
+    /// the same words: if the two grades ever diverge, the comparison fails.
+    #[test]
+    fn a_config_action_taking_a_reserved_name_fails_with_the_duplicate_name_message_shape() {
+        let steps = "\n[[action.steps]]\nargs = [\"true\"]\n";
+        for operation in crate::management::OPERATIONS {
+            let name = operation.name();
+            let reserved = parse_err(&format!("[[action]]\nname = \"{name}\"{steps}"));
+            let genuine_duplicate = parse_err(&format!(
+                "[[action]]\nname = \"not-reserved\"{steps}\n\
+                 [[action]]\nname = \"not-reserved\"{steps}"
+            ));
+
+            let shape = |message: &str| {
+                message
+                    .split(" at line")
+                    .next()
+                    .expect("a message")
+                    .to_string()
+            };
+            assert_eq!(
+                shape(&reserved),
+                shape(&genuine_duplicate).replace("not-reserved", name),
+                "a reserved name must fail with the same grade and wording a duplicate does"
+            );
+            assert!(
+                reserved.contains("line 2"),
+                "expected the offending declaration's own line, got: {reserved}"
+            );
+        }
+    }
+
+    /// The negative control: a name that merely contains a reserved one is not reserved, so
+    /// the check is an equality on the whole name rather than a substring test that would
+    /// quietly forbid `ignore-vendored`.
+    #[test]
+    fn an_action_name_that_merely_contains_a_reserved_one_still_loads() {
+        let loaded = parse_ok(
+            "[[action]]\nname = \"ignore-vendored\"\n\n[[action.steps]]\nargs = [\"true\"]\n",
+        );
+
+        assert_eq!(loaded.document.actions[0].name.get_ref(), "ignore-vendored");
     }
 
     /// Criterion 2's "no config key" half, for `[refresh]`: `refresh.md`'s "Scope and

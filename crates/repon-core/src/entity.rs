@@ -332,6 +332,29 @@ impl ActionReceipt {
     }
 }
 
+/// What accepting a `delete` confirm gate will destroy in one Repo, per
+/// [repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "The confirm gate": the three facts the gate names per Repo, read fresh at the moment the
+/// gate is built rather than folded out of Cells a Generation may have left stale.
+///
+/// Not a Cell and not part of the row summary fold: it is a fact of the instant it was read,
+/// the same standing [`crate::InProgressOperation`] has, and it never reaches the table at
+/// all. A Repo with `uncommitted` false and both counts zero is the "listed plainly" case the
+/// gate names with no risk line of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteRisk {
+    /// The working tree has changes against the index: any modified, untracked or deleted
+    /// path at all.
+    pub uncommitted: bool,
+    /// Commits on this Repo's own local branches that no remote-tracking ref carries.
+    pub unpushed_commits: u32,
+    /// How many of its local branches carry at least one of those commits.
+    pub unpushed_branches: u32,
+    /// How many linked Worktrees point into this Repo, which deleting its working tree
+    /// orphans.
+    pub linked_worktrees: u32,
+}
+
 /// Whether an Entity was found by the Refresh that just ran.
 ///
 /// Open, recorded here as well as in

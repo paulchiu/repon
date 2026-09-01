@@ -46,8 +46,8 @@ use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
-    ActionReceipt, DefaultBranch, DirtyCounts, EntityKey, EntityState, Head, Kind, Presence,
-    RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
+    ActionReceipt, DefaultBranch, DeleteRisk, DirtyCounts, EntityKey, EntityState, Head, Kind,
+    Presence, RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
@@ -830,6 +830,45 @@ impl Core {
             .wait_timeout_while(guard, within, |count| *count > 0)
             .unwrap();
         self.snapshot()
+    }
+
+    /// What deleting `key`'s working tree destroys, read fresh right now
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "The confirm gate"). A git read rather than a fold over this entity's Cells: the
+    /// gate is answering "what will accepting this destroy", and a Cell carries whatever the
+    /// last Generation left there, which is the wrong tense for a question with no undo.
+    ///
+    /// The linked-Worktree count is the table's own, since discovery already knows which
+    /// entities share this one's git common dir; the other two are read from the repository.
+    /// Errors rather than reporting zero when the read fails, so a gate never says "nothing
+    /// to lose" because it could not look.
+    pub fn delete_risk(&self, key: &EntityKey) -> Result<DeleteRisk, git::ProbeError> {
+        let linked_worktrees = self.linked_worktree_count(key);
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        let dirty = git::dirty_counts(&repo, Arc::new(AtomicBool::new(false)))?;
+        let (unpushed_commits, unpushed_branches) = git::unpushed(&repo)?;
+        Ok(DeleteRisk {
+            uncommitted: dirty.modified > 0 || dirty.untracked > 0 || dirty.deleted > 0,
+            unpushed_commits,
+            unpushed_branches,
+            linked_worktrees,
+        })
+    }
+
+    /// How many linked Worktrees the table currently holds for `key`'s own git common dir.
+    /// Zero for a key the table no longer knows, which is the same fallback `refresh` and
+    /// `run_action` give one.
+    fn linked_worktree_count(&self, key: &EntityKey) -> u32 {
+        let table = self.table.read().unwrap();
+        let Some(&idx) = table.index.get(key) else {
+            return 0;
+        };
+        let common_dir = Arc::clone(&table.entities[idx].common_dir);
+        table
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == Kind::Worktree && entity.common_dir == common_dir)
+            .count() as u32
     }
 
     /// Drops one entity from the table, cancelling any probe in flight against it.
@@ -10262,5 +10301,79 @@ mod tests {
                  only on its default_branch cell"
             );
         }
+    }
+
+    // =====================================================================================
+    // `delete_risk`: the three facts repo-management.md's confirm gate names per Repo, read
+    // rather than stubbed. Every repository here is built in a temp directory this test owns,
+    // and no path comes from config, an environment variable or the working directory.
+    // =====================================================================================
+
+    /// A Repo with all three: an uncommitted change, a commit no remote-tracking ref carries,
+    /// and a linked Worktree pointing into it.
+    #[test]
+    fn delete_risk_reads_all_three_facts_the_confirm_gate_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        fs::write(repo.join("uncommitted.txt"), "not staged\n").expect("write a stray file");
+        crate::test_support::git(
+            &repo,
+            &["worktree", "add", "-b", "sidecar", "../sidecar-worktree"],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        // Settled first, so the startup Generation's own phase C is no longer reading this
+        // same repository while the line below reads it: two concurrent gix statuses over one
+        // working tree is a race in the harness, not in `delete_risk`.
+        let key = core
+            .settle(Duration::from_secs(10))
+            .entities
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Repo)
+            .expect("the Repo row is discovered")
+            .key;
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert!(risk.uncommitted, "the stray file makes the tree dirty");
+        assert!(
+            risk.unpushed_commits > 0 && risk.unpushed_branches > 0,
+            "no remote-tracking ref carries any of this Repo's commits, got {risk:?}"
+        );
+        assert_eq!(
+            risk.linked_worktrees, 1,
+            "the one linked Worktree pointing into this Repo is counted, got {risk:?}"
+        );
+    }
+
+    /// The "listed plainly" case: nothing uncommitted, every commit already on a
+    /// remote-tracking ref, and no linked Worktree at all. Asserted as its own test rather
+    /// than left implied, since a gate that reports risk on every Repo is as wrong as one
+    /// that reports it on none.
+    #[test]
+    fn delete_risk_on_a_clean_fully_pushed_repo_with_no_worktrees_reports_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha = crate::test_support::head_sha(&repo);
+        crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert_eq!(
+            risk,
+            DeleteRisk {
+                uncommitted: false,
+                unpushed_commits: 0,
+                unpushed_branches: 0,
+                linked_worktrees: 0,
+            }
+        );
     }
 }

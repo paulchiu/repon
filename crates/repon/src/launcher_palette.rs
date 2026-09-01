@@ -7,7 +7,7 @@
 //!
 //! [ADR 0008](../../../docs/adr/0008-two-palettes-not-one.md) keeps this palette and
 //! [`crate::action_palette`]'s on separate keys for the reason recorded there;
-//! [`matching`] below has no counterpart shared with [`crate::action_palette::matching`] for
+//! [`matching`] below has no counterpart shared with [`crate::action_palette::entries`] for
 //! the same reason that module's own doc comment gives: each palette searches only its own
 //! list, by construction of its own function's parameter type.
 //!
@@ -47,7 +47,7 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 pub(crate) const NO_LAUNCHERS_CONFIGURED_MESSAGE: &str = "no launchers; see [[launcher]]";
 
 /// Case-insensitive substring match against a Launcher's own name, the same convention
-/// [`crate::action_palette::matching`] uses and for the same reason: a plain substring test
+/// [`crate::action_palette::entries`] uses and for the same reason: a plain substring test
 /// never reorders, so a match always reads as "why did this row match". An empty query
 /// matches every entry, what a just-opened palette shows before anything is typed.
 pub(crate) fn matching<'a>(launchers: &'a [Launcher], query: &str) -> Vec<&'a Launcher> {
