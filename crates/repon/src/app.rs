@@ -3018,7 +3018,11 @@ mod tests {
         let last_text = match lines.last().expect("expected content") {
             HelpLine::Binding { description, .. } => description.to_string(),
             HelpLine::Legend { meaning, .. } => meaning.to_string(),
-            HelpLine::LegendHeading => crate::help::LEGEND_HEADING.to_string(),
+            HelpLine::Heading(text) => text.to_string(),
+            HelpLine::Blank => panic!(
+                "fixture sanity: the legend always has at least one row, so the last line is \
+                 never the blank separator above a heading"
+            ),
         };
         let content_area = HelpLayout::compute(frame_area).content_area(frame_area);
         let last_row_y = content_area.bottom() - 1;
@@ -3077,7 +3081,9 @@ mod tests {
 
             app.help = Some(HelpOverlay::default());
             let buf = render_app_frame(&mut app, width, height);
-            crate::test_support::assert_frame_drawn_with(
+            // Not `assert_frame_drawn_with`: the help overlay's own bottom border carries its
+            // version rather than a plain run, since this ticket landed.
+            crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
                 &buf,
                 whole_frame,
                 glyphs.border,

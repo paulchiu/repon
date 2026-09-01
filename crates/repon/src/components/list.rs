@@ -1,9 +1,10 @@
 //! The repos table: real rows read from one already-cloned [`Snapshot`] per render tick.
 //!
 //! Column geometry is [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
-//! and [default-branch.md](../../../../docs/spec/default-branch.md)'s "The list": name 28,
-//! branch 24, sync 9, base 6, dirty 6, state 10, left-packed behind a one-character gutter,
-//! single-space gaps, ninety columns before the filler column that absorbs the slack.
+//! and [default-branch.md](../../../../docs/spec/default-branch.md)'s "The list": a
+//! one-character Selection marker, name 28, branch 24, sync 9, base 6, dirty 6, state 10,
+//! left-packed behind a one-character gutter, single-space gaps, ninety-two columns before
+//! the filler column that absorbs the slack.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -24,6 +25,14 @@ use crate::{
 };
 
 const GUTTER_WIDTH: u16 = 1;
+/// The Selection's own marker column, one character wide
+/// ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// vetting extends to this glyph too), sitting between the gutter and the name rather than
+/// inside the provenance gutter itself
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "Open": a
+/// second axis was refused there, for a different mark, on reasoning that applies here
+/// unchanged, since Selection is user state rather than anything a Probe settled).
+const SELECTED_WIDTH: u16 = 1;
 const NAME_WIDTH: u16 = 28;
 const BRANCH_WIDTH: u16 = 24;
 const SYNC_WIDTH: u16 = 9;
@@ -40,7 +49,8 @@ const BRANCH_CELL_OBJECT_ID_WIDTH: usize = 9;
 const GAP: u16 = 1;
 
 const GUTTER_X: u16 = 0;
-const NAME_X: u16 = GUTTER_X + GUTTER_WIDTH + GAP;
+const SELECTED_X: u16 = GUTTER_X + GUTTER_WIDTH + GAP;
+const NAME_X: u16 = SELECTED_X + SELECTED_WIDTH + GAP;
 const BRANCH_X: u16 = NAME_X + NAME_WIDTH + GAP;
 const SYNC_X: u16 = BRANCH_X + BRANCH_WIDTH + GAP;
 const BASE_X: u16 = SYNC_X + SYNC_WIDTH + GAP;
@@ -193,30 +203,26 @@ impl List {
                 // the visible area are left undrawn rather than pushing the frame to scroll.
                 break;
             }
+            let checked = self.selection.contains(&entity.key);
             if compact {
-                draw_row_compact(buf, interior, y, entity, glyphs, loading_frame);
+                draw_row_compact(buf, interior, y, entity, glyphs, loading_frame, checked);
             } else {
-                draw_row(buf, interior, y, entity, glyphs, loading_frame);
+                draw_row(buf, interior, y, entity, glyphs, loading_frame, checked);
             }
             // Painted after the row's own cells, over the row's full interior width, so it
             // reaches every column and every gap between them rather than only the cells a
             // value happened to write text into. `Buffer::set_style` patches rather than
             // replaces, so `Theme::selection_style`'s reverse-video default layers onto each
             // cell's own role colour and its explicit colours override them, matching
-            // theming.md's two directions either way.
+            // theming.md's two directions either way. This also reaches the Selection's own
+            // marker column `draw_row`/`draw_row_compact` already wrote above: a style patch
+            // changes a cell's colours and modifiers, never the symbol drawn into it, so a
+            // row that is both the cursor and checked keeps the marker glyph, now inside the
+            // reversed bar (theming.md's "The Selection").
             if Some(screen_row) == cursor_screen_row {
                 buf.set_style(
                     Rect::new(interior.x, y, interior.width, 1),
                     self.theme.selection_style(),
-                );
-            }
-            // The Selection's own mark, painted the same way and over the same width as the
-            // cursor's above: a second, independent patch, so a row that is both keeps both
-            // (theming.md's "The Selection"), rather than one replacing the other.
-            if self.selection.contains(&entity.key) {
-                buf.set_style(
-                    Rect::new(interior.x, y, interior.width, 1),
-                    self.theme.checked_style(),
                 );
             }
         }
@@ -594,6 +600,36 @@ fn draw_header(buf: &mut Buffer, interior: Rect) {
     );
 }
 
+/// Writes the Selection's own marker at [`SELECTED_X`]: `glyphs.checked` for a checked row,
+/// a blank cell otherwise. Shared by [`draw_row`] and [`draw_row_compact`] so the full list
+/// and the sidebar can never disagree about which rows carry it. [`Theme::checked_style`]
+/// names no colour, so this reads `theme::DEFAULT` the same way every other free-function
+/// cell style in this file does rather than threading a live `Theme` through, which is what
+/// keeps `List::set_theme` reaching only [`Theme::selection_style`]
+/// (this module's own "Criterion 2" test notes the gap).
+fn draw_selected_marker(
+    buf: &mut Buffer,
+    interior: Rect,
+    y: u16,
+    checked: bool,
+    glyphs: &'static GlyphSet,
+) {
+    let marker = if checked {
+        glyphs.checked.to_string()
+    } else {
+        " ".to_string()
+    };
+    write_cell(
+        buf,
+        interior,
+        interior.x + SELECTED_X,
+        y,
+        SELECTED_WIDTH,
+        &marker,
+        theme::DEFAULT.checked_style(),
+    );
+}
+
 fn draw_row(
     buf: &mut Buffer,
     interior: Rect,
@@ -601,6 +637,7 @@ fn draw_row(
     entity: &EntityState,
     glyphs: &'static GlyphSet,
     loading_frame: char,
+    checked: bool,
 ) {
     let row_summary = summary(entity);
     let gutter = gutter_glyph_for(row_summary, glyphs, loading_frame).to_string();
@@ -624,6 +661,7 @@ fn draw_row(
         &gutter,
         Style::new(),
     );
+    draw_selected_marker(buf, interior, y, checked, glyphs);
     draw_name_cell(buf, interior, y, entity, glyphs);
     write_cell(
         buf,
@@ -690,9 +728,13 @@ fn draw_row(
     );
 }
 
-/// The sidebar's own row: the gutter and the name, nothing else. Shares [`gutter_glyph`] with
-/// [`draw_row`] rather than recomputing the fold, so the two never disagree about which mark a
-/// row shows.
+/// The sidebar's own row: the gutter, the Selection's own marker and the name, nothing else.
+/// Shares [`gutter_glyph`] with [`draw_row`] rather than recomputing the fold, so the two
+/// never disagree about which mark a row shows. The marker rides along too, drawn through
+/// the same [`draw_selected_marker`] `draw_row` uses, so a checked row reads the same while
+/// the detail pane has the cursor's attention as it does in the full list
+/// (theming.md's "The Selection": "A Selection is exactly what you need to see while the
+/// detail pane has your attention").
 fn draw_row_compact(
     buf: &mut Buffer,
     interior: Rect,
@@ -700,6 +742,7 @@ fn draw_row_compact(
     entity: &EntityState,
     glyphs: &'static GlyphSet,
     loading_frame: char,
+    checked: bool,
 ) {
     let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
     write_cell(
@@ -711,6 +754,7 @@ fn draw_row_compact(
         &gutter,
         Style::new(),
     );
+    draw_selected_marker(buf, interior, y, checked, glyphs);
     draw_name_cell(buf, interior, y, entity, glyphs);
 }
 
@@ -1124,8 +1168,8 @@ mod tests {
         );
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 3, 1, 5), "first");
-        assert_eq!(cell_text(buf, 3, 2, 6), "second");
+        assert_eq!(cell_text(buf, absolute_x(NAME_X), 1, 5), "first");
+        assert_eq!(cell_text(buf, absolute_x(NAME_X), 2, 6), "second");
     }
 
     /// Inits a real disposable git repository at `path` with one empty commit, on a named
@@ -1506,12 +1550,21 @@ mod tests {
         let terminal = render_with_list(&mut list, 140, 24, &snapshot);
         let buf = terminal.backend().buffer();
 
-        // 3 is the top-level name column's own absolute start, 9 the child name column's own
-        // start behind the marker and its gap, both already fixed by
+        // `absolute_x(NAME_X)` is the top-level name column's own absolute start,
+        // `absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH)` the child name column's own start
+        // behind the marker and its gap, both already fixed by
         // `a_child_row_is_indented_and_marked_while_its_parent_row_is_not` above.
-        let repo_fg = buf[(3, entity_row_y(repo_row))].fg;
-        let worktree_fg = buf[(9, entity_row_y(worktree_row))].fg;
-        let submodule_fg = buf[(9, entity_row_y(submodule_row))].fg;
+        let repo_fg = buf[(absolute_x(NAME_X), entity_row_y(repo_row))].fg;
+        let worktree_fg = buf[(
+            absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
+            entity_row_y(worktree_row),
+        )]
+            .fg;
+        let submodule_fg = buf[(
+            absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
+            entity_row_y(submodule_row),
+        )]
+            .fg;
 
         assert_eq!(
             repo_fg,
@@ -1532,33 +1585,33 @@ mod tests {
         assert_ne!(repo_fg, worktree_fg);
     }
 
-    /// The defining behaviour of criterion 1: the sidebar shows only the gutter and the name,
-    /// never the columns the full list draws. A mutation that kept `branch` in the compact row
-    /// would make this fail, since a real branch value is exactly what the full list would
-    /// show at `BRANCH_X` and what the criterion forbids the sidebar from also showing.
+    /// The defining behaviour of criterion 1: the sidebar shows only the gutter, the
+    /// Selection's own marker and the name, never the columns the full list draws. A
+    /// mutation that kept `branch` in the compact row would make this fail, since a real
+    /// branch value is exactly what the full list would show at `BRANCH_X` and what the
+    /// criterion forbids the sidebar from also showing.
     #[test]
     fn the_sidebar_shows_only_the_gutter_and_the_name_never_the_other_columns() {
         let snapshot = settled_snapshot_with_a_known_branch("a-real-branch-name");
         assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
 
-        // 32 is `BRANCH_X`'s absolute buffer column: the header test above already fixes it
-        // there (`cell_text(buf, 32, 1, 6), "branch"`), one column right of the constant's
-        // own interior-relative value because of the panel's left border.
         let full = render(140, 24, &snapshot);
         assert_eq!(
-            cell_text(full.backend().buffer(), 32, 2, 19).trim_end(),
+            cell_text(full.backend().buffer(), absolute_x(BRANCH_X), 2, 19).trim_end(),
             "a-real-branch-name",
             "the full list must show the real branch value at its usual column"
         );
 
-        // A 34-column sidebar's interior right edge sits one column past `BRANCH_X`, so this
-        // reads the one interior column the branch column would otherwise start at rather
-        // than a run that would run past the panel's own border.
+        // `SIDEBAR_WIDTH` leaves the interior exactly filled by the gutter, the marker and
+        // the name, with no slack column left to pin a single "branch would start here"
+        // offset to; reading the whole row's text instead proves the branch value's absence
+        // regardless of how snugly the interior is packed.
         let compact = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot);
-        assert_eq!(
-            cell_text(compact.backend().buffer(), 32, 1, 1),
-            " ",
-            "the sidebar must never draw the branch column, even for a row that has one"
+        let compact_row = cell_text(compact.backend().buffer(), 0, 1, SIDEBAR_WIDTH);
+        assert!(
+            !compact_row.contains("a-real-branch-name"),
+            "the sidebar must never draw the branch column, even for a row that has one: \
+             {compact_row:?}"
         );
     }
 
@@ -1610,22 +1663,25 @@ mod tests {
             "the gutter must show the row's least-settled settled state, not an outstanding \
              cell's own loading mark"
         );
-        assert_eq!(cell_text(buf, 3, 2, name.len() as u16), name);
-        assert_eq!(cell_text(buf, 32, 2, 4), "main");
         assert_eq!(
-            cell_text(buf, 57, 2, 1),
+            cell_text(buf, absolute_x(NAME_X), 2, name.len() as u16),
+            name
+        );
+        assert_eq!(cell_text(buf, absolute_x(BRANCH_X), 2, 4), "main");
+        assert_eq!(
+            cell_text(buf, absolute_x(SYNC_X), 2, 1),
             glyphs.no_upstream.to_string(),
             "sync is probed, and an unborn HEAD has no branch to configure an upstream on, \
              so it must show its settled value rather than a loading mark"
         );
         assert_eq!(
-            cell_text(buf, 67, 2, BASE_WIDTH),
+            cell_text(buf, absolute_x(BASE_X), 2, BASE_WIDTH),
             " ".repeat(BASE_WIDTH as usize),
             "base is Not applicable on an unborn HEAD and must render blank, never the \
              loading mark and never a raw zero"
         );
         assert_eq!(
-            cell_text(buf, 74, 2, 1),
+            cell_text(buf, absolute_x(DIRTY_X), 2, 1),
             glyphs.clean.to_string(),
             "dirty is probed too, and this fixture's working tree is clean, so it must show \
              its settled value rather than a loading mark"
@@ -1645,13 +1701,24 @@ mod tests {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
 
         assert_eq!(cell_text(buf, 1, 2, 1), glyphs.loading[0].to_string());
-        for x in [32, 57, 67, 74, 81] {
+        for x in [
+            absolute_x(BRANCH_X),
+            absolute_x(SYNC_X),
+            absolute_x(BASE_X),
+            absolute_x(DIRTY_X),
+            absolute_x(STATE_X),
+        ] {
             assert_eq!(
                 cell_text(buf, x, 2, 1),
                 " ",
                 "column at x={x} must stay blank while the row holds no value at all"
             );
         }
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), 2, 1),
+            " ",
+            "an unchecked row must show a blank marker column, not the checked glyph"
+        );
     }
 
     /// One render, two rows, each computed independently. The first holds no value at all
@@ -1679,12 +1746,12 @@ mod tests {
 
         // Row 1 (y=2): holds nothing, so the gutter alone spins and every cell is blank.
         assert_eq!(cell_text(buf, 1, 2, 1), frame);
-        assert_eq!(cell_text(buf, 67, 2, 1), " ");
+        assert_eq!(cell_text(buf, absolute_x(BASE_X), 2, 1), " ");
 
         // Row 2 (y=3): fully settled, so the gutter is blank (Fresh) and `base` (Not
         // applicable on this unborn HEAD) renders blank too, never row 1's own spinner.
         assert_eq!(cell_text(buf, 1, 3, 1), " ");
-        assert_eq!(cell_text(buf, 67, 3, 1), " ");
+        assert_eq!(cell_text(buf, absolute_x(BASE_X), 3, 1), " ");
     }
 
     // --- Criteria 4 and 5: the mark moves, including on an already-populated row ---
@@ -1778,14 +1845,14 @@ mod tests {
             ..List::default()
         };
         let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
-        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
+        let base_first = cell_text(first_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
 
         let mut later = List {
             started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
             ..List::default()
         };
         let second_tick = render_with_list(&mut later, 140, 24, &snap);
-        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
+        let base_second = cell_text(second_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
 
         assert_eq!(base_first, glyphs.loading[0].to_string());
         assert_eq!(base_second, glyphs.loading[5].to_string());
@@ -1808,7 +1875,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, 3, 1, 17),
+            cell_text(buf, absolute_x(NAME_X), 1, 17),
             "acquiring-gateway",
             "with no header row, the first entity must render one row below the border"
         );
@@ -1830,7 +1897,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 8),
+            cell_text(buf, absolute_x(NAME_X), 1 + FIRST_ENTITY_ROW, 8),
             "repo-two",
             "an offset of 1 must skip the first row and start drawing from the second"
         );
@@ -1852,7 +1919,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, 3, 1 + FIRST_ENTITY_ROW, 10),
+            cell_text(buf, absolute_x(NAME_X), 1 + FIRST_ENTITY_ROW, 10),
             "repo-three",
             "a wildly stale offset must still leave the table's own last row drawn"
         );
@@ -1864,21 +1931,23 @@ mod tests {
             .collect()
     }
 
-    /// Column starts (name 3, branch 32, sync 57, base 67, dirty 74, state 81), hand-summed
+    /// Column starts (name 5, branch 34, sync 59, base 69, dirty 76, state 83), hand-summed
     /// from [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
-    /// list". Literal and independent of the production constants above: a mutation to
-    /// `NAME_X` et al. must move where this test looks, not the other way around.
+    /// list", one character wider behind the gutter than it once was for the Selection's own
+    /// marker column and its gap. Literal and independent of the production constants above:
+    /// a mutation to `NAME_X` et al. must move where this test looks, not the other way
+    /// around.
     #[test]
     fn the_header_row_places_every_column_name_at_its_literal_spec_offset() {
         let terminal = render(140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 3, 1, 4), "name");
-        assert_eq!(cell_text(buf, 32, 1, 6), "branch");
-        assert_eq!(cell_text(buf, 57, 1, 4), "sync");
-        assert_eq!(cell_text(buf, 67, 1, 4), "base");
-        assert_eq!(cell_text(buf, 74, 1, 5), "dirty");
-        assert_eq!(cell_text(buf, 81, 1, 5), "state");
+        assert_eq!(cell_text(buf, 5, 1, 4), "name");
+        assert_eq!(cell_text(buf, 34, 1, 6), "branch");
+        assert_eq!(cell_text(buf, 59, 1, 4), "sync");
+        assert_eq!(cell_text(buf, 69, 1, 4), "base");
+        assert_eq!(cell_text(buf, 76, 1, 5), "dirty");
+        assert_eq!(cell_text(buf, 83, 1, 5), "state");
     }
 
     #[test]
@@ -1887,7 +1956,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            buf[(3, 1)].fg,
+            buf[(5, 1)].fg,
             Color::DarkGray,
             "the header must show theming.md's documented dim default, dark-grey, as a \
              foreground colour rather than the DIM text attribute"
@@ -1906,7 +1975,7 @@ mod tests {
         // and shows the table's own first frame.
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         assert_eq!(cell_text(buf, 1, 2, 1), glyphs.loading[0].to_string());
-        assert_eq!(cell_text(buf, 3, 2, 17), "acquiring-gateway");
+        assert_eq!(cell_text(buf, 5, 2, 17), "acquiring-gateway");
     }
 
     #[test]
@@ -1914,8 +1983,8 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![entity("first"), entity("second")]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 3, 2, 5), "first");
-        assert_eq!(cell_text(buf, 3, 3, 6), "second");
+        assert_eq!(cell_text(buf, 5, 2, 5), "first");
+        assert_eq!(cell_text(buf, 5, 3, 6), "second");
     }
 
     #[test]
@@ -1924,17 +1993,17 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![entity(&long_name)]));
         let buf = terminal.backend().buffer();
 
-        // The name column is 28 wide starting at x=3 (see the header test above), so its
-        // last character sits at x=30, the single-space gap before branch is at x=31, and
-        // branch itself starts at x=32.
-        assert_eq!(cell_text(buf, 3, 2, 28), "n".repeat(28));
+        // The name column is 28 wide starting at x=5 (see the header test above), so its
+        // last character sits at x=32, the single-space gap before branch is at x=33, and
+        // branch itself starts at x=34.
+        assert_eq!(cell_text(buf, 5, 2, 28), "n".repeat(28));
         assert_eq!(
-            cell_text(buf, 31, 2, 1),
+            cell_text(buf, 33, 2, 1),
             " ",
             "the gap before branch must not carry name overflow"
         );
         assert_eq!(
-            cell_text(buf, 32, 2, 1),
+            cell_text(buf, 34, 2, 1),
             " ",
             "the branch column must not carry name overflow"
         );
@@ -1945,8 +2014,14 @@ mod tests {
         let narrow = render(100, 24, &snapshot(vec![]));
         let wide = render(220, 24, &snapshot(vec![]));
 
-        assert_eq!(cell_text(narrow.backend().buffer(), 81, 1, 5), "state");
-        assert_eq!(cell_text(wide.backend().buffer(), 81, 1, 5), "state");
+        assert_eq!(
+            cell_text(narrow.backend().buffer(), absolute_x(STATE_X), 1, 5),
+            "state"
+        );
+        assert_eq!(
+            cell_text(wide.backend().buffer(), absolute_x(STATE_X), 1, 5),
+            "state"
+        );
     }
 
     #[test]
@@ -2013,8 +2088,10 @@ mod tests {
     /// widths" sentence at test time, so `base`'s width and position can never quietly
     /// drift from the design of record. Every column's own width comes from the spec's
     /// text, not from this module's own layout constants, so a `BASE_X` built from the
-    /// wrong preceding widths still fails here; only `GUTTER_WIDTH` and `GAP` are reused,
-    /// since both are shared row geometry rather than a fact about any one column.
+    /// wrong preceding widths still fails here; only `GUTTER_WIDTH`, `SELECTED_WIDTH` and
+    /// `GAP` are reused, since all three are shared row geometry fixed in
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) rather
+    /// than a fact about any one column default-branch.md's own sentence names.
     #[test]
     fn base_occupies_its_spec_stated_width_and_position_after_sync() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2077,6 +2154,8 @@ mod tests {
         );
 
         let expected_base_x = GUTTER_WIDTH
+            + GAP
+            + SELECTED_WIDTH
             + GAP
             + by_name("name")
             + GAP
@@ -3178,24 +3257,34 @@ mod tests {
         let worktree_y = entity_row_y(worktree_row);
 
         assert_eq!(
-            cell_text(buf, 3, repo_y, 6),
+            cell_text(buf, absolute_x(NAME_X), repo_y, 6),
             "parent",
             "the top-level Repo row's name must start flush at the name column's own start"
         );
         assert_eq!(
-            cell_text(buf, 3, worktree_y, 4),
+            cell_text(buf, absolute_x(NAME_X), worktree_y, 4),
             "    ",
             "a child row's own indent must leave the name column's own start blank"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         assert_eq!(
-            cell_text(buf, 7, worktree_y, 1),
+            cell_text(
+                buf,
+                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
+                worktree_y,
+                1
+            ),
             glyphs.child_row.to_string(),
             "expected the active table's own child marker, read from the table rather than \
              restated"
         );
         assert_eq!(
-            cell_text(buf, 9, worktree_y, "feature-worktree".len() as u16),
+            cell_text(
+                buf,
+                absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
+                worktree_y,
+                "feature-worktree".len() as u16
+            ),
             "feature-worktree",
             "expected the child's own name text right after the marker and its gap"
         );
@@ -3240,8 +3329,18 @@ mod tests {
 
             let worktree_y = entity_row_y(worktree_row);
             let submodule_y = entity_row_y(submodule_row);
-            let worktree_marker = cell_text(buf, 7, worktree_y, 1);
-            let submodule_marker = cell_text(buf, 7, submodule_y, 1);
+            let worktree_marker = cell_text(
+                buf,
+                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
+                worktree_y,
+                1,
+            );
+            let submodule_marker = cell_text(
+                buf,
+                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
+                submodule_y,
+                1,
+            );
 
             assert_eq!(
                 worktree_marker, submodule_marker,
@@ -3274,7 +3373,12 @@ mod tests {
         let y = entity_row_y(row);
 
         assert_eq!(
-            cell_text(buf, 9, y, "vendor/lib".len() as u16),
+            cell_text(
+                buf,
+                absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
+                y,
+                "vendor/lib".len() as u16
+            ),
             "vendor/lib",
             "expected the submodule's declared relative path as its name"
         );
@@ -4137,7 +4241,7 @@ mod tests {
             ..List::default()
         };
         let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
-        let base_first = cell_text(first_tick.backend().buffer(), 67, 2, 1);
+        let base_first = cell_text(first_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
         let branch_first = cell_text(
             first_tick.backend().buffer(),
             absolute_x(BRANCH_X),
@@ -4150,7 +4254,7 @@ mod tests {
             ..List::default()
         };
         let second_tick = render_with_list(&mut later, 140, 24, &snap);
-        let base_second = cell_text(second_tick.backend().buffer(), 67, 2, 1);
+        let base_second = cell_text(second_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
         let branch_second = cell_text(
             second_tick.backend().buffer(),
             absolute_x(BRANCH_X),
@@ -4578,14 +4682,11 @@ mod tests {
     // clamped-offset interaction against machinery that cannot clamp anything would pass
     // vacuously. Left for whichever ticket lands `List::set_offset`.
 
-    // --- The Selection's own mark: `List::render` paints `Theme::checked_style()` over a
-    // checked row's own interior width the same way it paints the cursor's highlight, so the
-    // two independent tests below (full-width coverage, composition with the cursor) mirror
-    // the cursor row's own tests above.
-
-    fn is_underlined(buf: &Buffer, x: u16, y: u16) -> bool {
-        buf[(x, y)].modifier.contains(Modifier::UNDERLINED)
-    }
+    // --- The Selection's own mark: `List::render`/`draw_row`/`draw_row_compact` draw
+    // `glyphs.checked` into the marker column at `SELECTED_X` for a checked row, and a blank
+    // cell otherwise, rather than painting a style across the row the way the cursor's own
+    // highlight does. The tests below mirror the cursor row's own tests above, adapted for a
+    // glyph in a fixed column instead of a style patch over a width.
 
     fn checked_selection(keys: impl IntoIterator<Item = EntityKey>) -> Selection {
         let mut selection = Selection::new();
@@ -4593,11 +4694,22 @@ mod tests {
         selection
     }
 
+    /// Every `x` across the row's own interior width whose buffer symbol is `glyph`, the same
+    /// full-row scan discipline the cursor highlight's own width test uses: a marker drawn at
+    /// the wrong column, or leaking onto a row that is not checked, fails here even though a
+    /// single fixed-offset probe could miss it.
+    fn columns_showing(buf: &Buffer, y: u16, interior_width: u16, glyph: char) -> Vec<u16> {
+        (1..1 + interior_width)
+            .filter(|&x| buf[(x, y)].symbol().starts_with(glyph))
+            .collect()
+    }
+
     /// Counts across the whole rendered row rather than sampling one column, the same
-    /// discipline the cursor row's own full-width test uses: a mark that only reached the
-    /// gutter and the name text would still pass a name-cell-only assertion.
+    /// discipline the cursor row's own full-width test uses: a mutation that drew the marker
+    /// at the wrong column, or left it on every row instead of only the checked one, fails
+    /// here even though a single-column probe at `SELECTED_X` alone could miss either.
     #[test]
-    fn a_checked_rows_underline_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+    fn a_checked_rows_marker_appears_exactly_once_at_its_own_column_and_no_other_row_shows_it() {
         let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
         let checked_key = entities[1].key.clone();
         let snap = snapshot(entities);
@@ -4605,31 +4717,29 @@ mod tests {
         list.set_selection(checked_selection([checked_key]));
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         let interior_width = 138; // 140 columns minus the panel's left and right border.
 
-        for x in 1..1 + interior_width {
-            assert!(
-                is_underlined(buf, x, entity_row_y(1)),
-                "checked row cell at x={x} must be underlined, not just the cells with text \
-                 in them"
-            );
-        }
+        assert_eq!(
+            columns_showing(buf, entity_row_y(1), interior_width, glyphs.checked),
+            vec![absolute_x(SELECTED_X)],
+            "the checked row must show the marker glyph exactly once, at its own column"
+        );
         for row in [0, 2] {
-            for x in 1..1 + interior_width {
-                assert!(
-                    !is_underlined(buf, x, entity_row_y(row)),
-                    "row {row} cell at x={x} is not checked and must not be underlined"
-                );
-            }
+            assert_eq!(
+                columns_showing(buf, entity_row_y(row), interior_width, glyphs.checked),
+                Vec::<u16>::new(),
+                "row {row} is not checked and must not show the marker glyph anywhere"
+            );
         }
     }
 
     /// The distinguishing half of the ticket's own criterion: a checked row that is not the
     /// cursor must read differently from the cursor row itself, not merely "differently from
-    /// an ordinary row". Underlined without being reversed is the concrete claim, not "not
-    /// identical to the cursor row", which an accidental difference could also satisfy.
+    /// an ordinary row". The marker glyph without reverse video is the concrete claim, not
+    /// "not identical to the cursor row", which an accidental difference could also satisfy.
     #[test]
-    fn a_checked_row_that_is_not_the_cursor_is_underlined_but_not_reversed() {
+    fn a_checked_row_that_is_not_the_cursor_shows_the_marker_but_is_not_reversed() {
         let entities = vec![entity("alpha"), entity("beta")];
         let checked_key = entities[1].key.clone();
         let snap = snapshot(entities);
@@ -4638,21 +4748,23 @@ mod tests {
         list.set_selection(checked_selection([checked_key]));
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
 
-        assert!(
-            is_underlined(buf, absolute_x(NAME_X), entity_row_y(1)),
-            "the checked row (\"beta\") must be underlined"
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), entity_row_y(1), 1),
+            glyphs.checked.to_string(),
+            "the checked row (\"beta\") must show the marker glyph"
         );
         assert!(
-            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
-            "the checked row is not the cursor and must not be reversed"
+            !is_reversed(buf, absolute_x(SELECTED_X), entity_row_y(1)),
+            "the checked row is not the cursor and its marker must not be reversed"
         );
     }
 
-    /// The other half: the cursor row, while it is not checked, must be reversed but never
-    /// underlined, so the two treatments never bleed into one another by accident.
+    /// The other half: the cursor row, while it is not checked, must be reversed but show no
+    /// marker, so the two treatments never bleed into one another by accident.
     #[test]
-    fn the_cursor_row_that_is_not_checked_is_reversed_but_not_underlined() {
+    fn the_cursor_row_that_is_not_checked_is_reversed_and_shows_no_marker() {
         let snap = snapshot(vec![entity("alpha"), entity("beta")]);
         let mut list = List::default();
         list.set_cursor(0);
@@ -4663,18 +4775,22 @@ mod tests {
             is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
             "the cursor row must be reversed"
         );
-        assert!(
-            !is_underlined(buf, absolute_x(NAME_X), entity_row_y(0)),
-            "the cursor row is not checked and must not be underlined"
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), entity_row_y(0), 1),
+            " ",
+            "the cursor row is not checked and must show a blank marker column"
         );
     }
 
     /// theming.md's own resolution of "a row that is both is unambiguous": the two
     /// treatments compose rather than one replacing the other, so a row that is both the
-    /// cursor and checked carries both marks at once, distinct from either alone (the two
-    /// tests above).
+    /// cursor and checked shows the marker glyph *inside* the reversed bar rather than either
+    /// hiding the other. `Buffer::set_style` patches a cell's colours and modifiers without
+    /// touching its symbol, which is the mechanism this proves: the marker cell itself must
+    /// carry both the glyph `draw_row` wrote and the reversed modifier the cursor highlight
+    /// patched on top of it afterwards.
     #[test]
-    fn a_row_that_is_both_the_cursor_and_checked_is_reversed_and_underlined_at_once() {
+    fn a_row_that_is_both_the_cursor_and_checked_is_reversed_and_still_shows_the_marker() {
         let entities = vec![entity("alpha"), entity("beta")];
         let checked_key = entities[0].key.clone();
         let snap = snapshot(entities);
@@ -4683,25 +4799,33 @@ mod tests {
         list.set_selection(checked_selection([checked_key]));
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
 
         assert!(
             is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
             "a row that is both must still be reversed"
         );
-        assert!(
-            is_underlined(buf, absolute_x(NAME_X), entity_row_y(0)),
-            "a row that is both must still be underlined"
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), entity_row_y(0), 1),
+            glyphs.checked.to_string(),
+            "a row that is both must still show the marker glyph"
         );
         assert!(
-            !is_underlined(buf, absolute_x(NAME_X), entity_row_y(1)),
-            "the other row is neither the cursor nor checked and must carry no mark"
+            is_reversed(buf, absolute_x(SELECTED_X), entity_row_y(0)),
+            "the marker's own cell must carry the reversed modifier too, inside the bar \
+             rather than punched out of it"
+        );
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), entity_row_y(1), 1),
+            " ",
+            "the other row is neither the cursor nor checked and must show no marker"
         );
     }
 
-    /// The sidebar seam: [`List::draw_sidebar`] must apply the same checked mark
+    /// The sidebar seam: [`List::draw_sidebar`] must apply the same checked marker
     /// [`List::draw`] does, mirroring the cursor highlight's own sidebar test.
     #[test]
-    fn the_sidebar_also_underlines_a_checked_row_and_no_other() {
+    fn the_sidebar_also_shows_the_marker_on_a_checked_row_and_no_other() {
         let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
         let checked_key = entities[1].key.clone();
         let snap = snapshot(entities);
@@ -4720,28 +4844,50 @@ mod tests {
             terminal
         };
         let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         // The sidebar has no header row, so its entity rows start one line below the
         // border rather than two (see `entity_row_y`'s own doc comment).
         let sidebar_row_y = |row: u16| 1 + row;
 
-        assert!(
-            is_underlined(buf, absolute_x(NAME_X), sidebar_row_y(1)),
-            "the sidebar's checked row must be underlined"
+        assert_eq!(
+            cell_text(buf, absolute_x(SELECTED_X), sidebar_row_y(1), 1),
+            glyphs.checked.to_string(),
+            "the sidebar's checked row must show the marker glyph"
         );
         for row in [0, 2] {
-            assert!(
-                !is_underlined(buf, absolute_x(NAME_X), sidebar_row_y(row)),
-                "sidebar row {row} is not checked and must not be underlined"
+            assert_eq!(
+                cell_text(buf, absolute_x(SELECTED_X), sidebar_row_y(row), 1),
+                " ",
+                "sidebar row {row} is not checked and must show a blank marker column"
             );
         }
     }
 
-    /// Defect species 2's guard for this pair of criteria: theming.md's own "The Selection"
-    /// section, read at test time, must still name the underline treatment and the composed,
-    /// unambiguous resolution this test module's behavioural tests above pin in code, rather
-    /// than the two drifting apart silently.
+    /// Defect species 3's guard for the ticket's own "No `Modifier::UNDERLINED` remains in
+    /// the crate's row rendering" criterion: a source scan over both workspace crates rather
+    /// than a buffer probe, so a stray underline painted somewhere this test module's own
+    /// fixtures do not happen to render still fails the build. `production_lines_containing`
+    /// already excludes each file's own `#[cfg(test)]` module, so this is a claim about
+    /// production rendering code specifically, not about this test file's own history.
     #[test]
-    fn theming_md_names_the_selections_underline_treatment_and_its_composition_with_the_cursor() {
+    fn no_production_source_reaches_for_modifier_underlined_anywhere_in_the_workspace() {
+        let offending = crate::test_support::production_lines_containing("UNDERLINED");
+        assert_eq!(
+            offending,
+            Vec::<String>::new(),
+            "expected no production source to reach for Modifier::UNDERLINED: the Selection's \
+             own mark is a glyph in its own column now, not a row-wide underline"
+        );
+    }
+
+    /// Defect species 2's guard for this pair of criteria: theming.md's own "The Selection"
+    /// section, read at test time, must still name the marker-column treatment and the
+    /// composed, unambiguous resolution this test module's behavioural tests above pin in
+    /// code, rather than the two drifting apart silently. Also proves the underline mechanism
+    /// was actually replaced rather than merely supplemented: the section must no longer
+    /// describe the row as underlined at all.
+    #[test]
+    fn theming_md_names_the_selections_marker_column_and_its_composition_with_the_cursor() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
             .expect("read the theming specification");
@@ -4754,13 +4900,24 @@ mod tests {
             .expect("\"### The Selection\" must precede the next top-level heading");
 
         assert!(
-            section.contains("underlined"),
-            "expected theming.md's \"The Selection\" section to name the underline treatment"
+            section.contains("marker column"),
+            "expected theming.md's \"The Selection\" section to name the marker-column \
+             treatment"
         );
         assert!(
-            section.contains("reversed") && section.contains("underlined"),
-            "expected theming.md to name the composed, both-at-once treatment for a row that \
-             is both the cursor and checked"
+            section.contains("reversed"),
+            "expected theming.md to name the cursor row's reversed treatment, so the \
+             composition below has something to compose with"
+        );
+        assert!(
+            section.contains("inside the reversed"),
+            "expected theming.md to name the composed, both-at-once treatment: the marker \
+             shown inside the reversed bar for a row that is both"
+        );
+        assert!(
+            !section.contains("underlined"),
+            "expected the underline treatment to be gone from theming.md's \"The Selection\" \
+             section, replaced by the marker column rather than merely joined by it"
         );
     }
 }
