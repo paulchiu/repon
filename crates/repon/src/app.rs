@@ -6,6 +6,8 @@ use crossterm::event::KeyEvent;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect, Size},
+    style::Style,
+    widgets::Clear,
 };
 use repon_core::{
     ActionReceipt, Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot, StepOutcome,
@@ -19,7 +21,7 @@ use crate::{
     editor,
     filter_line::{self, FilterLine},
     footer,
-    glyphs::GlyphSet,
+    glyphs::{BorderScratch, GlyphSet},
     header::HeaderContent,
     help::HelpOverlay,
     keys::{self, Action, BindingTable, Context},
@@ -1969,14 +1971,17 @@ impl App {
         self.visible_keys().get(self.cursor).cloned()
     }
 
-    /// The context [`Self::render`]'s footer draws for: `Context::Input` while the Filter
-    /// line is open, naming its own `enter apply  esc cancel` hint
-    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-footer)), or `self.focus`
-    /// otherwise, named as its own method so a mutation that hardcoded `Context::List` there
-    /// instead is something a test can call directly rather than needing a full terminal
-    /// render to observe.
+    /// The context [`Self::render`]'s footer draws for: `Context::Confirm` while
+    /// [`Self::quit_confirm`] is armed, naming its own `y run  n cancel` hint
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-footer)); otherwise
+    /// `Context::Input` while the Filter line is open, naming its own `enter apply  esc
+    /// cancel` hint; otherwise `self.focus`. Named as its own method so a mutation that
+    /// hardcoded `Context::List` there instead is something a test can call directly rather
+    /// than needing a full terminal render to observe.
     fn footer_context(&self) -> Context {
-        if self.filter_line.is_some() {
+        if self.quit_confirm {
+            Context::Confirm
+        } else if self.filter_line.is_some() {
             Context::Input
         } else {
             self.focus
@@ -2356,6 +2361,22 @@ impl App {
     /// failed, for `render` to report, since the message channel is not this method's to send
     /// on mid-frame.
     fn draw_frame(&mut self, frame: &mut Frame) -> Option<color_eyre::Report> {
+        // Below `MIN_FRAME_HEIGHT` there is nowhere to put a legible status row, a bordered
+        // list and a footer, so the frame would otherwise be a broken box with no rows and no
+        // legible footer and nothing saying to resize. This gate replaces the whole thing with
+        // one line naming the floor, ahead of every other branch below, including the four
+        // early-returning overlays.
+        let area = frame.area();
+        if area.height < MIN_FRAME_HEIGHT {
+            let message = format!("resize: repon needs at least {MIN_FRAME_HEIGHT} rows");
+            frame.buffer_mut().set_string(
+                area.x,
+                area.y,
+                &message,
+                self.theme.style_for(theme::Role::Warn),
+            );
+            return None;
+        }
         let mut error = None;
         let snapshot = self.core.snapshot();
         let pane_entity = self
@@ -2387,12 +2408,6 @@ impl App {
                 .unwrap_or_default();
             (launchers, entity_name)
         });
-        // TODO: `self.quit_confirm` has no draw branch here yet, so the dialog
-        // `handle_quit_confirm_key` gates on has no on-screen representation: the frame
-        // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
-        // `y`/`n`/Esc. The behaviour is complete and tested; a themed modal matching
-        // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
-        let area = frame.area();
         // Help is a reading surface, not a chooser, so unlike a palette it always takes
         // the whole frame rather than leaving anything visible around it
         // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
@@ -2575,7 +2590,68 @@ impl App {
                 self.glyphs,
             );
         }
+
+        // The quit-confirm gate overlays the base frame just drawn above, the same centred
+        // shape the Launcher palette above uses, rather than replacing the frame the way the
+        // early returns at the top of this method do: the list stays visible behind it while
+        // the user decides. `self.quit_confirm` and `self.launcher_palette` (and every other
+        // early-returning overlay above) are mutually exclusive, since `Self::handle_key_event`
+        // routes every key to at most one of them, so drawing this last never fights another
+        // overlay for the same pixels.
+        if self.quit_confirm {
+            draw_quit_confirm(frame, area, &self.theme, self.glyphs);
+        }
         error
+    }
+}
+
+/// The floor `App::draw_frame` gates its own height on, from what the four vertical bands a
+/// frame draws actually need: the status row, the list's own top border, one row of content,
+/// its bottom border, and the footer. Below this a frame has nowhere to put a legible row of
+/// anything, so the gate replaces the whole broken box with one line saying so
+/// ([ADR 0026](../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)'s
+/// "a row too narrow ... still says that something is wrong" is the same argument, applied to
+/// height rather than width). No width floor exists: every degradation ladder in this crate
+/// already renders correctly down to two columns.
+const MIN_FRAME_HEIGHT: u16 = 5;
+
+/// The two lines `draw_quit_confirm` puts inside the popup. The footer already carries `y
+/// run  n cancel` ([keybindings.md](../../docs/spec/keybindings.md#the-footer)), so this
+/// names only what confirming would interrupt.
+const QUIT_CONFIRM_LINES: [&str; 2] = ["An Action is still running.", "Quit anyway?"];
+
+/// Draws the quit-confirm gate as a centred popup over `frame`, reusing
+/// `LauncherPalette::draw`'s own shape: `Clear` wipes the popup's interior, then a bordered
+/// block in the destructive `warn` role ([theming.md](../../docs/spec/theming.md)'s "two
+/// palettes") frames [`QUIT_CONFIRM_LINES`].
+fn draw_quit_confirm(frame: &mut Frame, area: Rect, theme: &Theme, glyphs: &'static GlyphSet) {
+    let content_width = QUIT_CONFIRM_LINES
+        .iter()
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = content_width.saturating_add(2).min(area.width);
+    let height = (QUIT_CONFIRM_LINES.len() as u16)
+        .saturating_add(2)
+        .min(area.height);
+    let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, popup);
+
+    let mut scratch = BorderScratch::new();
+    let block = glyphs
+        .bordered_block(&mut scratch)
+        .border_style(theme.style_for(theme::Role::Warn));
+    let interior = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    for (row, line) in QUIT_CONFIRM_LINES
+        .iter()
+        .enumerate()
+        .take(interior.height as usize)
+    {
+        frame
+            .buffer_mut()
+            .set_string(interior.x, interior.y + row as u16, line, Style::new());
     }
 }
 
@@ -3326,6 +3402,115 @@ mod tests {
             })
             .expect("draw the frame");
         terminal.backend().buffer().clone()
+    }
+
+    /// Every symbol `buf` holds, as one string per row, top to bottom: a whole-frame
+    /// substring search without picking one row's coordinates by hand.
+    fn buffer_lines(buf: &ratatui::buffer::Buffer, width: u16, height: u16) -> String {
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // =====================================================================================
+    // The quit-confirm gate has an on-screen representation: a centred popup over the live
+    // frame ([`draw_quit_confirm`]), rather than the invisible gate the TODO this ticket
+    // removes used to leave behind.
+    // =====================================================================================
+
+    /// The gate draws over the live frame rather than replacing it: proves both that
+    /// `draw_quit_confirm`'s own text reaches the screen and that the list row behind it
+    /// (`repo-a`, well clear of the small centred popup at this frame size) is still drawn,
+    /// which a mutation that turned the branch into an early return (the shape every other
+    /// overlay in `draw_frame` uses) would fail.
+    #[test]
+    fn the_quit_confirm_gate_draws_a_popup_with_the_list_still_visible_behind_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.quit_confirm = true;
+
+        let (width, height) = (60u16, 20u16);
+        let buf = render_app_frame(&mut app, width, height);
+        let frame = buffer_lines(&buf, width, height);
+
+        for line in QUIT_CONFIRM_LINES {
+            assert!(
+                frame.contains(line),
+                "expected the quit-confirm popup's own text {line:?} on screen, got:\n{frame}"
+            );
+        }
+        assert!(
+            frame.contains("repo-a"),
+            "expected the list's own row still visible behind the popup, got:\n{frame}"
+        );
+    }
+
+    // =====================================================================================
+    // A frame below `MIN_FRAME_HEIGHT` draws one line naming the floor and nothing else,
+    // ahead of every other branch in `draw_frame`, including the four early-returning
+    // overlays.
+    // =====================================================================================
+
+    /// At the floor and one row under it: proves the gate is `height < MIN_FRAME_HEIGHT`
+    /// rather than `<=`, which an off-by-one would flip either direction.
+    #[test]
+    fn a_frame_below_the_height_floor_draws_only_the_floor_message() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let width = 40u16;
+        let buf = render_app_frame(&mut app, width, MIN_FRAME_HEIGHT - 1);
+        let frame = buffer_lines(&buf, width, MIN_FRAME_HEIGHT - 1);
+        assert!(
+            frame.contains(&format!("at least {MIN_FRAME_HEIGHT} rows")),
+            "expected the floor message naming the minimum, got:\n{frame}"
+        );
+        assert!(
+            !frame.contains("repo-a"),
+            "expected nothing else drawn below the floor, got:\n{frame}"
+        );
+
+        let buf = render_app_frame(&mut app, width, MIN_FRAME_HEIGHT);
+        let frame = buffer_lines(&buf, width, MIN_FRAME_HEIGHT);
+        assert!(
+            !frame.contains(&format!("at least {MIN_FRAME_HEIGHT} rows")),
+            "expected the ordinary frame to draw again right at the floor rather than the \
+             height-gate message, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("entities") && frame.contains('╮') && frame.contains('╯'),
+            "expected the ordinary status row and the list's own border at the floor, got:\n\
+             {frame}"
+        );
+    }
+
+    /// No width floor exists ([ADR 0026](../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)):
+    /// a frame at `MIN_FRAME_HEIGHT` but only two columns wide must still draw the ordinary
+    /// frame rather than the height-floor message, proving the gate reads only `area.height`.
+    #[test]
+    fn no_width_floor_exists_at_two_columns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let (width, height) = (2u16, MIN_FRAME_HEIGHT);
+        let buf = render_app_frame(&mut app, width, height);
+        let frame = buffer_lines(&buf, width, height);
+        // The height-gate message is one line of text starting at (0, 0) and nothing else;
+        // the list's own bordered box is what proves the ordinary ladder drew instead, since
+        // a two-column buffer clips the message's own text down to nothing distinguishable
+        // either way.
+        assert!(
+            frame.contains('╭') && frame.contains('╰'),
+            "expected the list's own border to still draw at two columns rather than the \
+             height-floor message replacing it, got:\n{frame:?}"
+        );
     }
 
     /// Opens each overlay `App` frames in turn and asserts the frame it draws, corners and
@@ -6180,6 +6365,49 @@ mod tests {
             footer::render(&app.bindings, Context::List, 80),
             "the detail footer's own content must differ from the list's, which is what a \
              hardcoded Context::List would fail to produce"
+        );
+    }
+
+    /// `footer::confirm_items` was dead in production before this: `footer_context` could
+    /// only ever return `List` or `Detail`, so the confirm-gate hints it builds never reached
+    /// a real footer. Driven through `App::footer_context` and `footer::render` rather than
+    /// `footer.rs`'s own module tests (which call `Context::Confirm` directly and so cannot
+    /// see whether anything in `App` ever reaches that variant), and checked against the
+    /// exact text and width keybindings.md publishes, read from the document itself rather
+    /// than restated here.
+    #[test]
+    fn the_footer_shows_the_confirm_gates_own_hints_while_quit_confirm_is_armed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(
+            app.footer_context(),
+            Context::List,
+            "sanity: no gate armed yet"
+        );
+
+        app.quit_confirm = true;
+        assert_eq!(app.footer_context(), Context::Confirm);
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read docs/spec/keybindings.md");
+        let marker = "`y run  n cancel` at ";
+        let after = spec
+            .split(marker)
+            .nth(1)
+            .expect("keybindings.md must still publish the confirm gate's own width");
+        let width: u16 = after
+            .split(' ')
+            .next()
+            .expect("a number must follow the marker")
+            .parse()
+            .expect("the published width must be a number");
+
+        assert_eq!(
+            footer::render(&app.bindings, app.footer_context(), width),
+            "y run  n cancel"
         );
     }
 
