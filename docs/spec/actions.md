@@ -40,7 +40,7 @@ The bound is a defence against the pathological case, not a normal-path cost. Me
 
 ## Step outcomes
 
-A closed set of four.
+A closed set of five.
 
 | outcome | meaning | role |
 | --- | --- | --- |
@@ -48,8 +48,19 @@ A closed set of four.
 | `Failed(exit)` | Ran and exited nonzero; the code is carried | `danger` |
 | `NotRun` | An earlier step failed, so this one never started | `dim` |
 | `Cancelled` | The run was cancelled before this step finished, or before it started | `dim` |
+| `OwnWork(..)` | No child process ran: Repon did this step itself, and the outcome carries Repon's own words for what it did (`Did`, `ok`), why it would not (`Refused`, `dim`) or what stopped it (`CouldNotAct`, `danger`) | `ok` / `dim` / `danger` |
 
 Steps run in order and stop at the first failure, with gating implicit, as [the config spec](config.md) already fixes; a later step that ran is proof the earlier ones succeeded.
+
+### Why the set grew from four to five
+
+The first four are all a child process's: `Failed` carries an exit code, `NotRun` means an earlier command failed, `Cancelled` means a run was interrupted. [repo-management.md](repo-management.md)'s "Receipts" asks a management operation to leave a receipt in this document's own sense, naming per Repo what was done or why it was refused, and a management operation runs no child process at all. Against four child-process outcomes, `ignore` on an already-ignored row had to borrow an outcome that means something else, and a fabricated exit code in the detail pane is worse than no receipt, which is why it shipped as a log line and a Notice instead.
+
+`OwnWork` is the outcome for a step Repon performed itself. It carries a sentence rather than a code, because Repon knows what it did and can say so, where an exit code is a number only the child could have produced. Its three grades are the three answers the pane and the row summary fold need to tell apart: Repon did it, Repon would not, Repon could not. `Refused` is deliberately not a failure, for the same reason `Cancelled` is not: nothing went wrong, and colouring a refusal `danger` would put a `!` in the gutter of a Repo that is perfectly readable.
+
+The other shape considered was a result on `ActionReceipt` that is not a step's, sitting beside `steps` rather than inside it. Refused because it forks every reader. The row summary fold, the `action:` Filter term, the detail pane and the status row each read one receipt one way today; a second field beside `steps` gives each of them a second path that can drift from the first, and makes states representable that mean nothing (steps and an own-work result at once, or an own-work result on a `not_applicable` receipt). A fifth outcome keeps one traversal and one shape, and the compiler names every site that has to learn it. The cost, stated rather than hidden: a management operation's single act is a Step, so [GLOSSARY.md](../../GLOSSARY.md)'s Step widens from "one command in an Action's ordered list" to include one act Repon performs itself, and `StepResult`'s `output` and `elision` are empty for it, because there is no other program's screen to quote.
+
+`OwnWork` does not touch Not applicable, which stays what The Selection and the gate below makes it: an excluded row that was in the Selection and was never operated on. A management refusal is a different fact. The row was operated on, Repon looked at it and would not act, and it has a reason to give.
 
 This set fixes a defect already in the specs. [The config spec](config.md) admits two outcomes, ran-and-succeeded or stopped-by-failure. But [layout-and-provenance.md](layout-and-provenance.md)'s detail-pane mock drew `step 1 ok` then `step 2 skipped no upstream configured`, a step that neither ran nor was blocked by an earlier failure, and [theming.md](theming.md)'s role map gave `warn` to a skipped Action step while giving no role at all to a failed one: `danger` covered Failed provenance and a Gone Worktree only. Two specs described an outcome the third forbids, and the one outcome the whole feature exists to surface was unthemed. This spec amends both: `skipped` is deleted from [theming.md](theming.md)'s role map, `danger` gains a failed Action step, and the mock is corrected. Where the word "skipped" actually belonged is an excluded row, settled under The Selection and the gate below.
 
@@ -107,9 +118,9 @@ pub struct ActionReceipt {
 }
 
 pub struct StepResult {
-    pub label: Arc<str>,           // the step's argv, rendered for display
+    pub label: Arc<str>,           // the step's argv, or the operation, rendered for display
     pub outcome: StepOutcome,
-    pub output: Arc<[u8]>,         // raw bytes, bounded, never interpreted here
+    pub output: Arc<[u8]>,         // raw bytes, bounded, never interpreted here; empty for own work
     pub elapsed: Duration,
     pub elision: Option<CaptureElision>,  // what the bound dropped, None if output fitted whole
 }
@@ -119,7 +130,13 @@ pub struct CaptureElision {
     pub kept_head_lines: usize,    // kept lines before the gap, where a renderer draws its mark
 }
 
-pub enum StepOutcome { Ok, Failed(i32), NotRun, Cancelled }
+pub enum StepOutcome { Ok, Failed(i32), NotRun, Cancelled, OwnWork(OwnWork) }
+
+pub enum OwnWork {
+    Did(Arc<str>),         // Repon did it, and this is what it did
+    Refused(Arc<str>),     // Repon would not act, and this is why; not a failure
+    CouldNotAct(Arc<str>), // Repon tried and could not finish, and this is what stopped it
+}
 ```
 
 Not a `Cell<T>`: that type carries a Generation and a stale flag, both refresh machinery, and `Presence::Vanished` marks every cell Stale, which is meaningless for a receipt of something Repon did. Not plain `Diagnostics` either: [the core API spec](core-api.md) says those reach the detail pane and never the list and are excluded from the row summary fold, and partial failure needs the fold. The payloads are `Arc` because the snapshot is cloned every frame, and a receipt must cost a refcount rather than a copy of its output.
@@ -127,6 +144,8 @@ Not a `Cell<T>`: that type carries a Generation and a stale flag, both refresh m
 An Action failure marks the row `!`, entering the gutter through the derivation route [discovery.md](discovery.md) already opened when an unparseable `.gitmodules` made a row Failed with no blank cell: the fold in [the core API spec](core-api.md) takes the entity's cells and its own derivations, and a `Failed` step in `last_action` is a derivation. The cost is stated plainly: `!` now means both "Repon could not read this repo" and "your command exited nonzero", so a perfectly readable Repo can carry a provenance mark. The alternative is a new column out of a 90-column budget, and [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s own prototype already rejected a glyph in every cell as noise. The detail pane is what distinguishes the two, which is the same trade [0017](../adr/0017-discovery-stops-at-the-repo-boundary.md) accepted when a Submodule row and a Worktree row came to look alike.
 
 `Failed(exit)` carries the per-entity exit code even though nothing in v1 prints it, so the non-TTY consumer [0005](../adr/0005-rendering-agnostic-core.md) requires to be addable is not foreclosed.
+
+A step Repon performed itself widens the fold on the same route and by the same rule: `OwnWork(CouldNotAct(..))` is a failure and marks the row `!`, where `Did` and `Refused` leave the gutter alone. The core builds that receipt, so a consumer hands it what Repon did and the words for it rather than a whole receipt of its own making, and `not_applicable` stays false, `running` stays `None` and the step count stays one.
 
 Nothing persists. The receipt lives in memory for the session and dies with it, which satisfies "keep until the next run" exactly, with no key, no clock and no expiry; the configurable-expiry half of the recorded requirement is dropped, and [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) says so plainly rather than leaving it quietly unimplemented. Measured with the pinned toml crate, persisting would cost real money at startup: an 8 KiB per-step bound across 403 entities is a 3.2 MiB `state.toml` costing 15 to 26ms, 64 KiB per step is 25 MiB and 80 to 165ms, and an unbounded 1 MiB policy is over 400 MB and more than a second to serialise, all paid against [refresh.md](refresh.md)'s 50ms first-frame budget. Four comparable tools (pueue, GNU parallel, ansible, turbo) independently split a small structured metadata record from the output text and never put both in one blob. Captured output does not go to `repon.log` either: [the config spec](config.md)'s path table has exactly one log, whose documented purpose is warning detail behind `w`, and no new path row is added.
 

@@ -73,4 +73,16 @@ An `ignore` therefore takes effect immediately: the row it names is subtracted f
 
 A management operation's result is a receipt in [actions.md](actions.md)'s sense: it records what Repon did, never goes Stale on a poll, is not superseded by a Generation, and does not persist. A `delete` receipt names each Repo and whether its working tree was removed, its config entry was removed, or it was refused, with the refusal's reason.
 
-Not built. What ships is a log line per row and a one-line Notice carrying the counts; nothing reaches the detail pane. The obstacle is [actions.md](actions.md)'s closed set of four step outcomes, every one of them a child process's, and a management operation runs no child process. [The open questions register](../open-questions.md#a-management-result-has-no-receipt-of-its-own) states the gap and what would close it.
+The run leaves one receipt per Selection row, labelled with the operation, carrying exactly one Step: the act Repon performed itself, whose outcome is [actions.md](actions.md)'s `OwnWork` and whose words are the sentence below. No row carries an exit code, a `NotRun` or a `Cancelled`, because no child process ran, and no row is Not applicable, which belongs to an excluded row alone.
+
+| row | outcome | what the pane says |
+| --- | --- | --- |
+| `ignore` wrote `exclude = true` | `Did` | ignored |
+| `unignore` removed the key | `Did` | no longer ignored |
+| `delete` removed the tree and an entry of its own | `Did` | working tree removed, `[[repo]]` entry removed |
+| `delete` removed the tree and there was no entry | `Did` | working tree removed, no `[[repo]]` entry of its own |
+| `unignore` on a row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
+| the gate already refused it | `Refused` | refused, then the reason "What `delete` refuses" gives |
+| the tree would not remove, or the file would not write | `CouldNotAct` | failed, then what went wrong |
+
+The receipt does not replace the gate. A refusal is still named and counted before the gesture is accepted, which is where a user can still change their mind; the receipt is what says afterwards which row got which answer. The log line and the one-line Notice carrying the counts stay too, and the receipt's own words are the log line's own words, read from one place so the two cannot drift.

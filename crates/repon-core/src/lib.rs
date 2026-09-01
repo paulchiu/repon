@@ -106,6 +106,7 @@ pub use entity::EntityKey;
 pub use entity::EntityState;
 pub use entity::Head;
 pub use entity::Kind;
+pub use entity::OwnWork;
 pub use entity::Presence;
 pub use entity::RunningStep;
 pub use entity::StepOutcome;

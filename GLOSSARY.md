@@ -73,19 +73,22 @@ A command fanned out across the Selection, either named in config or typed into 
 An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps and its concurrency, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.
 
 **Step**:
-One command in an Action's ordered list, as the core receives it: its argv, already split rather than a shell string, and any per-step environment overrides already resolved. Distinct from a Step result, which is what running one produces.
+One act in an Action's ordered list: either a command as the core receives it, its argv already split rather than a shell string with any per-step environment overrides already resolved, or one act Repon performs itself with no child process at all, which is what a Management operation's single Step is. Distinct from a Step result, which is what running one produces.
 
 **Action receipt**:
 An Entity's most recent Action run: its label, the Step results finished so far, whether the row was excluded and never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes. Not an Action run or an Action result; receipt is the settled word.
 
 **Step result**:
-One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded.
+One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded. A Step of Own work has nothing to capture, so its output is empty and its Capture elision absent; its words live in its Step outcome instead.
 
 **Capture elision**:
 What a Step's captured output lost to the head-plus-tail bound: how many lines were dropped and how many kept lines precede the gap. Two counts and no mark, because the mark that stands in for the gap is a glyph, and glyphs belong to the consumer; nothing is written into the captured bytes to say a drop happened.
 
 **Step outcome**:
-A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.
+A Step's closed set of exactly five: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, cancelled before it finished or started, or Own work. Cancelled is explicitly not a failure.
+
+**Own work**:
+The Step outcome of a Step Repon performed itself, carrying Repon's own words rather than an exit code, in one of three grades: it did the work, it refused to and says why, or it could not and says what stopped it. Refused is not a failure; only could-not-act is. The Management operations are what produce it today. Not Not applicable, which is an excluded row that was in the Selection and was never operated on, where a refused row was looked at and answered.
 
 **Running step**:
 The Step an Action receipt is executing right now: its label and when it started, present on the receipt only until that Step finishes. Distinct from a Step result, which a Step earns only once it is done; the pane shows a spinner rather than a Step outcome for this one.

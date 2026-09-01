@@ -192,8 +192,8 @@ mod tests {
 
     use super::*;
     use crate::entity::{
-        AheadBehind, DefaultBranch, DirtyCounts, EntityKey, Head, Kind, StepOutcome, StepResult,
-        SyncState, WorktreeState,
+        AheadBehind, DefaultBranch, DirtyCounts, EntityKey, Head, Kind, OwnWork, StepOutcome,
+        StepResult, SyncState, WorktreeState,
     };
 
     /// One receipt, one step per outcome given, in order: enough for the fold's own tests,
@@ -784,6 +784,32 @@ mod tests {
         ]));
 
         assert_eq!(summary(&entity), RowSummary::Fresh);
+    }
+
+    /// The same classification for a step Repon performed itself: a Management operation that
+    /// refused is not a failure and must leave the gutter alone, or a Repo that reads
+    /// perfectly well takes `!` for having been declined
+    /// (`docs/spec/actions.md`'s "Why the set grew from four to five").
+    #[test]
+    fn own_work_repon_refused_leaves_the_row_fresh_and_work_it_could_not_finish_does_not() {
+        let mut refused = fresh_entity("repo-refused");
+        refused.last_action = Some(receipt_with_steps(vec![StepOutcome::OwnWork(
+            OwnWork::Refused(Arc::from("refused, already ignored")),
+        )]));
+
+        let mut could_not = fresh_entity("repo-could-not");
+        could_not.last_action = Some(receipt_with_steps(vec![StepOutcome::OwnWork(
+            OwnWork::CouldNotAct(Arc::from("failed, permission denied")),
+        )]));
+
+        let mut did = fresh_entity("repo-did");
+        did.last_action = Some(receipt_with_steps(vec![StepOutcome::OwnWork(
+            OwnWork::Did(Arc::from("ignored")),
+        )]));
+
+        assert_eq!(summary(&refused), RowSummary::Fresh);
+        assert_eq!(summary(&did), RowSummary::Fresh);
+        assert_eq!(summary(&could_not), RowSummary::Failed);
     }
 
     /// Reinforces criterion 1's exclusion from the Cell machinery: `FoldableCell` is a

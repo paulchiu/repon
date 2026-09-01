@@ -24,8 +24,8 @@ use ansi_to_tui::IntoText;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use repon_core::{
     ActionReceipt, CaptureElision, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts,
-    EntityState, Head, InProgressOperation, Kind, RunningStep, Settled, StepOutcome, StepResult,
-    SyncState, Timestamp, Unknown,
+    EntityState, Head, InProgressOperation, Kind, OwnWork, RunningStep, Settled, StepOutcome,
+    StepResult, SyncState, Timestamp, Unknown,
 };
 
 use super::list::{
@@ -352,6 +352,10 @@ fn last_action_spans(last_action: &Option<ActionReceipt>) -> StyledLine {
         Some(receipt) if receipt.failed() => {
             vec![("failed".to_string(), Meaning::FailedActionStep.role())]
         }
+        Some(receipt) if receipt.refused() => vec![(
+            "refused".to_string(),
+            Meaning::ActionStepNotRunOrCancelled.role(),
+        )],
         Some(_) => vec![("ok".to_string(), Meaning::SucceededActionStep.role())],
         None => vec![(
             "none yet".to_string(),
@@ -399,39 +403,78 @@ fn format_step_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// A finished step's own outcome word. Exhaustive over [`StepOutcome`]'s closed four, the
-/// same discipline [`sync_word`] and [`stopped_word`] hold over their own closed sets, so a
-/// fifth variant fails to compile here rather than falling through a default word.
-fn step_outcome_word(outcome: StepOutcome) -> String {
+/// A finished step's own outcome word, or, for a step Repon performed itself, Repon's own
+/// sentence about it. Exhaustive over [`StepOutcome`]'s closed five, the same discipline
+/// [`sync_word`] and [`stopped_word`] hold over their own closed sets, so a sixth variant
+/// fails to compile here rather than falling through a default word.
+fn step_outcome_word(outcome: &StepOutcome) -> String {
     match outcome {
         StepOutcome::Ok => "ok".to_string(),
         StepOutcome::Failed(code) => format!("failed exit {code}"),
         StepOutcome::NotRun => "not run".to_string(),
         StepOutcome::Cancelled => "cancelled".to_string(),
+        StepOutcome::OwnWork(work) => work.said().to_string(),
     }
 }
 
 /// [`step_outcome_word`]'s own role: the same three meanings [`last_action_spans`] already
-/// gives an Action's overall outcome, over the same closed four `StepOutcome` variants.
-fn step_outcome_meaning(outcome: StepOutcome) -> Meaning {
+/// gives an Action's overall outcome, over the same closed five `StepOutcome` variants. A
+/// refusal takes `dim` beside a cancelled step rather than `danger`, because nothing went
+/// wrong (`docs/spec/actions.md`'s own role column for `OwnWork`).
+fn step_outcome_meaning(outcome: &StepOutcome) -> Meaning {
     match outcome {
-        StepOutcome::Ok => Meaning::SucceededActionStep,
-        StepOutcome::Failed(_) => Meaning::FailedActionStep,
-        StepOutcome::NotRun | StepOutcome::Cancelled => Meaning::ActionStepNotRunOrCancelled,
+        StepOutcome::Ok | StepOutcome::OwnWork(OwnWork::Did(_)) => Meaning::SucceededActionStep,
+        StepOutcome::Failed(_) | StepOutcome::OwnWork(OwnWork::CouldNotAct(_)) => {
+            Meaning::FailedActionStep
+        }
+        StepOutcome::NotRun
+        | StepOutcome::Cancelled
+        | StepOutcome::OwnWork(OwnWork::Refused(_)) => Meaning::ActionStepNotRunOrCancelled,
     }
 }
 
-/// One finished step's own header line: its number, its outcome, its label and its elapsed
-/// time.
+/// One finished step's own header line, in whichever of the two shapes its outcome earns.
+/// Exhaustive rather than a default, so a sixth `StepOutcome` has to say which shape it draws
+/// in rather than inheriting one.
 fn finished_step_line(index: usize, step: &StepResult) -> ContentLine {
+    match &step.outcome {
+        StepOutcome::Ok | StepOutcome::Failed(_) | StepOutcome::NotRun | StepOutcome::Cancelled => {
+            child_step_line(index, step)
+        }
+        StepOutcome::OwnWork(_) => own_work_line(step),
+    }
+}
+
+/// A child process step's own header line: its number, its outcome, its label and its elapsed
+/// time.
+fn child_step_line(index: usize, step: &StepResult) -> ContentLine {
     ContentLine::Styled(vec![
         (format!("  step {}  ", index + 1), Role::Dim),
         (
-            step_outcome_word(step.outcome),
-            step_outcome_meaning(step.outcome).role(),
+            step_outcome_word(&step.outcome),
+            step_outcome_meaning(&step.outcome).role(),
         ),
         (
             format!("   {}   {}", step.label, format_step_elapsed(step.elapsed)),
+            Role::Dim,
+        ),
+    ])
+}
+
+/// A step Repon performed itself: the operation, then Repon's own sentence about what it did
+/// or would not do, then how long it took. No step number, because such an operation is one
+/// act rather than a position in an ordered list, and the sentence leads rather than trails
+/// because it is the answer this row exists to give
+/// (`docs/spec/repo-management.md`'s "Receipts").
+fn own_work_line(step: &StepResult) -> ContentLine {
+    ContentLine::Styled(vec![
+        (format!("  {}   ", step.label), Role::Dim),
+        (
+            step_outcome_word(&step.outcome),
+            step_outcome_meaning(&step.outcome).role(),
+        ),
+        (
+            format!("   {}", format_step_elapsed(step.elapsed)),
             Role::Dim,
         ),
     ])
@@ -1720,6 +1763,140 @@ mod tests {
             )[0]
             .1,
             Meaning::LoadingSpinner.role()
+        );
+    }
+
+    // --- Own work: the receipt a Management operation leaves, docs/spec/repo-management.md ---
+
+    /// A receipt whose one step Repon performed itself, built the way
+    /// [`repon_core::Core::record_own_work`] builds one: the operation labels both the receipt
+    /// and its single step, and nothing was captured.
+    fn own_work_receipt(operation: &str, work: OwnWork) -> ActionReceipt {
+        ActionReceipt {
+            label: Arc::from(operation),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from(operation),
+                outcome: StepOutcome::OwnWork(work),
+                output: Arc::from(&b""[..]),
+                elapsed: Duration::from_millis(3),
+                elision: None,
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+            running: None,
+        }
+    }
+
+    /// The pane names the operation and what Repon did, in Repon's own words. This is the
+    /// Done-when's "naming per Repo what was done" reaching the surface that has to show it.
+    #[test]
+    fn the_pane_names_the_operation_and_what_repon_did() {
+        let mut row = entity("repo-a");
+        row.last_action = Some(own_work_receipt(
+            "delete",
+            OwnWork::Did(Arc::from("working tree removed, `[[repo]]` entry removed")),
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        assert!(lines.contains("delete"), "got {lines:?}");
+        assert!(
+            lines.contains("working tree removed, `[[repo]]` entry removed"),
+            "got {lines:?}"
+        );
+    }
+
+    /// The refusal half: the pane names why the row was not acted on, and the summary word
+    /// above it says refused rather than ok, since neither a success nor a failure happened.
+    #[test]
+    fn the_pane_names_why_a_row_was_refused_and_calls_the_run_refused_rather_than_ok() {
+        let mut row = entity("sidecar");
+        row.last_action = Some(own_work_receipt(
+            "delete",
+            OwnWork::Refused(Arc::from(
+                "refused, removing a linked Worktree is `git worktree remove`'s job",
+            )),
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        assert!(
+            lines.contains("refused, removing a linked Worktree"),
+            "got {lines:?}"
+        );
+        assert_eq!(
+            last_action_spans(&row.last_action)[0].0,
+            "refused",
+            "a refusal is neither ok nor failed"
+        );
+        assert_eq!(
+            last_action_spans(&row.last_action)[0].1,
+            Meaning::ActionStepNotRunOrCancelled.role(),
+            "and takes the dim role rather than danger, since nothing went wrong"
+        );
+    }
+
+    /// No row of a management receipt reads as something a child process did: no step number,
+    /// since the operation is one act rather than a position in an ordered list, and no exit
+    /// code, since nothing exited.
+    #[test]
+    fn an_own_work_row_carries_no_step_number_and_no_exit_code() {
+        for work in [
+            OwnWork::Did(Arc::from("ignored")),
+            OwnWork::Refused(Arc::from("refused, already ignored")),
+            OwnWork::CouldNotAct(Arc::from("failed, permission denied")),
+        ] {
+            let mut row = entity("repo-a");
+            row.last_action = Some(own_work_receipt("ignore", work));
+
+            let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+            assert!(!lines.contains("step 1"), "got {lines:?}");
+            assert!(!lines.contains("exit"), "got {lines:?}");
+            assert!(!lines.contains("not run"), "got {lines:?}");
+            assert!(!lines.contains("cancelled"), "got {lines:?}");
+        }
+    }
+
+    /// Each grade takes the role theming.md already gives that state, and a refusal takes the
+    /// dim one rather than danger: a Repo Repon declined to act on must not read as a Repo
+    /// whose command blew up.
+    #[test]
+    fn each_grade_of_own_work_takes_its_own_role_and_only_could_not_act_reads_as_a_failure() {
+        let did = StepOutcome::OwnWork(OwnWork::Did(Arc::from("ignored")));
+        let refused = StepOutcome::OwnWork(OwnWork::Refused(Arc::from("already ignored")));
+        let could_not = StepOutcome::OwnWork(OwnWork::CouldNotAct(Arc::from("boom")));
+
+        assert_eq!(step_outcome_meaning(&did), Meaning::SucceededActionStep);
+        assert_eq!(
+            step_outcome_meaning(&refused),
+            Meaning::ActionStepNotRunOrCancelled
+        );
+        assert_eq!(step_outcome_meaning(&could_not), Meaning::FailedActionStep);
+
+        assert_eq!(step_outcome_word(&did), "ignored");
+        assert_eq!(step_outcome_word(&refused), "already ignored");
+        assert_eq!(step_outcome_word(&could_not), "boom");
+
+        let mut refused_row = entity("a");
+        refused_row.last_action = Some(own_work_receipt(
+            "ignore",
+            OwnWork::Refused(Arc::from("already ignored")),
+        ));
+        assert_eq!(
+            row_level_failure(&refused_row.diagnostics, &refused_row.last_action),
+            None,
+            "a refusal must not widen the row summary fold"
+        );
+
+        let mut could_not_row = entity("b");
+        could_not_row.last_action = Some(own_work_receipt(
+            "delete",
+            OwnWork::CouldNotAct(Arc::from("boom")),
+        ));
+        assert!(
+            row_level_failure(&could_not_row.diagnostics, &could_not_row.last_action).is_some(),
+            "work Repon could not finish is a failure and does widen it"
         );
     }
 
