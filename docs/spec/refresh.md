@@ -10,7 +10,7 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 
 | trigger | what it does |
 | --- | --- |
-| Startup | Generation 1 over everything, with an empty prior state. `Core::start` returns before its own discovery has landed, so this Generation resolves its order after its own walk rather than from a table the consumer could name. |
+| Startup | Generation 1 over everything, with an empty prior state. `Core::start` starts it itself: it returns before its own discovery has landed, and that same walk resolves the Generation's order and dispatches it, so a launch walks the tree once and a consumer names no keys. |
 | The refresh key | A new generation over everything, on `r`, settled in [keybindings.md](keybindings.md). |
 | Refreshing the Selection | A new generation over the Selection only, on `R`. A separate explicit gesture, not the default, because after acting on three Repos you want those three re-read now rather than a four second sweep. |
 | Returning from a Launcher | The entity that was handed off is re-probed first and synchronously, then a normal generation starts. |
@@ -106,7 +106,7 @@ Read that literally. The comparison is against the generation recorded on the ce
 
 ## Cancellation
 
-An abandoned generation is cancelled, not merely discarded. Measured: cancelling brings the next generation to 1.04 times a cold run, and leaving the old one to finish costs 1.79 times, because both contend for the same cores.
+An abandoned generation is cancelled, not merely discarded. Measured: cancelling brings the next generation to 1.04 times a cold run, and leaving the old one to finish costs 1.79 times, because both contend for the same cores. A `Core` being dropped counts as abandoning one, which is what a Set switch does while the outgoing Set's fan-out is still running.
 
 Mechanically, each generation owns one `Arc<AtomicBool>` per in-flight entity, passed to gix as `should_interrupt`. Never use `gix::interrupt::IS_INTERRUPTED`, which is a single process-global static wired to SIGINT and would cancel everything at once. `Repository::status()` takes it through `should_interrupt_shared()`; `dirwalk()` and `index_worktree_status()` take it directly.
 
@@ -120,7 +120,7 @@ Unknown carries a reason, which the detail pane reports in words: timed out, or 
 
 ## Discovery is never on the calling thread
 
-Discovery rides on every Generation, and no Generation's walk runs on the thread that asked for it. `Core::start` spawns the first walk and returns against an empty table, so the terminal is claimed and a first frame drawn while it runs; every later Generation reserves its number on the calling thread and runs the walk and the fan-out on one of its own. Measured against a directory of 309 Repos, the headless settle was 3.3 seconds of wall clock and 38.5 seconds of system time, all of it ahead of the first frame, and `r`, focus gained and resume each paid a full walk on the render thread.
+Discovery rides on every Generation, and no Generation's walk runs on the thread that asked for it. `Core::start` reserves Generation 1 on the calling thread, spawns the first walk and returns against an empty table, so the terminal is claimed and a first frame drawn while it runs; that walk is Generation 1's own, and dispatches over what it found rather than leaving a consumer to ask for a second walk of the same tree. Every later Generation reserves its number on the calling thread and runs the walk and the fan-out on one of its own. Measured against a directory of 309 Repos, the headless settle was 3.3 seconds of wall clock and 38.5 seconds of system time, all of it ahead of the first frame, and `r`, focus gained and resume each paid a full walk on the render thread.
 
 Two properties survive that move, and both are what the threading is shaped around. The Generation number is reserved on the calling thread, so the numbers stay in gesture order however long the walks take; and the bodies then run in that same order, so an older Generation can never reach the table behind a newer one, set that newer one's interrupt flags and record itself as the live one, which is Supersession below read backwards.
 

@@ -22,8 +22,8 @@ use crate::config::Config;
 const SETTLE_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
 /// Builds a Core over the Set `flag_set` (or `REPON_SET`, or the first declared Set) resolves
-/// to, dispatches one Generation over every discovered Entity, blocks until it settles or the
-/// deadline passes, then serialises the settled document to standard output. `flag_no_fetch`
+/// to, whose own first walk is one Generation over every discovered Entity, blocks until it
+/// settles or the deadline passes, then serialises the settled document to standard output. `flag_no_fetch`
 /// is `--no-fetch`, forcing `fetch.enabled` off the same way it does for [`super::App::new`].
 /// The process exits non-zero only when [`any_probe_failed`] finds one: a dirty tree, an
 /// ahead/behind count, a stale value or a Not-applicable cell never does, whatever it reads
@@ -64,9 +64,6 @@ fn settle_document(
         &active_set,
         flag_no_fetch,
     ));
-    // Everything discovery finds, rather than this instant's keys: `Core::start` returns
-    // before its own discovery has landed, so there are none to name yet.
-    core.refresh_all();
     let snapshot = core.settle(reload::GENERATION_DEADLINE + SETTLE_DEADLINE_SLACK);
 
     let any_failed = any_probe_failed(&snapshot);
