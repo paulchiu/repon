@@ -39,6 +39,9 @@ A transient predicate that narrows the visible rows. A Filter never mutates the 
 **Filter term**:
 One unit of a Filter. Either a bare word, which always matches the display name, or a key and a value joined by a colon. Terms always combine with and. Not a token, clause or qualifier.
 
+**Key Vocabulary**:
+One key's own text and the fixed values it accepts, closed the same way the Filter's own keys are. The core exposes it as plain data, read from the same closed key set the parser matches against, so a consumer offering it (the Filter line's completion list) cannot name a key or value the parser itself would reject.
+
 **Committed Filter**:
 A Filter that has been applied with Enter and is narrowing the list while the cursor is back on it. Distinct from the text still being typed into the Filter line, which narrows live but is abandoned by Esc. Only a committed Filter persists, and only a committed Filter is what Esc clears at the last rung of its unwind. Not an active or saved Filter, since a Set is the saved one.
 

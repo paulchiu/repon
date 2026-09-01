@@ -2,19 +2,44 @@
 //! `Action::EnterFilter`), prefilled with the committed Filter, applying live on every
 //! keystroke ([filter.md](../../../docs/spec/filter.md)). `crate::app::App` is what decides
 //! when the live text becomes the committed [`repon_core::Filter`]; this module only owns the
-//! edit buffer and how it draws.
+//! edit buffer, the completion list built from the term under the cursor, and how both draw.
 //!
 //! Deferred rather than built here, and recorded so nobody mistakes the gap for an oversight:
-//! the colon-triggered completion list, `Tab`'s accept, the `?` unrecognised-term advisory
-//! slot, and the footer's placement one row above this one at every width the ladder
-//! documents. `PreviousEntry` and `NextEntry` (`Ctrl+K`/`Ctrl+J`, `Up`/`Down`) are no-ops here
-//! for the same reason: they move a completion highlight this module does not have yet.
+//! the `?` unrecognised-term advisory slot, and the footer's placement one row above this one
+//! at every width the ladder documents.
 
-use ratatui::{Frame, buffer::Buffer, layout::Rect};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, widgets::Clear};
 use repon_core::Filter;
 
 use crate::edit_buffer;
+use crate::list_viewport::offset_following_cursor;
 use crate::theme::{Role, Theme};
+
+/// The completion overlay's own cap, whatever the terminal's height
+/// ([filter.md](../../../docs/spec/filter.md#screen-placement): "capped at 8 rows and
+/// scrolling ... beyond that").
+pub(crate) const COMPLETION_MAX_ROWS: usize = 8;
+
+/// What the term under the cursor offers, per
+/// [filter.md](../../../docs/spec/filter.md#completion)'s trigger table: nothing, every key,
+/// or one recognised key's own values. `Keys` and `Values` both carry the literal text
+/// [`FilterLine::accept_highlighted_completion`] inserts, already formatted (a key's own
+/// entry carries its trailing `:`; a value's does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Trigger {
+    None,
+    Keys(Vec<String>),
+    Values(Vec<String>),
+}
+
+impl Trigger {
+    fn candidates(&self) -> &[String] {
+        match self {
+            Trigger::None => &[],
+            Trigger::Keys(candidates) | Trigger::Values(candidates) => candidates,
+        }
+    }
+}
 
 /// The Filter line's own edit buffer: append-only text, the same shape
 /// [`crate::action_palette::ActionPalette`]'s own query takes. Editing is always at the end:
@@ -22,6 +47,14 @@ use crate::theme::{Role, Theme};
 /// ([keybindings.md](../../../docs/spec/keybindings.md)'s `input` context).
 pub(crate) struct FilterLine {
     input: String,
+    /// The row the completion list's highlight sits on, and the window following it
+    /// ([`offset_following_cursor`], the same viewport math the repo list's own cursor
+    /// uses). Reset to `(0, 0)` on every edit ([`Self::reset_completion`]): a keystroke can
+    /// swap the whole candidate set out from under it (an accepted key's `:` flips the list
+    /// from every key to that key's own values), so a standing highlight has nothing to
+    /// carry over.
+    highlight: usize,
+    completion_offset: usize,
 }
 
 /// The row's own text while [`FilterLine::input`] is empty, replaced by the prompt character
@@ -38,27 +71,38 @@ impl FilterLine {
     pub(crate) fn new(committed: &Filter) -> Self {
         FilterLine {
             input: committed.as_str().to_string(),
+            highlight: 0,
+            completion_offset: 0,
         }
     }
 
     pub(crate) fn type_char(&mut self, c: char) {
         self.input.push(c);
+        self.reset_completion();
     }
 
     /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
     /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
     pub(crate) fn delete_previous_char(&mut self) {
         self.input.pop();
+        self.reset_completion();
     }
 
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word.
     pub(crate) fn delete_previous_word(&mut self) {
         edit_buffer::delete_previous_word(&mut self.input);
+        self.reset_completion();
     }
 
     /// `Ctrl+U`: clears the line, the fastest way back to an unfiltered list while editing.
     pub(crate) fn clear_line(&mut self) {
         self.input.clear();
+        self.reset_completion();
+    }
+
+    fn reset_completion(&mut self) {
+        self.highlight = 0;
+        self.completion_offset = 0;
     }
 
     /// The live text, re-parsed on every read: cheap enough for a per-keystroke Filter and
@@ -66,6 +110,111 @@ impl FilterLine {
     /// `self.input`.
     pub(crate) fn live_filter(&self) -> Filter {
         Filter::parse(&self.input)
+    }
+
+    /// Where the term under the cursor starts in `self.input`. Editing is always at the end
+    /// ([`FilterLine`]'s own doc comment), so "the term under the cursor"
+    /// ([filter.md](../../../docs/spec/filter.md#completion)) is always the *last* term, and
+    /// there is never a cursor position to track separately from `self.input`'s own length.
+    /// [`edit_buffer::last_term_start`] is the one whitespace search the workspace blesses
+    /// (`edit_buffer`'s own doc comment), so this reads through it rather than keeping a
+    /// second copy of the same cut.
+    fn term_start(&self) -> usize {
+        edit_buffer::last_term_start(&self.input)
+    }
+
+    /// The current term's own [`Trigger`], and the byte offset in `self.input` where
+    /// [`Self::accept_highlighted_completion`] starts overwriting: right after a leading `-`
+    /// for a key completion, or right after the value fragment's own last comma (or the `:`
+    /// if there is no comma yet) for a value completion, so accepting one alternative of a
+    /// comma-joined value never destroys the ones already typed.
+    ///
+    /// [filter.md](../../../docs/spec/filter.md#completion)'s trigger table, verbatim: empty
+    /// (or a bare `-`) offers every key, a bare `:` (or `-:`) offers every key, a known key up
+    /// to or past its `:` offers that key's own values, anything else offers nothing. Matched
+    /// case-insensitively, the same as the parser itself
+    /// ([filter.md](../../../docs/spec/filter.md#the-grammar)).
+    fn trigger(&self) -> (Trigger, usize) {
+        let term_start = self.term_start();
+        let term = &self.input[term_start..];
+        let body_start = if term.starts_with('-') {
+            term_start + 1
+        } else {
+            term_start
+        };
+        let body = &self.input[body_start..];
+
+        if body.is_empty() || body == ":" {
+            let keys = repon_core::vocabulary()
+                .into_iter()
+                .map(|entry| format!("{}:", entry.key))
+                .collect();
+            return (Trigger::Keys(keys), body_start);
+        }
+
+        let Some(colon) = body.find(':') else {
+            return (Trigger::None, body_start);
+        };
+        let key_text = &body[..colon];
+        let Some(entry) = repon_core::vocabulary()
+            .into_iter()
+            .find(|entry| entry.key.eq_ignore_ascii_case(key_text))
+        else {
+            return (Trigger::None, body_start);
+        };
+
+        let value_text = &body[colon + 1..];
+        let fragment_offset = colon + 1 + value_text.rfind(',').map_or(0, |comma| comma + 1);
+        let values = entry.values.iter().map(|value| value.to_string()).collect();
+        (Trigger::Values(values), body_start + fragment_offset)
+    }
+
+    /// The completion list's current candidates, already formatted for display and for
+    /// insertion: empty when [`Self::trigger`] offers nothing, which is what makes the list
+    /// vanish ([filter.md](../../../docs/spec/filter.md#completion): "vanishes when it does
+    /// not").
+    pub(crate) fn completions(&self) -> Vec<String> {
+        self.trigger().0.candidates().to_vec()
+    }
+
+    /// `Ctrl+K`/`Ctrl+J`, `Up`/`Down`: moves the highlight by `delta`, clamped at both ends
+    /// rather than wrapping (the same convention
+    /// [`crate::action_palette::ActionPalette::move_highlight`] uses), and follows the
+    /// viewport to it exactly as the repo list's own cursor does
+    /// ([`offset_following_cursor`]), so scrolling past [`COMPLETION_MAX_ROWS`] moves the
+    /// window rather than losing the highlight off the visible edge
+    /// ([filter.md](../../../docs/spec/filter.md#screen-placement)).
+    pub(crate) fn move_completion_highlight(&mut self, delta: isize) {
+        let len = self.completions().len();
+        if len == 0 {
+            self.highlight = 0;
+            self.completion_offset = 0;
+            return;
+        }
+        let last = (len - 1) as isize;
+        let moved = self.highlight as isize + delta;
+        self.highlight = moved.clamp(0, last) as usize;
+        self.completion_offset = offset_following_cursor(
+            self.completion_offset,
+            self.highlight,
+            COMPLETION_MAX_ROWS,
+            len,
+        );
+    }
+
+    /// `Tab`: replaces the term under the cursor (or the value fragment being typed, for a
+    /// comma-joined value) with the highlighted candidate, then resets the highlight for
+    /// whatever the newly written text triggers next. A candidate list emptied out from under
+    /// a standing `self.highlight` (this cannot happen today, since every mutation already
+    /// resets it, but costs nothing to guard) leaves the line untouched rather than panicking.
+    pub(crate) fn accept_highlighted_completion(&mut self) {
+        let (trigger, fragment_start) = self.trigger();
+        let Some(candidate) = trigger.candidates().get(self.highlight) else {
+            return;
+        };
+        self.input.truncate(fragment_start);
+        self.input.push_str(candidate);
+        self.reset_completion();
     }
 
     /// Draws the line at `area`'s own row: a leading `/` marking the surface, then either the
@@ -80,6 +229,37 @@ impl FilterLine {
             (format!("/ {}", self.input), theme.style_for(Role::Text))
         };
         buf.set_stringn(area.x, area.y, &line, area.width as usize, style);
+    }
+
+    /// Draws the completion overlay into `area`, one candidate per row, the highlighted one
+    /// marked `> ` the way [`crate::action_palette::ActionPalette`] and
+    /// [`crate::set_picker::SetPicker`] already mark theirs. `area`'s own height is the
+    /// caller's job: [filter.md](../../../docs/spec/filter.md#screen-placement) has it grow
+    /// upward from the Filter line, capped at [`COMPLETION_MAX_ROWS`], and this draws
+    /// whatever height it is handed starting from `self.completion_offset`'s own window.
+    pub(crate) fn draw_completions(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let candidates = self.completions();
+        // Clears whatever the list already painted here first: `set_stringn` below only ever
+        // writes as many cells as the candidate text itself is long, so without this a short
+        // candidate would leave the tail of the list's own border or row peeking out past it.
+        frame.render_widget(Clear, area);
+        let buf: &mut Buffer = frame.buffer_mut();
+        for (row, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(self.completion_offset)
+            .take(area.height as usize)
+        {
+            let marker = if row == self.highlight { "> " } else { "  " };
+            let line = format!("{marker}{candidate}");
+            buf.set_stringn(
+                area.x,
+                area.y + (row - self.completion_offset) as u16,
+                &line,
+                area.width as usize,
+                theme.style_for(Role::Text),
+            );
+        }
     }
 }
 
@@ -220,5 +400,224 @@ mod tests {
         line.clear_line();
         assert_eq!(line.live_filter().as_str(), "");
         assert!(!line.live_filter().is_active());
+    }
+
+    // --- Completion: `docs/spec/filter.md#completion`'s trigger table ---
+
+    fn typed(text: &str) -> FilterLine {
+        let mut line = FilterLine::new(&committed(""));
+        for c in text.chars() {
+            line.type_char(c);
+        }
+        line
+    }
+
+    /// Every key's own completion entry, `key:` for each vocabulary entry in
+    /// `repon_core::vocabulary`'s own order: read from there rather than restated here, so a
+    /// thirteenth key reaches this list with no edit to this test.
+    fn every_key_entry() -> Vec<String> {
+        repon_core::vocabulary()
+            .into_iter()
+            .map(|entry| format!("{}:", entry.key))
+            .collect()
+    }
+
+    /// Row 1: "empty (an empty line, or just after a space)" offers every key. Exercised on
+    /// a genuinely empty line and on the empty term left by a trailing space after a
+    /// committed one, which is the "just after a space" half of the same row.
+    #[test]
+    fn an_empty_term_offers_every_key() {
+        assert_eq!(typed("").completions(), every_key_entry());
+        assert_eq!(typed("kind:repo ").completions(), every_key_entry());
+    }
+
+    /// Row 2: a bare `:`, the empty key, offers every key too, whether or not the term
+    /// carries a leading negation.
+    #[test]
+    fn a_bare_colon_offers_every_key() {
+        assert_eq!(typed(":").completions(), every_key_entry());
+        assert_eq!(typed("-:").completions(), every_key_entry());
+    }
+
+    /// Row 3: a known key up to or past its `:` offers that key's own values, matched
+    /// case-insensitively like the parser itself, and unaffected by a leading `-` or by text
+    /// already typed after the colon: completion is static, "it offers the vocabulary, never
+    /// the data" (`docs/spec/filter.md#completion`), so it does not narrow by what follows.
+    #[test]
+    fn a_known_key_up_to_or_past_its_colon_offers_that_keys_own_values() {
+        let kind_values: Vec<String> = repon_core::vocabulary()
+            .into_iter()
+            .find(|entry| entry.key == "kind")
+            .expect("`kind` is in the vocabulary")
+            .values
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+
+        assert_eq!(typed("kind:").completions(), kind_values);
+        assert_eq!(typed("KIND:").completions(), kind_values);
+        assert_eq!(typed("-kind:").completions(), kind_values);
+        assert_eq!(typed("kind:wor").completions(), kind_values);
+    }
+
+    /// Row 4: anything else offers nothing, including a key's own text with no colon reached
+    /// yet (a bare word never triggers, `docs/spec/filter.md#completion`'s own note) and a
+    /// colon whose key half is not recognised.
+    #[test]
+    fn anything_else_offers_nothing() {
+        assert!(typed("kin").completions().is_empty());
+        assert!(typed("kind").completions().is_empty());
+        assert!(typed("somerepo").completions().is_empty());
+        assert!(typed("kimd:repo").completions().is_empty());
+    }
+
+    /// The free-text keys (`name`, `branch`, `path`) reach the "known key" row too, but their
+    /// own vocabulary is empty, so the list still vanishes: the trigger table has no separate
+    /// row for them, and this is what that collapse means in practice.
+    #[test]
+    fn a_free_text_keys_own_values_list_is_empty_so_its_list_still_vanishes() {
+        assert!(typed("name:").completions().is_empty());
+        assert!(typed("branch:something").completions().is_empty());
+    }
+
+    #[test]
+    fn tab_accepts_the_highlighted_key_and_appends_its_own_colon() {
+        let mut line = typed("");
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "name:");
+    }
+
+    #[test]
+    fn tab_accepts_the_highlighted_value_after_moving_to_it() {
+        let mut line = typed("kind:");
+        line.move_completion_highlight(1);
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "kind:worktree");
+    }
+
+    /// Accepting one comma-joined alternative must not destroy the ones already typed: the
+    /// insertion point is the value fragment after the last comma, not the whole term.
+    #[test]
+    fn accepting_a_value_after_a_comma_keeps_the_earlier_alternatives() {
+        let mut line = typed("sync:ahead,");
+        line.move_completion_highlight(1); // "ahead" -> "behind"
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "sync:ahead,behind");
+    }
+
+    /// Accepting a key preserves a leading negation rather than swallowing it.
+    #[test]
+    fn accepting_a_key_preserves_a_leading_negation() {
+        let mut line = typed("-");
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "-name:");
+    }
+
+    /// `Ctrl+K`/`Ctrl+J`, `Up`/`Down`: clamped at both ends rather than wrapping, the same
+    /// convention `ActionPalette::move_highlight` uses for its own cursor.
+    #[test]
+    fn move_completion_highlight_clamps_at_both_ends_rather_than_wrapping() {
+        let mut line = typed("kind:");
+        let len = line.completions().len();
+        assert_eq!(len, 3, "kind: repo, worktree, submodule");
+
+        line.move_completion_highlight(-1);
+        line.accept_highlighted_completion();
+        assert_eq!(
+            line.live_filter().as_str(),
+            "kind:repo",
+            "moving above the first row must clamp to it, not wrap to the last"
+        );
+
+        let mut line = typed("kind:");
+        line.move_completion_highlight(10);
+        line.accept_highlighted_completion();
+        assert_eq!(
+            line.live_filter().as_str(),
+            "kind:submodule",
+            "moving past the last row must clamp to it, not wrap to the first"
+        );
+    }
+
+    /// Typing after a completion context is chosen must not carry the old highlight forward:
+    /// the candidate set underneath it can be a whole different list, and here it stays the
+    /// same list (`kind:`'s three values) but the highlight still has to reset, or accepting
+    /// afterwards would silently keep pointing at "submodule".
+    #[test]
+    fn a_further_keystroke_resets_the_highlight() {
+        let mut line = typed("kind:");
+        line.move_completion_highlight(2); // "submodule", the last of three
+        line.type_char('w');
+        line.accept_highlighted_completion();
+        assert_eq!(
+            line.live_filter().as_str(),
+            "kind:repo",
+            "the highlight must reset to the first row rather than keep pointing at \
+             \"submodule\", and accepting overwrites the \"w\" just typed along with it"
+        );
+    }
+
+    #[test]
+    fn draw_completions_marks_only_the_highlighted_row() {
+        let theme = Theme::default();
+        let mut line = typed("kind:");
+        line.move_completion_highlight(1);
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| line.draw_completions(frame, frame.area(), &theme))
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer().clone();
+
+        let row = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(0), "  repo");
+        assert_eq!(row(1), "> worktree");
+        assert_eq!(row(2), "  submodule");
+    }
+
+    /// [filter.md](../../../docs/spec/filter.md#screen-placement): "capped at 8 rows and
+    /// scrolling ... beyond that". `kind:`'s own three values never reach the cap, so this
+    /// drives it with the thirteen-key list instead, and asserts the scroll actually moves a
+    /// row past the ninth into view.
+    #[test]
+    fn scrolling_past_the_eight_row_cap_brings_a_later_key_into_view() {
+        let mut line = typed("");
+        let keys = every_key_entry();
+        assert!(
+            keys.len() > COMPLETION_MAX_ROWS,
+            "this test needs more keys than the cap to mean anything"
+        );
+
+        for _ in 0..COMPLETION_MAX_ROWS {
+            line.move_completion_highlight(1);
+        }
+        // The highlight now sits on the ninth key (index 8), one past an unmoved [0, 8)
+        // window, which must have scrolled by exactly one row to keep it in view.
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, COMPLETION_MAX_ROWS as u16);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| line.draw_completions(frame, frame.area(), &theme))
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer().clone();
+        let last_row: String = (0..buf.area.width)
+            .map(|x| {
+                buf[(x, (COMPLETION_MAX_ROWS - 1) as u16)]
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            last_row.trim_end(),
+            format!("> {}", keys[8]),
+            "the window must have scrolled down by one row to keep the ninth key visible"
+        );
     }
 }

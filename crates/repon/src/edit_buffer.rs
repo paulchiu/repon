@@ -8,23 +8,38 @@
 //! Only `Ctrl+W` lives here. `Backspace` and `Ctrl+U` are `String::pop` and `String::clear`
 //! called on the field's own buffer: no index of this module's making, so nothing to share.
 
-/// `Ctrl+W`: deletes one trailing whitespace-delimited word from `buffer`, leaving the
-/// whitespace that preceded it and clearing the buffer when no whitespace precedes the word.
-/// The cut is the separator's own `char_indices` offset plus that character's UTF-8 width,
-/// never that offset plus one byte, so it lands on a character boundary however wide the
-/// separator is: `String::truncate` panics on an index inside a character, and U+00A0
-/// NO-BREAK SPACE (macOS Option+Space) is two bytes, U+2003 EM SPACE three.
-pub(crate) fn delete_previous_word(buffer: &mut String) {
-    let trimmed = buffer.trim_end();
+/// The byte index right after the last run of whitespace in `text`, or `0` if there is none.
+/// The offset is the separator's own `char_indices` position plus that character's UTF-8
+/// width, never that position plus one byte, so it lands on a character boundary however wide
+/// the separator is: `String::truncate` panics on an index inside a character, and U+00A0
+/// NO-BREAK SPACE (macOS Option+Space) is two bytes, U+2003 EM SPACE three. The one whitespace
+/// search this module blesses; [`delete_previous_word`] and
+/// [`last_term_start`] both read through it rather than keeping a copy of their own.
+fn index_after_last_separator(text: &str) -> usize {
     // scan: the one whitespace search begin
-    let cut = trimmed
-        .char_indices()
+    text.char_indices()
         .rev()
         .find(|(_, character)| character.is_whitespace())
         .map(|(index, character)| index + character.len_utf8())
-        .unwrap_or(0);
+        .unwrap_or(0)
     // scan: the one whitespace search end
+}
+
+/// `Ctrl+W`: deletes one trailing whitespace-delimited word from `buffer`, leaving the
+/// whitespace that preceded it and clearing the buffer when no whitespace precedes the word.
+pub(crate) fn delete_previous_word(buffer: &mut String) {
+    let trimmed = buffer.trim_end();
+    let cut = index_after_last_separator(trimmed);
     buffer.truncate(cut);
+}
+
+/// The start of "the term under the cursor"
+/// ([filter.md](../../../docs/spec/filter.md#completion)'s own phrase) in `buffer`: one past
+/// the last run of whitespace, or `0` if there is none. Unlike [`delete_previous_word`]'s own
+/// cut, trailing whitespace is not trimmed away first, so a buffer ending in whitespace
+/// answers with its own length, the empty term filter.md calls "just after a space".
+pub(crate) fn last_term_start(buffer: &str) -> usize {
+    index_after_last_separator(buffer)
 }
 
 #[cfg(test)]
@@ -37,6 +52,33 @@ mod tests {
         let mut buffer = text.to_string();
         delete_previous_word(&mut buffer);
         buffer
+    }
+
+    #[test]
+    fn last_term_start_is_zero_for_an_empty_buffer_or_one_with_no_whitespace() {
+        assert_eq!(last_term_start(""), 0);
+        assert_eq!(last_term_start("kind:worktree"), 0);
+    }
+
+    #[test]
+    fn last_term_start_is_the_buffers_own_length_when_it_ends_in_whitespace() {
+        let buffer = "kind:repo ";
+        assert_eq!(last_term_start(buffer), buffer.len());
+        assert_eq!(&buffer[last_term_start(buffer)..], "");
+    }
+
+    #[test]
+    fn last_term_start_points_at_the_last_term_rather_than_trimming_trailing_whitespace_away() {
+        let buffer = "kind:repo is:dirty";
+        assert_eq!(&buffer[last_term_start(buffer)..], "is:dirty");
+    }
+
+    /// The same multi-byte separator this module's own `delete_previous_word` is built
+    /// against: a cut one byte past the separator's start would land inside it.
+    #[test]
+    fn last_term_start_lands_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let buffer = "café\u{00A0}naïve";
+        assert_eq!(&buffer[last_term_start(buffer)..], "naïve");
     }
 
     #[test]
