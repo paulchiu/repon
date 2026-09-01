@@ -207,6 +207,7 @@ mod tests {
                 outcome,
                 output: Arc::from(&b""[..]),
                 elapsed: std::time::Duration::from_millis(1),
+                elision: None,
             })
             .collect::<Vec<_>>();
         ActionReceipt {

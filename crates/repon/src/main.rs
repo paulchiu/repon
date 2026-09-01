@@ -13,6 +13,7 @@ mod cli;
 mod components;
 mod config;
 mod degrade;
+mod edit_buffer;
 mod editor;
 mod errors;
 mod filter_line;

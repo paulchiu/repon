@@ -96,6 +96,7 @@ pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverri
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;
+pub use entity::CaptureElision;
 pub use entity::DefaultBranch;
 pub use entity::DefaultBranchStopped;
 pub use entity::Diagnostics;

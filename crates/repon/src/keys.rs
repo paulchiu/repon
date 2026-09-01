@@ -242,6 +242,26 @@ pub(crate) fn compiled_binding_count() -> usize {
     BINDINGS.len()
 }
 
+/// The `Action` variant names [`dispatch`] can return in `context`, each without its payload
+/// and each named once, in table order. What a handler's own `match` must name arm by arm:
+/// the trailing `unreachable!` those matches carry is a catch-all, so a variant added to a
+/// context's vocabulary compiles there whether or not the handler answers it.
+#[cfg(test)]
+pub(crate) fn action_names_bound_in(context: Context) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (row_context, _, _, action, _) in BINDINGS {
+        if *row_context != context {
+            continue;
+        }
+        let name = format!("{action:?}");
+        let name = name.split('(').next().unwrap_or(&name).to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 const BINDINGS: &[Binding] = &[
     // global
     binding(Context::Global, KeyCode::Char('?'), NONE, Action::OpenHelp),

@@ -637,6 +637,7 @@ mod tests {
                 outcome: StepOutcome::Failed(1),
                 output: Arc::from(&b""[..]),
                 elapsed: std::time::Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),

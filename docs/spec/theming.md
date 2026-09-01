@@ -204,7 +204,7 @@ A static in-flight mark is not available. [refresh.md](refresh.md) records the p
 
 ### Where it stops
 
-`glyphs` governs Repon's own surfaces and does not reach inside a quoted region. [actions.md](actions.md) draws a captured pnpm failure emitting its own `└─┬` and `✕` in the detail pane, and the same spec already says the theme deliberately does not reach inside the quoted region for colour; the same holds for glyphs, so the switch is half a promise. Repon does not force a locale on the child to compensate: [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) derives the child environment from git facts only, and `LC_ALL=C` would change git's own output.
+`glyphs` governs Repon's own surfaces and does not reach inside a quoted region. [actions.md](actions.md) draws a captured pnpm failure emitting its own `└─┬` and `✕` in the detail pane, and the same spec already says the theme deliberately does not reach inside the quoted region for colour; the same holds for glyphs, so the switch is half a promise. The capture elision mark is the single exception, and it is one because the row it marks is Repon's own sentence about the quotation rather than part of it: the pane draws that row from the live set at render time, and it takes no role, so the nine above stay nine ([actions.md](actions.md)). Repon does not force a locale on the child to compensate: [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) derives the child environment from git facts only, and `LC_ALL=C` would change git's own output.
 
 ### Enforcement
 
