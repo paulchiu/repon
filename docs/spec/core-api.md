@@ -275,7 +275,7 @@ Exit codes follow two measured precedents. Google's `repo status` and `vcstool s
 
 ## The public surface
 
-Flat, re-exported from the crate root. `fanout` and `git` become private modules: a generic scatter primitive and a single branch read are not vocabulary a second consumer needs. What is public is what [CONTEXT.md](../../CONTEXT.md) names, so that reading the crate root and reading the glossary give the same answer.
+Flat, re-exported from the crate root. `fanout` and `git` become private modules: a generic scatter primitive and a single branch read are not vocabulary a second consumer needs. What is public is what [GLOSSARY.md](../../GLOSSARY.md) names, so that reading the crate root and reading the glossary give the same answer.
 
 No `#[non_exhaustive]`, no sealed traits, no separate versioning and no `GitBackend` trait. `#[non_exhaustive]` forces a consumer to add a wildcard match arm even when it already matches every variant, which reintroduces by attribute the default path [0001](../adr/0001-per-cell-provenance.md) forbids; gix 0.87.1 barely uses it; repon-core is a path dependency whose only consumer is in the same workspace, so a breaking change and its fix land in the same commit; and the core's existing test drives a real disposable repository rather than a mock, so a trait would buy testability already paid for.
 

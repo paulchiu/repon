@@ -229,7 +229,7 @@ pub struct App {
     /// positional `1`-`9` keys already take, so this can never become a second
     /// implementation of the same switch.
     set_picker: Option<SetPicker>,
-    /// The live Notice ([CONTEXT.md](../../../CONTEXT.md)'s glossary entry), if any: raised
+    /// The live Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
     /// declared when the pressed digit names none), by `reload.rs`'s own reload fallback
     /// (naming the Set fallen back to), and by each of the four bindings ADR 0023 names
@@ -307,7 +307,7 @@ pub struct App {
     /// once at startup ([`config::document::working_directory`]) rather than re-read per
     /// call, since a session never changes directory mid-run.
     cwd: PathBuf,
-    /// The committed Filter narrowing the list ([CONTEXT.md](../../../CONTEXT.md)'s
+    /// The committed Filter narrowing the list ([GLOSSARY.md](../../../GLOSSARY.md)'s
     /// "Committed Filter"): applied while `self.filter_line` is `None`, and what `Esc`
     /// restores when an edit is abandoned. Session state, persisted to `state.toml` on quit
     /// ([`Self::persist_state`]) and restored at startup
@@ -753,8 +753,10 @@ impl App {
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
-    /// `Context::Overlay` while the help overlay, the expanded warning list or the Set
-    /// picker is open, [`Self::handle_action_palette_key`]'s own `Context::Input`/`Context::Confirm`
+    /// `Context::Input` while the help overlay is open (its own query takes the whole
+    /// keyboard, [keybindings.md](../../docs/spec/keybindings.md)'s "The help overlay"),
+    /// `Context::Overlay` while the expanded warning list or the Set picker is open instead,
+    /// [`Self::handle_action_palette_key`]'s own `Context::Input`/`Context::Confirm`
     /// split while the Action palette is open, `self.focus` (`List` or `Detail`) otherwise,
     /// so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
     /// [`Message`], the movement and Selection actions
@@ -799,16 +801,73 @@ impl App {
             self.handle_quit_confirm_key(key);
             return Ok(());
         }
+        // Help stays inside `Context::Overlay` the way the expanded warning list and the
+        // Set picker already do, with one addition: `/` (`Action::Search`) enters the
+        // overlay's own search mode ([keybindings.md](../../docs/spec/keybindings.md)'s "The
+        // help overlay"). While searching, a printable key is checked before
+        // `Context::Overlay`'s own table is even consulted, so it is always query text, `q`
+        // included: `q` closing help mid-query is exactly the swallowing this ticket's own
+        // criterion forbids. `Esc` there leaves search mode and clears the query, one rung of
+        // the same one-level-at-a-time unwind `Action::Unwind` already walks elsewhere;
+        // `Enter` leaves search mode and keeps the query applied, so `j`/`k` then scroll the
+        // narrowed list. Reading mode (no search in progress) dispatches exactly as it did
+        // before this ticket: `q`/`Esc` close help outright, `j`/`k`/`g`/`G`/`Ctrl+D`/`Ctrl+U`
+        // scroll. Backspace is not bound anywhere yet (issue #176, on another branch); until
+        // it lands, `Esc` then `/` again is the only way to redo a query from scratch.
         if let Some(overlay) = &mut self.help {
-            match self.bindings.dispatch(Context::Overlay, key) {
-                Some(Action::Close) => self.help = None,
-                Some(action) => {
-                    let content_len = HelpOverlay::content_len(&self.bindings, self.focus);
-                    let frame_area = Rect::new(0, 0, self.frame_size.width, self.frame_size.height);
-                    let viewport_height = HelpOverlay::viewport_height(frame_area);
-                    overlay.apply(action, content_len, viewport_height);
+            let frame_area = Rect::new(0, 0, self.frame_size.width, self.frame_size.height);
+            let scroll = |overlay: &mut HelpOverlay, action: Action| {
+                let viewport_height = overlay.viewport_height(frame_area);
+                let content_len = HelpOverlay::visible_len(
+                    &self.bindings,
+                    self.focus,
+                    self.glyphs,
+                    overlay.query(),
+                );
+                overlay.apply(action, content_len, viewport_height);
+            };
+            if overlay.is_searching() {
+                // Backspace is looked up in `Context::Input` so the query shares the one
+                // compiled row every other text surface edits through, rather than growing a
+                // second Backspace of its own. It is checked before `printable` for the same
+                // reason `printable` is checked before `Context::Overlay`: an editing key
+                // belongs to the query while the query is open.
+                if matches!(
+                    self.bindings.dispatch(Context::Input, key),
+                    Some(Action::DeletePreviousChar)
+                ) {
+                    overlay.pop_query_char();
+                } else if let Some(c) = keys::printable(key) {
+                    overlay.push_query_char(c);
+                } else {
+                    match self.bindings.dispatch(Context::Overlay, key) {
+                        Some(Action::Close) => overlay.cancel_search(),
+                        Some(Action::Choose) => overlay.commit_search(),
+                        Some(
+                            action @ (Action::ScrollDown
+                            | Action::ScrollUp
+                            | Action::Top
+                            | Action::Bottom
+                            | Action::HalfPageDown
+                            | Action::HalfPageUp),
+                        ) => scroll(overlay, action),
+                        Some(_) | None => {}
+                    }
                 }
-                None => {}
+            } else {
+                match self.bindings.dispatch(Context::Overlay, key) {
+                    Some(Action::Close) => self.help = None,
+                    Some(Action::Search) => overlay.enter_search(),
+                    Some(
+                        action @ (Action::ScrollDown
+                        | Action::ScrollUp
+                        | Action::Top
+                        | Action::Bottom
+                        | Action::HalfPageDown
+                        | Action::HalfPageUp),
+                    ) => scroll(overlay, action),
+                    Some(_) | None => {}
+                }
             }
             return Ok(());
         }
@@ -1099,6 +1158,7 @@ impl App {
                 | Action::OpenInEditor
                 | Action::Choose
                 | Action::Close
+                | Action::Search
                 | Action::Run
                 | Action::Decline,
             ) => unreachable!(
@@ -1907,6 +1967,9 @@ impl App {
             self.list.set_cursor(self.cursor);
             self.list.set_offset(self.list_offset);
             self.list.set_theme(self.theme);
+            // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
+            // `self.list` the same per-frame way as the cursor and the Filter above.
+            self.list.set_selection(self.selection.clone());
             // A row for the Filter line takes real height only while it is open, shifting
             // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
             // screen: a change on a mode switch takes a real row").
@@ -2093,7 +2156,7 @@ mod tests {
     use super::*;
     use crate::{
         config::document,
-        help::HelpLayout,
+        help::{HelpLayout, HelpLine},
         test_support::{capture_tracing, production_source_at, rust_source_files, source_region},
     };
 
@@ -2638,7 +2701,9 @@ mod tests {
     // =====================================================================================
 
     /// Guards `handle_key_event`'s scroll clamp against reading the raw frame height instead
-    /// of the overlay's own interior viewport, two rows shorter once the border is drawn.
+    /// of the overlay's own interior viewport. Reading mode, so `j` scrolls exactly as it
+    /// did before this overlay could search at all
+    /// ([keybindings.md](../../docs/spec/keybindings.md)'s "The help overlay").
     #[test]
     fn scrolling_the_open_help_overlay_clamps_to_its_own_bordered_viewport() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2648,13 +2713,10 @@ mod tests {
         app.frame_size = Size::new(100, 15);
         app.help = Some(HelpOverlay::default());
 
-        let content_len = HelpOverlay::content_len(&app.bindings, app.focus);
+        let content_len = HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, "");
         for _ in 0..content_len {
-            app.handle_key_event(press(
-                crossterm::event::KeyCode::Char('j'),
-                crossterm::event::KeyModifiers::NONE,
-            ))
-            .expect("scroll down past the end of the content");
+            app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+                .expect("scroll down past the end of the content");
         }
 
         let frame_area = Rect::new(0, 0, app.frame_size.width, app.frame_size.height);
@@ -2674,18 +2736,347 @@ mod tests {
             .expect("draw the frame");
 
         let buf = terminal.backend().buffer();
-        let lines = HelpOverlay::content(&app.bindings, app.focus);
-        let (_, last_description) = lines.last().expect("expected content");
+        let lines = HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, "");
+        let last_text = match lines.last().expect("expected content") {
+            HelpLine::Binding { description, .. } => description.to_string(),
+            HelpLine::Legend { meaning, .. } => meaning.to_string(),
+            HelpLine::LegendHeading => crate::help::LEGEND_HEADING.to_string(),
+        };
         let content_area = HelpLayout::compute(frame_area).content_area(frame_area);
         let last_row_y = content_area.bottom() - 1;
         let row_text: String = (content_area.x..content_area.right())
             .map(|x| buf[(x, last_row_y)].symbol())
             .collect();
         assert!(
-            row_text.contains(last_description),
-            "expected the last content line {last_description:?} on the viewport's own last \
+            row_text.contains(&last_text),
+            "expected the last content line {last_text:?} on the viewport's own last \
              row, got {row_text:?}"
         );
+    }
+
+    // =====================================================================================
+    // Ticket 179: the help overlay is searchable, as a mode inside it rather than a switch
+    // away from `Context::Overlay`. `/` (`Action::Search`) enters search mode; `Esc` there
+    // leaves it and clears the query (one rung of help's own unwind ladder, one short of
+    // closing help entirely); `Enter` there leaves it and keeps the query applied. Reading
+    // mode (no search in progress) is unchanged from before this ticket: `q`/`Esc` close
+    // help outright, and a printable key means nothing to it at all unless it is `/`.
+    // =====================================================================================
+
+    /// The criterion the old, rejected design broke: a fresh, never-searched help closes on
+    /// `q` exactly as it always did. Nothing about being searchable should cost reading mode
+    /// its own close key.
+    #[test]
+    fn q_closes_a_freshly_opened_help_in_reading_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        assert!(app.help.is_some(), "expected help to be open");
+
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("close help");
+
+        assert!(
+            app.help.is_none(),
+            "expected q to close a freshly opened help"
+        );
+    }
+
+    /// The other half of the same criterion: once `/` has entered search mode, `q` is query
+    /// text like any other letter, and does not close help.
+    #[test]
+    fn slash_then_q_types_q_into_the_query_rather_than_closing_help() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("type q into the query");
+
+        assert!(
+            app.help.is_some(),
+            "q must not close help while a search is in progress"
+        );
+        let overlay = app.help.as_ref().expect("help is open");
+        assert!(
+            overlay.is_searching(),
+            "expected search mode to still be active"
+        );
+        assert_eq!(overlay.query(), "q");
+    }
+
+    /// Backspace edits help's own query through the same `Context::Input` row the palettes
+    /// and the Filter line read, rather than a second one of help's own. Asserted on the
+    /// query the surface actually holds, and on the rendered content length, so a Backspace
+    /// that edited the buffer without re-filtering would fail here.
+    #[test]
+    fn backspace_deletes_one_character_of_helps_query_and_re_filters() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "movex".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the query");
+        }
+        let narrowed_to_nothing = {
+            let overlay = app.help.as_ref().expect("help is open");
+            assert_eq!(overlay.query(), "movex");
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query()).len()
+        };
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("backspace");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(
+            overlay.is_searching(),
+            "backspace must not leave search mode"
+        );
+        assert_eq!(overlay.query(), "move");
+        let widened =
+            HelpOverlay::filtered_lines(&app.bindings, app.focus, app.glyphs, overlay.query())
+                .len();
+        assert!(
+            widened > narrowed_to_nothing,
+            "deleting the trailing \"x\" must widen the filtered list: \
+             {narrowed_to_nothing} lines before, {widened} after"
+        );
+    }
+
+    /// Backspace on an empty query is inert, and specifically is not a second way out of
+    /// search mode or out of help.
+    #[test]
+    fn backspace_on_an_empty_help_query_is_inert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+
+        app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("backspace on an empty query");
+
+        let overlay = app.help.as_ref().expect("help must still be open");
+        assert!(
+            overlay.is_searching(),
+            "backspace on an empty query must not leave search mode"
+        );
+        assert_eq!(overlay.query(), "");
+    }
+
+    /// The two-level unwind `Esc` walks inside help's own search: the first press leaves
+    /// search mode, clears the query and returns to an unfiltered reading mode without
+    /// closing help; the second press, now in reading mode, closes it. Both levels proven
+    /// against the same session rather than two separate ones.
+    #[test]
+    fn esc_leaves_search_mode_before_a_second_esc_closes_help() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(app.focus, Context::List);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "move".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type into the query");
+        }
+        assert_eq!(app.help.as_ref().expect("help is open").query(), "move");
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("leave search mode");
+
+        let overlay = app
+            .help
+            .as_ref()
+            .expect("expected Esc to leave search mode, not close help");
+        assert!(
+            !overlay.is_searching(),
+            "expected reading mode after the first Esc"
+        );
+        assert_eq!(
+            overlay.query(),
+            "",
+            "expected the query cleared by the first Esc"
+        );
+        assert_eq!(
+            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, overlay.query()),
+            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, ""),
+            "expected the content unfiltered again after the first Esc"
+        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close help");
+
+        assert!(app.help.is_none(), "expected the second Esc to close help");
+    }
+
+    /// `Enter` from search mode is the other way out: it leaves search mode but keeps the
+    /// query applied, so the narrowed list stays narrowed, matching
+    /// [`crate::filter_line::FilterLine`]'s own commit-and-keep-filtering behaviour for the
+    /// main list.
+    #[test]
+    fn enter_commits_the_search_and_keeps_the_filter_applied_in_reading_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "move".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type into the query");
+        }
+
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the search");
+
+        let overlay = app
+            .help
+            .as_ref()
+            .expect("expected Enter to leave help open");
+        assert!(!overlay.is_searching(), "expected reading mode after Enter");
+        assert_eq!(
+            overlay.query(),
+            "move",
+            "expected Enter to keep the query applied"
+        );
+    }
+
+    /// Typing filters the list live: `Move down`, `Move up` and `First row` all live in
+    /// `List`'s own help, and "move" keeps exactly the first two.
+    #[test]
+    fn typing_a_query_narrows_the_open_help_overlays_own_rendered_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(app.focus, Context::List);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        for c in "move".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type into the query");
+        }
+
+        // Reads the query back off the live overlay `handle_key_event` actually mutated,
+        // rather than a query string handed to `filtered_lines` by hand: the latter would
+        // pass even if typing never reached the overlay at all.
+        assert_eq!(app.help.as_ref().expect("help is open").query(), "move");
+
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let backend = ratatui::backend::TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                app.help.as_ref().expect("help is open").draw(
+                    frame,
+                    frame.area(),
+                    app.focus,
+                    &app.bindings,
+                    &app.theme,
+                    app.glyphs,
+                );
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+        let rendered: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            rendered.contains("Move down"),
+            "expected the query to keep a matching binding on screen"
+        );
+        assert!(
+            !rendered.contains("First row"),
+            "expected the query to drop a non-matching binding from the screen"
+        );
+    }
+
+    /// `Ctrl+D`/`Ctrl+U` keep their reading-mode meaning (half page down/up) even while a
+    /// search is in progress: neither is a printable key, so `Context::Overlay`'s own
+    /// scroll bindings still see them rather than the query intercepting them.
+    #[test]
+    fn ctrl_d_and_ctrl_u_still_scroll_while_searching() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(100, 15);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("half page down");
+        let overlay = app.help.as_ref().expect("help is open");
+        assert!(
+            overlay.is_searching(),
+            "expected Ctrl+D to leave search mode untouched"
+        );
+        assert_eq!(
+            overlay.query(),
+            "",
+            "expected Ctrl+D to leave the query untouched, not swallow it as text"
+        );
+    }
+
+    /// Closing help clears the query, so reopening starts fresh: `App` drops the whole
+    /// `HelpOverlay` on close and rebuilds a default one on the next open
+    /// ([`HelpOverlay::default`]'s own doc comment), so a query typed in one session cannot
+    /// survive into the next.
+    #[test]
+    fn closing_help_and_reopening_it_starts_with_an_empty_query() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open help");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter search mode");
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("type into the query");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the search, still open");
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("close help from reading mode");
+        assert!(
+            app.help.is_none(),
+            "expected q to close help once back in reading mode"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("reopen help");
+
+        assert_eq!(app.help.as_ref().expect("help is open again").query(), "");
     }
 
     // =====================================================================================
