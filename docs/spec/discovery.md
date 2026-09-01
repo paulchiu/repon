@@ -71,20 +71,20 @@ Once shown, a Submodule is a full citizen: selectable, counted in the Selection,
 
 The payload, stated honestly: all 16 initialised Submodules in the measured population are at a detached HEAD, and none has an attached branch. A Submodule row is mostly blank, and correctly so.
 
-Detachment is not what blanks those cells. [head.md](head.md) records a detached Worktree computing both `base` and Merged, because each needs a commit and a default branch rather than a branch name. A Submodule's stay blank because [default-branch.md](default-branch.md) records that population's default branch as known-wrong with no local detector, so a proof against it would be a confident lie.
+Detachment is not what blanks those cells. [head.md](head.md) records a detached Worktree computing both `base` and Merged, because each needs a commit and a default branch rather than a branch name. A Submodule's stay blank for a different reason: [default-branch.md](default-branch.md) records that population's default branch as known-wrong with no local detector, so a proof against it would be a confident lie.
 
 | column | on a Submodule row |
 | --- | --- |
 | `name` | the submodule path |
 | `branch` | the short object id; the detail pane says detached ([head.md](head.md)) |
 | `sync` | `-`, no upstream, for all 16 |
-| `base` | Not applicable |
+| `base` | Unknown |
 | `dirty` | normal |
-| `state` | Not applicable |
+| `state` | Unknown |
 
-`state` is Not applicable because none of Merged, Gone, Local only or Active means anything without a branch, the same way it already is on a Repo row ([0009](../adr/0009-worktree-state-model.md)). `base` is Not applicable because [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records this exact population as its ceiling: Submodules cached as `master` where the truth is `qmk-master`, with no local detector, so a blank beats a confident wrong number. Not applicable is the sixth case in [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) and is excluded from the row summary fold.
+`state` and `base` are `Unknown`, carrying one reason between them rather than two: [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records this exact population as its ceiling, Submodules cached as `master` where the truth is `qmk-master`, with no local detector, so a proof against it would be a confident lie. "No trustworthy default branch, so no proof" is a question that applies and has no answer Repon can stand behind, which is `Unknown`; Not applicable is reserved for a question with no meaning on the row at all, the way Worktree state has none on a Repo row ([0009](../adr/0009-worktree-state-model.md)). `state` and `base` therefore move together rather than settling on different variants for the one reason ([ADR 0017](../adr/0017-discovery-stops-at-the-repo-boundary.md)'s "Amended by #173"). `Unknown` renders blank exactly like Not applicable does, so the row still reads mostly blank, but it folds into the row summary rather than being excluded from it: with the periodic fetch off, the default, this puts `?` in the gutter where a Not applicable pair would have left it a plain space, a cost accepted for the 16 of 403 entities hidden by default.
 
-There is no Submodule row marker of its own. A Submodule is a child row, indented under its parent and marked `└`, which is the mark a Worktree row already carries. The `∙` (U+2219) marker previously drawn in [layout-and-provenance.md](layout-and-provenance.md) is dropped: it sits one codepoint from `·` (U+00B7), the clean-dirty value, on the same row, and a distinction that fine is a misreading waiting to happen. The cost is that a Submodule row and a Worktree row look alike in the gutter and the indent, so the name column, the two Not applicable cells and the detail pane are what tell them apart.
+There is no Submodule row marker of its own. A Submodule is a child row, indented under its parent and marked `└`, which is the mark a Worktree row already carries. The `∙` (U+2219) marker previously drawn in [layout-and-provenance.md](layout-and-provenance.md) is dropped: it sits one codepoint from `·` (U+00B7), the clean-dirty value, on the same row, and a distinction that fine is a misreading waiting to happen. The cost is that a Submodule row and a Worktree row look alike in the gutter and the indent, so the name column, the gutter mark and the detail pane are what tell them apart.
 
 An uninitialised Submodule is a row with every cell blank and `?` in the gutter. All 16 in the population are initialised, so this is the case that arrives right after a plain clone. The alternative, no row at all, makes rows appear on `git submodule update --init` with nothing having changed in what the Repo declares.
 

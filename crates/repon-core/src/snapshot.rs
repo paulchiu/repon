@@ -97,14 +97,19 @@ impl<T> FoldableCell for Cell<T> {
 /// consumer, is what says a value is still coming (`docs/spec/refresh.md`'s
 /// "What the gutter and the cells show", amended by ADR 0013). A `NotApplicable`
 /// Cell is excluded from the fold entirely too, which is what lets a Repo row
-/// (Worktree state Not applicable by kind) or a Submodule row (`state` and
-/// `base` both Not applicable) read Fresh, or still show the first-probe
-/// spinner, on cells that simply do not apply. Otherwise the row shows its
-/// least settled Cell, widened by two entity-level derivations that are not
-/// Cells at all: an unparseable `.gitmodules` and a failed last Action both
-/// drive the row to `Failed` even when every Cell reads fine. The default
-/// branch's rung and its disagreement stay out, being metadata about how a
-/// value was obtained rather than a value that can itself fail.
+/// (Worktree state Not applicable by kind) or a Worktree row on its own default
+/// branch (`base` Not applicable) read Fresh, or still show the first-probe
+/// spinner, on cells that simply do not apply. A Submodule row's `state` and
+/// `base` are `Unknown` rather than `NotApplicable`, per
+/// [ADR 0017](https://github.com/paulchiu/repon/blob/main/docs/adr/0017-discovery-stops-at-the-repo-boundary.md)
+/// as amended, so they do fold in, and with the periodic fetch off (the
+/// default) that is what puts `?` in a Submodule row's gutter rather than a
+/// space. Otherwise the row shows its least settled Cell, widened by two
+/// entity-level derivations that are not Cells at all: an unparseable
+/// `.gitmodules` and a failed last Action both drive the row to `Failed` even
+/// when every Cell reads fine. The default branch's rung and its disagreement
+/// stay out, being metadata about how a value was obtained rather than a value
+/// that can itself fail.
 pub fn summary(entity: &EntityState) -> RowSummary {
     // Exhaustive: a Cell or derivation source added to EntityState or Diagnostics
     // later must be named here or the pattern fails to compile, so it cannot be
@@ -191,6 +196,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::cell::Unknown;
     use crate::entity::{
         AheadBehind, DefaultBranch, DirtyCounts, EntityKey, Head, Kind, OwnWork, StepOutcome,
         StepResult, SyncState, WorktreeState,
@@ -308,19 +314,21 @@ mod tests {
 
     #[test]
     fn a_not_applicable_cell_is_excluded_rather_than_dragging_the_row_down() {
-        // A freshly constructed Submodule has `state` and `base` both
-        // Not-applicable and every other cell still unset (folding as Unknown). If
-        // Not-applicable were not excluded, the row would still read Unknown here
-        // too, so this only distinguishes a correct fold from a naive one once the
-        // other four cells are made Fresh, matching a Submodule whose readable
-        // cells have all settled.
+        // A freshly constructed Repo has `state` Not-applicable by kind
+        // (`EntityState::new`); `base` is settled Not-applicable by hand below,
+        // simulating a Repo with no remote, so both of `NotApplicable`'s named
+        // producers are exercised in one row. If Not-applicable were not
+        // excluded, the row would still read Unknown here too, so this only
+        // distinguishes a correct fold from a naive one once the other four
+        // cells are made Fresh.
         let mut entity = EntityState::new(
-            EntityKey::new(Arc::from(Path::new("/repo/vendor/lib"))),
-            Arc::from("lib"),
+            EntityKey::new(Arc::from(Path::new("/repo"))),
+            Arc::from("repo"),
             Arc::from(Path::new("/repo/.git")),
-            Kind::Submodule,
+            Kind::Repo,
         );
         let generation = Generation::new(1);
+        entity.base.settle(generation, Settled::NotApplicable);
         entity.branch.settle(
             generation,
             Settled::Known {
@@ -467,15 +475,17 @@ mod tests {
         assert_eq!(summary(&entity), RowSummary::InFlight);
     }
 
+    /// A Submodule is constructed with `state` and `base` already `Unknown`
+    /// (see `EntityState::new`), and `Unknown` is a genuine settled fact rather
+    /// than "nothing has looked at this yet", so [`FoldableCell::holds_a_value`]
+    /// correctly counts it: the row reads `?` from the moment it is discovered,
+    /// before `branch`, `sync`, `dirty` or `default_branch` have been probed at
+    /// all, rather than showing the first-probe spinner in the meantime. Those
+    /// four cells still show their own per-cell loading mark while they settle,
+    /// the same fallback an ordinary partially-probed row already gets.
     #[test]
-    fn a_submodule_whose_only_settled_cells_are_not_applicable_still_shows_in_flight_on_its_first_probe()
-     {
-        // A Submodule is constructed with `state` and `base` already
-        // Not-applicable (see `EntityState::new`). Not-applicable is excluded from
-        // the fold entirely, so it must not count as the row already holding a
-        // value either, or this row would jump straight to Unknown instead of
-        // showing the first-probe spinner.
-        let mut entity = EntityState::new(
+    fn a_freshly_discovered_submodule_reads_unknown_before_any_other_cell_is_probed() {
+        let entity = EntityState::new(
             EntityKey::new(Arc::from(Path::new("/repo/vendor/lib"))),
             Arc::from("lib"),
             Arc::from(Path::new("/repo/.git")),
@@ -483,16 +493,14 @@ mod tests {
         );
         assert!(matches!(
             entity.state.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
         assert!(matches!(
             entity.base.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
 
-        entity.branch.begin_probe();
-
-        assert_eq!(summary(&entity), RowSummary::InFlight);
+        assert_eq!(summary(&entity), RowSummary::Unknown);
     }
 
     /// Criterion 3's "no prior state" case, constructed so the two readings this ticket

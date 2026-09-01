@@ -1609,9 +1609,12 @@ mod tests {
     /// than resting on that alone, since a future change could narrow both back to the same
     /// shape. A `Kind::Submodule` entity is built from a real disposable repository nested
     /// under a `.gitmodules` boundary, whose own working tree this crate probes and finds
-    /// clean; construction alone settles `state` and `base` to `NotApplicable`, which is what
-    /// gives `base` and `dirty` distinct, non-equal text ("not applicable" against "clean")
-    /// without a way to reach into a private `Cell` from this crate.
+    /// clean, with its own `default_branch` genuinely resolvable; construction alone still
+    /// settles `state` and `base` to `Unknown` regardless, per
+    /// [ADR 0017](https://github.com/paulchiu/repon/blob/main/docs/adr/0017-discovery-stops-at-the-repo-boundary.md)
+    /// as amended, which is what gives `base` and `dirty` distinct, non-equal text
+    /// ("unknown: no default branch found" against "clean") without a way to reach into a
+    /// private `Cell` from this crate.
     #[test]
     fn content_lines_never_reads_one_cells_line_from_a_different_cell() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1697,8 +1700,14 @@ mod tests {
             "the submodule's own working tree is freshly committed and clean, got \
              {dirty_line:?}"
         );
-        assert!(base_line.ends_with("not applicable"), "got {base_line:?}");
-        assert!(state_line.ends_with("not applicable"), "got {state_line:?}");
+        assert!(
+            base_line.ends_with("unknown: no default branch found"),
+            "got {base_line:?}"
+        );
+        assert!(
+            state_line.ends_with("unknown: no default branch found"),
+            "got {state_line:?}"
+        );
 
         // Defence in depth beyond the type-level guard `DirtyCounts` now gives `dirty` over
         // `base`'s plain `u32`: a wiring bug that read one cell's line from the other would

@@ -2867,9 +2867,9 @@ fn sweep_deadline(
             let cells: [&mut dyn TimeoutableCell; 6] =
                 [branch, sync, base, dirty, state, default_branch];
             for cell in cells {
-                // Only a cell actually marked in flight times out: a Repo or
-                // Submodule's `state` (`NotApplicable`, never probed) and any
-                // cell no probe yet reaches (`sync`, `base`) are never in
+                // Only a cell actually marked in flight times out: a Repo's or a
+                // Submodule's `state` (never probed, by `EntityState::probes_state`)
+                // and any cell no probe yet reaches (`sync`, `base`) are never in
                 // flight, so this never overwrites them with a lie.
                 if cell.is_in_flight() {
                     cell.time_out(*generation);
@@ -2921,8 +2921,9 @@ fn begin_probes(entity: &mut EntityState) {
     // refresh.md's "Scope and order" makes scope never a partial dial, so `dirty` carries
     // no `probes_state`-style condition of its own.
     dirty.begin_probe();
-    // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's is
-    // `NotApplicable` from construction, and marking it in flight here would
+    // Only a Worktree's `state` is ever (re)probed: a Repo's is `NotApplicable`
+    // and a Submodule's is `Unknown` from construction, neither ever revisited
+    // (`EntityState::probes_state`), and marking either in flight here would
     // leave it in-flight forever, since nothing would ever call `settle` on it.
     if probes_state {
         state.begin_probe();
@@ -7617,15 +7618,17 @@ mod tests {
         );
     }
 
-    /// A Submodule's `base` cell must stay `NotApplicable` through a real refresh
-    /// cycle, not only at construction: [`EntityState::probes_base`] is what stops
-    /// `refresh`'s dispatch from ever calling `probe_base` for it again. The
-    /// Submodule here is a real, valid repository with a real remote and a
-    /// resolvable default branch ahead of its own tip, so if the gate were
-    /// missing this would settle a genuine live count rather than merely fail to
-    /// open.
+    /// A Submodule's `state` and `base` cells must stay `Unknown` through a real
+    /// refresh cycle, not only at construction:
+    /// [`EntityState::probes_state`] and [`EntityState::probes_base`] are what
+    /// stop `refresh`'s dispatch from ever calling `landing::probe` or
+    /// `probe_base` for it again. The Submodule here is a real, valid repository
+    /// with a real remote and a resolvable default branch ahead of its own tip
+    /// (in fact an ancestor of it, so ancestry alone would prove `Merged`), so if
+    /// either gate were missing this would settle a genuine live answer rather
+    /// than merely fail to open.
     #[test]
-    fn a_submodules_base_cell_stays_not_applicable_through_a_real_refresh() {
+    fn a_submodules_state_and_base_cells_stay_unknown_through_a_real_refresh() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let parent = root.join("parent");
@@ -7675,11 +7678,20 @@ mod tests {
         assert!(
             matches!(
                 submodule_entity.base.settled(),
-                Some(Settled::NotApplicable)
+                Some(Settled::Unknown(Unknown::NoDefaultBranch))
             ),
-            "expected a Submodule's base to stay Not applicable through a real refresh, \
+            "expected a Submodule's base to stay Unknown through a real refresh, \
              got {:?}",
             submodule_entity.base.settled()
+        );
+        assert!(
+            matches!(
+                submodule_entity.state.settled(),
+                Some(Settled::Unknown(Unknown::NoDefaultBranch))
+            ),
+            "expected a Submodule's state to stay Unknown through a real refresh, \
+             rather than settling Merged off an untrusted default branch, got {:?}",
+            submodule_entity.state.settled()
         );
     }
 
