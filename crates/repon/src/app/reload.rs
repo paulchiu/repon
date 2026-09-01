@@ -1138,13 +1138,6 @@ mod tests {
         );
     }
 
-    /// Criterion 8's reload half: `notice_timeout` "re-applies immediately"
-    /// (config.md), so a shorter value from a reload must age out a Notice already on
-    /// screen with no new keypress, exactly as `theme`, `glyphs` and the other keys that
-    /// list names already do for their own state. Goes through the real
-    /// `apply_reloaded_config`, the same path `Action::ReloadConfig` takes, rather than
-    /// assigning `app.document` directly, so this proves the wiring, not only that `notice()`
-    /// reads whatever `document.notice_timeout` happens to hold.
     /// config.md's Reload list names `glyphs` among the keys that re-apply immediately, and
     /// theming.md says the same. `List` reads the reloaded table through its own
     /// `register_config_handler`; every other framed surface reads `App::glyphs`, so leaving
@@ -1193,6 +1186,13 @@ mod tests {
         );
     }
 
+    /// Criterion 8's reload half: `notice_timeout` "re-applies immediately"
+    /// (config.md), so a shorter value from a reload must age out a Notice already on
+    /// screen with no new keypress, exactly as `theme`, `glyphs` and the other keys that
+    /// list names already do for their own state. Goes through the real
+    /// `apply_reloaded_config`, the same path `Action::ReloadConfig` takes, rather than
+    /// assigning `app.document` directly, so this proves the wiring, not only that `notice()`
+    /// reads whatever `document.notice_timeout` happens to hold.
     #[test]
     fn notice_timeout_re_applies_immediately_on_reload_with_no_new_press() {
         let dir = tempfile::tempdir().expect("temp dir");

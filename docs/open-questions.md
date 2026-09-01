@@ -115,3 +115,33 @@ in common.
 - **Owned by**: [`spec/repo-management.md`](spec/repo-management.md), which owns the
   write, and [`adr/0028-repon-writes-the-repo-entries-it-owns.md`](adr/0028-repon-writes-the-repo-entries-it-owns.md),
   which records the trade.
+
+## The detail pane's glyph table is unpinned
+
+`App::draw_frame`'s two detail-pane call sites (`SideBySide` and `DetailOnly`) are the
+only `self.glyphs` hand-offs no test reads back, so hardcoding either to `glyphs::FULL`
+still passes the suite. The overlay sites are pinned by
+[`crates/repon/src/app.rs`](../crates/repon/src/app.rs)'s
+`every_overlay_app_frames_takes_its_border_from_the_glyph_table_app_is_holding`, which
+names the surfaces it covers and does not claim the detail pane.
+
+- **Reopens if**: the detail pane grows a frame assertion of its own, or the overlay
+  test is widened to cover every `self.glyphs` hand-off.
+- **Owned by**: [`spec/theming.md`](spec/theming.md), which owns the one-table rule.
+
+## The Set picker hides rows rather than scrolling at small frame sizes
+
+Framing the picker gave it an interior smaller than its area, so a frame too short for
+the Set list drops the overflow silently (`take(interior.height as usize)`,
+[`crates/repon/src/set_picker.rs`](../crates/repon/src/set_picker.rs)), and an over-long
+*active* Set name loses the trailing ` (active)` marker
+[`spec/keybindings.md`](spec/keybindings.md) requires, since the marker is appended last
+and is the first thing the clamp drops. The help and Action palettes were framed earlier
+and carry the same gap, but the picker drew flush over the whole area until it was
+framed, so its share of this is new.
+
+- **Reopens if**: the picker gains scrolling, or the marker is moved ahead of the name so
+  the clamp cannot drop it.
+- **Owned by**: [`spec/keybindings.md`](spec/keybindings.md), which requires the marker,
+  and [ADR 0027](adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md),
+  which owns the picker and the marker it carries.

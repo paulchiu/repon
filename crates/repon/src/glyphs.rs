@@ -715,24 +715,42 @@ mod tests {
         "border_set",
     ];
 
+    /// A plain block for the cases that chain a setter onto one, standing in for whatever a
+    /// surface would have built.
+    fn block<'a>() -> Block<'a> {
+        Block::new()
+    }
+
+    /// A frame set of this table's own, standing in for the argument a surface would hand
+    /// [`Block::border_set`].
+    fn house_set<'a>() -> border::Set<'a> {
+        border::PLAIN
+    }
+
+    /// Pairs a needle with a construction that is both compiled and stringified from the one
+    /// set of tokens, so a needle that has stopped naming a ratatui API fails the build here
+    /// instead of matching a fixture string edited to agree with it.
+    macro_rules! border_construction_cases {
+        ($($needle:literal => $construction:expr),+ $(,)?) => {
+            [$(($needle, {
+                #[allow(dead_code)]
+                fn compiled<'a>() -> Block<'a> {
+                    $construction
+                }
+                stringify!($construction)
+            })),+]
+        };
+    }
+
     /// One real construction per needle, each written the way a surface would actually write
     /// it. Every needle needs a case here, which is what keeps a needle that names nothing
     /// (a typo, or a ratatui rename) from joining the list unnoticed.
-    const BORDER_CONSTRUCTION_CASES: [(&str, &str); 5] = [
-        ("Block::bordered", "    ratatui::widgets::Block::bordered()"),
-        (
-            "Borders::",
-            "    block().borders(ratatui::widgets::Borders::ALL)",
-        ),
-        (
-            "border::",
-            "    block().border_set(ratatui::symbols::border::PLAIN)",
-        ),
-        (
-            "BorderType",
-            "    block().border_type(ratatui::widgets::BorderType::Plain)",
-        ),
-        ("border_set", "    block().border_set(house_set())"),
+    const BORDER_CONSTRUCTION_CASES: [(&str, &str); 5] = border_construction_cases![
+        "Block::bordered" => ratatui::widgets::Block::bordered(),
+        "Borders::" => block().borders(ratatui::widgets::Borders::ALL),
+        "border::" => block().border_set(ratatui::symbols::border::PLAIN),
+        "BorderType" => block().border_type(ratatui::widgets::BorderType::Plain),
+        "border_set" => block().border_set(house_set()),
     ];
 
     /// This file's path and the 1-based line numbers of [`BORDER_REGION`]'s own interior,
@@ -806,9 +824,10 @@ mod tests {
     /// Proves the mechanism before trusting it over the workspace, the same way
     /// [`crate::theme::tests::the_hardcoded_colour_scan_would_catch_a_real_color_variant`]
     /// does for its own scan: a real second constructor in a disposable fixture file must be
-    /// caught, at the line it sits on. Every needle is planted in turn, so a needle that has
-    /// stopped naming anything (`border_type` renamed upstream, say) fails here rather than
-    /// leaving the workspace scan quietly passing on one fewer way in.
+    /// caught, at the line it sits on. Every needle is planted in turn, and each plant is the
+    /// stringified form of tokens [`BORDER_CONSTRUCTION_CASES`] also compiles, so a needle
+    /// that has stopped naming anything (`BorderType` renamed upstream, say) fails the build
+    /// rather than leaving the workspace scan quietly passing on one fewer way in.
     #[test]
     fn the_border_scan_would_catch_a_surface_that_built_its_own_bordered_block() {
         for needle in BORDER_CONSTRUCTION_NEEDLES {
