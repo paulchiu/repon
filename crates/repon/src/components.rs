@@ -64,8 +64,18 @@ pub trait Component {
     }
 
     /// Draws the component into its area against one already-cloned read of the Core's
-    /// table, the same [`Snapshot`] every panel drawn this tick shares.
-    fn draw(&mut self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) -> Result<()>;
+    /// table, the same [`Snapshot`] every panel drawn this tick shares. `focused` is whether
+    /// the keyboard is on this panel right now
+    /// ([theming.md](../../docs/spec/theming.md)'s "focus communicated by border colour"),
+    /// so a component with only one border to draw still has to be told rather than always
+    /// painting itself focused.
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+        focused: bool,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

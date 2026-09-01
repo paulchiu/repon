@@ -68,9 +68,10 @@ impl Detail {
 
     /// Draws the pane's border and content into `area`. `focused` picks the border role,
     /// [theming.md](../../../../docs/spec/theming.md)'s "focus communicated by border colour":
-    /// this is the one place two panels can be on screen together, so unlike `List` (which has
-    /// had no second panel to be dimmer than) this reads a real focus flag rather than always
-    /// painting itself focused. `theme` is the live, loaded theme, not the compiled default:
+    /// this is the one place two panels can be on screen together, so `List` reads the same
+    /// real focus flag through [`crate::components::Component::draw`] rather than either
+    /// panel always painting itself focused. `theme` is the live, loaded theme, not the
+    /// compiled default:
     /// a theme file's own colours must reach this pane the same as the palettes and the
     /// status bar already do. The top title names `entity`, following the superfile research's
     /// own "the panel title, path, mode, and cursor position in the border itself" import; the

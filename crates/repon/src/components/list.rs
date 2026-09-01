@@ -160,7 +160,14 @@ impl List {
             .unwrap_or_else(|| GlyphSet::for_config(crate::config::document::Glyphs::default()))
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, snapshot: &Snapshot, compact: bool) {
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+        compact: bool,
+        focused: bool,
+    ) {
         let glyphs = self.glyphs();
         // One clock read per draw, shared by every row this tick: still "one moving
         // character per row" (`docs/spec/refresh.md`), since each row's own gutter and cells
@@ -180,10 +187,18 @@ impl List {
             &self.filter,
         );
 
+        // `Component::draw`'s own doc comment: focus is communicated by border colour
+        // (theming.md's "focus communicated by border colour"), the same choice
+        // `Detail::draw` already makes for its own border.
+        let border_role = if focused {
+            theme::Role::BorderFocused
+        } else {
+            theme::Role::Border
+        };
         let mut scratch = BorderScratch::new();
         let mut block = glyphs
             .bordered_block(&mut scratch)
-            .border_style(self.theme.style_for(theme::Role::BorderFocused))
+            .border_style(self.theme.style_for(border_role))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
         if let Some(counter) =
@@ -289,8 +304,14 @@ impl Component for List {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame, area: Rect, snapshot: &Snapshot) -> Result<()> {
-        self.render(frame, area, snapshot, false);
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: &Snapshot,
+        focused: bool,
+    ) -> Result<()> {
+        self.render(frame, area, snapshot, false, focused);
         Ok(())
     }
 }
@@ -302,13 +323,16 @@ impl List {
     /// the gutter and the name column, and no header row (there is nothing left to label).
     /// Reads the same [`Snapshot`] the full list does, so the rows, their order and whichever
     /// row the caller has as the cursor are exactly what the full list would have shown.
+    /// `focused` is whether the keyboard is on the list rather than the detail pane beside
+    /// it, [`Component::draw`]'s own doc comment.
     pub fn draw_sidebar(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         snapshot: &Snapshot,
+        focused: bool,
     ) -> Result<()> {
-        self.render(frame, area, snapshot, true);
+        self.render(frame, area, snapshot, true, focused);
         Ok(())
     }
 
@@ -1215,7 +1239,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, snapshot).expect("draw the list");
+                // `true`: every caller of this helper predates the focus flag and expects
+                // the border it always drew, `BorderFocused`. The two tests exercising
+                // `focused: false` call `list.draw`/`draw_sidebar` directly instead.
+                list.draw(frame, area, snapshot, true)
+                    .expect("draw the list");
             })
             .expect("draw the frame");
         terminal
@@ -1236,7 +1264,8 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw_sidebar(frame, area, snapshot)
+                // `true`, for the same reason `render_with_list` above passes it.
+                list.draw_sidebar(frame, area, snapshot, true)
                     .expect("draw the sidebar");
             })
             .expect("draw the frame");
@@ -2127,6 +2156,54 @@ mod tests {
             buf[(0, 0)].fg,
             Color::LightBlue,
             "the border must show theming.md's documented border_focused default, light-blue"
+        );
+    }
+
+    /// Defect 4: with the keyboard on the detail pane instead, the list's own border must
+    /// dim to `Role::Border` rather than staying `Role::BorderFocused` regardless, so the
+    /// frame actually says where the keyboard is.
+    #[test]
+    fn the_list_border_dims_to_role_border_once_another_panel_is_focused() {
+        let mut list = List::default();
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw(frame, area, &snapshot(vec![]), false)
+                    .expect("draw the list");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme::DEFAULT.role_color(Role::Border),
+            "expected the list's border to dim to Role::Border while another panel holds the \
+             keyboard, not stay BorderFocused regardless"
+        );
+    }
+
+    /// The sidebar seam for the same defect: `draw_sidebar` must dim exactly the way `draw`
+    /// does, since both take `focused` through the same `List::render`.
+    #[test]
+    fn the_sidebars_border_also_dims_to_role_border_once_another_panel_is_focused() {
+        let mut list = List::default();
+        let backend = TestBackend::new(SIDEBAR_WIDTH, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw_sidebar(frame, area, &snapshot(vec![]), false)
+                    .expect("draw the sidebar");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme::DEFAULT.role_color(Role::Border),
+            "expected the sidebar's border to dim the same way the full list's does"
         );
     }
 
@@ -4797,7 +4874,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, &snap).expect("draw the list");
+                list.draw(frame, area, &snap, true).expect("draw the list");
             })
             .expect("draw the frame");
         {
@@ -4816,7 +4893,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                list.draw(frame, area, &snap).expect("draw the list");
+                list.draw(frame, area, &snap, true).expect("draw the list");
             })
             .expect("draw the frame");
         let buf = terminal.backend().buffer();
@@ -4876,7 +4953,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    list.draw_sidebar(frame, area, &snap)
+                    list.draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
@@ -4932,7 +5009,7 @@ mod tests {
                 .draw(|frame| {
                     let area = frame.area();
                     sidebar_list
-                        .draw_sidebar(frame, area, &snap)
+                        .draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
@@ -5141,7 +5218,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    list.draw_sidebar(frame, area, &snap)
+                    list.draw_sidebar(frame, area, &snap, true)
                         .expect("draw the sidebar");
                 })
                 .expect("draw the frame");
