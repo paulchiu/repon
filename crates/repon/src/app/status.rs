@@ -400,6 +400,7 @@ mod tests {
                 outcome: StepOutcome::Failed(37),
                 output: Arc::from(&b"boom"[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),

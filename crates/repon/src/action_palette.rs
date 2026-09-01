@@ -31,6 +31,7 @@ use repon_core::{ActionSpec, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
+    edit_buffer,
     glyphs::{BorderScratch, GlyphSet},
     theme::{Meaning, Role, Theme},
 };
@@ -248,12 +249,7 @@ impl ActionPalette {
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
     pub(crate) fn delete_previous_word(&mut self, actions: &[ActionConfig]) {
-        let trimmed = self.query.trim_end();
-        let cut = trimmed
-            .rfind(char::is_whitespace)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.query.truncate(cut);
+        edit_buffer::delete_previous_word(&mut self.query);
         self.refusal = None;
         self.clamp_cursor(actions);
     }
@@ -835,6 +831,31 @@ mod tests {
             0,
             "query is now just \"re \""
         );
+    }
+
+    /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
+    /// three, so a cut derived by adding one byte to the separator's start lands inside a
+    /// character; the accented letters pin that a multi-byte *non*-whitespace character
+    /// before the cut survives it.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "café\u{00A0}naïve".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.delete_previous_word(&actions);
+
+        assert_eq!(palette.text(), "café\u{00A0}");
+
+        for c in "naïve\u{2003}encore".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.delete_previous_word(&actions);
+
+        assert_eq!(palette.text(), "café\u{00A0}naïve\u{2003}");
     }
 
     #[test]

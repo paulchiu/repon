@@ -79,7 +79,10 @@ One command in an Action's ordered list, as the core receives it: its argv, alre
 An Entity's most recent Action run: its label, the Step results finished so far, whether the row was excluded and never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes. Not an Action run or an Action result; receipt is the settled word.
 
 **Step result**:
-One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output and its elapsed time.
+One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded.
+
+**Capture elision**:
+What a Step's captured output lost to the head-plus-tail bound: how many lines were dropped and how many kept lines precede the gap. Two counts and no mark, because the mark that stands in for the gap is a glyph, and glyphs belong to the consumer; nothing is written into the captured bytes to say a drop happened.
 
 **Step outcome**:
 A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.

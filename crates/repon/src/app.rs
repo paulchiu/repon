@@ -3382,6 +3382,112 @@ mod tests {
         );
     }
 
+    /// Every action `dispatch(Context::Input, _)` can return is named arm by arm in every
+    /// handler that dispatches through that context, so an action joining the input
+    /// vocabulary is a red test rather than a runtime `unreachable!` on the key press. The
+    /// trailing catch-all arm those matches carry cannot make that claim: it compiles
+    /// whatever the vocabulary becomes. The vocabulary is read off the compiled table plus
+    /// `dispatch`'s own printable-character fallback, never listed here, and it is looked for
+    /// in the arms' own patterns, so neither the catch-all's message nor any other mention
+    /// inside a body counts as a handled action.
+    #[test]
+    fn every_input_handler_names_every_action_the_input_context_dispatches() {
+        let mut vocabulary = crate::keys::action_names_bound_in(Context::Input);
+        let text = BindingTable::compiled_default()
+            .dispatch(
+                Context::Input,
+                press(KeyCode::Char('x'), KeyModifiers::NONE),
+            )
+            .expect("a printable character is text in the input context");
+        let text = format!("{text:?}");
+        let text = text.split('(').next().expect("a variant name").to_string();
+        assert!(
+            !vocabulary.contains(&text),
+            "{text:?} is now a compiled row as well as `dispatch`'s fallback, so this test \
+             is counting it twice"
+        );
+        vocabulary.push(text);
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut handlers = 0usize;
+        for path in crate::test_support::production_rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            for block in crate::test_support::match_blocks_over(&source, "dispatch(Context::Input")
+            {
+                handlers += 1;
+                let named = match_arm_patterns(&block).join(" ");
+                for action in &vocabulary {
+                    assert!(
+                        named.contains(&format!("Action::{action}")),
+                        "{}'s input handler has no arm whose pattern names \
+                         `Action::{action}`, which `dispatch(Context::Input, _)` can return; \
+                         its catch-all arm sends that key to `unreachable!` at runtime \
+                         instead. Its arms match {named}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            handlers, 3,
+            "expected the Action palette, the Filter line and the Launcher palette to be \
+             the three handlers dispatching through the input context, found {handlers}"
+        );
+    }
+
+    /// The pattern of each of `block`'s own arms, every body and nested match excluded: the
+    /// text run to each `=>` sitting at the match's own bracket depth. Depth rather than
+    /// indentation, so a `|`-joined pattern rustfmt wrapped over four lines reads as one
+    /// pattern; comments and literals are gone first, so a `=>` inside a panic message opens
+    /// no arm. Losing an arm can only fail a caller's containment check, never satisfy one.
+    fn match_arm_patterns(block: &str) -> Vec<String> {
+        let code = crate::test_support::code_only(block);
+        let chars: Vec<char> = code.chars().collect();
+        let mut index = match code.find('{') {
+            Some(brace) => code[..brace].chars().count() + 1,
+            None => return Vec::new(),
+        };
+        let mut patterns = Vec::new();
+        let mut pattern = String::new();
+        let mut depth = 0usize;
+        let mut in_body = false;
+        while index < chars.len() {
+            let character = chars[index];
+            index += 1;
+            if !in_body {
+                if character == '=' && chars.get(index) == Some(&'>') && depth == 0 {
+                    index += 1;
+                    patterns.push(pattern.split_whitespace().collect::<Vec<_>>().join(" "));
+                    pattern.clear();
+                    in_body = true;
+                    continue;
+                }
+                if "([{".contains(character) {
+                    depth += 1;
+                } else if "}])".contains(character) {
+                    if depth == 0 {
+                        break; // the brace closing the match itself
+                    }
+                    depth -= 1;
+                }
+                pattern.push(character);
+                continue;
+            }
+            if "([{".contains(character) {
+                depth += 1;
+            } else if "}])".contains(character) {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                in_body = depth > 0 || character != '}';
+            } else if character == ',' && depth == 0 {
+                in_body = false;
+            }
+        }
+        patterns
+    }
+
     /// Criterion 5's own "exactly four, no more": every call site that raises
     /// `action_running_notice` across both crates, since a Launcher and an Action step's
     /// executor both spawn child processes and a scan confined to one crate would be
