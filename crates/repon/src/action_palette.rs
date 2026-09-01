@@ -25,7 +25,13 @@
 //! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
 //! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
-use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    layout::{Position, Rect},
+    style::Style,
+    widgets::Paragraph,
+};
+use unicode_width::UnicodeWidthStr;
 
 use repon_core::{ActionSpec, Applicability, Step};
 
@@ -684,6 +690,17 @@ impl ActionPalette {
                     (format!("; {}", self.query), theme.style_for(Role::Text))
                 };
                 draw_row(frame, interior, 0, &query_line, query_style);
+                // The caret sits at the query's own end, "; " plus whatever has been typed,
+                // not at the end of whichever placeholder text an empty query is showing in
+                // its place: this is where the next keystroke would land. ratatui shows the
+                // caret only on a frame where a position was set, so this is the one call
+                // that puts one on this palette's query row at all.
+                if interior.height > 0 {
+                    frame.set_cursor_position(Position::new(
+                        interior.x + 2 + UnicodeWidthStr::width(self.query.as_str()) as u16,
+                        interior.y,
+                    ));
+                }
 
                 let matches = self.matches(actions);
                 let rows_below_query = interior.height.saturating_sub(1) as usize;
@@ -714,7 +731,21 @@ impl ActionPalette {
                             Entry::Builtin(_) => theme.style_for(Role::Accent),
                             Entry::Configured(_) => Style::new(),
                         };
-                        draw_row(frame, interior, 1 + row as u16, &line, style);
+                        let y_row = 1 + row as u16;
+                        draw_row(frame, interior, y_row, &line, style);
+                        // Painted after the row's own text, over the row's full interior
+                        // width, the same patch-not-replace order `components/list.rs` uses
+                        // for the table's own cursor row: the reversed-video default layers
+                        // onto the marker and name this loop just drew rather than erasing
+                        // them, so the `> ` marker survives inside the highlighted bar and
+                        // stays readable under `NO_COLOR` (theming.md's "Colour is never the
+                        // only carrier").
+                        if row == self.cursor && y_row < interior.height {
+                            frame.buffer_mut().set_style(
+                                Rect::new(interior.x, interior.y + y_row, interior.width, 1),
+                                theme.selection_style(),
+                            );
+                        }
                     }
                 }
                 // The three built-ins are always listed, so an unconfigured run is never an
@@ -1512,6 +1543,172 @@ mod tests {
             !row_text(2).contains('>'),
             "only the highlighted row carries the marker: {:?}",
             row_text(2)
+        );
+    }
+
+    // --- the query caret ---
+
+    /// keybindings.md's own claim, "the query's end": the caret sits right after `"; "` plus
+    /// whatever has been typed, which is where the next keystroke lands, not at the end of
+    /// the placeholder text an empty query shows in its place. ratatui only shows a caret on
+    /// a frame that actually set one, so this also proves this palette's query row sets one
+    /// at all.
+    #[test]
+    fn draw_places_the_caret_at_the_end_of_the_typed_query_not_the_placeholder() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        let interior = crate::glyphs::bordered_interior(Rect::new(0, 0, 40, 10));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(3),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw an empty query");
+        assert!(
+            terminal.backend().cursor_visible(),
+            "ratatui shows the caret only on a frame that set one"
+        );
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2, interior.y),
+            "an empty query's caret sits right after \"; \", not at the placeholder's end"
+        );
+
+        for c in "rei".chars() {
+            palette.type_char(c, &actions);
+        }
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(3),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the typed query");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2 + 3, interior.y),
+            "the caret must move to the end of the three typed characters"
+        );
+    }
+
+    /// `Stage::Confirming` shows no query row at all, so it must set no caret either: a
+    /// stale position left over from `Stage::Choosing` would draw a caret over the confirm
+    /// sentence, which is not a text field.
+    #[test]
+    fn a_live_confirm_gate_sets_no_caret_at_all() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.choose(&actions, 12);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(12),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the frame");
+
+        assert!(
+            !terminal.backend().cursor_visible(),
+            "a confirm gate has no text field, so no caret must be set"
+        );
+    }
+
+    // --- the cursor row's highlight covers its full interior width ---
+
+    /// theming.md's "The cursor row": the same full-width `set_style` patch
+    /// `components/list.rs` paints for the table's own cursor, read here as
+    /// `Modifier::REVERSED` on every interior column of the cursor's row and none of its
+    /// neighbour's. A highlight that only reached the marker and name text would still pass
+    /// a narrower, name-only assertion; this counts every column.
+    #[test]
+    fn the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        palette.move_highlight(1, &actions);
+        let interior = crate::glyphs::bordered_interior(Rect::new(0, 0, 40, 10));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(2),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        // Interior row 0 is the query line, row 1 "reinstall", row 2 the cursor's own
+        // "deploy".
+        for x in interior.x..interior.right() {
+            assert!(
+                buf[(x, interior.y + 2)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                "cursor row cell at x={x} must be reversed, not just the cells with text"
+            );
+        }
+        for row in [interior.y, interior.y + 1] {
+            for x in interior.x..interior.right() {
+                assert!(
+                    !buf[(x, row)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED),
+                    "row at y={row} is not the cursor row and must not be reversed"
+                );
+            }
+        }
+        let row_text: String = (interior.x..interior.right())
+            .map(|x| buf[(x, interior.y + 2)].symbol().to_string())
+            .collect();
+        assert!(
+            row_text.starts_with("> deploy"),
+            "the `> ` marker must survive inside the reversed bar, got {row_text:?}"
         );
     }
 

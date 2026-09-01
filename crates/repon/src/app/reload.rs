@@ -1196,11 +1196,17 @@ mod tests {
         app.apply_reloaded_config(config_with_document(reloaded));
 
         let ascii = crate::glyphs::ASCII.border;
-        app.set_picker = Some(crate::set_picker::SetPicker::new());
+        let picker = crate::set_picker::SetPicker::new();
+        let popup = picker.popup_area(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            &app.document.sets,
+            &app.active_set.name,
+        );
+        app.set_picker = Some(picker);
         let buf = render_app_frame(&mut app, width, height);
         crate::test_support::assert_frame_drawn_with(
             &buf,
-            ratatui::layout::Rect::new(0, 0, width, height),
+            popup,
             ascii,
             crate::set_picker::BORDER_TITLE,
             "the Set picker after a reload to `ascii`",

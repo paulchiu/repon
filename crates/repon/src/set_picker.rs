@@ -6,7 +6,12 @@
 //! `overlay` context, not `input`, which is what makes `q` close it rather than quit and
 //! makes `Enter` (`Action::Choose`) the one binding `overlay` answers only here.
 
-use ratatui::{Frame, layout::Rect, style::Style};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Rect},
+    style::Style,
+    widgets::Clear,
+};
 
 use crate::{
     config::document::SetConfig,
@@ -14,6 +19,15 @@ use crate::{
     keys::Action,
     theme::{Role, Theme},
 };
+
+/// A floor under the popup's own computed width and height
+/// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The Launcher
+/// palette popup", the same shape this picker now takes), so a picker with one short Set
+/// name still reads as a palette rather than a sliver. Kept identical to
+/// [`crate::launcher_palette`]'s own floors rather than a second pair of numbers, since
+/// nothing about this picker's content argues for a different minimum.
+const MIN_POPUP_WIDTH: u16 = 24;
+const MIN_POPUP_HEIGHT: u16 = 4;
 
 /// The title the picker draws into its own top border, named once here and read back from
 /// [keybindings.md](../../../docs/spec/keybindings.md)'s picker paragraph by the tests below,
@@ -69,16 +83,66 @@ impl SetPicker {
         };
     }
 
-    /// One line per declared Set, in file order, the cursor row marked with `> `, its
-    /// one-indexed number ([`Self::number_for_row`]) beside the name, and the currently
-    /// active Set named, so choosing without moving the cursor at least shows which Set that
-    /// would be. This is what turns the picker into the teaching surface for the positional
-    /// `1` to `9` keys
+    /// One line per declared Set, the width the widest of them needs, so a short list of
+    /// short names never pays for a full-frame popup's worth of empty interior. Mirrors
+    /// [`crate::launcher_palette::LauncherPalette::popup_area`]'s own shape: content-sized
+    /// then clamped, never the other way around, so a Set list far longer than the frame can
+    /// show never grows the popup past the frame's own edge.
+    fn row_width(row: usize, set: &SetConfig, active_set_name: &str) -> usize {
+        let marker = 2; // "> " or "  "
+        let number = Self::number_for_row(row)
+            .map(|n| format!("{n} ").len())
+            .unwrap_or(0);
+        let active = if set.name.get_ref() == active_set_name {
+            " (active)".len()
+        } else {
+            0
+        };
+        marker + number + set.name.get_ref().len() + active
+    }
+
+    /// The popup's own rect inside `frame_area`, sized to content and clamped to the frame
+    /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
+    /// Launcher palette popup", the shape this picker now takes too).
+    pub(crate) fn popup_area(
+        &self,
+        frame_area: Rect,
+        sets: &[SetConfig],
+        active_set_name: &str,
+    ) -> Rect {
+        let content_width = sets
+            .iter()
+            .enumerate()
+            .map(|(row, set)| Self::row_width(row, set, active_set_name))
+            .max()
+            .unwrap_or(0)
+            .max(BORDER_TITLE.len());
+        let width = (content_width as u16)
+            .saturating_add(2) // the two border columns
+            .clamp(MIN_POPUP_WIDTH, frame_area.width);
+
+        let content_rows = sets.len().max(1);
+        let height = (content_rows as u16)
+            .saturating_add(2) // the two border rows
+            .clamp(MIN_POPUP_HEIGHT, frame_area.height);
+
+        frame_area.centered(Constraint::Length(width), Constraint::Length(height))
+    }
+
+    /// One line per declared Set, in file order, the cursor row marked with `> ` and carrying
+    /// [`Theme::selection_style`] across its own full interior width, its one-indexed number
+    /// ([`Self::number_for_row`]) beside the name, and the currently active Set named, so
+    /// choosing without moving the cursor at least shows which Set that would be. This is
+    /// what turns the picker into the teaching surface for the positional `1` to `9` keys
     /// ([0027](../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)):
     /// [`crate::app::App::switch_to_set`] takes the same one-indexed number this draws.
     ///
-    /// The rows sit inside the house-style frame every other panel and overlay draws, its
-    /// characters taken from `glyphs` rather than ratatui's own default set.
+    /// Draws as a centred popup over `frame`
+    /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
+    /// Launcher palette popup"), `Clear` rendered into the popup's own rect first so whatever
+    /// the live frame drew there does not bleed through. The rows sit inside the house-style
+    /// frame every other panel and overlay draws, its characters taken from `glyphs` rather
+    /// than ratatui's own default set.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -88,6 +152,9 @@ impl SetPicker {
         theme: &Theme,
         glyphs: &'static GlyphSet,
     ) {
+        let popup = self.popup_area(area, sets, active_set_name);
+        frame.render_widget(Clear, popup);
+
         let mut scratch = BorderScratch::new();
         // Always painted focused, like `List` and the help overlay: the picker is the only
         // thing on screen while it is open, so there is no dimmer panel to contrast it with.
@@ -95,8 +162,8 @@ impl SetPicker {
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Role::BorderFocused))
             .title(BORDER_TITLE);
-        let interior = block.inner(area);
-        frame.render_widget(block, area);
+        let interior = block.inner(popup);
+        frame.render_widget(block, popup);
 
         for (row, set) in sets.iter().enumerate().take(interior.height as usize) {
             let marker = if row == self.cursor { "> " } else { "  " };
@@ -110,15 +177,28 @@ impl SetPicker {
                 ""
             };
             let line = format!("{marker}{number}{}{active}", set.name.get_ref());
+            let y = interior.y + row as u16;
             // Clamped to the interior, not the buffer: a Set name is user-supplied and
             // unbounded, and a long one must not paint over the frame's right border.
             frame.buffer_mut().set_stringn(
                 interior.x,
-                interior.y + row as u16,
+                y,
                 &line,
                 interior.width as usize,
                 Style::new(),
             );
+            // Painted after the line's own text, over the row's full interior width, the
+            // same patch-not-replace order `components/list.rs` uses for the table's own
+            // cursor row: `Buffer::set_style` layers the reversed-video default onto the
+            // cells the line just wrote rather than erasing them, so the `> ` marker survives
+            // inside the highlighted bar and stays readable under `NO_COLOR`
+            // (theming.md's "Colour is never the only carrier").
+            if row == self.cursor {
+                frame.buffer_mut().set_style(
+                    Rect::new(interior.x, y, interior.width, 1),
+                    theme.selection_style(),
+                );
+            }
         }
     }
 
@@ -144,22 +224,11 @@ mod tests {
         }
     }
 
-    /// The `TestBackend` area every test below draws into, named once so a test reading a
-    /// row through [`row_text`] and the draw it reads agree on the frame.
-    const FRAME: Rect = Rect {
-        x: 0,
-        y: 0,
-        width: 40,
-        height: 14,
-    };
-
-    /// Row `row` of the picker's own interior, inside the frame the border draws: the
-    /// picker's first Set is row 0 here, one cell in and one row down from the frame itself.
-    fn row_text(buf: &ratatui::buffer::Buffer, row: u16) -> String {
-        let interior = crate::glyphs::bordered_interior(FRAME);
-        (interior.x..interior.right())
-            .map(|x| buf[(x, interior.y + row)].symbol().to_string())
-            .collect()
+    /// The `TestBackend` area every test below draws into: named once so a test computing
+    /// where the popup landed (via [`SetPicker::popup_area`]) uses the exact same frame the
+    /// real draw ran against.
+    fn frame_area() -> Rect {
+        Rect::new(0, 0, 40, 14)
     }
 
     fn draw_to_buffer(
@@ -169,7 +238,8 @@ mod tests {
         glyphs: &'static GlyphSet,
     ) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(FRAME.width, FRAME.height);
+        let area = frame_area();
+        let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| picker.draw(frame, frame.area(), sets, active, &Theme::default(), glyphs))
@@ -177,22 +247,45 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// The popup's own interior for this exact picker state, since a test can no longer
+    /// hard-code a row or column now the popup is sized to content and centred rather than
+    /// filling the frame.
+    fn popup_interior(picker: &SetPicker, sets: &[SetConfig], active: &str) -> Rect {
+        let popup = picker.popup_area(frame_area(), sets, active);
+        Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        }
+    }
+
+    /// Row `row` of `interior`, the popup's own interior: the picker's first Set is row 0
+    /// here, one cell in and one row down from the popup's own border.
+    fn row_text(buf: &ratatui::buffer::Buffer, interior: Rect, row: u16) -> String {
+        (interior.x..interior.right())
+            .map(|x| buf[(x, interior.y + row)].symbol().to_string())
+            .collect()
+    }
+
     // --- The frame's own characters come from the glyph table, not ratatui's default ---
 
     /// theming.md's "panel border" row: the picker frames itself with the active table's own
     /// characters, the set the list and detail panes already draw, and degrades with them
     /// under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded rounded
-    /// set would satisfy neither.
+    /// set would satisfy neither. The corners are read at the popup's own rect, not the
+    /// frame's, since the popup is centred rather than full-screen.
     #[test]
     fn draw_frames_the_picker_with_the_active_glyph_tables_own_border() {
         for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
             let sets = vec![set("alpha")];
             let picker = SetPicker::new();
             let buf = draw_to_buffer(&picker, &sets, "alpha", glyphs);
+            let popup = picker.popup_area(frame_area(), &sets, "alpha");
 
             crate::test_support::assert_frame_drawn_with(
                 &buf,
-                FRAME,
+                popup,
                 glyphs.border,
                 BORDER_TITLE,
                 "the picker's frame",
@@ -222,31 +315,33 @@ mod tests {
     }
 
     /// A Set name is user-supplied and unbounded, so a long one must stop at the interior
-    /// rather than paint over the frame's own right border. Asserted on the whole frame, not
+    /// rather than paint over the popup's own right border. Asserted on the whole popup, not
     /// on the one cell beside the name: an overrun writes down the border's own column.
     #[test]
     fn a_set_name_wider_than_the_interior_never_paints_over_the_frames_right_border() {
         let long = "production-monorepo-and-everything-else-we-own-twice-over";
         assert!(
-            long.len() > FRAME.width as usize,
+            long.len() > frame_area().width as usize,
             "the name has to be wider than the whole frame for this to test anything"
         );
         let sets = vec![set(long)];
         let picker = SetPicker::new();
 
         let buf = draw_to_buffer(&picker, &sets, long, &crate::glyphs::FULL);
+        let popup = picker.popup_area(frame_area(), &sets, long);
+        let interior = popup_interior(&picker, &sets, long);
 
         crate::test_support::assert_frame_drawn_with(
             &buf,
-            FRAME,
+            popup,
             crate::glyphs::FULL.border,
             BORDER_TITLE,
             "the picker's frame beside an over-long Set name",
         );
         assert!(
-            row_text(&buf, 0).starts_with("> 1 production-monorepo"),
+            row_text(&buf, interior, 0).starts_with("> 1 production-monorepo"),
             "the name must still be drawn up to the interior's own edge, got {:?}",
-            row_text(&buf, 0)
+            row_text(&buf, interior, 0)
         );
     }
 
@@ -261,8 +356,11 @@ mod tests {
         let sets = vec![set("alpha"), set("beta"), set("gamma"), set("delta")];
         let picker = SetPicker::new();
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
+        let interior = popup_interior(&picker, &sets, "alpha");
 
-        let rendered: Vec<String> = (0..6).map(|y| row_text(&buf, y)).collect();
+        let rendered: Vec<String> = (0..interior.height)
+            .map(|y| row_text(&buf, interior, y))
+            .collect();
         let occurrences = |name: &str| rendered.iter().filter(|line| line.contains(name)).count();
 
         for name in ["alpha", "beta", "gamma", "delta"] {
@@ -299,9 +397,10 @@ mod tests {
         );
 
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
-        assert!(row_text(&buf, 2).starts_with("> 3 gamma"));
-        assert!(!row_text(&buf, 0).contains('>'));
-        assert!(!row_text(&buf, 1).contains('>'));
+        let interior = popup_interior(&picker, &sets, "alpha");
+        assert!(row_text(&buf, interior, 2).starts_with("> 3 gamma"));
+        assert!(!row_text(&buf, interior, 0).contains('>'));
+        assert!(!row_text(&buf, interior, 1).contains('>'));
     }
 
     // --- criterion 1: each row's own one-indexed number, not zero-indexed and not absent ---
@@ -316,10 +415,11 @@ mod tests {
         let sets = vec![set("alpha"), set("beta"), set("gamma")];
         let picker = SetPicker::new();
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
+        let interior = popup_interior(&picker, &sets, "alpha");
 
-        assert_eq!(row_text(&buf, 0).trim_end(), "> 1 alpha (active)");
-        assert_eq!(row_text(&buf, 1).trim_end(), "  2 beta");
-        assert_eq!(row_text(&buf, 2).trim_end(), "  3 gamma");
+        assert_eq!(row_text(&buf, interior, 0).trim_end(), "> 1 alpha (active)");
+        assert_eq!(row_text(&buf, interior, 1).trim_end(), "  2 beta");
+        assert_eq!(row_text(&buf, interior, 2).trim_end(), "  3 gamma");
     }
 
     /// The tenth row is the one place the numbering has to stop: the positional keys only
@@ -332,14 +432,15 @@ mod tests {
         let picker = SetPicker::new();
 
         let buf = draw_to_buffer(&picker, &sets, "set1", &crate::glyphs::FULL);
+        let interior = popup_interior(&picker, &sets, "set1");
 
         for (row, name) in names.iter().enumerate().take(9) {
             let marker = if row == 0 { "> " } else { "  " };
             let active = if row == 0 { " (active)" } else { "" };
             let expected = format!("{marker}{} {name}{active}", row + 1);
-            assert_eq!(row_text(&buf, row as u16).trim_end(), expected);
+            assert_eq!(row_text(&buf, interior, row as u16).trim_end(), expected);
         }
-        assert_eq!(row_text(&buf, 9).trim_end(), "  set10");
+        assert_eq!(row_text(&buf, interior, 9).trim_end(), "  set10");
     }
 
     // --- cursor movement: clamped, not wrapped ---
@@ -395,8 +496,9 @@ mod tests {
         }
 
         let buf = draw_to_buffer(&picker, &[], "irrelevant", &crate::glyphs::FULL);
+        let interior = popup_interior(&picker, &[], "irrelevant");
         assert_eq!(
-            row_text(&buf, 0).trim(),
+            row_text(&buf, interior, 0).trim(),
             "",
             "an empty document must render no rows"
         );
@@ -419,7 +521,210 @@ mod tests {
         }
 
         let buf = draw_to_buffer(&picker, &sets, "only", &crate::glyphs::FULL);
-        assert!(row_text(&buf, 0).contains("only"));
-        assert!(row_text(&buf, 0).contains("(active)"));
+        let interior = popup_interior(&picker, &sets, "only");
+        assert!(row_text(&buf, interior, 0).contains("only"));
+        assert!(row_text(&buf, interior, 0).contains("(active)"));
+    }
+
+    // --- criterion: the cursor row carries `selection_style()` across its full interior
+    // width, and its neighbour does not, with the `> ` marker surviving inside it ---
+
+    /// theming.md's "The cursor row": the same full-width `set_style` patch
+    /// `components/list.rs` paints for the table's own cursor, read here as
+    /// `Modifier::REVERSED` on every interior column of the cursor's row and none of its
+    /// neighbour's, the same shape
+    /// `the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row`
+    /// proves there. A highlight that only reached the name text (not the padding beside it)
+    /// would still pass a narrower assertion; this counts every column.
+    #[test]
+    fn the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+        let sets = vec![set("alpha"), set("beta"), set("gamma")];
+        let mut picker = SetPicker::new();
+        picker.apply(Action::ScrollDown, sets.len());
+
+        let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
+        let interior = popup_interior(&picker, &sets, "alpha");
+
+        for x in interior.x..interior.right() {
+            assert!(
+                buf[(x, interior.y + 1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                "cursor row cell at x={x} must be reversed, not just the cells with text"
+            );
+        }
+        for row in [0u16, 2] {
+            for x in interior.x..interior.right() {
+                assert!(
+                    !buf[(x, interior.y + row)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED),
+                    "row {row} is not the cursor row and must not be reversed"
+                );
+            }
+        }
+        assert!(
+            row_text(&buf, interior, 1).starts_with("> 2 beta"),
+            "the `> ` marker must survive inside the reversed bar"
+        );
+    }
+
+    // --- the popup: sized to content, clamped to the frame, `Clear` under it ---
+
+    /// This ticket's own required test: not "the picker drew something", but that a cell
+    /// inside the popup's interior no longer carries content that was underneath it before
+    /// the popup drew, which is exactly what a missing `Clear` would fail to catch. Copied
+    /// from [`crate::launcher_palette`]'s own version of this test, the one assertion a
+    /// missing `Clear` fails.
+    #[test]
+    fn clear_is_rendered_under_the_popup_so_a_stale_cell_from_beneath_does_not_bleed_through() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let sets = vec![set("alpha")];
+        let picker = SetPicker::new();
+        let backend = TestBackend::new(frame_area().width, frame_area().height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                // Simulates a table row already drawn underneath, the same as the base
+                // frame `App::render` draws before overlaying this popup.
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(
+                        0,
+                        y,
+                        "#".repeat(area.width as usize),
+                        Style::new(),
+                    );
+                }
+                picker.draw(
+                    frame,
+                    area,
+                    &sets,
+                    "alpha",
+                    &Theme::default(),
+                    &crate::glyphs::FULL,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let interior = popup_interior(&picker, &sets, "alpha");
+        // The one row's own rightmost interior column: `"> 1 alpha (active)"` (18 columns)
+        // is shorter than the interior by construction of `MIN_POPUP_WIDTH`'s own floor over
+        // this one-Set fixture, so nothing but `Clear` running first can explain this column
+        // no longer carrying the sentinel. A column inside the row's own drawn text (the
+        // interior's first cell, this test's previous choice) proves nothing: the row's own
+        // `set_stringn` call would overwrite the sentinel there whether or not `Clear` ran.
+        let drawn_line_len = "> 1 alpha (active)".len() as u16;
+        let trailing_x = interior.right() - 1;
+        assert!(
+            trailing_x >= interior.x + drawn_line_len,
+            "test fixture assumption: the interior must be wider than the one drawn row, or \
+             this column proves nothing about `Clear`"
+        );
+        assert_ne!(
+            buf[(trailing_x, interior.y)].symbol(),
+            "#",
+            "expected `Clear` to wipe the popup's own interior before its border and \
+             content draw, so nothing from the row underneath bleeds through"
+        );
+    }
+
+    /// [layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
+    /// Launcher palette popup": the picker no longer takes the whole frame, so whatever the
+    /// base frame drew outside the popup's own rect must stay exactly as drawn underneath it.
+    #[test]
+    fn the_popup_does_not_take_the_whole_frame_the_corners_stay_as_drawn_underneath() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let sets = vec![set("alpha")];
+        let picker = SetPicker::new();
+        let area = frame_area();
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(
+                        0,
+                        y,
+                        "#".repeat(area.width as usize),
+                        Style::new(),
+                    );
+                }
+                picker.draw(
+                    frame,
+                    area,
+                    &sets,
+                    "alpha",
+                    &Theme::default(),
+                    &crate::glyphs::FULL,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "#",
+            "the top-left corner sits outside a centred popup and must stay whatever the \
+             base frame drew there"
+        );
+        assert_eq!(
+            buf[(area.width - 1, area.height - 1)].symbol(),
+            "#",
+            "the bottom-right corner sits outside a centred popup and must stay whatever \
+             the base frame drew there"
+        );
+    }
+
+    #[test]
+    fn the_popup_is_clamped_to_fit_and_read_at_the_88_column_narrow_screen() {
+        let sets = vec![set("a-fairly-long-set-name-for-this-fixture")];
+        let picker = SetPicker::new();
+        let narrow_frame = Rect::new(0, 0, 88, 24);
+
+        let popup = picker.popup_area(
+            narrow_frame,
+            &sets,
+            "a-fairly-long-set-name-for-this-fixture",
+        );
+
+        assert!(
+            popup.x + popup.width <= narrow_frame.width
+                && popup.y + popup.height <= narrow_frame.height,
+            "the popup must fit entirely inside the 88-column narrow screen, got {popup:?}"
+        );
+        assert!(
+            popup.width >= MIN_POPUP_WIDTH && popup.height >= MIN_POPUP_HEIGHT,
+            "the popup must still read as a palette, not shrink to nothing, got {popup:?}"
+        );
+    }
+
+    /// A table of declared Sets taller than the popup must not make the popup taller than
+    /// the frame: [layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
+    /// own words for the Launcher popup, which this picker now shares.
+    #[test]
+    fn a_table_taller_than_the_popup_does_not_make_the_popup_taller_than_the_frame() {
+        let sets: Vec<SetConfig> = (0..200).map(|i| set(&format!("set-{i}"))).collect();
+        let picker = SetPicker::new();
+        let frame = frame_area();
+
+        let popup = picker.popup_area(frame, &sets, "set-0");
+
+        assert!(
+            popup.height <= frame.height,
+            "a 200-entry Set list must not grow the popup past the frame's own height, got \
+             {popup:?} against frame height {}",
+            frame.height
+        );
+
+        // Also proves `draw` itself never panics indexing past the frame with a list this
+        // long, the behavioural half of the same criterion.
+        let _ = draw_to_buffer(&picker, &sets, "set-0", &crate::glyphs::FULL);
     }
 }

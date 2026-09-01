@@ -19,10 +19,11 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Rect},
+    layout::{Constraint, Position, Rect},
     style::Style,
     widgets::Clear,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     edit_buffer,
@@ -249,6 +250,15 @@ impl LauncherPalette {
         frame
             .buffer_mut()
             .set_string(interior.x, interior.y, &query_line, query_style);
+        // The caret sits at the query's own end, "! " plus whatever has been typed, not at
+        // the end of whichever placeholder text an empty query is showing in its place: this
+        // is where the next keystroke would land. ratatui shows the caret only on a frame
+        // where a position was set, so this is the one call that puts one on this palette's
+        // query row at all.
+        frame.set_cursor_position(Position::new(
+            interior.x + 2 + UnicodeWidthStr::width(self.query.as_str()) as u16,
+            interior.y,
+        ));
 
         let matches = self.matches(launchers);
         let rows_below_query = interior.height.saturating_sub(1) as usize;
@@ -263,12 +273,22 @@ impl LauncherPalette {
             for (row, launcher) in matches.iter().enumerate().take(rows_below_query) {
                 let marker = if row == self.cursor { "> " } else { "  " };
                 let line = format!("{marker}{}", launcher.name);
-                frame.buffer_mut().set_string(
-                    interior.x,
-                    interior.y + 1 + row as u16,
-                    &line,
-                    Style::new(),
-                );
+                let y = interior.y + 1 + row as u16;
+                frame
+                    .buffer_mut()
+                    .set_string(interior.x, y, &line, Style::new());
+                // Painted after the row's own text, over the row's full interior width, the
+                // same patch-not-replace order `components/list.rs` uses for the table's own
+                // cursor row: the reversed-video default layers onto the marker and name
+                // this loop just wrote rather than erasing them, so the `> ` marker survives
+                // inside the highlighted bar and stays readable under `NO_COLOR`
+                // (theming.md's "Colour is never the only carrier").
+                if row == self.cursor {
+                    frame.buffer_mut().set_style(
+                        Rect::new(interior.x, y, interior.width, 1),
+                        theme.selection_style(),
+                    );
+                }
             }
         }
     }
@@ -856,6 +876,113 @@ mod tests {
         );
     }
 
+    // --- the query caret ---
+
+    /// keybindings.md's own claim, "the query's end": the caret sits right after `"! "` plus
+    /// whatever has been typed, which is where the next keystroke lands, not at the end of
+    /// the placeholder text an empty query shows in its place. ratatui only shows a caret on
+    /// a frame that actually set one, so this also proves this palette's query row sets one
+    /// at all.
+    #[test]
+    fn draw_places_the_caret_at_the_end_of_the_typed_query_not_the_placeholder() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let launchers = vec![launcher("lazygit")];
+        let mut palette = LauncherPalette::new();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw an empty query");
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        assert!(
+            terminal.backend().cursor_visible(),
+            "ratatui shows the caret only on a frame that set one"
+        );
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2, interior.y),
+            "an empty query's caret sits right after \"! \", not at the placeholder's end"
+        );
+
+        for c in "laz".chars() {
+            palette.type_char(c, &launchers);
+        }
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the typed query");
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2 + 3, interior.y),
+            "the caret must move to the end of the three typed characters"
+        );
+    }
+
+    // --- the cursor row's highlight covers its full interior width ---
+
+    /// theming.md's "The cursor row": the same full-width `set_style` patch
+    /// `components/list.rs` paints for the table's own cursor, read here as
+    /// `Modifier::REVERSED` on every interior column of the cursor's row and none of its
+    /// neighbour's. A highlight that only reached the marker and name text would still pass
+    /// a narrower, name-only assertion; this counts every column.
+    #[test]
+    fn the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+        let launchers = vec![launcher("alpha"), launcher("beta"), launcher("gamma")];
+        let mut palette = LauncherPalette::new();
+        palette.move_highlight(1, &launchers);
+
+        let buf = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        // Interior row 0 is the query line, row 1 "alpha", row 2 the cursor's own "beta".
+        for x in interior.x..interior.right() {
+            assert!(
+                buf[(x, interior.y + 2)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                "cursor row cell at x={x} must be reversed, not just the cells with text"
+            );
+        }
+        for row in [interior.y, interior.y + 1] {
+            for x in interior.x..interior.right() {
+                assert!(
+                    !buf[(x, row)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED),
+                    "row at y={row} is not the cursor row and must not be reversed"
+                );
+            }
+        }
+        assert!(
+            row_text(&buf, interior.y + 2, 40).contains("> beta"),
+            "the `> ` marker must survive inside the reversed bar"
+        );
+    }
+
     // --- the two empty states ---
 
     #[test]
@@ -1072,13 +1199,18 @@ mod tests {
 
         let buf = terminal.backend().buffer();
         let interior = popup_interior(&palette, &launchers, "repo-a");
-        // The query row's own trailing columns, past the leading "! " (the query is
-        // empty): `draw`'s own `set_string` calls never reach this cell, so only `Clear`
-        // running first can explain it no longer carrying the sentinel.
-        let trailing_x = interior.x + 2;
+        // The query row's own rightmost interior column: with the query empty, `draw`
+        // writes the placeholder there (`QUERY_PLACEHOLDER`, shorter than the interior by
+        // construction of `MIN_POPUP_WIDTH`'s own floor over this one-Launcher fixture), so
+        // nothing but `Clear` running first can explain this column no longer carrying the
+        // sentinel. A column inside the placeholder's own span (this test's previous
+        // `interior.x + 2`) proves nothing: the placeholder's own text would overwrite the
+        // sentinel there whether or not `Clear` ran.
+        let trailing_x = interior.right() - 1;
         assert!(
-            trailing_x < interior.x + interior.width,
-            "test fixture assumption: the interior must be wider than the leading \"! \""
+            trailing_x >= interior.x + QUERY_PLACEHOLDER.len() as u16,
+            "test fixture assumption: the interior must be wider than the placeholder text, \
+             or this column proves nothing about `Clear`"
         );
         assert_ne!(
             buf[(trailing_x, interior.y)].symbol(),

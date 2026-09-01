@@ -79,12 +79,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # expansion needs to see. Already in the dependency tree transitively via ratatui and
 # ansi-to-tui, so this only makes a direct dependency of one already resolved.
 unicode-segmentation = "1.13.3"
+# The width function ratatui itself budgets glyphs with (the same one the width test in
+# `glyphs.rs` measures against, hence the version pinned exactly): the Action and Launcher
+# palettes' own query caret ([`ratatui::Frame::set_cursor_position`]) needs the typed query's
+# own display width, not its byte length, to land on the character actually being typed
+# rather than short or long of it under a multi-byte one. Already in the dependency tree
+# transitively via ratatui, so this only makes a direct dependency of one already resolved.
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 # Enables `Timestamp::at` for this crate's own tests without reaching it from the
 # `[dependencies]` entry above, which is what keeps a production build of `repon`
 # from carrying it.
 repon-core = { workspace = true, features = ["test-util"] }
-# The width function ratatui itself budgets glyphs with; the width test in `glyphs.rs`
-# measures against this, not against ratatui's own re-export, so the version is pinned here.
-unicode-width = "0.2.2"
