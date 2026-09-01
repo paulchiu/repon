@@ -4207,11 +4207,12 @@ struct ProbeOutcomes {
 
 /// Lands one probe's phase C/D outcome for `key` at `generation`: writes the
 /// `state` and `dirty` cells subject to the per-cell supersession `Cell::settle`
-/// already enforces, then clears `key` from the table's in-flight set and
-/// signals `settle_gate` once for the whole entity. This is the one write that
-/// closes out a dispatched entity, whether or not [`apply_cheap_probe_outcomes`]
-/// already landed that same entity's cheap cells; a test's simulated late result
-/// goes through the same path so it does not duplicate this bookkeeping.
+/// already enforces, then clears `key`'s in-flight entry if `generation` still
+/// owns it and signals `settle_gate` once for the whole entity. This is the one
+/// write that closes out a dispatched entity, whether or not
+/// [`apply_cheap_probe_outcomes`] already landed that same entity's cheap cells;
+/// a test's simulated late result goes through the same path so it does not
+/// duplicate this bookkeeping.
 ///
 /// `outcomes.state` being `None` writes nothing at all: the `state` cell is left
 /// exactly as unsettled as `begin_probe` alone leaves it, which is what an
@@ -4237,7 +4238,20 @@ fn apply_probe_outcome(
             table.entities[idx].dirty.settle(generation, settled);
         }
     }
-    table.in_flight.remove(key);
+    // By Generation as well as by key. Cancellation is cooperative, so a superseded
+    // probe still runs to completion and arrives here after the Generation that
+    // superseded it has already put its own entry under this key; clearing by key
+    // alone would delete that live entry, leaving the entity with nothing for the
+    // next Generation to interrupt and nothing for the deadline sweep to time out.
+    // The settle gate is signalled either way, since the debt belongs to the probe
+    // rather than to the entry.
+    if table
+        .in_flight
+        .get(key)
+        .is_some_and(|in_flight| in_flight.generation == generation.value())
+    {
+        table.in_flight.remove(key);
+    }
     drop(table);
     complete_one(settle_gate);
 }
@@ -5027,6 +5041,48 @@ mod tests {
             "a gate registered after this Generation dispatched must never be marked \
              finished by it: a test waiting on that gate would return before this \
              Generation had applied its outcome or decremented the settle gate"
+        );
+    }
+
+    /// A probe finishing clears its own Generation's in-flight entry, never whatever the
+    /// table holds under that key by the time it gets there.
+    ///
+    /// Cancellation is cooperative (refresh.md's "Cancellation"), so a superseded probe
+    /// runs to completion and reaches `apply_probe_outcome` after the Generation that
+    /// superseded it has already put its own entry under the same key. Clearing by key
+    /// alone deleted that live entry, and refresh.md's "Supersession" then had nothing to
+    /// set: the Generation after it found no previous entry, so the entity's interrupt
+    /// flag stayed false and its probe ran on uncancelled, which is the 1.79x ADR 0013
+    /// measured. Parking a probe at its phase C gate and superseding it while it is held
+    /// is that interleaving with the timing taken out of it.
+    #[test]
+    fn a_probe_finishing_clears_only_its_own_generations_in_flight_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
+
+        core.hold_phase_c_for_test(&key);
+        core.refresh(std::slice::from_ref(&key));
+        core.wait_phase_c_landed_for_test(&key);
+
+        // The Generation that supersedes the parked probe, holding the interrupt flag the
+        // `refresh` below has to be able to find and set.
+        let superseding = core.begin_shared_generation_for_test(std::slice::from_ref(&key));
+
+        core.release_phase_c_for_test(&key);
+        core.wait_phase_c_finished_for_test(&key);
+
+        core.refresh(std::slice::from_ref(&key));
+        core.wait_dispatched_for_test();
+
+        assert!(
+            superseding.cancels[&key].load(Ordering::Acquire),
+            "a probe from a Generation that has already been superseded must leave the \
+             live Generation's in-flight entry alone, or the Generation after it has \
+             nothing to interrupt"
         );
     }
 
@@ -7502,6 +7558,15 @@ mod tests {
     /// against the cell's own recorded Generation this test failed exactly there:
     /// B's late result was rejected, which is precisely the "cannot strand the
     /// rows it never spoke for" defect the ticket names.
+    ///
+    /// This test read A's interrupt flag intermittently false under load. The cause was
+    /// `apply_probe_outcome` clearing the in-flight entry by key alone: launch's own
+    /// Generation was left undrained here, so one of its probes could finish after the
+    /// simulated older Generation had put its flags under the same keys and delete the
+    /// entry holding them, leaving the Selection-scoped refresh nothing to supersede.
+    /// Launch is drained first now, and the entry is cleared by Generation as well as by
+    /// key, which `a_probe_finishing_clears_only_its_own_generations_in_flight_entry`
+    /// pins directly.
     #[test]
     fn a_selection_scoped_refresh_supersedes_only_the_entity_it_covers() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7509,8 +7574,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("a"));
         init_repo_with_a_commit(&root.join("b"));
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let snapshot = core.snapshot();
+        let (core, snapshot) = started_and_settled(spec(vec![root]));
         let key_a = snapshot
             .entities
             .iter()
@@ -7540,8 +7604,12 @@ mod tests {
             "the Selection-scoped refresh must be the Generation immediately after the one \
              still in flight, with nothing minted in between"
         );
-        let after_refresh = core.settle(Duration::from_millis(500));
 
+        // Supersession happens on the new Generation's own thread, behind its walk, so
+        // this is the rendezvous that says it has happened. A join, never a deadline: no
+        // production rule bounds how long that walk takes short of the thirty seconds at
+        // which discovery is abandoned.
+        core.wait_dispatched_for_test();
         assert!(
             older.cancels[&key_a].load(Ordering::Acquire),
             "the entity the new Generation covers must have its old interrupt flag set"
@@ -7550,6 +7618,11 @@ mod tests {
             !older.cancels[&key_b].load(Ordering::Acquire),
             "an entity the new Generation does not cover must be left running, untouched"
         );
+
+        // [`BACKSTOP`] rather than a budget: what follows reads the cell the new
+        // Generation's own probe writes, which is a liveness property with no wall-clock
+        // bound of its own.
+        let after_refresh = core.settle(BACKSTOP);
 
         let a_after_gen2 = after_refresh
             .entities
