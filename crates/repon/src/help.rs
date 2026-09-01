@@ -216,7 +216,7 @@ impl HelpOverlay {
     /// [`Self::lines`] narrowed to `query`: a binding row matches on its own key text or
     /// description, a legend row on its own glyph or meaning, both a case-insensitive
     /// substring, the same convention [`crate::launcher_palette::matching`] and
-    /// [`crate::action_palette::matching`] already match their own lists with. An empty
+    /// [`crate::action_palette::ActionPalette::matches`] already match their own lists with. An empty
     /// query matches everything. `LegendHeading` survives only when at least one legend row
     /// does, so a query that empties the legend never leaves its own heading standing over
     /// nothing.
