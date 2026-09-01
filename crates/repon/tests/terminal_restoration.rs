@@ -41,6 +41,11 @@ unsafe extern "C" {
 /// one.
 const WUNTRACED: c_int = 2;
 
+/// POSIX-standard on both macOS and Linux (`errno.h`): what a pty master read reports once its
+/// last slave descriptor has closed, on Linux. macOS reports the same condition as `Ok(0)`
+/// instead; see [`DrainEnd::EofViaEio`].
+const EIO: i32 = 5;
+
 const O_RDWR: c_int = 2;
 #[cfg(target_os = "macos")]
 const O_NOCTTY: c_int = 0x0002_0000;
@@ -125,19 +130,35 @@ fn open_pty() -> (File, String) {
     (master, slave_path)
 }
 
+/// Opens an extra descriptor on `slave_path`, independent of the three the spawned child
+/// inherits, for this process to hold open across a drain.
+///
+/// `spawn_attached_to_pty_with` moves its three slave descriptors into the child's `Command`,
+/// so once the child exits the pty would otherwise have no slave open at all. On macOS a read
+/// of the master in that state fails with `EIO` whether or not bytes are still buffered, which
+/// silently discards whatever the child wrote if the reader had not already drained it first.
+/// Keeping this descriptor open for the lifetime of a drain, and dropping it only after the
+/// child is reaped, is what makes the master's eventual `Ok(0)` a real end of file instead of a
+/// race against the child's own exit.
+fn open_parent_held_slave(slave_path: &str) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(slave_path)
+        .expect("open pty slave for the parent to hold open across the drain")
+}
+
 /// Spawns `repon <flag>` with the pty slave wired to all three standard streams, the same
 /// shape a real terminal session gives it.
 fn spawn_attached_to_pty(slave_path: &str, flag: &str) -> std::process::Child {
     spawn_attached_to_pty_with(slave_path, &[flag], &[])
 }
 
-/// [`spawn_attached_to_pty`], generalised to an argv of any length plus extra environment
-/// variables, for a caller that needs `--theme <name>` rather than a single bare flag.
-fn spawn_attached_to_pty_with(
-    slave_path: &str,
-    args: &[&str],
-    envs: &[(&str, &str)],
-) -> std::process::Child {
+/// Opens the three descriptors a spawned child inherits as its standard streams, all on
+/// `slave_path`, with a real window size set on the first. Factored out of
+/// [`spawn_attached_to_pty_with`] so [`spawn_shell_on_pty`] can wire a different binary onto
+/// the same slave without duplicating the `ioctl` call.
+fn open_pty_slave_streams(slave_path: &str) -> (File, File, File) {
     let stdin = OpenOptions::new()
         .read(true)
         .write(true)
@@ -161,6 +182,17 @@ fn spawn_attached_to_pty_with(
     );
     let stdout = stdin.try_clone().expect("clone pty slave for stdout");
     let stderr = stdin.try_clone().expect("clone pty slave for stderr");
+    (stdin, stdout, stderr)
+}
+
+/// [`spawn_attached_to_pty`], generalised to an argv of any length plus extra environment
+/// variables, for a caller that needs `--theme <name>` rather than a single bare flag.
+fn spawn_attached_to_pty_with(
+    slave_path: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Child {
+    let (stdin, stdout, stderr) = open_pty_slave_streams(slave_path);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_repon"));
     command
@@ -187,6 +219,21 @@ fn spawn_attached_to_pty_with(
         .unwrap_or_else(|error| panic!("spawn repon {args:?}: {error}"))
 }
 
+/// Spawns `sh -c script` directly on the pty's slave, the same three-stream wiring
+/// [`spawn_attached_to_pty_with`] gives `repon`. Used only by the fast-exit regression test
+/// below, which needs a minimal child with no dependency on any of `repon`'s own exit paths.
+fn spawn_shell_on_pty(slave_path: &str, script: &str) -> std::process::Child {
+    let (stdin, stdout, stderr) = open_pty_slave_streams(slave_path);
+    Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn sh -c {script:?}: {error}"))
+}
+
 /// The ANSI bytes crossterm itself would emit for `command`, so an expectation here comes
 /// from crossterm's own encoding rather than a hand-copied escape sequence that could
 /// silently drift from what a future crossterm version writes.
@@ -202,35 +249,102 @@ fn wifstopped(status: c_int) -> bool {
     (status & 0xff) == 0x7f
 }
 
+/// Why a pty drain's reader thread stopped reading from the master.
+///
+/// Both platforms agree only that a slave-less pty read must stop the drain; they report the
+/// same condition through different results, so this names both explicitly rather than folding
+/// one into the other. Do not collapse `Eof` and `EofViaEio` back into one variant: that would
+/// erase the platform difference this comment exists to record.
+#[derive(Debug)]
+enum DrainEnd {
+    /// The master reported `Ok(0)`: what macOS returns once every slave descriptor, including
+    /// this process's own held one, has closed.
+    Eof,
+    /// The master's read failed with `EIO`: what Linux returns for the same fully-closed
+    /// condition `Eof` reports on macOS, not a fault distinct from it.
+    EofViaEio,
+    /// The read syscall failed for any other reason, which is a real failure on both platforms.
+    Err(std::io::Error),
+}
+
+/// Classifies one `read` result from a pty master: more bytes to accumulate, or the
+/// [`DrainEnd`] the drain loop should stop with. A free function, rather than inline in the
+/// loop, so the classification itself is unit-testable without a real pty.
+fn classify_pty_read(result: std::io::Result<usize>) -> Result<usize, DrainEnd> {
+    match result {
+        Ok(0) => Err(DrainEnd::Eof),
+        Ok(n) => Ok(n),
+        Err(error) if error.raw_os_error() == Some(EIO) => Err(DrainEnd::EofViaEio),
+        Err(error) => Err(DrainEnd::Err(error)),
+    }
+}
+
+/// Starts a thread draining `master` to completion, returning a `JoinHandle` and a channel
+/// that reports the bytes read and why the loop stopped.
+///
+/// The caller must open a parent-held slave ([`open_parent_held_slave`]) before spawning the
+/// child this drains, and must not drop it until the child has been reaped: while it stays
+/// open, the pty by construction still has a slave, so neither `Ok(0)` nor `EIO` can occur here
+/// and this thread simply blocks waiting for more bytes. Only after the caller drops it does a
+/// read here report a real end of file, as `Eof` or `EofViaEio` depending on the platform.
+fn spawn_pty_reader(
+    mut master: File,
+) -> (
+    std::thread::JoinHandle<()>,
+    mpsc::Receiver<(Vec<u8>, DrainEnd)>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let end = loop {
+            let mut chunk = [0u8; 4096];
+            match classify_pty_read(master.read(&mut chunk)) {
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+                Err(end) => break end,
+            }
+        };
+        let _ = tx.send((output, end));
+    });
+    (reader, rx)
+}
+
+/// Waits for a [`spawn_pty_reader`] drain to report back, joins its thread, and asserts it
+/// stopped on a real end of file (`Eof` or `EofViaEio`, both legitimate) rather than an error
+/// masking lost output. `what` names the drain, so a hang or a masked error names which one.
+fn expect_eof(
+    reader: std::thread::JoinHandle<()>,
+    rx: mpsc::Receiver<(Vec<u8>, DrainEnd)>,
+    what: &str,
+) -> String {
+    let (output, end) = rx
+        .recv_timeout(BACKSTOP)
+        .unwrap_or_else(|_| panic!("{what}: pty reader thread did not report back"));
+    let _ = reader.join();
+    match end {
+        DrainEnd::Eof | DrainEnd::EofViaEio => String::from_utf8_lossy(&output).into_owned(),
+        DrainEnd::Err(error) => panic!(
+            "{what}: pty read stopped on an error rather than end of file ({error}); output \
+             captured before that: {:?}",
+            String::from_utf8_lossy(&output)
+        ),
+    }
+}
+
 /// Spawns `repon` with `args` and `envs` over a real pty, drains the pty concurrently with
 /// the child (the same reason every test above does its own draining), waits for it to exit,
 /// and returns the exit status alongside everything the child wrote. Shared by the handoff tests
 /// below, which only care about the final output and exit code rather than an intermediate
 /// state like `suspend_restores_the_terminal_before_the_process_actually_stops` does.
 fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
-    let (mut master, slave_path) = open_pty();
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let mut child = spawn_attached_to_pty_with(&slave_path, args, envs);
 
-    let (output_tx, output_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let _ = output_tx.send(output);
-    });
-
+    let (reader, rx) = spawn_pty_reader(master);
     let status = wait_for_exit(&mut child, &format!("repon {args:?}"));
-
-    let output = output_rx
-        .recv_timeout(BACKSTOP)
-        .expect("pty reader thread did not report back after the child exited");
-    let _ = reader.join();
-    (status, String::from_utf8_lossy(&output).into_owned())
+    drop(held_slave);
+    let output = expect_eof(reader, rx, &format!("repon {args:?}"));
+    (status, output)
 }
 
 /// Every byte offset at which `needle` starts in `haystack`, in order: how the handoff tests
@@ -243,36 +357,25 @@ fn indices_of(haystack: &str, needle: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Reported intermittently red under load and not reproduced, in roughly 1400 runs of this
-/// test alone and 156 of the whole file at up to twelve concurrent copies. Four causes were
-/// ruled out with evidence, so the next investigator can start past them: the assertions hold
-/// no raw descriptor or pid a concurrent actor could reuse; the seven ANSI sequences searched
-/// for are pairwise non-overlapping; the two waits below are not tight, the whole file
-/// finishing in 1.5s worst case under heavier load than CI applies, and both now draw on
-/// `liveness::BACKSTOP` rather than a five-second budget of their own; and the reader's `Err`
-/// arm masks nothing, every one of 539 observed drains ending on `Ok(0)`.
-///
-/// If it recurs, keep the failing assertion's message and the full captured `output` rather
-/// than rerunning past it; none of the above explains it, so that capture is the next lead.
+/// Historically flaky under load, in roughly 1400 runs of this test alone and 156 of the whole
+/// file at up to twelve concurrent copies, always with the captured `output` missing bytes the
+/// child must have written. The cause was the harness rather than this test:
+/// `spawn_attached_to_pty_with` moved every slave descriptor into the child, so once the child
+/// exited the pty had no slave open at all, and a macOS read of the master in that state fails
+/// with `EIO` whether or not bytes are still buffered. The "539 observed drains ending on
+/// `Ok(0)`" once recorded here were the races the reader thread happened to win; the ones it
+/// lost were this flake. Fixed by having the parent hold its own slave descriptor open for the
+/// lifetime of the drain ([`open_parent_held_slave`]), dropped only after the child is reaped.
 #[test]
 fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_panics() {
-    let (mut master, slave_path) = open_pty();
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let mut child = spawn_attached_to_pty(&slave_path, "--panic-after-tui-enter");
 
-    // Drains the pty concurrently with the child rather than after `wait()`, which would
-    // race the master's end-of-file against bytes still buffered when every slave fd closes.
-    let (output_tx, output_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let _ = output_tx.send(output);
-    });
+    // Drains the pty concurrently with the child rather than after `wait()`; `held_slave`
+    // above is what keeps that from racing the master's end-of-file against bytes still
+    // buffered when the child's own slave descriptors close.
+    let (reader, rx) = spawn_pty_reader(master);
 
     let status = wait_for_exit(&mut child, "repon --panic-after-tui-enter");
     assert_eq!(
@@ -281,13 +384,8 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         "the panic hook exits 1 once it has restored the terminal"
     );
 
-    // The exited child has closed its slave descriptors, so the reader reports back almost
-    // immediately; this timeout is a final safety net, not the expected path.
-    let output = output_rx
-        .recv_timeout(BACKSTOP)
-        .expect("pty reader thread did not report back after the child exited");
-    let _ = reader.join();
-    let output = String::from_utf8_lossy(&output);
+    drop(held_slave);
+    let output = expect_eof(reader, rx, "repon --panic-after-tui-enter");
 
     let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
     let enable_paste = ansi(crossterm::event::EnableBracketedPaste);
@@ -343,24 +441,14 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
 /// sequence already reached the pty by the time it does.
 #[test]
 fn suspend_restores_the_terminal_before_the_process_actually_stops() {
-    let (mut master, slave_path) = open_pty();
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let mut child = spawn_attached_to_pty(&slave_path, "--suspend-after-tui-enter");
     let pid = child.id() as c_int;
 
     // Drains the pty concurrently, the same reason the panic test above does: reading only
     // after the child stops would race the pty buffer against this thread's own timeout.
-    let (output_tx, output_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let _ = output_tx.send(output);
-    });
+    let (reader, rx) = spawn_pty_reader(master);
 
     // `waitpid` blocks, so it runs on its own thread and reports back over a channel, giving
     // this test a bounded wait instead of a risk of hanging on a child that never stops.
@@ -391,11 +479,8 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let output = output_rx
-        .recv_timeout(BACKSTOP)
-        .expect("pty reader thread did not report back after the child was killed");
-    let _ = reader.join();
-    let output = String::from_utf8_lossy(&output);
+    drop(held_slave);
+    let output = expect_eof(reader, rx, "repon --suspend-after-tui-enter");
 
     let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
     assert!(
@@ -415,7 +500,8 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
 /// would leave `EnterAlternateScreen` in the output that this test asserts never appears.
 #[test]
 fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
-    let (mut master, slave_path) = open_pty();
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
     let mut child = spawn_attached_to_pty_with(
         &slave_path,
@@ -430,27 +516,13 @@ fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
     );
 
     // Drains the pty concurrently, the same reason the two tests above do.
-    let (output_tx, output_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let _ = output_tx.send(output);
-    });
+    let (reader, rx) = spawn_pty_reader(master);
 
     let status = wait_for_exit(&mut child, "repon --theme does-not-exist-anywhere");
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
-    let output = output_rx
-        .recv_timeout(BACKSTOP)
-        .expect("pty reader thread did not report back after the child exited");
-    let _ = reader.join();
-    let output = String::from_utf8_lossy(&output);
+    drop(held_slave);
+    let output = expect_eof(reader, rx, "repon --theme does-not-exist-anywhere");
 
     assert!(
         output.contains("does-not-exist-anywhere"),
@@ -475,7 +547,8 @@ fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
 /// reaches the terminal at all, rather than merely that the process died.
 #[test]
 fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and_the_key() {
-    let (mut master, slave_path) = open_pty();
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
     std::fs::write(
         config_dir.path().join("config.toml"),
@@ -495,27 +568,13 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
     );
 
     // Drains the pty concurrently, the same reason the tests above do.
-    let (output_tx, output_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let _ = output_tx.send(output);
-    });
+    let (reader, rx) = spawn_pty_reader(master);
 
     let status = wait_for_exit(&mut child, "repon with a colliding [keys] block");
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
-    let output = output_rx
-        .recv_timeout(BACKSTOP)
-        .expect("pty reader thread did not report back after the child exited");
-    let _ = reader.join();
-    let output = String::from_utf8_lossy(&output);
+    drop(held_slave);
+    let output = expect_eof(reader, rx, "repon with a colliding [keys] block");
 
     assert!(
         output.contains("anchor_range"),
@@ -627,13 +686,17 @@ fn an_unmatched_repon_set_exits_before_the_terminal_is_claimed_naming_the_variab
 /// naming the flag and the path given. `REPON_CONFIG` is pointed at a real, empty directory so
 /// this cannot pass because of an unrelated `REPON_CONFIG` failure.
 ///
-/// Reported red on macOS under load, not reproduced here in several hundred runs (isolated
-/// and alongside its thirteen siblings) under sustained CPU contention. Two causes were ruled
-/// out with evidence: `check_named_paths_exist` runs inside `App::new`, whose `?` returns
-/// before `Tui::new`/`enter` are ever reached, so nothing here races a background thread the
-/// way the discovery watcher does; and color-eyre 0.6.5 carries no line-wrapping dependency,
-/// confirmed by running the failing case directly and finding its ~250-character message on
-/// one unbroken line. If it recurs, keep the captured `output` rather than rerunning past it.
+/// Historically flaky on macOS under load: the captured `output` came back empty even though
+/// the exit-code assertion above it passed, so the child exited 1 correctly and the harness
+/// read nothing back. This is the fastest test in the file (it fails inside `App::new`, before
+/// `Tui::new`/`enter` are ever reached), so the window between spawn and exit is the narrowest
+/// of any test here, and the harness lost the race most often on this one. The cause was
+/// `spawn_attached_to_pty_with` moving every slave descriptor into the child: once it exited,
+/// the pty had no slave open at all, and a macOS read of the master in that state fails with
+/// `EIO` whether or not bytes are still buffered, discarding whatever the child wrote if the
+/// reader had not already drained it. Fixed by having the parent hold its own slave descriptor
+/// open for the lifetime of the drain, dropped only after the child is reaped; see
+/// `run_over_pty` and [`open_parent_held_slave`].
 #[test]
 fn a_missing_config_flag_file_exits_before_the_terminal_is_claimed_naming_the_flag_and_path() {
     let repon_config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
@@ -1014,6 +1077,7 @@ fn a_launcher_that_cannot_be_spawned_still_reclaims_the_terminal() {
 #[test]
 fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claimed() {
     let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
     let mut writer = master.try_clone().expect("clone pty master for writing");
     let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
     std::fs::write(
@@ -1043,17 +1107,19 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
     // render paints anything, and `q` wins the race and quits the app before it ever draws
     // the slot this test means to inspect.
     let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
-    let reader = std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || -> DrainEnd {
         let mut master = master;
         loop {
             let mut chunk = [0u8; 4096];
-            match master.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+            match classify_pty_read(master.read(&mut chunk)) {
                 Ok(n) => {
-                    if chunk_tx.send(chunk[..n].to_vec()).is_err() {
-                        break;
-                    }
+                    // Nothing drops `chunk_rx` before this loop stops on its own, so a failed
+                    // send would mean a bug in this test rather than a real drain outcome.
+                    chunk_tx
+                        .send(chunk[..n].to_vec())
+                        .expect("chunk receiver dropped before the reader stopped");
                 }
+                Err(end) => break end,
             }
         }
     });
@@ -1108,13 +1174,23 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
             )
         },
     );
+    // The wait above only returns once `try_wait` has seen the child exit, so dropping the
+    // held slave now is what lets the reader's next read report a real end of file instead of
+    // blocking on a pty that still has this descriptor open.
+    drop(held_slave);
+
     // Drain whatever the reader thread already queued between the last check above and the
     // child actually exiting, and whatever it collects before the pty finally closes.
     let mut output = output.into_inner();
     while let Ok(chunk) = chunk_rx.recv_timeout(DRAIN_POLL) {
         output.extend_from_slice(&chunk);
     }
-    let _ = reader.join();
+    let end = reader.join().expect("pty reader thread panicked");
+    assert!(
+        matches!(end, DrainEnd::Eof | DrainEnd::EofViaEio),
+        "expected the pty drain to end on a real end of file, got {end:?}; output so far: {:?}",
+        String::from_utf8_lossy(&output)
+    );
     let output = String::from_utf8_lossy(&output).into_owned();
 
     assert!(
@@ -1140,5 +1216,60 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
          offset {bare_newline_at:?} past the claim; ratatui's own rendering never emits one, \
          so this is the signature a raw println!/eprintln! reaching the terminal would leave: \
          {after_claim:?}"
+    );
+}
+
+/// Regression test for the parent-held-slave fix every drain above now relies on: a child that
+/// writes and exits immediately must not lose its own output. This waits for the child to exit
+/// and be reaped *before* the reader thread even starts, which guarantees every descriptor the
+/// child held is already closed by the time anything reads the master, rather than leaving that
+/// to scheduling luck. Against a harness with no parent-held slave this failed on every run, not
+/// only under load: the deterministic reproduction this bug's own flakiness never gave directly.
+#[test]
+fn a_child_that_writes_and_exits_immediately_has_its_output_captured_in_full() {
+    const MARKER: &str = "FAST_EXIT_MARKER";
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
+    let mut child = spawn_shell_on_pty(&slave_path, &format!("printf {MARKER}"));
+
+    wait_for_exit(&mut child, "sh -c printf");
+
+    // Only now does anything read the master: every descriptor the child held is already
+    // closed, so without `held_slave` still open this read would find the pty already
+    // slave-less and fail with `EIO` before it ever saw a byte.
+    let (reader, rx) = spawn_pty_reader(master);
+    drop(held_slave);
+    let output = expect_eof(reader, rx, "sh -c printf");
+
+    assert!(
+        output.contains(MARKER),
+        "expected the fast-exiting child's full output, got: {output:?}"
+    );
+}
+
+/// Locks in the classification [`spawn_pty_reader`] depends on: `EIO` is what Linux reports for
+/// the same fully-closed pty condition macOS reports as `Ok(0)`, so it must classify as a
+/// legitimate end rather than a failure that would mask a fast-exiting child's captured output.
+/// Exercises the pure classifier directly, since macOS itself never produces a real `EIO` here
+/// to drive this through the pty tests above.
+#[test]
+fn classify_pty_read_treats_eio_as_a_legitimate_end_not_a_failure() {
+    let result = Err(std::io::Error::from_raw_os_error(EIO));
+    assert!(
+        matches!(classify_pty_read(result), Err(DrainEnd::EofViaEio)),
+        "EIO must classify as EofViaEio, the Linux-shaped half of a legitimate end"
+    );
+}
+
+/// The other half of the same distinction: an error that is not `EIO` must still classify as a
+/// failure, so `DrainEnd::Err` keeps naming a real problem rather than folding every error into
+/// "the pty closed".
+#[test]
+fn classify_pty_read_still_treats_a_non_eio_error_as_a_failure() {
+    const EBADF: i32 = 9; // POSIX-standard on both macOS and Linux; deliberately not EIO.
+    let result = Err(std::io::Error::from_raw_os_error(EBADF));
+    assert!(
+        matches!(classify_pty_read(result), Err(DrainEnd::Err(_))),
+        "a non-EIO error must still classify as a failure"
     );
 }
