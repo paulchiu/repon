@@ -197,23 +197,60 @@ fn action_keyword(receipt: Option<&ActionReceipt>) -> &'static str {
     }
 }
 
-/// One of the vocabulary's twelve keys, `docs/spec/filter.md#the-vocabulary`, `Name` standing
-/// in for both a bare word and an explicit `name:`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Key {
-    Name,
-    Branch,
-    Path,
-    Kind,
-    Head,
-    State,
-    Sync,
-    Base,
-    Is,
-    Row,
-    Action,
-    Presence,
-    Unknown,
+/// Counts the identifiers passed to it, sizing [`Key::ALL`] without a hand-typed number that
+/// could drift from the variant list it is generated from. Mirrors `repon::theme`'s own
+/// `count_idents!`, kept local since this crate does not depend on that one.
+macro_rules! count_idents {
+    () => { 0usize };
+    ($head:ident $(, $tail:ident)* $(,)?) => {
+        1usize + count_idents!($($tail),*)
+    };
+}
+
+/// Declares `Key` together with `Key::ALL`, generated from the one variant list below so a
+/// key added to the enum necessarily grows `ALL` to match: nothing else names the variant
+/// list for the two to drift apart from. Backs [`vocabulary`], which is what lets the Filter
+/// line's completion list offer exactly the keys this parser accepts rather than a second,
+/// hand-typed list of its own.
+macro_rules! enum_with_all {
+    (
+        $(#[$meta:meta])*
+        enum $name:ident { $($variant:ident),+ $(,)? }
+    ) => {
+        $(#[$meta])*
+        enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            /// Every variant, generated with the enum so a variant cannot be added without
+            /// this array growing to match.
+            const ALL: [$name; count_idents!($($variant),+)] = [
+                $($name::$variant),+
+            ];
+        }
+    };
+}
+
+enum_with_all! {
+    /// One of the vocabulary's twelve keys, `docs/spec/filter.md#the-vocabulary`, `Name`
+    /// standing in for both a bare word and an explicit `name:`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Key {
+        Name,
+        Branch,
+        Path,
+        Kind,
+        Head,
+        State,
+        Sync,
+        Base,
+        Is,
+        Row,
+        Action,
+        Presence,
+        Unknown,
+    }
 }
 
 impl Key {
@@ -237,6 +274,71 @@ impl Key {
             _ => None,
         }
     }
+
+    /// This key's own text, the inverse of [`Key::parse`]. Exhaustive over [`Key`], so a
+    /// variant added to the enum fails to compile here rather than reaching
+    /// [`vocabulary`] under no name at all.
+    fn text(self) -> &'static str {
+        match self {
+            Key::Name => "name",
+            Key::Branch => "branch",
+            Key::Path => "path",
+            Key::Kind => "kind",
+            Key::Head => "head",
+            Key::State => "state",
+            Key::Sync => "sync",
+            Key::Base => "base",
+            Key::Is => "is",
+            Key::Row => "row",
+            Key::Action => "action",
+            Key::Presence => "presence",
+            Key::Unknown => "unknown",
+        }
+    }
+
+    /// This key's own fixed value vocabulary, `docs/spec/filter.md`'s vocabulary table:
+    /// empty for the three free-text keys (`name`, `branch`, `path`), whose value is
+    /// arbitrary text rather than a closed set. Exhaustive over [`Key`] for the same reason
+    /// [`Key::text`] is.
+    fn values(self) -> &'static [&'static str] {
+        match self {
+            Key::Name | Key::Branch | Key::Path => &[],
+            Key::Kind => &["repo", "worktree", "submodule"],
+            Key::Head => &["branch", "detached", "unborn"],
+            Key::State => &["merged", "gone", "local-only", "active"],
+            Key::Sync => &["ahead", "behind", "even", "no-upstream", "no-remote"],
+            Key::Base => &["behind", "even"],
+            Key::Is => &["dirty", "clean", "excluded"],
+            Key::Row => &["fresh", "stale", "unknown", "loading", "failed"],
+            Key::Action => &["ok", "failed", "refused", "cancelled", "none"],
+            Key::Presence => &["present", "vanished"],
+            Key::Unknown => &["timed-out", "no-default-branch"],
+        }
+    }
+}
+
+/// One key's own completion vocabulary, for the Filter line's completion list
+/// ([filter.md](https://github.com/paulchiu/repon/blob/main/docs/spec/filter.md#completion)):
+/// its own text, and the fixed values `docs/spec/filter.md`'s vocabulary table gives it,
+/// empty for the three free-text keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyVocabulary {
+    pub key: &'static str,
+    pub values: &'static [&'static str],
+}
+
+/// The Filter's whole vocabulary, one entry per key in `docs/spec/filter.md`'s own table
+/// order, read off the parser's own closed key set so a key it accepts can never be missing
+/// from it and a key it does not accept can never be offered: this is the one place a
+/// consumer reaches that set from, rather than restating it.
+pub fn vocabulary() -> Vec<KeyVocabulary> {
+    Key::ALL
+        .iter()
+        .map(|&key| KeyVocabulary {
+            key: key.text(),
+            values: key.values(),
+        })
+        .collect()
 }
 
 /// One parsed term: an optional leading negation, its key, and one or more comma-split
@@ -456,6 +558,7 @@ impl Applicability {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -463,6 +566,76 @@ mod tests {
     use crate::cell::{Generation, Timestamp};
     use crate::entity::{AheadBehind, DirtyCounts, EntityKey, OwnWork, StepResult};
     use crate::git::ProbeError;
+
+    /// Reads `docs/spec/filter.md`'s own "## The vocabulary" table at test time: one entry
+    /// per key, its values in the table's own order, empty for a `<text>` placeholder rather
+    /// than a closed set. The `<word>` row (no colon) is skipped, since `name:<text>` already
+    /// covers `Key::Name`.
+    fn parse_vocabulary_table(spec: &str) -> HashMap<String, Vec<String>> {
+        let mut documented = HashMap::new();
+        let (_, after_heading) = spec
+            .split_once("## The vocabulary")
+            .expect("filter.md has a \"## The vocabulary\" heading");
+        let (section, _) = after_heading
+            .split_once("\n## ")
+            .expect("\"## The vocabulary\" is followed by another heading");
+        for line in section.lines() {
+            let line = line.trim();
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let mut ticks = line.match_indices('`');
+            let Some((start, _)) = ticks.next() else {
+                continue;
+            };
+            let Some((end, _)) = ticks.next() else {
+                continue;
+            };
+            let term = &line[start + 1..end];
+            let Some((key, value_part)) = term.split_once(':') else {
+                continue;
+            };
+            let values = if value_part.contains('<') {
+                Vec::new()
+            } else {
+                value_part
+                    .split("\\|")
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect()
+            };
+            documented.insert(key.to_string(), values);
+        }
+        documented
+    }
+
+    /// Pins [`vocabulary`] to `docs/spec/filter.md`'s own table in both directions: a key or
+    /// a value the code offers and the document does not name fails here, as does one the
+    /// document names and the code does not offer. This is what the Filter line's completion
+    /// list reads its vocabulary from, so a drift here is a drift the user sees on screen.
+    #[test]
+    fn vocabulary_matches_filter_mds_own_table_in_both_directions() {
+        let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/filter.md");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()));
+        let mut documented = parse_vocabulary_table(&spec);
+
+        for entry in vocabulary() {
+            let expected = documented.remove(entry.key).unwrap_or_else(|| {
+                panic!("filter.md's vocabulary table has no `{}` row", entry.key)
+            });
+            let actual: Vec<String> = entry.values.iter().map(|value| value.to_string()).collect();
+            assert_eq!(
+                actual, expected,
+                "`{}`'s own values must match filter.md's own table",
+                entry.key
+            );
+        }
+        assert!(
+            documented.is_empty(),
+            "filter.md's vocabulary table names keys `vocabulary()` does not: {documented:?}"
+        );
+    }
 
     fn entity(name: &str, kind: Kind) -> EntityState {
         EntityState::new(

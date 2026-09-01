@@ -17,7 +17,7 @@ use crate::{
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
-    filter_line::FilterLine,
+    filter_line::{self, FilterLine},
     footer,
     glyphs::GlyphSet,
     header::HeaderContent,
@@ -1443,11 +1443,18 @@ impl App {
     /// `Context::Input` like both palettes. `Apply` (Enter) commits the live buffer into
     /// `self.filter` and closes the line, which is what returns focus to the list
     /// ([filter.md](../../../docs/spec/filter.md): "Enter commits it and returns focus to the
-    /// list"). `Cancel` (Esc) abandons the edit, closing the line with `self.filter`
-    /// untouched, so it still reads whatever was last committed. `AcceptCompletion`,
-    /// `OpenInEditor`, `PreviousEntry` and `NextEntry` are inert: [`crate::filter_line`]'s own
-    /// doc comment records why. The trailing `unreachable!` arm is the same proof-made-loud
-    /// shape [`Self::handle_action_palette_key`] already uses for `Context::Input`.
+    /// list"), never accepting a completion even with a highlight active: the line's own
+    /// completion list plays no part in this arm at all. `Cancel` (Esc) abandons the edit,
+    /// closing the line with `self.filter` untouched, so it still reads whatever was last
+    /// committed; the completion list is not dismissible on its own
+    /// ([filter.md](../../../docs/spec/filter.md#completion)), so `Cancel` never gets a
+    /// second, completion-only arm here, only this one closing the whole line. `AcceptCompletion`
+    /// (`Tab`) and `PreviousEntry`/`NextEntry` (`Ctrl+K`/`Ctrl+J`, `Up`/`Down`) forward
+    /// straight to [`crate::filter_line::FilterLine`], which owns the completion list itself.
+    /// `OpenInEditor` stays inert: filter.md never routes the Filter line through `$EDITOR`,
+    /// unlike the Action palette's own ad hoc command field. The trailing `unreachable!` arm
+    /// is the same proof-made-loud shape [`Self::handle_action_palette_key`] already uses for
+    /// `Context::Input`.
     fn handle_filter_line_key(&mut self, key: KeyEvent) {
         match self.bindings.dispatch(Context::Input, key) {
             Some(Action::Cancel) => self.filter_line = None,
@@ -1477,12 +1484,22 @@ impl App {
                     line.clear_line();
                 }
             }
-            Some(
-                Action::AcceptCompletion
-                | Action::OpenInEditor
-                | Action::PreviousEntry
-                | Action::NextEntry,
-            ) => {}
+            Some(Action::PreviousEntry) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.move_completion_highlight(-1);
+                }
+            }
+            Some(Action::NextEntry) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.move_completion_highlight(1);
+                }
+            }
+            Some(Action::AcceptCompletion) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.accept_highlighted_completion();
+                }
+            }
+            Some(Action::OpenInEditor) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or Text, \
@@ -2428,6 +2445,25 @@ impl App {
         }
         if let Some(line) = &self.filter_line {
             line.draw(frame, filter_area, &self.theme);
+            // Overlays the bottom of the list area, anchored to the Filter line and growing
+            // upward, capped at `COMPLETION_MAX_ROWS`
+            // ([filter.md](../../../docs/spec/filter.md#screen-placement)); `content_area`
+            // itself was already sized above with no regard to this, which is what "never
+            // resizes the list" means here.
+            let completions = line.completions();
+            let overlay_height = completions
+                .len()
+                .min(filter_line::COMPLETION_MAX_ROWS)
+                .min(content_area.height as usize) as u16;
+            if overlay_height > 0 {
+                let overlay_area = Rect {
+                    x: content_area.x,
+                    y: content_area.y + content_area.height - overlay_height,
+                    width: content_area.width,
+                    height: overlay_height,
+                };
+                line.draw_completions(frame, overlay_area, &self.theme);
+            }
         }
         footer::draw(
             frame,
@@ -9382,6 +9418,160 @@ mod tests {
         assert!(
             !app.filter.is_active(),
             "a second Esc, with nothing left to unwind first, must clear the committed Filter"
+        );
+    }
+
+    // =========================================================================================
+    // The Filter line's completion list: `docs/spec/filter.md#completion` and
+    // `#screen-placement`. `crate::filter_line`'s own tests exercise the trigger table,
+    // accepting, and moving the highlight directly; these drive the same behaviour through
+    // `App::handle_key_event`, the seam a person's keystrokes actually reach.
+    // =========================================================================================
+
+    /// `Enter` always commits the Filter and never accepts a completion, even with the
+    /// highlight moved off its default row
+    /// ([filter.md](../../../docs/spec/filter.md#completion): "Enter: Always commit the
+    /// Filter, never accept a completion").
+    #[test]
+    fn enter_commits_the_filter_verbatim_even_with_a_completion_highlight_active() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the Filter line onto an empty term, offering every key");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the completion highlight off its first row");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the Filter");
+
+        assert!(
+            app.filter_line.is_none(),
+            "Enter must close the Filter line"
+        );
+        assert_eq!(
+            app.filter.as_str(),
+            "",
+            "Enter must commit the line's own typed text verbatim, never a completion the \
+             highlight was sitting on"
+        );
+    }
+
+    /// `Tab` reaches the Filter line's own completion list through the same dispatch every
+    /// other keystroke here goes through, `crate::filter_line`'s own tests already proving
+    /// what gets inserted; this pins only that the wiring reaches it at all.
+    #[test]
+    fn tab_accepts_a_completion_through_the_real_key_dispatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the Filter line");
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("accept the highlighted key");
+
+        let line = app
+            .filter_line
+            .as_ref()
+            .expect("the Filter line stays open");
+        assert_eq!(line.live_filter().as_str(), "name:");
+    }
+
+    /// [filter.md](../../../docs/spec/filter.md#screen-placement): "It never resizes the
+    /// list." `App::list_viewport_rows` is exactly what the standing cursor's own viewport
+    /// math reads ([`App::follow_cursor`]), computed from `self.frame_size` and whether
+    /// `self.filter_line` is open at all; it never reads the completion list's own length, so
+    /// this must hold whether the term under the cursor offers thirteen keys or none.
+    #[test]
+    fn the_completion_overlay_never_changes_the_lists_own_viewport_row_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(100, 20);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open onto an empty term: every key, thirteen entries, well past the cap");
+        let rows_with_the_full_key_list_showing = app.list_viewport_rows();
+
+        // A bare word never triggers completion at all (`filter.md`'s own note), so this
+        // term offers nothing while still being a well-formed, harmless Filter.
+        for c in "somebogusname".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a bare word");
+        }
+        assert!(
+            app.filter_line
+                .as_ref()
+                .expect("still open")
+                .completions()
+                .is_empty(),
+            "fixture sanity: a bare word must offer nothing"
+        );
+        let rows_with_nothing_showing = app.list_viewport_rows();
+
+        assert_eq!(
+            rows_with_the_full_key_list_showing, rows_with_nothing_showing,
+            "the list's own viewport row count must not depend on how many completions are \
+             on screen"
+        );
+    }
+
+    /// The overlay paints directly onto `content_area`'s own bottom rows, immediately above
+    /// the Filter line, capped at eight regardless of how many keys there are to offer
+    /// ([filter.md](../../../docs/spec/filter.md#screen-placement)): thirteen keys is well
+    /// past the cap, so the ninth key up from the Filter line must not appear at all.
+    #[test]
+    fn the_overlay_caps_at_eight_rows_anchored_directly_above_the_filter_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(100, 24);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open onto an empty term");
+
+        let (width, height) = (app.frame_size.width, app.frame_size.height);
+        let buf = render_app_frame(&mut app, width, height);
+        let row_text = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // Row layout, bottom up: footer (last row), the Filter line (one above it), then the
+        // overlay's own eight rows in vocabulary order (the highlight defaults to row 0,
+        // "name:", the topmost of the eight), then whatever the list itself draws.
+        let footer_row = app.frame_size.height - 1;
+        let filter_row = footer_row - 1;
+        let keys = repon_core::vocabulary();
+        assert_eq!(
+            keys.len(),
+            13,
+            "fixture sanity: more keys than the eight-row cap"
+        );
+
+        for (index, entry) in keys.iter().take(8).enumerate() {
+            let depth = 8 - index as u16;
+            let marker = if index == 0 { "> " } else { "  " };
+            assert_eq!(
+                row_text(filter_row - depth),
+                format!("{marker}{}:", entry.key),
+                "row {depth} above the Filter line"
+            );
+        }
+        let ninth_key = &keys[8].key;
+        let row_past_the_cap = row_text(filter_row - 9);
+        assert!(
+            !row_past_the_cap.contains(ninth_key),
+            "the cap is eight rows; the ninth key ({ninth_key}) must not reach the screen, \
+             got {row_past_the_cap:?}"
         );
     }
 
