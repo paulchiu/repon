@@ -32,6 +32,11 @@ fmt-check:
 # Lint with clippy, warnings are errors
 lint:
     cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+    # The run above uses default features, so the `fetch` module is only ever compiled by
+    # `just test`'s own fetch pass, as a test target, where a field the production path
+    # ignores still reads as live. Without this, dead code behind the feature reaches a
+    # user's `cargo install --features fetch` as a warning CI never saw.
+    cargo clippy --workspace --all-targets --locked --no-deps --features fetch -- -D warnings
 
 # Fail on a broken intra-doc link or a malformed doc comment
 docs:
