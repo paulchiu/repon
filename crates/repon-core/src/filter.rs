@@ -5,6 +5,8 @@
 //! for why. Deciding when to apply one, if ever, stays with the consumer
 //! ([`crate`]'s own doc comment); this module only parses a string and answers `matches`.
 
+use std::ops::Range;
+
 use crate::cell::{Cell, Settled, Unknown};
 use crate::entity::Presence;
 use crate::entity::{
@@ -341,18 +343,57 @@ pub fn vocabulary() -> Vec<KeyVocabulary> {
         .collect()
 }
 
-/// One parsed term: an optional leading negation, its key, and one or more comma-split
-/// values that OR together (`docs/spec/filter.md`'s grammar, steps 1 to 3).
+/// One parsed term: an optional leading negation, its key, one or more comma-split values
+/// that OR together (`docs/spec/filter.md`'s grammar, steps 1 to 3), and its own byte range
+/// in the Filter's raw text, which is what lets [`Filter::unrecognised_ranges`] point at the
+/// term it names rather than a consumer re-deriving it by scanning the text a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     negated: bool,
     key: Key,
     values: Vec<String>,
+    range: Range<usize>,
 }
 
-/// Parses one whitespace-delimited term. Total: every input produces a `Term`, never an
-/// error, per the grammar's own "no fifth failure grade".
-fn parse_term(raw: &str) -> Term {
+impl Term {
+    /// Whether this term's value(s) sit inside its own key's vocabulary
+    /// (`docs/spec/filter.md`'s advisory: `?` "when any term is unrecognised"). Always true
+    /// for the three free-text keys, whose value is arbitrary, and for a key reinterpreted
+    /// as `Name` because the text before the colon was not one of the twelve
+    /// (`kimd:repo`): the grammar calls that a legitimate name term, not an error
+    /// (`docs/spec/filter.md`'s own "none of them is an error"). False when a comma-split
+    /// alternative falls outside a closed-vocabulary key's own value list, which is what an
+    /// unrecognised value (`is:banana`) and an empty one (`is:`) both are.
+    fn is_recognised(&self) -> bool {
+        let vocabulary = self.key.values();
+        vocabulary.is_empty()
+            || self
+                .values
+                .iter()
+                .all(|value| vocabulary.contains(&value.as_str()))
+    }
+}
+
+/// Every term in `input`, paired with its own byte range, so a term found unrecognised can
+/// be pointed at in the text it came from. `str::split_whitespace` is `edit_buffer`'s own
+/// blessed whitespace search (`edit_buffer::tests::the_workspace_holds_one_whitespace_search`,
+/// this crate's own doc comment cannot reach `repon`'s to route through it directly), so this
+/// derives each term's start from its slice's own address in `input` rather than scanning for
+/// separators a second time: always a valid char boundary, since the slice came from `input`.
+fn split_terms(input: &str) -> Vec<(Range<usize>, &str)> {
+    let base = input.as_ptr() as usize;
+    input
+        .split_whitespace()
+        .map(|term| {
+            let start = term.as_ptr() as usize - base;
+            (start..start + term.len(), term)
+        })
+        .collect()
+}
+
+/// Parses one whitespace-delimited term at `range` in the Filter's raw text. Total: every
+/// input produces a `Term`, never an error, per the grammar's own "no fifth failure grade".
+fn parse_term(raw: &str, range: Range<usize>) -> Term {
     let (negated, rest) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, raw),
@@ -374,6 +415,7 @@ fn parse_term(raw: &str) -> Term {
         negated,
         key,
         values,
+        range,
     }
 }
 
@@ -460,7 +502,10 @@ impl Filter {
     pub fn parse(input: &str) -> Self {
         Filter {
             raw: input.to_string(),
-            terms: input.split_whitespace().map(parse_term).collect(),
+            terms: split_terms(input)
+                .into_iter()
+                .map(|(range, text)| parse_term(text, range))
+                .collect(),
         }
     }
 
@@ -510,6 +555,20 @@ impl Filter {
             }
         }
         counts
+    }
+
+    /// Byte ranges in [`Self::as_str`] of every unrecognised term
+    /// ([filter.md](https://github.com/paulchiu/repon/blob/main/docs/spec/filter.md)'s
+    /// advisory slot): a keyed term whose value falls outside its own key's closed
+    /// vocabulary, or that names no value at all. Empty when every term is recognised, which
+    /// is what an empty Filter and a bare name search both are. `ADR 0005` keeps this fact
+    /// in the core rather than the rendering crate reparsing the input to find it.
+    pub fn unrecognised_ranges(&self) -> Vec<Range<usize>> {
+        self.terms
+            .iter()
+            .filter(|term| !term.is_recognised())
+            .map(|term| term.range.clone())
+            .collect()
     }
 
     /// Whether this Filter carries a non-negated `kind:` term explicitly naming `kind`,
@@ -567,6 +626,13 @@ mod tests {
     use crate::entity::{AheadBehind, DirtyCounts, EntityKey, OwnWork, StepResult};
     use crate::git::ProbeError;
 
+    /// `docs/spec/filter.md`'s own text, read fresh at test time rather than copied in.
+    fn read_filter_spec() -> String {
+        let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/filter.md");
+        std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()))
+    }
+
     /// Reads `docs/spec/filter.md`'s own "## The vocabulary" table at test time: one entry
     /// per key, its values in the table's own order, empty for a `<text>` placeholder rather
     /// than a closed set. The `<word>` row (no colon) is skipped, since `name:<text>` already
@@ -615,9 +681,7 @@ mod tests {
     /// list reads its vocabulary from, so a drift here is a drift the user sees on screen.
     #[test]
     fn vocabulary_matches_filter_mds_own_table_in_both_directions() {
-        let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/filter.md");
-        let spec = std::fs::read_to_string(&spec_path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()));
+        let spec = read_filter_spec();
         let mut documented = parse_vocabulary_table(&spec);
 
         for entry in vocabulary() {
@@ -691,6 +755,86 @@ mod tests {
         let repo = entity("repo", Kind::Repo);
         assert!(!Filter::parse("is:banana").matches(&repo));
         assert!(!Filter::parse("is:").matches(&repo));
+    }
+
+    /// The Filter line's advisory (`docs/spec/filter.md`'s "It has an advisory") needs to
+    /// tell an unrecognised term from the grammar's own "none of them is an error" cases.
+    /// Read straight off the grammar section's own worked-example sentence rather than
+    /// restated here, so a fifth example added there reaches this test with no edit: each
+    /// clause names one backtick-quoted term and calls it either "a name term" (recognised)
+    /// or a keyed term with "an unrecognised value" / "an empty value" (not).
+    #[test]
+    fn unrecognised_ranges_agrees_with_the_grammars_own_worked_examples() {
+        let spec = read_filter_spec();
+        let sentence = spec
+            .lines()
+            .find(|line| line.contains("is a name term searching for the literal text"))
+            .expect("filter.md's grammar section still walks its own worked examples");
+
+        let mut checked = 0;
+        for clause in sentence.split([';', '.']) {
+            let mut ticks = clause.match_indices('`');
+            let Some((start, _)) = ticks.next() else {
+                continue;
+            };
+            let Some((end, _)) = ticks.next() else {
+                continue;
+            };
+            let term = &clause[start + 1..end];
+            let recognised = clause.contains("name term");
+            let unrecognised =
+                clause.contains("unrecognised value") || clause.contains("empty value");
+            if !recognised && !unrecognised {
+                continue;
+            }
+            let filter = Filter::parse(term);
+            assert_eq!(
+                filter.unrecognised_ranges().is_empty(),
+                recognised,
+                "filter.md calls `{term}` {}, so unrecognised_ranges should be {}: {clause:?}",
+                if recognised {
+                    "a name term"
+                } else {
+                    "unrecognised"
+                },
+                if recognised { "empty" } else { "non-empty" }
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 4,
+            "expected to check all four of filter.md's own worked examples \
+             (`kimd:repo`, `is:banana`, `is:`, `:`), checked {checked}"
+        );
+    }
+
+    /// The range an unrecognised term reports must point at that term's own text in the raw
+    /// input, not just anywhere: this is what lets the Filter line paint only the offending
+    /// term in the `warn` role rather than the whole line.
+    #[test]
+    fn unrecognised_ranges_points_at_the_offending_terms_own_text() {
+        let input = "kind:repo is:banana name:x";
+        let filter = Filter::parse(input);
+        let ranges = filter.unrecognised_ranges();
+        assert_eq!(
+            ranges.len(),
+            1,
+            "only `is:banana` is unrecognised in {input:?}, got ranges {ranges:?}"
+        );
+        assert_eq!(&input[ranges[0].clone()], "is:banana");
+    }
+
+    /// Two independently unrecognised terms are both reported, not just the first: nothing
+    /// in `docs/spec/filter.md`'s advisory limits it to one offender, and a consumer folding
+    /// this down to "any" for the `?` glyph still needs every one of them to paint each in
+    /// the `warn` role.
+    #[test]
+    fn unrecognised_ranges_reports_every_offending_term_not_only_the_first() {
+        let input = "is:banana state:nope";
+        let filter = Filter::parse(input);
+        let ranges = filter.unrecognised_ranges();
+        let texts: Vec<&str> = ranges.iter().map(|range| &input[range.clone()]).collect();
+        assert_eq!(texts, vec!["is:banana", "state:nope"]);
     }
 
     // --- criterion 2: a detached term matches any row at a detached HEAD ---
