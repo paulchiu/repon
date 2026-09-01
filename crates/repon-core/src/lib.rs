@@ -206,7 +206,7 @@ mod tests {
     /// answer.
     ///
     /// Both files are read at test time from `CARGO_MANIFEST_DIR` rather than with
-    /// `include_str!`: `CONTEXT.md` lives at the repository root, outside this
+    /// `include_str!`: `GLOSSARY.md` lives at the repository root, outside this
     /// crate's own directory, so it is not among the files `cargo package` ships.
     /// `include_str!` was tried first; it compiles fine in the workspace checkout
     /// and does not itself break `cargo publish --dry-run` (packaging only builds,
@@ -221,7 +221,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = std::fs::read_to_string(manifest_dir.join("src/lib.rs"))
             .expect("read this crate's own source");
-        let glossary = std::fs::read_to_string(manifest_dir.join("../../CONTEXT.md"))
+        let glossary = std::fs::read_to_string(manifest_dir.join("../../GLOSSARY.md"))
             .expect("read the project glossary");
 
         for name in crate_root_public_surface(&source) {

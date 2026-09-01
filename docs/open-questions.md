@@ -53,7 +53,7 @@ why it stays open here rather than settled as never.
 - **Reopens if**: the schema grows a way to declare, per Action, which Repos it
   applies to.
 - **Owned by**: [`spec/actions.md`](spec/actions.md#open). The promised count was
-  already removed from [`CONTEXT.md`](../CONTEXT.md)'s glossary; its `Action` entry
+  already removed from [`GLOSSARY.md`](../GLOSSARY.md)'s glossary; its `Action` entry
   now says only "how many Repos it will run on", which is the Selection count the
   confirm gate and the palette both already show.
 

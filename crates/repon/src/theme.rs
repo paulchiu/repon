@@ -633,7 +633,7 @@ mod tests {
     }
 
     /// Reads `docs/spec/theming.md` at test time, the way `repon-core`'s
-    /// `public_surface_matches_glossary` reads `CONTEXT.md`, so the compiled default and the
+    /// `public_surface_matches_glossary` reads `GLOSSARY.md`, so the compiled default and the
     /// spec's own table cannot drift apart. Asserts the count (exactly nine) and every
     /// value, rather than a hand-picked few, against the spec's own literal.
     #[test]

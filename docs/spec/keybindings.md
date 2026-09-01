@@ -166,7 +166,7 @@ The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothin
 
 Selection is per row, so a Worktree is selected independently of its Repo and selecting a Repo does not select its Worktrees. The Repo row and its Worktree rows have different working directories, so a Launcher on one and a Launcher on the other are different acts. `j` and `k` step over every visible row without regard to depth.
 
-When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes CONTEXT.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
+When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes GLOSSARY.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
 
 ## The ad hoc command field
 

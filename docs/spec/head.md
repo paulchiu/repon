@@ -54,7 +54,7 @@ All three shapes on one screen, with a Submodule row for the fourth case that re
 
 ## The state cell on a detached row
 
-Merged needs a commit and a default branch, not a branch name, so it stays provable when HEAD is detached. Gone, Local only and Active all need an upstream, and a detached HEAD structurally cannot have one, because an upstream is configured against a branch. The cell therefore carries a positive answer or nothing: `Known(Merged)` when ancestry or patch equivalence proves it, `NotApplicable` when it does not. `Cell<WorktreeState>` already expresses this without change, because `NotApplicable` lives in the `Cell` rather than in `WorktreeState`, so the four states in [CONTEXT.md](../../CONTEXT.md) are untouched.
+Merged needs a commit and a default branch, not a branch name, so it stays provable when HEAD is detached. Gone, Local only and Active all need an upstream, and a detached HEAD structurally cannot have one, because an upstream is configured against a branch. The cell therefore carries a positive answer or nothing: `Known(Merged)` when ancestry or patch equivalence proves it, `NotApplicable` when it does not. `Cell<WorktreeState>` already expresses this without change, because `NotApplicable` lives in the `Cell` rather than in `WorktreeState`, so the four states in [GLOSSARY.md](../../GLOSSARY.md) are untouched.
 
 Measured: 2 of the 125 detached entities are ancestors of the default branch, and a further 53 are patch-equivalent to a commit on it, so 55 of 125 read Merged. Across the whole list that takes the `state` column from 42 to 96 of 403 rows carrying a value, and makes 54 of 163 Worktrees read Merged.
 
