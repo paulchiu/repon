@@ -344,8 +344,8 @@ impl App {
 
         if bounds_changed {
             self.core = Core::start(core_spec(document, &self.active_set, self.no_fetch));
-            // Everything the new `Core`'s own discovery finds: it has not run yet, so
-            // there is nothing in its table to order.
+            // A Generation over the new Set, ordered by the walk it runs for itself: the
+            // switch has just discarded the old Set's rows, so there is no key to name.
             self.core.refresh_all();
             // The new `Core` starts with no discovery warning of its own, so a warning the
             // old one already logged must not suppress logging a fresh one from this one.

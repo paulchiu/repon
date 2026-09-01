@@ -475,12 +475,6 @@ impl App {
             &active_set,
             flag_no_fetch,
         ));
-        // Generation 1 over everything discovery finds (refresh.md's "Startup"). Not
-        // `refresh` with an order of this instant's keys: `Core::start` returns before its
-        // discovery has finished, so there are none yet to name. Nothing is ordered away by
-        // that, since before the first frame there is no rendered viewport to narrow
-        // `visible`, and `dispatch_order`'s three-tier split returns its input unchanged.
-        core.refresh_all();
 
         let mut list = List::default();
         list.register_config_handler(config.clone())?;
@@ -7016,7 +7010,7 @@ mod tests {
         }
     }
 
-    // --- Issue #65: the eight Refresh triggers. Startup (`App::new`'s own dispatch above),
+    // --- Issue #65: the eight Refresh triggers. Startup (`Core::start`'s own first walk),
     // Launcher return (`returning_from_a_handoff_starts_a_new_generation_synchronously_with_
     // nothing_queued` and its neighbours above), a Set switch
     // (`app::reload::tests::switching_to_a_different_declared_set_discards_discovery_and_
