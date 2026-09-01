@@ -6,6 +6,10 @@ glyphs = "full"
 show_worktrees = true
 show_submodules = false
 
+# One declared action runs after a refresh you asked for: `r` and `R`, never the
+# background sweep.
+on_refresh = "sync"
+
 [refresh]
 poll_interval = "2s"       # "0s" turns the sweep off
 status_stale_after = "5m"
@@ -79,6 +83,14 @@ args = ["rm", "-rf", "node_modules"]
 
 [[action.steps]]
 args = ["pnpm", "install"]
+
+[[action]]
+name = "sync"
+description = "Whatever each Repo needs once its state is fresh"
+concurrency = 4
+
+[[action.steps]]
+args = ["sync-repo"]
 
 # Only what changes. Everything else keeps the default map.
 [keys.global]
