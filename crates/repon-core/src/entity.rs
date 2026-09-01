@@ -237,6 +237,26 @@ impl StepOutcome {
     }
 }
 
+/// What a step's captured output lost to the head-plus-tail bound
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "Capture"): two counts and no mark.
+///
+/// The mark that draws the gap is the consumer's, chosen from its live glyph set at render
+/// time, so an `ascii` reader gets an ascii mark; this is the same split
+/// [ADR 0010](https://github.com/paulchiu/repon/blob/main/docs/adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)
+/// makes between a provenance state and the glyph that renders it. Writing a formatted line
+/// into [`StepResult::output`] instead would leave the consumer string-matching its own
+/// quotation of another program's screen, which a step printing that same text defeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct CaptureElision {
+    /// How many lines the bound dropped.
+    pub dropped_lines: usize,
+    /// How many of [`StepResult::output`]'s own lines precede the gap, so a renderer draws
+    /// its mark after that many lines and before the kept tail.
+    pub kept_head_lines: usize,
+}
+
 /// One step's own result within an [`ActionReceipt`]: its label, its outcome, its
 /// captured output and its elapsed time
 /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
@@ -254,6 +274,8 @@ pub struct StepResult {
     /// Raw bytes, bounded, never interpreted here.
     pub output: Arc<[u8]>,
     pub elapsed: Duration,
+    /// What the bound dropped out of `output`, or `None` when the output fitted whole.
+    pub elision: Option<CaptureElision>,
 }
 
 /// The step an [`ActionReceipt`] is executing right now, present only while its run has not
@@ -728,6 +750,7 @@ mod tests {
             outcome: StepOutcome::Ok,
             output: Arc::from(&b""[..]),
             elapsed: Duration::from_millis(1),
+            elision: None,
         }
     }
 
@@ -737,6 +760,7 @@ mod tests {
             outcome: StepOutcome::Failed(code),
             output: Arc::from(&b"boom"[..]),
             elapsed: Duration::from_millis(2),
+            elision: None,
         }
     }
 
@@ -770,6 +794,7 @@ mod tests {
             outcome,
             output: _,
             elapsed: _,
+            elision: _,
         } = steps[0].clone();
 
         assert_eq!(&*label, "reinstall");
@@ -798,6 +823,7 @@ mod tests {
                     outcome: StepOutcome::Cancelled,
                     output: Arc::from(&b""[..]),
                     elapsed: Duration::from_millis(1),
+                    elision: None,
                 }]
             )
             .failed(),
@@ -1157,6 +1183,7 @@ mod tests {
                 outcome: StepOutcome::Ok,
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),

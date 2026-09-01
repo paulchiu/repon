@@ -93,7 +93,10 @@ An Entity's most recent Action run: its label, the Step results finished so far,
 _Avoid_: Action run, Action result (the receipt is the specific, settled word)
 
 **Step result**:
-One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output and its elapsed time.
+One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded.
+
+**Capture elision**:
+What a Step's captured output lost to the head-plus-tail bound: how many lines were dropped and how many kept lines precede the gap. Two counts and no mark, because the mark that stands in for the gap is a glyph, and glyphs belong to the consumer; nothing is written into the captured bytes to say a drop happened.
 
 **Step outcome**:
 A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.

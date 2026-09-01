@@ -30,7 +30,9 @@ The honest cost, stated rather than hidden: a PTY widens the class of programs t
 
 The core stores raw bytes per step, never a `String`, with no interpretation. What those bytes mean is the consumer's question, answered under The run on screen.
 
-Capture is bounded to the head 200 lines plus the tail 200 lines, with an elision line naming the dropped count. Head plus tail rather than a tail-only ring, because the tail alone loses the invocation and keeps only the noise. Truncation walks to a char boundary, never a raw byte offset.
+Capture is bounded to the head 200 lines plus the tail 200 lines. Head plus tail rather than a tail-only ring, because the tail alone loses the invocation and keeps only the noise. Truncation walks to a char boundary, never a raw byte offset.
+
+The drop is reported beside the bytes rather than written into them. The step's own result carries a `CaptureElision`: how many lines went, and how many kept lines precede the gap. Nothing at all is inserted between the kept head and the kept tail, because the mark that stands in for the gap is a glyph, and every glyph is the consumer's ([the core API spec](core-api.md), [0015](../adr/0015-the-core-owns-the-table.md)). The pane draws it from the live glyph set at render time, so a `glyphs = "ascii"` reader gets that table's own mark rather than the `full` table's ([theming.md](theming.md)). This is the split [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) already makes between a provenance state and the glyph that renders it. A formatted line in the bytes would also make a step whose own output prints that same text indistinguishable from a real drop.
 
 Two rules govern carriage returns, because under a PTY ONLCR means every newline arrives as `\r\n`. A `\r` immediately before a `\n` is a line ending and its CR is dropped. A bare `\r` is a progress-frame separator, and only the last frame of the sequence is kept, which is what turns an animated progress bar into its final state rather than a concatenation of every repaint.
 
@@ -103,6 +105,12 @@ pub struct StepResult {
     pub outcome: StepOutcome,
     pub output: Arc<[u8]>,         // raw bytes, bounded, never interpreted here
     pub elapsed: Duration,
+    pub elision: Option<CaptureElision>,  // what the bound dropped, None if output fitted whole
+}
+
+pub struct CaptureElision {
+    pub dropped_lines: usize,      // how many lines the bound dropped
+    pub kept_head_lines: usize,    // kept lines before the gap, where a renderer draws its mark
 }
 
 pub enum StepOutcome { Ok, Failed(i32), NotRun, Cancelled }
