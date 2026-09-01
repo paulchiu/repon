@@ -27,11 +27,11 @@
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Position, Rect},
     style::Style,
     widgets::Paragraph,
 };
-use unicode_width::UnicodeWidthStr;
 
 use repon_core::{ActionSpec, Applicability, Step};
 
@@ -60,6 +60,12 @@ pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action
 /// [`crate::launcher_palette::QUERY_PLACEHOLDER`] and [`crate::filter_line::QUERY_PLACEHOLDER`],
 /// each the prompt character, a verb, then what it acts on.
 pub(crate) const QUERY_PLACEHOLDER: &str = "; filter actions";
+
+/// `; ` plus the space after it: the caret's own column while [`ActionPalette::query`] is
+/// empty, since nothing has been painted yet to measure a cursor position off. Once there is
+/// typed text [`ActionPalette::draw`] reads the caret's column back from what it painted
+/// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
+const PROMPT_WIDTH: u16 = 2;
 
 /// The last interior row of [`Stage::Confirming`], always drawn: the gate's own answer
 /// vocabulary, which [repo-management.md](../../../docs/spec/repo-management.md) requires be
@@ -684,22 +690,51 @@ impl ActionPalette {
                 }
             }
             Stage::Choosing => {
-                let (query_line, query_style) = if self.query.is_empty() {
-                    (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
-                } else {
-                    (format!("; {}", self.query), theme.style_for(Role::Text))
-                };
-                draw_row(frame, interior, 0, &query_line, query_style);
-                // The caret sits at the query's own end, "; " plus whatever has been typed,
-                // not at the end of whichever placeholder text an empty query is showing in
-                // its place: this is where the next keystroke would land. ratatui shows the
-                // caret only on a frame where a position was set, so this is the one call
-                // that puts one on this palette's query row at all.
-                if interior.height > 0 {
-                    frame.set_cursor_position(Position::new(
-                        interior.x + 2 + UnicodeWidthStr::width(self.query.as_str()) as u16,
+                let row_right = interior.x + interior.width;
+                if self.query.is_empty() {
+                    draw_row(
+                        frame,
+                        interior,
+                        0,
+                        QUERY_PLACEHOLDER,
+                        theme.style_for(Role::Dim),
+                    );
+                    // Nothing has been painted for the query itself yet, so there is no
+                    // paint to read a column back from: the placeholder text is not the
+                    // query, and [`PROMPT_WIDTH`] is a fixed constant rather than a restated
+                    // measurement.
+                    if interior.height > 0 {
+                        frame.set_cursor_position(Position::new(
+                            (interior.x + PROMPT_WIDTH).min(row_right),
+                            interior.y,
+                        ));
+                    }
+                } else if interior.height > 0 {
+                    // The caret sits at the query's own end, "; " plus whatever has been
+                    // typed, not at the end of whichever placeholder text an empty query is
+                    // showing in its place: this is where the next keystroke would land.
+                    // Read back from `set_stringn`'s own return, the same technique
+                    // [`crate::filter_line::FilterLine::draw`] uses, rather than adding a
+                    // separately measured query width to a literal prefix width: a changed
+                    // prefix or a wide character can then never drift the caret from the
+                    // text it follows. `draw_row`'s `Paragraph` is bypassed here rather than
+                    // reused because it never hands back where it stopped painting.
+                    let buf: &mut Buffer = frame.buffer_mut();
+                    let (x, _) = buf.set_stringn(
+                        interior.x,
                         interior.y,
-                    ));
+                        "; ",
+                        row_right.saturating_sub(interior.x) as usize,
+                        theme.style_for(Role::Text),
+                    );
+                    let (x, _) = buf.set_stringn(
+                        x,
+                        interior.y,
+                        &self.query,
+                        row_right.saturating_sub(x) as usize,
+                        theme.style_for(Role::Text),
+                    );
+                    frame.set_cursor_position(Position::new(x.min(row_right), interior.y));
                 }
 
                 let matches = self.matches(actions);
@@ -2362,5 +2397,82 @@ mod tests {
             row_text(&action_buf, action_message_row, 40).contains(NO_MATCHES_MESSAGE),
             "expected the Action palette's own no-matches row to read the message"
         );
+    }
+
+    // --- one caret technique across all three surfaces ---
+
+    /// [`crate::filter_line::FilterLine::draw`] reads its caret column back from what the
+    /// same call already painted rather than adding a separately measured query width to a
+    /// literal prefix width; this and [`crate::launcher_palette::LauncherPalette::draw`] must
+    /// use the same technique rather than a second one of their own, so `UnicodeWidthStr`
+    /// must appear in neither's production source, nor anywhere else in the workspace.
+    #[test]
+    fn no_production_code_measures_a_caret_column_with_unicode_width_str() {
+        let offending = crate::test_support::production_lines_containing("UnicodeWidthStr");
+        assert!(
+            offending.is_empty(),
+            "expected every caret to be read back from its own paint, the way \
+             `filter_line.rs` already does, found `UnicodeWidthStr` still measuring one \
+             separately at: {offending:?}"
+        );
+    }
+
+    /// The specific shape the caret bug took twice: a literal prefix width added to a
+    /// separately measured query width. Distinct from the technique check above, since a
+    /// caret could in principle restate a prefix width through some means other than
+    /// `UnicodeWidthStr` and still be wrong; this pins the literal itself absent.
+    #[test]
+    fn no_caret_position_adds_a_literal_prefix_width_to_a_separately_measured_query_width() {
+        let offending = crate::test_support::production_lines_containing("+ 2 + ");
+        assert!(
+            offending.is_empty(),
+            "expected no caret column built from a literal prefix width plus a separately \
+             measured query width, found: {offending:?}"
+        );
+    }
+
+    // --- the unicode-width dependency ---
+
+    /// Promoted from a dev-dependency to a normal one for exactly the two call sites the
+    /// technique tests above now forbid; once neither remains, nothing outside `#[cfg(test)]`
+    /// needs it and it belongs back among the dev-dependencies.
+    #[test]
+    fn unicode_width_is_a_normal_dependency_only_if_production_code_still_uses_it() {
+        let offending = crate::test_support::production_lines_containing("unicode_width");
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("read this crate's own Cargo.toml");
+        let dependencies_start = manifest
+            .find("[dependencies]")
+            .expect("this crate's manifest to declare a [dependencies] table");
+        let dev_dependencies_start = manifest
+            .find("[dev-dependencies]")
+            .expect("this crate's manifest to declare a [dev-dependencies] table");
+        assert!(
+            dev_dependencies_start > dependencies_start,
+            "expected [dev-dependencies] to follow [dependencies] in Cargo.toml"
+        );
+        let dependencies_section = &manifest[dependencies_start..dev_dependencies_start];
+        let dev_dependencies_section = &manifest[dev_dependencies_start..];
+
+        if offending.is_empty() {
+            assert!(
+                !dependencies_section.contains("unicode-width"),
+                "no production code uses unicode-width any more, so it must not sit in \
+                 [dependencies]: {dependencies_section}"
+            );
+            assert!(
+                dev_dependencies_section.contains("unicode-width"),
+                "no production code uses unicode-width any more, so it must sit in \
+                 [dev-dependencies] instead: {dev_dependencies_section}"
+            );
+        } else {
+            assert!(
+                dependencies_section.contains("unicode-width"),
+                "production code still uses unicode-width ({offending:?}), so it must stay a \
+                 normal dependency: {dependencies_section}"
+            );
+        }
     }
 }

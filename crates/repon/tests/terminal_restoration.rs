@@ -626,6 +626,14 @@ fn an_unmatched_repon_set_exits_before_the_terminal_is_claimed_naming_the_variab
 /// Criterion 5: a `--config` file that does not exist exits before the terminal is claimed,
 /// naming the flag and the path given. `REPON_CONFIG` is pointed at a real, empty directory so
 /// this cannot pass because of an unrelated `REPON_CONFIG` failure.
+///
+/// Reported red on macOS under load, not reproduced here in several hundred runs (isolated
+/// and alongside its thirteen siblings) under sustained CPU contention. Two causes were ruled
+/// out with evidence: `check_named_paths_exist` runs inside `App::new`, whose `?` returns
+/// before `Tui::new`/`enter` are ever reached, so nothing here races a background thread the
+/// way the discovery watcher does; and color-eyre 0.6.5 carries no line-wrapping dependency,
+/// confirmed by running the failing case directly and finding its ~250-character message on
+/// one unbroken line. If it recurs, keep the captured `output` rather than rerunning past it.
 #[test]
 fn a_missing_config_flag_file_exits_before_the_terminal_is_claimed_naming_the_flag_and_path() {
     let repon_config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
