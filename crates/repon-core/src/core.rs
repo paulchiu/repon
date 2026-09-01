@@ -543,10 +543,10 @@ impl Core {
     ///
     /// The table it returns is empty: discovery lands its rows afterwards, which is what
     /// lets a consumer claim the terminal and draw a first frame without waiting out a
-    /// walk (refresh.md's "The first frame"). It starts no Generation of its own, so a
-    /// consumer that wants its rows probed calls [`Self::refresh_all`], which resolves its
-    /// order after its own discovery rather than from a table nobody can name yet.
-    /// [`Self::settle`] waits for this walk the way it waits for a probe.
+    /// walk (refresh.md's "The first frame"). That walk is refresh.md's "Startup"
+    /// Generation as well, dispatched over what it found, so a consumer probes its rows
+    /// by starting a `Core` and never by asking for a second walk of the same tree.
+    /// [`Self::settle`] waits for it the way it waits for any other Generation.
     pub fn start(spec: CoreSpec) -> Core {
         Self::start_watched(spec).core
     }
@@ -612,13 +612,13 @@ impl Core {
     /// Starts a new Generation over every entity this Generation's own discovery
     /// leaves in the table, in discovery order.
     ///
-    /// Startup's Generation, per
+    /// A Set switch's Generation, per
     /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
-    /// "Startup": a caller that has not seen a Snapshot yet has no order to compute
-    /// and no keys to name, since discovery runs on a thread of its own now and the
-    /// table is empty until it lands. Unlike [`Self::refresh`], which resolves the
-    /// order the caller handed it, this resolves the order after discovery has run,
-    /// which is what lets it cover rows the caller could not have named. Returns
+    /// "Switching Set": the caller has just discarded the old Set's rows, so it has no
+    /// order to compute and no keys to name. Unlike [`Self::refresh`], which resolves
+    /// the order the caller handed it, this resolves the order after discovery has run,
+    /// which is what lets it cover rows the caller could not have named. Startup needs
+    /// none of this: [`Self::start`]'s own walk is that Generation. Returns
     /// immediately, the same way `refresh` does.
     pub fn refresh_all(&self) -> Generation {
         self.refresh_handles().dispatch_over_everything()
@@ -1835,10 +1835,18 @@ impl RefreshHandles {
 }
 
 impl Drop for Core {
-    /// Joins the dedicated thread. Rayon's global pool is shared process-wide
-    /// infrastructure, not a thread this core spawned, so it is not joined here;
-    /// its jobs are short probes that run to completion on their own regardless.
+    /// Cancels whatever this `Core` still has in flight, then joins the dedicated thread.
+    ///
+    /// The cancel is what [`Core::pause`] already does, for the same reason
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Cancellation" gives: an abandoned Generation is cancelled rather than left to
+    /// finish, since a Set switch rebuilds the `Core` and the outgoing one's fan-out
+    /// would otherwise contend for the same cores as the incoming one's. A probe already
+    /// past its own cancel check still runs to completion on rayon's global pool, which
+    /// is shared process-wide infrastructure rather than a thread this core spawned, so
+    /// it is not joined here.
     fn drop(&mut self) {
+        cancel_in_flight(&self.table, &self.settle_gate);
         let _ = self.control.send(ClockControl::Shutdown);
         if let Some(handle) = self.clock_thread.take() {
             let _ = handle.join();
@@ -1911,6 +1919,17 @@ impl Core {
         begin_probes_owed(&self.settle_gate, 1);
         cancel
     }
+}
+
+/// One simulated in-flight Generation, as [`Core::begin_shared_generation_for_test`]
+/// left it: the Generation itself, and one interrupt flag per key it covers.
+#[cfg(test)]
+pub(crate) struct SharedGeneration {
+    /// The Generation this simulation minted, so a test can name it and its successor
+    /// rather than the counter values they happen to hold.
+    pub generation: Generation,
+    /// One `cancel` flag per covered key, the same handle a real dispatch would hold.
+    pub cancels: HashMap<EntityKey, Arc<AtomicBool>>,
 }
 
 #[cfg(test)]
@@ -2186,10 +2205,11 @@ impl Core {
     /// touching the settle gate, so a test can drive per-entity supersession
     /// directly: which keys a later real `refresh` does and does not cover, and
     /// what happens to each one's own cancel flag and eventual result.
-    pub(crate) fn begin_shared_generation_for_test(
-        &self,
-        keys: &[EntityKey],
-    ) -> HashMap<EntityKey, Arc<AtomicBool>> {
+    ///
+    /// Hands back the Generation it minted rather than only the flags, so the test
+    /// names that Generation and its successor instead of the counter values they
+    /// happen to hold.
+    pub(crate) fn begin_shared_generation_for_test(&self, keys: &[EntityKey]) -> SharedGeneration {
         let mut table = self.table.write().unwrap();
         table.generation += 1;
         let generation_number = table.generation;
@@ -2211,7 +2231,10 @@ impl Core {
             );
             cancels.insert(key.clone(), cancel);
         }
-        cancels
+        SharedGeneration {
+            generation: Generation::new(generation_number),
+            cancels,
+        }
     }
 
     /// Lands one branch probe result for `key` at `generation` through the exact
@@ -2529,11 +2552,13 @@ fn start_internal(
     // Discovery runs here rather than on the calling thread, so `Core::start`
     // returns against the empty table above and the consumer can claim the terminal
     // and draw before the walk has finished (ADR 0015's "a constructor that spawns
-    // threads is not a surprise"). It starts no Generation of its own; the consumer's
-    // own `refresh_all` is Generation 1 and walks again for itself, concurrently with
-    // this one rather than after it, which is where the two sequential walks a launch
-    // used to pay went. The debt is recorded before the spawn, so a `settle` called in
-    // between waits for this walk rather than returning on an empty table.
+    // threads is not a surprise"). This walk is also refresh.md's "Startup"
+    // Generation, so a launch walks the tree once: the number and the turnstile place
+    // are reserved here on the calling thread, exactly as every later Generation
+    // reserves its own, and the walk and the fan-out it orders both run on the
+    // spawned thread. The debt is recorded before the spawn, so a `settle` called in
+    // between waits for this Generation rather than returning on an empty table.
+    let (startup_generation, startup_ticket) = fetch_refresh_handles.reserve_generation();
     begin_dispatch(&settle_gate);
     let (watch, discovery_watcher) =
         spawn_discovery_watcher(spec.set.roots.clone(), &discovery_warning, warn_after);
@@ -2548,6 +2573,7 @@ fn start_internal(
         let fetch_cycle_count = Arc::clone(&fetch_cycle_count);
         let discovery_gate = discovery_gate.clone();
         move || {
+            let turn = fetch_refresh_handles.turnstile.take(startup_ticket);
             wait_for_discovery_gate(discovery_gate.as_ref());
             let discovery =
                 run_watched_discovery(&watch, &set, &discovery_warning, discovery_abandon_after);
@@ -2561,7 +2587,7 @@ fn start_internal(
             // which half produced a given entry.
             let (discovered, gitmodules_failures) = discovery::resolve(&set, &discovery.entities);
             let resolved_exclusions = exclusions.read().unwrap().clone();
-            {
+            let order: Vec<EntityKey> = {
                 let mut table = table.write().unwrap();
                 // A fresh table has nothing in flight yet, so nothing here is ever
                 // cancelled: the same reconciliation `refresh` uses later, run once
@@ -2573,8 +2599,20 @@ fn start_internal(
                     gitmodules_failures,
                 );
                 table.discovered_at = Timestamp::now();
-            }
+                table
+                    .entities
+                    .iter()
+                    .map(|entity| entity.key.clone())
+                    .collect()
+            };
+            // Read off the table this walk just reconciled, the same way
+            // `dispatch_over_everything` resolves its own order: nobody holding the
+            // empty table `start` returned has a key to name yet.
+            fetch_refresh_handles.dispatch_probes(&order, startup_generation);
             finish_dispatch(&settle_gate);
+            // Released here rather than at thread exit: the first fetch cycle spawned
+            // below is not part of this Generation's body.
+            drop(turn);
 
             // "Fires immediately on being enabled rather than waiting for the first
             // tick" ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
@@ -4294,7 +4332,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
-    use crate::liveness::{FIXTURE_LIFETIME, wait_for};
+    use crate::liveness::{BACKSTOP, FIXTURE_LIFETIME, wait_for};
     use crate::snapshot::{RowSummary, summary};
     use crate::test_support::{git, head_sha, loose_object_count};
 
@@ -4446,6 +4484,33 @@ mod tests {
 
     fn root_of(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().canonicalize().expect("canonicalize temp dir")
+    }
+
+    /// Blocks until `core`'s launch Generation has settled, and hands back what it settled
+    /// to.
+    ///
+    /// `Core::start`'s own first walk is that `Core`'s Generation 1 and probes every row it
+    /// finds, so a test that counts what a later Generation did, or that watches a cell
+    /// only its own Generation may write, has to begin from a table launch has already
+    /// finished with. [`BACKSTOP`] rather than a budget, and the gate is read afterwards so
+    /// an expired wait fails here by name instead of downstream as a wrong value.
+    fn settle_launch(core: &Core) -> Snapshot {
+        let launched = core.settle(BACKSTOP);
+        assert_eq!(
+            core.settle_gate_count_for_test(),
+            0,
+            "launch's own Generation never settled, so nothing after this is starting from \
+             the point it claims to"
+        );
+        launched
+    }
+
+    /// [`settle_launch`] over a `Core` built the ordinary way, for the many tests that want
+    /// nothing else from the constructor.
+    fn started_and_settled(spec: CoreSpec) -> (Core, Snapshot) {
+        let core = Core::start_discovered(spec);
+        let launched = settle_launch(&core);
+        (core, launched)
     }
 
     /// Sets every polled gitdir entry's modification time ten seconds into the past, so any
@@ -4658,18 +4723,38 @@ mod tests {
     /// unreachable if the cheap outcomes wait behind phase C, so this proves the two
     /// applies are independent with a blocking seam rather than a sleep or a wall-clock
     /// deadline: `Core::hold_phase_c_for_test` holds phase C (and D) open after the cheap
-    /// outcomes have already landed, and the test observes `branch` settled while `dirty`
-    /// is still in flight. Run this against a version that bundles every outcome into one
-    /// apply placed after phase C computes (this ticket's regression) and it fails, since
-    /// nothing writes `branch` until that single bundled apply lands alongside `dirty`.
+    /// outcomes have already landed, and the test observes `branch` carrying this
+    /// Generation's answer while `dirty` still carries the previous one. Run this against
+    /// a version that bundles every outcome into one apply placed after phase C computes
+    /// (this ticket's regression) and it fails, since nothing writes `branch` until that
+    /// single bundled apply lands alongside `dirty`.
+    ///
+    /// Launch's own Generation is drained first and both cells are then moved, so each is
+    /// read on the value it holds rather than on being blank: a table that has already
+    /// been probed once is the only starting point available now that `Core::start` runs
+    /// a Generation of its own, and reading values is the stronger claim anyway.
     #[test]
     fn cheap_outcomes_land_before_a_held_phase_c_settles() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
-        init_repo_with_a_commit(&root.join("repo"));
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let key = core.snapshot().entities[0].key.clone();
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
+        assert_eq!(
+            dirty_total(&launched.entities[0]),
+            0,
+            "the fixture starts clean, which is the value the held phase C must still be \
+             reading once the working tree below has moved"
+        );
+
+        // One move per phase, so neither cell can be read on absence: `branch` is phase A
+        // and must carry the new name while phase C is held, `dirty` is phase C and must
+        // still carry launch's own clean count until it is released.
+        git(&repo, &["checkout", "-b", "held"]);
+        fs::write(repo.join("untracked.txt"), b"uncommitted")
+            .expect("write an untracked file into the fixture");
 
         core.hold_phase_c_for_test(&key);
         core.refresh(std::slice::from_ref(&key));
@@ -4685,18 +4770,19 @@ mod tests {
             matches!(
                 entity.branch.settled(),
                 Some(Settled::Known {
-                    value: Head::Branch { .. },
+                    value: Head::Branch { name, .. },
                     at: _,
                     stale: _
-                })
+                }) if &**name == "held"
             ),
-            "the cheap branch cell must be readable while phase C is still held open, got {:?}",
+            "the cheap branch cell must carry this Generation's own answer while phase C is \
+             still held open, got {:?}",
             entity.branch.settled()
         );
         assert!(
-            entity.dirty.settled().is_none() && entity.dirty.is_in_flight(),
+            entity.dirty.is_in_flight() && dirty_total(entity) == 0,
             "phase C is deliberately held open here; a bundled apply would already have \
-             written this cell alongside branch, got {:?}",
+             written this cell's new count alongside branch, got {:?}",
             entity.dirty.settled()
         );
 
@@ -4709,18 +4795,26 @@ mod tests {
             .iter()
             .find(|entity| entity.key == key)
             .expect("entity present");
-        assert!(
-            matches!(
-                entity.dirty.settled(),
-                Some(Settled::Known {
-                    value: _,
-                    at: _,
-                    stale: _
-                })
-            ),
-            "phase C must settle once released, got {:?}",
+        assert_eq!(
+            dirty_total(entity),
+            1,
+            "phase C must settle its own count once released, got {:?}",
             entity.dirty.settled()
         );
+    }
+
+    /// One entity's settled dirty count, or a panic naming what it read instead. Lets a
+    /// test that has to distinguish two Generations by value say "still zero" and "now
+    /// one" without repeating the match on every read.
+    fn dirty_total(entity: &EntityState) -> u32 {
+        match entity.dirty.settled() {
+            Some(Settled::Known {
+                value,
+                at: _,
+                stale: _,
+            }) => value.total(),
+            other => panic!("expected a settled dirty count, got {other:?}"),
+        }
     }
 
     /// Splitting one dispatched entity's write into a cheap apply and a phase C/D apply
@@ -4737,8 +4831,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("a"));
         init_repo_with_a_commit(&root.join("b"));
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let snapshot = core.snapshot();
+        let (core, snapshot) = started_and_settled(spec(vec![root]));
         let key_a = snapshot
             .entities
             .iter()
@@ -4817,9 +4910,8 @@ mod tests {
             init_repo_with_a_commit(&root.join(format!("repo-{index}")));
         }
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let discovery_order: Vec<EntityKey> = core
-            .snapshot()
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let discovery_order: Vec<EntityKey> = launched
             .entities
             .iter()
             .map(|entity| entity.key.clone())
@@ -4917,6 +5009,9 @@ mod tests {
         ));
     }
 
+    /// An empty order names no key, so the Generation it starts must reach no entity at
+    /// all. Read off the dispatch log and the in-flight flag rather than off an unprobed
+    /// cell, since launch's own Generation has already filled every cell by here.
     #[test]
     fn an_empty_order_dispatches_nothing_and_settle_returns_immediately() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4924,11 +5019,22 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start_discovered(spec(vec![root]));
-        core.refresh(&[]);
-        let settled = core.settle(Duration::from_millis(50));
+        let (core, _launched) = started_and_settled(spec(vec![root]));
+        assert!(
+            !core.dispatch_log_for_test().is_empty(),
+            "launch dispatched nothing, so an empty log below would say nothing about the \
+             empty order"
+        );
 
-        assert!(settled.entities[0].branch.settled().is_none());
+        core.refresh(&[]);
+        core.wait_dispatched_for_test();
+
+        assert_eq!(
+            core.dispatch_log_for_test(),
+            Vec::new(),
+            "an empty order must dispatch no probe"
+        );
+        let settled = core.settle(Duration::from_millis(50));
         assert!(!settled.entities[0].branch.is_in_flight());
     }
 
@@ -5347,8 +5453,9 @@ mod tests {
 
         let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
-        let cancels = core.begin_shared_generation_for_test(std::slice::from_ref(&key));
-        let cancel = cancels
+        let in_flight = core.begin_shared_generation_for_test(std::slice::from_ref(&key));
+        let cancel = in_flight
+            .cancels
             .get(&key)
             .expect("the in-flight entity has a cancel flag")
             .clone();
@@ -5377,9 +5484,10 @@ mod tests {
     /// left over from a naive implementation that also called `refresh` directly would
     /// both leave every entity settled, so counting settled entities alone cannot tell
     /// zero, one and two apart. Reading the table's own `generation` number after
-    /// completion can: it must read exactly 1, one Generation minted from a fresh
-    /// `Core` starting at 0, covering both entities although the Action only ever
-    /// named one of them.
+    /// completion can: it must be the Generation immediately after the settled table
+    /// this Action ran against, covering both entities although the Action only ever
+    /// named one of them. Named by its order rather than by a number, so what launch
+    /// itself mints cannot renumber the claim.
     #[test]
     fn a_finished_action_starts_exactly_one_generation_over_every_known_entity() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5389,9 +5497,7 @@ mod tests {
         init_repo_with_a_commit(&acted_on);
         init_repo_with_a_commit(&untouched);
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let before = core.snapshot();
-        assert_eq!(before.generation, Generation::default());
+        let (core, before) = started_and_settled(spec(vec![root]));
         let acted_key = before
             .entities
             .iter()
@@ -5410,21 +5516,23 @@ mod tests {
             "the completion Generation to probe every known entity, including the one the \
              Action never touched",
             || {
-                core.snapshot().entities.iter().all(|entity| {
-                    matches!(
-                        entity.branch.settled(),
-                        Some(Settled::Known {
-                            value: _,
-                            at: _,
-                            stale: _
-                        })
-                    )
-                })
+                let snapshot = core.snapshot();
+                snapshot.generation != before.generation
+                    && snapshot.entities.iter().all(|entity| {
+                        matches!(
+                            entity.branch.settled(),
+                            Some(Settled::Known {
+                                value: _,
+                                at: _,
+                                stale: _
+                            })
+                        )
+                    })
             },
         );
         assert_eq!(
-            core.snapshot().generation,
-            Generation::new(1),
+            core.settle(Duration::from_secs(5)).generation,
+            before.generation.successor(),
             "completion must start exactly one Generation: not zero (no refresh at all) and \
              not two (a double refresh)"
         );
@@ -5960,8 +6068,11 @@ mod tests {
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let key = core.snapshot().entities[0].key.clone();
+        // Drained before the table lock is poisoned below: a probe still in flight would
+        // take the poison too, and a panic in one of rayon's global workers aborts the
+        // process rather than unwinding.
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
 
         // A step slow enough that the fan-out's own write of `last_action` cannot have
         // happened yet by the time the poisoning below completes: `run_action`'s own
@@ -6612,14 +6723,27 @@ mod tests {
         spec.generation_deadline = Duration::ZERO;
         let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
-        let key = core.snapshot().entities[0].key.clone();
+        // Drained, so the only entry in flight below is this test's own and only the sweep
+        // can settle it again.
+        let key = settle_launch(&core).entities[0].key.clone();
 
         core.begin_untracked_probe_for_test(&key);
 
         // No tick has been sent: the sweep has not run even though the (zero)
         // deadline has already elapsed in real time.
         let before = core.snapshot();
-        assert!(before.entities[0].branch.settled().is_none());
+        assert!(
+            matches!(
+                before.entities[0].branch.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
+            "the cell still holds launch's own answer here, so the Unknown below is the \
+             sweep's write rather than a cell that was already empty"
+        );
         assert!(before.entities[0].branch.is_in_flight());
 
         tick_tx.send(Instant::now()).expect("send one tick");
@@ -7061,7 +7185,8 @@ mod tests {
         let started =
             Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
-        let key = core.snapshot().entities[0].key.clone();
+        // Drained, so the only entry in flight below is the one this test puts there.
+        let key = settle_launch(&core).entities[0].key.clone();
         let cancel = core.begin_untracked_probe_for_test(&key);
         assert!(!cancel.load(Ordering::Acquire));
 
@@ -7076,19 +7201,87 @@ mod tests {
         drop(tick_tx);
     }
 
-    /// Per-entity supersession, not global. Generation 1 covers two entities, A
-    /// and B, both simulated as still in flight. A Selection-scoped Generation 2
-    /// covers only A: A's own Generation-1 interrupt flag must be set, and B's
-    /// must not, since Generation 2 never mentions B. Once Generation 2 has
-    /// written A's cell, A's slow Generation-1 result finally arrives and must be
-    /// dropped there; B's own Generation-1 result, arriving after everything
-    /// else, must still be accepted, because Generation 2 never superseded it.
+    /// A launch walks the tree once.
+    ///
+    /// Discovery rides on every Generation
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Discovery is never on the calling thread"), so counting a launch's walks is
+    /// counting its Generations: one walk means the very first Generation a fresh `Core`
+    /// mints is the only one a settled launch has, and that it already covers every row
+    /// the walk found. A second walk would be a second Generation and would read here.
+    #[test]
+    fn a_launch_is_one_generation_over_every_row_its_own_walk_found() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("first"));
+        init_repo_with_a_commit(&root.join("second"));
+
+        let (_core, launched) = started_and_settled(spec(vec![root]));
+
+        assert_eq!(
+            launched.generation,
+            Generation::default().successor(),
+            "a launch must settle on the first Generation a fresh `Core` mints; a second \
+             walk of the same tree would be a second Generation"
+        );
+        let mut named: Vec<String> = launched
+            .entities
+            .iter()
+            .filter(|entity| entity.branch.settled().is_some())
+            .map(|entity| entity.name.to_string())
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            vec!["first".to_string(), "second".to_string()],
+            "that one Generation must cover every row its own walk found, or the walk it \
+             saved would have to be paid by a second one"
+        );
+    }
+
+    /// A `Core` going away cancels what it still has in flight, the same way `pause` does.
+    ///
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+    /// "Cancellation": an abandoned Generation is cancelled rather than left to finish,
+    /// because both would contend for the same cores. A Set switch is where that bites,
+    /// rebuilding the `Core` while the outgoing one's fan-out is still running.
+    #[test]
+    fn dropping_a_core_cancels_every_entity_it_still_has_in_flight() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
+        let cancel = core.begin_untracked_probe_for_test(&key);
+        assert!(!cancel.load(Ordering::Acquire));
+
+        drop(core);
+
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "a dropped Core must cancel the Generation it still has in flight rather than \
+             leave it running against a Set nothing will read again"
+        );
+    }
+
+    /// Per-entity supersession, not global. An older Generation covers two entities,
+    /// A and B, both simulated as still in flight. A Selection-scoped newer
+    /// Generation covers only A: A's own older interrupt flag must be set, and B's
+    /// must not, since the newer one never mentions B. Once the newer Generation has
+    /// written A's cell, A's slow older result finally arrives and must be dropped
+    /// there; B's own older result, arriving after everything else, must still be
+    /// accepted, because the newer Generation never superseded it.
+    ///
+    /// The two are named by their order, never by their counter values, so a
+    /// Generation minted earlier in the crate cannot renumber this test out from
+    /// under itself.
     ///
     /// This is exactly the distinction a global-current-Generation comparison
     /// would get wrong: such a check compares every write against the table's one
-    /// counter (2, after this test's second `refresh`), so B's Generation-1
-    /// result (1 < 2) would be wrongly dropped even though nothing ever
-    /// superseded B specifically. Before `Cell::settle`'s comparison was wired
+    /// counter, which the Selection-scoped refresh has already advanced, so B's
+    /// older result would be wrongly dropped even though nothing ever superseded B
+    /// specifically. Before `Cell::settle`'s comparison was wired
     /// against the cell's own recorded Generation this test failed exactly there:
     /// B's late result was rejected, which is precisely the "cannot strand the
     /// rows it never spoke for" defect the ticket names.
@@ -7116,22 +7309,28 @@ mod tests {
             .key
             .clone();
 
-        // Generation 1, simulated: both A and B are mid-flight, with nothing
+        // The older Generation, simulated: both A and B are mid-flight, with nothing
         // spawned to complete either one, so the test controls exactly when each
         // one's result lands.
-        let gen1_cancels = core.begin_shared_generation_for_test(&[key_a.clone(), key_b.clone()]);
+        let older = core.begin_shared_generation_for_test(&[key_a.clone(), key_b.clone()]);
 
-        // A Selection-scoped refresh over A alone: Generation 2.
-        let generation_2 = core.refresh(std::slice::from_ref(&key_a));
-        assert_eq!(generation_2, Generation::new(2));
+        // A Selection-scoped refresh over A alone, the very next Generation after the
+        // one still in flight.
+        let newer = core.refresh(std::slice::from_ref(&key_a));
+        assert_eq!(
+            newer,
+            older.generation.successor(),
+            "the Selection-scoped refresh must be the Generation immediately after the one \
+             still in flight, with nothing minted in between"
+        );
         let after_refresh = core.settle(Duration::from_millis(500));
 
         assert!(
-            gen1_cancels[&key_a].load(Ordering::Acquire),
+            older.cancels[&key_a].load(Ordering::Acquire),
             "the entity the new Generation covers must have its old interrupt flag set"
         );
         assert!(
-            !gen1_cancels[&key_b].load(Ordering::Acquire),
+            !older.cancels[&key_b].load(Ordering::Acquire),
             "an entity the new Generation does not cover must be left running, untouched"
         );
 
@@ -7149,15 +7348,15 @@ mod tests {
                     stale: _
                 })
             ),
-            "Generation 2's real probe should have written A's cell by now"
+            "the newer Generation's real probe should have written A's cell by now"
         );
 
-        // A's slow Generation-1 result finally arrives, after Generation 2 has
-        // already written the cell: dropped, since 1 is lower than the
-        // Generation already recorded there.
+        // A's slow older result finally arrives, after the newer Generation has
+        // already written the cell: dropped, since it is lower than the Generation
+        // already recorded there.
         core.apply_probe_result_for_test(
             &key_a,
-            Generation::new(1),
+            older.generation,
             Settled::Known {
                 value: Head::Branch {
                     name: Arc::from("stale-from-generation-one"),
@@ -7182,14 +7381,14 @@ mod tests {
                 &**name, "stale-from-generation-one",
                 "a lower-Generation result must be dropped at the cell it would write"
             ),
-            other => panic!("expected A to still hold Generation 2's value, got {other:?}"),
+            other => panic!("expected A to still hold the newer Generation's value, got {other:?}"),
         }
 
-        // B's own Generation-1 result, landing last of all, is still accepted:
-        // Generation 2 never covered B, so nothing superseded it.
+        // B's own older result, landing last of all, is still accepted: the newer
+        // Generation never covered B, so nothing superseded it.
         core.apply_probe_result_for_test(
             &key_b,
-            Generation::new(1),
+            older.generation,
             Settled::Known {
                 value: Head::Branch {
                     name: Arc::from("b-generation-one-result"),
@@ -7214,9 +7413,9 @@ mod tests {
                 &**name, "b-generation-one-result",
                 "an entity the new Generation never covered must still accept its own result"
             ),
-            other => panic!(
-                "expected B's un-superseded Generation-1 result to be accepted, got {other:?}"
-            ),
+            other => {
+                panic!("expected B's un-superseded older result to be accepted, got {other:?}")
+            }
         }
     }
 
@@ -7236,7 +7435,9 @@ mod tests {
         spec.generation_deadline = Duration::ZERO;
         let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
-        let snapshot = core.snapshot();
+        // Drained, so the only cell still loading when the sweep fires is the one this
+        // test puts in flight.
+        let snapshot = settle_launch(&core);
         let key_a = snapshot
             .entities
             .iter()
@@ -7274,8 +7475,24 @@ mod tests {
             .iter()
             .find(|entity| entity.key == key_b)
             .expect("entity b present");
-        assert!(b_before.branch.settled().is_none());
-        assert!(b_before.branch.is_in_flight());
+        assert!(
+            b_before.branch.is_in_flight(),
+            "B must be mid-flight when the sweep fires; that is the only shape the sweep \
+             may touch"
+        );
+        assert!(
+            matches!(
+                b_before.branch.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
+            "B still carries launch's own answer here, so the Unknown below is a write the \
+             sweep made rather than a cell that was already empty, got {:?}",
+            b_before.branch.settled()
+        );
 
         tick_tx.send(Instant::now()).expect("send one tick");
         let after_sweep = core.settle(Duration::from_millis(500));
@@ -7413,7 +7630,8 @@ mod tests {
         spec.generation_deadline = Duration::ZERO;
         let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
-        let key = core.snapshot().entities[0].key.clone();
+        // Drained, so the only entry the sweep below finds in flight is this test's own.
+        let key = settle_launch(&core).entities[0].key.clone();
 
         let receipt = crate::entity::ActionReceipt {
             label: Arc::from("reinstall"),
@@ -7811,9 +8029,8 @@ mod tests {
             ],
         );
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let keys: Vec<EntityKey> = core
-            .snapshot()
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let keys: Vec<EntityKey> = launched
             .entities
             .iter()
             .map(|entity| entity.key.clone())
@@ -8323,8 +8540,15 @@ mod tests {
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("repo-a"));
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let before = core.snapshot().generation;
+        // Drained, so the two readings below differ only by whatever the toggles did.
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let before = launched.generation;
+        let dispatched_before = core.dispatch_log_for_test();
+        assert!(
+            !dispatched_before.is_empty(),
+            "launch dispatched nothing, so the comparison below would hold however much a \
+             toggle dispatched"
+        );
 
         core.set_show_submodules(true);
         core.set_show_submodules(false);
@@ -8336,8 +8560,9 @@ mod tests {
         );
         assert_eq!(
             core.dispatch_log_for_test(),
-            Vec::new(),
-            "toggling show_submodules must dispatch no probe of its own"
+            dispatched_before,
+            "toggling show_submodules must dispatch no probe of its own, leaving the last \
+             Generation's own log exactly as it found it"
         );
     }
 
@@ -8486,11 +8711,16 @@ mod tests {
     /// the table `start` actually returned rather than one this test raced it to. Joining
     /// the harness's own `initial_discovery` handle afterwards is the rendezvous that says
     /// the walk landed: no sleep and no poll on either side.
+    ///
+    /// The row's phase C is held from before the walk is let go, so the cell read below
+    /// is read at a point this test fixes rather than at whatever point launch's own
+    /// Generation happened to have reached.
     #[test]
     fn start_returns_against_an_empty_table_and_the_rows_land_when_discovery_does() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
-        init_repo_with_a_commit(&root.join("repo"));
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
         let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
         let (gate, start_returned, opener) = gate_opened_on_signal(false);
 
@@ -8502,6 +8732,8 @@ mod tests {
             Some(Arc::clone(&gate)),
         );
         let at_start = started.core.snapshot();
+        let key = EntityKey::new(Arc::from(repo.as_path()));
+        started.core.hold_phase_c_for_test(&key);
         start_returned.send(()).expect("the opener is listening");
         opener.join().expect("the opener thread should not panic");
         let started = started.discovered();
@@ -8528,32 +8760,52 @@ mod tests {
             "the row must land on the table as soon as discovery does"
         );
         assert!(
-            landed.entities[0].branch.settled().is_none(),
-            "discovery lands the row alone: its Cells stay unsettled until a Generation \
-             probes them, which is what the spinner sits behind"
+            landed.entities[0].dirty.settled().is_none() && landed.entities[0].dirty.is_in_flight(),
+            "discovery lands the row alone: launch's own Generation is already covering it \
+             and its Cells stay unsettled until that Generation answers, which is what the \
+             spinner sits behind"
         );
+
+        started.core.release_phase_c_for_test(&key);
+        started.core.wait_phase_c_finished_for_test(&key);
     }
 
-    /// Criterion 2: the Generation a consumer starts at launch covers every row
-    /// discovery found, including the ones it could not have named, and fills their
-    /// Cells.
+    /// Criterion 2: a Generation that resolves its own order after its own discovery
+    /// covers every row that walk found, including the ones the caller could not have
+    /// named, and fills their Cells.
     ///
-    /// `refresh_all` rather than `refresh`, because a caller holding the empty table
-    /// `start` returned has no key to order by; the row below is discovered by this
-    /// Generation's own walk and probed by the same Generation.
+    /// `refresh_all` rather than `refresh`, because a caller that has just discarded the
+    /// old Set's rows has no key to order by; the row below is discovered by this
+    /// Generation's own walk and probed by the same Generation. Named by its order after
+    /// launch's own Generation rather than by a number.
     #[test]
     fn refresh_all_covers_every_row_its_own_discovery_found() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         init_repo_with_a_commit(&root.join("repo"));
 
-        let core = Core::start_discovered(spec(vec![root.clone()]));
-        // Created after the first walk finished, so this row exists in no snapshot the
-        // caller could have read: only a Generation that resolves its own order after its
-        // own discovery reaches it.
+        let (core, launched) = started_and_settled(spec(vec![root.clone()]));
+        assert_eq!(
+            launched
+                .entities
+                .iter()
+                .map(|entity| entity.name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["repo".to_string()],
+            "launch's own walk must have landed and covered exactly the one row that \
+             existed when it ran"
+        );
+        // Created after that walk finished, so this row exists in no snapshot the caller
+        // could have read: only a Generation that resolves its own order after its own
+        // discovery reaches it.
         init_repo_with_a_commit(&root.join("late"));
 
-        assert_eq!(core.refresh_all(), Generation::new(1));
+        assert_eq!(
+            core.refresh_all(),
+            launched.generation.successor(),
+            "`refresh_all` must be the Generation immediately after the one already on the \
+             table"
+        );
         let settled = core.settle(Duration::from_secs(5));
 
         let mut named: Vec<String> = settled
@@ -8566,8 +8818,8 @@ mod tests {
         assert_eq!(
             named,
             vec!["late".to_string(), "repo".to_string()],
-            "the startup Generation must cover every row its own discovery found, including \
-             one the caller had no key for"
+            "the Generation must cover every row its own discovery found, including one the \
+             caller had no key for"
         );
     }
 
@@ -8597,8 +8849,9 @@ mod tests {
         )
         .discovered();
         let core = started.core;
-        let keys: Vec<EntityKey> = core
-            .snapshot()
+        // Drained, so the settle-gate reading below is this `refresh`'s alone.
+        let launched = settle_launch(&core);
+        let keys: Vec<EntityKey> = launched
             .entities
             .iter()
             .map(|entity| entity.key.clone())
@@ -8614,9 +8867,9 @@ mod tests {
 
         assert_eq!(
             generation,
-            Generation::new(1),
-            "`refresh` must return its own Generation's number before that Generation has \
-             done any of its work"
+            launched.generation.successor(),
+            "`refresh` must return its own Generation's number, the one immediately after \
+             the table's, before that Generation has done any of its work"
         );
         assert!(
             !while_held
@@ -9471,9 +9724,8 @@ mod tests {
         let other_repo = root.join("other");
         init_repo_with_a_commit(&other_repo);
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let keys: Vec<EntityKey> = core
-            .snapshot()
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let keys: Vec<EntityKey> = launched
             .entities
             .iter()
             .map(|entity| entity.key.clone())
@@ -9627,9 +9879,8 @@ mod tests {
             ],
         );
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let keys: Vec<EntityKey> = core
-            .snapshot()
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let keys: Vec<EntityKey> = launched
             .entities
             .iter()
             .map(|entity| entity.key.clone())
@@ -9794,8 +10045,7 @@ mod tests {
             );
         }
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let snapshot = core.snapshot();
+        let (core, snapshot) = started_and_settled(spec(vec![root]));
         let deep_key = snapshot
             .entities
             .iter()
@@ -10082,8 +10332,7 @@ mod tests {
             ],
         );
 
-        let core = Core::start_discovered(spec(vec![root]));
-        let snapshot = core.snapshot();
+        let (core, snapshot) = started_and_settled(spec(vec![root]));
         let worktree_key = snapshot
             .entities
             .iter()

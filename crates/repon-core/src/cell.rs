@@ -28,6 +28,16 @@ impl Generation {
     pub(crate) fn value(self) -> u64 {
         self.0
     }
+
+    /// The Generation immediately after this one.
+    ///
+    /// What lets a supersession test name the Generation it means by its order after a
+    /// Generation it holds, rather than by a counter value that shifts the moment
+    /// something else in the crate mints one earlier.
+    #[cfg(test)]
+    pub(crate) fn successor(self) -> Self {
+        Generation(self.0 + 1)
+    }
 }
 
 /// A wall-clock moment, RFC 3339 on request via [`std::fmt::Display`].
