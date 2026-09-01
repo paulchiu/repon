@@ -192,6 +192,7 @@ mod tests {
             roots: vec![root.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         }];
         document
     }

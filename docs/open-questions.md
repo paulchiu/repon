@@ -120,6 +120,19 @@ names the surfaces it covers and does not claim the detail pane.
   test is widened to cover every `self.glyphs` hand-off.
 - **Owned by**: [`spec/theming.md`](spec/theming.md), which owns the one-table rule.
 
+## A Set cannot opt itself out of a top-level `on_refresh` hook
+
+`[[set]].on_refresh` lets a Set name its own hook, or none, and fall through to the
+top-level key; there is no way for a Set to say "not me" once a top-level key is
+declared, since every Set with no `on_refresh` of its own inherits it. No sentinel
+value (`""`, `false`) is invented to close this, on purpose: a sentinel is its own
+small schema decision, and nothing yet needs one.
+
+- **Reopens if**: someone actually wants a Set excluded from a top-level hook.
+- **Owned by**: [`spec/config.md`](spec/config.md#sets), which owns the field, and
+  [ADR 0029](adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)'s
+  amendment, which records the bound.
+
 ## The Set picker hides rows rather than scrolling at small frame sizes
 
 Framing the picker gave it an interior smaller than its area, so a frame too short for
