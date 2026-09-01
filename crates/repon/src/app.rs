@@ -1879,7 +1879,19 @@ impl App {
         self.render(tui)
     }
 
-    /// The already-scheduled render tick's one read of the Core's table: exactly one
+    /// The already-scheduled render tick: claims a frame from the terminal, hands it to
+    /// [`Self::draw_frame`], and reports whichever draw failed on the message channel.
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut error = None;
+        tui.draw(|frame| error = self.draw_frame(frame))?;
+        if let Some(err) = error {
+            self.message_tx
+                .send(Message::Error(format!("could not draw: {err:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// One whole frame, and the tick's one read of the Core's table: exactly one
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
     /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
     /// priority, each take the whole frame in place of everything else when open; otherwise
@@ -1890,16 +1902,24 @@ impl App {
     /// [`footer::draw`] renders the last row for whichever of `List` or `Detail` is focused.
     /// There is no permanently pinned bottom output pane: an Action's own output, once
     /// wired, lives inside the detail pane rather than a fourth region here.
-    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+    ///
+    /// A method rather than a closure inside [`Self::render`] so a test can drive these call
+    /// sites against a [`ratatui::Terminal<ratatui::backend::TestBackend>`]:
+    /// [`crate::tui::Tui`] hardcodes `CrosstermBackend<Stdout>`, and a test that cannot reach
+    /// here can only assert on each surface's own `draw`, which leaves what this method hands
+    /// them (the live glyph table, the live theme) pinned by nothing. Returns whichever draw
+    /// failed, for `render` to report, since the message channel is not this method's to send
+    /// on mid-frame.
+    fn draw_frame(&mut self, frame: &mut Frame) -> Option<color_eyre::Report> {
         let snapshot = self.core.snapshot();
         let pane_entity = self
             .pane
             .as_ref()
             .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
         let warnings = self.current_warnings();
-        // The identical computation `Self::choose_highlighted_action` reads: read once,
-        // before the frame-drawing closure below borrows `self` immutably, so the border
-        // title can never show a different number than a real choice would act on.
+        // The identical computation `Self::choose_highlighted_action` reads, taken once up
+        // front so the border title can never show a different number than a real choice
+        // would act on.
         let action_palette_operable_count = self.action_palette_operable_count();
         // The identical read `Self::choose_highlighted_launcher` does: the resolved Launcher
         // list and the cursor row's own name, computed once here for the same reason
@@ -1920,145 +1940,154 @@ impl App {
         // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
         // `y`/`n`/Esc. The behaviour is complete and tested; a themed modal matching
         // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
-        tui.draw(|frame| {
-            let area = frame.area();
-            // Help is a reading surface, not a chooser, so unlike a palette it always takes
-            // the whole frame rather than leaving anything visible around it
-            // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
-            if let Some(overlay) = &self.help {
-                overlay.draw(
-                    frame,
-                    area,
-                    self.focus,
-                    &self.bindings,
-                    &self.theme,
-                    self.glyphs,
-                );
-                return;
-            }
-            if self.warning_overlay_open {
-                warnings::draw_overlay(frame, area, &warnings, &self.theme);
-                return;
-            }
-            if let Some(palette) = &self.action_palette {
-                palette.draw(
-                    frame,
-                    area,
-                    &self.theme,
-                    &self.document.actions,
-                    action_palette_operable_count.unwrap_or(0),
-                );
-                return;
-            }
-            if let Some(picker) = &self.set_picker {
-                picker.draw(frame, area, &self.document.sets, &self.active_set.name);
-                return;
-            }
-            // The Filter narrowing this frame's list, live while `self.filter_line` is open
-            // ([`Self::active_filter`]), read once and handed to `self.list` before either of
-            // its own draw methods runs below.
-            let filter = self.active_filter();
-            self.list.set_filter(filter);
-            // The cursor, its viewport offset and the loaded theme, handed to `self.list`
-            // the same per-frame way as `filter` above, so the cursor row's highlight
-            // ([`theme::Theme::selection_style`]) and the window it is drawn in always
-            // reflect this tick's cursor and this run's resolved theme rather than whatever
-            // `List` was constructed with.
-            self.list.set_cursor(self.cursor);
-            self.list.set_offset(self.list_offset);
-            self.list.set_theme(self.theme);
-            // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
-            // `self.list` the same per-frame way as the cursor and the Filter above.
-            self.list.set_selection(self.selection.clone());
-            // A row for the Filter line takes real height only while it is open, shifting
-            // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
-            // screen: a change on a mode switch takes a real row").
-            let filter_row_height = if self.filter_line.is_some() { 1 } else { 0 };
-            let areas = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(filter_row_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            let status_area = areas[0];
-            let content_area = areas[1];
-            let filter_area = areas[2];
-            let footer_area = areas[3];
-            let status_row_content = self.status_row_content(&snapshot, &warnings);
-            draw_status_row(
+        let area = frame.area();
+        // Help is a reading surface, not a chooser, so unlike a palette it always takes
+        // the whole frame rather than leaving anything visible around it
+        // ([0008](../../docs/adr/0008-two-palettes-not-one.md)).
+        if let Some(overlay) = &self.help {
+            overlay.draw(
                 frame,
-                status_area,
-                self.notice(),
-                &status_row_content,
+                area,
+                self.focus,
                 &self.bindings,
                 &self.theme,
+                self.glyphs,
             );
-            match layout_state(content_area.width, pane_entity.is_some()) {
-                Layout3::ListOnly => {
-                    if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
-                        error = Some(err);
-                    }
-                }
-                Layout3::SideBySide => {
-                    let columns =
-                        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
-                            .split(content_area);
-                    if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
-                        error = Some(err);
-                    }
-                    if let Some(entity) = pane_entity {
-                        self.detail.draw(
-                            frame,
-                            columns[1],
-                            entity,
-                            self.glyphs,
-                            self.focus == Context::Detail,
-                            &self.theme,
-                        );
-                    }
-                }
-                Layout3::DetailOnly => {
-                    if let Some(entity) = pane_entity {
-                        self.detail.draw(
-                            frame,
-                            content_area,
-                            entity,
-                            self.glyphs,
-                            self.focus == Context::Detail,
-                            &self.theme,
-                        );
-                    }
-                }
-            }
-            if let Some(line) = &self.filter_line {
-                line.draw(frame, filter_area, &self.theme);
-            }
-            footer::draw(
-                frame,
-                footer_area,
-                self.footer_context(),
-                &self.bindings,
-                &self.theme,
-            );
-
-            // The Launcher palette overlays the base frame just drawn above, as a centred
-            // popup, rather than replacing it the way the three early returns above do
-            // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
-            // "The Launcher palette popup"): choosing a Launcher is a decision about the row
-            // under the cursor, and that row has to stay on screen while choosing.
-            if let Some(palette) = &self.launcher_palette {
-                let (launchers, entity_name) = launcher_palette_view
-                    .as_ref()
-                    .expect("computed above whenever launcher_palette is Some");
-                palette.draw(frame, area, &self.theme, launchers, entity_name);
-            }
-        })?;
-        if let Some(err) = error {
-            self.message_tx
-                .send(Message::Error(format!("could not draw: {err:?}")))?;
+            return None;
         }
-        Ok(())
+        if self.warning_overlay_open {
+            warnings::draw_overlay(frame, area, &warnings, &self.theme);
+            return None;
+        }
+        if let Some(palette) = &self.action_palette {
+            palette.draw(
+                frame,
+                area,
+                &self.theme,
+                &self.document.actions,
+                action_palette_operable_count.unwrap_or(0),
+                self.glyphs,
+            );
+            return None;
+        }
+        if let Some(picker) = &self.set_picker {
+            picker.draw(
+                frame,
+                area,
+                &self.document.sets,
+                &self.active_set.name,
+                &self.theme,
+                self.glyphs,
+            );
+            return None;
+        }
+        // The Filter narrowing this frame's list, live while `self.filter_line` is open
+        // ([`Self::active_filter`]), read once and handed to `self.list` before either of
+        // its own draw methods runs below.
+        let filter = self.active_filter();
+        self.list.set_filter(filter);
+        // The cursor, its viewport offset and the loaded theme, handed to `self.list`
+        // the same per-frame way as `filter` above, so the cursor row's highlight
+        // ([`theme::Theme::selection_style`]) and the window it is drawn in always
+        // reflect this tick's cursor and this run's resolved theme rather than whatever
+        // `List` was constructed with.
+        self.list.set_cursor(self.cursor);
+        self.list.set_offset(self.list_offset);
+        self.list.set_theme(self.theme);
+        // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
+        // `self.list` the same per-frame way as the cursor and the Filter above.
+        self.list.set_selection(self.selection.clone());
+        // A row for the Filter line takes real height only while it is open, shifting
+        // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
+        // screen: a change on a mode switch takes a real row").
+        let filter_row_height = if self.filter_line.is_some() { 1 } else { 0 };
+        let areas = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(filter_row_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let status_area = areas[0];
+        let content_area = areas[1];
+        let filter_area = areas[2];
+        let footer_area = areas[3];
+        let status_row_content = self.status_row_content(&snapshot, &warnings);
+        draw_status_row(
+            frame,
+            status_area,
+            self.notice(),
+            &status_row_content,
+            &self.bindings,
+            &self.theme,
+        );
+        match layout_state(content_area.width, pane_entity.is_some()) {
+            Layout3::ListOnly => {
+                if let Err(err) = self.list.draw(frame, content_area, &snapshot) {
+                    error = Some(err);
+                }
+            }
+            Layout3::SideBySide => {
+                let columns =
+                    Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
+                        .split(content_area);
+                if let Err(err) = self.list.draw_sidebar(frame, columns[0], &snapshot) {
+                    error = Some(err);
+                }
+                if let Some(entity) = pane_entity {
+                    self.detail.draw(
+                        frame,
+                        columns[1],
+                        entity,
+                        self.glyphs,
+                        self.focus == Context::Detail,
+                        &self.theme,
+                    );
+                }
+            }
+            Layout3::DetailOnly => {
+                if let Some(entity) = pane_entity {
+                    self.detail.draw(
+                        frame,
+                        content_area,
+                        entity,
+                        self.glyphs,
+                        self.focus == Context::Detail,
+                        &self.theme,
+                    );
+                }
+            }
+        }
+        if let Some(line) = &self.filter_line {
+            line.draw(frame, filter_area, &self.theme);
+        }
+        footer::draw(
+            frame,
+            footer_area,
+            self.footer_context(),
+            &self.bindings,
+            &self.theme,
+        );
+
+        // The Launcher palette overlays the base frame just drawn above, as a centred
+        // popup, rather than replacing it the way the three early returns above do
+        // ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s
+        // "The Launcher palette popup"): choosing a Launcher is a decision about the row
+        // under the cursor, and that row has to stay on screen while choosing.
+        if let Some(palette) = &self.launcher_palette {
+            let (launchers, entity_name) = launcher_palette_view
+                .as_ref()
+                .expect("computed above whenever launcher_palette is Some");
+            palette.draw(
+                frame,
+                area,
+                &self.theme,
+                launchers,
+                entity_name,
+                self.glyphs,
+            );
+        }
+        error
     }
 }
 
@@ -2755,6 +2784,97 @@ mod tests {
     }
 
     // =====================================================================================
+    // Ticket 167: every framed surface `App` draws takes its border from the glyph table
+    // `App` is holding, not from a table named at the call site. `App::draw_frame` is a
+    // method rather than a closure precisely so this can drive the real call sites against a
+    // `ratatui::Terminal<TestBackend>`, the same workaround `render_status_row` above uses.
+    // =====================================================================================
+
+    /// The whole frame `App` would put on the terminal this tick, drawn through the real
+    /// `draw_frame` so every argument it passes a surface is the one under test.
+    pub(crate) fn render_app_frame(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                app.draw_frame(frame);
+            })
+            .expect("draw the frame");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Opens each overlay `App` frames in turn and asserts the frame it draws, corners and
+    /// runs alike, is the one `self.glyphs` names. Hardcoding any one of these call sites to
+    /// `glyphs::FULL` renders `╭╮╰╯` where the panels under `glyphs = "ascii"` draw `+`, which
+    /// is issue 167's own screenshot with the tables swapped, and nothing else in the
+    /// workspace reads what `App` hands these three surfaces.
+    #[test]
+    fn every_overlay_app_frames_takes_its_border_from_the_glyph_table_app_is_holding() {
+        // No repo under the root, so discovery never produces an Entity and the two titles
+        // that read live state (the Action palette's operable count, the Launcher popup's
+        // Entity name) hold still while the frame is drawn.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let (width, height) = (60u16, 16u16);
+        let whole_frame = Rect::new(0, 0, width, height);
+
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let mut app = test_app(&root);
+            app.glyphs = glyphs;
+
+            app.help = Some(HelpOverlay::default());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                crate::help::BORDER_TITLE,
+                "the help overlay App drew",
+            );
+            app.help = None;
+
+            app.action_palette = Some(ActionPalette::new());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                &ActionPalette::border_title(0),
+                "the Action palette App drew",
+            );
+            app.action_palette = None;
+
+            app.set_picker = Some(SetPicker::new());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                crate::set_picker::BORDER_TITLE,
+                "the Set picker App drew",
+            );
+            app.set_picker = None;
+
+            let palette = LauncherPalette::new();
+            let launchers = crate::launcher::resolve(&app.document);
+            let popup = palette.popup_area(whole_frame, &launchers, "");
+            app.launcher_palette = Some(palette);
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                popup,
+                glyphs.border,
+                &LauncherPalette::border_title(""),
+                "the Launcher popup App drew",
+            );
+            app.launcher_palette = None;
+        }
+    }
+
     // Ticket 179: the help overlay is searchable, as a mode inside it rather than a switch
     // away from `Context::Overlay`. `/` (`Action::Search`) enters search mode; `Esc` there
     // leaves it and clears the query (one rung of help's own unwind ladder, one short of

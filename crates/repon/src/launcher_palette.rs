@@ -21,11 +21,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::Style,
-    widgets::{Block, Clear},
+    widgets::Clear,
 };
 
 use crate::{
     edit_buffer,
+    glyphs::{BorderScratch, GlyphSet},
     launcher::Launcher,
     theme::{Role, Theme},
 };
@@ -203,6 +204,13 @@ impl LauncherPalette {
         frame_area.centered(Constraint::Length(width), Constraint::Length(height))
     }
 
+    /// The title the popup draws into its own top border: the Entity the chosen Launcher
+    /// would act on, named once here so the popup's own width arithmetic and every reader of
+    /// the drawn title agree with what is drawn.
+    pub(crate) fn border_title(entity_name: &str) -> String {
+        format!(" {entity_name} ")
+    }
+
     /// Draws as a centred popup over `frame`, `entity_name` in the border title
     /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
     /// Launcher palette popup"). The first interior row is always the typed query and the
@@ -214,13 +222,16 @@ impl LauncherPalette {
         theme: &Theme,
         launchers: &[Launcher],
         entity_name: &str,
+        glyphs: &'static GlyphSet,
     ) {
         let popup = self.popup_area(area, launchers, entity_name);
         frame.render_widget(Clear, popup);
 
-        let block = Block::bordered()
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
             .border_style(theme.style_for(Role::BorderFocused))
-            .title(format!(" {entity_name} "));
+            .title(Self::border_title(entity_name));
         let interior = block.inner(popup);
         frame.render_widget(block, popup);
 
@@ -290,12 +301,13 @@ mod tests {
         launchers: &[Launcher],
         theme: &Theme,
         entity_name: &str,
+        glyphs: &'static GlyphSet,
     ) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), theme, launchers, entity_name))
+            .draw(|frame| palette.draw(frame, frame.area(), theme, launchers, entity_name, glyphs))
             .expect("draw the frame");
         terminal.backend().buffer().clone()
     }
@@ -359,7 +371,13 @@ mod tests {
             launcher("delta"),
         ];
         let palette = LauncherPalette::new();
-        let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let buf = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let interior = popup_interior(&palette, &launchers, "repo-a");
 
         let rendered: Vec<String> = (interior.y..interior.y + interior.height)
@@ -393,7 +411,13 @@ mod tests {
         let mut palette = LauncherPalette::new();
         palette.move_highlight(2, &launchers);
 
-        let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let buf = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let interior = popup_interior(&palette, &launchers, "repo-a");
         // Interior row 0 is the query line, row 1 "alpha", row 2 "beta", row 3 the cursor's
         // own "gamma".
@@ -407,7 +431,13 @@ mod tests {
     fn draw_names_the_one_entity_a_choice_would_act_on_in_the_border_title() {
         let launchers = vec![launcher("lazygit")];
         let palette = LauncherPalette::new();
-        let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "worktree-name");
+        let buf = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "worktree-name",
+            &crate::glyphs::FULL,
+        );
         let popup = palette.popup_area(frame_area(), &launchers, "worktree-name");
 
         assert!(
@@ -430,7 +460,16 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("create test terminal");
 
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), &theme, &launchers, "repo-a"))
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the frame");
 
         let buf = terminal.backend().buffer();
@@ -648,7 +687,13 @@ mod tests {
         }
         assert!(palette.choose(&[]).is_none());
 
-        let buf = draw_to_buffer(&palette, &[], &Theme::default(), "repo-a");
+        let buf = draw_to_buffer(
+            &palette,
+            &[],
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let interior = popup_interior(&palette, &[], "repo-a");
         assert!(
             row_text(&buf, interior.y + 1, 40).contains(NO_LAUNCHERS_CONFIGURED_MESSAGE),
@@ -683,7 +728,16 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("create test terminal");
 
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), &monochrome, &launchers, "repo-a"))
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &monochrome,
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the frame");
 
         let buf = terminal.backend().buffer();
@@ -711,7 +765,13 @@ mod tests {
         let launchers = vec![launcher("lazygit"), launcher("tuicr")];
         let mut palette = LauncherPalette::new();
 
-        let empty = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let empty = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let empty_interior = popup_interior(&palette, &launchers, "repo-a");
         assert!(
             !row_text(&empty, empty_interior.y, 40).contains("zzq"),
@@ -721,7 +781,13 @@ mod tests {
         for c in "zzq".chars() {
             palette.type_char(c, &launchers);
         }
-        let typed = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let typed = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let typed_interior = popup_interior(&palette, &launchers, "repo-a");
         assert!(
             row_text(&typed, typed_interior.y, 40).contains("zzq"),
@@ -730,7 +796,13 @@ mod tests {
         );
 
         palette.delete_previous_word(&launchers);
-        let cleared = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let cleared = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let cleared_interior = popup_interior(&palette, &launchers, "repo-a");
         assert!(
             !row_text(&cleared, cleared_interior.y, 40).contains("zzq"),
@@ -749,7 +821,13 @@ mod tests {
             palette.type_char(c, &launchers);
         }
 
-        let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let buf = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let interior = popup_interior(&palette, &launchers, "repo-a");
         let message_row = interior.y + 1;
 
@@ -781,9 +859,21 @@ mod tests {
         }
         let nothing_configured = LauncherPalette::new();
 
-        let no_match_buf = draw_to_buffer(&no_match, &some_launchers, &theme, "repo-a");
+        let no_match_buf = draw_to_buffer(
+            &no_match,
+            &some_launchers,
+            &theme,
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let no_match_interior = popup_interior(&no_match, &some_launchers, "repo-a");
-        let nothing_configured_buf = draw_to_buffer(&nothing_configured, &[], &theme, "repo-a");
+        let nothing_configured_buf = draw_to_buffer(
+            &nothing_configured,
+            &[],
+            &theme,
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let nothing_configured_interior = popup_interior(&nothing_configured, &[], "repo-a");
 
         assert_ne!(
@@ -802,16 +892,53 @@ mod tests {
         let launchers = vec![launcher("lazygit"), launcher("tuicr")];
         let mut palette = LauncherPalette::new();
         palette.type_char('l', &launchers);
-        let narrowed = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let narrowed = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let narrowed_interior = popup_interior(&palette, &launchers, "repo-a");
         assert!(!row_text(&narrowed, narrowed_interior.y + 2, 40).contains("tuicr"));
 
         palette.clear_line(&launchers);
 
-        let restored = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let restored = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
         let restored_interior = popup_interior(&palette, &launchers, "repo-a");
         assert!(row_text(&restored, restored_interior.y + 1, 40).contains("lazygit"));
         assert!(row_text(&restored, restored_interior.y + 2, 40).contains("tuicr"));
+    }
+
+    // --- The frame's own characters come from the glyph table, not ratatui's default ---
+
+    /// theming.md's "panel border" row: the popup frames itself with the active table's own
+    /// characters, the set the list and detail panes already draw, and degrades with them
+    /// under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded rounded
+    /// set would satisfy neither. The corners are read at the popup's own rect, not the
+    /// frame's, since the popup is centred rather than full-screen.
+    #[test]
+    fn draw_frames_the_popup_with_the_active_glyph_tables_own_border() {
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let launchers = vec![launcher("lazygit")];
+            let palette = LauncherPalette::new();
+            let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a", glyphs);
+            let popup = palette.popup_area(frame_area(), &launchers, "repo-a");
+
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                popup,
+                glyphs.border,
+                " repo-a ",
+                "the Launcher popup's frame",
+            );
+        }
     }
 
     // --- the popup: sized to content, clamped to the frame, `Clear` under it ---
@@ -836,7 +963,14 @@ mod tests {
                         Style::new(),
                     );
                 }
-                palette.draw(frame, area, &Theme::default(), &launchers, "repo-a");
+                palette.draw(
+                    frame,
+                    area,
+                    &Theme::default(),
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -880,7 +1014,14 @@ mod tests {
                         Style::new(),
                     );
                 }
-                palette.draw(frame, area, &Theme::default(), &launchers, "repo-a");
+                palette.draw(
+                    frame,
+                    area,
+                    &Theme::default(),
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -943,6 +1084,12 @@ mod tests {
 
         // Also proves `draw` itself never panics indexing past the frame with a list this
         // long, the behavioural half of the same criterion.
-        let _ = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a");
+        let _ = draw_to_buffer(
+            &palette,
+            &launchers,
+            &Theme::default(),
+            "repo-a",
+            &crate::glyphs::FULL,
+        );
     }
 }

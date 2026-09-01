@@ -479,6 +479,86 @@ pub(crate) fn incomplete_settled_known_destructures(source: &str) -> (usize, Vec
     (total, incomplete)
 }
 
+/// Asserts every cell of the frame drawn around `area`: the four corners *and* every cell of
+/// the four runs, since a [`border::Set`](ratatui::symbols::border::Set) names eight slots and
+/// a corner-only sample leaves the four runs asserted nowhere.
+///
+/// `title` is whatever the surface writes into its own top border, `""` for a frame with none;
+/// it is spliced in one column from the left corner, where ratatui's default title position
+/// puts it, so the horizontal run either side of it is still counted.
+pub(crate) fn assert_frame_drawn_with(
+    buf: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    border: crate::glyphs::Border,
+    title: &str,
+    surface: &str,
+) {
+    assert!(
+        area.width >= 2 && area.height >= 2,
+        "{surface}: a frame needs at least 2x2 to have a border at all, got {area:?}"
+    );
+    let crate::glyphs::Border {
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+        horizontal,
+        vertical,
+    } = border;
+
+    let row = |y: u16| -> String {
+        (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    };
+    let run = usize::from(area.width) - 2;
+    let title_width = title.chars().count();
+    assert!(
+        title_width <= run,
+        "{surface}: the title {title:?} does not fit between the corners of {area:?}, so this \
+         helper cannot say which cells of the top run it covers"
+    );
+    let expected_top = format!(
+        "{top_left}{title}{}{top_right}",
+        horizontal.to_string().repeat(run - title_width)
+    );
+    let expected_bottom = format!(
+        "{bottom_left}{}{bottom_right}",
+        horizontal.to_string().repeat(run)
+    );
+    assert_eq!(
+        row(area.y),
+        expected_top,
+        "{surface}: the whole top border, corners and horizontal run alike, must come from the \
+         glyph table"
+    );
+    assert_eq!(
+        row(area.bottom() - 1),
+        expected_bottom,
+        "{surface}: the whole bottom border, corners and horizontal run alike, must come from \
+         the glyph table"
+    );
+
+    let sides = (area.y + 1)..(area.bottom() - 1);
+    assert!(
+        !sides.is_empty(),
+        "{surface}: {area:?} has no row between its top and bottom borders, so the two vertical \
+         runs would go unchecked"
+    );
+    for y in sides {
+        assert_eq!(
+            buf[(area.x, y)].symbol(),
+            vertical.to_string(),
+            "{surface}: row {y} of the left border must come from the glyph table"
+        );
+        assert_eq!(
+            buf[(area.right() - 1, y)].symbol(),
+            vertical.to_string(),
+            "{surface}: row {y} of the right border must come from the glyph table"
+        );
+    }
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so

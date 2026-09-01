@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use ansi_to_tui::IntoText;
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use repon_core::{
     ActionReceipt, CaptureElision, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts,
     EntityState, Head, InProgressOperation, Kind, RunningStep, Settled, StepOutcome, StepResult,
@@ -33,14 +33,14 @@ use super::list::{
     worktree_state_word, write_cell_runs,
 };
 use crate::{
-    glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
+    glyphs::{BorderScratch, FULL_SPINNER_INTERVAL, GlyphSet},
     keys::Action,
     scroll::scroll_after,
     theme::{Meaning, Role, Theme},
 };
 
 /// Columns eaten by the pane's own border, subtracted from an area's width to get the
-/// interior [`Block::inner`] draws into: one column of `│` on each side.
+/// interior [`ratatui::widgets::Block::inner`] draws into: one column of `│` on each side.
 const BORDER_WIDTH: u16 = 2;
 
 /// The pane's own scroll position. Owns no content of its own: [`content_lines`] derives it
@@ -82,27 +82,14 @@ impl Detail {
         focused: bool,
         theme: &Theme,
     ) {
-        let border = glyphs.border;
-        let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
-            [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
-        );
-        let border_set = border::Set {
-            top_left: border.top_left.encode_utf8(&mut tl),
-            top_right: border.top_right.encode_utf8(&mut tr),
-            bottom_left: border.bottom_left.encode_utf8(&mut bl),
-            bottom_right: border.bottom_right.encode_utf8(&mut br),
-            vertical_left: border.vertical.encode_utf8(&mut vl),
-            vertical_right: border.vertical.encode_utf8(&mut vr),
-            horizontal_top: border.horizontal.encode_utf8(&mut ht),
-            horizontal_bottom: border.horizontal.encode_utf8(&mut hb),
-        };
         let role = if focused {
             Role::BorderFocused
         } else {
             Role::Border
         };
-        let block = Block::bordered()
-            .border_set(border_set)
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
             .border_style(theme.style_for(role))
             .title(" detail (esc closes) ");
         let interior = block.inner(area);
@@ -120,7 +107,7 @@ impl Detail {
 }
 
 /// `area_width` (the outer, bordered area) minus the one-column border on each side, the
-/// same subtraction [`Block::inner`] performs; kept as its own function so
+/// same subtraction [`ratatui::widgets::Block::inner`] performs; kept as its own function so
 /// [`Detail::content_len`]'s clamp and [`Detail::draw`]'s own `block.inner(area)` can never
 /// disagree about how wide the interior actually is.
 fn interior_width(area_width: u16) -> u16 {
@@ -1873,6 +1860,42 @@ mod tests {
             ratatui::style::Color::Rgb(9, 8, 7),
             "expected the focused border painted in the live theme's own colour"
         );
+    }
+
+    /// theming.md's "panel border" row: the pane frames itself with the active table's own
+    /// characters and degrades with it under `glyphs = "ascii"`, the same set every other
+    /// framed surface reads. Both tables in the one test, so a hardcoded copy of either
+    /// satisfies neither.
+    #[test]
+    fn draw_frames_the_pane_with_the_active_glyph_tables_own_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let detail = Detail::default();
+            let backend = TestBackend::new(40, 10);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+            terminal
+                .draw(|frame| {
+                    detail.draw(
+                        frame,
+                        frame.area(),
+                        &entity("a"),
+                        glyphs,
+                        true,
+                        &theme::DEFAULT,
+                    );
+                })
+                .expect("draw the frame");
+
+            crate::test_support::assert_frame_drawn_with(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, 40, 10),
+                glyphs.border,
+                " detail (esc closes) ",
+                "the detail pane's frame",
+            );
+        }
     }
 
     /// The rendering half of the criterion above: proves `draw` actually reads
