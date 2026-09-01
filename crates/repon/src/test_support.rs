@@ -1203,6 +1203,39 @@ mod tests {
         );
     }
 
+    // --- `dirty_counts` hands its own `cancel` flag straight into gix rather than only
+    // checking it before the read starts. A runtime assertion on the walk's outcome would
+    // race gix's own per-entry polling, so the presence half of the proof is a source scan
+    // instead, paired with `should_interrupt_owned_holds_its_own_clone_of_the_cancel_flag`
+    // in `repon-core`'s `git.rs`, which proves gix's own side of the contract.
+
+    /// `dirty_counts`'s own marked region (`// scan: dirty-counts-cancel begin`/`end` in
+    /// `repon-core/src/git.rs`) still passes its own `cancel` parameter to
+    /// `should_interrupt_owned`, rather than a mutation such as dropping the call or
+    /// substituting a fresh flag of its own. Paired with `git.rs`'s own
+    /// `should_interrupt_owned_holds_its_own_clone_of_the_cancel_flag`, which proves gix's
+    /// half (that the call, once made, actually holds the flag): neither half alone proves
+    /// the flag reaches gix from a real cancellation. `source_region` returning `None` fails
+    /// this test outright, so a renamed or deleted marker pair cannot read as "region empty,
+    /// nothing to find".
+    #[test]
+    fn dirty_counts_passes_its_own_cancel_flag_to_should_interrupt_owned() {
+        let core_source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../repon-core/src/git.rs"),
+        )
+        .expect("read repon-core's git.rs");
+        let region = source_region(&core_source, "dirty-counts-cancel")
+            .expect("git.rs carries the dirty-counts-cancel scan markers");
+
+        let normalised = normalised_production(&region);
+
+        assert!(
+            normalised.contains("should_interrupt_owned(cancel)"),
+            "expected dirty_counts's marked region to pass its own `cancel` parameter to \
+             `should_interrupt_owned`, found: {normalised:?}"
+        );
+    }
+
     // --- A `Settled::Known` destructure that hides a field behind `..` compiles silently
     // once a fourth field is added, and quietly ignores it forever.
 

@@ -550,10 +550,12 @@ pub(crate) fn dirty_counts(
     repo: &gix::Repository,
     cancel: Arc<AtomicBool>,
 ) -> Result<DirtyCounts, ProbeError> {
+    // scan: dirty-counts-cancel begin
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|error| ProbeError::Status(error.to_string().into()))?
         .should_interrupt_owned(cancel);
+    // scan: dirty-counts-cancel end
     let iter = platform
         .into_index_worktree_iter(Vec::new())
         .map_err(|error| ProbeError::Status(error.to_string().into()))?;
@@ -1332,18 +1334,17 @@ mod tests {
         assert_eq!(counts, DirtyCounts::default());
     }
 
-    /// `refresh.md`'s "Cancellation" says this phase hands `cancel` straight into gix rather
-    /// than only checking it before the read starts, unlike phases A and B. Asserting on a
-    /// pre-set flag's outcome is not a deterministic edge of that, despite this test once
-    /// claiming otherwise: gix polls `should_interrupt` per index entry rather than before
-    /// every read, so a walk with few enough entries can finish before ever consulting it and
-    /// return `Ok` regardless of the flag. What is provable without racing a walk is that the
-    /// flag actually reaches gix at all: `should_interrupt_owned` takes the `Arc` by value and
-    /// holds it in the platform it returns, so its strong count rises by exactly one for as
-    /// long as that platform lives. A mutation that dropped the `should_interrupt_owned` call
-    /// entirely, the one this test exists to catch, leaves the count unchanged.
+    /// gix's own contract for `should_interrupt_owned`: it takes the `Arc` by value and holds
+    /// it in the platform it returns, rather than merely borrowing it, so the platform's strong
+    /// count rises by exactly one for as long as it lives. This is half of the proof that
+    /// `dirty_counts` threads `cancel` into gix; the other half, that `dirty_counts` actually
+    /// calls `should_interrupt_owned` with its own `cancel` parameter, is
+    /// `dirty_counts_passes_its_own_cancel_flag_to_should_interrupt_owned` in
+    /// `crates/repon/src/test_support.rs`. Neither test alone proves the flag reaches gix from
+    /// a real cancellation; asserting on the outcome of a walk instead would race it, which is
+    /// what this test replaced.
     #[test]
-    fn dirty_counts_threads_the_cancel_flag_into_gix() {
+    fn should_interrupt_owned_holds_its_own_clone_of_the_cancel_flag() {
         let dir = tempfile::tempdir().expect("temp dir");
         init_repo_with_a_commit(dir.path());
         let repo = open_thread_safe(dir.path())
