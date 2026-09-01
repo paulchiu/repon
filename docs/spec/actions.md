@@ -239,6 +239,24 @@ While the detail pane is open beside the list, moving the cursor re-targets it. 
 
 The single `Progress:` line is the bare-`\r` rule from Capture doing its work: the frames collapsed to the last one. The elision line is the head-plus-tail bound naming what it dropped.
 
+## The refresh hook
+
+The top-level `on_refresh` key names one declared `[[action]]`, and Repon runs it after a Refresh the user asked for. `r` and `R`, and nothing else: not the periodic fetch's own completion Generation, not terminal focus gained, not a resume. This is a trigger for everything above, unchanged. The same executor, the same PTY, the same environment contract, the same receipt; nothing here is a second way to run a command. The reasoning is [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)'s, and the fields are [the config spec](config.md)'s.
+
+The restriction is the design rather than a simplification, and two independent things fix it. [0002](../adr/0002-repon-owns-the-outer-loop-only.md) limits Repon's mutating operations to the narrowest safe cases, which "The Selection and the gate" above already reconciles with an Action: 0002 governs what Repon decides to do unbidden, never what the user asks for. A script fired by `r` is asked for, and one fired by a two second background tick is not. And a Generation-triggered hook is a literal infinite loop, because "Refreshing around a run" above says an Action finishing starts a fresh Generation, which would fire the hook again, forever, one child per Repo per cycle.
+
+The hook fans out over the rows the Refresh that fired it covers: every known Entity for `r`, the Selection for `R`. The Refresh itself still starts, and the hook fires after it, so the two rules already in force compose into refresh, script, refresh: starting an Action cancels the in-flight Generation, and finishing one starts a fresh Generation over everything.
+
+Three more rules.
+
+There is no confirm gate, whatever the entry's own `confirm` says. `r` is the confirmation, and a dialog on every refresh is unusable. The same entry chosen from the palette still asks, so `confirm`'s default is untouched and only its scope is stated: it governs the palette, never this trigger.
+
+The hook yields rather than queueing. One Action runs at a time, and `r` stays live during a run (it is not among the five keys that go inert below), so a Refresh pressed mid-run refreshes and the hook simply does not fire. Nothing is remembered and the next `r` runs it.
+
+A nonzero step stands as a Warning, the surface that already ranks and expands ([theming.md](theming.md)'s "Warnings and Notices"). Every other Action is watched, with run progress on the status row and the `!` gutter plus `n` and `N` under "Finding the failures" above; a hook fired by a refresh has none of that attention on it, and an unattended script whose failure nobody sees defeats the point. The condition is derived from the live receipts rather than latched, so a later run clears it with nothing to reset.
+
+An `on_refresh` naming an Action no `[[action]]` declares is a load warning on the existing warnings path, never an exit and never silence.
+
 ## Cancellation, suspend and quit
 
 Esc cancels the fan-out, the first level of the unwind [keybindings.md](keybindings.md) fixes. Teardown is one SIGTERM to each step's process group, then SIGKILL to the group after a grace, because SIGTERM is trappable: measured, `trap '' TERM; sleep 300` survives SIGTERM and dies on SIGKILL (rc -9). The grace is 350ms, the budget GNU parallel's default `--term-seq` (`TERM,200,TERM,100,TERM,50,KILL,25`) spends on TERM pulses before KILL. A step that was running becomes `Cancelled`; so does a step, or a whole entity's run, that had not started, since `NotRun` is reserved for being blocked by an earlier failure.

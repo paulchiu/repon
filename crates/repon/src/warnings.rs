@@ -1,6 +1,7 @@
 //! The one shared warning population [config.md](../../../../docs/spec/config.md) amends
-//! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings, an
-//! abandoned discovery and vanished entities fold into one [`Warning`] list. This module is
+//! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings, a
+//! failed `on_refresh` hook, an abandoned discovery and vanished entities fold into one
+//! [`Warning`] list. This module is
 //! an item source for [`crate::status_row`], not a renderer: [`slot_line`] computes the
 //! single most severe warning's own text, the same text the status row shows as its rank-2
 //! item while any condition is unacknowledged, and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
@@ -8,16 +9,17 @@
 //! the overlay is its own screen rather than an item in the status row's list
 //! ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
 //! [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" fixes the
-//! population to these four **standing conditions of the session**: a bound-but-unbuilt key
-//! the user just pressed was a fourth source here until
+//! population to these **standing conditions of the session**: a bound-but-unbuilt key
+//! the user just pressed was a source here until
 //! [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
 //! removed it, since a reply to a keystroke is not a standing condition and this module never
 //! clears one on its own; [`crate::notice`] is where that reply now lives instead. Vanished
-//! entities are the real fourth source, an abandoned discovery's mirror: an
-//! abandoned walk means rows may be missing, and a Vanished row means one is present that no
-//! longer exists. Unlike the other three, this source is never latched: [`WarningSources`] is
-//! built fresh every frame from the live snapshot, so the condition clears itself the instant
-//! the last Vanished row is dismissed or rediscovered, with nothing to reset by hand.
+//! entities are an abandoned discovery's mirror: an abandoned walk means rows may be missing,
+//! and a Vanished row means one is present that no longer exists. Vanished and the failed
+//! `on_refresh` hook are the two sources never latched: [`WarningSources`] is built fresh
+//! every frame from the live snapshot, so each condition clears itself the instant the last
+//! Vanished row is dismissed or rediscovered, or a later run replaces the failed receipts,
+//! with nothing to reset by hand.
 //!
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
@@ -32,14 +34,21 @@ use crate::{
     theme::{self, Theme},
 };
 
-/// Every source the shared warning slot can carry, one variant per source. Adding a fifth
+/// Every source the shared warning slot can carry, one variant per source. Adding another
 /// source means adding a variant here, which leaves [`Warning::rank`] and [`Warning`]'s own
 /// `Display` impl refusing to compile until the new variant is folded in: neither match below
-/// has a catch-all arm, so a fifth source cannot go silently unranked.
+/// has a catch-all arm, so a new source cannot go silently unranked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Warning {
     Theme(theme::ThemeWarning),
     Config(config::document::Warning),
+    /// The Action `on_refresh` names, and how many rows its last run left holding a failed
+    /// step. A hook fired by `r` runs unattended, so nothing else on screen is watching it
+    /// ([actions.md](../../../../docs/spec/actions.md)'s "The refresh hook").
+    OnRefreshFailed {
+        action: String,
+        entities: usize,
+    },
     DiscoveryAbandoned(String),
     /// How many Entities are currently Vanished
     /// rows present that no longer
@@ -52,19 +61,24 @@ impl Warning {
     /// Higher ranks are more severe. Ranked by how much of what is already on screen the
     /// condition puts in doubt: a Vanished row and an abandoned walk are ranked together at
     /// the top, one meaning rows on screen no longer exist and the other meaning rows are
-    /// missing from it, a config warning means some of this session's own behaviour silently
-    /// fell back to a default, and a theme warning is cosmetic only.
+    /// missing from it, a failed `on_refresh` hook means something the user asked Repon to
+    /// run did not finish, a config warning means some of this session's own behaviour
+    /// silently fell back to a default, and a theme warning is cosmetic only.
     /// [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" states the
     /// population in this same order, least severe first, which this module's own
     /// `rank_matches_theming_mds_own_severity_order` test pins this match against rather than
-    /// restating the order by hand. Exhaustive by construction: a fifth [`Warning`] variant
+    /// restating the order by hand. Exhaustive by construction: another [`Warning`] variant
     /// leaves this `match` refusing to compile until it is ranked too.
     fn rank(&self) -> u8 {
         match self {
             Warning::Theme(_) => 1,
             Warning::Config(_) => 2,
-            Warning::DiscoveryAbandoned(_) => 3,
-            Warning::Vanished(_) => 4,
+            Warning::OnRefreshFailed {
+                action: _,
+                entities: _,
+            } => 3,
+            Warning::DiscoveryAbandoned(_) => 4,
+            Warning::Vanished(_) => 5,
         }
     }
 }
@@ -74,6 +88,9 @@ impl std::fmt::Display for Warning {
         match self {
             Warning::Theme(warning) => write!(f, "{warning}"),
             Warning::Config(warning) => write!(f, "{warning}"),
+            Warning::OnRefreshFailed { action, entities } => {
+                write!(f, "on_refresh `{action}` failed a step on {entities} rows")
+            }
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
             Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
         }
@@ -89,6 +106,11 @@ impl std::fmt::Display for Warning {
 pub(crate) struct WarningSources {
     pub(crate) theme: Vec<theme::ThemeWarning>,
     pub(crate) config: Vec<config::document::Warning>,
+    /// The Action `on_refresh` names, paired with how many rows its last run left holding a
+    /// failed step. `None` with no hook declared; a zero count contributes no warning, so
+    /// the condition clears itself the moment a later run replaces those receipts, the same
+    /// unlatched shape `vanished` below takes.
+    pub(crate) on_refresh_failed: Option<(String, usize)>,
     pub(crate) discovery_abandoned: Option<String>,
     /// How many Entities are Vanished right now, read fresh from the live snapshot every
     /// time this struct is built rather than latched, which is what lets the condition clear
@@ -104,11 +126,15 @@ impl WarningSources {
         let WarningSources {
             theme,
             config,
+            on_refresh_failed,
             discovery_abandoned,
             vanished,
         } = self;
         let mut warnings: Vec<Warning> = theme.into_iter().map(Warning::Theme).collect();
         warnings.extend(config.into_iter().map(Warning::Config));
+        if let Some((action, entities)) = on_refresh_failed.filter(|(_, entities)| *entities > 0) {
+            warnings.push(Warning::OnRefreshFailed { action, entities });
+        }
         warnings.extend(
             discovery_abandoned
                 .into_iter()
@@ -247,6 +273,13 @@ mod tests {
         Warning::Vanished(count)
     }
 
+    fn on_refresh_failed(entities: usize) -> Warning {
+        Warning::OnRefreshFailed {
+            action: "sync".to_string(),
+            entities,
+        }
+    }
+
     // --- WarningSources: the compile-time forcing function ---
 
     #[test]
@@ -256,6 +289,7 @@ mod tests {
                 key: "x".to_string(),
             }],
             config: vec![document::Warning::SetNamedAll],
+            on_refresh_failed: Some(("sync".to_string(), 3)),
             discovery_abandoned: Some("discovery: stopped at 5 directories".to_string()),
             vanished: 2,
         };
@@ -267,6 +301,7 @@ mod tests {
             vec![
                 theme_unknown_key("x"),
                 config_set_named_all(),
+                on_refresh_failed(3),
                 discovery_abandoned(5),
                 vanished(2),
             ]
@@ -278,6 +313,9 @@ mod tests {
         let sources = WarningSources {
             theme: Vec::new(),
             config: Vec::new(),
+            // A declared hook whose last run failed on nothing is the zero this asserts
+            // contributes no warning, exactly as a zero Vanished count does.
+            on_refresh_failed: Some(("sync".to_string(), 0)),
             discovery_abandoned: None,
             vanished: 0,
         };
@@ -663,11 +701,12 @@ mod tests {
 
     /// [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" names the
     /// warning slot's population in one sentence, least severe standing condition first: "a
-    /// theme that half-applied, a config key that fell back, an abandoned discovery, entities
-    /// that vanished and are still listed". Reads that sentence at test time and asserts
-    /// [`Warning::rank`] increases in the same order, rather than hand-copying "theme, config,
-    /// discovery, vanished" into the assertion, which would let this test and `rank` drift
-    /// independently of the document both are supposed to agree with.
+    /// theme that half-applied, a config key that fell back, an `on_refresh` Action whose
+    /// last run failed a step, an abandoned discovery, entities that vanished and are still
+    /// listed". Reads that sentence at test time and asserts [`Warning::rank`] increases in
+    /// the same order, rather than hand-copying the order into the assertion, which would let
+    /// this test and `rank` drift independently of the document both are supposed to agree
+    /// with.
     #[test]
     fn rank_matches_theming_mds_own_severity_order() {
         let theming = spec("theming.md");
@@ -681,8 +720,8 @@ mod tests {
         let clauses: Vec<&str> = clauses_text.split(", ").collect();
         assert_eq!(
             clauses.len(),
-            4,
-            "expected theming.md to name exactly the four standing conditions `Warning` has \
+            5,
+            "expected theming.md to name exactly the five standing conditions `Warning` has \
              variants for, got: {clauses:?}"
         );
 
@@ -691,6 +730,8 @@ mod tests {
             .map(|clause| {
                 if clause.contains("theme") {
                     theme_unknown_key("x").rank()
+                } else if clause.contains("on_refresh") {
+                    on_refresh_failed(1).rank()
                 } else if clause.contains("config") {
                     config_set_named_all().rank()
                 } else if clause.contains("discovery") {

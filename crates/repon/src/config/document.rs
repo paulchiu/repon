@@ -220,6 +220,11 @@ pub struct Document {
     /// as the only ways to clear one.
     #[serde(with = "humantime_serde")]
     pub notice_timeout: Duration,
+    /// The name of the one declared `[[action]]` a Refresh the user asked for runs after
+    /// it ([actions.md](../../../../docs/spec/actions.md)'s "The refresh hook"). A name no
+    /// `[[action]]` declares is [`Warning::OnRefreshNamesNoAction`] at load rather than an
+    /// exit, so a typo costs the hook and nothing else.
+    pub on_refresh: Option<String>,
     pub refresh: RefreshConfig,
     pub fetch: FetchConfig,
     pub auto_update: AutoUpdateConfig,
@@ -247,6 +252,7 @@ impl Default for Document {
             show_worktrees: true,
             show_submodules: false,
             notice_timeout: Duration::from_secs(3),
+            on_refresh: None,
             refresh: RefreshConfig::default(),
             fetch: FetchConfig::default(),
             auto_update: AutoUpdateConfig::default(),
@@ -275,6 +281,8 @@ pub enum Warning {
     /// `fetch.enabled` on a build that carries no fetch mechanism, which is equally inert
     /// and equally silent without this.
     FetchEnabledButNotBuilt,
+    /// `on_refresh` naming an Action no `[[action]]` declares, so the hook can never fire.
+    OnRefreshNamesNoAction { name: String },
 }
 
 impl std::fmt::Display for Warning {
@@ -302,6 +310,10 @@ impl std::fmt::Display for Warning {
             Warning::AutoUpdateWithoutFetch => write!(
                 f,
                 "auto_update.enabled is true but fetch.enabled is false, so auto-update can never fire"
+            ),
+            Warning::OnRefreshNamesNoAction { name } => write!(
+                f,
+                "on_refresh names `{name}`, which no [[action]] declares, so nothing runs after a refresh"
             ),
         }
     }
@@ -614,7 +626,7 @@ fn duplicate<'a, T>(
     None
 }
 
-/// The four checks [config.md](../../../../docs/spec/config.md#cross-key-validity) runs at
+/// The checks [config.md](../../../../docs/spec/config.md#cross-key-validity) runs at
 /// load, each a warning rather than an exit. Run against the sets as declared, before the
 /// implicit `all` Set (if any) is added, since that Set always matches everything under the
 /// working directory and warning about it would say nothing useful.
@@ -627,6 +639,15 @@ fn cross_key_warnings(document: &Document) -> Vec<Warning> {
 
     if document.auto_update.enabled && !document.fetch.enabled {
         warnings.push(Warning::AutoUpdateWithoutFetch);
+    }
+
+    if let Some(name) = document.on_refresh.as_ref().filter(|name| {
+        !document
+            .actions
+            .iter()
+            .any(|action| action.name.get_ref() == *name)
+    }) {
+        warnings.push(Warning::OnRefreshNamesNoAction { name: name.clone() });
     }
 
     for set in &document.sets {
@@ -1400,6 +1421,57 @@ mod tests {
     fn auto_update_with_fetch_does_not_warn() {
         let loaded = parse_ok("[fetch]\nenabled = true\n\n[auto_update]\nenabled = true\n");
         assert!(!loaded.warnings.contains(&Warning::AutoUpdateWithoutFetch));
+    }
+
+    // Cross-key check: `on_refresh` naming an Action no `[[action]]` declares. A typo here
+    // costs the whole hook, and a hook that never fires is exactly the silence a warning
+    // exists for; it is a warning rather than an exit, because every other value in the file
+    // is still usable (docs/spec/config.md's "Cross-key validity").
+    #[test]
+    fn on_refresh_naming_an_undeclared_action_warns_rather_than_failing_the_load() {
+        let loaded = parse_ok("on_refresh = \"sync\"\n");
+
+        assert!(
+            loaded.warnings.contains(&Warning::OnRefreshNamesNoAction {
+                name: "sync".to_string(),
+            }),
+            "got: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(loaded.document.on_refresh.as_deref(), Some("sync"));
+    }
+
+    #[test]
+    fn on_refresh_naming_a_declared_action_does_not_warn() {
+        let loaded = parse_ok(
+            "on_refresh = \"sync\"\n\n[[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::OnRefreshNamesNoAction { name: _ })),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    /// The key left out entirely is the zero-config shape, and must not warn about an Action
+    /// nobody named: a warning here would stand on every default install.
+    #[test]
+    fn an_absent_on_refresh_key_warns_about_nothing_and_defaults_to_none() {
+        let loaded = parse_ok("theme = \"default\"\n");
+
+        assert_eq!(loaded.document.on_refresh, None);
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::OnRefreshNamesNoAction { name: _ })),
+            "got: {:?}",
+            loaded.warnings
+        );
     }
 
     // Cross-key check: a [[set]] named `all` warns, and the declaration still wins (it is
