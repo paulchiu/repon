@@ -1123,6 +1123,7 @@ mod tests {
             "Set picker",
             "Reload config",
             "Set switch",
+            "Edit config",
         ] {
             let text = action_running_notice(what);
             assert!(

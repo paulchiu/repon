@@ -41,6 +41,7 @@ pub(crate) enum Action {
     /// `1` to `9`: which Set to switch to.
     SwitchToSet(u8),
     ReloadConfig,
+    EditConfig,
     MoveFocusBetweenListAndDetail,
     Unwind,
 
@@ -158,6 +159,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::OpenSetPicker => "Open the Set picker",
         Action::SwitchToSet(_) => "Switch to the Nth declared Set",
         Action::ReloadConfig => "Reload config",
+        Action::EditConfig => "Edit config.toml in `$EDITOR`",
         Action::MoveFocusBetweenListAndDetail => "Move focus between list and detail",
         Action::Unwind => "Unwind one level",
         Action::MoveDown => "Move down",
@@ -403,6 +405,12 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char('r'),
         CTRL,
         Action::ReloadConfig,
+    ),
+    binding(
+        Context::Global,
+        KeyCode::Char('e'),
+        NONE,
+        Action::EditConfig,
     ),
     binding(
         Context::Global,
@@ -815,6 +823,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::OpenSetPicker => "open_set_picker",
         Action::SwitchToSet(_) => return None,
         Action::ReloadConfig => "reload_config",
+        Action::EditConfig => "edit_config",
         Action::MoveFocusBetweenListAndDetail => "move_focus_between_list_and_detail",
         Action::Unwind => "unwind",
         Action::MoveDown => "move_down",
@@ -1459,6 +1468,52 @@ mod tests {
 
         #[test]
         fn suspended_in_confirm() {
+            assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
+        }
+    }
+
+    /// `e` (`Action::EditConfig`) is free across every context: Global's own row fires it
+    /// while `list` or `detail` has focus, `input`'s printable catch-all claims it as text
+    /// rather than leaking the Global action through, and `overlay` and `confirm` bind no
+    /// `e` of their own and so answer with silence. The only other `e` in the table is
+    /// `Ctrl+E` (`OpenInEditor`, `input`), a different chord entirely, so this and that row
+    /// never compete for the same keystroke.
+    mod e_is_free_across_every_context {
+        use super::*;
+
+        const PROBE: (KeyCode, KeyModifiers) = (KeyCode::Char('e'), NONE);
+
+        #[test]
+        fn fires_edit_config_in_list() {
+            assert_eq!(
+                dispatch(Context::List, press(PROBE.0, PROBE.1)),
+                Some(Action::EditConfig)
+            );
+        }
+
+        #[test]
+        fn fires_edit_config_in_detail() {
+            assert_eq!(
+                dispatch(Context::Detail, press(PROBE.0, PROBE.1)),
+                Some(Action::EditConfig)
+            );
+        }
+
+        #[test]
+        fn is_plain_text_in_input_rather_than_the_global_action() {
+            assert_eq!(
+                dispatch(Context::Input, press(PROBE.0, PROBE.1)),
+                Some(Action::Text('e'))
+            );
+        }
+
+        #[test]
+        fn is_unbound_in_overlay() {
+            assert_eq!(dispatch(Context::Overlay, press(PROBE.0, PROBE.1)), None);
+        }
+
+        #[test]
+        fn is_unbound_in_confirm() {
             assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
         }
     }

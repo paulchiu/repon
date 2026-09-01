@@ -38,6 +38,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `s` | Open the Set picker |
 | `1` to `9` | Switch to the Nth declared Set |
 | `Ctrl+R` | Reload config |
+| `e` | Edit config.toml in `$EDITOR` |
 | `Tab` | Move focus between list and detail |
 | `Esc` | Unwind one level |
 
@@ -124,7 +125,7 @@ An **unavailable** binding is Built, is advertised exactly as it always is, and 
 
 The reason is computed at the point of refusal rather than fixed per action, since `;` refusing because no Actions are configured and `;` refusing because none of the selected Repos define one are different facts. Each reason's static text is authored to fit 44 columns, half the narrow screen, and a test asserts the budget rather than the renderer truncating to it.
 
-Four surfaces are already conditional in this way. While an Action is fanning out, the Action palette (`;`, and `m`, which opens the same palette filtered to the management operations), `s`, `1` to `9` and `Ctrl+R` are inert, and each now answers with a Notice rather than the silence it gives today.
+Five surfaces are already conditional in this way. While an Action is fanning out, the Action palette (`;`, and `m`, which opens the same palette filtered to the management operations), `s`, `1` to `9`, `Ctrl+R` and `e` are inert, and each now answers with a Notice rather than the silence it gives today.
 
 ### Not built yet
 
@@ -139,6 +140,8 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 `!` for the Launcher palette was settled in [0008](../adr/0008-two-palettes-not-one.md). `;` for the Action palette comes from mutt, whose generic map binds `!` to shell-escape and `;` to tag-prefix, "apply the next command to everything tagged". That is the same one-target versus N-target split, in a tool that has shipped it for thirty years. `;` is unshifted home row while `!` is Shift+1, so they are far apart under the fingers, which is what 0008 actually asks for. `@` was rejected despite reading well as "across", because Shift+2 sits directly beside Shift+1 and the whole requirement is that the two keys not be one slip apart. The cost of `;` is real: it is bound in lf, yazi, nnn, ranger and helix with five different meanings, so its prior is inconsistent rather than absent.
 
 `m` for management is free rather than fought over: it is unbound in Repon today, and `Ctrl+M` is already reserved as permanently unbindable because terminals deliver it as `Enter`, which does not reach the unmodified key. It opens the same palette `;` opens rather than a third one, so it adds a filter and not a surface, and [0008](../adr/0008-two-palettes-not-one.md)'s boundary is unmoved: management fans out over the Selection and can do damage, which puts it on the Action palette's side of the split.
+
+`e` for editing `config.toml` is free the same way: unbound in Global, List, Detail, Overlay and Confirm, and the table's only other `e` is `Ctrl+E` (`OpenInEditor`, the ad hoc command field's own `input`-context chord), which does not collide because it is a different chord and a mnemonically consistent one at that.
 
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
@@ -162,7 +165,7 @@ Esc-twice gestures were measured safe against human typing: crossterm collapses 
 
 ## Quitting, suspending, confirming
 
-`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;` and `m`, `s`, `1` to `9` and `Ctrl+R` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out, because quitting orphans the children. `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out is in flight `;` and `m`, `s`, `1` to `9`, `Ctrl+R` and `e` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself, and `e` ends in the identical reload; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
 
 The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
 
@@ -177,6 +180,12 @@ When the Selection is empty, an Action and a Launcher both act on the cursor row
 The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+E` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
 
 What such a command does when it runs, how its lines gate, and what its output looks like are settled in [actions.md](actions.md), which makes it argv split with `shell-words` rather than a shell string, because [0007](../adr/0007-launchers-are-argv-vectors.md) puts the shell behind an explicit flag and an ad hoc command has no config entry in which to show one. This spec fixes only the keys that reach it.
+
+## Editing config.toml
+
+`e` opens the resolved config file (`repon config`'s own first line) in `$EDITOR`, through the same handoff machinery the ad hoc command field's own `Ctrl+E` uses (`editor::edit`), and reloads through the identical path `Ctrl+R` runs once the editor returns. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) bans Repon rewriting `config.toml` programmatically; handing the file to the user's own editor and writing back exactly what it returned is not that, the same way `git commit` hands a message file to `$EDITOR` without git composing the message.
+
+If the file does not exist yet, which is the zero-config default, the editor opens on the annotated example `repon config --example` prints, so the first edit starts from something readable rather than an empty buffer, and the edited text is written to the resolved path (creating its directory if needed) rather than discarded.
 
 ## The footer
 
@@ -254,7 +263,7 @@ A `[keys]` block in config.toml, one sub-table per context. The merge is per con
 
 The collision case is the one worth explaining. [theming.md](theming.md) refused to make glyphs themeable because [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md)'s disjointness is a correctness property that no flat TOML schema can express to someone editing the file. A key collision is the same class of property with one difference: it can be checked at load. So it is checked rather than forbidden. [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) sharpens the contrast rather than removing it: glyph disjointness can be checked earlier still, at compile time, precisely because glyph sets are never user-supplied and there is nothing at load to check. The same assertion runs over the compiled-in default map at startup in debug builds, because the default map can grow a collision in review just as easily as a config file can.
 
-`Ctrl+R` reloads config and can therefore change the keyboard mid-session, which is the whole reason the footer is derived rather than written.
+`Ctrl+R` reloads config and can therefore change the keyboard mid-session, which is the whole reason the footer is derived rather than written. `e` opens the resolved config file in `$EDITOR` and reloads through this same path on return, so a `[keys]` block edited there takes effect exactly the same way.
 
 ## Terminal state
 
