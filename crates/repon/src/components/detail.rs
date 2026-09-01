@@ -482,13 +482,72 @@ fn captured_output_lines(output: &[u8], interior_width: u16) -> Vec<ContentLine>
     let wrap_width = (interior_width as usize).saturating_sub(CAPTURED_OUTPUT_INDENT.len());
     let mut lines = Vec::new();
     for line in parse_output_lines(output) {
-        for row in wrap_output_line(&line, wrap_width) {
+        let expanded = expand_tabs(&line);
+        for row in wrap_output_line(&expanded, wrap_width) {
             let mut runs = vec![(CAPTURED_OUTPUT_INDENT.to_string(), Style::default())];
             runs.extend(row);
             lines.push(ContentLine::Raw(runs));
         }
     }
     lines
+}
+
+/// A terminal's own fixed tab-stop width, matching the columnar `ls` output
+/// [issue #177](https://github.com/paulchiu/repon/issues/177) was raised against: a tab
+/// advances to the next multiple of 8 columns, never a fixed number of characters.
+const TAB_STOP: usize = 8;
+
+/// Expands every tab in `line` to the spaces reaching its next [`TAB_STOP`]-column stop,
+/// measured from column 0 of `line` itself, before wrapping and before
+/// [`CAPTURED_OUTPUT_INDENT`] is prepended: the child that wrote the tab knows nothing of
+/// either, so measuring against the wrapped, indented screen row would misalign every stop
+/// by the indent's own width and reset the count at an arbitrary wrap boundary the child
+/// never saw. Each inserted space keeps the style of the run the tab came from, so a tab
+/// inside a coloured span still colours the space it becomes (ADR 0018, "Captured colours
+/// are rendered rather than stripped").
+///
+/// Walks each span's own graphemes with [`unicode_segmentation`] directly rather than
+/// [`ratatui::text::Line::styled_graphemes`]: that method's own `Span::styled_graphemes`
+/// filters every control character out of the stream it yields
+/// (`ratatui_core`'s `span.rs`, `.filter(|g| !g.contains(char::is_control))`), which drops a
+/// raw tab before this function would ever see it, silently, with no line or symbol left
+/// behind to expand. Each span's own resolved style is `line.style` patched with that
+/// span's own style, the same two-step patch `styled_graphemes` itself performs.
+fn expand_tabs(line: &ratatui::text::Line<'static>) -> ratatui::text::Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut runs: Vec<(String, Style)> = Vec::new();
+    let mut column = 0usize;
+    for span in &line.spans {
+        let style = Style::default().patch(line.style).patch(span.style);
+        for grapheme in span.content.as_ref().graphemes(true) {
+            if grapheme == "\t" {
+                let width = TAB_STOP - (column % TAB_STOP);
+                column += width;
+                push_run(&mut runs, &" ".repeat(width), style);
+            } else {
+                column += ratatui::text::Span::raw(grapheme).width();
+                push_run(&mut runs, grapheme, style);
+            }
+        }
+    }
+    ratatui::text::Line::from(
+        runs.into_iter()
+            .map(|(text, style)| ratatui::text::Span::styled(text, style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Appends `text` onto `runs`' last run when it already carries `style`, splitting into a
+/// new run only where the style actually changes: the one merge rule [`expand_tabs`] and
+/// [`wrap_output_line`] both need, kept in one place so they cannot drift apart.
+fn push_run(runs: &mut Vec<(String, Style)>, text: &str, style: Style) {
+    match runs.last_mut() {
+        Some((existing_text, existing_style)) if *existing_style == style => {
+            existing_text.push_str(text)
+        }
+        _ => runs.push((text.to_string(), style)),
+    }
 }
 
 /// `output` parsed into ratatui lines carrying the child's own real colour
@@ -525,10 +584,7 @@ fn wrap_output_line(
         }
         let style = strip_colour_if_disabled(grapheme.style);
         let row = rows.last_mut().expect("rows always holds at least one row");
-        match row.last_mut() {
-            Some((text, existing)) if *existing == style => text.push_str(grapheme.symbol),
-            _ => row.push((grapheme.symbol.to_string(), style)),
-        }
+        push_run(row, grapheme.symbol, style);
         row_width += symbol_width;
     }
     rows
@@ -1975,6 +2031,320 @@ mod tests {
         );
     }
 
+    // --- Criterion 6 (issue #177): a tab advances to the next 8-column stop, not a fixed
+    // width, measured from the output line's own start ---
+
+    /// The ticket's own risk analysis: a single tab looks the same under a correct
+    /// implementation and a fixed-width one, since the first stop is the same either way.
+    /// Two tabs at different starting columns, with the middle field long enough to cross a
+    /// stop on its own, are needed to tell them apart: `"ab"` (column 2) takes 6 spaces to
+    /// reach column 8, and `"cdefghijkl"` (10 characters, crossing the column-16 stop) takes
+    /// 6 more to reach column 24, not the same width either time and not a multiple of the
+    /// field's own length.
+    #[test]
+    fn a_tab_advances_to_the_next_eight_column_stop_not_a_fixed_width() {
+        let output = b"ab\tcdefghijkl\tmn\n".to_vec();
+
+        let lines = captured_output_lines(&output, interior_width(104));
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected the one output line to stay one rendered row"
+        );
+        let ContentLine::Raw(runs) = &lines[0] else {
+            panic!("expected a Raw content line, got {:?}", lines[0]);
+        };
+        let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(
+            text,
+            format!("{CAPTURED_OUTPUT_INDENT}ab      cdefghijkl      mn"),
+            "expected each tab to reach the next 8-column stop counted from the line's own \
+             start, got {text:?}"
+        );
+    }
+
+    /// Inserted tab spaces keep the style of the run the tab itself came from, not the run
+    /// before or after it: colour brackets only the tab here (`a` and `b` are both default
+    /// style, the tab alone is red), so a wrong implementation that copied a neighbouring
+    /// run's style rather than the tab's own would still pass a test that coloured the whole
+    /// line one colour.
+    #[test]
+    fn a_tabs_inserted_spaces_keep_the_style_of_the_run_the_tab_came_from() {
+        use ratatui::style::Color;
+
+        // `wrap_output_line`'s own colour stripping reads the same process-global flag the
+        // colour-capability tests toggle; without this lock this test's own `Color::Red`
+        // assertion below races them.
+        let _guard = COLOUR_CAPABILITY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crossterm::style::force_color_output(true);
+
+        let output = b"a\x1b[31m\t\x1b[0mb\n".to_vec();
+
+        let lines = captured_output_lines(&output, interior_width(104));
+
+        let ContentLine::Raw(runs) = &lines[0] else {
+            panic!("expected a Raw content line, got {:?}", lines[0]);
+        };
+        let (tab_run_text, tab_run_style) = runs[1..]
+            .iter()
+            .find(|(text, _)| text.chars().all(|ch| ch == ' ') && !text.is_empty())
+            .expect("expected a run of spaces from the expanded tab");
+        assert_eq!(
+            tab_run_text.len(),
+            7,
+            "expected the tab (starting at column 1, after 'a') to reach column 8 with 7 \
+             spaces, got {tab_run_text:?}"
+        );
+        assert_eq!(
+            tab_run_style.fg,
+            Some(Color::Red),
+            "expected the tab's own inserted spaces to carry the tab's own colour"
+        );
+        for (text, style) in runs {
+            if text == "a" || text == "b" {
+                assert_ne!(
+                    style.fg,
+                    Some(Color::Red),
+                    "expected the untouched letters either side of the tab to keep their own \
+                     default style, not the tab's"
+                );
+            }
+        }
+    }
+
+    /// Real pty bytes, captured once and committed here rather than typed by hand, per the
+    /// ticket's own warning that a hand-written expected string risks writing exactly what
+    /// the implementation under test produces: `ls` run under a pty sized 120x40 (the same
+    /// width `repon-core`'s own `executor.rs` opens every step's pty at, `PTY_WIDTH`), over a
+    /// fresh directory holding exactly the five files named below. Names were chosen so real
+    /// `ls` crosses several tab stops at different starting columns, per the ticket's risk
+    /// analysis that two short adjacent names alone would look aligned under both a correct
+    /// and a fixed-width implementation. Captured with:
+    ///
+    /// ```text
+    /// python3 -c "
+    /// import pty, os, fcntl, termios, struct, tempfile
+    /// d = tempfile.mkdtemp()
+    /// for n in ['ab', 'abcdefghij', 'longlonglonglongname', 'mid1234', 'x']:
+    ///     open(os.path.join(d, n), 'w').close()
+    /// master, slave = pty.openpty()
+    /// fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+    /// pid = os.fork()
+    /// if pid == 0:
+    ///     os.setsid(); os.dup2(slave, 0); os.dup2(slave, 1); os.dup2(slave, 2)
+    ///     os.chdir(d); os.execvp('ls', ['ls'])
+    /// else:
+    ///     os.close(slave)
+    ///     data = b''
+    ///     while True:
+    ///         chunk = os.read(master, 4096)
+    ///         if not chunk: break
+    ///         data += chunk
+    ///     os.waitpid(pid, 0)
+    ///     print(repr(data))
+    /// "
+    /// ```
+    ///
+    /// run against macOS's own `/bin/ls`, `\r\n` line ending included exactly as captured.
+    const REAL_LS_PTY_CAPTURE: &[u8] =
+        b"ab\t\t\tabcdefghij\t\tlonglonglonglongname\tmid1234\t\t\tx\r\n";
+
+    /// The ticket's other named criterion: real `ls` output under a pty renders with its
+    /// columns aligned, checked by comparing where each name actually lands on screen rather
+    /// than by string equality against a blob this test authored. A fixed number of spaces
+    /// per tab (the ticket's own named wrong fix) cannot reproduce these positions: `"ab"`
+    /// needs 22 spaces of padding to reach the next stop, `"abcdefghij"` needs 14,
+    /// `"longlonglonglongname"` needs 4 and `"mid1234"` needs 17, so no single per-tab
+    /// constant reaches column 24, 48, 72 and 96 all at once, though real `ls` happened to
+    /// pick a uniform 24-column field width here, which is why the gap between each pair of
+    /// names comes out equal even though the padding behind each one does not.
+    #[test]
+    fn real_ls_output_under_a_pty_keeps_its_columns_tab_stop_aligned() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "list",
+            vec![step_result(
+                "ls",
+                StepOutcome::Ok,
+                REAL_LS_PTY_CAPTURE,
+                Duration::from_millis(1),
+            )],
+            None,
+        ));
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+        let backend = TestBackend::new(150, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(frame, frame.area(), &row, glyphs, true, &theme::DEFAULT);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let names = ["ab", "abcdefghij", "longlonglonglongname", "mid1234", "x"];
+        let mut positions = Vec::new();
+        let mut row_y = None;
+        for name in names {
+            let (x, y) = find_text(buf, buf.area, name).unwrap_or_else(|| {
+                panic!("expected to find {name:?} rendered somewhere in the pane")
+            });
+            match row_y {
+                Some(expected_y) => assert_eq!(
+                    y, expected_y,
+                    "expected every name on the same rendered row, {name:?} landed on a \
+                     different one"
+                ),
+                None => row_y = Some(y),
+            }
+            positions.push(x);
+        }
+        let gaps: Vec<u16> = positions.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(
+            gaps,
+            vec![24, 24, 24, 24],
+            "expected each name's start column to match real tab-stop arithmetic, got \
+             positions {positions:?}"
+        );
+
+        // No stray CR artifact from the pty's own carriage-return-plus-newline line ending:
+        // nothing but blank cells follows "x" up to the pane's own right border, excluding
+        // the border column itself.
+        let last_x = positions.last().expect("at least one position") + 1;
+        let border_x = buf.area.width - 1;
+        let trailing: String = (last_x..border_x)
+            .map(|x| buf[(x, row_y.expect("a row was found"))].symbol())
+            .collect();
+        assert_eq!(
+            trailing.trim(),
+            "",
+            "expected nothing but blank cells after the last name, got {trailing:?}"
+        );
+    }
+
+    // --- Criterion 7 (issue #177): a step whose output is elided says so on screen ---
+
+    /// Whether the elision line actually reaches this pane at all, proven by really
+    /// overrunning `repon-core`'s own head-plus-tail capture bound through a real Action
+    /// rather than typing the words `docs/spec/actions.md`'s own mock shows: a step that
+    /// echoes 3,000 lines is bound to exceed that bound however many lines it actually keeps,
+    /// so this needs no restated number of its own to compare against. The rendered pane is
+    /// dumped and searched by text, not by constructing the exact bytes
+    /// `repon_core::executor`'s own (private) `elision_line` would produce, since restating
+    /// that wording here is exactly the single-source-of-truth risk this project's own
+    /// defect history warns about.
+    #[test]
+    fn a_step_whose_output_is_elided_says_so_on_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use repon_core::{ActionSpec, Core, CoreSpec, FetchSpec, SetSpec, Step};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let status = Command::new("git")
+            .arg("init")
+            .args(["--quiet", "--initial-branch", "main"])
+            .arg(&root)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        git(&root, &["commit", "--allow-empty", "-m", "first"]);
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root.clone()],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+            fetch: FetchSpec {
+                enabled: false,
+                interval: Duration::from_secs(3600),
+                concurrency: 4,
+            },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
+        });
+        let key = core.snapshot().entities[0].key.clone();
+
+        let steps = vec![Step {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "i=1; while [ \"$i\" -le 3000 ]; do echo \"line $i\"; i=$((i+1)); done".to_string(),
+            ],
+            shell: false,
+            env: Vec::new(),
+        }];
+        let started = core.run_action(
+            ActionSpec {
+                label: Arc::from("flood"),
+                name: None,
+                steps,
+                concurrency: 1,
+            },
+            std::slice::from_ref(&key),
+        );
+        assert!(started, "expected the flooding Action to start");
+        let finished = wait_until(Duration::from_secs(15), || !core.action_running());
+        assert!(finished, "expected the flooding step to actually finish");
+
+        let entity = core.snapshot().entities[0].clone();
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+        let backend = TestBackend::new(120, 450);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                detail.draw(frame, frame.area(), &entity, glyphs, true, &theme::DEFAULT);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let screen = dump_screen(buf, buf.area);
+        let elision_line = screen
+            .lines()
+            .find(|line| line.contains("lines elided"))
+            .unwrap_or_else(|| {
+                panic!("expected an elision line somewhere on screen, got:\n{screen}")
+            });
+        let dropped_count: usize = elision_line
+            .split_whitespace()
+            .find_map(|word| word.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                panic!("expected a number naming the dropped count in {elision_line:?}")
+            });
+        assert!(
+            dropped_count > 0 && dropped_count < 3_000,
+            "expected a plausible dropped-line count between 0 and 3,000, got {dropped_count}"
+        );
+    }
+
+    /// A local `wait_until`, the same shape `app.rs`'s own test module already carries: this
+    /// module has no reason to import that one across a module boundary just to poll a
+    /// `bool`-returning condition on its own thread.
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if condition() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     // --- Criterion 2: the child's own colour is parsed at render time, in this crate ---
 
     /// Captured colour reaches the rendered buffer as the child's own real colour: the raw
@@ -2115,5 +2485,22 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Renders `buf`'s own cells back to plain text, one line per row, trailing blanks
+    /// trimmed: the actual evidence a test that only asserts never produces, kept separate
+    /// from [`find_text`] so a caller wanting the whole rendered screen for a report does not
+    /// have to reassemble it by hand.
+    fn dump_screen(buf: &Buffer, area: Rect) -> String {
+        let mut screen = String::new();
+        for y in area.top()..area.bottom() {
+            let mut row = String::new();
+            for x in area.left()..area.right() {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            screen.push_str(row.trim_end());
+            screen.push('\n');
+        }
+        screen
     }
 }
