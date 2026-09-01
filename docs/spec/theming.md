@@ -113,7 +113,7 @@ The theme is read at startup and read again on resume, both from a Launcher retu
 
 ### What the switch is for
 
-The key is `glyphs = "full" | "ascii"` in `config.toml`, which [the config spec](config.md) fixes as a bare top-level key beside `theme`, default `"full"`, re-applying immediately on reload. It describes the terminal rather than the user's taste, which is why it is not in a theme file.
+The key is `glyphs = "full" | "ascii"` in `config.toml`, which [the config spec](config.md) fixes as a bare top-level key beside `theme`, re-applying immediately on reload. Its default is conditional rather than fixed: `ascii` on the Linux console's own `TERM=linux`, `full` otherwise, and an explicit value in the file always overrides either way. It describes the terminal rather than the user's taste, which is why it is not in a theme file.
 
 The natural claim, that `full` requires a font carrying box drawing (U+2500), braille (U+2800) and the arrows and bullet in the value set, is wrong in both directions. Across the five macOS system monospace faces (SF Mono, Menlo, Monaco, Andale Mono, Courier New):
 
@@ -216,7 +216,9 @@ And one limit no check can reach: on the Linux console the kernel's fallback tab
 
 ### What was refused
 
-No `glyphs = "auto"`, no third value, no `TERM` sniffing, no runtime probe. One switch and two vetted sets is what keeps the vetting obligation finite; a third set is a third proof, and an environment-derived set is an unbounded family of them. tig gates its equivalent switch on the locale codeset, which is real precedent, but the probes are worse than the setting: tmux answers a cursor-position report from its own pane grid, so a probe measures the multiplexer rather than the terminal, and vim's probe, the only shipped one, clobbers two screen rows before the first frame.
+No `glyphs = "auto"`, no third value, no runtime probe. One switch and two vetted sets is what keeps the vetting obligation finite; a third set is a third proof, and an environment-derived set is an unbounded family of them. tig gates its equivalent switch on the locale codeset, which is real precedent, but the probes are worse than the setting: tmux answers a cursor-position report from its own pane grid, so a probe measures the multiplexer rather than the terminal, and vim's probe, the only shipped one, clobbers two screen rows before the first frame.
+
+This left the `full` default wrong for exactly one terminal class: the Linux virtual console's kernel fallback table rewrites the braille spinner and several other `full` glyphs onto other gutter marks (recorded above and in [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s own "one limit no check can reach"). The default is now conditional on that one signal, `TERM=linux`, rather than fixed to `full`; this narrows the refusal above rather than reversing it. What stays refused is a table of terminal emulator names, since unlike the Linux console's fixed and documented substitution table, an emulator's own mapping is neither fixed nor knowable, and a wrong guess built on one is worse than the manual switch it would replace. `config.md`'s `glyphs` entry has the exact rule.
 
 ## The two palettes
 
