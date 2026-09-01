@@ -7478,7 +7478,11 @@ mod tests {
     }
 
     /// A `println!` or `eprintln!` anywhere a warning is gathered, logged or drawn would
-    /// bypass `tracing`'s file-only writer entirely.
+    /// bypass `tracing`'s file-only writer entirely. A scan over this crate's own source, so
+    /// it is structurally blind to a dependency writing to fd 2 directly
+    /// (`gix-transport`'s ssh stderr supervisor is the motivating case): `Tui::enter`'s
+    /// fd-level redirect guards against that instead, proven at the fd level in
+    /// `tests/terminal_restoration.rs` rather than by a second scan here.
     #[test]
     fn no_warning_path_calls_println_or_eprintln_anywhere_in_this_crates_production_source() {
         let legitimate_producers = [("main.rs", "print_config_paths"), ("errors.rs", "init")];
