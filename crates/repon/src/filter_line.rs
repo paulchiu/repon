@@ -5,8 +5,9 @@
 //! edit buffer, the completion list built from the term under the cursor, and how both draw.
 //!
 //! Deferred rather than built here, and recorded so nobody mistakes the gap for an oversight:
-//! the `?` unrecognised-term advisory slot, and the footer's placement one row above this one
-//! at every width the ladder documents.
+//! the footer's placement one row above this one at every width the ladder documents.
+
+use std::ops::Range;
 
 use ratatui::{Frame, buffer::Buffer, layout::Rect, widgets::Clear};
 use repon_core::Filter;
@@ -14,6 +15,11 @@ use repon_core::Filter;
 use crate::edit_buffer;
 use crate::list_viewport::offset_following_cursor;
 use crate::theme::{Role, Theme};
+
+/// `/` plus the space after it: the caret's own column while [`FilterLine::input`] is empty,
+/// since nothing has been painted yet to measure a cursor position off. Once there is typed
+/// text [`FilterLine::draw`] reads the caret's column back from what it painted instead.
+const PROMPT_WIDTH: u16 = 2;
 
 /// The completion overlay's own cap, whatever the terminal's height
 /// ([filter.md](../../../docs/spec/filter.md#screen-placement): "capped at 8 rows and
@@ -55,6 +61,26 @@ pub(crate) struct FilterLine {
     /// carry over.
     highlight: usize,
     completion_offset: usize,
+}
+
+/// Splits `text` at `warn_ranges`' own boundaries (byte offsets into `text`, already sorted
+/// and non-overlapping since Filter terms never overlap), pairing each piece with whether it
+/// falls inside one of them. What lets [`FilterLine::draw`] paint an unrecognised term in
+/// [`Role::Warn`] without re-deriving which term that is: `warn_ranges` already names it.
+fn warn_split<'a>(text: &'a str, warn_ranges: &[Range<usize>]) -> Vec<(&'a str, bool)> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for range in warn_ranges {
+        if range.start > cursor {
+            segments.push((&text[cursor..range.start], false));
+        }
+        segments.push((&text[range.start..range.end], true));
+        cursor = range.end;
+    }
+    if cursor < text.len() {
+        segments.push((&text[cursor..], false));
+    }
+    segments
 }
 
 /// The row's own text while [`FilterLine::input`] is empty, replaced by the prompt character
@@ -218,17 +244,66 @@ impl FilterLine {
     }
 
     /// Draws the line at `area`'s own row: a leading `/` marking the surface, then either the
-    /// typed text in [`Role::Text`] or, while empty, [`QUERY_PLACEHOLDER`] in [`Role::Dim`].
-    /// `area` is expected to be exactly one row tall ([filter.md](../../../docs/spec/filter.md):
-    /// "one real row directly above the footer").
+    /// typed text in [`Role::Text`] or, while empty, [`QUERY_PLACEHOLDER`] in [`Role::Dim`];
+    /// an unrecognised term within the typed text paints in [`Role::Warn`] instead
+    /// ([filter.md](../../../docs/spec/filter.md): "the offending term itself takes the
+    /// `warn` role"). The rightmost column is the fixed advisory slot, `?` in [`Role::Warn`]
+    /// when [`repon_core::Filter::unrecognised_ranges`] is non-empty and a plain space
+    /// otherwise, so the typed text itself gets one column less than `area`'s own width.
+    /// The caret lands at the end of the typed text (or right after the prompt while empty),
+    /// clamped so it never advances past the advisory column, however long the typed text.
+    /// `area` is expected to be exactly one row tall
+    /// ([filter.md](../../../docs/spec/filter.md): "one real row directly above the footer").
     pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        if area.width == 0 {
+            return;
+        }
+        let text_width = area.width - 1;
+        let advisory_x = area.x + text_width;
+
+        if self.input.is_empty() {
+            let buf: &mut Buffer = frame.buffer_mut();
+            buf.set_stringn(
+                area.x,
+                area.y,
+                QUERY_PLACEHOLDER,
+                text_width as usize,
+                theme.style_for(Role::Dim),
+            );
+            buf.set_stringn(advisory_x, area.y, " ", 1, theme.style_for(Role::Dim));
+            frame.set_cursor_position(((area.x + PROMPT_WIDTH).min(advisory_x), area.y));
+            return;
+        }
+
+        let unrecognised = self.live_filter().unrecognised_ranges();
         let buf: &mut Buffer = frame.buffer_mut();
-        let (line, style) = if self.input.is_empty() {
-            (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
+        let (mut x, _) = buf.set_stringn(
+            area.x,
+            area.y,
+            "/ ",
+            text_width as usize,
+            theme.style_for(Role::Text),
+        );
+        for (segment, warn) in warn_split(&self.input, &unrecognised) {
+            if x >= advisory_x {
+                break;
+            }
+            let style = theme.style_for(if warn { Role::Warn } else { Role::Text });
+            let (next_x, _) = buf.set_stringn(x, area.y, segment, (advisory_x - x) as usize, style);
+            x = next_x;
+        }
+
+        let (glyph, glyph_role) = if unrecognised.is_empty() {
+            (" ", Role::Dim)
         } else {
-            (format!("/ {}", self.input), theme.style_for(Role::Text))
+            ("?", Role::Warn)
         };
-        buf.set_stringn(area.x, area.y, &line, area.width as usize, style);
+        buf.set_stringn(advisory_x, area.y, glyph, 1, theme.style_for(glyph_role));
+
+        // `x` is already where the last painted segment left off, the same cell-width
+        // accounting `set_stringn` used to lay out every glyph, clamped at every step to
+        // `advisory_x`: no separate width measurement can disagree with it.
+        frame.set_cursor_position((x.min(advisory_x), area.y));
     }
 
     /// Draws the completion overlay into `area`, one candidate per row, the highlighted one
@@ -265,7 +340,7 @@ impl FilterLine {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position};
 
     use super::*;
 
@@ -280,6 +355,22 @@ mod tests {
             .draw(|frame| line.draw(frame, frame.area(), theme))
             .expect("draw the frame");
         terminal.backend().buffer().clone()
+    }
+
+    /// Same as [`draw_to_buffer`], but also hands back where [`FilterLine::draw`] left the
+    /// caret, at whatever row width the test needs.
+    fn draw_with_cursor(
+        line: &FilterLine,
+        theme: &Theme,
+        width: u16,
+    ) -> (ratatui::buffer::Buffer, Position) {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| line.draw(frame, frame.area(), theme))
+            .expect("draw the frame");
+        let cursor = terminal.backend().cursor_position();
+        (terminal.backend().buffer().clone(), cursor)
     }
 
     fn row_text(buf: &ratatui::buffer::Buffer) -> String {
@@ -321,6 +412,172 @@ mod tests {
             theme.text,
             "typed text must paint in the text role, not dim"
         );
+    }
+
+    // --- The caret ---
+
+    #[test]
+    fn the_caret_sits_right_after_the_prompt_while_the_line_is_empty() {
+        let theme = Theme::default();
+        let line = FilterLine::new(&committed(""));
+        let (_, cursor) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(cursor, Position::new(PROMPT_WIDTH, 0));
+    }
+
+    #[test]
+    fn the_caret_sits_at_the_end_of_the_typed_text() {
+        let theme = Theme::default();
+        let line = typed("kind:worktree");
+        let (_, cursor) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(
+            cursor,
+            Position::new(PROMPT_WIDTH + "kind:worktree".len() as u16, 0)
+        );
+    }
+
+    /// A further keystroke has to move the caret along with it, not leave it pinned where
+    /// the line opened: this is what tells a caret that tracks `self.input` apart from one
+    /// drawn once at a fixed column.
+    #[test]
+    fn the_caret_advances_by_one_column_per_typed_character() {
+        let theme = Theme::default();
+        let mut line = typed("kind");
+        let (_, before) = draw_with_cursor(&line, &theme, 40);
+        line.type_char(':');
+        let (_, after) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(after.x, before.x + 1);
+    }
+
+    /// Typed text longer than the line must not push the caret past the advisory column,
+    /// which is what would happen at an unclamped `area.x + PROMPT_WIDTH + width`.
+    #[test]
+    fn the_caret_clamps_at_the_advisory_column_when_typed_text_overflows_the_line() {
+        let theme = Theme::default();
+        let line = typed(&"x".repeat(50));
+        let (_, cursor) = draw_with_cursor(&line, &theme, 10);
+        assert_eq!(
+            cursor.x, 9,
+            "width 10's advisory column is index 9; the caret must not run past it"
+        );
+    }
+
+    // --- The advisory slot ---
+
+    #[test]
+    fn the_advisory_slot_is_a_space_at_the_lines_own_right_end_when_every_term_is_recognised() {
+        let theme = Theme::default();
+        for width in [15, 24, 40] {
+            let line = typed("kind:worktree");
+            let buf = draw_with_cursor(&line, &theme, width).0;
+            let last = buf.area.width - 1;
+            assert_eq!(
+                buf[(last, 0)].symbol(),
+                " ",
+                "width {width}: advisory column {last} must be a space when nothing is \
+                 unrecognised"
+            );
+        }
+    }
+
+    #[test]
+    fn the_advisory_slot_carries_a_question_mark_when_a_term_is_unrecognised() {
+        let theme = Theme::default();
+        for width in [15, 24, 40] {
+            let line = typed("is:banana");
+            let buf = draw_with_cursor(&line, &theme, width).0;
+            let last = buf.area.width - 1;
+            assert_eq!(
+                buf[(last, 0)].symbol(),
+                "?",
+                "width {width}: advisory column {last} must carry `?` for `is:banana`"
+            );
+            assert_eq!(
+                buf[(last, 0)].fg,
+                theme.warn,
+                "the `?` itself paints in the warn role"
+            );
+        }
+    }
+
+    /// `docs/spec/filter.md`'s own worked example (`is:` is "a keyed term with an empty
+    /// value") is unrecognised too, not only a misspelled one.
+    #[test]
+    fn an_empty_value_on_a_known_key_also_trips_the_advisory() {
+        let theme = Theme::default();
+        let line = typed("is:");
+        let buf = draw_to_buffer(&line, &theme);
+        let last = buf.area.width - 1;
+        assert_eq!(buf[(last, 0)].symbol(), "?");
+    }
+
+    /// `kimd:repo` is a name term by the grammar's own rule (an unrecognised key falls back
+    /// to a name search), not an unrecognised one, so it must not trip the advisory.
+    #[test]
+    fn an_unrecognised_key_reinterpreted_as_a_name_term_does_not_trip_the_advisory() {
+        let theme = Theme::default();
+        let line = typed("kimd:repo");
+        let buf = draw_to_buffer(&line, &theme);
+        let last = buf.area.width - 1;
+        assert_eq!(buf[(last, 0)].symbol(), " ");
+    }
+
+    /// The offending term paints in `warn`; the rest of the line, including a term typed
+    /// after it, stays in `text`.
+    #[test]
+    fn the_offending_term_paints_warn_and_the_rest_of_the_line_stays_in_text() {
+        let theme = Theme::default();
+        let line = typed("kind:repo is:banana name:x");
+        let buf = draw_to_buffer(&line, &theme);
+
+        let prefix_and_first_term = PROMPT_WIDTH as usize + "kind:repo".len();
+        for x in PROMPT_WIDTH as usize..prefix_and_first_term {
+            assert_eq!(
+                buf[(x as u16, 0)].fg,
+                theme.text,
+                "the recognised term at column {x} must stay in the text role"
+            );
+        }
+
+        let offender_start = prefix_and_first_term + 1; // the space between terms
+        let offender_end = offender_start + "is:banana".len();
+        for x in offender_start..offender_end {
+            assert_eq!(
+                buf[(x as u16, 0)].fg,
+                theme.warn,
+                "`is:banana` at column {x} must paint in the warn role"
+            );
+        }
+
+        for x in offender_end..buf.area.width as usize - 1 {
+            assert_eq!(
+                buf[(x as u16, 0)].fg,
+                theme.text,
+                "text after the offending term at column {x} must return to the text role"
+            );
+        }
+    }
+
+    /// Typed text can never reach the reserved advisory column, whatever the width: the
+    /// budget each painted run is given already stops one short of it.
+    #[test]
+    fn typed_text_never_overwrites_the_reserved_advisory_column() {
+        let line = typed("abcd");
+        let buf = draw_to_buffer(&line, &Theme::default());
+        let last = buf.area.width - 1;
+        assert_eq!(buf[(last, 0)].symbol(), " ");
+    }
+
+    /// A row zero cells wide cannot host a prompt, typed text or an advisory column; `draw`
+    /// must not panic on it.
+    #[test]
+    fn drawing_into_a_zero_width_area_does_not_panic() {
+        let theme = Theme::default();
+        let line = typed("kind:repo");
+        let backend = TestBackend::new(0, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| line.draw(frame, frame.area(), &theme))
+            .expect("draw the frame");
     }
 
     #[test]
