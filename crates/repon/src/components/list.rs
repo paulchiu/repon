@@ -48,6 +48,16 @@ const BRANCH_CELL_OBJECT_ID_WIDTH: usize = 9;
 /// puts between every column, gutter included.
 const GAP: u16 = 1;
 
+/// Shown in place of the row list once `row_order` is empty and no Filter is narrowing the
+/// view: nothing was discovered, rather than everything being filtered out
+/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "An empty result says so rather
+/// than rendering blank", which both palettes already follow for their own empty state).
+const NO_REPOS_MESSAGE: &str = "no repos";
+/// The same row's text once an active Filter matches nothing: the same word the Launcher and
+/// Action palettes already use for their own zero-match state
+/// ([filter.md](../../../../docs/spec/filter.md): "zero matches is legal and not an error").
+const NO_MATCHES_MESSAGE: &str = "no matches";
+
 const GUTTER_X: u16 = 0;
 const SELECTED_X: u16 = GUTTER_X + GUTTER_WIDTH + GAP;
 const NAME_X: u16 = SELECTED_X + SELECTED_WIDTH + GAP;
@@ -183,6 +193,28 @@ impl List {
             self.show_submodules,
             &self.filter,
         );
+        if row_order.is_empty() {
+            // Nothing to draw below the header: say so rather than leaving a bordered box
+            // with no rows, indistinguishable from a hang. Which sentence depends on whether
+            // a Filter is the reason nothing is showing.
+            let message = if self.filter.is_active() {
+                NO_MATCHES_MESSAGE
+            } else {
+                NO_REPOS_MESSAGE
+            };
+            let y = interior.y + first_row;
+            if y < interior.bottom() {
+                write_cell(
+                    buf,
+                    interior,
+                    interior.x,
+                    y,
+                    interior.width,
+                    message,
+                    theme::DEFAULT.style_for(theme::Role::Dim),
+                );
+            }
+        }
         // Clamped against the real row count rather than trusted as-is: a stale `self.offset`
         // (computed against a wider table, before a filter narrowed this one) must never
         // blank the list, so this stops one row short of `row_order.len()` rather than at it,
@@ -2081,6 +2113,63 @@ mod tests {
         assert!(
             top_row.contains("repos"),
             "expected the title inline in the top border row, got: {top_row:?}"
+        );
+    }
+
+    /// Defect 1: nothing discovered (an empty snapshot, no Filter) reads distinctly from
+    /// everything being filtered out, both against the design of record's own rule
+    /// (keybindings.md's "An empty result says so rather than rendering blank").
+    #[test]
+    fn an_empty_snapshot_says_so_rather_than_rendering_an_empty_box() {
+        let terminal = render(140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(
+                buf,
+                absolute_x(0),
+                entity_row_y(0),
+                NO_REPOS_MESSAGE.len() as u16
+            ),
+            NO_REPOS_MESSAGE,
+            "an empty snapshot with no Filter must say so on the first row below the header"
+        );
+    }
+
+    /// The other half of defect 1: a Filter narrowing the view to zero rows must say a
+    /// different thing than an empty snapshot, per filter.md's "zero matches is legal and
+    /// not an error": the two are different facts and the row must not conflate them.
+    #[test]
+    fn a_filter_matching_nothing_says_so_distinctly_from_an_empty_snapshot() {
+        let mut list = List::default();
+        list.set_filter(Filter::parse("name:does-not-exist-anywhere"));
+        let snap = snapshot(vec![entity("alpha")]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(
+                buf,
+                absolute_x(0),
+                entity_row_y(0),
+                NO_MATCHES_MESSAGE.len() as u16
+            ),
+            NO_MATCHES_MESSAGE,
+            "a Filter matching zero rows must say so, distinctly from the no-filter empty state"
+        );
+    }
+
+    /// The sidebar shares the same empty-state draw as the full list: proven separately since
+    /// the sidebar has no header row, so its own first row sits one line higher.
+    #[test]
+    fn the_sidebar_also_says_so_when_nothing_is_discovered() {
+        let terminal = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 1, 1, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE,
+            "the sidebar must show the same empty-state message, one row higher (no header)"
         );
     }
 
