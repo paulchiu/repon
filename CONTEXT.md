@@ -163,6 +163,9 @@ An optional mutation that rides the periodic fetch cycle rather than carrying a 
 **Auto update spec**:
 The auto-update's own bounding data as the core receives it: whether it runs at all, plain data with no TOML type. Present regardless of the `fetch` cargo feature, the same way Fetch spec is; inert without it, and inert while Fetch spec's own `enabled` is false.
 
+**Fetch available**:
+Whether the build in hand carries the periodic fetch's own mechanism rather than only the bounding data on Core spec. False on a default build, where Fetch spec's `enabled` is accepted and inert, which a consumer is expected to say out loud rather than leave silent.
+
 ### Provenance
 
 **Probe**:
@@ -250,3 +253,9 @@ None of the above: unlanded, pushed work.
 
 **Dirty**:
 Uncommitted changes are present. Orthogonal to the four states above, and the flag that makes a Worktree unsafe to remove.
+
+### Testing
+
+**Liveness**:
+A property with no wall-clock bound of its own: this eventually settles, this child eventually exits. A test asserting one waits rather than sleeps, and the wait's deadline is a backstop against a wedged process, never a budget for how long the work should take. The one namespace on the core's public surface that exists for a test rather than for a consumer, and the only one gated off the default published build.
+_Avoid_: Timeout (that names the number, not the property it stands in for)

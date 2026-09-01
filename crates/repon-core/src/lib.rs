@@ -70,9 +70,12 @@ mod fetch;
 mod filter;
 mod git;
 mod landing;
-// The one module reachable by name rather than re-exported flat: it holds no vocabulary a
-// consumer needs, only the wait a test in either crate uses for a liveness property, and a
-// namespace is what keeps names that generic out of the crate root. Gated with it.
+/// The one module reachable by name rather than re-exported flat: it holds no vocabulary a
+/// consumer needs, only the wait a test in either crate uses for a liveness property, and a
+/// namespace is what keeps names that generic out of the crate root. Gated with it, and the
+/// gate is what
+/// `every_pub_item_documented_as_test_only_is_either_gated_or_has_a_production_use_site`
+/// reads this doc comment to require.
 #[cfg(any(test, feature = "test-util"))]
 pub mod liveness;
 mod patch_equivalence;
@@ -131,28 +134,52 @@ mod tests {
         name.to_string()
     }
 
-    /// The crate's actual public surface: every name a `pub use` line in `source`
-    /// brings into the crate root, read from the crate's own `src/lib.rs` rather
-    /// than a hand-kept list, so a `pub use` added without a matching glossary
-    /// entry has nowhere to hide. A line scan, not a parser, since this crate
-    /// controls the formatting of its own `pub use` lines: it recognises
-    /// `pub use path::Name;`, `pub use path::Name as Alias;`, and a single-line
-    /// braced group `pub use path::{Name, Other as Alias};`, and panics naming
-    /// any `pub use` line it cannot make sense of, since a scanner that quietly
-    /// skips an unfamiliar form is the same drift this test exists to catch.
-    /// Stops at the test module, so its own `pub use` (if any) is not scanned.
+    /// The crate's actual public surface: every name reachable at the crate root
+    /// of `source`, read from the crate's own `src/lib.rs` rather than a hand-kept
+    /// list, so a name added without a matching glossary entry has nowhere to hide.
+    ///
+    /// Three declaration forms carry a name onto that surface, and all three are
+    /// read: a `pub use` re-export, a `pub mod` namespace, and a `pub const`. A
+    /// line scan, not a parser, since this crate controls the formatting of its own
+    /// crate-root lines: it recognises `pub use path::Name;`,
+    /// `pub use path::Name as Alias;`, a single-line braced group
+    /// `pub use path::{Name, Other as Alias};`, `pub mod name;` and
+    /// `pub const NAME: Type = ...;`. Any other `pub ` line at the crate root is a
+    /// panic rather than a skip, since a scanner that quietly passes over an
+    /// unfamiliar form is the same drift this test exists to catch: `pub mod
+    /// liveness;` was invisible to the `pub use`-only version of this scan, and so
+    /// was the `mod fanout;`/`mod git;` privacy that `docs/spec/releasing.md`'s
+    /// cleared-gate item 1 requires. Stops at the test module, so its own `pub`
+    /// items are not scanned.
     fn crate_root_public_surface(source: &str) -> Vec<String> {
         let before_tests = source.split("mod tests {").next().unwrap_or(source);
         let mut names = Vec::new();
         for line in before_tests.lines() {
             let line = line.trim();
-            if !line.starts_with("pub use ") {
+            if !line.starts_with("pub ") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pub mod ") {
+                let name = rest
+                    .strip_suffix(';')
+                    .unwrap_or_else(|| panic!("`pub mod` line is not `;`-terminated: `{line}`"));
+                names.push(exported_name(name, line));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pub const ") {
+                let name = rest
+                    .split(':')
+                    .next()
+                    .unwrap_or_else(|| panic!("`pub const` line names nothing: `{line}`"));
+                names.push(exported_name(name, line));
                 continue;
             }
             let body = line
                 .strip_prefix("pub use ")
                 .and_then(|s| s.strip_suffix(';'))
-                .unwrap_or_else(|| panic!("`pub use` line is not `;`-terminated: `{line}`"));
+                .unwrap_or_else(|| {
+                    panic!("crate-root `pub` line is in no form this scan reads: `{line}`")
+                });
             match body.split_once('{') {
                 Some((_path, rest)) => {
                     let group = rest.strip_suffix('}').unwrap_or_else(|| {
@@ -178,7 +205,9 @@ mod tests {
     ///
     /// A Rust identifier's casing never matches the glossary's Capitalised prose
     /// terms directly, so `name` is split into words on `_` and on a
-    /// lowercase-to-uppercase boundary, rejoined with single spaces, and searched
+    /// lowercase-to-uppercase boundary (never inside a run of capitals, or a
+    /// SCREAMING_CASE constant would come apart one letter at a time), rejoined
+    /// with single spaces, and searched
     /// for case-insensitively. Matching is deliberately whole-phrase rather than
     /// any-single-word: a name like `EntityState` must find "entity state" together,
     /// not pass because "state" alone occurs in unrelated prose such as "Worktree
@@ -196,7 +225,7 @@ mod tests {
                 }
                 continue;
             }
-            if ch.is_uppercase() && !word.is_empty() {
+            if ch.is_uppercase() && word.ends_with(|last: char| !last.is_uppercase()) {
                 words.push(std::mem::take(&mut word));
             }
             word.push(ch);
@@ -234,7 +263,7 @@ mod tests {
         for name in crate_root_public_surface(&source) {
             assert!(
                 glossary_covers(&glossary, &name),
-                "public re-export `{name}` has no matching entry in the project glossary"
+                "crate-root public name `{name}` has no matching entry in the project glossary"
             );
         }
     }

@@ -15,7 +15,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use repon_core::liveness::{backstop, wait_for_or};
+use repon_core::liveness::{BACKSTOP, wait_for_or};
 
 // Safety contract: every call site below passes a valid, currently-open fd and, for
 // `ptsname_r`, a buffer at least as long as the `buflen` it also passes; for `ioctl`, a
@@ -227,7 +227,7 @@ fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStat
     let status = wait_for_exit(&mut child, &format!("repon {args:?}"));
 
     let output = output_rx
-        .recv_timeout(backstop())
+        .recv_timeout(BACKSTOP)
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     (status, String::from_utf8_lossy(&output).into_owned())
@@ -249,7 +249,7 @@ fn indices_of(haystack: &str, needle: &str) -> Vec<usize> {
 /// no raw descriptor or pid a concurrent actor could reuse; the seven ANSI sequences searched
 /// for are pairwise non-overlapping; the two waits below are not tight, the whole file
 /// finishing in 1.5s worst case under heavier load than CI applies, and both now draw on
-/// `liveness::backstop` rather than a five-second budget of their own; and the reader's `Err`
+/// `liveness::BACKSTOP` rather than a five-second budget of their own; and the reader's `Err`
 /// arm masks nothing, every one of 539 observed drains ending on `Ok(0)`.
 ///
 /// If it recurs, keep the failing assertion's message and the full captured `output` rather
@@ -284,7 +284,7 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     // The exited child has closed its slave descriptors, so the reader reports back almost
     // immediately; this timeout is a final safety net, not the expected path.
     let output = output_rx
-        .recv_timeout(backstop())
+        .recv_timeout(BACKSTOP)
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -373,7 +373,7 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
         let _ = stop_tx.send((rc, status));
     });
 
-    let (rc, status) = stop_rx.recv_timeout(backstop()).unwrap_or_else(|_| {
+    let (rc, status) = stop_rx.recv_timeout(BACKSTOP).unwrap_or_else(|_| {
         let _ = child.kill();
         panic!("waitpid did not report a state change; the child may never have stopped")
     });
@@ -392,7 +392,7 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
     let _ = child.wait();
 
     let output = output_rx
-        .recv_timeout(backstop())
+        .recv_timeout(BACKSTOP)
         .expect("pty reader thread did not report back after the child was killed");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -447,7 +447,7 @@ fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
     let output = output_rx
-        .recv_timeout(backstop())
+        .recv_timeout(BACKSTOP)
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -512,7 +512,7 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
     let output = output_rx
-        .recv_timeout(backstop())
+        .recv_timeout(BACKSTOP)
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);

@@ -3738,7 +3738,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
-    use crate::liveness::wait_for;
+    use crate::liveness::{FIXTURE_LIFETIME, wait_for};
     use crate::snapshot::{RowSummary, summary};
     use crate::test_support::{git, head_sha, loose_object_count};
 
@@ -5168,9 +5168,14 @@ mod tests {
     /// own SIGKILL follow-up entirely, which is exactly the regression this criterion
     /// exists to catch.
     ///
-    /// Bounded so a regression fails rather than hangs: the step sleeps 30s, and every wait
-    /// below is backstopped by [`wait_for`], so a `stop_action` that stops working reads back
-    /// as a named wait giving up rather than as the suite blocking on the child.
+    /// The step sleeps [`FIXTURE_LIFETIME`], ten times the backstop every wait below
+    /// carries, so a `stop_action` that stops working reads back as a named wait giving up
+    /// rather than as the step ending on its own inside the wait watching it. That margin is
+    /// the whole discrimination here, because the outcome assertion cannot supply it:
+    /// `run_action_for_entity` stamps `Cancelled` on whatever was running the moment the run
+    /// was cancelled, however the step actually ended. A run that does fail here leaves the
+    /// trapping child alive until its own sleep ends, which is the price of a fixture the
+    /// wait cannot outlast.
     #[test]
     fn stop_action_escalates_from_sigterm_to_sigkill_against_a_trapping_step() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5180,9 +5185,10 @@ mod tests {
 
         let core = Core::start(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
+        let sleep_past_the_backstop = format!("trap '' TERM; sleep {}", FIXTURE_LIFETIME.as_secs());
         let trapping = action(
             "trapping",
-            vec![step(&["sh", "-c", "trap '' TERM; sleep 30"])],
+            vec![step(&["sh", "-c", &sleep_past_the_backstop])],
         );
 
         assert!(core.run_action(trapping, std::slice::from_ref(&key)));
@@ -5253,12 +5259,15 @@ mod tests {
         // directory name, which is `$PWD`'s basename in each entity's own working
         // directory, so `fail` fails immediately and `slow` is still running when this
         // test cancels the whole run.
+        // `slow`'s branch sleeps `FIXTURE_LIFETIME` rather than a number of its own: the
+        // wait below is on cancellation bringing the fan-out down, which a step that ends by
+        // itself inside the backstop would satisfy without cancellation working at all.
+        let branch_on_the_entity_name = format!(
+            "case \"$(basename \"$PWD\")\" in fail) exit 1 ;; *) sleep {} ;; esac",
+            FIXTURE_LIFETIME.as_secs()
+        );
         let steps = vec![
-            step(&[
-                "sh",
-                "-c",
-                "case \"$(basename \"$PWD\")\" in fail) exit 1 ;; *) sleep 30 ;; esac",
-            ]),
+            step(&["sh", "-c", &branch_on_the_entity_name]),
             step(&["true"]),
         ];
         let mut action_spec = action("mixed", steps);

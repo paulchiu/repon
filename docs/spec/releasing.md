@@ -76,7 +76,7 @@ It packages and verifies both crates and exits 0, because `--workspace` resolves
 
 So the workspace form is the only form that rehearses before the first publish, and it is also what the tag pipeline will run without `--dry-run`: cargo orders the publishes itself, library first, and waits for the index between them.
 
-The packaged artefacts, measured: `repon-core` is 9 files, 50.7 KiB, 15.9 KiB compressed; `repon` is 17 files, 116.4 KiB, 33.6 KiB compressed. Both counts moved since the first measurement: cargo now packages `Cargo.lock` into both archives, and `repon` also gained `src/message.rs`. Both archives still sit far under crates.io's 10 MB limit, so archive size never enters the release checklist.
+The packaged artefacts, measured: `repon-core` is 28 files, 1.0 MiB, 254.0 KiB compressed; `repon` is 51 files, 1.5 MiB, 382.7 KiB compressed. Every count here has moved at least twice since the first measurement, because both archives grow with ordinary work: cargo packages `Cargo.lock`, every source file the crate gains ships, and the source itself carries its own tests. Re-measure with `cargo package --workspace --allow-dirty --no-verify` rather than trusting this line; nothing reads it at test time, and a figure in prose goes stale the moment a file is added. Both archives still sit far under crates.io's 10 MB limit, so archive size never enters the release checklist.
 
 ## Crate metadata
 

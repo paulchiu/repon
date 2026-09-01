@@ -2087,7 +2087,7 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyModifiers};
-    use repon_core::liveness::wait_for;
+    use repon_core::liveness::{FIXTURE_LIFETIME, wait_for};
     use repon_core::{CoreSpec, SetSpec};
 
     use super::*;
@@ -3060,17 +3060,21 @@ mod tests {
     // one, and the levels not yet reached stay untouched.
     // =====================================================================================
 
-    /// An Action whose one step never dies from its own accord (untrapped, so a single
-    /// SIGTERM from `stop_action` kills it almost immediately): long enough that this test
-    /// could never wait it out by accident, which is what makes "it finished because Esc
-    /// cancelled it" the only honest explanation for `action_running` going false during
-    /// this test's own bounded wait.
+    /// An Action whose one step never dies of its own accord (untrapped, so a single
+    /// SIGTERM from `stop_action` kills it almost immediately). It sleeps
+    /// [`FIXTURE_LIFETIME`], ten times the backstop behind every `wait_for` below, which is
+    /// what makes "it finished because Esc cancelled it" the only honest explanation for
+    /// `action_running` going false inside one of those waits.
     fn long_running_action_config(name: &str) -> document::ActionConfig {
         document::ActionConfig {
             name: toml::Spanned::new(0..0, name.to_string()),
             description: None,
             steps: vec![document::StepConfig {
-                args: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                args: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("sleep {}", FIXTURE_LIFETIME.as_secs()),
+                ],
                 shell: false,
                 env: std::collections::BTreeMap::new(),
             }],
@@ -3408,32 +3412,6 @@ mod tests {
         assert_eq!(
             app.cursor, 1,
             "`N` from row 2 must land on the failed row behind it, not the one `n` finds"
-        );
-    }
-
-    /// The fixture's own postcondition, asserted at the fixture rather than three steps
-    /// downstream of it.
-    ///
-    /// Every `NextFailed`/`PreviousFailed` test above reads `run_failing_action_on`'s result
-    /// through a cursor position, so a fixture that returned before its row read Failed
-    /// reported as a cursor landing on the wrong index, with nothing in the message naming
-    /// the wait that had actually given up. Pinned here so the fixture's contract has a
-    /// failure of its own.
-    #[test]
-    fn run_failing_action_on_returns_only_once_its_row_reads_failed() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        init_repo(&root.join("repo-a"));
-        init_repo(&root.join("repo-b"));
-        init_repo(&root.join("repo-c"));
-        let mut app = test_app(&root);
-
-        run_failing_action_on(&mut app, 2);
-
-        assert_eq!(
-            app.visible_failed(),
-            vec![false, false, true],
-            "the row the Action ran on must read Failed, and no other row may"
         );
     }
 
@@ -5067,6 +5045,14 @@ mod tests {
 
     /// Runs [`failing_action_config`] on the visible row at `index` and returns once that
     /// row reads Failed, which is what every caller then walks the cursor to.
+    ///
+    /// The wait below is this fixture's own assertion, run at every call site: it panics
+    /// naming the postcondition rather than handing a caller a row that does not read Failed
+    /// yet. A separate test calling this fixture could not add to that, since on an idle
+    /// machine the postcondition already holds by the time such a test could read it; the
+    /// production fact the wait exists for is pinned instead by
+    /// `a_failed_last_action_is_outranked_while_the_row_still_holds_no_values` in
+    /// `repon-core`'s `snapshot.rs`.
     fn run_failing_action_on(app: &mut App, index: usize) {
         app.set_cursor(index);
         app.document.actions.push(failing_action_config("break"));

@@ -820,7 +820,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::liveness::{backstop, wait_for};
+    use crate::liveness::{BACKSTOP, FIXTURE_LIFETIME, wait_for};
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -853,7 +853,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(backstop())
+            .recv_timeout(BACKSTOP)
             .expect("a child reading a null stdin must terminate rather than hang");
 
         assert_eq!(result.outcome, StepOutcome::Ok);
@@ -994,19 +994,22 @@ mod tests {
     /// were mutated to send only SIGTERM, which is exactly the regression this criterion
     /// exists to catch; trapping TERM here is what rules that mutation out.
     ///
-    /// Bounded end to end by `recv_timeout` on a real child spawned to sleep 30s: the grace
-    /// plus SIGKILL together take well under a second, so a regression that drops the
-    /// SIGKILL follow-up fails this test's own timeout rather than hanging the suite for
-    /// 30s or forever.
+    /// Bounded end to end by `recv_timeout` at [`BACKSTOP`], against a child spawned to
+    /// sleep [`FIXTURE_LIFETIME`], ten times that: the grace plus SIGKILL together take well
+    /// under a second, and the fixture cannot end on its own inside the receive, so a
+    /// regression that drops the SIGKILL follow-up fails this test's own bound rather than
+    /// being waited out by a child that finished by itself.
     #[test]
     fn a_child_that_traps_sigterm_still_dies_once_cancel_escalates_to_sigkill() {
         let dir = tempdir();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let (master, keepalive, child, pgid) = spawn_controlled(
-                &["sh", "-c", "trap '' TERM; echo ready; sleep 30"],
-                dir.path(),
+            let sleep_past_the_backstop = format!(
+                "trap '' TERM; echo ready; sleep {}",
+                FIXTURE_LIFETIME.as_secs()
             );
+            let (master, keepalive, child, pgid) =
+                spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
             let control = RunControl::new();
             control.register(pgid);
 
@@ -1028,7 +1031,7 @@ mod tests {
         });
 
         let status = rx
-            .recv_timeout(backstop())
+            .recv_timeout(BACKSTOP)
             .expect("a TERM-trapping child must still die once cancel escalates to SIGKILL");
         assert!(
             status.is_some_and(|status| !status.success()),

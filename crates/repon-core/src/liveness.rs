@@ -6,16 +6,26 @@
 //! reason unrelated to what it was checking. Two rules follow, and this module exists to
 //! make both structural rather than per-call-site discipline.
 //!
-//! First, the number is a backstop, not a budget. [`BASE_BACKSTOP`] is sized for
-//! "genuinely stuck", never for "how long should this take": every wait in this workspace
-//! completes in milliseconds on a healthy machine and never approaches it, so a generous
-//! value costs a passing run nothing and only pays out when something is really wedged.
-//! A machine slower still raises [`DEADLINE_SCALE`] once, rather than a number being
-//! edited at one call site out of forty.
+//! First, the number is a backstop, not a budget. [`BACKSTOP`] is sized for "genuinely
+//! stuck", never for "how long should this take": every wait in this workspace completes in
+//! milliseconds on a healthy machine and never approaches it, so a generous value costs a
+//! passing run nothing and only pays out when something is really wedged. There is no knob
+//! to raise it: a machine on which a millisecond-scale wait needs more than thirty seconds
+//! is broken rather than slow, and a knob nothing sets is a remedy nobody has tried.
 //!
 //! Second, expiry is reported where it happens. [`wait_for`] panics naming the property
 //! that never held, so a wait that gives up cannot be mistaken for the assertion three
 //! steps downstream of it.
+//!
+//! ## A fixture that has to outlive the wait watching it
+//!
+//! A backstop shared by every wait sets a trap for one kind of test: the sort whose fixture
+//! is a process spawned to still be running when the wait gives up, so that the wait
+//! succeeding is evidence the thing under test cut the fixture short. Such a fixture must
+//! outlive the backstop by a wide margin, or its own natural end satisfies the wait and the
+//! test passes on a machine where nothing works. [`FIXTURE_LIFETIME`] is the one length
+//! those fixtures sleep, related to [`BACKSTOP`] by a compile-time assertion below rather
+//! than by two numbers that happen to differ today.
 //!
 //! ## The survey this module records
 //!
@@ -28,13 +38,18 @@
 //!   through this module. The five in the pty harness were the worst of the set, since
 //!   they wait on a freshly built binary claiming a real terminal.
 //! - **Blocking receives used as a backstop** (`recv_timeout` in `executor.rs` and the pty
-//!   harness): at risk on the same terms; each now takes [`backstop`] rather than its own
+//!   harness): at risk on the same terms; each now takes [`BACKSTOP`] rather than its own
 //!   five seconds. The short `recv_timeout` calls that poll for the next chunk of pty
 //!   output are intervals, not deadlines, and are left alone.
 //! - **`Core::settle` awaiting a Generation the caller already dispatched** (most of its
-//!   call sites): not at risk on the deadline, because `refresh` raises the settle gate
-//!   before it returns, so the wait cannot end early. `repon-core/tests/action_dedicated_pool.rs`
-//!   is the model: a loose backstop, with the assertion reading the probe's own result.
+//!   call sites, 82 of them): at risk, and not fixed here. `Core::settle` discards the
+//!   `WaitTimeoutResult` its own `wait_timeout_while` returns, so an expiry is
+//!   indistinguishable from a settle and comes back as an unsettled snapshot the caller
+//!   then reports as a wrong value several steps downstream, with nothing naming the wait.
+//!   That is this ticket's defect exactly, at forty-four call sites bounded at 500ms.
+//!   Routing them through this module is not enough on its own: the fix is a `settle` that
+//!   says whether it settled, which is a change to a published `Core` method rather than to
+//!   a test helper, so it is recorded here and left for its own ticket.
 //! - **`Core::settle` awaiting an Action's completion Generation**: at risk, and *not* on
 //!   the deadline. `run_action`'s completion clears `action_running` before it dispatches
 //!   that Generation, so a settle called in the window between the two finds the gate at
@@ -43,7 +58,7 @@
 //!   is what `run_failing_action_on` in `app.rs` now does.
 //! - **Deliberately short settles proving a negative** (`app.rs`'s 200ms focus gate,
 //!   `core.rs`'s 50ms empty-order settle, and the 500ms pair either side of a Launcher
-//!   handoff): not scaled here, on purpose. Their number is the claim, not a backstop,
+//!   handoff): not raised here, on purpose. Their number is the claim, not a backstop,
 //!   so raising it would delete the thing they check. They are still weakened by load, in
 //!   that a probe too slow to land inside the window makes them pass without discriminating;
 //!   that is a different defect from this ticket's and is left recorded, not fixed.
@@ -54,59 +69,42 @@
 //! Gated behind `test-util` (on under `cfg(test)` for this crate's own tests) so a
 //! test-only affordance never ships on the default published surface, per
 //! [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md).
-//! The gate is repeated on each public item, where both a reader and the workspace's own
-//! scan for ungated test-only surface look for it.
+//! The gate is repeated on each public item, and every item here says in its own doc
+//! comment that it exists for a test, which is the pair
+//! `every_pub_fn_documented_as_test_only_is_either_gated_or_has_a_production_call_site`
+//! looks for: remove any one of these gates and that scan fails.
 
 use std::time::{Duration, Instant};
 
-/// The unscaled backstop behind every wait in this module.
+/// The deadline every wait a test makes goes through.
 ///
 /// Thirty seconds because nothing here benefits from failing fast: a correct run reaches
 /// its condition in milliseconds, and the only event this number decides is how long a
 /// wedged suite runs before it reports.
 #[cfg(any(test, feature = "test-util"))]
-pub const BASE_BACKSTOP: Duration = Duration::from_secs(30);
+pub const BACKSTOP: Duration = Duration::from_secs(30);
 
-/// Environment variable multiplying [`BASE_BACKSTOP`], for a machine slow enough that even
-/// a backstop sized for "stuck" is not.
+/// How long a test's fixture sleeps when the point of it is to still be running once
+/// [`BACKSTOP`] expires.
 ///
-/// The one knob: a loaded CI runner raises it once for the whole suite. A value that is
-/// not a finite positive number is a mistake worth failing on rather than ignoring.
+/// Ten times the backstop, so the margin is a factor rather than a coincidence: a fixture
+/// that ended on its own before the wait watching it gave up would make its test pass
+/// without discriminating anything.
 #[cfg(any(test, feature = "test-util"))]
-pub const DEADLINE_SCALE: &str = "REPON_TEST_DEADLINE_SCALE";
+pub const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
+
+// The relationship the two constants above only mean anything together, checked where it
+// cannot be forgotten rather than left to a reader comparing two literals.
+#[cfg(any(test, feature = "test-util"))]
+const _: () = assert!(
+    FIXTURE_LIFETIME.as_secs() >= 10 * BACKSTOP.as_secs(),
+    "a fixture spawned to outlive its own wait must outlive the backstop by a wide margin"
+);
 
 /// How often [`wait_for`] re-reads its condition. An interval, never a deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// [`BASE_BACKSTOP`] scaled by [`DEADLINE_SCALE`], the deadline every wait below shares.
-///
-/// Public so a test that must own its own wait loop (one with cleanup to do, or a side
-/// effect to perform between polls) still draws its deadline from here rather than naming
-/// a second one.
-#[cfg(any(test, feature = "test-util"))]
-pub fn backstop() -> Duration {
-    BASE_BACKSTOP.mul_f64(scale(std::env::var(DEADLINE_SCALE).ok().as_deref()))
-}
-
-/// [`DEADLINE_SCALE`]'s value as a multiplier: absent means 1.
-///
-/// Split out from [`backstop`] so the parse is testable without a test writing to the
-/// environment every other test in the process shares.
-fn scale(raw: Option<&str>) -> f64 {
-    let Some(raw) = raw else {
-        return 1.0;
-    };
-    let parsed: f64 = raw.trim().parse().unwrap_or_else(|_| {
-        panic!("{DEADLINE_SCALE} must be a number, got {raw:?}");
-    });
-    assert!(
-        parsed.is_finite() && parsed > 0.0,
-        "{DEADLINE_SCALE} must be a finite positive multiplier, got {raw:?}"
-    );
-    parsed
-}
-
-/// Blocks until `condition` holds, panicking once [`backstop`] expires.
+/// Blocks until `condition` holds, panicking once [`BACKSTOP`] expires. For a test.
 ///
 /// `property` names what was being waited for, as a noun phrase reading after "waiting
 /// for": the panic is the report, so a test never has to carry a deadline's expiry
@@ -116,7 +114,7 @@ pub fn wait_for(property: &str, condition: impl FnMut() -> bool) {
     wait_for_or(property, condition, String::new);
 }
 
-/// [`wait_for`], plus whatever a hung fixture owes before the panic.
+/// [`wait_for`], plus whatever a hung fixture owes a test before the panic.
 ///
 /// `on_timeout` runs only on expiry: it does its cleanup (killing a child that never
 /// exited, say) and returns any extra context to fold into the panic message.
@@ -126,7 +124,7 @@ pub fn wait_for_or(
     condition: impl FnMut() -> bool,
     on_timeout: impl FnOnce() -> String,
 ) {
-    wait_within(backstop(), property, condition, on_timeout);
+    wait_within(BACKSTOP, property, condition, on_timeout);
 }
 
 /// [`wait_for_or`] against an explicit deadline, so this module's own tests can exercise
@@ -145,9 +143,9 @@ fn wait_within(
         if start.elapsed() >= deadline {
             let context = on_timeout();
             panic!(
-                "gave up after {deadline:?} waiting for {property}{}{context}\nRaise \
-                 {DEADLINE_SCALE} if this machine is merely slow; a wait that expires is \
-                 never evidence about the property itself.",
+                "gave up after {deadline:?} waiting for {property}{}{context}\nA wait that \
+                 expires is never evidence about the property itself; this one is sized for \
+                 a wedged process, not for a slow one.",
                 if context.is_empty() { "" } else { ": " }
             );
         }
@@ -160,31 +158,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    #[test]
-    fn an_absent_scale_leaves_the_backstop_unmultiplied() {
-        assert_eq!(scale(None), 1.0);
-    }
-
-    #[test]
-    fn a_scale_multiplies_the_base_backstop() {
-        assert_eq!(BASE_BACKSTOP.mul_f64(scale(Some("4"))), BASE_BACKSTOP * 4);
-        assert_eq!(scale(Some(" 2.5 ")), 2.5);
-    }
-
-    /// A typo in the one knob must fail loudly rather than silently reverting to the
-    /// unscaled backstop, which is the machine the raiser already knew was too slow.
-    #[test]
-    #[should_panic(expected = "must be a number")]
-    fn an_unparseable_scale_is_a_failure_not_a_fallback() {
-        scale(Some("slower please"));
-    }
-
-    #[test]
-    #[should_panic(expected = "finite positive multiplier")]
-    fn a_zero_scale_is_refused() {
-        scale(Some("0"));
-    }
 
     #[test]
     fn wait_for_returns_as_soon_as_the_condition_holds() {

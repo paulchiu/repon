@@ -107,12 +107,14 @@ pub(crate) struct SourceLine {
     pub(crate) text: String,
 }
 
-/// Every line under `dirs` whose *whole* file contains `needle`, comment lines excluded.
+/// Every line under `dirs` that `matches` accepts, comment lines excluded, whole files.
 ///
 /// No [`production_source`] cut, deliberately: a claim about test code is a claim about
 /// exactly the region that cut discards, so cutting here would be the check quietly
-/// stopping checking.
-pub(crate) fn all_lines_containing(dirs: &[PathBuf], needle: &str) -> Vec<SourceLine> {
+/// stopping checking. A predicate rather than a needle, so a caller whose shape is more
+/// than one substring still gets one pass over the tree rather than a pass per fragment
+/// and a pile of duplicate hits to merge.
+pub(crate) fn all_lines_where(dirs: &[PathBuf], matches: impl Fn(&str) -> bool) -> Vec<SourceLine> {
     let mut found = Vec::new();
     for dir in dirs {
         for path in rust_source_files(dir) {
@@ -121,7 +123,7 @@ pub(crate) fn all_lines_containing(dirs: &[PathBuf], needle: &str) -> Vec<Source
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                if line.contains(needle) {
+                if matches(line) {
                     found.push(SourceLine {
                         path: path.clone(),
                         number: index + 1,
