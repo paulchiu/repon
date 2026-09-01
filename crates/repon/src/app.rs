@@ -289,8 +289,8 @@ pub struct App {
     /// a flag rather than an immediate call. Cleared the moment it is handed to
     /// [`Self::run_config_editor_handoff`], so a handoff runs at most once per press.
     pending_config_editor_handoff: bool,
-    /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s`) and
-    /// closed by `Action::Close` (`Esc` or `q`,
+    /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s` or
+    /// `Tab`) and closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
     /// touching the active Set or starting a Generation. Its own `Action::Choose` (`Enter`)
     /// routes the highlighted row through [`Self::switch_to_set`], the exact path the
@@ -885,7 +885,7 @@ impl App {
     /// [`Self::switch_to_set`] and `Unwind` reaches [`unwind::unwind_one`] over the range
     /// anchor then the pane.
     ///
-    /// `OpenSetPicker` (`s`) opens [`Self::set_picker`]
+    /// `OpenSetPicker` (`s` or `Tab`) opens [`Self::set_picker`]
     /// ([keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context);
     /// [`Self::handle_set_picker_key`] is what its own `Enter` routes through
     /// [`Self::switch_to_set`], the same path `1` to `9` (`SwitchToSet`) already take.
@@ -1120,8 +1120,10 @@ impl App {
                 self.focus = Context::List;
                 None
             }
-            // `Detail`'s own Tab intercepts before Global's ever would, per `keys::dispatch`,
-            // so this only ever fires while `List` is focused; a no-op with no pane open.
+            // `Global`'s own chord is `BackTab` (Shift+Tab), which `Detail` does not bind, so
+            // per `keys::dispatch` this can fire from either pane: a move into Detail from
+            // `List`, or an idempotent no-op from `Detail`, where focus is already there. A
+            // no-op either way with no pane open.
             Some(Action::MoveFocusBetweenListAndDetail) => {
                 if self.pane.is_some() {
                     self.focus = Context::Detail;
@@ -6452,31 +6454,47 @@ mod tests {
     }
 
     #[test]
-    fn tab_moves_focus_to_the_pane_only_once_it_is_open() {
+    fn shift_tab_moves_focus_to_the_pane_only_once_it_is_open() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
 
         let mut app = test_app(&root);
         app.handle_key_event(press(
-            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyCode::BackTab,
             crossterm::event::KeyModifiers::NONE,
         ))
-        .expect("handle tab with no pane open");
+        .expect("handle shift+tab with no pane open");
         assert_eq!(
             app.focus,
             Context::List,
-            "no pane open: Tab must be a no-op"
+            "no pane open: Shift+Tab must be a no-op"
         );
 
         let key = app.visible_keys()[0].clone();
         app.pane = Some(key);
         app.handle_key_event(press(
-            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyCode::BackTab,
             crossterm::event::KeyModifiers::NONE,
         ))
-        .expect("handle tab with the pane open");
+        .expect("handle shift+tab with the pane open");
         assert_eq!(app.focus, Context::Detail);
+    }
+
+    /// Tab took over `MoveFocusBetweenListAndDetail`'s old chord, so it now opens the Set
+    /// picker from `List` exactly as `s` does; `pressing_s_opens_the_set_picker_rather_than_the_not_implemented_notice`
+    /// covers `s` itself.
+    #[test]
+    fn tab_also_opens_the_set_picker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("handle tab");
+
+        assert!(app.set_picker.is_some(), "Tab must open the Set picker");
     }
 
     // --- the shared warning slot expands to the full list on a keystroke ---

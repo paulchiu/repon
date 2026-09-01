@@ -350,6 +350,7 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::OpenSetPicker,
     ),
+    binding(Context::Global, KeyCode::Tab, NONE, Action::OpenSetPicker),
     binding(
         Context::Global,
         KeyCode::Char('1'),
@@ -418,7 +419,7 @@ const BINDINGS: &[Binding] = &[
     ),
     binding(
         Context::Global,
-        KeyCode::Tab,
+        KeyCode::BackTab,
         NONE,
         Action::MoveFocusBetweenListAndDetail,
     ),
@@ -642,6 +643,9 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
         KeyCode::Enter => "enter".to_string(),
         KeyCode::Esc => "esc".to_string(),
         KeyCode::Tab => "tab".to_string(),
+        // crossterm reports Shift+Tab as its own `KeyCode::BackTab`, never as `Tab` with
+        // SHIFT set, so it needs a name of its own rather than the modifier branch below.
+        KeyCode::BackTab => "shift-tab".to_string(),
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Up => "up".to_string(),
         KeyCode::Down => "down".to_string(),
@@ -920,8 +924,10 @@ fn parse_context_name(name: &str) -> Option<Context> {
 /// [`chord_label`]'s own output, so whatever the footer or the help overlay shows is exactly
 /// what a user types back to rebind it. `ctrl-` is the one modifier prefix; an uppercase
 /// single letter carries an implied SHIFT, matching how the compiled table itself binds `R`,
-/// `G` and `N`. `None` means the text names no chord this parser recognises, which a caller
-/// reports as config.md's third failure grade: exit non-zero before the terminal is claimed.
+/// `G` and `N`. `shift-tab` is its own named word rather than a SHIFT-prefixed `tab`, because
+/// crossterm delivers it as `KeyCode::BackTab` with no modifier at all. `None` means the text
+/// names no chord this parser recognises, which a caller reports as config.md's third failure
+/// grade: exit non-zero before the terminal is claimed.
 pub(crate) fn parse_chord(text: &str) -> Option<(KeyCode, KeyModifiers)> {
     let (ctrl, base) = match text.strip_prefix("ctrl-") {
         Some(rest) => (true, rest),
@@ -945,6 +951,7 @@ fn named_key_code(base: &str) -> Option<KeyCode> {
         "enter" => KeyCode::Enter,
         "esc" => KeyCode::Esc,
         "tab" => KeyCode::Tab,
+        "shift-tab" => KeyCode::BackTab,
         "backspace" => KeyCode::Backspace,
         "up" => KeyCode::Up,
         "down" => KeyCode::Down,
@@ -1392,9 +1399,9 @@ mod tests {
     fn global_move_focus_between_list_and_detail_never_dispatches_outside_list_and_detail() {
         for context in [Context::Overlay, Context::Confirm] {
             assert_eq!(
-                dispatch(context, press(KeyCode::Tab, NONE)),
+                dispatch(context, press(KeyCode::BackTab, NONE)),
                 None,
-                "{context:?} must not reach Global's Tab binding"
+                "{context:?} must not reach Global's Shift+Tab binding"
             );
         }
     }
@@ -1869,6 +1876,10 @@ mod tests {
             "Esc" => (KeyCode::Esc, NONE),
             "Enter" => (KeyCode::Enter, NONE),
             "Tab" => (KeyCode::Tab, NONE),
+            // crossterm delivers Shift+Tab as its own `KeyCode::BackTab`, never as `Tab`
+            // with SHIFT set, so the spec's own token needs a named case rather than falling
+            // out of the single-character SHIFT rule below.
+            "Shift+Tab" => (KeyCode::BackTab, NONE),
             "Backspace" => (KeyCode::Backspace, NONE),
             "Up" => (KeyCode::Up, NONE),
             "Down" => (KeyCode::Down, NONE),

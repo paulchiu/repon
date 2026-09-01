@@ -1,5 +1,5 @@
 //! The Set picker overlay ([keybindings.md](../../../docs/spec/keybindings.md)'s
-//! `Action::OpenSetPicker`, bound to `s`): lists every declared Set in file order and
+//! `Action::OpenSetPicker`, bound to `s` and `Tab`): lists every declared Set in file order and
 //! switches to whichever is highlighted through
 //! [`crate::app::App::switch_to_set`], the exact path the positional `1`-`9` keys already
 //! take, never a second implementation of the same switch. It lives in `keybindings.md`'s
