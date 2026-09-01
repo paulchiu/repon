@@ -8442,6 +8442,10 @@ mod tests {
     /// The same watcher `start_internal` wires in: on a fast, already-finished
     /// walk (the common case), joining its handle proves it ran and recorded no
     /// warning, exercised through `Core::start` itself rather than in isolation.
+    /// `warn_after` is one second, the real production threshold, rather than a
+    /// margin picked for speed: a one-repository walk finishes orders of
+    /// magnitude faster than that even on a loaded machine, so this proves the
+    /// fast path without racing a real walk the way a millisecond threshold did.
     #[test]
     fn a_fast_discovery_leaves_no_warning_once_the_watcher_has_run() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -8450,7 +8454,7 @@ mod tests {
         let (_tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
 
         let started =
-            Core::start_for_test(spec(vec![root]), Duration::from_millis(1), tick_rx).discovered();
+            Core::start_for_test(spec(vec![root]), Duration::from_secs(1), tick_rx).discovered();
         started
             .discovery_watcher
             .join()
