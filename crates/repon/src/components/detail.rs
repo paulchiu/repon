@@ -2131,11 +2131,19 @@ mod tests {
     /// before the kept tail, which is the only thing that can place it now that no line in
     /// the captured bytes says so. Built at the real capture's own scale, the head count
     /// `docs/spec/actions.md` fixes, because a fixture with one kept head line cannot tell
-    /// the field apart from the literal `1`.
+    /// the field apart from the literal `1`. The tail run is deliberately a different
+    /// length: with equal runs, counting from the end lands on the same index as counting
+    /// from the start, so a head-for-tail confusion would pass.
     #[test]
     fn an_elided_steps_mark_sits_after_exactly_the_kept_head_lines_it_names() {
         let kept_head = spec_capture_head_lines();
-        let lines = elided_step_content_lines(&crate::glyphs::FULL, 100, kept_head, kept_head);
+        let kept_tail = kept_head / 4 + 1;
+        assert_ne!(
+            kept_head, kept_tail,
+            "the two kept runs must differ, or this test cannot tell an index counted from \
+             the head apart from one counted from the tail"
+        );
+        let lines = elided_step_content_lines(&crate::glyphs::FULL, 100, kept_head, kept_tail);
         let position = |needle: &str| {
             lines
                 .iter()
@@ -2153,6 +2161,86 @@ mod tests {
         );
         assert_eq!(lines[elided - 1].trim(), format!("head {}", kept_head - 1));
         assert_eq!(lines[elided + 1].trim(), "tail 0");
+    }
+
+    /// A bounded step whose kept lines carry the child's own bold, so the elision row's own
+    /// styling is distinguishable from its neighbours'. Bold rather than a colour because
+    /// `strip_colour_if_disabled` drops colour under `NO_COLOR` and leaves every other
+    /// attribute alone, which a machine with that variable set would otherwise turn into a
+    /// failure with nothing wrong.
+    fn bold_elided_step(dropped_lines: usize, kept_head: usize, kept_tail: usize) -> StepResult {
+        let mut output = String::new();
+        for n in 0..kept_head {
+            output.push_str(&format!("\u{1b}[1mhead {n}\u{1b}[0m\n"));
+        }
+        for n in 0..kept_tail {
+            output.push_str(&format!("\u{1b}[1mtail {n}\u{1b}[0m\n"));
+        }
+        StepResult {
+            label: Arc::from("pnpm install"),
+            outcome: StepOutcome::Ok,
+            output: Arc::from(output.as_bytes()),
+            elapsed: Duration::from_millis(1),
+            elision: Some(CaptureElision {
+                dropped_lines,
+                kept_head_lines: kept_head,
+            }),
+        }
+    }
+
+    /// The pane's own rendered rows, styles and all, for a row whose last Action elided
+    /// output written by a child that styled it: what [`elided_step_content_lines`]'s plain
+    /// text throws away.
+    fn bold_elided_step_rendered_rows(set: &'static GlyphSet) -> Vec<Vec<(String, Style)>> {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![bold_elided_step(212, 3, 2)],
+            None,
+        ));
+        styled_content_lines(&row, WIDE, set)
+            .into_iter()
+            .filter_map(|line| match line {
+                ContentLine::Styled(_) => None,
+                ContentLine::Raw(runs) => Some(runs),
+            })
+            .collect()
+    }
+
+    /// `docs/spec/actions.md`'s "It renders unstyled": the row belongs to neither voice, so
+    /// it takes no theme role and none of the child's own SGR either. The child's own rows
+    /// are asserted bold in the same pass, so a rendering that styled nothing at all could
+    /// not pass this by accident.
+    #[test]
+    fn an_elided_steps_mark_renders_unstyled_between_the_childs_own_styled_rows() {
+        for (label, set) in [
+            ("full", &crate::glyphs::FULL),
+            ("ascii", &crate::glyphs::ASCII),
+        ] {
+            let rows = bold_elided_step_rendered_rows(set);
+            let (elided, child): (Vec<_>, Vec<_>) = rows
+                .iter()
+                .partition(|runs| runs.iter().any(|(text, _)| text.contains("lines elided")));
+            let [elided] = elided.as_slice() else {
+                panic!("expected exactly one elision row under {label}, got {elided:?}");
+            };
+
+            for (text, style) in elided.iter() {
+                assert_eq!(
+                    *style,
+                    Style::default(),
+                    "the {label} set's elision row must render unstyled, but {text:?} carries \
+                     {style:?}"
+                );
+            }
+            assert!(
+                child.iter().flat_map(|runs| runs.iter()).any(|(_, style)| {
+                    style.add_modifier.contains(ratatui::style::Modifier::BOLD)
+                }),
+                "the child's own rows must reach the pane styled under {label}, or this test \
+                 cannot tell an unstyled elision row from an unstyled pane"
+            );
+        }
     }
 
     /// A step whose own output prints the elision text must not be read as an elision: the
