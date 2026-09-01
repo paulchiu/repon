@@ -180,10 +180,12 @@ fn default_action_concurrency() -> u32 {
 
 /// An `[[action]]` entry, per [config.md](../../../../docs/spec/config.md#actions)'s full
 /// field table: a unique `name`, an optional `description`, the required ordered `steps`,
-/// `confirm` defaulting on, and `concurrency` defaulting to four with no schema maximum
+/// `confirm` defaulting on, `concurrency` defaulting to four with no schema maximum
 /// (`concurrency` is a bare `u32`, so the only ceiling is the type's own, never a
-/// deliberate one this schema imposes). [`crate::action_palette::to_action_spec`] turns
-/// this, plus its `steps`, into `repon_core::ActionSpec` and `repon_core::Step`.
+/// deliberate one this schema imposes), and the optional `when`.
+/// [`crate::action_palette::to_action_spec`] turns this, plus its `steps`, into
+/// `repon_core::ActionSpec` and `repon_core::Step`; `when` is deliberately not among what
+/// crosses, since it narrows what the palette counts and never what the fan-out runs on.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionConfig {
     pub name: toml::Spanned<String>,
@@ -194,6 +196,11 @@ pub struct ActionConfig {
     pub confirm: bool,
     #[serde(default = "default_action_concurrency")]
     pub concurrency: u32,
+    /// A predicate in the Filter grammar, held as the raw text the file carried: parsing it
+    /// is `repon_core::Filter::parse`'s job and cannot fail, so there is no load-time check
+    /// here and no failure grade to add ([config.md](../../../../docs/spec/config.md#actions)).
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 /// The document as the file declares it, deep-merged over the compiled defaults.
@@ -1625,6 +1632,79 @@ mod tests {
         );
     }
 
+    /// The name of the key carrying an Action's applicability predicate, read out of
+    /// [config.md](../../../../docs/spec/config.md)'s own "Actions" table rather than
+    /// restated here: the row is the one whose meaning names the Filter grammar, and its
+    /// first backticked cell is the key. A rename in the document that never reached the
+    /// schema fails the test below rather than passing beside it.
+    fn the_applicability_key_config_md_names() -> String {
+        let spec = read_config_spec();
+        let actions = spec
+            .split("## Actions")
+            .nth(1)
+            .expect("config.md must carry an Actions section");
+        let row = actions
+            .lines()
+            .take_while(|line| !line.starts_with("## "))
+            .find(|line| line.starts_with('|') && line.contains("Filter grammar"))
+            .expect("config.md's Actions table must carry a row naming the Filter grammar");
+        row.split('`')
+            .nth(1)
+            .expect("that row must name its key in backticks")
+            .to_string()
+    }
+
+    /// Criterion 1: the key config.md names is the key the schema parses, and it reaches
+    /// `ActionConfig` carrying the text the file wrote verbatim. An unknown-key warning is
+    /// asserted absent as well, since a key the schema does not know parses "fine" and warns
+    /// instead of failing, which would leave a silent nothing behind this assertion.
+    #[test]
+    fn an_action_parses_the_applicability_predicate_key_config_md_names() {
+        let key = the_applicability_key_config_md_names();
+        let loaded = parse_ok(&format!(
+            "[[action]]\nname = \"reinstall\"\n{key} = \"kind:repo\"\n\n\
+             [[action.steps]]\nargs = [\"true\"]\n"
+        ));
+
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::UnknownKey(path) if path.contains(&key))),
+            "`{key}` is a key of the schema, not an unknown one: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(
+            loaded.document.actions[0].when.as_deref(),
+            Some("kind:repo")
+        );
+    }
+
+    /// Criterion 2: totality carries over, so a `when` naming nothing the grammar knows is
+    /// not a load error and adds no failure grade of its own. The three inputs are the
+    /// grammar's own documented degenerate cases, each of which matches nothing and none of
+    /// which is a failure ([0022](../../../../docs/adr/0022-the-filter-language-is-total-and-three-valued.md)).
+    #[test]
+    fn a_when_naming_nothing_the_grammar_knows_is_never_a_load_error() {
+        let key = the_applicability_key_config_md_names();
+        for predicate in ["is:banana", ":", "kimd:repo"] {
+            let loaded = parse_ok(&format!(
+                "[[action]]\nname = \"reinstall\"\n{key} = \"{predicate}\"\n\n\
+                 [[action.steps]]\nargs = [\"true\"]\n"
+            ));
+            assert_eq!(
+                loaded.document.actions[0].when.as_deref(),
+                Some(predicate),
+                "the text must reach the schema unaltered, since nothing here judges it"
+            );
+            assert!(
+                loaded.warnings.is_empty(),
+                "a predicate matching nothing is not a condition to warn about: {:?}",
+                loaded.warnings
+            );
+        }
+    }
+
     /// Issue #58, criterion 4's "no config key" half: the PTY is a fixed 120-column
     /// constant, never a config key. An exhaustive destructure names every field
     /// `ActionConfig` has; a width field added under any name fails to compile this
@@ -1639,6 +1719,7 @@ mod tests {
             steps: _,
             confirm: _,
             concurrency: _,
+            when: _,
         } = loaded
             .document
             .actions

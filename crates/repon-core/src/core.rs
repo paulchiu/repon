@@ -51,6 +51,7 @@ use crate::entity::{
 };
 use crate::environment;
 use crate::executor;
+use crate::filter::{Applicability, Filter};
 use crate::git;
 use crate::landing;
 use crate::patch_equivalence;
@@ -972,6 +973,20 @@ impl Core {
     /// drifting from what a run really does.
     pub fn operable_count(&self, order: &[EntityKey]) -> usize {
         self.partition_operable(order).0.len()
+    }
+
+    /// How an Action's `when` predicate divides the very rows [`Self::operable_count`]
+    /// counts: the identical partition runs first, so an excluded row is subtracted before
+    /// the predicate ever sees it and `when` narrows what is left rather than replacing that
+    /// subtraction
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate").
+    ///
+    /// The tally lives here rather than in the consumer for that reason alone:
+    /// `partition_operable` is this type's own, so a caller cannot count applicability over
+    /// a set the run would not act on.
+    pub fn applicability(&self, order: &[EntityKey], when: &Filter) -> Applicability {
+        when.applicability(self.partition_operable(order).0.iter())
     }
 
     /// `true` while one Action fan-out's steps are still running, the consumer-facing read
@@ -5200,6 +5215,56 @@ mod tests {
             actually_ran,
             "operable_count must report exactly how many rows run_action actually ran a \
              step against, not merely how many keys resolved"
+        );
+    }
+
+    /// An excluded row is subtracted before an Action's `when` ever sees it, so the
+    /// predicate narrows what is left rather than replacing that subtraction
+    /// (`docs/spec/actions.md`'s "The Selection and the gate").
+    ///
+    /// Proven against `operable_count` itself rather than against a hand-written expectation:
+    /// a predicate every remaining row satisfies must leave a total identical to that count,
+    /// which it cannot do if the excluded row reached the tally under any of the three
+    /// headings.
+    #[test]
+    fn applicability_subtracts_an_excluded_row_before_the_predicate_reads_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let excluded_repo = root.join("excluded");
+        let normal_repo = root.join("normal");
+        init_repo_with_a_commit(&excluded_repo);
+        init_repo_with_a_commit(&normal_repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: excluded_repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let order: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(order.len(), 2, "the fixture must discover both repos");
+
+        let counts = core.applicability(&order, &Filter::parse("kind:repo"));
+
+        assert_eq!(
+            counts.total(),
+            core.operable_count(&order),
+            "the predicate must be counted over exactly the rows `operable_count` keeps"
+        );
+        assert_eq!(
+            counts,
+            Applicability {
+                applicable: 1,
+                inapplicable: 0,
+                unresolved: 0,
+            }
         );
     }
 
