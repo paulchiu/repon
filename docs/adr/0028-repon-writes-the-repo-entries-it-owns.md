@@ -23,3 +23,11 @@ There is no undo and no trash, accepted deliberately. A branch that exists on a 
 - Deletion is available on Repos and refused on Submodules and linked Worktrees, with the refusal reported and counted rather than silent.
 - Work is lost permanently when the confirm gate is accepted. That is the recorded trade, not an oversight.
 - The map's Out of scope entry ruling out removal is redrawn to worktree removal specifically, which remains out of scope.
+
+## Amended by #260
+
+The scope line above, "A linked Worktree is refused... worktree management stays out of scope", and the Consequences bullet repeating it, are overruled by hands-on use. A Worktree is a row Repon discovered, reports on and lets the user `ignore`; refusing to remove it was the one operation that stopped halfway, and "it leaves administrative files in the Repo it was linked from" was always an argument for calling `git worktree remove`, not for refusing outright.
+
+`delete` is now eligible on a Worktree and removes it the way git does: its own administrative entry under the Repo it is linked from, then its own working directory, falling back to a bare directory removal, reported as that rather than a clean removal, when that Repo cannot be opened. Deleting a Repo now takes its linked Worktrees with it too, so the count this ADR's confirm gate names as "the number of linked Worktrees pointing into each Repo" becomes a count of what will be destroyed rather than a warning about what will be orphaned. A Worktree already in the same Selection as its parent Repo is removed once, by the Repo's own `delete`, and is not named or run a second time. A Submodule stays refused for the reason this ADR already gives, unchanged.
+
+See [#260](https://github.com/paulchiu/repon/issues/260).

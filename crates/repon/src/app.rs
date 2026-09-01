@@ -1823,7 +1823,12 @@ impl App {
             );
             return;
         }
-        let report = management::run(&plan, &self.config_file);
+        let report = management::run(
+            &plan,
+            &self.config_file,
+            |key| self.core.worktree_admin_dir(key).ok(),
+            |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
+        );
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
         }
@@ -5013,9 +5018,12 @@ mod tests {
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
         init_repo(&repo);
-        worktree_add(&repo, &root.join("sidecar"), "sidecar");
+        write_gitmodules(&repo, "lib", "vendor/lib");
+        std::fs::create_dir_all(repo.join("vendor").join("lib")).expect("create submodule dir");
         let config_dir = tempfile::tempdir().expect("config temp dir");
         let mut app = test_app_with_config(&root, config_dir.path());
+        app.document.show_submodules = true;
+        app.core.set_show_submodules(true);
         app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
             .expect("select every visible row");
 
@@ -5055,9 +5063,9 @@ mod tests {
             "working tree removed, no `[[repo]]` entry of its own"
         );
         assert!(
-            words("sidecar").contains("refused, removing a linked Worktree"),
+            words("vendor/lib").contains("refused, a Submodule's git dir lives in its parent"),
             "the refused row says why, got {:?}",
-            words("sidecar")
+            words("vendor/lib")
         );
         let receipt_of = |name: &str| {
             entities
@@ -5071,11 +5079,11 @@ mod tests {
             "the Repo that was acted on did not refuse"
         );
         assert!(
-            receipt_of("sidecar").refused(),
+            receipt_of("vendor/lib").refused(),
             "and the row the gate refused reads as a refusal rather than a failure"
         );
         assert!(
-            !receipt_of("sidecar").failed(),
+            !receipt_of("vendor/lib").failed(),
             "a refusal never widens the row summary fold"
         );
     }
@@ -5115,18 +5123,21 @@ mod tests {
         );
     }
 
-    /// The refusal half of the same frame: a Selection carrying a linked Worktree names it
-    /// and its reason on screen rather than dropping it, and the headline's own count says
-    /// how many were subtracted ([repo-management.md](../../../docs/spec/repo-management.md):
-    /// "A refusal is reported and counted in the confirm gate, never silent").
+    /// The refusal half of the same frame: a Selection carrying a Submodule names it and its
+    /// reason on screen rather than dropping it, and the headline's own count says how many
+    /// were subtracted ([repo-management.md](../../../docs/spec/repo-management.md): "A
+    /// refusal is reported and counted in the confirm gate, never silent").
     #[test]
     fn a_refused_row_is_named_with_its_reason_on_the_gates_own_frame() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
         init_repo(&repo);
-        worktree_add(&repo, &root.join("sidecar"), "sidecar");
+        write_gitmodules(&repo, "lib", "vendor/lib");
+        std::fs::create_dir_all(repo.join("vendor").join("lib")).expect("create submodule dir");
         let mut app = test_app(&root);
+        app.document.show_submodules = true;
+        app.core.set_show_submodules(true);
         app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
             .expect("select every visible row");
 
@@ -5138,8 +5149,89 @@ mod tests {
             "the headline counts the refusal as well as the eligible rows, got:\n{frame}"
         );
         assert!(
-            frame.contains("sidecar: refused, removing a linked Worktree"),
+            frame.contains("vendor/lib: refused, a Submodule's git dir lives in its parent"),
             "the refused row is named with its reason, got:\n{frame}"
+        );
+    }
+
+    /// The Done-when's own claim, proven end to end through the production key path: a
+    /// Worktree row is eligible for `delete`, and accepting the gate removes it the way
+    /// `git worktree remove` does, both the working directory and the parent Repo's own
+    /// administrative entry, which is what `git worktree list` in the parent reads.
+    #[test]
+    fn deleting_a_worktree_row_alone_removes_it_and_the_parent_forgets_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("sidecar");
+        worktree_add(&repo, &worktree, "sidecar");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let worktree_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "sidecar")
+            .expect("the Worktree row is discovered")
+            .key
+            .clone();
+        app.selection.toggle(worktree_key);
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(!worktree.exists(), "the Worktree's own directory is gone");
+        assert!(repo.exists(), "the parent Repo is untouched");
+        let list = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "list"])
+            .output()
+            .expect("run git worktree list");
+        assert!(list.status.success());
+        assert!(
+            !String::from_utf8_lossy(&list.stdout).contains("sidecar"),
+            "the parent's own worktree register must forget the removed Worktree too, got \
+             {:?}",
+            String::from_utf8_lossy(&list.stdout)
+        );
+    }
+
+    /// Criterion "one removal, reported once": a Worktree selected alongside the parent Repo
+    /// it is linked from is not named as its own row in the gate or the report, since the
+    /// Repo's own `delete` already takes it with it.
+    #[test]
+    fn deleting_a_worktree_and_its_parent_repo_together_is_one_removal_reported_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("sidecar");
+        worktree_add(&repo, &worktree, "sidecar");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            frame.contains("delete on 1 repos?"),
+            "the Worktree covered by its selected parent must not inflate the count, got:\n{frame}"
+        );
+        assert!(
+            !frame.contains("sidecar"),
+            "a Worktree covered by its selected parent must not be named as its own row, got:\n{frame}"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+
+        assert!(!repo.exists(), "the Repo's own working tree is gone");
+        assert!(
+            !worktree.exists(),
+            "the Repo's own delete must take its linked Worktree with it"
         );
     }
 
@@ -5165,6 +5257,34 @@ mod tests {
         assert!(
             source.contains("self.core.delete_risk(key)"),
             "the one call must read the risk off the Core"
+        );
+    }
+
+    /// The same "computed, not stubbed" claim for what a `delete` run needs to remove a
+    /// Worktree the way `git worktree remove` does: [`repon_core::Core::worktree_admin_dir`]
+    /// and [`repon_core::Core::linked_worktree_paths`] at the one call site, not a literal
+    /// this crate could hand [`crate::management::run`] instead.
+    #[test]
+    fn the_delete_run_reads_its_worktree_removal_from_the_core_rather_than_a_literal() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+
+        let call_sites: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains("management::run("))
+            .collect();
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "expected exactly one place a `delete` run is dispatched, found: {call_sites:?}"
+        );
+        assert!(
+            source.contains("self.core.worktree_admin_dir(key)"),
+            "the run must read a Worktree's admin dir off the Core"
+        );
+        assert!(
+            source.contains("self.core.linked_worktree_paths(key)"),
+            "the run must read a Repo's linked Worktree paths off the Core"
         );
     }
 

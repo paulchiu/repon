@@ -8,7 +8,7 @@ Management operations change what Repon operates on, or remove a Repo from the m
 | --- | --- | --- |
 | `ignore` | Writes `exclude = true` for the entity's path | A Repo or Worktree not already excluded |
 | `unignore` | Removes `exclude` for the entity's path | A Repo or Worktree currently excluded by a `[[repo]]` entry |
-| `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one | A Repo |
+| `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one | A Repo or Worktree |
 
 The three names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
 
@@ -20,9 +20,15 @@ The three names are reserved. A config-defined `[[action]]` may not take one, an
 
 `delete` is refused on a Submodule: its git common dir is `<parent>/.git/modules/<name>` rather than its own, so removing the directory corrupts the parent, whose `.gitmodules` still names it.
 
-`delete` is refused on a linked Worktree: removing one is `git worktree remove`'s job, it leaves administrative files in the Repo it was linked from, and worktree management is out of scope.
-
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
+
+## What `delete` does to a Worktree
+
+Worktree removal was ruled out of scope when this document first refused a linked Worktree outright; hands-on use overruled that. `delete` is now eligible on a Worktree, and removes it the way `git worktree remove` does: its own administrative entry under the Repo it is linked from (`<repo>/.git/worktrees/<name>`), then its own working directory.
+
+A Worktree whose parent Repo cannot be opened, gone or otherwise unreadable, falls back to removing its working directory alone, with no administrative entry to clean up. That is reported as a directory removal rather than a clean worktree removal, never silently upgraded to one.
+
+Deleting a Repo takes its linked Worktrees with it. Each one's own working directory sits outside the Repo's own and is not touched by removing that alone, so `delete` removes every linked Worktree's directory too, in the same run. A Worktree already in the same Selection as its parent Repo is not named or run as its own row: the Repo's own `delete` already destroys it, and naming it twice would report one removal as two.
 
 ## The confirm gate
 
@@ -34,9 +40,11 @@ A refusal is reported and counted in the confirm gate, never silent, the same wa
   to any check that compares only the index against the worktree, so the gate compares against
   `HEAD` as well.
 - how many commits are unpushed, and on how many branches
-- how many linked Worktrees point into the Repo
+- how many linked Worktrees point into the Repo, which the Repo's own `delete` now destroys along with it rather than merely orphaning
 
 A Repo with none of the three is listed plainly. There is no undo and no trash, which the gate says in as many words; [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md) records why.
+
+A Worktree row's own gate line discloses the same first two facts about its own working tree, uncommitted changes and unpushed commits, and never the third: deleting one Worktree never touches its siblings, so it names no linked-Worktree count of its own. A Worktree already selected alongside the parent Repo it is linked from is not shown as its own row at all, per "What `delete` does to a Worktree" above.
 
 `ignore` and `unignore` use the ordinary Action confirm gate with no additional lines, since neither destroys anything.
 
@@ -71,7 +79,7 @@ An `ignore` therefore takes effect immediately: the row it names is subtracted f
 
 ## Receipts
 
-A management operation's result is a receipt in [actions.md](actions.md)'s sense: it records what Repon did, never goes Stale on a poll, is not superseded by a Generation, and does not persist. A `delete` receipt names each Repo and whether its working tree was removed, its config entry was removed, or it was refused, with the refusal's reason.
+A management operation's result is a receipt in [actions.md](actions.md)'s sense: it records what Repon did, never goes Stale on a poll, is not superseded by a Generation, and does not persist. A `delete` receipt names each Repo or Worktree and whether its working tree was removed, its config entry was removed, or it was refused, with the refusal's reason.
 
 The run leaves one receipt per Selection row, labelled with the operation, carrying exactly one Step: the act Repon performed itself, whose outcome is [actions.md](actions.md)'s `OwnWork` and whose words are the sentence below. No row carries an exit code, a `NotRun` or a `Cancelled`, because no child process ran, and no row is Not applicable, which belongs to an excluded row alone.
 
@@ -79,8 +87,12 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | --- | --- | --- |
 | `ignore` wrote `exclude = true` | `Did` | ignored |
 | `unignore` removed the key | `Did` | no longer ignored |
-| `delete` removed the tree and an entry of its own | `Did` | working tree removed, `[[repo]]` entry removed |
-| `delete` removed the tree and there was no entry | `Did` | working tree removed, no `[[repo]]` entry of its own |
+| `delete` removed a Repo's tree and an entry of its own | `Did` | working tree removed, `[[repo]]` entry removed |
+| `delete` removed a Repo's tree and there was no entry | `Did` | working tree removed, no `[[repo]]` entry of its own |
+| `delete` removed a Worktree cleanly and an entry of its own | `Did` | worktree removed, `[[repo]]` entry removed |
+| `delete` removed a Worktree cleanly and there was no entry | `Did` | worktree removed, no `[[repo]]` entry of its own |
+| `delete` fell back to a directory removal and an entry of its own | `Did` | directory removed, its parent Repo was unreadable, `[[repo]]` entry removed |
+| `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
 | `unignore` on a row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
 | the gate already refused it | `Refused` | refused, then the reason "What `delete` refuses" gives |
 | the tree would not remove, or the file would not write | `CouldNotAct` | failed, then what went wrong |

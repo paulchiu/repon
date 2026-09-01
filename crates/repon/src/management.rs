@@ -18,7 +18,7 @@
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -61,7 +61,7 @@ impl Operation {
         match self {
             Operation::Ignore => "Stop operating on the selected entities",
             Operation::Unignore => "Operate on the selected entities again",
-            Operation::Delete => "Remove the selected Repos' working trees, permanently",
+            Operation::Delete => "Remove the selected working trees, permanently",
         }
     }
 
@@ -96,12 +96,9 @@ impl Operation {
             (Operation::Ignore | Operation::Unignore, Kind::Submodule) => {
                 Eligibility::Refused(Refusal::SubmoduleHasNoEntryOfItsOwn)
             }
-            (Operation::Delete, Kind::Repo) => Eligibility::Eligible,
+            (Operation::Delete, Kind::Repo | Kind::Worktree) => Eligibility::Eligible,
             (Operation::Delete, Kind::Submodule) => {
                 Eligibility::Refused(Refusal::SubmoduleCannotBeDeleted)
-            }
-            (Operation::Delete, Kind::Worktree) => {
-                Eligibility::Refused(Refusal::LinkedWorktreeCannotBeDeleted)
             }
         }
     }
@@ -123,10 +120,6 @@ pub(crate) enum Refusal {
     /// than its own, so removing the directory corrupts the parent, whose `.gitmodules`
     /// still names it.
     SubmoduleCannotBeDeleted,
-    /// `delete` on a linked Worktree: removing one is `git worktree remove`'s job, it leaves
-    /// administrative files in the Repo it was linked from, and worktree management is out
-    /// of scope.
-    LinkedWorktreeCannotBeDeleted,
     /// `ignore` or `unignore` on a Submodule: a `[[repo]]` entry's `path` resolves to a git
     /// common dir, and a Submodule's is its parent's `.git/modules/<name>`, so one entry
     /// cannot cover a parent and its Submodules together
@@ -145,9 +138,6 @@ impl Refusal {
             Refusal::SubmoduleCannotBeDeleted => {
                 "a Submodule's git dir lives in its parent; deleting it corrupts the parent"
             }
-            Refusal::LinkedWorktreeCannotBeDeleted => {
-                "removing a linked Worktree is `git worktree remove`'s job"
-            }
             Refusal::SubmoduleHasNoEntryOfItsOwn => {
                 "a Submodule shares its parent's `[[repo]]` entry and has none of its own"
             }
@@ -163,6 +153,11 @@ impl Refusal {
 pub(crate) struct Target {
     pub(crate) key: EntityKey,
     pub(crate) name: Arc<str>,
+    pub(crate) kind: Kind,
+    /// Shared with every other Entity attached to the same Repo, which is what
+    /// [`drop_worktrees_covered_by_their_own_selected_parent`] matches a Worktree against
+    /// its parent Repo by, rather than by path.
+    pub(crate) common_dir: Arc<Path>,
     pub(crate) eligibility: Eligibility,
     /// `delete` only, and only on a row it will act on: `Ok` with the read, or `Err` with
     /// why it could not be read, never a zeroed stand-in.
@@ -192,16 +187,21 @@ impl Plan {
         entities: &[EntityState],
         targets: &[EntityKey],
     ) -> Self {
-        let plan_targets = targets
+        let mut plan_targets: Vec<Target> = targets
             .iter()
             .filter_map(|key| entities.iter().find(|entity| &entity.key == key))
             .map(|entity| Target {
                 key: entity.key.clone(),
                 name: Arc::clone(&entity.name),
+                kind: entity.kind,
+                common_dir: Arc::clone(&entity.common_dir),
                 eligibility: operation.eligibility(entity),
                 risk: None,
             })
             .collect();
+        if operation == Operation::Delete {
+            drop_worktrees_covered_by_their_own_selected_parent(&mut plan_targets);
+        }
         Plan {
             operation,
             targets: plan_targets,
@@ -265,6 +265,23 @@ impl Plan {
     }
 }
 
+/// Drops a Worktree target whose parent Repo is also targeted, so a `delete` over both
+/// reports one removal rather than two: the Repo's own run already takes its linked
+/// Worktrees with it
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a Repo also
+/// takes its linked Worktrees with it"). Matched by `common_dir` rather than by path, the
+/// same fact that ties a Worktree to the Repo it shares an object store with.
+fn drop_worktrees_covered_by_their_own_selected_parent(targets: &mut Vec<Target>) {
+    let selected_repos: std::collections::HashSet<Arc<Path>> = targets
+        .iter()
+        .filter(|target| target.kind == Kind::Repo)
+        .map(|target| Arc::clone(&target.common_dir))
+        .collect();
+    targets.retain(|target| {
+        target.kind != Kind::Worktree || !selected_repos.contains(&target.common_dir)
+    });
+}
+
 /// The gate's own sentence about permanence
 /// ([repo-management.md](../../../docs/spec/repo-management.md): "There is no undo and no
 /// trash, which the gate says in as many words").
@@ -288,7 +305,7 @@ fn target_line(operation: Operation, target: &Target) -> String {
             format!("{}: refused, {}", target.name, refusal.reason())
         }
         Eligibility::Eligible => match (operation, &target.risk) {
-            (Operation::Delete, Some(Ok(risk))) => match risk_phrases(risk) {
+            (Operation::Delete, Some(Ok(risk))) => match risk_phrases(risk, target.kind) {
                 phrases if phrases.is_empty() => target.name.to_string(),
                 phrases => format!("{}: {}", target.name, phrases.join(", ")),
             },
@@ -305,9 +322,11 @@ fn target_line(operation: Operation, target: &Target) -> String {
     }
 }
 
-/// The three facts the gate names per Repo, each present only when it is true, so a Repo with
-/// none of them produces an empty list and is listed plainly.
-fn risk_phrases(risk: &DeleteRisk) -> Vec<String> {
+/// The facts the gate names per row, each present only when it is true, so a row with none
+/// of them produces an empty list and is listed plainly. A Repo's linked-Worktree count
+/// names what its own `delete` destroys along with it; a Worktree row never carries that
+/// phrase, because deleting one Worktree never touches its siblings.
+fn risk_phrases(risk: &DeleteRisk, kind: Kind) -> Vec<String> {
     let DeleteRisk {
         uncommitted,
         unpushed_commits,
@@ -325,7 +344,7 @@ fn risk_phrases(risk: &DeleteRisk) -> Vec<String> {
             plural(unpushed_branches, "branch", "branches"),
         ));
     }
-    if linked_worktrees > 0 {
+    if kind == Kind::Repo && linked_worktrees > 0 {
         phrases.push(format!(
             "{linked_worktrees} linked {}",
             plural(linked_worktrees, "worktree", "worktrees")
@@ -351,9 +370,20 @@ pub(crate) enum Outcome {
     /// Removing that entry would unignore all of them, which is not what this row asked for,
     /// so nothing is written and the row says so.
     ExcludedByAnInheritedEntry,
-    /// The working tree is gone, and `config_entry_removed` says whether an entry of its
-    /// own went with it.
+    /// A Repo's working tree is gone, along with every linked Worktree's own directory
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a Repo also
+    /// takes its linked Worktrees with it"), and `config_entry_removed` says whether an
+    /// entry of the Repo's own went with it.
     Deleted { config_entry_removed: bool },
+    /// A Worktree was removed the way `git worktree remove` does: its own administrative
+    /// entry under the Repo it was linked from, then its own working directory.
+    /// `config_entry_removed` says whether an entry of its own went with it.
+    WorktreeRemoved { config_entry_removed: bool },
+    /// A Worktree's parent Repo could not be opened, so only its own working directory was
+    /// removed, with no administrative entry cleaned up: a bare directory removal rather
+    /// than a clean `git worktree remove`. `config_entry_removed` says whether an entry of
+    /// its own went with it.
+    DirectoryRemoved { config_entry_removed: bool },
     /// The gate already named this one and counted it; it is carried through so the report
     /// after the run names it too.
     Refused(Refusal),
@@ -379,6 +409,24 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
             config_entry_removed: false,
         } => OwnWork::Did(Arc::from(
             "working tree removed, no `[[repo]]` entry of its own",
+        )),
+        Outcome::WorktreeRemoved {
+            config_entry_removed: true,
+        } => OwnWork::Did(Arc::from("worktree removed, `[[repo]]` entry removed")),
+        Outcome::WorktreeRemoved {
+            config_entry_removed: false,
+        } => OwnWork::Did(Arc::from(
+            "worktree removed, no `[[repo]]` entry of its own",
+        )),
+        Outcome::DirectoryRemoved {
+            config_entry_removed: true,
+        } => OwnWork::Did(Arc::from(
+            "directory removed, its parent Repo was unreadable, `[[repo]]` entry removed",
+        )),
+        Outcome::DirectoryRemoved {
+            config_entry_removed: false,
+        } => OwnWork::Did(Arc::from(
+            "directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own",
         )),
         Outcome::ExcludedByAnInheritedEntry => OwnWork::Refused(Arc::from(
             "still ignored: the `[[repo]]` entry excluding it names another path",
@@ -447,6 +495,18 @@ impl Report {
                 }
                 | Outcome::Deleted {
                     config_entry_removed: false,
+                }
+                | Outcome::WorktreeRemoved {
+                    config_entry_removed: true,
+                }
+                | Outcome::WorktreeRemoved {
+                    config_entry_removed: false,
+                }
+                | Outcome::DirectoryRemoved {
+                    config_entry_removed: true,
+                }
+                | Outcome::DirectoryRemoved {
+                    config_entry_removed: false,
                 } => done += 1,
                 Outcome::ExcludedByAnInheritedEntry => unchanged += 1,
                 Outcome::Refused(_) => refused += 1,
@@ -473,7 +533,16 @@ impl Report {
 /// `config_file` is passed in rather than resolved here, so a test drives this against a
 /// temp directory of its own making and never against the process-wide path
 /// [`crate::config::config_file`] fixes.
-pub(crate) fn run(plan: &Plan, config_file: &Path) -> Report {
+/// Runs `plan` against `config_file`. `worktree_admin_dir` and `linked_worktree_paths` are
+/// [`repon_core::Core::worktree_admin_dir`] and [`repon_core::Core::linked_worktree_paths`]
+/// at the one call site; taken as parameters, the same way [`Plan::with_risk`] takes `read`,
+/// so this module never needs a `Core` to be tested.
+pub(crate) fn run(
+    plan: &Plan,
+    config_file: &Path,
+    worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
+    linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
+) -> Report {
     let records = plan
         .targets
         .iter()
@@ -481,8 +550,14 @@ pub(crate) fn run(plan: &Plan, config_file: &Path) -> Report {
             let started = Instant::now();
             let outcome = match target.eligibility {
                 Eligibility::Refused(refusal) => Outcome::Refused(refusal),
-                Eligibility::Eligible => run_one(plan.operation, target, config_file)
-                    .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
+                Eligibility::Eligible => run_one(
+                    plan.operation,
+                    target,
+                    config_file,
+                    &worktree_admin_dir,
+                    &linked_worktree_paths,
+                )
+                .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
             };
             Record {
                 key: target.key.clone(),
@@ -498,7 +573,13 @@ pub(crate) fn run(plan: &Plan, config_file: &Path) -> Report {
     }
 }
 
-fn run_one(operation: Operation, target: &Target, config_file: &Path) -> Result<Outcome> {
+fn run_one(
+    operation: Operation,
+    target: &Target,
+    config_file: &Path,
+    worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
+    linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
+) -> Result<Outcome> {
     match operation {
         Operation::Ignore => {
             repo_entry::write(config_file, target.key.path(), Edit::Exclude)?;
@@ -511,7 +592,32 @@ fn run_one(operation: Operation, target: &Target, config_file: &Path) -> Result<
                 Ok(Outcome::ExcludedByAnInheritedEntry)
             }
         }
-        Operation::Delete => {
+        Operation::Delete => delete_one(
+            target,
+            config_file,
+            worktree_admin_dir,
+            linked_worktree_paths,
+        ),
+    }
+}
+
+/// `delete` on one row: a Repo takes its linked Worktrees' own directories with it, a
+/// Worktree is removed the way `git worktree remove` does when its parent Repo can still be
+/// opened and falls back to a bare directory removal when it cannot, and a Submodule never
+/// reaches here at all, since [`Operation::eligibility`] always refuses it first.
+fn delete_one(
+    target: &Target,
+    config_file: &Path,
+    worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
+    linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
+) -> Result<Outcome> {
+    match target.kind {
+        Kind::Repo => {
+            for worktree in linked_worktree_paths(&target.key) {
+                // Best effort: a sibling Worktree that will not remove is not this row's own
+                // outcome, and the Repo's own removal below is what the report names.
+                let _ = remove_working_tree(&worktree);
+            }
             remove_working_tree(target.key.path())?;
             let config_entry_removed =
                 repo_entry::write(config_file, target.key.path(), Edit::Remove)?;
@@ -519,16 +625,39 @@ fn run_one(operation: Operation, target: &Target, config_file: &Path) -> Result<
                 config_entry_removed,
             })
         }
+        Kind::Worktree => {
+            let admin_dir = worktree_admin_dir(&target.key);
+            if let Some(admin_dir) = &admin_dir {
+                let _ = fs::remove_dir_all(admin_dir);
+            }
+            remove_working_tree(target.key.path())?;
+            let config_entry_removed =
+                repo_entry::write(config_file, target.key.path(), Edit::Remove)?;
+            Ok(if admin_dir.is_some() {
+                Outcome::WorktreeRemoved {
+                    config_entry_removed,
+                }
+            } else {
+                Outcome::DirectoryRemoved {
+                    config_entry_removed,
+                }
+            })
+        }
+        Kind::Submodule => {
+            unreachable!("a Submodule is always refused before `delete` reaches a row")
+        }
     }
 }
 
-/// Removes one Repo's working tree, the whole directory the Entity key names.
+/// Removes one Repo's or Worktree's working tree, the whole directory `path` names.
 ///
-/// The path comes from the key discovery resolved, never from config, an environment variable
-/// or the working directory. The two guards below can only refuse: a relative path is one no
-/// discovery ever produced (an [`EntityKey`] is a resolved absolute working directory), and a
-/// directory with no `.git` in it is not the Repo this key was built from, so either means
-/// something other than the intended Repo is about to be removed permanently.
+/// The path comes from the key discovery resolved, or from git's own worktree register for
+/// a cascading Repo delete, never from config, an environment variable or the working
+/// directory. The two guards below can only refuse: a relative path is one neither source
+/// ever produces (an [`EntityKey`] is a resolved absolute working directory, and git's own
+/// register writes absolute paths), and a directory with no `.git` in it is not the Repo or
+/// Worktree this call named, so either means something other than the intended one is about
+/// to be removed permanently.
 fn remove_working_tree(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(eyre!(
@@ -583,6 +712,25 @@ mod tests {
         Plan::new(operation, entities, &keys(entities))
     }
 
+    /// A Worktree sharing `parent`'s own path as its `common_dir`, the fixture's stand-in
+    /// for two Entities attached to the same Repo: real discovery ties them by the git
+    /// common dir they share, and every dedup this module does (`delete` merging a Worktree
+    /// into its selected parent's own removal) reads that same field.
+    fn worktree_of(parent: &EntityState, path: &Path, name: &str) -> EntityState {
+        EntityState::new(
+            EntityKey::new(Arc::from(path)),
+            Arc::from(name),
+            Arc::clone(&parent.common_dir),
+            Kind::Worktree,
+        )
+    }
+
+    /// [`run`] with no Worktree of its own to remove: every test that is not itself about
+    /// the Worktree-removal cascade wires trivial closures here rather than repeating them.
+    fn run_plain(plan: &Plan, config_file: &Path) -> Report {
+        run(plan, config_file, |_| None, |_| Vec::new())
+    }
+
     /// The three names, and their order, come from repo-management.md's own operations table
     /// read at test time, never restated here: the reserved-name check in
     /// [`crate::config::document`] and the palette's own built-in list are both this array,
@@ -612,51 +760,61 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 5: `delete` is refused on a Submodule and on a linked Worktree, and each
-    // refusal is reported and counted rather than silent.
+    // Criterion 5: `delete` is refused on a Submodule alone; a Worktree is eligible.
     // =====================================================================================
 
     #[test]
-    fn delete_is_refused_on_a_submodule_and_on_a_linked_worktree_and_each_is_named_and_counted() {
+    fn delete_is_refused_on_a_submodule_and_it_is_named_and_counted() {
         let entities = vec![
             entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo),
-            entity(Path::new("/tmp/x/tree"), "tree", Kind::Worktree),
             entity(Path::new("/tmp/x/sub"), "sub", Kind::Submodule),
         ];
 
         let plan = plan(Operation::Delete, &entities);
 
         assert_eq!(plan.eligible_count(), 1, "only the Repo is eligible");
-        assert_eq!(plan.refused_count(), 2, "and both refusals are counted");
+        assert_eq!(plan.refused_count(), 1, "and the refusal is counted");
 
         let lines = plan.confirm_lines();
         assert!(
-            lines[0].contains('1') && lines[0].contains("2 refused"),
+            lines[0].contains('1') && lines[0].contains("1 refused"),
             "the headline must carry both counts, got {:?}",
             lines[0]
         );
-        let rendered = lines.join("\n");
-        for (name, refusal) in [
-            ("tree", Refusal::LinkedWorktreeCannotBeDeleted),
-            ("sub", Refusal::SubmoduleCannotBeDeleted),
-        ] {
-            let line = lines
-                .iter()
-                .find(|line| line.starts_with(name))
-                .unwrap_or_else(|| panic!("no line names {name:?} in {rendered:?}"));
-            assert!(
-                line.contains("refused") && line.contains(refusal.reason()),
-                "a refusal must name itself and say why, got {line:?}"
-            );
-        }
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with("sub"))
+            .unwrap_or_else(|| panic!("no line names sub in {lines:?}"));
+        assert!(
+            line.contains("refused") && line.contains(Refusal::SubmoduleCannotBeDeleted.reason()),
+            "a refusal must name itself and say why, got {line:?}"
+        );
     }
 
-    /// The sharp half of criterion 5: a refusal is not merely a line, it is a row nothing
-    /// happens to. Every directory here is created by this test in a temp directory of its
-    /// own making; no path comes from config, an environment variable or the working
-    /// directory.
+    /// A Worktree with no selected parent is eligible for `delete` on its own, the scope
+    /// rule this ticket overrules.
     #[test]
-    fn running_delete_removes_the_repo_alone_and_leaves_every_refused_row_on_disk() {
+    fn a_worktree_is_eligible_for_delete_when_its_parent_is_not_also_selected() {
+        let repo = entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo);
+        let tree = worktree_of(&repo, Path::new("/tmp/x/tree"), "tree");
+
+        let entities = [tree];
+        let plan = Plan::new(Operation::Delete, &entities, &keys(&entities));
+
+        assert_eq!(
+            plan.eligible_count(),
+            1,
+            "the Worktree is eligible on its own"
+        );
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].eligibility, Eligibility::Eligible);
+    }
+
+    /// A refusal is not merely a line, it is a row nothing happens to. Every directory here
+    /// is created by this test in a temp directory of its own making; no path comes from
+    /// config, an environment variable or the working directory.
+    #[test]
+    fn running_delete_removes_the_repo_alone_and_leaves_the_refused_submodule_on_disk() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config_file = dir.path().join("config.toml");
         let made = |name: &str| -> PathBuf {
@@ -665,18 +823,15 @@ mod tests {
             path
         };
         let repo = made("repo");
-        let tree = made("tree");
         let sub = made("sub");
         let entities = vec![
             entity(&repo, "repo", Kind::Repo),
-            entity(&tree, "tree", Kind::Worktree),
             entity(&sub, "sub", Kind::Submodule),
         ];
 
-        let report = run(&plan(Operation::Delete, &entities), &config_file);
+        let report = run_plain(&plan(Operation::Delete, &entities), &config_file);
 
         assert!(!repo.exists(), "the Repo's working tree is gone");
-        assert!(tree.exists(), "a linked Worktree is never removed");
         assert!(sub.exists(), "a Submodule is never removed");
         assert_eq!(
             report
@@ -692,21 +847,151 @@ mod tests {
                     }
                 ),
                 (
-                    "tree".to_string(),
-                    Outcome::Refused(Refusal::LinkedWorktreeCannotBeDeleted)
-                ),
-                (
                     "sub".to_string(),
                     Outcome::Refused(Refusal::SubmoduleCannotBeDeleted)
                 ),
             ],
-            "every row is reported, refusals included"
+            "every row is reported, the refusal included"
         );
         assert!(
-            report.summary().contains("2 refused"),
-            "the summary must count the refusals rather than announce a clean run, got {:?}",
+            report.summary().contains("1 refused"),
+            "the summary must count the refusal rather than announce a clean run, got {:?}",
             report.summary()
         );
+    }
+
+    // =====================================================================================
+    // `delete` on a Worktree: removed the way `git worktree remove` does when its parent
+    // can still be found, falling back to a bare directory removal when it cannot. The
+    // admin-dir and linked-worktree-paths closures stand in for `repon_core::Core`'s own
+    // reads, taken as parameters so this module never needs a real git repository to test
+    // this half either.
+    // =====================================================================================
+
+    #[test]
+    fn deleting_a_worktree_removes_its_admin_dir_and_its_own_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        let admin_dir = dir.path().join("admin");
+        std::fs::create_dir_all(&admin_dir).expect("create the admin dir fixture");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is gone");
+        assert!(!admin_dir.exists(), "its administrative entry is gone too");
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::WorktreeRemoved {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    /// The fallback: a Worktree whose parent cannot be opened is still removed, but only its
+    /// own directory, and the report says so rather than claiming a clean `git worktree
+    /// remove`.
+    #[test]
+    fn deleting_a_worktree_whose_parent_is_unreachable_falls_back_to_a_directory_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| Vec::new(),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is still gone");
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::DirectoryRemoved {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    /// Deleting a Repo takes its linked Worktrees with it: each one's own directory sits
+    /// outside the Repo's own and is removed too, read from the injected
+    /// `linked_worktree_paths` the same way `repon_core::Core::linked_worktree_paths` would
+    /// answer for the real thing.
+    #[test]
+    fn deleting_a_repo_removes_every_linked_worktrees_own_directory_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let sibling_one = dir.path().join("sibling-one");
+        let sibling_two = dir.path().join("sibling-two");
+        std::fs::create_dir_all(sibling_one.join(".git")).expect("create sibling one");
+        std::fs::create_dir_all(sibling_two.join(".git")).expect("create sibling two");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+        let siblings = [sibling_one.clone(), sibling_two.clone()];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| siblings.to_vec(),
+        );
+
+        assert!(!repo.exists(), "the Repo's own working tree is gone");
+        assert!(!sibling_one.exists(), "the first linked Worktree is gone");
+        assert!(!sibling_two.exists(), "the second linked Worktree is gone");
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::Deleted {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    // =====================================================================================
+    // "One removal, reported once": a Worktree selected alongside the parent Repo it is
+    // linked from is dropped from the Plan entirely, since the Repo's own delete already
+    // takes it with it.
+    // =====================================================================================
+
+    #[test]
+    fn a_worktree_selected_alongside_its_parent_repo_is_not_named_as_its_own_target() {
+        let repo = entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo);
+        let tree = worktree_of(&repo, Path::new("/tmp/x/tree"), "tree");
+        let entities = vec![repo, tree];
+
+        let plan = plan(Operation::Delete, &entities);
+
+        assert_eq!(
+            plan.targets.len(),
+            1,
+            "the Worktree covered by its selected parent must not be its own target"
+        );
+        assert_eq!(plan.targets[0].name.as_ref(), "repo");
+        assert_eq!(plan.eligible_count(), 1);
+    }
+
+    /// A Worktree whose parent is not itself selected keeps its own target: the merge is
+    /// about what is in the same gesture, not about family membership on its own.
+    #[test]
+    fn a_worktree_whose_parent_is_not_selected_keeps_its_own_target() {
+        let repo = entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo);
+        let tree = worktree_of(&repo, Path::new("/tmp/x/tree"), "tree");
+        let entities = vec![tree.clone()];
+
+        let plan = Plan::new(Operation::Delete, &entities, &keys(&entities));
+
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].name.as_ref(), "tree");
     }
 
     // =====================================================================================
@@ -780,6 +1065,28 @@ mod tests {
         assert_eq!(
             all_three,
             "repo: uncommitted changes, 1 commit unpushed on 1 branch, 2 linked worktrees"
+        );
+    }
+
+    /// A Worktree row's own gate line never names a linked-Worktree count: deleting one
+    /// Worktree never touches its siblings, so the count would mislead rather than inform.
+    #[test]
+    fn a_worktrees_own_gate_line_never_names_a_linked_worktree_count() {
+        let tree = entity(Path::new("/tmp/x/tree"), "tree", Kind::Worktree);
+        let plan = plan(Operation::Delete, &[tree]).with_risk(|_| {
+            Ok(DeleteRisk {
+                uncommitted: true,
+                unpushed_commits: 0,
+                unpushed_branches: 0,
+                linked_worktrees: 3,
+            })
+        });
+
+        let line = plan.confirm_lines()[1].clone();
+
+        assert_eq!(
+            line, "tree: uncommitted changes",
+            "a Worktree's own family size is not this row's own risk, got {line:?}"
         );
     }
 
@@ -892,14 +1199,14 @@ mod tests {
         let repo = dir.path().join("repo");
         let plain = entity(&repo, "repo", Kind::Repo);
 
-        run(
+        run_plain(
             &plan(Operation::Ignore, std::slice::from_ref(&plain)),
             &config_file,
         );
         let ignored = std::fs::read_to_string(&config_file).expect("read it back");
         assert!(ignored.contains("exclude = true"), "got {ignored:?}");
 
-        run(&plan(Operation::Unignore, &[excluded(plain)]), &config_file);
+        run_plain(&plan(Operation::Unignore, &[excluded(plain)]), &config_file);
 
         assert_eq!(
             std::fs::read_to_string(&config_file).expect("read it back"),
@@ -918,7 +1225,7 @@ mod tests {
         std::fs::write(&config_file, before).expect("write the config file");
         let inheriting = excluded(entity(&dir.path().join("tree"), "tree", Kind::Worktree));
 
-        let report = run(&plan(Operation::Unignore, &[inheriting]), &config_file);
+        let report = run_plain(&plan(Operation::Unignore, &[inheriting]), &config_file);
 
         assert_eq!(
             report.records[0].outcome,
@@ -986,6 +1293,30 @@ mod tests {
                 },
                 "Did",
             ),
+            (
+                Outcome::WorktreeRemoved {
+                    config_entry_removed: true,
+                },
+                "Did",
+            ),
+            (
+                Outcome::WorktreeRemoved {
+                    config_entry_removed: false,
+                },
+                "Did",
+            ),
+            (
+                Outcome::DirectoryRemoved {
+                    config_entry_removed: true,
+                },
+                "Did",
+            ),
+            (
+                Outcome::DirectoryRemoved {
+                    config_entry_removed: false,
+                },
+                "Did",
+            ),
             (Outcome::ExcludedByAnInheritedEntry, "Refused"),
             (Outcome::Refused(Refusal::AlreadyIgnored), "Refused"),
             (Outcome::Failed("boom".to_string()), "CouldNotAct"),
@@ -1031,6 +1362,18 @@ mod tests {
             Outcome::Deleted {
                 config_entry_removed: false,
             },
+            Outcome::WorktreeRemoved {
+                config_entry_removed: true,
+            },
+            Outcome::WorktreeRemoved {
+                config_entry_removed: false,
+            },
+            Outcome::DirectoryRemoved {
+                config_entry_removed: true,
+            },
+            Outcome::DirectoryRemoved {
+                config_entry_removed: false,
+            },
             Outcome::ExcludedByAnInheritedEntry,
         ] {
             let said = describe(&outcome);
@@ -1055,7 +1398,7 @@ mod tests {
             entity(&sub, "sub", Kind::Submodule),
         ];
 
-        let report = run(&plan(Operation::Ignore, &entities), &config_file);
+        let report = run_plain(&plan(Operation::Ignore, &entities), &config_file);
         let records = report.own_work_records();
 
         assert_eq!(records.len(), 2, "every row is recorded, refusals included");
