@@ -22,6 +22,116 @@ pub(crate) fn rust_source_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// [`rust_source_files`] minus the modules the crate root declares under `#[cfg(test)]`,
+/// which are scaffolding a release build never compiles: a scan over "production" that
+/// reads them is scanning itself, and this file's own `rfind` over a whitespace predicate
+/// is the standing example. Derived from the root's own declarations rather than a path
+/// list, so a second test-only module leaves the scans the day it is declared.
+pub(crate) fn production_rust_source_files(dir: &Path) -> Vec<PathBuf> {
+    let root = ["main.rs", "lib.rs"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{} holds neither a main.rs nor a lib.rs", dir.display()));
+    let source = std::fs::read_to_string(&root).expect("read a crate root");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut test_only: Vec<PathBuf> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim() != "#[cfg(test)]" {
+            continue;
+        }
+        let Some(declaration) = lines.get(index + 1).map(|next| next.trim()) else {
+            continue;
+        };
+        let Some(name) = declaration
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        else {
+            continue; // an inline `mod tests { .. }` or some other test-gated item
+        };
+        test_only.push(dir.join(format!("{name}.rs")));
+        test_only.push(dir.join(name));
+    }
+    rust_source_files(dir)
+        .into_iter()
+        .filter(|path| !test_only.iter().any(|excluded| path.starts_with(excluded)))
+        .collect()
+}
+
+/// `source` with every whole-line comment dropped and every whitespace run collapsed to one
+/// space. A needle a rustfmt line wrap split reads as one string again, and a doc comment
+/// naming the very shape a scan bans can neither trip it nor satisfy it.
+pub(crate) fn normalised_production(source: &str) -> String {
+    let mut normalised = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if !normalised.is_empty() {
+            normalised.push(' ');
+        }
+        normalised.push_str(&trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    normalised
+}
+
+/// The block the 0-based line `start` opens, that line included, ending at the first later
+/// line that is exactly `start`'s own indentation followed by `}`. rustfmt closes a brace at
+/// its opener's indentation, so this reads one match arm or one function body without
+/// brace-counting, which a `{}` inside a `format!` string would defeat. `None` when no such
+/// line follows, so a caller cannot mistake an unread block for an empty one.
+pub(crate) fn block_at(source: &str, start: usize) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let opener = lines.get(start)?;
+    let indent = &opener[..opener.len() - opener.trim_start().len()];
+    let closer = format!("{indent}}}");
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| **line == closer)
+        .map(|(index, _)| index)?;
+    Some(lines[start..=end].join("\n"))
+}
+
+/// Every block in `source` whose opening line contains `needle`, comment lines excluded.
+/// An opening line that does not end in `{` opens no block and is returned alone, so a
+/// one-line form of the same construct is read rather than skipped.
+pub(crate) fn blocks_opened_by(source: &str, needle: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") || !line.contains(needle) {
+            continue;
+        }
+        if !line.trim_end().ends_with('{') {
+            blocks.push(line.to_string());
+            continue;
+        }
+        blocks.push(
+            block_at(source, index).unwrap_or_else(|| panic!("an unclosed block at: {line}")),
+        );
+    }
+    blocks
+}
+
+/// Every `match` block in `source` whose scrutinee line contains `needle`. The `match`
+/// prefix is what keeps a string literal quoting the same call, which an `unreachable!`
+/// message routinely does, out of the answer. A match written over a scrutinee bound
+/// earlier is invisible here, so a caller must pin how many blocks it expects rather than
+/// trust an empty answer.
+pub(crate) fn match_blocks_over(source: &str, needle: &str) -> Vec<String> {
+    blocks_opened_by(source, needle)
+        .into_iter()
+        .filter(|block| {
+            block
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("match "))
+        })
+        .collect()
+}
+
 /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than at the first
 /// `#[cfg(test)]`, since a doc comment can name that attribute in prose and a lone item can
 /// be test-gated ahead of the module. Finds the *last* such line for the same reason: a file

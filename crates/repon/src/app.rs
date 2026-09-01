@@ -2871,6 +2871,56 @@ mod tests {
         );
     }
 
+    /// Every action `dispatch(Context::Input, _)` can return is named arm by arm in every
+    /// handler that dispatches through that context, so an action joining the input
+    /// vocabulary is a red test rather than a runtime `unreachable!` on the key press. The
+    /// trailing catch-all arm those matches carry cannot make that claim: it compiles
+    /// whatever the vocabulary becomes. The vocabulary is read off the compiled table plus
+    /// `dispatch`'s own printable-character fallback, never listed here.
+    #[test]
+    fn every_input_handler_names_every_action_the_input_context_dispatches() {
+        let mut vocabulary = crate::keys::action_names_bound_in(Context::Input);
+        let text = BindingTable::compiled_default()
+            .dispatch(
+                Context::Input,
+                press(KeyCode::Char('x'), KeyModifiers::NONE),
+            )
+            .expect("a printable character is text in the input context");
+        let text = format!("{text:?}");
+        let text = text.split('(').next().expect("a variant name").to_string();
+        assert!(
+            !vocabulary.contains(&text),
+            "{text:?} is now a compiled row as well as `dispatch`'s fallback, so this test \
+             is counting it twice"
+        );
+        vocabulary.push(text);
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut handlers = 0usize;
+        for path in crate::test_support::production_rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            for block in crate::test_support::match_blocks_over(&source, "dispatch(Context::Input")
+            {
+                handlers += 1;
+                let named = crate::test_support::normalised_production(&block);
+                for action in &vocabulary {
+                    assert!(
+                        named.contains(&format!("Action::{action}")),
+                        "{}'s input handler never names `Action::{action}`, which \
+                         `dispatch(Context::Input, _)` can return; its catch-all arm sends \
+                         that key to `unreachable!` at runtime instead",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            handlers, 3,
+            "expected the Action palette, the Filter line and the Launcher palette to be \
+             the three handlers dispatching through the input context, found {handlers}"
+        );
+    }
+
     /// Criterion 5's own "exactly four, no more": every call site that raises
     /// `action_running_notice` across both crates, since a Launcher and an Action step's
     /// executor both spawn child processes and a scan confined to one crate would be

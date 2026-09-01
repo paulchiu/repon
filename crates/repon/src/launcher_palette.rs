@@ -118,6 +118,16 @@ impl LauncherPalette {
         self.clamp_cursor(launchers);
     }
 
+    /// The typed query verbatim. Nothing in the running program reads it: this palette has
+    /// no `$EDITOR` hand-off to seed, unlike
+    /// [`crate::action_palette::ActionPalette::text`]. It exists so an edit's own test can
+    /// assert the buffer the edit leaves, which the match list cannot stand in for: several
+    /// different cuts of `"café\u{00A0}naïve"` leave the same entries matching.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
+        &self.query
+    }
+
     pub(crate) fn clear_line(&mut self, launchers: &[Launcher]) {
         self.query.clear();
         self.clamp_cursor(launchers);
@@ -531,10 +541,37 @@ mod tests {
     /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
     /// three, so a cut derived by adding one byte to the separator's start lands inside a
     /// character; the accented letters pin that a multi-byte *non*-whitespace character
-    /// before the cut survives it. The third Launcher is what separates deleting one word
-    /// from clearing the whole query, which would match every entry rather than two.
+    /// before the cut survives it. Asserted on the buffer the edit leaves rather than on
+    /// which entries still match: eating the separator along with the word leaves the same
+    /// two entries matching, so a match list cannot tell a boundary-safe wrong cut from the
+    /// right one.
     #[test]
     fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let launchers = vec![launcher("café\u{00A0}naïve")];
+        let mut palette = LauncherPalette::new();
+        for c in "café\u{00A0}naïve".chars() {
+            palette.type_char(c, &launchers);
+        }
+
+        palette.delete_previous_word(&launchers);
+
+        assert_eq!(palette.text(), "café\u{00A0}");
+
+        for c in "naïve\u{2003}encore".chars() {
+            palette.type_char(c, &launchers);
+        }
+
+        palette.delete_previous_word(&launchers);
+
+        assert_eq!(palette.text(), "café\u{00A0}naïve\u{2003}");
+    }
+
+    /// The narrowing the query line drives, kept beside the buffer assertion above rather
+    /// than in place of it: a `Ctrl+W` that leaves the right text must also leave the right
+    /// entries listed. The third Launcher is what separates deleting one word from clearing
+    /// the whole query, which would match every entry rather than two.
+    #[test]
+    fn delete_previous_word_renarrows_the_match_list_to_the_shortened_query() {
         let launchers = vec![
             launcher("café\u{00A0}naïve"),
             launcher("café\u{00A0}encore"),
@@ -559,30 +596,6 @@ mod tests {
             "the query is now \"café\u{00A0}\": one whole word gone, neither one character \
              nor the whole query"
         );
-    }
-
-    /// The same claim as the U+00A0 case for a three-byte separator, so the cut is derived
-    /// rather than tuned to the two-byte width macOS happens to type.
-    #[test]
-    fn delete_previous_word_cuts_on_a_character_boundary_after_an_em_space() {
-        let launchers = vec![
-            launcher("café\u{2003}naïve"),
-            launcher("café\u{2003}encore"),
-            launcher("zzz"),
-        ];
-        let mut palette = LauncherPalette::new();
-        for c in "café\u{2003}naïve".chars() {
-            palette.type_char(c, &launchers);
-        }
-
-        palette.delete_previous_word(&launchers);
-
-        let matched: Vec<&str> = palette
-            .matches(&launchers)
-            .iter()
-            .map(|entry| entry.name.as_str())
-            .collect();
-        assert_eq!(matched, vec!["café\u{2003}naïve", "café\u{2003}encore"]);
     }
 
     #[test]
