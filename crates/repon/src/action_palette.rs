@@ -604,19 +604,15 @@ impl ActionPalette {
             }
             Stage::Choosing => {
                 let query_line = format!("; {}", self.query);
-                frame.buffer_mut().set_string(
-                    interior.x,
-                    interior.y,
-                    &query_line,
-                    theme.style_for(Role::Text),
-                );
+                draw_row(frame, interior, 0, &query_line, theme.style_for(Role::Text));
 
                 let matches = self.matches(actions);
                 let rows_below_query = interior.height.saturating_sub(1) as usize;
                 if matches.is_empty() {
-                    frame.buffer_mut().set_string(
-                        interior.x,
-                        interior.y + 1,
+                    draw_row(
+                        frame,
+                        interior,
+                        1,
                         NO_MATCHES_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
@@ -639,12 +635,7 @@ impl ActionPalette {
                             Entry::Builtin(_) => theme.style_for(Role::Accent),
                             Entry::Configured(_) => Style::new(),
                         };
-                        frame.buffer_mut().set_string(
-                            interior.x,
-                            interior.y + 1 + row as u16,
-                            &line,
-                            style,
-                        );
+                        draw_row(frame, interior, 1 + row as u16, &line, style);
                     }
                 }
                 // The three built-ins are always listed, so an unconfigured run is never an
@@ -654,18 +645,19 @@ impl ActionPalette {
                     && actions.is_empty()
                     && matches.len() < rows_below_query
                 {
-                    frame.buffer_mut().set_string(
-                        interior.x,
-                        interior.y + 1 + matches.len() as u16,
+                    draw_row(
+                        frame,
+                        interior,
+                        1 + matches.len() as u16,
                         NO_ACTIONS_CONFIGURED_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
                 }
                 if let Some(refusal) = &self.refusal {
-                    let row = interior.y + interior.height.saturating_sub(1);
-                    frame.buffer_mut().set_string(
-                        interior.x,
-                        row,
+                    draw_row(
+                        frame,
+                        interior,
+                        interior.height.saturating_sub(1),
                         refusal,
                         theme.style_for(Role::Danger),
                     );
