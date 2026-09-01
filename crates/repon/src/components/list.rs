@@ -371,9 +371,19 @@ impl List {
     }
 }
 
-/// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge. Buffer
-/// clipping alone is not enough: it only stops at the *frame's* edge, one column past
+/// The clamp [`write_cell`] and [`write_truncating_cell`] share: `x` past `interior`'s own
+/// right edge draws nothing, and `width` never reaches past that edge either. Buffer clipping
+/// alone is not enough for either: it only stops at the *frame*'s edge, one column past
 /// `interior`'s own, which is the panel's right border.
+fn clipped_cell_width(interior: Rect, x: u16, width: u16) -> Option<u16> {
+    if x >= interior.right() {
+        None
+    } else {
+        Some(width.min(interior.right() - x))
+    }
+}
+
+/// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge.
 fn write_cell(
     buf: &mut Buffer,
     interior: Rect,
@@ -383,11 +393,76 @@ fn write_cell(
     text: &str,
     style: Style,
 ) {
-    if x >= interior.right() {
+    let Some(max_width) = clipped_cell_width(interior, x, width) else {
         return;
-    }
-    let max_width = width.min(interior.right() - x);
+    };
     buf.set_stringn(x, y, text, max_width as usize, style);
+}
+
+/// [`write_cell`]'s counterpart for text that must say when it has been cut short: when
+/// `text` would not otherwise fit, the cell's own last column is reserved for `mark` rather
+/// than letting [`Buffer::set_stringn`]'s silent cut at a grapheme boundary
+/// (`keybindings.md`'s own words for what it does un-aided) leave a truncated name looking
+/// exactly like a whole one
+/// ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// tenth value meaning, `Truncated`; ADR 0027's "a rendered `wo` names neither of them while
+/// looking exactly like a name"). Used by [`draw_name_cell`] alone: every other column this
+/// crate draws is bounded well inside its own width by the values it can legitimately hold
+/// (ADR 0020's own sweep puts `sync`'s worst case at five of its nine columns), so a name is
+/// the one cell long enough to need this.
+/// The text a [`write_truncating_cell`] call writes, paired with its own truncation mark:
+/// bundled into one argument rather than two so this crate's own
+/// `clippy::too_many_arguments` budget has room for it alongside the geometry
+/// [`write_cell`]'s own seven parameters already spend, the same reason `action_palette.rs`'s
+/// own `Run` bundles its fields.
+struct TruncatingText<'a> {
+    text: &'a str,
+    mark: char,
+}
+
+fn write_truncating_cell(
+    buf: &mut Buffer,
+    interior: Rect,
+    x: u16,
+    y: u16,
+    width: u16,
+    content: TruncatingText,
+    style: Style,
+) {
+    let Some(max_width) = clipped_cell_width(interior, x, width) else {
+        return;
+    };
+    let content = truncate_with_mark(content.text, max_width, content.mark);
+    buf.set_stringn(x, y, &content, max_width as usize, style);
+}
+
+/// `text`, unchanged if it already fits `max_width` columns; otherwise cut to `max_width - 1`
+/// columns at a grapheme boundary, plus `mark` as the last character. Measured with
+/// [`ratatui::text::Span::width`], the same `UnicodeWidthStr::width()` function
+/// `Buffer::set_stringn` itself budgets with (ADR 0020), so this can never disagree with what
+/// the renderer was about to cut anyway.
+fn truncate_with_mark(text: &str, max_width: u16, mark: char) -> std::borrow::Cow<'_, str> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if ratatui::text::Span::raw(text).width() <= max_width as usize {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    if max_width == 0 {
+        return std::borrow::Cow::Borrowed("");
+    }
+    let budget = (max_width - 1) as usize;
+    let mut kept = String::new();
+    let mut column = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = ratatui::text::Span::raw(grapheme).width();
+        if column + grapheme_width > budget {
+            break;
+        }
+        column += grapheme_width;
+        kept.push_str(grapheme);
+    }
+    kept.push(mark);
+    std::borrow::Cow::Owned(kept)
 }
 
 /// [`write_cell`]'s counterpart for a cell that carries more than one role at once: writes
@@ -607,23 +682,29 @@ fn draw_name_cell(
             Style::new(),
         );
         let name_x = marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
-        write_cell(
+        write_truncating_cell(
             buf,
             interior,
             name_x,
             y,
             CHILD_ROW_NAME_WIDTH,
-            &entity.name,
+            TruncatingText {
+                text: &entity.name,
+                mark: glyphs.truncated,
+            },
             name_style,
         );
     } else {
-        write_cell(
+        write_truncating_cell(
             buf,
             interior,
             interior.x + NAME_X,
             y,
             NAME_WIDTH,
-            &entity.name,
+            TruncatingText {
+                text: &entity.name,
+                mark: glyphs.truncated,
+            },
             name_style,
         );
     }
@@ -2111,8 +2192,13 @@ mod tests {
 
         // The name column is 28 wide starting at x=5 (see the header test above), so its
         // last character sits at x=32, the single-space gap before branch is at x=33, and
-        // branch itself starts at x=34.
-        assert_eq!(cell_text(buf, 5, 2, 28), "n".repeat(28));
+        // branch itself starts at x=34. Defect 5: the cut reserves the column's own last
+        // character for the truncation mark rather than filling all 28 with the name's own
+        // text, so a truncated name never looks exactly like a whole one (ADR 0020's tenth
+        // value meaning).
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let expected = format!("{}{}", "n".repeat(27), glyphs.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 28), expected);
         assert_eq!(
             cell_text(buf, 33, 2, 1),
             " ",
@@ -2122,6 +2208,101 @@ mod tests {
             cell_text(buf, 34, 2, 1),
             " ",
             "the branch column must not carry name overflow"
+        );
+    }
+
+    /// A name exactly as wide as its column fits with no mark: the mark is reserved only
+    /// when a cut actually happens, never appended just because a name reaches the edge.
+    #[test]
+    fn a_name_exactly_as_wide_as_its_column_carries_no_truncation_mark() {
+        let exact_name = "n".repeat(NAME_WIDTH as usize);
+        let terminal = render(140, 24, &snapshot(vec![entity(&exact_name)]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(cell_text(buf, 5, 2, NAME_WIDTH), exact_name);
+    }
+
+    /// The ascii table's own truncation mark, `$` per ADR 0020's tenth value meaning, the
+    /// same character the full table uses (`GlyphSet::for_config` is the seam that would
+    /// diverge if a future ascii-only fallback were ever added).
+    #[test]
+    fn a_truncated_name_carries_the_ascii_tables_own_mark_under_glyphs_ascii() {
+        let mut list = List::default();
+        list.register_config_handler(crate::config::Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document: crate::config::document::Document {
+                glyphs: crate::config::document::Glyphs::Ascii,
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+            zero_config: false,
+        })
+        .expect("register config");
+        let long_name = "n".repeat(40);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![entity(&long_name)]));
+        let buf = terminal.backend().buffer();
+
+        let ascii = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+        let expected = format!("{}{}", "n".repeat(27), ascii.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 28), expected);
+    }
+
+    /// A child row's own reduced name budget ([`CHILD_ROW_NAME_WIDTH`]) truncates the same
+    /// way the top-level name column does: the mark comes out of the child's own budget, not
+    /// appended past it.
+    #[test]
+    fn a_truncated_child_row_name_also_carries_the_mark_inside_its_own_reduced_budget() {
+        let long_branch_name = "b".repeat(40);
+        let parent = entity("parent-repo");
+        let mut child = entity(&long_branch_name);
+        child.kind = Kind::Worktree;
+        let terminal = render(140, 24, &snapshot(vec![parent, child]));
+        let buf = terminal.backend().buffer();
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        // Indent (4) + marker (1) + gap (1) = 6 columns before the child's own name text
+        // starts, per `CHILD_ROW_PREFIX_WIDTH`; its own budget is `NAME_WIDTH - 6` = 22.
+        let child_name_x =
+            5 + CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
+        let expected = format!(
+            "{}{}",
+            "b".repeat(CHILD_ROW_NAME_WIDTH as usize - 1),
+            glyphs.truncated
+        );
+        assert_eq!(
+            cell_text(buf, child_name_x, entity_row_y(1), CHILD_ROW_NAME_WIDTH),
+            expected
+        );
+    }
+
+    /// [`truncate_with_mark`] proven directly, independent of any rendering: the pure
+    /// function every render-level test above exercises end to end.
+    #[test]
+    fn truncate_with_mark_reserves_the_last_column_only_when_a_cut_actually_happens() {
+        assert_eq!(
+            truncate_with_mark("short", 10, '$'),
+            std::borrow::Cow::Borrowed("short"),
+            "text that already fits must be returned unchanged, with no mark appended"
+        );
+        assert_eq!(
+            truncate_with_mark("exact", 5, '$'),
+            std::borrow::Cow::Borrowed("exact"),
+            "text exactly as wide as the budget must not be treated as needing a cut"
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 5, '$'),
+            "nnnn$".to_string()
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 1, '$'),
+            "$".to_string(),
+            "a one-column budget spends its whole column on the mark, keeping nothing"
+        );
+        assert_eq!(
+            truncate_with_mark("nnnnnnnnnn", 0, '$'),
+            "",
+            "a zero-column budget has no room for the mark either"
         );
     }
 

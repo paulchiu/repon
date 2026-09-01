@@ -185,6 +185,7 @@ glyph_set! {
         Changed: changed,
         ChildRow: child_row,
         Checked: checked,
+        Truncated: truncated,
     },
 }
 
@@ -217,6 +218,12 @@ pub const FULL: GlyphSet = GlyphSet {
     // singled the braille spinner out as ADR 0020's one open defect. Not one glance from any
     // other value glyph in this table.
     checked: '✓',
+    // One of the 95 printable ASCII characters carried by all five surveyed faces, the same
+    // universal tier every other glyph in this file occupies; proposed for both tables
+    // rather than a full-only unicode mark, per ADR 0020's tenth value meaning. Cited from
+    // `less(1)` and GNU `nano`, which both mark a line continuing past the visible width
+    // with `$` at the boundary.
+    truncated: '$',
     border: Border {
         top_left: '╭',
         top_right: '╮',
@@ -255,6 +262,10 @@ pub const ASCII: GlyphSet = GlyphSet {
     // the row interior's disjointness rule, and a border is read as a region around the
     // panel rather than decoded character by character inside one row.
     checked: '+',
+    // The same character as `full`'s own `truncated` above, ADR 0020's tenth value meaning:
+    // one truncation mark, unchanged by which table is live, rather than a second ascii-only
+    // choice. Distinct from every other glyph in this table.
+    truncated: '$',
     border: Border {
         top_left: '+',
         top_right: '+',
@@ -541,6 +552,26 @@ mod tests {
         );
     }
 
+    /// ADR 0020's tenth value meaning, `Truncated`: unlike `Checked`'s own `ascii` glyph,
+    /// `$` collides with nothing already in either table, gutter or border alike, so this
+    /// meaning introduces no new permitted-collision class. Pinned by name so a future change
+    /// to either glyph fails a named test rather than silently colliding.
+    #[test]
+    fn the_truncated_value_mark_is_the_same_dollar_character_in_both_tables_and_collides_with_neither_frame()
+     {
+        assert_eq!(FULL.truncated, '$');
+        assert_eq!(ASCII.truncated, '$');
+        assert_ne!(
+            ASCII.border.top_left, ASCII.truncated,
+            "the ascii border's corner must not collide with the truncation mark the way it \
+             does, permitted, with `Checked`"
+        );
+        assert_ne!(
+            ASCII.border.horizontal, ASCII.truncated,
+            "the ascii border's horizontal rule must not collide with the truncation mark"
+        );
+    }
+
     /// ADR 0020: line art need not stay injective the way the row interior's vocabulary must,
     /// because a border is read as a region rather than decoded character by character. The
     /// ascii set exercises that liberty fully: all four corners collapse onto one `+`.
@@ -648,10 +679,11 @@ mod tests {
     /// table at test time and compares it against the full glyph table in both directions:
     /// a meaning the spec names and the code does not implement fails here, as does a value
     /// meaning the code implements and the spec's table does not name, and a meaning both
-    /// sides name but render with a different character also fails here. `ChildRow` and
-    /// `Checked` are excluded on the code side: each marks a row's shape or state (a nested
-    /// Worktree or Submodule line, a row the Selection holds), specified in its own
-    /// paragraph, not an in-cell value this table covers.
+    /// sides name but render with a different character also fails here. `ChildRow`,
+    /// `Checked` and `Truncated` are excluded on the code side: each marks a row's shape or
+    /// state (a nested Worktree or Submodule line, a row the Selection holds, a name cut to
+    /// fit its column), specified in its own paragraph, not an in-cell value this table
+    /// covers.
     ///
     /// If the spec gains a seventh glyph, this test fails two different ways depending on
     /// what the code does: an unrecognised meaning phrase panics inside
@@ -699,6 +731,7 @@ mod tests {
                         | Meaning::Loading
                         | Meaning::ChildRow
                         | Meaning::Checked
+                        | Meaning::Truncated
                 )
             })
             .collect();
