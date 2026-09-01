@@ -209,7 +209,7 @@ impl App {
             tracing::error!("config reload failed to hand the new config to a component: {err:#}");
         }
 
-        // `new_config.warnings` was already logged inside `Config::new()`, which is what
+        // `new_config.warnings` was already logged inside `Config::at`, which is what
         // built it; nothing here re-logs it. Moved out last, after the whole-struct clone
         // just above, since a partial move here would leave nothing left to clone.
         self.config_warnings = new_config.warnings;
