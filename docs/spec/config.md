@@ -107,6 +107,8 @@ The active Set is named on screen, as the status row's first item, ahead of the 
 
 `exclude = true` means the entity is listed and never operated on, which is different from a Set's exclude glob, where the entity is never discovered at all. It cannot exclude a parent and its Submodules together, because a Submodule's git common dir is `<parent>/.git/modules/<name>` rather than the parent's; excluding a subtree is a Set's `exclude` glob. An excluded entity is still a row, so it can be selected, and it is subtracted from the count the Action confirm gate and the palette border both show; [actions.md](actions.md) settles what it renders after a run.
 
+`exclude` is the one key Repon itself writes, and `[[repo]]` the one table: [repo-management.md](repo-management.md) fixes when, and [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md) records why the file stopped being read-only. Nothing else in this document is ever written by Repon.
+
 ## Launchers
 
 | field | type | meaning |

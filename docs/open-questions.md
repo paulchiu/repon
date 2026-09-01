@@ -98,6 +98,24 @@ one.
   question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
   (the gutter mark).
 
+## Two writers to `config.toml`
+
+Repon now writes `[[repo]]` entries, and it takes no lock and runs no watcher, so a
+write races an editor open on the same file and the last writer wins. The exposure is
+accepted rather than closed: it is the same one a user already has between two
+editors, and neither a lock file nor a watcher was judged worth the machinery for a
+file edited by hand a few times a year. What makes it survivable is that every write
+is a read, a modify and a write of the file on disk rather than a serialisation of an
+in-memory document, so a concurrent edit loses only the keys the two writers touched
+in common.
+
+- **Reopens if**: a write is observed clobbering a hand edit in practice, or Repon
+  gains a second writer of its own (a background one, say) so that two Repon
+  processes can race each other rather than a person.
+- **Owned by**: [`spec/repo-management.md`](spec/repo-management.md), which owns the
+  write, and [`adr/0028-repon-writes-the-repo-entries-it-owns.md`](adr/0028-repon-writes-the-repo-entries-it-owns.md),
+  which records the trade.
+
 ## Help's search has no Backspace
 
 Help's search mode is `overlay`'s own addition rather than a switch to `input`
