@@ -68,6 +68,50 @@ released, so the no stays enforced rather than merely stated.
 - **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#open), reasoning in
   [ADR 0024](adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
 
+## A management result has no receipt of its own
+
+[`spec/repo-management.md`](spec/repo-management.md)'s "Receipts" asks for a
+management result to be a receipt in [`spec/actions.md`](spec/actions.md)'s own
+sense, naming per Repo what was done or why it was refused. What ships instead is a
+log line per row and a one-line Notice carrying the counts: the confirm gate names
+and counts every refusal before the gesture is accepted, and nothing reaches the
+detail pane afterwards. The obstacle is vocabulary, not wiring. An `ActionReceipt`
+carries its result in `StepResult::outcome`, whose set
+[`spec/actions.md`](spec/actions.md#step-outcomes) declares "a closed set of four",
+and every one of the four is a child process's: `Failed` carries an exit code,
+`NotRun` means an earlier step failed, `Cancelled` means a run was interrupted. A
+management operation runs no child process, so a refusal and a write that would not
+write both have to borrow an outcome that means something else, and a fabricated
+exit code in the detail pane is worse than the gap.
+
+- **Reopens if**: `StepOutcome` gains a fifth outcome for work Repon did itself,
+  which is the change that closes this, or `ActionReceipt` grows a result that is
+  not a step's.
+- **Owned by**: [`spec/actions.md`](spec/actions.md), which owns the outcome set,
+  and [`spec/repo-management.md`](spec/repo-management.md), which asks for the
+  receipt.
+
+## A confirm gate too short to show every refusal has no way to reach one
+
+[`spec/repo-management.md`](spec/repo-management.md)'s "A refusal is reported and
+counted in the confirm gate, never silent" is met in its counted half at every
+height: the headline carries `N refused`, and
+[`crates/repon/src/action_palette.rs`](../crates/repon/src/action_palette.rs)'s
+`fit_confirm_rows` replaces the per-Repo lines it cannot fit with one line saying how
+many are not shown. The reported half is not, below a certain height. The fit keeps
+the headline and the last line and gives up the middle, so a refused row's own reason
+can be among the lines dropped, and the gate does not scroll, so there is no way to
+reach it. Below four interior rows there is provably no room for a reason at all.
+Making a reason survive means either a priority the fitting function does not have (it
+is content-blind by design, taking lines rather than a `Plan`) or a scrolling gate,
+which is a feature rather than a fix, so the gap is recorded rather than papered over.
+
+- **Reopens if**: the gate gains scrolling, or `fit_confirm_rows` is given the
+  refusals to prefer, whichever comes first.
+- **Owned by**: [`spec/repo-management.md`](spec/repo-management.md), which owns the
+  promise, and [`spec/theming.md`](spec/theming.md), which owns the palette's own
+  geometry.
+
 ## Two writers to `config.toml`
 
 Repon now writes `[[repo]]` entries, and it takes no lock and runs no watcher, so a

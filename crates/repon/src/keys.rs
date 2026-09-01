@@ -280,7 +280,7 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::OpenActionPalette,
     ),
-    binding_not_built(
+    binding(
         Context::Global,
         KeyCode::Char('m'),
         NONE,

@@ -46,8 +46,8 @@ use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
-    ActionReceipt, DefaultBranch, DirtyCounts, EntityKey, EntityState, Head, Kind, Presence,
-    RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
+    ActionReceipt, DefaultBranch, DeleteRisk, DirtyCounts, EntityKey, EntityState, Head, Kind,
+    Presence, RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
@@ -120,34 +120,82 @@ pub struct ActionSpec {
     pub concurrency: u32,
 }
 
-/// A [`RepoOverride`] with its common dir already resolved, built once at
-/// `Core::start` rather than on every match.
+/// A [`RepoOverride`]'s probe-input half with its common dir already resolved, built
+/// once at `Core::start` and frozen for this `Core`'s life: `default_branch` is read
+/// while probing, so moving it needs the rediscovery a rebuild does
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "Writing config").
 #[derive(Debug, Clone)]
 struct ResolvedOverride {
     path: PathBuf,
     common_dir: PathBuf,
     default_branch: Option<String>,
+}
+
+/// A [`RepoOverride`]'s `exclude` with its common dir already resolved, held apart from
+/// [`ResolvedOverride`] because it re-applies live: `exclude` decides only whether an
+/// operation may reach a row that is discovered, probed and listed either way
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s "listed,
+/// never operated on"), so [`Core::set_exclusions`] replaces it with no rebuild at all.
+#[derive(Debug, Clone)]
+struct ResolvedExclusion {
+    path: PathBuf,
+    common_dir: PathBuf,
     excluded: bool,
 }
 
-/// Opens every override's own `path` to learn its common dir, silently dropping
-/// one that will not even open: a path that matches no discovered entity already
-/// gets its own warning on the consumer's side
+/// The two path fields [`find_entry`]'s match rule reads, so the rule itself is written
+/// once for both halves a `[[repo]]` entry resolves into.
+trait ResolvedEntry {
+    fn path(&self) -> &Path;
+    fn common_dir(&self) -> &Path;
+}
+
+impl ResolvedEntry for ResolvedOverride {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+}
+
+impl ResolvedEntry for ResolvedExclusion {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+}
+
+/// Opens every override's own `path` to learn its common dir, once, and splits the result
+/// into the half frozen for this `Core`'s life and the half [`Core::set_exclusions`] can
+/// replace live. Silently drops an entry that will not even open: a path that matches no
+/// discovered entity already gets its own warning on the consumer's side
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#cross-key-validity)),
 /// and the core raises no second one for the same fact.
-fn resolve_overrides(overrides: &[RepoOverride]) -> Vec<ResolvedOverride> {
+fn resolve_entries(overrides: &[RepoOverride]) -> (Vec<ResolvedOverride>, Vec<ResolvedExclusion>) {
     overrides
         .iter()
         .filter_map(|entry| {
             let common_dir = git::common_dir_of(&entry.path).ok()?;
-            Some(ResolvedOverride {
-                path: entry.path.clone(),
-                common_dir: common_dir.to_path_buf(),
-                default_branch: entry.default_branch.clone(),
-                excluded: entry.excluded,
-            })
+            Some((
+                ResolvedOverride {
+                    path: entry.path.clone(),
+                    common_dir: common_dir.to_path_buf(),
+                    default_branch: entry.default_branch.clone(),
+                },
+                ResolvedExclusion {
+                    path: entry.path.clone(),
+                    common_dir: common_dir.to_path_buf(),
+                    excluded: entry.excluded,
+                },
+            ))
         })
-        .collect()
+        .unzip()
 }
 
 /// The entry that applies to an entity at `path` sharing `common_dir`: one naming
@@ -162,19 +210,26 @@ fn resolve_overrides(overrides: &[RepoOverride]) -> Vec<ResolvedOverride> {
 /// can never also exclude the parent's Submodules. The documented workaround is a
 /// Set's own `exclude` glob over the subtree, which keeps the Submodule out of
 /// discovery entirely rather than merely marking it excluded here.
-fn find_override<'a>(
-    overrides: &'a [ResolvedOverride],
+fn find_entry<'a, T: ResolvedEntry>(
+    entries: &'a [T],
     path: &Path,
     common_dir: &Path,
-) -> Option<&'a ResolvedOverride> {
-    overrides
+) -> Option<&'a T> {
+    entries
         .iter()
-        .find(|entry| entry.path == path)
+        .find(|entry| entry.path() == path)
         .or_else(|| {
-            overrides
+            entries
                 .iter()
-                .find(|entry| entry.common_dir == common_dir)
+                .find(|entry| entry.common_dir() == common_dir)
         })
+}
+
+/// Whether an entity at `path` sharing `common_dir` is excluded by `exclusions`: the one
+/// place the table's own [`EntityState::excluded`] is derived, read at entity creation, at
+/// [`Core::probe_now`] and again whenever [`Core::set_exclusions`] replaces the list.
+fn excluded_by(exclusions: &[ResolvedExclusion], path: &Path, common_dir: &Path) -> bool {
+    find_entry(exclusions, path, common_dir).is_some_and(|entry| entry.excluded)
 }
 
 /// Whether a Generation's dispatch probes `kind` at all: always for a Repo or a
@@ -300,11 +355,18 @@ enum ClockControl {
 /// `discovery_warning` and `run_action` (see its own doc comment).
 pub struct Core {
     table: Arc<RwLock<Table>>,
-    /// Resolved once at `start` and never mutated afterwards: overrides only
-    /// change on a config reload, which re-derives a whole new `Core`
-    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#reload)
-    /// is later work).
+    /// Resolved once at `start` and never mutated afterwards: `default_branch` is a probe
+    /// input, so moving it needs the rediscovery a rebuilt `Core` does
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#reload)).
     overrides: Arc<Vec<ResolvedOverride>>,
+    /// The live `exclude` half of the same `[[repo]]` entries, replaced wholesale by
+    /// [`Core::set_exclusions`] with no rebuild and no rediscovery, the same shape
+    /// `show_submodules` already has: `exclude` decides only whether an operation may reach
+    /// a row that is discovered and listed either way, so it is an operate-time filter over
+    /// a table that is already correct
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "Writing config").
+    exclusions: Arc<RwLock<Vec<ResolvedExclusion>>>,
     /// The Set `start` was given, retained so `refresh` can re-run discovery over
     /// the same bounding specification at the head of every Generation
     /// ([discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md),
@@ -550,7 +612,7 @@ impl Core {
                 };
                 table.entities[idx].default_branch.begin_probe();
                 let common_dir = Arc::clone(&table.entities[idx].common_dir);
-                let override_branch = find_override(&self.overrides, key.path(), &common_dir)
+                let override_branch = find_entry(&self.overrides, key.path(), &common_dir)
                     .and_then(|entry| entry.default_branch.clone());
                 let repo = table.repos.get(key).cloned();
                 let kind = table.entities[idx].kind;
@@ -643,6 +705,7 @@ impl Core {
         RefreshHandles {
             table: Arc::clone(&self.table),
             overrides: Arc::clone(&self.overrides),
+            exclusions: Arc::clone(&self.exclusions),
             set: self.set.clone(),
             discovery_manual: Arc::clone(&self.discovery_manual),
             discovery_warn_after: self.discovery_warn_after,
@@ -699,9 +762,13 @@ impl Core {
             (repo, common_dir, probes_state, probes_base, kind)
         };
         let common_dir_hint = common_dir_hint.unwrap_or_else(|| Arc::from(key.path().join(".git")));
-        let matched = find_override(&self.overrides, key.path(), &common_dir_hint);
-        let override_branch = matched.and_then(|entry| entry.default_branch.clone());
-        let excluded = matched.map(|entry| entry.excluded).unwrap_or(false);
+        let override_branch = find_entry(&self.overrides, key.path(), &common_dir_hint)
+            .and_then(|entry| entry.default_branch.clone());
+        let excluded = excluded_by(
+            &self.exclusions.read().unwrap(),
+            key.path(),
+            &common_dir_hint,
+        );
 
         let branch_outcome =
             probe_branch(key.path(), cached_repo.as_deref(), kind, &never_cancelled);
@@ -830,6 +897,35 @@ impl Core {
             .wait_timeout_while(guard, within, |count| *count > 0)
             .unwrap();
         self.snapshot()
+    }
+
+    /// What deleting `key`'s working tree destroys, read fresh right now
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "The confirm gate"). Every one of the three is a git read rather than a fold over this
+    /// entity's Cells or over the table: the gate is answering "what will accepting this
+    /// destroy", a Cell carries whatever the last Generation left there, and the table is
+    /// bounded by the active Set's roots, so a linked Worktree outside them would go
+    /// unnamed. Both are the wrong tense, or the wrong scope, for a question with no undo.
+    ///
+    /// `uncommitted` is both halves of "not in a commit": the index against the working tree
+    /// (`git::dirty_counts`) and `HEAD` against the index (`git::staged_changes`). The
+    /// second is the one a `git add` with no commit lands in, and the one the dirty column
+    /// deliberately never asks about.
+    ///
+    /// Errors rather than reporting zero when any read fails, so a gate never says "nothing
+    /// to lose" because it could not look.
+    pub fn delete_risk(&self, key: &EntityKey) -> Result<DeleteRisk, git::ProbeError> {
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        let dirty = git::dirty_counts(&repo, Arc::new(AtomicBool::new(false)))?;
+        let staged = git::staged_changes(&repo)?;
+        let (unpushed_commits, unpushed_branches) = git::unpushed(&repo)?;
+        let linked_worktrees = git::linked_worktrees(&repo)?;
+        Ok(DeleteRisk {
+            uncommitted: dirty.total() > 0 || staged,
+            unpushed_commits,
+            unpushed_branches,
+            linked_worktrees,
+        })
     }
 
     /// Drops one entity from the table, cancelling any probe in flight against it.
@@ -1109,6 +1205,30 @@ impl Core {
         self.show_submodules
             .store(show_submodules, Ordering::Release);
     }
+
+    /// Replaces the live `exclude` half of `[[repo]]` and re-applies it over every row the
+    /// table already holds, so the next [`Core::snapshot`] answers with the new reading
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "Writing config": an `ignore` takes effect in the frame the write completes).
+    ///
+    /// Starts no Generation, dispatches nothing and rediscovers nothing, for the same reason
+    /// [`Core::set_show_submodules`] does not: `exclude` decides only whether an operation
+    /// may reach a row, never what discovery finds or what a probe reads. `default_branch`,
+    /// the other key a `[[repo]]` entry may carry, is a probe input and is deliberately not
+    /// moved here; it still needs a rebuilt `Core`.
+    pub fn set_exclusions(&self, overrides: &[RepoOverride]) {
+        let (_, resolved) = resolve_entries(overrides);
+        // Written and released before the table lock is taken, never held across it:
+        // `rerun_discovery` reads these two in the opposite order.
+        {
+            let mut exclusions = self.exclusions.write().unwrap();
+            *exclusions = resolved.clone();
+        }
+        let mut table = self.table.write().unwrap();
+        for entity in &mut table.entities {
+            entity.excluded = excluded_by(&resolved, entity.key.path(), &entity.common_dir);
+        }
+    }
 }
 
 /// Every `Arc` and plain-data field a Generation's dispatch reads, owned rather than
@@ -1124,6 +1244,9 @@ impl Core {
 struct RefreshHandles {
     table: Arc<RwLock<Table>>,
     overrides: Arc<Vec<ResolvedOverride>>,
+    /// [`Core::exclusions`]'s own clone, so a re-run discovery's newly found rows take
+    /// whatever `exclude` says right now rather than whatever it said at `start`.
+    exclusions: Arc<RwLock<Vec<ResolvedExclusion>>>,
     set: SetSpec,
     discovery_manual: Arc<AtomicBool>,
     discovery_warn_after: Duration,
@@ -1217,7 +1340,7 @@ impl RefreshHandles {
             .map(|(key, _)| {
                 let idx = table.index[key];
                 let common_dir = &table.entities[idx].common_dir;
-                find_override(&self.overrides, key.path(), common_dir)
+                find_entry(&self.overrides, key.path(), common_dir)
                     .and_then(|entry| entry.default_branch.clone())
             })
             .collect();
@@ -1450,10 +1573,13 @@ impl RefreshHandles {
         let (discovered, gitmodules_failures) =
             discovery::resolve_with_cache(&self.set, &discovery.entities, &repos_cache);
 
+        // Copied out before the table lock is taken, never read through it: `set_exclusions`
+        // takes these two locks in the opposite order, and holding one while asking for the
+        // other is what would let the two deadlock.
+        let exclusions = self.exclusions.read().unwrap().clone();
         let mut table = self.table.write().unwrap();
         table.discovered_at = Timestamp::now();
-        let cancelled =
-            merge_discovery(&mut table, &self.overrides, discovered, gitmodules_failures);
+        let cancelled = merge_discovery(&mut table, &exclusions, discovered, gitmodules_failures);
         drop(table);
         if cancelled > 0 {
             complete_many(&self.settle_gate, cancelled);
@@ -1992,7 +2118,9 @@ fn start_internal(
     // its Submodules. One combined list, with nothing recording which half
     // produced a given entry.
     let (discovered, gitmodules_failures) = discovery::resolve(&spec.set, &discovery.entities);
-    let overrides = Arc::new(resolve_overrides(&spec.overrides));
+    let (overrides, resolved_exclusions) = resolve_entries(&spec.overrides);
+    let overrides = Arc::new(overrides);
+    let exclusions = Arc::new(RwLock::new(resolved_exclusions.clone()));
     let show_submodules = Arc::new(AtomicBool::new(spec.show_submodules));
 
     let table = Arc::new(RwLock::new(Table {
@@ -2010,7 +2138,12 @@ fn start_internal(
         // A fresh table has nothing in flight yet, so nothing here is ever
         // cancelled: the same reconciliation `refresh` uses later, run once
         // against an empty starting point.
-        merge_discovery(&mut table, &overrides, discovered, gitmodules_failures);
+        merge_discovery(
+            &mut table,
+            &resolved_exclusions,
+            discovered,
+            gitmodules_failures,
+        );
     }
 
     let settle_gate = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -2041,6 +2174,7 @@ fn start_internal(
     let fetch_refresh_handles = RefreshHandles {
         table: Arc::clone(&table),
         overrides: Arc::clone(&overrides),
+        exclusions: Arc::clone(&exclusions),
         set: spec.set.clone(),
         discovery_manual: Arc::clone(&discovery_manual),
         discovery_warn_after: warn_after,
@@ -2103,6 +2237,7 @@ fn start_internal(
         core: Core {
             table,
             overrides,
+            exclusions,
             set: spec.set,
             discovery_manual,
             discovery_warn_after: warn_after,
@@ -2541,7 +2676,7 @@ fn run_poll_sweep(
             }
         }
 
-        let override_branch = find_override(overrides, &candidate.path, &candidate.common_dir)
+        let override_branch = find_entry(overrides, &candidate.path, &candidate.common_dir)
             .and_then(|entry| entry.default_branch.clone());
         let never_cancelled = AtomicBool::new(false);
         let chain_cache: ChainFactsCache = Mutex::new(HashMap::new());
@@ -3584,7 +3719,7 @@ fn apply_probe_outcome(
 /// to signal `settle_gate`.
 fn merge_discovery(
     table: &mut Table,
-    overrides: &[ResolvedOverride],
+    exclusions: &[ResolvedExclusion],
     discovered: Vec<discovery::DiscoveredEntity>,
     gitmodules_failures: Vec<(EntityKey, String)>,
 ) -> usize {
@@ -3610,11 +3745,8 @@ fn merge_discovery(
                     Arc::clone(&discovered.common_dir),
                     discovered.kind,
                 );
-                if let Some(matched) =
-                    find_override(overrides, discovered.key.path(), &discovered.common_dir)
-                {
-                    entity.excluded = matched.excluded;
-                }
+                entity.excluded =
+                    excluded_by(exclusions, discovered.key.path(), &discovered.common_dir);
                 if let Some(repo) = discovered.repo {
                     table.repos.insert(discovered.key.clone(), repo);
                 }
@@ -10240,5 +10372,350 @@ mod tests {
                  only on its default_branch cell"
             );
         }
+    }
+
+    // =====================================================================================
+    // `set_exclusions`: `[[repo]]`'s `exclude` re-applied live, with no rebuild and no
+    // rediscovery, per repo-management.md's "Writing config".
+    // =====================================================================================
+
+    /// The live half: a row already in the table becomes excluded, and is subtracted from
+    /// `operable_count`, without a rebuilt `Core` and without a Generation of any kind.
+    #[test]
+    fn set_exclusions_excludes_a_row_already_in_the_table_with_no_rebuild() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec(vec![root]));
+        let snapshot = core.settle(Duration::from_secs(10));
+        let key = snapshot.entities[0].key.clone();
+        let generation_before = snapshot.generation;
+        assert!(
+            !snapshot.entities[0].excluded,
+            "nothing excludes it to start with"
+        );
+        assert_eq!(core.operable_count(std::slice::from_ref(&key)), 1);
+
+        core.set_exclusions(&[RepoOverride {
+            path: repo.clone(),
+            default_branch: None,
+            excluded: true,
+        }]);
+
+        let after = core.snapshot();
+        assert!(
+            after.entities[0].excluded,
+            "the row the write named is excluded in the very next snapshot"
+        );
+        assert_eq!(
+            core.operable_count(&[key]),
+            0,
+            "an excluded row is subtracted from what an operation may reach"
+        );
+        assert_eq!(
+            after.generation, generation_before,
+            "re-applying an operate-time filter must start no Generation of its own"
+        );
+    }
+
+    /// The other direction, which is `unignore`: dropping the entry clears the flag, so a row
+    /// ignored and unignored in one session ends where it started.
+    #[test]
+    fn set_exclusions_clears_the_flag_when_the_entry_is_gone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        assert!(
+            core.settle(Duration::from_secs(10)).entities[0].excluded,
+            "the starting override excludes it"
+        );
+
+        core.set_exclusions(&[]);
+
+        assert!(
+            !core.snapshot().entities[0].excluded,
+            "removing the entry unexcludes the row in the very next snapshot"
+        );
+    }
+
+    /// The boundary the specification draws around the live half: `exclude` re-applies and
+    /// `default_branch` does not, because one is an operate-time filter and the other is a
+    /// probe input. A `set_exclusions` that swapped the whole `[[repo]]` reading in would
+    /// move both, which is what this refuses.
+    #[test]
+    fn set_exclusions_moves_exclude_alone_and_never_the_default_branch_override() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        crate::test_support::git(&repo, &["branch", "trunk"]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&key));
+        let before = format!(
+            "{:?}",
+            core.settle(Duration::from_secs(10)).entities[0]
+                .default_branch
+                .settled()
+        );
+
+        core.set_exclusions(&[RepoOverride {
+            path: repo.clone(),
+            default_branch: Some("trunk".to_string()),
+            excluded: true,
+        }]);
+        core.refresh(&[key]);
+        core.settle(Duration::from_secs(10));
+
+        let after = core.snapshot();
+        assert!(after.entities[0].excluded, "exclude took effect");
+        assert_eq!(
+            format!("{:?}", after.entities[0].default_branch.settled()),
+            before,
+            "a default_branch override reaches a session only through a rebuilt Core"
+        );
+    }
+
+    // =====================================================================================
+    // `delete_risk`: the three facts repo-management.md's confirm gate names per Repo, read
+    // rather than stubbed. Every repository here is built in a temp directory this test owns,
+    // and no path comes from config, an environment variable or the working directory.
+    // =====================================================================================
+
+    /// A Repo with all three: an uncommitted change, a commit no remote-tracking ref carries,
+    /// and a linked Worktree pointing into it.
+    #[test]
+    fn delete_risk_reads_all_three_facts_the_confirm_gate_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        fs::write(repo.join("uncommitted.txt"), "not staged\n").expect("write a stray file");
+        crate::test_support::git(
+            &repo,
+            &["worktree", "add", "-b", "sidecar", "../sidecar-worktree"],
+        );
+
+        let core = Core::start(spec(vec![root]));
+        // Settled first, so the startup Generation's own phase C is no longer reading this
+        // same repository while the line below reads it: two concurrent gix statuses over one
+        // working tree is a race in the harness, not in `delete_risk`.
+        let key = core
+            .settle(Duration::from_secs(10))
+            .entities
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Repo)
+            .expect("the Repo row is discovered")
+            .key;
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert!(risk.uncommitted, "the stray file makes the tree dirty");
+        assert!(
+            risk.unpushed_commits > 0 && risk.unpushed_branches > 0,
+            "no remote-tracking ref carries any of this Repo's commits, got {risk:?}"
+        );
+        assert_eq!(
+            risk.linked_worktrees, 1,
+            "the one linked Worktree pointing into this Repo is counted, got {risk:?}"
+        );
+    }
+
+    /// The `uncommitted` field's own range, one position at a time, because the composition
+    /// behind it folds four separate reads: a modified tracked file, a deleted tracked file,
+    /// an untracked file, and a staged change. Each gets a repository of its own with nothing
+    /// else wrong with it, so narrowing the composition to any one of the four fails here
+    /// rather than passing on whichever position a single fixture happened to sample.
+    #[test]
+    fn every_kind_of_work_that_is_not_in_a_commit_makes_the_gate_say_uncommitted() {
+        for kind in ["modified", "deleted", "untracked", "staged"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = root_of(&dir);
+            let repo = root.join("repo");
+            init_repo_with_a_commit(&repo);
+            fs::write(repo.join("tracked.txt"), "first\n").expect("write a tracked file");
+            crate::test_support::git(&repo, &["add", "tracked.txt"]);
+            crate::test_support::git(&repo, &["commit", "-m", "add tracked"]);
+            let sha = crate::test_support::head_sha(&repo);
+            crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+
+            match kind {
+                "modified" => fs::write(repo.join("tracked.txt"), "second\n").expect("modify it"),
+                "deleted" => fs::remove_file(repo.join("tracked.txt")).expect("delete it"),
+                "untracked" => fs::write(repo.join("stray.txt"), "new\n").expect("write a stray"),
+                "staged" => {
+                    fs::write(repo.join("staged.txt"), "new\n").expect("write a new file");
+                    crate::test_support::git(&repo, &["add", "staged.txt"]);
+                }
+                other => unreachable!("unhandled kind {other}"),
+            }
+
+            let core = Core::start(spec(vec![root]));
+            let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+
+            let risk = core.delete_risk(&key).expect("read the risk");
+
+            assert!(
+                risk.uncommitted,
+                "a {kind} change is work that is not in a commit, got {risk:?}"
+            );
+        }
+    }
+
+    /// The staged case, stated on its own as well as in the range above, because it is the
+    /// one the dirty column deliberately answers `clean` to: `dirty_counts` compares the index
+    /// against the working tree and never against `HEAD`, so a `git add` with no commit is
+    /// invisible to it. Both readings are asserted here together, so a fix that widened
+    /// `dirty_counts` instead of giving the gate its own read would fail this rather than
+    /// silently change what the dirty column means.
+    #[test]
+    fn staged_work_reads_clean_to_the_dirty_column_and_uncommitted_to_the_delete_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha = crate::test_support::head_sha(&repo);
+        crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        fs::write(repo.join("staged.txt"), "staged\n").expect("write a new file");
+        crate::test_support::git(&repo, &["add", "staged.txt"]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+
+        let opened = git::open_thread_safe(repo.as_path())
+            .expect("open the repo")
+            .to_thread_local();
+        let dirty = git::dirty_counts(&opened, Arc::new(AtomicBool::new(false)))
+            .expect("read the dirty counts");
+        assert_eq!(
+            dirty.total(),
+            0,
+            "the dirty column stays an index-to-worktree comparison, got {dirty:?}"
+        );
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+        assert!(
+            risk.uncommitted,
+            "a Repo whose only work is staged must never be listed plainly, got {risk:?}"
+        );
+    }
+
+    /// The two unpushed quantities are two quantities: a fixture whose commit count and
+    /// branch count differ, so transposing the pair in the composition changes both numbers
+    /// rather than satisfying an inequality either way round.
+    #[test]
+    fn unpushed_commits_and_unpushed_branches_are_counted_into_their_own_fields() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha = crate::test_support::head_sha(&repo);
+        crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        for nth in 0..3 {
+            fs::write(repo.join(format!("file-{nth}.txt")), "x\n").expect("write a file");
+            crate::test_support::git(&repo, &["add", "."]);
+            crate::test_support::git(&repo, &["commit", "-m", "unpushed"]);
+        }
+        crate::test_support::git(&repo, &["checkout", "."]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert_eq!(
+            (risk.unpushed_commits, risk.unpushed_branches),
+            (3, 1),
+            "three commits on one branch, each in its own field, got {risk:?}"
+        );
+    }
+
+    /// The linked-Worktree count is git's own register, not the table's: a Worktree living
+    /// outside the active Set's roots is never discovered, and deleting the Repo it is linked
+    /// from orphans it just the same.
+    #[test]
+    fn a_linked_worktree_outside_the_sets_roots_is_still_counted_by_the_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = root_of(&dir);
+        let inside = base.join("inside");
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).expect("create the outside dir");
+        let repo = inside.join("repo");
+        init_repo_with_a_commit(&repo);
+        crate::test_support::git(
+            &repo,
+            &["worktree", "add", "-b", "sidecar", "../../outside/sidecar"],
+        );
+        assert!(
+            outside.join("sidecar").exists(),
+            "the harness really created a linked Worktree outside the Set's roots"
+        );
+
+        // Bounded by `inside` alone, so the Worktree is not a row in this Core's own table.
+        let core = Core::start(spec(vec![inside]));
+        let snapshot = core.settle(Duration::from_secs(10));
+        assert!(
+            snapshot
+                .entities
+                .iter()
+                .all(|entity| entity.kind != Kind::Worktree),
+            "the Worktree is outside the roots and so is not discovered, got {:?}",
+            snapshot.entities.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+        let key = snapshot
+            .entities
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Repo)
+            .expect("the Repo row is discovered")
+            .key;
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert_eq!(
+            risk.linked_worktrees, 1,
+            "the gate must name the linked Worktree deleting this Repo would orphan, got {risk:?}"
+        );
+    }
+
+    /// The "listed plainly" case: nothing uncommitted, every commit already on a
+    /// remote-tracking ref, and no linked Worktree at all. Asserted as its own test rather
+    /// than left implied, since a gate that reports risk on every Repo is as wrong as one
+    /// that reports it on none.
+    #[test]
+    fn delete_risk_on_a_clean_fully_pushed_repo_with_no_worktrees_reports_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let sha = crate::test_support::head_sha(&repo);
+        crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+
+        let core = Core::start(spec(vec![root]));
+        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+
+        let risk = core.delete_risk(&key).expect("read the risk");
+
+        assert_eq!(
+            risk,
+            DeleteRisk {
+                uncommitted: false,
+                unpushed_commits: 0,
+                unpushed_branches: 0,
+                linked_worktrees: 0,
+            }
+        );
     }
 }

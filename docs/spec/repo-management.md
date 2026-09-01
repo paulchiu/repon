@@ -28,7 +28,11 @@ A refusal is reported and counted in the confirm gate, never silent, the same wa
 
 `delete` names, per Repo, what accepting will destroy:
 
-- whether the working tree has uncommitted changes
+- whether the working tree has uncommitted changes, which means work that is not in a commit: a
+  modified, deleted or untracked file in the worktree, **and** a change that has been staged with
+  `git add` and not yet committed. Staged work is the case most easily lost, because it looks clean
+  to any check that compares only the index against the worktree, so the gate compares against
+  `HEAD` as well.
 - how many commits are unpushed, and on how many branches
 - how many linked Worktrees point into the Repo
 
@@ -55,6 +59,12 @@ An entry that already exists is modified in place rather than appended a second 
 
 After a successful write, Repon runs the same path `Action::ReloadConfig` runs. Nothing mutates the in-memory document directly, so config reaches the running app one way and a write cannot produce a state the file alone would not reproduce.
 
+That path does not re-apply most of `[[repo]]`, and deliberately: `crates/repon/src/app/reload.rs` records that `Core` cannot move to a new `CoreSpec` without being rebuilt, and rebuilding it would restart discovery for a reload that changed nothing discovery reads. `exclude` is the exception, and re-applies live.
+
+The exception is not special pleading. `exclude` is not a discovery-time fact at all: [config.md](config.md) defines it as "listed, never operated on", so the entity is still discovered, still probed and still a row, and all `exclude` decides is whether an operation may reach it. That is an operate-time filter over a table that is already correct, which is why it needs no rebuild, and it is the same shape as `show_submodules`, which reload.rs already names as its one live-updating exception. `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and keeps the existing behaviour: it reaches the session it was written in only through a restart. Repon never writes it, so nothing here depends on that.
+
+An `ignore` therefore takes effect immediately: the row it names is subtracted from the Action confirm gate's count and from every operation's eligible set in the same frame the write completes, without a refresh and without a restart.
+
 ## Keys
 
 `m` opens the Action palette filtered to the built-in management operations. It is a filter over the one palette, not a second chooser: `;` opens the same palette unfiltered, with the management operations listed alongside the config-defined Actions and visually distinguished from them. [keybindings.md](keybindings.md) carries the binding.
@@ -62,3 +72,5 @@ After a successful write, Repon runs the same path `Action::ReloadConfig` runs. 
 ## Receipts
 
 A management operation's result is a receipt in [actions.md](actions.md)'s sense: it records what Repon did, never goes Stale on a poll, is not superseded by a Generation, and does not persist. A `delete` receipt names each Repo and whether its working tree was removed, its config entry was removed, or it was refused, with the refusal's reason.
+
+Not built. What ships is a log line per row and a one-line Notice carrying the counts; nothing reaches the detail pane. The obstacle is [actions.md](actions.md)'s closed set of four step outcomes, every one of them a child process's, and a management operation runs no child process. [The open questions register](../open-questions.md#a-management-result-has-no-receipt-of-its-own) states the gap and what would close it.

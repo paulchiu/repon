@@ -105,13 +105,12 @@ fn no_such_set_notice(declared: usize) -> String {
     format!("only {declared} Set{plural} declared; press s to pick one")
 }
 
-/// The Notice each of the four bindings
+/// The Notice each binding inert while an Action is fanning out
 /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
-/// confirming") raises while an Action is fanning out, in place of the silence they answer
-/// with today: `what` names the thing the press would otherwise have opened or done, read at
-/// the point of refusal rather than a table keyed on the action, so a later fifth inert
-/// binding costs one call site, not a new case in a lookup this function would otherwise
-/// need.
+/// confirming") raises, in place of the silence they answer with today: `what` names the
+/// thing the press would otherwise have opened or done, read at the point of refusal rather
+/// than a table keyed on the action, which is what let `m` join them for one call site rather
+/// than a new case in a lookup this function would otherwise need.
 pub(crate) fn action_running_notice(what: &str) -> String {
     format!("{what}: Action already running")
 }
@@ -122,24 +121,40 @@ impl App {
     /// replaces `self.bindings` wholesale, re-loads the theme, hands the Component tree the
     /// reloaded [`Config`] and re-resolves the active Set ([`Self::reload_active_set`]).
     ///
+    /// Reads `self.config_file` rather than [`crate::config::config_file`]'s own process-wide
+    /// `OnceLock`, which `App::new` already fixed this field from: same path in production,
+    /// and a path a test can point at a tempdir. Because that field is a resolved path,
+    /// [`crate::config::check_named_paths_exist`] runs first over the paths the user actually
+    /// named: config.md's "Either must exist if given" holds for the whole session, and a
+    /// `REPON_CONFIG` directory or `--config` file deleted mid-session must refuse here rather
+    /// than load as zero config, which would replace every Set, Action, Launcher, theme and
+    /// binding with the implicit defaults on a key pressed as casually as `Ctrl+R`.
+    ///
     /// A failure here (malformed TOML, a collision the edit just introduced) is logged and
     /// otherwise swallowed rather than propagated: the terminal is already claimed, so this
     /// is not the "exit before the terminal is claimed" grade [`keys::merge`] and
     /// [`document::load`] give the same failure at startup, and a session mid-work should not
     /// be torn down by a typo in a file it can simply go on using the previous, still-valid
-    /// reading of. `[[repo]]`, `[refresh]`, `[fetch]` and `[auto_update]` are deliberately not
-    /// re-applied here: `Core` has no way to move to a new [`repon_core::CoreSpec`] short of
-    /// rebuilding the whole thing, and rebuilding it for every reload regardless of relevance
-    /// would restart discovery even for a reload that only changed the theme, which
-    /// config.md's Reload section does not ask for. `show_submodules` is the one exception:
-    /// [`repon_core::Core::set_show_submodules`] updates it live with no rebuild at all, which
-    /// is what [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
-    /// "toggling is instant" asks for. `[[launcher]]` is read by
+    /// reading of. `[refresh]`, `[fetch]`, `[auto_update]` and `[[repo]]`'s `default_branch`
+    /// are deliberately not re-applied here: `Core` has no way to move to a new
+    /// [`repon_core::CoreSpec`] short of rebuilding the whole thing, and rebuilding it for
+    /// every reload regardless of relevance would restart discovery even for a reload that
+    /// only changed the theme, which config.md's Reload section does not ask for. Two keys
+    /// are the exception, both because they change what an already-correct table means rather
+    /// than what discovery finds: [`repon_core::Core::set_show_submodules`], which is what
+    /// [discovery.md](https://github.com/paulchiu/repon/blob/main/docs/spec/discovery.md)'s
+    /// "toggling is instant" asks for, and [`repon_core::Core::set_exclusions`], which is
+    /// what [repo-management.md](../../../../docs/spec/repo-management.md)'s "an `ignore`
+    /// therefore takes effect immediately" asks for. `[[launcher]]` is read by
     /// [`crate::launcher::resolve`], but `App` caches no resolved list to refresh, since no
     /// key dispatches to a Launcher yet; `[[action]]` needs no re-apply of its own, since
     /// nothing in this crate reads it yet.
     pub(crate) fn reload_config(&mut self) {
-        let new_config = match Config::new() {
+        if let Err(err) = crate::config::check_named_paths_exist(&self.named_config_paths) {
+            tracing::error!("config reload failed, keeping the previous configuration: {err:#}");
+            return;
+        }
+        let new_config = match Config::at(self.config_dir.clone(), self.config_file.clone()) {
             Ok(config) => config,
             Err(err) => {
                 tracing::error!(
@@ -203,7 +218,7 @@ impl App {
             tracing::error!("config reload failed to hand the new config to a component: {err:#}");
         }
 
-        // `new_config.warnings` was already logged inside `Config::new()`, which is what
+        // `new_config.warnings` was already logged inside `Config::at`, which is what
         // built it; nothing here re-logs it. Moved out last, after the whole-struct clone
         // just above, since a partial move here would leave nothing left to clone.
         self.config_warnings = new_config.warnings;
@@ -216,6 +231,13 @@ impl App {
         // outright, since the fresh `Core` already started with this same reading from
         // `core_spec`.
         self.core.set_show_submodules(self.document.show_submodules);
+        // Live, no rebuild, for the same reason `show_submodules` above is: `exclude` decides
+        // only whether an operation may reach a row that is discovered and listed either way
+        // ([repo-management.md](../../../../docs/spec/repo-management.md)'s "Writing config").
+        // Safe after a `reload_active_set` rebuild for the same reason too: the fresh `Core`
+        // started from this same `[[repo]]` reading.
+        self.core
+            .set_exclusions(&document::repo_overrides(&self.document));
         // Toggling `show_submodules` can itself shrink or grow the visible row set under a
         // standing cursor, after `reload_active_set`'s own call already ran, so this needs a
         // second call rather than relying on that one.
@@ -951,7 +973,7 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 9: `1` to `9` is one of the four bindings inert while an Action is fanning
+    // Criterion 9: `1` to `9` is one of the surfaces inert while an Action is fanning
     // out. Criterion 10: `SwitchToSet` refused for two different reasons (an out-of-range
     // digit, or a live fan-out) must answer with two different texts, which is the
     // discriminator that tells a computed reason from a fixed one.

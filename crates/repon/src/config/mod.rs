@@ -15,6 +15,7 @@ use etcetera::{BaseStrategy, choose_base_strategy};
 use tracing::warn;
 
 pub mod document;
+pub mod repo_entry;
 
 pub use document::{Document, Warning};
 
@@ -40,15 +41,22 @@ impl Config {
     /// the resolved path.
     pub fn new() -> Result<Self> {
         let resolved = resolved_config();
-        check_named_paths_exist(resolved)?;
-        let dir = resolved.dir.clone();
-        let path = resolved.file.clone();
-        let loaded = document::load(&path)?;
+        check_named_paths_exist(&resolved.named)?;
+        Self::at(resolved.dir.clone(), resolved.file.clone())
+    }
+
+    /// [`Config::new`] with the two resolved paths passed in rather than read from the
+    /// process-wide `OnceLock` [`init`] fixes, which cannot be pointed at a tempdir per test:
+    /// this is what lets a whole write-then-reload round trip run against a directory a test
+    /// owns. Skips [`check_named_paths_exist`], whose subject is a path the user named on the
+    /// command line or in the environment, not one already resolved.
+    pub fn at(config_dir: PathBuf, config_file: PathBuf) -> Result<Self> {
+        let loaded = document::load(&config_file)?;
         for warning in &loaded.warnings {
             warn!("{warning}");
         }
         Ok(Self {
-            config_dir: dir,
+            config_dir,
             data_dir: data_dir(),
             document: loaded.document,
             warnings: loaded.warnings,
@@ -58,15 +66,26 @@ impl Config {
 }
 
 /// The config directory (holding `config.toml` and `themes/`) and the config file path, which
-/// can diverge when `--config` names a file outside that directory. `env_dir` and `flag_file`
-/// keep the two named values [`check_named_paths_exist`] checks, distinct from `dir` and
-/// `file`, which already carry the default fallback baked in and so cannot tell "named by the
-/// user" apart from "resolved to the default".
+/// can diverge when `--config` names a file outside that directory. `named` keeps the values
+/// [`check_named_paths_exist`] checks, distinct from `dir` and `file`, which already carry the
+/// default fallback baked in and so cannot tell "named by the user" apart from "resolved to
+/// the default".
 struct ResolvedConfig {
     dir: PathBuf,
     file: PathBuf,
-    env_dir: Option<PathBuf>,
-    flag_file: Option<PathBuf>,
+    named: NamedPaths,
+}
+
+/// The two paths a user can name, `REPON_CONFIG` and `--config`, kept apart from the resolved
+/// pair so [`check_named_paths_exist`] can be repeated after startup: a session holds a copy
+/// so `Ctrl+R` refuses a reload whose named path has gone away rather than succeeding with
+/// zero config ([`crate::app::App::reload_config`]).
+#[derive(Clone, Debug, Default)]
+pub struct NamedPaths {
+    /// The `REPON_CONFIG` directory, when the environment named one.
+    pub env_dir: Option<PathBuf>,
+    /// The `--config` file, when the flag named one.
+    pub flag_file: Option<PathBuf>,
 }
 
 /// `REPON_CONFIG` (a directory) beats `default_dir`; a flag-supplied file path beats both and
@@ -83,8 +102,10 @@ fn resolve_config(
     ResolvedConfig {
         dir,
         file,
-        env_dir: env_config_dir,
-        flag_file: flag_config_file,
+        named: NamedPaths {
+            env_dir: env_config_dir,
+            flag_file: flag_config_file,
+        },
     }
 }
 
@@ -96,11 +117,11 @@ fn resolve_config(
 /// default path's own absence "not an error": [`document::load`] already treats a missing
 /// file there as zero config, and a `REPON_CONFIG` directory that exists but holds no
 /// `config.toml` reaches that same treatment once this check passes.
-fn check_named_paths_exist(resolved: &ResolvedConfig) -> Result<()> {
-    if let Some(dir) = resolved.env_dir.as_ref().filter(|dir| !dir.exists()) {
+pub fn check_named_paths_exist(named: &NamedPaths) -> Result<()> {
+    if let Some(dir) = named.env_dir.as_ref().filter(|dir| !dir.exists()) {
         return Err(eyre!("REPON_CONFIG `{}` does not exist", dir.display()));
     }
-    if let Some(file) = resolved.flag_file.as_ref().filter(|file| !file.exists()) {
+    if let Some(file) = named.flag_file.as_ref().filter(|file| !file.exists()) {
         return Err(eyre!("--config `{}` does not exist", file.display()));
     }
     Ok(())
@@ -165,6 +186,11 @@ pub fn config_dir() -> PathBuf {
 /// The file `config.toml` is read from; see [`resolve_config`] for precedence.
 pub fn config_file() -> PathBuf {
     resolved_config().file.clone()
+}
+
+/// The paths this process was started with a name for, for a session to re-check later.
+pub fn named_paths() -> NamedPaths {
+    resolved_config().named.clone()
 }
 
 /// Where theme files (`<name>.toml`) live: a `themes` directory beside `config.toml`, per
@@ -242,8 +268,7 @@ mod tests {
         ResolvedConfig {
             dir,
             file,
-            env_dir,
-            flag_file,
+            named: NamedPaths { env_dir, flag_file },
         }
     }
 
@@ -262,7 +287,7 @@ mod tests {
             None,
         );
 
-        let err = check_named_paths_exist(&resolved)
+        let err = check_named_paths_exist(&resolved.named)
             .expect_err("a missing REPON_CONFIG directory must be an error");
         let message = err.to_string();
         assert!(
@@ -288,7 +313,7 @@ mod tests {
             None,
         );
 
-        check_named_paths_exist(&resolved)
+        check_named_paths_exist(&resolved.named)
             .expect("an existing REPON_CONFIG directory with no config.toml must not error");
     }
 
@@ -305,7 +330,7 @@ mod tests {
             Some(missing),
         );
 
-        let err = check_named_paths_exist(&resolved)
+        let err = check_named_paths_exist(&resolved.named)
             .expect_err("a missing --config file must be an error");
         let message = err.to_string();
         assert!(
@@ -326,7 +351,7 @@ mod tests {
         std::fs::write(&file, "").expect("write an empty config file");
         let resolved = resolved(dir.path().to_path_buf(), file.clone(), None, Some(file));
 
-        check_named_paths_exist(&resolved).expect("an existing --config file must not error");
+        check_named_paths_exist(&resolved.named).expect("an existing --config file must not error");
     }
 
     /// Criterion 5, second half: with neither `REPON_CONFIG` nor `--config` given, the check
@@ -346,7 +371,7 @@ mod tests {
             None,
         );
 
-        check_named_paths_exist(&resolved)
+        check_named_paths_exist(&resolved.named)
             .expect("the default path's own absence must never be an error");
     }
 

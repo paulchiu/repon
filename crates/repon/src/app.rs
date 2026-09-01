@@ -11,7 +11,7 @@ use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Snapshot};
 use tracing::debug;
 
 use crate::{
-    action_palette::{ActionPalette, Decision, Stage},
+    action_palette::{ActionPalette, Decision, Entry, Run, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
@@ -24,6 +24,7 @@ use crate::{
     launcher::{self, Launcher},
     launcher_palette::LauncherPalette,
     list_viewport::{half_page_cursor, offset_following_cursor},
+    management::{self, Plan},
     message::Message,
     notice,
     selection::Selection,
@@ -203,6 +204,12 @@ pub struct App {
     /// keeps this on a key, and a struct, entirely separate from `launcher_palette`, the
     /// safety boundary the two palettes exist to hold.
     action_palette: Option<ActionPalette>,
+    /// The built-in management operation's own confirm gate, `Some` only while
+    /// [`ActionPalette`] holds `Stage::Confirming` over a built-in. Built once when the gate
+    /// opens rather than per frame, since a `delete` gate reads every target Repo's working
+    /// tree and refs ([`repon_core::Core::delete_risk`]); the rows it names are the rows the
+    /// run then acts on, so the count on screen and the run cannot disagree.
+    management_plan: Option<Plan>,
     /// `Some` while the Launcher palette has focus, opened by `Action::OpenLauncher` (`!`)
     /// and closed by `Action::Cancel` (`Esc`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context, the same one
@@ -232,8 +239,9 @@ pub struct App {
     /// The live Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
     /// declared when the pressed digit names none), by `reload.rs`'s own reload fallback
-    /// (naming the Set fallen back to), and by each of the four bindings ADR 0023 names
-    /// inert while an Action is fanning out. Cleared by [`Self::notice`]'s own timeout read,
+    /// (naming the Set fallen back to), and by each of the surfaces
+    /// [keybindings.md](../../../docs/spec/keybindings.md) names inert while an Action is
+    /// fanning out. Cleared by [`Self::notice`]'s own timeout read,
     /// by a replacement (any later call to [`Self::set_notice`]), or by the next keypress,
     /// whichever comes first ([theming.md](../../../docs/spec/theming.md)'s "Warnings and
     /// Notices").
@@ -299,6 +307,19 @@ pub struct App {
     /// a test can point it at a tempdir ([`Self::persist_state`],
     /// [`Self::restore_session_state`]).
     data_dir: PathBuf,
+    /// The `config.toml` this session reads and the directory it sits in, fixed at
+    /// construction from [`config::config_file`] and [`config::config_dir`] and kept as
+    /// fields for the same reason `data_dir` is: a management write
+    /// ([`Self::run_management`]) and the reload that follows it
+    /// ([`Self::reload_config`]) both go through these, so a test can drive the whole
+    /// round trip against a directory it owns rather than the user's own configuration.
+    config_dir: PathBuf,
+    config_file: PathBuf,
+    /// The `REPON_CONFIG` directory and `--config` file this run was started with a name for,
+    /// carried so [`Self::reload_config`] can re-run [`config::check_named_paths_exist`]
+    /// against them: a named path that has gone away mid-session must refuse the reload, not
+    /// silently reload as zero config and discard every Set, Action, Launcher and binding.
+    named_config_paths: config::NamedPaths,
     /// Whether this run has no config at all: the default path absent, or a `REPON_CONFIG`
     /// directory holding no `config.toml` ([`config::document::Loaded::zero_config`]). Read
     /// by [`Self::scope_key`], which is the only thing that reads it.
@@ -434,6 +455,7 @@ impl App {
             warning_overlay_open: false,
             acknowledged_warnings: Vec::new(),
             action_palette: None,
+            management_plan: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
@@ -454,6 +476,9 @@ impl App {
             active_set,
             document: config.document,
             data_dir: config.data_dir,
+            config_dir: config::config_dir(),
+            config_file: config::config_file(),
+            named_config_paths: config::named_paths(),
             zero_config: config.zero_config,
             cwd: config::document::working_directory(),
             filter: Filter::default(),
@@ -1123,12 +1148,16 @@ impl App {
             Some(Action::DismissVanished) => {
                 unreachable!("DismissVanished is unbuilt; dispatch never returns an unbuilt action")
             }
-            // `OpenManagementPalette` is unbuilt for the same reason, and this arm exists for
-            // the same one: exhaustiveness, not reachability.
+            // `m`: the same palette `;` opens, filtered to the built-in management operations
+            // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"). Gated
+            // while a fan-out is in flight for the same reason `;` is: it is the same palette.
             Some(Action::OpenManagementPalette) => {
-                unreachable!(
-                    "OpenManagementPalette is unbuilt; dispatch never returns an unbuilt action"
-                )
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Action palette"));
+                } else {
+                    self.action_palette = Some(ActionPalette::management());
+                }
+                None
             }
             // `ScrollDown`/`ScrollUp`/`Top`/`Bottom` are bound only in `Detail`
             // (`keys::BindingTable`'s own table), so the guarded arm above always claims them
@@ -1237,15 +1266,25 @@ impl App {
                         .action_palette
                         .as_ref()
                         .and_then(ActionPalette::confirm_run);
+                    let management = self
+                        .action_palette
+                        .as_ref()
+                        .and_then(ActionPalette::confirm_management);
+                    // Exactly one of the two is ever `Some`: `Stage::Confirming` carries one
+                    // `Chosen`, and each accessor answers for its own arm alone.
                     if let Some(spec) = spec {
                         self.start_action(spec);
                     }
-                    self.action_palette = None;
+                    if let Some(operation) = management {
+                        self.run_management(operation);
+                    }
+                    self.close_action_palette();
                 }
                 Some(Action::Decline) => {
                     if let Some(palette) = &mut self.action_palette {
                         palette.decline();
                     }
+                    self.management_plan = None;
                 }
                 None => {}
                 Some(other) => unreachable!(
@@ -1257,7 +1296,7 @@ impl App {
         }
 
         match self.bindings.dispatch(Context::Input, key) {
-            Some(Action::Cancel) => self.action_palette = None,
+            Some(Action::Cancel) => self.close_action_palette(),
             Some(Action::Text(c)) => {
                 if let Some(palette) = &mut self.action_palette {
                     palette.type_char(c, &self.document.actions);
@@ -1514,29 +1553,65 @@ impl App {
         }
     }
 
-    /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count
-    /// from `self.selection.targets(cursor)` through
-    /// [`repon_core::Core::operable_count`], the identical computation
-    /// [`Self::start_action`]'s own confirm dialog reads, then hands it to
-    /// [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
-    /// untouched, the same as choosing with no match at all.
     /// How many entities a choice made right now would actually run against: the
     /// Selection narrowed by [`repon_core::Core::operable_count`], which is the same
     /// partition the fan-out itself uses, so the border title can never show a number a
     /// real choice would not act on. `None` while no palette is open.
     fn action_palette_operable_count(&self) -> Option<usize> {
-        self.action_palette.as_ref().map(|_| {
-            self.cursor_key()
-                .map(|key| self.core.operable_count(&self.selection.targets(&key)))
-                .unwrap_or(0)
+        let palette = self.action_palette.as_ref()?;
+        // A live gate's own count, so the border and the gate can never name two numbers.
+        if let Some(plan) = &self.management_plan {
+            return Some(plan.eligible_count());
+        }
+        let Some(cursor_key) = self.cursor_key() else {
+            return Some(0);
+        };
+        let targets = self.selection.targets(&cursor_key);
+        Some(match palette.highlighted(&self.document.actions) {
+            // A built-in subtracts its own ineligible rows rather than the excluded ones
+            // `operable_count` subtracts: `unignore`'s eligible set is exactly the
+            // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
+            // operations table), which the Action gate's own subtraction would zero.
+            Some(Entry::Builtin(operation)) => self
+                .management_plan_for(operation, &targets)
+                .eligible_count(),
+            Some(Entry::Configured(_)) | None => self.core.operable_count(&targets),
         })
     }
 
+    /// The cheap half of a built-in's gate: eligibility read from the snapshot, with no risk
+    /// read at all. [`Self::choose_highlighted_action`] is what adds the risk, once.
+    fn management_plan_for(&self, operation: management::Operation, targets: &[EntityKey]) -> Plan {
+        Plan::new(operation, &self.core.snapshot().entities, targets)
+    }
+
+    /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count from
+    /// `self.selection.targets(cursor)` through [`repon_core::Core::operable_count`], the
+    /// identical computation [`Self::start_action`]'s own confirm dialog reads, then hands it
+    /// to [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
+    /// untouched, the same as choosing with no match at all.
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
         };
         let targets = self.selection.targets(&cursor_key);
+        let chosen_builtin = self.action_palette.as_ref().and_then(|palette| {
+            match palette.highlighted(&self.document.actions) {
+                Some(Entry::Builtin(operation)) => Some(operation),
+                Some(Entry::Configured(_)) | None => None,
+            }
+        });
+        // Read once, here, rather than per frame: `delete_risk` opens each target Repo and
+        // walks its refs. A plan with nothing eligible reads nothing, since `with_risk` only
+        // fills the rows the run would act on.
+        let plan = chosen_builtin.map(|operation| {
+            self.management_plan_for(operation, &targets)
+                .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
+        });
+        // Read for a config-defined Action and an ad hoc command alone: those two are
+        // refused at a count of zero, where a built-in enters its own gate instead and names
+        // and counts each ineligible row there
+        // ([repo-management.md](../../../docs/spec/repo-management.md)).
         let operable_count = self.core.operable_count(&targets);
         let Some(palette) = &mut self.action_palette else {
             return;
@@ -1544,10 +1619,71 @@ impl App {
         match palette.choose(&self.document.actions, operable_count) {
             Some(Decision::RunImmediately(spec)) => {
                 self.start_action(spec);
-                self.action_palette = None;
+                self.close_action_palette();
             }
-            Some(Decision::NeedsConfirm | Decision::Refused) | None => {}
+            Some(Decision::NeedsConfirm) => self.management_plan = plan,
+            Some(Decision::Refused) | None => {}
         }
+    }
+
+    /// Closes the Action palette and drops whatever gate it was holding, so a plan built for
+    /// one gesture can never be read by the next.
+    fn close_action_palette(&mut self) {
+        self.action_palette = None;
+        self.management_plan = None;
+    }
+
+    /// `y` over a built-in's confirm gate: runs [`Self::management_plan`] against the config
+    /// file, announces what it did and reloads.
+    ///
+    /// The plan is the one the gate was built from, so the rows named on screen are the rows
+    /// acted on. `operation` is checked against it rather than trusted: the two come from the
+    /// palette and from this struct, and a mismatch means a gate outlived its own plan.
+    ///
+    /// The reload is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config"), so
+    /// config reaches the running app one way and a write cannot produce a state the file
+    /// alone would not reproduce. Nothing here touches `self.document`.
+    ///
+    /// An `ignore` takes effect in this same frame: the reload re-applies `exclude` live
+    /// through [`repon_core::Core::set_exclusions`], so the row it named is subtracted from
+    /// the Action confirm gate's count and from every operation's eligible set with no
+    /// refresh and no restart
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config").
+    /// `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and
+    /// still needs a rebuilt `Core`; Repon never writes it.
+    ///
+    /// One thing the write does not reach, recorded here rather than worked around, because
+    /// closing it means changing a document this implements rather than owns. A deleted
+    /// Repo's row: no Generation starts here, so a row whose directory this just removed
+    /// keeps its last known values until the next one. `docs/spec/refresh.md`'s Triggers
+    /// table is a closed list and names no management trigger, so starting one here would be
+    /// a ninth trigger that document does not have; `r` is what settles those rows Vanished
+    /// today.
+    fn run_management(&mut self, operation: management::Operation) {
+        // scan: management_write_reload begin -- criterion 8: everything between this pair is
+        // what a management write does after the gate is accepted, and the test over this
+        // region asserts it reaches config through `reload_config` and touches no in-memory
+        // document of its own. A marker that moves or is renamed fails that test loudly rather
+        // than reading as "nothing found".
+        let Some(plan) = self.management_plan.take() else {
+            return;
+        };
+        if plan.operation != operation {
+            tracing::error!(
+                "the confirm gate named `{}` but its plan was built for `{}`; nothing ran",
+                operation.name(),
+                plan.operation.name()
+            );
+            return;
+        }
+        let report = management::run(&plan, &self.config_file);
+        for record in &report.records {
+            tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
+        }
+        self.reload_config();
+        // scan: management_write_reload end
+        self.set_notice(report.summary());
     }
 
     /// Runs `spec` over the current Selection's targets ([`crate::selection::Selection::targets`]),
@@ -1555,7 +1691,7 @@ impl App {
     /// confirm gate and one started by a `confirm = false` entry can never diverge in what
     /// they act on. `Core::run_action`'s own `bool` (whether a second fan-out was rejected
     /// because one is already live) is not surfaced here: making that visible, and making
-    /// the four keys `docs/spec/actions.md` names inert while a run is in flight, is issue
+    /// the keys `docs/spec/actions.md` names inert while a run is in flight, is issue
     /// #69's own scope, blocked by this one.
     fn start_action(&mut self, spec: repon_core::ActionSpec) {
         let Some(cursor_key) = self.cursor_key() else {
@@ -1911,6 +2047,7 @@ impl App {
     /// failed, for `render` to report, since the message channel is not this method's to send
     /// on mid-frame.
     fn draw_frame(&mut self, frame: &mut Frame) -> Option<color_eyre::Report> {
+        let mut error = None;
         let snapshot = self.core.snapshot();
         let pane_entity = self
             .pane
@@ -1921,6 +2058,13 @@ impl App {
         // front so the border title can never show a different number than a real choice
         // would act on.
         let action_palette_operable_count = self.action_palette_operable_count();
+        // Read from the plan the gate was built with, never rebuilt here: a `delete` gate's
+        // own risk read costs a git read per Repo, and a frame must not pay it.
+        let management_lines: Vec<String> = self
+            .management_plan
+            .as_ref()
+            .map(Plan::confirm_lines)
+            .unwrap_or_default();
         // The identical read `Self::choose_highlighted_launcher` does: the resolved Launcher
         // list and the cursor row's own name, computed once here for the same reason
         // `action_palette_operable_count` is, so the border title can never name a different
@@ -1934,7 +2078,6 @@ impl App {
                 .unwrap_or_default();
             (launchers, entity_name)
         });
-        let mut error = None;
         // TODO: `self.quit_confirm` has no draw branch here yet, so the dialog
         // `handle_quit_confirm_key` gates on has no on-screen representation: the frame
         // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
@@ -1964,8 +2107,11 @@ impl App {
                 frame,
                 area,
                 &self.theme,
-                &self.document.actions,
-                action_palette_operable_count.unwrap_or(0),
+                Run {
+                    actions: &self.document.actions,
+                    operable_count: action_palette_operable_count.unwrap_or(0),
+                    management_lines: &management_lines,
+                },
                 self.glyphs,
             );
             return None;
@@ -2278,6 +2424,7 @@ mod tests {
             warning_overlay_open: false,
             acknowledged_warnings: Vec::new(),
             action_palette: None,
+            management_plan: None,
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
@@ -2319,6 +2466,14 @@ mod tests {
             // shape `themes_dir` above already takes; a test exercising `persist_state` or
             // `restore_session_state` points `data_dir` at a real tempdir first.
             data_dir: PathBuf::new(),
+            // Pointed at a real tempdir by any test that drives a write or a reload;
+            // an empty, never-created path is inert for every other test, the same shape
+            // `data_dir` and `themes_dir` above already take.
+            config_dir: PathBuf::new(),
+            config_file: PathBuf::new(),
+            // Neither path was named, which is what a run with no `REPON_CONFIG` and no
+            // `--config` carries; a test about the named-path refusal sets this itself.
+            named_config_paths: config::NamedPaths::default(),
             zero_config: false,
             cwd: PathBuf::new(),
             filter: Filter::default(),
@@ -3267,7 +3422,7 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 9: `;`, `s` and `Ctrl+R` are three of the four bindings inert while an Action
+    // Criterion 9: `;`, `m`, `s` and `Ctrl+R` are the surfaces inert while an Action
     // is fanning out (`1` to `9`'s own coverage lives in reload.rs, beside `switch_to_set`'s
     // other tests). Each answers with a Notice instead of the silence it gives today.
     // =====================================================================================
@@ -3339,6 +3494,123 @@ mod tests {
         wait_for(
             "the fan-out to finish before this test's own Core is dropped",
             || !app.core.action_running(),
+        );
+    }
+
+    /// `m` is the fifth key that goes inert while a fan-out is in flight, for the same reason
+    /// `;` is: it opens the same palette
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// confirming"). Asserted on the palette itself, not on the Notice alone: a guard that
+    /// raised the Notice and opened the palette anyway would satisfy the Notice half.
+    #[test]
+    fn m_is_inert_while_an_action_is_fanning_out_and_answers_with_the_same_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m while an Action is fanning out");
+
+        assert!(
+            app.action_palette.is_none(),
+            "m must not open the Action palette while an Action is running"
+        );
+        assert_eq!(app.notice(), Some("Action palette: Action already running"));
+
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
+        );
+    }
+
+    /// A built-in counts its own eligible rows, never the Action gate's operable count, and
+    /// `unignore` is the case that proves it: its eligible set is exactly the excluded rows,
+    /// which [`repon_core::Core::operable_count`] subtracts to zero. Read from the palette's
+    /// own border title on a real frame, which is the number the user is shown.
+    #[test]
+    fn unignore_over_an_excluded_row_counts_it_rather_than_subtracting_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "sanity: the row starts excluded"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("highlight unignore");
+        let choosing = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            choosing.contains("run on 1 repos"),
+            "the border title counts the excluded row unignore would act on, got:\n{choosing}"
+        );
+
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+
+        assert!(
+            app.management_plan.is_some(),
+            "Enter must reach the confirm gate rather than being refused as targeting 0 repos"
+        );
+        let confirming = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            confirming.contains("unignore on 1 repos?"),
+            "and the gate itself counts it too, got:\n{confirming}"
+        );
+    }
+
+    /// The mirror of the above: `ignore` over a row that is already excluded is refused, and
+    /// the refusal is named and counted in the gate rather than collapsing into a bare "0
+    /// repos" ([repo-management.md](../../../docs/spec/repo-management.md): "A refusal is
+    /// reported and counted in the confirm gate, never silent"). Every row of the Selection
+    /// being ineligible is the case that used to close the palette with a count and no reason.
+    #[test]
+    fn a_gate_whose_every_row_is_refused_still_names_each_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+
+        open_the_management_gate(&mut app, management::Operation::Ignore);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("ignore on 0 repos, 1 refused?"),
+            "the headline counts the refusal, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("repo-a: refused, already ignored"),
+            "and the row is named with its reason, got:\n{frame}"
         );
     }
 
@@ -3489,17 +3761,571 @@ mod tests {
         patterns
     }
 
-    /// Criterion 5's own "exactly four, no more": every call site that raises
-    /// `action_running_notice` across both crates, since a Launcher and an Action step's
-    /// executor both spawn child processes and a scan confined to one crate would be
-    /// exactly "a check that quietly stops checking"
-    /// ([`crate::test_support::workspace_crate_src_dirs`]'s own doc comment). Named against
-    /// the ticket's own four groups (`;`, `s`, `1`-`9`, `Ctrl+R`) rather than merely counted,
-    /// so a fifth call site that happened to reuse one of the four names could not slip
-    /// through as still reading "four".
+    // =====================================================================================
+    // Criteria 8 and 9: `m` and `;` over the one palette, and the one way a write reaches the
+    // running app.
+    // =====================================================================================
+
+    /// Criterion 9, first half: `m` opens the palette filtered to the built-ins, so a
+    /// config-defined Action declared on the same run is not among its rows.
     #[test]
-    fn exactly_four_bindings_are_gated_on_action_running_and_no_more() {
+    fn m_opens_the_action_palette_filtered_to_the_built_in_management_operations() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+
+        let palette = app
+            .action_palette
+            .as_ref()
+            .expect("m must open the Action palette");
+        let listed: Vec<String> = palette
+            .matches(&app.document.actions)
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            crate::management::OPERATIONS
+                .iter()
+                .map(|operation| operation.name().to_string())
+                .collect::<Vec<_>>(),
+            "m lists the built-ins and nothing else"
+        );
+    }
+
+    /// Criterion 9, second half: `;` still opens the same palette unfiltered, with both kinds
+    /// of row listed and the built-ins distinguished by text rather than by colour alone
+    /// ([0011](../../../docs/adr/0011-themes-correct-the-terminal-palette.md)).
+    #[test]
+    fn semicolon_still_opens_the_palette_unfiltered_with_the_built_ins_distinguished() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("reinstall"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("press ;");
+
+        let palette = app
+            .action_palette
+            .as_ref()
+            .expect("; must open the Action palette");
+        let listed: Vec<String> = palette
+            .matches(&app.document.actions)
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        assert!(
+            listed.contains(&"reinstall".to_string()),
+            "the config-defined Action is still listed, got {listed:?}"
+        );
+        for operation in crate::management::OPERATIONS {
+            assert!(
+                listed.contains(&operation.name().to_string()),
+                "the built-in `{}` is listed alongside it, got {listed:?}",
+                operation.name()
+            );
+        }
+
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 10)).expect("create the test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &app.theme,
+                    Run {
+                        actions: &app.document.actions,
+                        operable_count: 1,
+                        management_lines: &[],
+                    },
+                    app.glyphs,
+                )
+            })
+            .expect("draw the palette");
+        let rendered: String = (0..10)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let built_in_rows: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                crate::management::OPERATIONS
+                    .iter()
+                    .any(|operation| line.contains(operation.name()))
+            })
+            .collect();
+        assert_eq!(
+            built_in_rows.len(),
+            crate::management::OPERATIONS.len(),
+            "every built-in has a row of its own, got {rendered:?}"
+        );
+        for row in &built_in_rows {
+            assert!(
+                row.contains(crate::action_palette::BUILT_IN_MARK),
+                "a built-in row must say so in its own text, not only in its colour: {row:?}"
+            );
+        }
+        let configured_row = rendered
+            .lines()
+            .find(|line| line.contains("reinstall"))
+            .expect("the config-defined Action has a row");
+        assert!(
+            !configured_row.contains(crate::action_palette::BUILT_IN_MARK),
+            "a config-defined Action must not carry the built-in mark: {configured_row:?}"
+        );
+    }
+
+    /// [`test_app`] pointed at a real `config.toml` in `config_dir`, declaring the same Set
+    /// `test_app` wires the `App` to so a reload finds it and rebuilds nothing. This is what
+    /// lets a whole write-then-reload round trip run against a directory the test owns rather
+    /// than the process-wide path [`crate::config::config_file`] fixes once and for all.
+    fn test_app_with_config(root: &std::path::Path, config_dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(config_dir).expect("create the config dir");
+        let config_file = config_dir.join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "# a comment the write must not eat\n[[set]]\nname = \"test\"\nroots = [\"{}\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config.toml");
+        let mut app = test_app(root);
+        app.config_dir = config_dir.to_path_buf();
+        app.config_file = config_file;
+        app
+    }
+
+    /// Opens the management palette, chooses the operation named `operation` and accepts the
+    /// gate, all through `handle_key_event`: the production key path and nothing beside it,
+    /// so a `y` that stopped running the plan fails every test built on this rather than
+    /// passing a scan over the callee it no longer calls.
+    fn press_through_the_management_gate(app: &mut App, operation: management::Operation) {
+        open_the_management_gate(app, operation);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+    }
+
+    /// [`press_through_the_management_gate`] stopped one press short, with the gate open and
+    /// nothing run yet: what a test asserting about the gate on screen needs.
+    fn open_the_management_gate(app: &mut App, operation: management::Operation) {
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+        let index = crate::management::OPERATIONS
+            .iter()
+            .position(|candidate| *candidate == operation)
+            .expect("the operation is one of the built-ins");
+        for _ in 0..index {
+            app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move the highlight");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+    }
+
+    /// One whole frame of `app` at `width` by `height`, rendered through
+    /// [`App::draw_frame`] itself, as lines. The production frame and nothing beside it: a
+    /// component this stopped handing its content to shows up here as missing text.
+    fn render_to_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("create the test terminal");
+        terminal
+            .draw(|frame| {
+                app.draw_frame(frame);
+            })
+            .expect("draw a frame");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The whole gesture, end to end through the real key path: `m`, `Enter`, `y`, and then a
+    /// `[[repo]]` entry on disk carrying `exclude = true`, the row subtracted from what any
+    /// operation may reach in the very same frame, and a Notice saying what happened. A `y`
+    /// that ran nothing fails all three ([repo-management.md](../../../docs/spec/repo-management.md)'s
+    /// "Writing config": an `ignore` "takes effect immediately ... without a refresh and
+    /// without a restart").
+    #[test]
+    fn y_on_the_ignore_gate_writes_the_entry_and_subtracts_the_row_in_the_same_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let key = app.core.snapshot().entities[0].key.clone();
+        assert_eq!(
+            app.core.operable_count(std::slice::from_ref(&key)),
+            1,
+            "the row starts operable"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        let written = std::fs::read_to_string(&app.config_file).expect("read config.toml back");
+        assert!(
+            written.contains("exclude = true"),
+            "the write reached the file, got: {written:?}"
+        );
+        assert!(
+            written.contains(&repo.display().to_string()),
+            "the entry names the Repo the gate named, got: {written:?}"
+        );
+        assert!(
+            written.contains("# a comment the write must not eat"),
+            "the hand-written comment survived, got: {written:?}"
+        );
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the row is excluded in the very next snapshot, with no refresh and no restart"
+        );
+        assert_eq!(
+            app.core.operable_count(&[key]),
+            0,
+            "and is subtracted from what an operation may reach"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("ignore: 1 done"),
+            "the run answers with a Notice naming what it did"
+        );
+    }
+
+    /// `unignore` immediately after, in the same session: the entry it wrote is the entry it
+    /// removes, and the row is operable again in the same frame. This is the half
+    /// [repo-management.md](../../../docs/spec/repo-management.md) says `ignore` alone cannot
+    /// prove, since a row that was never subtracted would also read as unsubtracted here.
+    #[test]
+    fn unignore_in_the_same_session_returns_the_row_and_the_file_to_where_they_started() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let key = app.core.snapshot().entities[0].key.clone();
+        let before = std::fs::read_to_string(&app.config_file).expect("read config.toml");
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the ignore took effect first"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Unignore);
+
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
+            before,
+            "a file that had no `[[repo]]` array is byte for byte what it started as"
+        );
+        assert!(
+            !app.core.snapshot().entities[0].excluded,
+            "the row is operable again in the very same frame"
+        );
+        assert_eq!(
+            app.core.operable_count(&[key]),
+            1,
+            "and is no longer subtracted"
+        );
+        assert_eq!(app.notice(), Some("unignore: 1 done"));
+    }
+
+    /// `delete`'s second half, which the operations table names and no test reached before:
+    /// the working tree goes, and the entity's own `[[repo]]` entry goes with it. Built with
+    /// the entry already in the file, since a Repo Repon never ignored has none to remove.
+    #[test]
+    fn y_on_the_delete_gate_removes_the_working_tree_and_the_entrys_own_config_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        std::fs::write(
+            &app.config_file,
+            format!(
+                "# a comment the write must not eat\n[[set]]\nname = \"test\"\nroots = \
+                 [\"{root}\"]\n\n# pinned by hand\n[[repo]]\npath = \"{repo}\"\ndefault_branch \
+                 = \"main\"\n",
+                root = root.display(),
+                repo = repo.display(),
+            ),
+        )
+        .expect("write config.toml with an entry of its own");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(
+            !repo.exists(),
+            "the working tree the gate named is gone from disk"
+        );
+        let written = std::fs::read_to_string(&app.config_file).expect("read config.toml back");
+        assert!(
+            !written.contains("[[repo]]"),
+            "the entity's own `[[repo]]` entry went with it, got: {written:?}"
+        );
+        assert!(
+            written.contains("[[set]]"),
+            "and nothing else in the file was touched, got: {written:?}"
+        );
+        assert_eq!(app.notice(), Some("delete: 1 done"));
+    }
+
+    /// `delete` on a Repo with no `[[repo]]` entry of its own: the working tree still goes,
+    /// and the report says there was no entry rather than claiming one was removed. The
+    /// negative half of the test above, so neither branch of `config_entry_removed` can be
+    /// hard-coded.
+    #[test]
+    fn delete_on_a_repo_with_no_entry_of_its_own_removes_the_tree_and_says_there_was_no_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let before = std::fs::read_to_string(&app.config_file).expect("read config.toml");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(!repo.exists(), "the working tree is gone");
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
+            before,
+            "a file with no entry for it is left exactly as it was"
+        );
+        assert_eq!(app.notice(), Some("delete: 1 done"));
+    }
+
+    /// The `delete` gate on screen: its headline, the per-Repo risk line computed from the
+    /// real git read, and the sentence saying there is no undo, all reaching a real frame
+    /// through `App`'s own render. Nothing short of that proves the gate a user is about to
+    /// answer says anything at all
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "The confirm gate").
+    #[test]
+    fn the_delete_gates_computed_lines_reach_the_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        std::fs::write(repo.join("stray.txt"), "not committed\n").expect("write a stray file");
+        let mut app = test_app(&root);
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("delete on 1 repos?"),
+            "the headline names the operation and the count, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("repo-a: uncommitted changes"),
+            "the row's own computed risk is on screen, got:\n{frame}"
+        );
+        assert!(
+            frame.contains(crate::management::NO_UNDO),
+            "the sentence about there being no undo is on screen, got:\n{frame}"
+        );
+        assert!(
+            frame.contains(crate::action_palette::CONFIRM_HINT),
+            "and the answer vocabulary with it, got:\n{frame}"
+        );
+    }
+
+    /// The refusal half of the same frame: a Selection carrying a linked Worktree names it
+    /// and its reason on screen rather than dropping it, and the headline's own count says
+    /// how many were subtracted ([repo-management.md](../../../docs/spec/repo-management.md):
+    /// "A refusal is reported and counted in the confirm gate, never silent").
+    #[test]
+    fn a_refused_row_is_named_with_its_reason_on_the_gates_own_frame() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("sidecar"), "sidecar");
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("delete on 1 repos, 1 refused?"),
+            "the headline counts the refusal as well as the eligible rows, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("sidecar: refused, removing a linked Worktree"),
+            "the refused row is named with its reason, got:\n{frame}"
+        );
+    }
+
+    /// Criterion 6's "computed, not stubbed" half at the call site: the gate's risk comes
+    /// from [`repon_core::Core::delete_risk`], the real git read, and not from a literal this
+    /// crate could hand [`crate::management::Plan::with_risk`] instead. What that read
+    /// actually reads is `repon-core`'s own `delete_risk_reads_all_three_facts_the_confirm_gate_names`;
+    /// this holds the wiring between the two.
+    #[test]
+    fn the_delete_gate_reads_its_risk_from_the_core_rather_than_a_literal() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+
+        let call_sites: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(".with_risk("))
+            .collect();
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "expected exactly one place a gate's risk is filled in, found: {call_sites:?}"
+        );
+        assert!(
+            source.contains("self.core.delete_risk(key)"),
+            "the one call must read the risk off the Core"
+        );
+    }
+
+    /// Criterion 8, first half: nothing anywhere in this workspace assigns the in-memory
+    /// document except the reload path itself, so a write can only reach the running app by
+    /// being read back off disk. Scanned over every workspace crate's `src`, not this file
+    /// alone, since a second assignment is as possible in `app/reload.rs` or a module added
+    /// later as it is here.
+    #[test]
+    fn nothing_assigns_the_in_memory_document_outside_the_reload_path() {
+        let assignments = crate::test_support::production_lines_containing("self.document = ");
+
+        assert_eq!(
+            assignments.len(),
+            1,
+            "expected exactly one assignment of the in-memory document, found: {assignments:?}"
+        );
+        assert!(
+            assignments[0].contains("app/reload.rs"),
+            "the one assignment must be the reload path's own, found: {assignments:?}"
+        );
+    }
+
+    /// Criterion 8, second half: after a management write, config reaches the running app
+    /// through [`App::reload_config`], the identical path `Action::ReloadConfig` dispatches
+    /// to, and the write path itself touches no in-memory state of its own. Read over
+    /// `run_management`'s own marked region rather than the whole file, since
+    /// `reload_config` is legitimately called from elsewhere and `self.document` is
+    /// legitimately read all over this one.
+    #[test]
+    fn a_management_write_reaches_the_running_app_through_the_reload_config_path_alone() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+        let region = crate::test_support::source_region(&source, "management_write_reload")
+            .expect("run_management's own scan markers are still in place");
+
+        assert!(
+            region.contains("self.reload_config()"),
+            "a management write must reload through the same path Action::ReloadConfig runs,              got: {region}"
+        );
+        assert!(
+            !region.contains("self.document"),
+            "a management write must never touch the in-memory document, got: {region}"
+        );
+        let dispatch = crate::test_support::source_region(&source, "key_event_dispatch")
+            .expect("the key dispatch's own scan markers are still in place");
+        assert!(
+            dispatch.contains("self.reload_config()"),
+            "the claim is that both reach the same call; if Action::ReloadConfig stopped              calling it, this test would otherwise still pass: {dispatch}"
+        );
+    }
+
+    /// config.md's "Either must exist if given" holds for the whole session, not only for
+    /// startup: a `REPON_CONFIG` directory that has gone away by the time `Ctrl+R` is pressed
+    /// refuses the reload and keeps the previous reading. Without the check the reload
+    /// succeeds as zero config, and the implicit `all` Set rooted at the working directory
+    /// silently replaces every declared Set, which is the loss this asserts against.
+    #[test]
+    fn a_reload_refuses_once_a_named_config_directory_has_gone_away_and_keeps_the_previous_reading()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.named_config_paths = config::NamedPaths {
+            env_dir: Some(app.config_dir.clone()),
+            flag_file: None,
+        };
+
+        std::fs::remove_dir_all(config_dir.path()).expect("the named directory goes away");
+        let logs = crate::test_support::capture_tracing(|| app.reload_config());
+
+        assert_eq!(
+            app.document
+                .sets
+                .iter()
+                .map(|set| set.name.get_ref().clone())
+                .collect::<Vec<_>>(),
+            vec!["test".to_string()],
+            "the declared Set must survive a reload whose named directory has gone away"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "and the session must still be running the Set it was running"
+        );
+        assert!(
+            logs.contains("REPON_CONFIG") && logs.contains("keeping the previous configuration"),
+            "the refusal must name the variable it refused on, got: {logs:?}"
+        );
+    }
+
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s own count of conditional
+    /// surfaces, read off the sentence that states it rather than transcribed here. The spec
+    /// writes the number as a word, so an unknown word is a loud panic rather than a silently
+    /// skipped check.
+    fn spec_conditional_surface_count(spec: &str) -> usize {
+        let (before, _) = spec
+            .split_once(" surfaces are already conditional")
+            .expect("keybindings.md still states how many surfaces are conditional");
+        let word = before
+            .rsplit(char::is_whitespace)
+            .next()
+            .expect("a word before that count");
+        match word.to_lowercase().as_str() {
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            other => panic!("keybindings.md's surface count `{other}` is not a number word"),
+        }
+    }
+
+    /// Criterion 5's own "and no more": every call site that raises
+    /// `action_running_notice`. Scanned over this crate's `src` alone, which is the whole of
+    /// the claim rather than a narrowing of it, because `action_running_notice` is
+    /// `pub(crate)` in `repon` and so has no call site `repon-core` could hold. How many
+    /// distinct surfaces the count must come to is read from
+    /// [keybindings.md](../../../docs/spec/keybindings.md) at test time, and each one is
+    /// named as well as counted, so neither a call site reusing an existing label nor a spec
+    /// that grew a fifth surface can pass as still reading the same.
+    #[test]
+    fn exactly_the_four_declared_surfaces_are_gated_on_action_running_and_no_more() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read docs/spec/keybindings.md");
         let mut call_sites = Vec::new();
         for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
             let source = crate::test_support::production_source_at(&path);
@@ -3526,13 +4352,26 @@ mod tests {
         assert_eq!(
             call_sites,
             vec![
+                // Twice, and one surface: `;` and `m` both open the Action palette, `m`
+                // filtered to the built-in management operations
+                // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"), so
+                // both are inert for the identical reason and say the identical thing.
+                "Action palette",
                 "Action palette",
                 "Reload config",
                 "Set picker",
                 "Set switch"
             ],
-            "expected exactly the ticket's own four groups gated on action_running, no more \
-             and no fewer, found: {call_sites:?}"
+            "expected exactly the four surfaces keybindings.md names, no more and no \
+             fewer, found: {call_sites:?}"
+        );
+
+        let mut surfaces = call_sites.clone();
+        surfaces.dedup();
+        assert_eq!(
+            surfaces.len(),
+            spec_conditional_surface_count(&spec),
+            "the number of gated surfaces is keybindings.md's to declare, found: {surfaces:?}"
         );
     }
 
@@ -5989,8 +6828,8 @@ mod tests {
             app.action_palette
                 .as_ref()
                 .map(|palette| palette.matches(&app.document.actions).len()),
-            Some(1),
-            "an empty query still matches every configured action"
+            Some(1 + crate::management::OPERATIONS.len()),
+            "an empty query still matches every configured action, and the built-ins"
         );
     }
 

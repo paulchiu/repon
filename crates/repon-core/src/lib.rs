@@ -99,6 +99,7 @@ pub use entity::AheadBehind;
 pub use entity::CaptureElision;
 pub use entity::DefaultBranch;
 pub use entity::DefaultBranchStopped;
+pub use entity::DeleteRisk;
 pub use entity::Diagnostics;
 pub use entity::DirtyCounts;
 pub use entity::EntityKey;
