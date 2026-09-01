@@ -1878,6 +1878,7 @@ fn run_action_for_entity(
                 },
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::ZERO,
+                elision: None,
             });
             continue;
         }
@@ -5500,6 +5501,7 @@ mod tests {
                 outcome: crate::entity::StepOutcome::Ok,
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
@@ -5539,6 +5541,7 @@ mod tests {
                 outcome: crate::entity::StepOutcome::Failed(1),
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
@@ -6820,6 +6823,7 @@ mod tests {
                 outcome: crate::entity::StepOutcome::Ok,
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),

@@ -8,20 +8,24 @@
 //! A step's own captured output is parsed from raw ANSI bytes into styled spans here, in
 //! this crate, and nowhere in `repon-core`: `docs/spec/actions.md`'s "The run on screen"
 //! puts the parse "in the consumer, never in repon-core", since the parser produces ratatui
-//! types the core's own dependency allowlist cannot carry. Those spans take the child's own
+//! types the core's own dependency allowlist cannot carry. The mark standing in for what a
+//! bounded capture dropped is chosen here for the same reason: the core reports the drop as
+//! a `CaptureElision`'s two counts and never names a glyph. Those spans take the child's own
 //! literal colour, never a theme [`Role`], because that output is a quotation of another
 //! program's screen; [`ContentLine::Raw`] is the one place in this module a real
 //! [`ratatui::style::Style`] reaches the buffer instead of a role resolved against the
-//! live theme.
+//! live theme. The elision row is the one row inside that region Repon writes itself, and it
+//! takes no role and no child colour but a default style, `docs/spec/actions.md`'s own rule
+//! for it.
 
 use std::time::Duration;
 
 use ansi_to_tui::IntoText;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
 use repon_core::{
-    ActionReceipt, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts, EntityState,
-    Head, InProgressOperation, Kind, RunningStep, Settled, StepOutcome, StepResult, SyncState,
-    Timestamp, Unknown,
+    ActionReceipt, CaptureElision, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts,
+    EntityState, Head, InProgressOperation, Kind, RunningStep, Settled, StepOutcome, StepResult,
+    SyncState, Timestamp, Unknown,
 };
 
 use super::list::{
@@ -135,9 +139,11 @@ type Span = (String, Role);
 type StyledLine = Vec<Span>;
 
 /// One row [`draw_lines`] paints: almost every row takes its colour from a theme [`Role`]
-/// ([`Styled`](ContentLine::Styled)), except a captured Action step's own output, which
-/// takes the child's own literal [`Style`] instead ([`Raw`](ContentLine::Raw)), per this
-/// module's own top-level doc comment. [`content_lines`] flattens either shape to plain text.
+/// ([`Styled`](ContentLine::Styled)), while every row inside a captured step's own quoted
+/// region is a [`Raw`](ContentLine::Raw) carrying a real [`Style`], per this module's own
+/// top-level doc comment. Two kinds of row live there: the child's own output, which carries
+/// the child's literal [`Style`], and [`elision_row`], Repon's own text about the quotation,
+/// which carries [`Style::default`]. [`content_lines`] flattens either shape to plain text.
 #[derive(Debug)]
 enum ContentLine {
     Styled(StyledLine),
@@ -381,7 +387,12 @@ fn action_run_lines(
     let mut lines = Vec::new();
     for (index, step) in receipt.steps.iter().enumerate() {
         lines.push(finished_step_line(index, step));
-        lines.extend(captured_output_lines(&step.output, interior_width));
+        lines.extend(captured_output_lines(
+            &step.output,
+            step.elision,
+            interior_width,
+            glyphs,
+        ));
     }
     if let Some(running) = &receipt.running {
         lines.push(running_step_line(receipt.steps.len(), running, glyphs));
@@ -470,18 +481,56 @@ fn running_step_line(
 /// no styling of its own.
 const CAPTURED_OUTPUT_INDENT: &str = "    ";
 
+/// The row standing in for what the capture bound dropped, drawn with the live glyph set's
+/// own `capture_elision`, so `glyphs = "ascii"` renders `...` where `full` renders `···`.
+/// The wording is `docs/spec/actions.md`'s own detail-pane mock.
+///
+/// The mark is picked here rather than in `repon-core` for [ADR 0015](../../../../docs/adr/0015-the-core-owns-the-table.md)'s
+/// reason ("the consumer owns ... every glyph"), which is why the core hands over a
+/// [`CaptureElision`] and not a formatted line.
+fn elision_row(elision: CaptureElision, glyphs: &'static GlyphSet) -> String {
+    // Destructured exhaustively rather than read field by field, so a third count added to
+    // `CaptureElision` is a compile error here instead of a silently ignored field.
+    let CaptureElision {
+        dropped_lines,
+        kept_head_lines: _,
+    } = elision;
+    let mark = glyphs.capture_elision;
+    format!("{mark} {dropped_lines} lines elided {mark}")
+}
+
 /// Parses `output`'s raw ANSI SGR bytes into wrapped, styled lines at `interior_width`
-/// columns, indented under the step header they belong to. `output.into_text()` fails only
-/// on invalid UTF-8, never observed from a real step's own capture; that fallback reads the
-/// bytes lossily as plain, unstyled text instead, so a parse failure loses no content, only
-/// its colour.
-fn captured_output_lines(output: &[u8], interior_width: u16) -> Vec<ContentLine> {
+/// columns, indented under the step header they belong to, with [`elision_row`] inserted
+/// after `elision`'s own kept head if the capture was bounded. `output.into_text()` fails
+/// only on invalid UTF-8, never observed from a real step's own capture; that fallback
+/// reads the bytes lossily as plain, unstyled text instead, so a parse failure loses no
+/// content, only its colour.
+///
+/// The elision row joins the parsed lines before wrapping rather than being spliced into
+/// `output`'s bytes, so it is never mistaken for the child's own output and the child's own
+/// output is never mistaken for it.
+fn captured_output_lines(
+    output: &[u8],
+    elision: Option<CaptureElision>,
+    interior_width: u16,
+    glyphs: &'static GlyphSet,
+) -> Vec<ContentLine> {
     if output.is_empty() {
         return Vec::new();
     }
     let wrap_width = (interior_width as usize).saturating_sub(CAPTURED_OUTPUT_INDENT.len());
+    let mut parsed = parse_output_lines(output);
+    if let Some(elision) = elision {
+        // Exhaustive for the reason `elision_row` states.
+        let CaptureElision {
+            dropped_lines: _,
+            kept_head_lines,
+        } = elision;
+        let at = kept_head_lines.min(parsed.len());
+        parsed.insert(at, ratatui::text::Line::raw(elision_row(elision, glyphs)));
+    }
     let mut lines = Vec::new();
-    for line in parse_output_lines(output) {
+    for line in parsed {
         let expanded = expand_tabs(&line);
         for row in wrap_output_line(&expanded, wrap_width) {
             let mut runs = vec![(CAPTURED_OUTPUT_INDENT.to_string(), Style::default())];
@@ -841,7 +890,8 @@ mod tests {
     use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
     use repon_core::{
-        Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec, StepOutcome, StepResult,
+        CaptureElision, Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec, StepOutcome,
+        StepResult,
     };
 
     use super::*;
@@ -879,6 +929,7 @@ mod tests {
                 outcome,
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
+                elision: None,
             }]),
             not_applicable: false,
             finished_at: Timestamp::now(),
@@ -897,6 +948,7 @@ mod tests {
             outcome,
             output: Arc::from(output),
             elapsed,
+            elision: None,
         }
     }
 
@@ -1989,6 +2041,360 @@ mod tests {
         );
     }
 
+    // --- The capture elision mark is the consumer's, chosen from the live glyph set ---
+
+    /// A finished step whose capture was bounded: `kept_head` head lines, then `kept_tail`
+    /// tail lines, with the drop reported beside them, which is the shape
+    /// `bound_head_and_tail` hands over once the mark stopped being written into the bytes.
+    /// The two runs are numbered so a row's position can be read off the text, not merely
+    /// its presence.
+    fn elided_step(dropped_lines: usize, kept_head: usize, kept_tail: usize) -> StepResult {
+        let mut output = String::new();
+        for n in 0..kept_head {
+            output.push_str(&format!("head {n}\n"));
+        }
+        for n in 0..kept_tail {
+            output.push_str(&format!("tail {n}\n"));
+        }
+        StepResult {
+            label: Arc::from("pnpm install"),
+            outcome: StepOutcome::Ok,
+            output: Arc::from(output.as_bytes()),
+            elapsed: Duration::from_millis(1),
+            elision: Some(CaptureElision {
+                dropped_lines,
+                kept_head_lines: kept_head,
+            }),
+        }
+    }
+
+    /// The pane's own content lines for a row whose last Action elided output, under `set`.
+    fn elided_step_content_lines(
+        set: &'static GlyphSet,
+        dropped_lines: usize,
+        kept_head: usize,
+        kept_tail: usize,
+    ) -> Vec<String> {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![elided_step(dropped_lines, kept_head, kept_tail)],
+            None,
+        ));
+        content_lines(&row, WIDE, set)
+    }
+
+    /// The one line of a bounded step's rendering that stands in for the drop.
+    fn rendered_elision_row(lines: &[String], label: &str) -> String {
+        lines[rendered_elision_index(lines, label)]
+            .trim()
+            .to_string()
+    }
+
+    /// Where that line sits among `lines`, which is the half of the claim
+    /// [`rendered_elision_row`] throws away.
+    fn rendered_elision_index(lines: &[String], label: &str) -> usize {
+        let matches: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("lines elided"))
+            .map(|(index, _)| index)
+            .collect();
+        let [index] = matches.as_slice() else {
+            panic!("expected exactly one elision row under {label}, got {matches:?}");
+        };
+        *index
+    }
+
+    /// The head half of the capture bound, read out of `docs/spec/actions.md` at test time
+    /// rather than restated here, so a fixture standing in for a real capture carries the
+    /// number the core actually reports.
+    fn spec_capture_head_lines() -> usize {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read the actions specification");
+        spec.split("Capture is bounded to the head ")
+            .nth(1)
+            .expect("actions.md states the capture bound")
+            .split(' ')
+            .next()
+            .expect("a head line count")
+            .parse()
+            .expect("actions.md's head bound is a whole number of lines")
+    }
+
+    /// The `capture elision` row of `docs/spec/theming.md`'s own two-set glyph table, read
+    /// at test time: `(full, ascii)`. The design of record names the marks; restating them
+    /// here would let the code and the spec drift apart with both tests still green.
+    fn spec_capture_elision_marks() -> (String, String) {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let rows: Vec<Vec<String>> = spec
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|'))
+            .map(|line| {
+                line.trim_matches('|')
+                    .split('|')
+                    .map(|cell| cell.trim().trim_matches('`').to_string())
+                    .collect()
+            })
+            .filter(|cells: &Vec<String>| {
+                cells
+                    .first()
+                    .is_some_and(|first| first == "capture elision")
+            })
+            .collect();
+        let [row] = rows.as_slice() else {
+            panic!(
+                "expected exactly one `capture elision` row in theming.md's glyph table, got {rows:?}"
+            );
+        };
+        let [_, full, ascii] = row.as_slice() else {
+            panic!("theming.md's `capture elision` row does not have exactly three cells: {row:?}");
+        };
+        (full.clone(), ascii.clone())
+    }
+
+    /// The criterion itself, both halves of it: the mark on screen travels from the live
+    /// glyph set through [`content_lines`], the pane's own path, and it is the mark
+    /// `docs/spec/theming.md`'s glyph table names for that set, so `glyphs = "ascii"`
+    /// renders `...` and not merely something different from `full`'s.
+    #[test]
+    fn an_elided_steps_mark_is_the_one_theming_mds_glyph_table_names_for_the_live_set() {
+        let (spec_full, spec_ascii) = spec_capture_elision_marks();
+        assert_ne!(
+            spec_full, spec_ascii,
+            "theming.md's two sets must name different capture elision marks, or this test \
+             cannot tell them apart"
+        );
+
+        for (label, set, mark) in [
+            ("full", &crate::glyphs::FULL, &spec_full),
+            ("ascii", &crate::glyphs::ASCII, &spec_ascii),
+        ] {
+            assert_eq!(
+                rendered_elision_row(&elided_step_content_lines(set, 212, 3, 2), label),
+                format!("{mark} 212 lines elided {mark}"),
+                "the {label} set's elision row must be drawn with the mark theming.md's own \
+                 glyph table gives it"
+            );
+        }
+    }
+
+    /// Where the mark sits: after exactly `kept_head_lines` of the kept output and directly
+    /// before the kept tail, which is the only thing that can place it now that no line in
+    /// the captured bytes says so. Built at the real capture's own scale, the head count
+    /// `docs/spec/actions.md` fixes, because a fixture with one kept head line cannot tell
+    /// the field apart from the literal `1`. The tail run is deliberately a different
+    /// length: with equal runs, counting from the end lands on the same index as counting
+    /// from the start, so a head-for-tail confusion would pass.
+    #[test]
+    fn an_elided_steps_mark_sits_after_exactly_the_kept_head_lines_it_names() {
+        let kept_head = spec_capture_head_lines();
+        let kept_tail = kept_head / 4 + 1;
+        assert_ne!(
+            kept_head, kept_tail,
+            "the two kept runs must differ, or this test cannot tell an index counted from \
+             the head apart from one counted from the tail"
+        );
+        let lines = elided_step_content_lines(&crate::glyphs::FULL, 100, kept_head, kept_tail);
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim() == needle)
+                .unwrap_or_else(|| panic!("expected a line reading {needle:?}: {lines:?}"))
+        };
+
+        let elided = rendered_elision_index(&lines, "full");
+
+        assert_eq!(
+            elided,
+            position("head 0") + kept_head,
+            "the mark must sit {kept_head} kept lines after the first, not merely somewhere \
+             between the head and the tail"
+        );
+        assert_eq!(lines[elided - 1].trim(), format!("head {}", kept_head - 1));
+        assert_eq!(lines[elided + 1].trim(), "tail 0");
+    }
+
+    /// A bounded step whose kept lines carry the child's own bold, so the elision row's own
+    /// styling is distinguishable from its neighbours'. Bold rather than a colour because
+    /// `strip_colour_if_disabled` drops colour under `NO_COLOR` and leaves every other
+    /// attribute alone, which a machine with that variable set would otherwise turn into a
+    /// failure with nothing wrong.
+    fn bold_elided_step(dropped_lines: usize, kept_head: usize, kept_tail: usize) -> StepResult {
+        let mut output = String::new();
+        for n in 0..kept_head {
+            output.push_str(&format!("\u{1b}[1mhead {n}\u{1b}[0m\n"));
+        }
+        for n in 0..kept_tail {
+            output.push_str(&format!("\u{1b}[1mtail {n}\u{1b}[0m\n"));
+        }
+        StepResult {
+            label: Arc::from("pnpm install"),
+            outcome: StepOutcome::Ok,
+            output: Arc::from(output.as_bytes()),
+            elapsed: Duration::from_millis(1),
+            elision: Some(CaptureElision {
+                dropped_lines,
+                kept_head_lines: kept_head,
+            }),
+        }
+    }
+
+    /// The pane's own rendered rows, styles and all, for a row whose last Action elided
+    /// output written by a child that styled it: what [`elided_step_content_lines`]'s plain
+    /// text throws away.
+    fn bold_elided_step_rendered_rows(set: &'static GlyphSet) -> Vec<Vec<(String, Style)>> {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![bold_elided_step(212, 3, 2)],
+            None,
+        ));
+        styled_content_lines(&row, WIDE, set)
+            .into_iter()
+            .filter_map(|line| match line {
+                ContentLine::Styled(_) => None,
+                ContentLine::Raw(runs) => Some(runs),
+            })
+            .collect()
+    }
+
+    /// `docs/spec/actions.md`'s "It renders unstyled": the row belongs to neither voice, so
+    /// it takes no theme role and none of the child's own SGR either. The child's own rows
+    /// are asserted bold in the same pass, so a rendering that styled nothing at all could
+    /// not pass this by accident.
+    #[test]
+    fn an_elided_steps_mark_renders_unstyled_between_the_childs_own_styled_rows() {
+        for (label, set) in [
+            ("full", &crate::glyphs::FULL),
+            ("ascii", &crate::glyphs::ASCII),
+        ] {
+            let rows = bold_elided_step_rendered_rows(set);
+            let (elided, child): (Vec<_>, Vec<_>) = rows
+                .iter()
+                .partition(|runs| runs.iter().any(|(text, _)| text.contains("lines elided")));
+            let [elided] = elided.as_slice() else {
+                panic!("expected exactly one elision row under {label}, got {elided:?}");
+            };
+
+            for (text, style) in elided.iter() {
+                assert_eq!(
+                    *style,
+                    Style::default(),
+                    "the {label} set's elision row must render unstyled, but {text:?} carries \
+                     {style:?}"
+                );
+            }
+            assert!(
+                child.iter().flat_map(|runs| runs.iter()).any(|(_, style)| {
+                    style.add_modifier.contains(ratatui::style::Modifier::BOLD)
+                }),
+                "the child's own rows must reach the pane styled under {label}, or this test \
+                 cannot tell an unstyled elision row from an unstyled pane"
+            );
+        }
+    }
+
+    /// A step whose own output prints the elision text must not be read as an elision: the
+    /// receipt says whether output was dropped, and matching on the captured bytes is the
+    /// hack this split exists to prevent.
+    #[test]
+    fn a_step_whose_own_output_prints_the_elision_text_is_not_treated_as_elided() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "reinstall",
+            vec![step_result(
+                "echo",
+                StepOutcome::Ok,
+                "\u{b7}\u{b7}\u{b7} 212 lines elided \u{b7}\u{b7}\u{b7}\n".as_bytes(),
+                Duration::from_millis(1),
+            )],
+            None,
+        ));
+
+        let lines = content_lines(&row, WIDE, &crate::glyphs::ASCII);
+
+        let row = rendered_elision_row(&lines, "ascii");
+        assert_eq!(
+            row, "\u{b7}\u{b7}\u{b7} 212 lines elided \u{b7}\u{b7}\u{b7}",
+            "a step's own output is a quotation of another program's screen and must reach \
+             the pane unrewritten, even under the ascii table"
+        );
+    }
+
+    /// The wording is `docs/spec/actions.md`'s, read at test time from the pane mock that
+    /// fixes it rather than restated here, so a change to the mock's phrasing fails this
+    /// test instead of leaving the code and the design of record quietly apart.
+    #[test]
+    fn the_full_tables_elision_row_matches_actions_mds_own_detail_pane_mock() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read the actions specification");
+        let mock: Vec<String> = spec
+            .lines()
+            .filter(|line| line.contains("lines elided"))
+            .map(|line| line.trim_matches(['│', ' ']).to_string())
+            .collect();
+        let [mock] = mock.as_slice() else {
+            panic!("expected exactly one elision line in actions.md's own mocks, got {mock:?}");
+        };
+
+        let dropped: usize = mock
+            .split_whitespace()
+            .nth(1)
+            .expect("the mock's dropped count")
+            .parse()
+            .expect("the mock's dropped count is a number");
+
+        assert_eq!(
+            rendered_elision_row(
+                &elided_step_content_lines(&crate::glyphs::FULL, dropped, 3, 2),
+                "full"
+            ),
+            *mock
+        );
+    }
+
+    /// Every way a Rust source line can spell U+00B7: the literal character, and the
+    /// `\u{...}` escape, whose grammar allows one to six hex digits in either case. The
+    /// spellings are generated from that grammar rather than listed, because a scan that
+    /// lists two of them stops checking under the third.
+    fn elision_glyph_spellings() -> Vec<String> {
+        let mut spellings = vec!["\u{b7}".to_string()];
+        for leading_zeros in 0..=4 {
+            let zeros = "0".repeat(leading_zeros);
+            // Only `b` has a case; `7` and the zeros do not.
+            for hex in ["b7", "B7"] {
+                spellings.push(format!("u{{{zeros}{hex}}}"));
+            }
+        }
+        spellings
+    }
+
+    /// The boundary claim, which is an absence and so a source scan is the honest form of:
+    /// nothing in `repon-core` names the mark it used to hardcode, in any spelling
+    /// [`elision_glyph_spellings`] enumerates. Comment lines are excluded by the shared
+    /// helper, so a doc comment explaining the split is free to name the character.
+    #[test]
+    fn repon_core_names_no_elision_glyph() {
+        let core_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../repon-core/src");
+        for needle in elision_glyph_spellings() {
+            let offending = crate::test_support::production_lines_under_containing(
+                std::slice::from_ref(&core_src),
+                &needle,
+            );
+            assert!(
+                offending.is_empty(),
+                "repon-core names {needle:?}, the mark the consumer's glyph set owns, at: \
+                 {offending:?}"
+            );
+        }
+    }
+
     /// The fifth claim: a captured line longer than the pane wraps rather than truncating,
     /// with no character lost. 300 characters against a 40-column area (36-column wrap width
     /// once the 4-column indent is subtracted) forces several wrapped rows, not a boundary
@@ -2002,7 +2408,8 @@ mod tests {
         let area_width = 40u16;
         let wrap_width = (interior_width(area_width) as usize) - CAPTURED_OUTPUT_INDENT.len();
 
-        let wrapped = captured_output_lines(&output, interior_width(area_width));
+        let wrapped =
+            captured_output_lines(&output, None, interior_width(area_width), full_glyphs());
 
         assert!(
             wrapped.len() > 1,
@@ -2045,7 +2452,7 @@ mod tests {
     fn a_tab_advances_to_the_next_eight_column_stop_not_a_fixed_width() {
         let output = b"ab\tcdefghijkl\tmn\n".to_vec();
 
-        let lines = captured_output_lines(&output, interior_width(104));
+        let lines = captured_output_lines(&output, None, interior_width(104), full_glyphs());
 
         assert_eq!(
             lines.len(),
@@ -2083,7 +2490,7 @@ mod tests {
 
         let output = b"a\x1b[31m\t\x1b[0mb\n".to_vec();
 
-        let lines = captured_output_lines(&output, interior_width(104));
+        let lines = captured_output_lines(&output, None, interior_width(104), full_glyphs());
 
         let ContentLine::Raw(runs) = &lines[0] else {
             panic!("expected a Raw content line, got {:?}", lines[0]);
