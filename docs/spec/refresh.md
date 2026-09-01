@@ -18,6 +18,9 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 | Switching Set | A new generation over the new Set's entities. |
 | Starting an Action | Any generation in flight is cancelled. Measured, a fan-out over a 60 entity Selection takes 0.85s alone and 3.14s beside a generation, while the generation itself barely moves, so the background read costs the foreground 3.7 times for nothing. |
 | An Action finishing | One normal generation over everything, the same path a finished fetch already takes. The first entity to finish therefore holds stale cells for the length of the run. |
+| An `on_refresh` Action | Not a trigger for a generation, but a trigger *by* one: the Action `on_refresh` names runs after the generation `r` or `R` started, and after no other row in this table. [actions.md](actions.md)'s "The refresh hook" and [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md) fix why, and the row above is why a generation may not fire it: an Action finishing starts one, which would fire the hook again. |
+
+Only the two refresh keys carry the hook, and the rest of this table deliberately does not. Terminal focus gained is best effort and terminal dependent, so a script would run or not run depending on a multiplexer option; a resume is the moment the user was doing inner-loop work by hand; and a finished fetch is a background tick nobody aimed at anything. All three are Repon deciding rather than the user asking, which is the line [0002](../adr/0002-repon-owns-the-outer-loop-only.md) draws.
 
 The Launcher return is the most precise signal in the design. Repon suspends, execs the tool and resumes, so the `SIGTSTP` call returning is a deterministic 'I am back' moment, and Repon knows exactly which entity the user was just working in.
 
@@ -166,5 +169,7 @@ A finished fetch starts a normal generation, so the new behind counts arrive thr
 | `fetch.enabled` | `false` | The periodic fetch |
 | `fetch.interval` | `"5m"` | Cadence of the periodic fetch |
 | `fetch.concurrency` | `4` | Concurrent fetches in flight |
+
+`on_refresh` is not in this table because it is not a `[refresh]` key: it is a top-level bare scalar naming an Action, settled in [the config spec](config.md) and [actions.md](actions.md).
 
 Naming and nesting are settled in [the config spec](config.md): `[refresh]` and `[fetch]` are tables, and every duration is a humantime string. The disable value is amended from `0` to `"0s"`, since `humantime-serde` rejects a bare TOML integer. Disabling the poll does not remove `~`, since the status age threshold and the Launcher return still produce it.

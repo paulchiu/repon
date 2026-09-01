@@ -52,6 +52,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
 | `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
 | `notice_timeout` | humantime string | `"3s"` | How long a Notice stays on the status row ([theming.md](theming.md)). `"0s"` turns the timer off, not Notices: the next keypress or a replacement still clears one. There is no key that disables Notices, since a refusal nobody is told about is the defect [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) exists to remove |
+| `on_refresh` | string | unset | Names one declared `[[action]]` to run after a Refresh the user asked for, `r` and `R` alone ([actions.md](actions.md)'s "The refresh hook", [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)). A bare scalar rather than a table, since it is about the whole program and names one thing |
 
 `glyphs`'s default is the one conditional value on this page: `ascii` when the process environment has `TERM=linux`, `full` for every other value, absent included. An explicit `glyphs` in the file always wins over the conditional default, in both directions, since pinning it either way is the whole point of writing it down. The signal is capped at this one check on purpose: the Linux console's own fallback substitution table is fixed and knowable ([0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)), where a terminal emulator's is not, so no table of emulator names is ever read to make this decision.
 
@@ -177,7 +178,7 @@ Steps run in order and stop at the first failure, where failure is a nonzero exi
 
 `when` reuses [filter.md](filter.md)'s language rather than extending it, and is never a load error of any grade: that grammar is total, so an unrecognised term inside a `when` is advisory exactly as it is on the Filter line, and there is no entry for it under "Cross-key validity" below. An entry with no `when` is applicable everywhere, which is what an Action without one already meant. It narrows the count the palette shows and not the set the fan-out acts on; [actions.md](actions.md) settles the readings of the border title that count produces.
 
-`confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable. The fan-out runs on its own pool rather than rayon's global one, because a step blocked in `wait()` removes a worker from that pool and a `concurrency` at or above the pool's thread count stops the refresh entirely; [actions.md](actions.md) carries the measurement.
+`confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. It governs the palette and nothing else: an Action reached through the top-level `on_refresh` key runs with no gate whatever this field says, because `r` is the confirmation there and a dialog on every refresh is unusable ([actions.md](actions.md)'s "The refresh hook"). Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable. The fan-out runs on its own pool rather than rayon's global one, because a step blocked in `wait()` removes a worker from that pool and a `concurrency` at or above the pool's thread count stops the refresh entirely; [actions.md](actions.md) carries the measurement.
 
 Execution belongs elsewhere. Output capture, the run pane, what a partial failure looks like, cancellation, and how a run's result persists are settled in [actions.md](actions.md); this spec fixes only the fields.
 
@@ -221,6 +222,7 @@ Checked at load, each a warning rather than an exit:
 - A `[[repo]]` `path` matching no discovered entity.
 - A `[[set]]` glob matching nothing.
 - A `[[set]]` named `all`.
+- `on_refresh` naming an Action no `[[action]]` declares, so the hook can never fire. The warning names the value.
 
 ## Reload
 

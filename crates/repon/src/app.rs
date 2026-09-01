@@ -7,7 +7,9 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect, Size},
 };
-use repon_core::{ActionReceipt, Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot};
+use repon_core::{
+    ActionReceipt, Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot, StepOutcome,
+};
 use tracing::debug;
 
 use crate::{
@@ -291,11 +293,11 @@ pub struct App {
     /// when `notice` is `None`.
     notice_set_at: Option<std::time::Instant>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
-    /// `Action::ReloadConfig`. One of the four sources [`Self::current_warnings`] folds into
+    /// `Action::ReloadConfig`. One of the sources [`Self::current_warnings`] folds into
     /// the shared warning slot ([`warnings::WarningSources`]).
     theme_warnings: Vec<theme::ThemeWarning>,
     /// Config warnings raised at the last load, the same lifecycle as `theme_warnings` and
-    /// the second of the four sources.
+    /// the second of those sources.
     config_warnings: Vec<config::document::Warning>,
     /// Whether the abandoned-discovery warning has already been logged to `repon.log` for
     /// `self.core`'s lifetime: `Core` never clears the warning once a walk abandons, so this
@@ -619,27 +621,29 @@ impl App {
     }
 
     /// The shared warning slot's whole current population, folded once from every source
-    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the four sources by
+    /// ([`WarningSources::into_warnings`]) so no caller can enumerate the sources by
     /// hand. `self.core`'s own abandoned-discovery warning is read fresh here rather than
     /// cached, since it can turn from `None` to `Some` at any point in the run with no reload
     /// involved; the first time it does, this also logs it to `repon.log`
     /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
     /// reported twice" (the theme and config halves already log at the point their own load
-    /// raises them). The Vanished count is read fresh from the live snapshot the same way,
-    /// with nothing latched: the condition clears itself the moment the count returns to zero.
-    /// A live Notice is never folded
+    /// raises them). The Vanished count and the `on_refresh` hook's own failures are read
+    /// fresh from `snapshot` the same way, with nothing latched: each condition clears itself
+    /// the moment the count returns to zero. A live Notice is never folded
     /// in here: it is not a standing condition of the session, and
     /// [theming.md](../../../docs/spec/theming.md) keeps the two apart.
-    fn current_warnings(&mut self) -> Vec<Warning> {
+    fn current_warnings(&mut self, snapshot: &Snapshot) -> Vec<Warning> {
         let discovery_abandoned = self.core.discovery_warning();
         warnings::log_discovery_warning_once(
             discovery_abandoned.as_ref(),
             &mut self.discovery_warning_logged,
         );
         let vanished = self.core.vanished_count();
+        let on_refresh_failed = self.on_refresh_failures(snapshot);
         WarningSources {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
+            on_refresh_failed,
             discovery_abandoned,
             vanished,
         }
@@ -1125,7 +1129,7 @@ impl App {
                 None
             }
             Some(Action::ExpandWarning) => {
-                let warnings = self.current_warnings();
+                let warnings = self.current_warnings(&self.core.snapshot());
                 if !warnings.is_empty() {
                     self.acknowledged_warnings = warnings;
                     self.warning_overlay_open = true;
@@ -1156,16 +1160,24 @@ impl App {
                 }
                 None
             }
+            // scan: on_refresh_trigger begin -- the two arms are the whole set of places the
+            // refresh hook fires, which is the restriction ADR 0029 records; a call added
+            // outside this pair fails the test over this region rather than reading as
+            // "nothing found".
             Some(Action::RefreshAll) => {
-                self.core.refresh(&self.refresh_everything_order());
+                let order = self.refresh_everything_order();
+                self.core.refresh(&order);
+                self.fire_on_refresh_hook(&order);
                 None
             }
             Some(Action::RefreshSelection) => {
                 if let Some(order) = self.refresh_selection_order() {
                     self.core.refresh(&order);
+                    self.fire_on_refresh_hook(&order);
                 }
                 None
             }
+            // scan: on_refresh_trigger end
             Some(Action::RederiveDefaultBranches) => {
                 if let Some(order) = self.refresh_selection_order() {
                     self.core.rederive_default_branches(&order);
@@ -1791,6 +1803,15 @@ impl App {
             return;
         };
         let targets = self.selection.targets(&cursor_key);
+        self.start_action_over(spec, targets);
+    }
+
+    /// [`Self::start_action`]'s body with the rows named rather than resolved from the
+    /// Selection, so the refresh hook ([`Self::fire_on_refresh_hook`]) fans out over the rows
+    /// its own trigger covered and still shares one seam with every other Action-running path
+    /// here: the baseline receipts the status row's `run n/m` counts against are built the one
+    /// way whoever asked for the run.
+    fn start_action_over(&mut self, spec: repon_core::ActionSpec, targets: Vec<EntityKey>) {
         let snapshot = self.core.snapshot();
         let action_run = ActionRun {
             targets: targets
@@ -1809,6 +1830,61 @@ impl App {
         if self.core.run_action(spec, &targets) {
             self.action_run = Some(action_run);
         }
+    }
+
+    /// The `[[action]]` the top-level `on_refresh` key names, if the file declares one.
+    /// `None` with the key unset, and `None` when it names an Action nothing declares, which
+    /// [`config::document::Warning::OnRefreshNamesNoAction`] already said at load rather than
+    /// this repeating it once per keypress.
+    fn on_refresh_action(&self) -> Option<&config::document::ActionConfig> {
+        let name = self.document.on_refresh.as_deref()?;
+        self.document
+            .actions
+            .iter()
+            .find(|action| action.name.get_ref() == name)
+    }
+
+    /// Runs the Action `on_refresh` names over `order`, the rows the Refresh that just
+    /// started covers ([actions.md](../../../docs/spec/actions.md)'s "The refresh hook").
+    /// Called from `r` and `R` alone: a Generation nobody asked for (the periodic fetch's
+    /// own completion, focus gained, a resume) never reaches here, which is the whole
+    /// restriction [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)
+    /// records. The entry's own `confirm` is deliberately not read: `r` is the confirmation.
+    /// Yields rather than queues while another Action is in flight, so pressing `r` during a
+    /// run leaves that run alone.
+    fn fire_on_refresh_hook(&mut self, order: &[EntityKey]) {
+        let Some(spec) = self
+            .on_refresh_action()
+            .map(crate::action_palette::to_action_spec)
+        else {
+            return;
+        };
+        if self.action_running() {
+            return;
+        }
+        self.start_action_over(spec, order.to_vec());
+    }
+
+    /// The Action `on_refresh` names, paired with how many rows its last run left holding a
+    /// failed step, or `None` with no hook declared. Read fresh from the live snapshot rather
+    /// than latched, the same shape the Vanished count takes: a later run replaces those
+    /// receipts and the condition clears itself.
+    fn on_refresh_failures(&self, snapshot: &Snapshot) -> Option<(String, usize)> {
+        let name = self.document.on_refresh.clone()?;
+        let failures = snapshot
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.last_action.as_ref().is_some_and(|receipt| {
+                    *receipt.label == *name
+                        && receipt
+                            .steps
+                            .iter()
+                            .any(|step| matches!(step.outcome, StepOutcome::Failed(_)))
+                })
+            })
+            .count();
+        Some((name, failures))
     }
 
     /// The Filter currently narrowing the list: the edit buffer's own live parse while
@@ -2191,7 +2267,7 @@ impl App {
             .pane
             .as_ref()
             .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
-        let warnings = self.current_warnings();
+        let warnings = self.current_warnings(&snapshot);
         // The identical computation `Self::choose_highlighted_action` reads, taken once up
         // front so the border title can never show a different number than a real choice
         // would act on.
@@ -2929,7 +3005,7 @@ mod tests {
                 keys::Context::Overlay => keys::Context::Overlay,
                 keys::Context::Confirm => keys::Context::Confirm,
             };
-            let warnings_before = app.current_warnings().len();
+            let warnings_before = app.current_warnings(&app.core.snapshot()).len();
 
             app.handle_key_event(press(code, modifiers))
                 .expect("dispatch an unbuilt chord");
@@ -2944,7 +3020,7 @@ mod tests {
                 "{action:?} is marked unbuilt, but pressing its chord raised a Notice"
             );
             assert_eq!(
-                app.current_warnings().len(),
+                app.current_warnings(&app.core.snapshot()).len(),
                 warnings_before,
                 "{action:?} is marked unbuilt, but pressing its chord changed the shared \
                  warning slot's population"
@@ -3531,7 +3607,7 @@ mod tests {
     // =====================================================================================
 
     /// [theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices": `current_warnings`
-    /// folds only the four standing sources, so a live Notice, even alongside a real
+    /// folds only the standing sources, so a live Notice, even alongside a real
     /// warning, never joins its population. `w`'s expanded list ([`warnings::draw_overlay`])
     /// reads this exact same population, so this one assertion covers both the slot and the
     /// expanded list.
@@ -3546,7 +3622,7 @@ mod tests {
         }];
         app.set_notice("switched to `second`".to_string());
 
-        let warnings = app.current_warnings();
+        let warnings = app.current_warnings(&app.core.snapshot());
 
         assert_eq!(
             warnings.len(),
@@ -5615,7 +5691,7 @@ mod tests {
         vanish(&app, &repo);
 
         assert!(
-            app.current_warnings()
+            app.current_warnings(&app.core.snapshot())
                 .iter()
                 .any(|warning| matches!(warning, warnings::Warning::Vanished(_))),
             "expected a Vanished warning while the row is still listed"
@@ -5626,7 +5702,7 @@ mod tests {
             .expect("dismiss");
 
         assert!(
-            !app.current_warnings()
+            !app.current_warnings(&app.core.snapshot())
                 .iter()
                 .any(|warning| matches!(warning, warnings::Warning::Vanished(_))),
             "expected the Vanished warning to clear itself once the last Vanished row is gone"
@@ -5764,7 +5840,7 @@ mod tests {
     // --- criterion 6: `w` acknowledges every currently outstanding condition ---
 
     fn status_row_text(app: &mut App, width: u16) -> String {
-        let warnings = app.current_warnings();
+        let warnings = app.current_warnings(&app.core.snapshot());
         let content = app.status_row_content(&app.core.snapshot(), &warnings);
         status_row::render(&content, &app.bindings, width).to_string()
     }
@@ -6910,6 +6986,370 @@ mod tests {
             generation_before,
             "with no focus event and no other trigger pressed, nothing should have started a \
              Generation on its own"
+        );
+    }
+
+    // --- Issue #215: `on_refresh` fires one declared Action after a Refresh the user asked
+    // for, and after nothing else
+    // (ADR 0029, docs/spec/actions.md's "The refresh hook").
+
+    /// One `[[action]]` whose steps are `args`, each run in the entity's own working
+    /// directory, with `confirm = true` so every test below that still sees it run is also
+    /// proving the hook never consults the gate.
+    fn hook_action_config(name: &str, args: &[&str]) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm: true,
+            concurrency: 4,
+            when: None,
+        }
+    }
+
+    /// The file every hook step below drops in whichever entity's working directory it ran
+    /// in, which is how a test tells "the hook ran here" from "the hook ran somewhere".
+    const HOOK_MARKER: &str = "on-refresh-ran";
+
+    /// Declares `on_refresh = "sync"` and the `[[action]]` it names, whose one step touches
+    /// [`HOOK_MARKER`] in each row it runs on.
+    fn declare_on_refresh_hook(app: &mut App) {
+        app.document
+            .actions
+            .push(hook_action_config("sync", &["touch", HOOK_MARKER]));
+        app.document.on_refresh = Some("sync".to_string());
+    }
+
+    fn hook_ran_in(repo: &std::path::Path) -> bool {
+        repo.join(HOOK_MARKER).exists()
+    }
+
+    /// The first "Done when": `on_refresh = "sync"` runs that Action once after a Refresh
+    /// started by `r`, over every row that Refresh covers. The entry declares
+    /// `confirm = true`, so a build that put the hook behind the Action confirm gate would
+    /// sit at a dialog here and touch nothing.
+    #[test]
+    fn on_refresh_runs_the_named_action_after_the_refresh_key_with_no_confirm_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        assert!(
+            app.action_run.is_some(),
+            "`Core::run_action` accepts or rejects a run synchronously, so the hook's own \
+             dispatch must be observable the instant the key press returns"
+        );
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            hook_ran_in(&repo_a) && hook_ran_in(&repo_b),
+            "`r` covers every known Entity, so its hook must fan out over every one of them"
+        );
+    }
+
+    /// The same "Done when" for `R`, plus the scope that key carries: a Selection refresh's
+    /// hook runs on the Selection alone. Asserting only that `repo-a` ran would pass on a
+    /// build that fanned out over everything, so the load-bearing half is `repo-b`, which is
+    /// neither selected nor the cursor row and must never be touched.
+    #[test]
+    fn on_refresh_runs_after_the_selection_refresh_key_over_the_selection_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+        let key_a = entity_for(&app.core.snapshot(), &repo_a).key.clone();
+        app.selection.toggle(key_a);
+
+        app.handle_key_event(press(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .expect("handle RefreshSelection");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            hook_ran_in(&repo_a),
+            "the Selection's own row must have run"
+        );
+        assert!(
+            !hook_ran_in(&repo_b),
+            "a row outside the Selection must never be operated on by `R`'s own hook"
+        );
+    }
+
+    /// "It never runs after ... a focus-gained refresh". `Core::run_action` flips
+    /// `action_running` and `App::start_action_over` sets `action_run`, both synchronously
+    /// before the trigger returns, so this negative needs no wait and cannot pass merely by
+    /// reading too early.
+    #[test]
+    fn a_focus_gained_refresh_never_runs_the_on_refresh_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+        assert!(
+            app.document.refresh.on_focus,
+            "sanity: the focus trigger is enabled, so this test exercises a refresh that \
+             really happened"
+        );
+
+        app.on_focus_gained();
+
+        assert!(app.action_run.is_none() && !app.core.action_running());
+        app.core.settle(Duration::from_secs(5));
+        assert!(
+            !hook_ran_in(&repo),
+            "a Generation nobody asked for must never fire the hook"
+        );
+    }
+
+    /// "It never runs after ... a resume", covering both ways back into the screen: a bare
+    /// `SIGTSTP` and a Launcher's own handoff share `App::on_resume`.
+    #[test]
+    fn a_resume_never_runs_the_on_refresh_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+
+        app.on_resume();
+
+        assert!(app.action_run.is_none() && !app.core.action_running());
+        app.core.settle(Duration::from_secs(5));
+        assert!(
+            !hook_ran_in(&repo),
+            "returning from suspension is not a Refresh the user asked for"
+        );
+    }
+
+    /// "It never runs after a fetch-started generation". A finished periodic fetch starts
+    /// its Generation through `RefreshHandles::dispatch`, the identical body `Core::refresh`
+    /// calls (`refresh.md`'s "A finished fetch starts a normal generation", and
+    /// `test_support.rs`'s own count of that primitive's three callers), and the `fetch`
+    /// cargo feature is off in this crate's build, so driving `Core::refresh` directly is
+    /// this seam's own reachable form of that trigger. The claim it cannot make alone, that
+    /// no other production path reaches the hook, is
+    /// [`the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else`]'s.
+    #[test]
+    fn a_generation_started_the_way_a_finished_fetch_starts_one_never_runs_the_on_refresh_action() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+
+        app.core.refresh(&entity_keys(&app.core.snapshot()));
+
+        assert!(app.action_run.is_none() && !app.core.action_running());
+        app.core.settle(Duration::from_secs(5));
+        assert!(
+            !hook_ran_in(&repo),
+            "a Generation started off the key path must run no Action at all, which is what \
+             keeps an Action's own completion Generation from firing the hook again"
+        );
+    }
+
+    /// "It never runs concurrently with another Action": the hook yields rather than
+    /// queueing or pre-empting. The palette-run Action holds the fan-out for long enough
+    /// that the `r` below lands inside it, asserted rather than assumed; the hook must then
+    /// neither run beside it nor be waiting to run once it ends.
+    #[test]
+    fn the_on_refresh_hook_yields_while_another_action_is_already_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        // Declared first, so it is the palette's own highlighted entry and `Enter` runs it
+        // with no navigation; `confirm = false` starts it on that keystroke alone.
+        let mut slow = hook_action_config("slow", &["sleep", "2"]);
+        slow.confirm = false;
+        app.document.actions.push(slow);
+        declare_on_refresh_hook(&mut app);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run the highlighted entry");
+        assert!(
+            app.core.action_running(),
+            "sanity: the slow Action must still be in flight when `r` is pressed below"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        wait_for("the slow Action to finish", || !app.core.action_running());
+        app.core.settle(Duration::from_secs(5));
+        assert!(
+            !hook_ran_in(&repo),
+            "the hook yields while a fan-out is in flight, and never queues itself behind it"
+        );
+    }
+
+    /// "A nonzero step surfaces as a Warning", on the surface that already ranks and expands
+    /// ([`warnings::Warning`]). Read fresh from the receipts rather than latched, so the
+    /// count is the rows that actually failed.
+    #[test]
+    fn a_nonzero_step_in_the_on_refresh_action_stands_as_a_warning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(hook_action_config("sync", &["sh", "-c", "exit 3"]));
+        app.document.on_refresh = Some("sync".to_string());
+        let before = app.current_warnings(&app.core.snapshot());
+        assert!(
+            !before.iter().any(|warning| matches!(
+                warning,
+                Warning::OnRefreshFailed {
+                    action: _,
+                    entities: _
+                }
+            )),
+            "sanity: nothing has run yet, so no such condition stands"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        let after = app.current_warnings(&app.core.snapshot());
+        assert!(
+            after.contains(&Warning::OnRefreshFailed {
+                action: "sync".to_string(),
+                entities: 2,
+            }),
+            "a failing unattended hook must stand as a Warning, got: {after:?}"
+        );
+    }
+
+    /// The load warning is the whole of what a typo costs: pressing `r` afterwards still
+    /// refreshes, runs nothing and does not panic. `App` deliberately raises no Notice of its
+    /// own here, since `r` is pressed many times a session and the condition was already
+    /// reported once, at load.
+    #[test]
+    fn an_on_refresh_naming_no_declared_action_refreshes_and_runs_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+
+        let mut app = test_app(&root);
+        app.document.on_refresh = Some("nothing-declares-this".to_string());
+        let generation_before = app.core.snapshot().generation;
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        assert!(app.action_run.is_none() && !app.core.action_running());
+        app.core.settle(Duration::from_secs(5));
+        assert_ne!(
+            app.core.snapshot().generation,
+            generation_before,
+            "the Refresh itself must still happen; only the hook is missing"
+        );
+        assert!(app.notice.is_none());
+    }
+
+    /// The specs of record for this trigger, and the link every one of them carries to the
+    /// decision behind it. Read at test time rather than trusted: a renamed or deleted ADR
+    /// would otherwise leave four documents pointing at nothing and this crate's own doc
+    /// comments beside them.
+    #[test]
+    fn the_refresh_hooks_decision_of_record_exists_and_every_spec_that_states_it_links_to_it() {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let adr = "0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md";
+        assert!(
+            docs.join("adr").join(adr).is_file(),
+            "the decision of record for the refresh hook is missing"
+        );
+
+        for (name, needle) in [
+            ("actions.md", "## The refresh hook"),
+            ("refresh.md", "An `on_refresh` Action"),
+            ("config.md", "| `on_refresh` |"),
+        ] {
+            let text = std::fs::read_to_string(docs.join("spec").join(name))
+                .unwrap_or_else(|_| panic!("read docs/spec/{name}"));
+            assert!(
+                text.contains(needle),
+                "docs/spec/{name} no longer states the refresh hook"
+            );
+            assert!(
+                text.contains(adr),
+                "docs/spec/{name} must link to the decision behind the hook rather than \
+                 restate it"
+            );
+        }
+    }
+
+    /// The absence half of the restriction: the hook has exactly two production call sites
+    /// and both sit in the `r` and `R` arms, marked in this file with a
+    /// `// scan: on_refresh_trigger begin` / `end` pair. Scanned across every workspace
+    /// crate's `src` for the count, so a call newly appearing anywhere (`repon-core`
+    /// included) moves it, and against the marked region for the placement, so a call that
+    /// stayed in `app.rs` but moved out of the two arms is caught too.
+    #[test]
+    fn the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else() {
+        let needle = format!("self.fire_{}(", "on_refresh_hook");
+        let calls = crate::test_support::production_lines_containing(&needle);
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected exactly two production call sites for the refresh hook, one per \
+             Refresh key; a count that moved means a trigger was added or duplicated, at: \
+             {calls:?}"
+        );
+
+        let source = production_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        );
+        let region = crate::test_support::source_region(&source, "on_refresh_trigger")
+            .expect("app.rs carries the on_refresh_trigger scan markers");
+        assert_eq!(
+            region.matches(needle.as_str()).count(),
+            2,
+            "both call sites must sit inside the two Refresh-key arms; ADR 0029 restricts \
+             the hook to a Refresh the user asked for"
+        );
+        assert!(
+            region.contains("Some(Action::RefreshAll)")
+                && region.contains("Some(Action::RefreshSelection)"),
+            "the marked region must still be the two Refresh-key arms themselves"
         );
     }
 
@@ -8369,7 +8809,7 @@ mod tests {
             .expect("handle s");
 
         assert!(app.set_picker.is_some(), "s must open the Set picker");
-        let warnings = app.current_warnings();
+        let warnings = app.current_warnings(&app.core.snapshot());
         assert!(
             !warnings
                 .iter()
