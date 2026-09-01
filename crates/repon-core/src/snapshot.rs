@@ -207,6 +207,7 @@ mod tests {
                 outcome,
                 output: Arc::from(&b""[..]),
                 elapsed: std::time::Duration::from_millis(1),
+                elision: None,
             })
             .collect::<Vec<_>>();
         ActionReceipt {
@@ -717,6 +718,48 @@ mod tests {
             StepOutcome::Ok,
             StepOutcome::Failed(1),
         ]));
+
+        assert_eq!(summary(&entity), RowSummary::Failed);
+    }
+
+    /// The first-probe spinner outranks a failed receipt, which is why a consumer waiting
+    /// for a row to read Failed cannot stop at "the fan-out finished".
+    ///
+    /// A row on which nothing has settled yet reads InFlight whatever else is true of it,
+    /// so an Action that has already failed on such a row is invisible until the Generation
+    /// covering it lands. `repon`'s `run_failing_action_on` fixture waits on the row reading
+    /// Failed for exactly this reason, rather than on the fan-out being over; this is the
+    /// fold that makes the two different.
+    #[test]
+    fn a_failed_last_action_is_outranked_while_the_row_still_holds_no_values() {
+        let mut entity = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("repo"))),
+            Arc::from("repo"),
+            Arc::from(Path::new("repo")),
+            Kind::Repo,
+        );
+        entity.last_action = Some(receipt_with_steps(vec![StepOutcome::Failed(1)]));
+
+        assert_eq!(
+            summary(&entity),
+            RowSummary::InFlight,
+            "a row holding no values yet must still read InFlight, receipt or no receipt"
+        );
+
+        // The same entity once one Generation has settled a single Cell: the receipt is
+        // read from that point on, so the assertion above is about the ordering of the two
+        // rather than about the receipt being ignored outright.
+        entity.branch.settle(
+            Generation::new(1),
+            Settled::Known {
+                value: Head::Branch {
+                    name: Arc::from("main"),
+                    commit: gix::hash::Kind::Sha1.null(),
+                },
+                at: Timestamp::now(),
+                stale: false,
+            },
+        );
 
         assert_eq!(summary(&entity), RowSummary::Failed);
     }

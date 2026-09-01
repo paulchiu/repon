@@ -25,17 +25,14 @@
 //! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
 //! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::Style,
-    widgets::{Block, Paragraph},
-};
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 
 use repon_core::{ActionSpec, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
+    edit_buffer,
+    glyphs::{BorderScratch, GlyphSet},
     management::{self, Operation},
     theme::{Meaning, Role, Theme},
 };
@@ -386,12 +383,7 @@ impl ActionPalette {
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
     pub(crate) fn delete_previous_word(&mut self, actions: &[ActionConfig]) {
-        let trimmed = self.query.trim_end();
-        let cut = trimmed
-            .rfind(char::is_whitespace)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.query.truncate(cut);
+        edit_buffer::delete_previous_word(&mut self.query);
         self.refusal = None;
         self.clamp_cursor(actions);
     }
@@ -540,7 +532,7 @@ impl ActionPalette {
 
     /// The border title theming.md fixes: "the Action palette ... puts the Selection count
     /// in the border title, so it reads `run on 12 repos`" before anything is typed.
-    fn border_title(operable_count: usize) -> String {
+    pub(crate) fn border_title(operable_count: usize) -> String {
         format!(" run on {operable_count} repos ")
     }
 
@@ -556,8 +548,11 @@ impl ActionPalette {
         actions: &[ActionConfig],
         operable_count: usize,
         management_lines: &[String],
+        glyphs: &'static GlyphSet,
     ) {
-        let block = Block::bordered()
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
             .title(Self::border_title(operable_count));
         let interior = block.inner(area);
@@ -1049,6 +1044,31 @@ mod tests {
         );
     }
 
+    /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
+    /// three, so a cut derived by adding one byte to the separator's start lands inside a
+    /// character; the accented letters pin that a multi-byte *non*-whitespace character
+    /// before the cut survives it.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "café\u{00A0}naïve".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.delete_previous_word(&actions);
+
+        assert_eq!(palette.text(), "café\u{00A0}");
+
+        for c in "naïve\u{2003}encore".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.delete_previous_word(&actions);
+
+        assert_eq!(palette.text(), "café\u{00A0}naïve\u{2003}");
+    }
+
     #[test]
     fn clear_line_empties_the_query_and_restores_every_match() {
         let actions = vec![action("reinstall", true), action("deploy", true)];
@@ -1130,6 +1150,46 @@ mod tests {
         );
     }
 
+    // --- The frame's own characters come from the glyph table, not ratatui's default ---
+
+    /// theming.md's "panel border" row: the palette frames itself with the active table's
+    /// own characters, the set the list and detail panes already draw, and degrades with
+    /// them under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded
+    /// rounded set would satisfy neither.
+    #[test]
+    fn draw_frames_the_palette_with_the_active_glyph_tables_own_border() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let actions = vec![action("reinstall", true)];
+            let palette = ActionPalette::new();
+            let backend = TestBackend::new(40, 10);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+            terminal
+                .draw(|frame| {
+                    palette.draw(
+                        frame,
+                        frame.area(),
+                        &Theme::default(),
+                        &actions,
+                        3,
+                        &[],
+                        glyphs,
+                    );
+                })
+                .expect("draw the frame");
+
+            crate::test_support::assert_frame_drawn_with(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, 40, 10),
+                glyphs.border,
+                &ActionPalette::border_title(3),
+                "the Action palette's frame",
+            );
+        }
+    }
+
     // --- Criterion 3: the border renders in the warning role ---
 
     /// theming.md: "the Action palette's border is `warn`". Read through the same
@@ -1151,7 +1211,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 3, &[]);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    3,
+                    &[],
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1175,7 +1243,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 2, &[]);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    2,
+                    &[],
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1210,7 +1286,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &theme, &actions, 12, &[]);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &actions,
+                    12,
+                    &[],
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1284,7 +1368,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &crate::theme::DEFAULT, &[], 25, &lines);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &crate::theme::DEFAULT,
+                    &[],
+                    25,
+                    &lines,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1367,7 +1459,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &crate::theme::DEFAULT, &[], 1, &lines);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &crate::theme::DEFAULT,
+                    &[],
+                    1,
+                    &lines,
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1414,7 +1514,15 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                palette.draw(frame, frame.area(), &monochrome, &actions, 2, &[]);
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &monochrome,
+                    &actions,
+                    2,
+                    &[],
+                    &crate::glyphs::FULL,
+                );
             })
             .expect("draw the frame");
 
@@ -1541,7 +1649,17 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| palette.draw(frame, frame.area(), theme, actions, operable_count, &[]))
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    theme,
+                    actions,
+                    operable_count,
+                    &[],
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the frame");
         terminal.backend().buffer().clone()
     }
@@ -1727,7 +1845,16 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| launcher_palette.draw(frame, frame.area(), &theme, &launchers, "repo-a"))
+            .draw(|frame| {
+                launcher_palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
             .expect("draw the launcher palette");
         let launcher_buf = terminal.backend().buffer().clone();
         // Issue 162 turned the Launcher palette into a centred popup, so its border no

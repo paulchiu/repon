@@ -26,11 +26,9 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    symbols::border,
-    widgets::Block,
 };
 
-use crate::glyphs::{GlyphSet, Meaning};
+use crate::glyphs::{BorderScratch, GlyphSet, Meaning, bordered_interior};
 use crate::keys::{Action, BindingTable, Context};
 use crate::scroll::scroll_after;
 use crate::theme::{Role, Theme};
@@ -47,6 +45,10 @@ const MIN_CONTENT_WIDTH: u16 = 1;
 const MIN_CONTENT_HEIGHT: u16 = 1;
 const MIN_BORDERED_WIDTH: u16 = BORDER_WIDTH + MIN_CONTENT_WIDTH;
 const MIN_BORDERED_HEIGHT: u16 = BORDER_HEIGHT + MIN_CONTENT_HEIGHT;
+
+/// The title the overlay draws into its own top border, recorded in keybindings.md's "The
+/// help overlay's own chrome" and named once here so no reader of it holds a second copy.
+pub(crate) const BORDER_TITLE: &str = " help (esc or q closes) ";
 
 /// The interior's list rows when the query matches nothing, the same convention
 /// [`crate::launcher_palette::NO_MATCHES_MESSAGE`] uses for the same fact on a different
@@ -132,7 +134,7 @@ impl HelpLayout {
     /// which draws no border to be inset from.
     pub(crate) fn content_area(self, frame_area: Rect) -> Rect {
         match self {
-            HelpLayout::Bordered => Block::bordered().inner(frame_area),
+            HelpLayout::Bordered => bordered_interior(frame_area),
             HelpLayout::Degraded => frame_area,
         }
     }
@@ -363,27 +365,14 @@ impl HelpOverlay {
     ) {
         let layout = HelpLayout::compute(frame_area);
         if layout == HelpLayout::Bordered {
-            let border_glyphs = glyphs.border;
-            let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
-                [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
-            );
-            let border_set = border::Set {
-                top_left: border_glyphs.top_left.encode_utf8(&mut tl),
-                top_right: border_glyphs.top_right.encode_utf8(&mut tr),
-                bottom_left: border_glyphs.bottom_left.encode_utf8(&mut bl),
-                bottom_right: border_glyphs.bottom_right.encode_utf8(&mut br),
-                vertical_left: border_glyphs.vertical.encode_utf8(&mut vl),
-                vertical_right: border_glyphs.vertical.encode_utf8(&mut vr),
-                horizontal_top: border_glyphs.horizontal.encode_utf8(&mut ht),
-                horizontal_bottom: border_glyphs.horizontal.encode_utf8(&mut hb),
-            };
             // Like `List`'s own border, always painted focused: help is the only thing on
             // screen while it is open, so there is no second, dimmer panel to contrast it
             // against.
-            let block = Block::bordered()
-                .border_set(border_set)
+            let mut scratch = BorderScratch::new();
+            let block = glyphs
+                .bordered_block(&mut scratch)
                 .border_style(theme.style_for(Role::BorderFocused))
-                .title(" help (esc or q closes) ");
+                .title(BORDER_TITLE);
             frame.render_widget(block, frame_area);
         }
         let content_area = layout.content_area(frame_area);
@@ -1285,30 +1274,14 @@ mod tests {
         let buf = terminal.backend().buffer();
         let glyphs = full_glyphs();
         let outer = ROOMY_FRAME;
-        assert_eq!(
-            buf[(outer.x, outer.y)].symbol(),
-            glyphs.border.top_left.to_string()
-        );
-        assert_eq!(
-            buf[(outer.right() - 1, outer.y)].symbol(),
-            glyphs.border.top_right.to_string()
-        );
-        assert_eq!(
-            buf[(outer.x, outer.bottom() - 1)].symbol(),
-            glyphs.border.bottom_left.to_string()
-        );
-        assert_eq!(
-            buf[(outer.right() - 1, outer.bottom() - 1)].symbol(),
-            glyphs.border.bottom_right.to_string()
-        );
+        let title = BORDER_TITLE;
 
-        let title = " help (esc or q closes) ";
-        let title_row: String = (outer.x..outer.right())
-            .map(|x| buf[(x, outer.y)].symbol())
-            .collect();
-        assert!(
-            title_row.contains(title),
-            "expected the title {title:?} on the box's own top border, got {title_row:?}"
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            outer,
+            glyphs.border,
+            title,
+            "the help overlay's frame",
         );
     }
 

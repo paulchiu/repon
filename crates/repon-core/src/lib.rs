@@ -3,7 +3,9 @@
 //! Its public surface is flat, re-exported from the crate root rather than through
 //! `fanout`, `git`, `entity` or `snapshot`, which stay private: a generic scatter
 //! primitive and a single branch read are not vocabulary a second consumer needs,
-//! and neither is which file happens to define `EntityState` or `Snapshot`. The
+//! and neither is which file happens to define `EntityState` or `Snapshot`. The one
+//! exception is `liveness`, a `test-util`-gated module of test waits that names
+//! nothing git-shaped and so belongs under a namespace rather than at the root. The
 //! entry points on `Core` itself (`start`, `refresh`, `snapshot`, `settle`, ...)
 //! land in later work and get re-exported the same way once they exist.
 //!
@@ -68,6 +70,14 @@ mod fetch;
 mod filter;
 mod git;
 mod landing;
+/// The one module reachable by name rather than re-exported flat: it holds no vocabulary a
+/// consumer needs, only the wait a test in either crate uses for a liveness property, and a
+/// namespace is what keeps names that generic out of the crate root. Gated with it, and the
+/// gate is what
+/// `every_pub_item_documented_as_test_only_is_either_gated_or_has_a_production_use_site`
+/// reads this doc comment to require.
+#[cfg(any(test, feature = "test-util"))]
+pub mod liveness;
 mod patch_equivalence;
 mod poll;
 mod snapshot;
@@ -86,6 +96,7 @@ pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverri
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;
+pub use entity::CaptureElision;
 pub use entity::DefaultBranch;
 pub use entity::DefaultBranchStopped;
 pub use entity::DeleteRisk;
@@ -125,28 +136,61 @@ mod tests {
         name.to_string()
     }
 
-    /// The crate's actual public surface: every name a `pub use` line in `source`
-    /// brings into the crate root, read from the crate's own `src/lib.rs` rather
-    /// than a hand-kept list, so a `pub use` added without a matching glossary
-    /// entry has nowhere to hide. A line scan, not a parser, since this crate
-    /// controls the formatting of its own `pub use` lines: it recognises
-    /// `pub use path::Name;`, `pub use path::Name as Alias;`, and a single-line
-    /// braced group `pub use path::{Name, Other as Alias};`, and panics naming
-    /// any `pub use` line it cannot make sense of, since a scanner that quietly
-    /// skips an unfamiliar form is the same drift this test exists to catch.
-    /// Stops at the test module, so its own `pub use` (if any) is not scanned.
+    /// Everything in `source` ahead of the test module, which is the region where a
+    /// crate-root declaration's visibility is decided and the only region either scan
+    /// below reads: a `pub` item inside the test module is not part of the surface.
+    fn crate_root_declarations(source: &str) -> &str {
+        source.split("mod tests {").next().unwrap_or(source)
+    }
+
+    /// The crate's actual public surface: every name reachable at the crate root
+    /// of `source`, read from the crate's own `src/lib.rs` rather than a hand-kept
+    /// list, so a name added without a matching glossary entry has nowhere to hide.
+    ///
+    /// Three declaration forms carry a name onto that surface, and all three are
+    /// read: a `pub use` re-export, a `pub mod` namespace, and a `pub const`. A
+    /// line scan, not a parser, since this crate controls the formatting of its own
+    /// crate-root lines: it recognises `pub use path::Name;`,
+    /// `pub use path::Name as Alias;`, a single-line braced group
+    /// `pub use path::{Name, Other as Alias};`, `pub mod name;` and
+    /// `pub const NAME: Type = ...;`. Any other `pub ` line at the crate root is a
+    /// panic rather than a skip, since a scanner that quietly passes over an
+    /// unfamiliar form is the same drift this test exists to catch: `pub mod
+    /// liveness;` was invisible to the `pub use`-only version of this scan. What it
+    /// does *not* check is privacy: a name collected here is only ever asked whether
+    /// the glossary documents it, so a module made public whose name happens to be a
+    /// glossary term passes. `docs/spec/releasing.md`'s cleared-gate item 1 is the
+    /// privacy claim, and
+    /// [`modules_the_release_gate_names_are_private_at_the_crate_root`] is what
+    /// enforces it.
     fn crate_root_public_surface(source: &str) -> Vec<String> {
-        let before_tests = source.split("mod tests {").next().unwrap_or(source);
         let mut names = Vec::new();
-        for line in before_tests.lines() {
+        for line in crate_root_declarations(source).lines() {
             let line = line.trim();
-            if !line.starts_with("pub use ") {
+            if !line.starts_with("pub ") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pub mod ") {
+                let name = rest
+                    .strip_suffix(';')
+                    .unwrap_or_else(|| panic!("`pub mod` line is not `;`-terminated: `{line}`"));
+                names.push(exported_name(name, line));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pub const ") {
+                let name = rest
+                    .split(':')
+                    .next()
+                    .unwrap_or_else(|| panic!("`pub const` line names nothing: `{line}`"));
+                names.push(exported_name(name, line));
                 continue;
             }
             let body = line
                 .strip_prefix("pub use ")
                 .and_then(|s| s.strip_suffix(';'))
-                .unwrap_or_else(|| panic!("`pub use` line is not `;`-terminated: `{line}`"));
+                .unwrap_or_else(|| {
+                    panic!("crate-root `pub` line is in no form this scan reads: `{line}`")
+                });
             match body.split_once('{') {
                 Some((_path, rest)) => {
                     let group = rest.strip_suffix('}').unwrap_or_else(|| {
@@ -172,7 +216,9 @@ mod tests {
     ///
     /// A Rust identifier's casing never matches the glossary's Capitalised prose
     /// terms directly, so `name` is split into words on `_` and on a
-    /// lowercase-to-uppercase boundary, rejoined with single spaces, and searched
+    /// lowercase-to-uppercase boundary (never inside a run of capitals, or a
+    /// SCREAMING_CASE constant would come apart one letter at a time), rejoined
+    /// with single spaces, and searched
     /// for case-insensitively. Matching is deliberately whole-phrase rather than
     /// any-single-word: a name like `EntityState` must find "entity state" together,
     /// not pass because "state" alone occurs in unrelated prose such as "Worktree
@@ -190,7 +236,7 @@ mod tests {
                 }
                 continue;
             }
-            if ch.is_uppercase() && !word.is_empty() {
+            if ch.is_uppercase() && word.ends_with(|last: char| !last.is_uppercase()) {
                 words.push(std::mem::take(&mut word));
             }
             word.push(ch);
@@ -228,7 +274,76 @@ mod tests {
         for name in crate_root_public_surface(&source) {
             assert!(
                 glossary_covers(&glossary, &name),
-                "public re-export `{name}` has no matching entry in the project glossary"
+                "crate-root public name `{name}` has no matching entry in the project glossary"
+            );
+        }
+    }
+
+    /// The module names `docs/spec/releasing.md`'s cleared-gate item 1 requires to stay
+    /// private, read out of the document rather than restated beside it.
+    ///
+    /// The item spells each one as a backticked `mod name;` fragment, which is what this
+    /// picks out: a name the gate stops naming stops being enforced here, and one it adds
+    /// is enforced without an edit to this file. An item naming none panics, since a
+    /// reworded gate would otherwise leave the test below asserting nothing.
+    fn modules_the_release_gate_requires_to_be_private(releasing: &str) -> Vec<String> {
+        let gate = releasing
+            .split("## Before the first crates.io publish")
+            .nth(1)
+            .expect("releasing.md must carry the pre-publish gate section");
+        let item = gate
+            .lines()
+            .find(|line| line.trim_start().starts_with("1. "))
+            .expect("the pre-publish gate must carry a numbered item 1");
+        let names: Vec<String> = item
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|code| Some(code.strip_prefix("mod ")?.strip_suffix(';')?.to_string()))
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "cleared-gate item 1 names no `mod name;` fragment any more, so the privacy it \
+             records has nothing left to check: {item}"
+        );
+        names
+    }
+
+    /// `docs/spec/releasing.md`'s cleared-gate item 1 is a privacy claim about this crate
+    /// root, so the names it makes that claim about are read from the document and asserted
+    /// against the source rather than restated here.
+    ///
+    /// Each named module must still be declared at the crate root, in either form, before
+    /// its declaration is required to be the private one: a gate naming a module this crate
+    /// no longer has is a stale gate, not a passing check.
+    #[test]
+    fn modules_the_release_gate_names_are_private_at_the_crate_root() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(manifest_dir.join("src/lib.rs"))
+            .expect("read this crate's own source");
+        let releasing = std::fs::read_to_string(manifest_dir.join("../../docs/spec/releasing.md"))
+            .expect("read the releasing spec");
+        let declarations: Vec<&str> = crate_root_declarations(&source)
+            .lines()
+            .map(str::trim)
+            .collect();
+
+        for name in modules_the_release_gate_requires_to_be_private(&releasing) {
+            let private = format!("mod {name};");
+            let public = format!("pub {private}");
+            let declaration = declarations
+                .iter()
+                .find(|line| **line == private || **line == public)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`docs/spec/releasing.md`'s cleared-gate item 1 names `{private}`, \
+                         which this crate root no longer declares in any form"
+                    )
+                });
+            assert_eq!(
+                **declaration, private,
+                "`{name}` is public at this crate root, which `docs/spec/releasing.md`'s \
+                 cleared-gate item 1 requires to stay private"
             );
         }
     }

@@ -79,7 +79,10 @@ One command in an Action's ordered list, as the core receives it: its argv, alre
 An Entity's most recent Action run: its label, the Step results finished so far, whether the row was excluded and never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes. Not an Action run or an Action result; receipt is the settled word.
 
 **Step result**:
-One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output and its elapsed time.
+One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded.
+
+**Capture elision**:
+What a Step's captured output lost to the head-plus-tail bound: how many lines were dropped and how many kept lines precede the gap. Two counts and no mark, because the mark that stands in for the gap is a glyph, and glyphs belong to the consumer; nothing is written into the captured bytes to say a drop happened.
 
 **Step outcome**:
 A Step's closed set of exactly four: ran and exited zero, ran and exited nonzero (with the code carried), never started because an earlier Step failed, or cancelled before it finished or started. Cancelled is explicitly not a failure.
@@ -148,6 +151,9 @@ An optional mutation that rides the periodic fetch cycle rather than carrying a 
 
 **Auto update spec**:
 The auto-update's own bounding data as the core receives it: whether it runs at all, plain data with no TOML type. Present regardless of the `fetch` cargo feature, the same way Fetch spec is; inert without it, and inert while Fetch spec's own `enabled` is false.
+
+**Fetch available**:
+Whether the build in hand carries the periodic fetch's own mechanism rather than only the bounding data on Core spec. False on a default build, where Fetch spec's `enabled` is accepted and inert, which a consumer is expected to say out loud rather than leave silent.
 
 ## Provenance
 
@@ -230,3 +236,9 @@ None of the above: unlanded, pushed work.
 
 **Dirty**:
 Uncommitted changes are present. Orthogonal to the four states above, and the flag that makes a Worktree unsafe to remove.
+
+### Testing
+
+**Liveness**:
+A property with no wall-clock bound of its own: this eventually settles, this child eventually exits. A test asserting one waits rather than sleeps, and the wait's deadline is a backstop against a wedged process, never a budget for how long the work should take. The one namespace on the core's public surface that exists for a test rather than for a consumer, and the only one gated off the default published build.
+_Avoid_: Timeout (that names the number, not the property it stands in for)

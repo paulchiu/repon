@@ -30,7 +30,9 @@ The honest cost, stated rather than hidden: a PTY widens the class of programs t
 
 The core stores raw bytes per step, never a `String`, with no interpretation. What those bytes mean is the consumer's question, answered under The run on screen.
 
-Capture is bounded to the head 200 lines plus the tail 200 lines, with an elision line naming the dropped count. Head plus tail rather than a tail-only ring, because the tail alone loses the invocation and keeps only the noise. Truncation walks to a char boundary, never a raw byte offset.
+Capture is bounded to the head 200 lines plus the tail 200 lines. Head plus tail rather than a tail-only ring, because the tail alone loses the invocation and keeps only the noise. Truncation walks to a char boundary, never a raw byte offset.
+
+The drop is reported beside the bytes rather than written into them. The step's own result carries a `CaptureElision`: how many lines went, and how many kept lines precede the gap. Nothing at all is inserted between the kept head and the kept tail, because the mark that stands in for the gap is a glyph, and every glyph is the consumer's ([the core API spec](core-api.md), [0015](../adr/0015-the-core-owns-the-table.md)). The pane draws it from the live glyph set at render time, so a `glyphs = "ascii"` reader gets that table's own mark rather than the `full` table's ([theming.md](theming.md)). This is the split [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) already makes between a provenance state and the glyph that renders it. A formatted line in the bytes would also make a step whose own output prints that same text indistinguishable from a real drop.
 
 Two rules govern carriage returns, because under a PTY ONLCR means every newline arrives as `\r\n`. A `\r` immediately before a `\n` is a line ending and its CR is dropped. A bare `\r` is a progress-frame separator, and only the last frame of the sequence is kept, which is what turns an animated progress bar into its final state rather than a concatenation of every repaint.
 
@@ -109,6 +111,12 @@ pub struct StepResult {
     pub outcome: StepOutcome,
     pub output: Arc<[u8]>,         // raw bytes, bounded, never interpreted here
     pub elapsed: Duration,
+    pub elision: Option<CaptureElision>,  // what the bound dropped, None if output fitted whole
+}
+
+pub struct CaptureElision {
+    pub dropped_lines: usize,      // how many lines the bound dropped
+    pub kept_head_lines: usize,    // kept lines before the gap, where a renderer draws its mark
 }
 
 pub enum StepOutcome { Ok, Failed(i32), NotRun, Cancelled }
@@ -163,6 +171,8 @@ Captured output wraps rather than truncates. There is no horizontal scroll key i
 Colours are preserved, and the ANSI parse is the consumer's job. ratatui-core 0.1.2 silently drops every control character (`span.rs` and `Buffer::set_stringn` both filter `char::is_control`), so raw bytes fed straight in render `\x1b[1;31merror\x1b[0m[E0308]` as the literal `[1;31merror[0m[E0308]`, and an 11-frame CR progress bar collapses to one 286-character line of concatenated frames. ansi-to-tui 8.0.1 works against ratatui 0.30.2, verified by compiling it: it parses that string into `("error", Red)` and `("[E0308]: mismatched types", Reset)`, and its own dependencies are nom, ratatui-core, simdutf8, smallvec and thiserror. The parse cannot live in repon-core, because ansi-to-tui produces ratatui types and the core has a CI line asserting its tree contains no ratatui; the core stores raw bytes, the consumer parses SGR into spans at render time, and [0015](../adr/0015-the-core-owns-the-table.md)'s seam is reinforced rather than bent.
 
 Under `NO_COLOR` the captured SGR is stripped too, because that variable is a statement about the whole screen and not about Repon's share of it. The honest cost against the theme: [0011](../adr/0011-themes-correct-the-terminal-palette.md) makes a theme a correction layer over the terminal's own palette, [theming.md](theming.md) states no meaning is carried by colour alone, and captured output is the first surface in Repon that neither rule reaches, since a child's red sits beside `danger` red on the same screen. The reconciliation: captured output is a quotation of another program's screen rather than one of Repon's own surfaces, so the theme deliberately does not reach inside the quoted region, while Repon's own step labels keep their roles and sit outside it. `glyphs` stops at the same boundary, which makes it half a promise and is said so in [theming.md](theming.md): the `└─┬` and `✕` in the failed run below are pnpm's, and a user who set `ascii` because their terminal cannot draw the full set still sees them.
+
+The elision row is the one exception to that boundary in both directions, and it is stated here rather than left to be discovered. It is Repon's own words about the quotation, sitting inside the quoted region because that is the only place the gap it names exists. Its mark therefore does come from the live glyph set, unlike anything else inside the region. Its colour comes from neither side: it takes no theme role, so [theming.md](theming.md)'s role count is untouched and no tenth role is added, and it takes no colour from the child either, because the child never wrote it. It renders unstyled, which is what a row that belongs to neither voice should look like.
 
 ## Finding the failures
 

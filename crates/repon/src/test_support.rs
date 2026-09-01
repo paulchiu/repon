@@ -22,6 +22,251 @@ pub(crate) fn rust_source_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// [`rust_source_files`] minus the modules the crate root declares under `#[cfg(test)]`,
+/// which are scaffolding a release build never compiles: a scan over "production" that
+/// reads them is scanning itself, and this file's own `rfind` over a whitespace predicate
+/// is the standing example. Derived from the root's own declarations rather than a path
+/// list, so a second test-only module leaves the scans the day it is declared.
+pub(crate) fn production_rust_source_files(dir: &Path) -> Vec<PathBuf> {
+    let root = ["main.rs", "lib.rs"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{} holds neither a main.rs nor a lib.rs", dir.display()));
+    let source = std::fs::read_to_string(&root).expect("read a crate root");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut test_only: Vec<PathBuf> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim() != "#[cfg(test)]" {
+            continue;
+        }
+        let Some(declaration) = lines.get(index + 1).map(|next| next.trim()) else {
+            continue;
+        };
+        let Some(name) = declaration
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        else {
+            continue; // an inline `mod tests { .. }` or some other test-gated item
+        };
+        test_only.push(dir.join(format!("{name}.rs")));
+        test_only.push(dir.join(name));
+    }
+    rust_source_files(dir)
+        .into_iter()
+        .filter(|path| !test_only.iter().any(|excluded| path.starts_with(excluded)))
+        .collect()
+}
+
+/// `source` as [`code_only`] with every whitespace run collapsed to one space and its blank
+/// lines dropped. A needle a rustfmt line wrap split reads as one string again, and prose
+/// naming the very shape a scan bans can neither trip it nor satisfy it, whether that prose
+/// is a comment or an `unreachable!` message.
+pub(crate) fn normalised_production(source: &str) -> String {
+    let mut normalised = String::new();
+    for line in code_only(source).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !normalised.is_empty() {
+            normalised.push(' ');
+        }
+        normalised.push_str(&trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    normalised
+}
+
+/// `source` with every comment removed and every string, byte-string and character literal
+/// emptied to its delimiters, so a scan over the result reads what the compiler reads rather
+/// than what the file says. A panic message quoting the vocabulary it is proving exhaustive,
+/// or a doc comment naming the shape a scan bans, satisfied a `contains` check over the raw
+/// text and no longer can.
+pub(crate) fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut code = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '/' && chars.get(index + 1) == Some(&'/') {
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if character == '/' && chars.get(index + 1) == Some(&'*') {
+            index = block_comment_end(&chars, index);
+            code.push(' ');
+            continue;
+        }
+        if let Some(end) = raw_string_end(&chars, index) {
+            code.push_str("\"\"");
+            index = end;
+            continue;
+        }
+        if character == '"' {
+            index = string_end(&chars, index);
+            code.push_str("\"\"");
+            continue;
+        }
+        if let Some(end) = char_literal_end(&chars, index) {
+            code.push_str("''");
+            index = end;
+            continue;
+        }
+        code.push(character);
+        index += 1;
+    }
+    code
+}
+
+/// One past the `*/` closing the block comment opening at `start`, counting nested pairs as
+/// rustc does, or the end of input when the comment is never closed.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = start + 2;
+    while index < chars.len() && depth > 0 {
+        if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+            depth += 1;
+            index += 2;
+        } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+            depth -= 1;
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+/// One past the `"` closing the ordinary string literal opening at `start`, `\` escaping the
+/// character after it, or the end of input when the literal is never closed.
+fn string_end(chars: &[char], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// One past the end of the raw string literal (`r"`, `r#"`, `br"`, ...) opening at `start`,
+/// or `None` when `start` opens no such literal. A raw string honours no escape, so only a
+/// `"` followed by the opener's own hash count closes it.
+fn raw_string_end(chars: &[char], start: usize) -> Option<usize> {
+    let previous = start.checked_sub(1).and_then(|before| chars.get(before));
+    if previous.is_some_and(|character| character.is_alphanumeric() || *character == '_') {
+        return None;
+    }
+    let mut index = start;
+    if chars.get(index) == Some(&'b') {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'r') {
+        return None;
+    }
+    index += 1;
+    let first_hash = index;
+    while chars.get(index) == Some(&'#') {
+        index += 1;
+    }
+    let hashes = index - first_hash;
+    if chars.get(index) != Some(&'"') {
+        return None;
+    }
+    index += 1;
+    while index < chars.len() {
+        if chars[index] == '"' && (1..=hashes).all(|offset| chars.get(index + offset) == Some(&'#'))
+        {
+            return Some(index + 1 + hashes);
+        }
+        index += 1;
+    }
+    Some(chars.len())
+}
+
+/// One past the `'` closing the character literal opening at `start`, or `None` when `start`
+/// opens no such literal: a lifetime, a loop label, or any other character. `'x'` and `'\''`
+/// close on their own third or later character; `'a` in `&'a str` never closes at all.
+fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
+    if chars.get(start) != Some(&'\'') {
+        return None;
+    }
+    if chars.get(start + 1) == Some(&'\\') {
+        let mut index = start + 2;
+        while index < chars.len() {
+            if chars[index] == '\'' {
+                return Some(index + 1);
+            }
+            index += 1;
+        }
+        return None;
+    }
+    if chars.get(start + 2) == Some(&'\'') {
+        return Some(start + 3);
+    }
+    None
+}
+
+/// The block the 0-based line `start` opens, that line included, ending at the first later
+/// line that is exactly `start`'s own indentation followed by `}`. rustfmt closes a brace at
+/// its opener's indentation, so this reads one match arm or one function body without
+/// brace-counting, which a `{}` inside a `format!` string would defeat. `None` when no such
+/// line follows, so a caller cannot mistake an unread block for an empty one.
+pub(crate) fn block_at(source: &str, start: usize) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let opener = lines.get(start)?;
+    let indent = &opener[..opener.len() - opener.trim_start().len()];
+    let closer = format!("{indent}}}");
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| **line == closer)
+        .map(|(index, _)| index)?;
+    Some(lines[start..=end].join("\n"))
+}
+
+/// Every block in `source` whose opening line contains `needle`, comment lines excluded.
+/// An opening line that does not end in `{` opens no block and is returned alone, so a
+/// one-line form of the same construct is read rather than skipped.
+pub(crate) fn blocks_opened_by(source: &str, needle: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") || !line.contains(needle) {
+            continue;
+        }
+        if !line.trim_end().ends_with('{') {
+            blocks.push(line.to_string());
+            continue;
+        }
+        blocks.push(
+            block_at(source, index).unwrap_or_else(|| panic!("an unclosed block at: {line}")),
+        );
+    }
+    blocks
+}
+
+/// Every `match` block in `source` whose scrutinee line contains `needle`. The `match`
+/// prefix is what keeps a string literal quoting the same call, which an `unreachable!`
+/// message routinely does, out of the answer. A match written over a scrutinee bound
+/// earlier is invisible here, so a caller must pin how many blocks it expects rather than
+/// trust an empty answer.
+pub(crate) fn match_blocks_over(source: &str, needle: &str) -> Vec<String> {
+    blocks_opened_by(source, needle)
+        .into_iter()
+        .filter(|block| {
+            block
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("match "))
+        })
+        .collect()
+}
+
 /// Cuts `source` at its trailing `#[cfg(test)] mod tests` line rather than at the first
 /// `#[cfg(test)]`, since a doc comment can name that attribute in prose and a lone item can
 /// be test-gated ahead of the module. Finds the *last* such line for the same reason: a file
@@ -80,6 +325,60 @@ pub(crate) fn workspace_crate_src_dirs() -> Vec<PathBuf> {
         manifest_dir.join("src"),
         manifest_dir.join("../repon-core/src"),
     ]
+}
+
+/// Every directory of Rust source either workspace crate owns, `tests` as well as `src`.
+///
+/// [`workspace_crate_src_dirs`] is the right reach for a claim about production code; this
+/// is the right reach for one about test code, which lives in a crate's `tests` target as
+/// well as inside its `src` files. A scan that took the narrower list would have missed the
+/// five hand-rolled deadlines in `repon/tests/terminal_restoration.rs` entirely.
+pub(crate) fn workspace_rust_source_dirs() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        manifest_dir.join("src"),
+        manifest_dir.join("tests"),
+        manifest_dir.join("../repon-core/src"),
+        manifest_dir.join("../repon-core/tests"),
+    ]
+}
+
+/// One non-comment line under a scanned directory: its file, its 1-based number, and its
+/// own text trimmed, so a caller can allow a line by what it says rather than by where it
+/// currently sits.
+pub(crate) struct SourceLine {
+    pub(crate) path: PathBuf,
+    pub(crate) number: usize,
+    pub(crate) text: String,
+}
+
+/// Every line under `dirs` that `matches` accepts, comment lines excluded, whole files.
+///
+/// No [`production_source`] cut, deliberately: a claim about test code is a claim about
+/// exactly the region that cut discards, so cutting here would be the check quietly
+/// stopping checking. A predicate rather than a needle, so a caller whose shape is more
+/// than one substring still gets one pass over the tree rather than a pass per fragment
+/// and a pile of duplicate hits to merge.
+pub(crate) fn all_lines_where(dirs: &[PathBuf], matches: impl Fn(&str) -> bool) -> Vec<SourceLine> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        for path in rust_source_files(dir) {
+            let source = std::fs::read_to_string(&path).expect("read a workspace source file");
+            for (index, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if matches(line) {
+                    found.push(SourceLine {
+                        path: path.clone(),
+                        number: index + 1,
+                        text: line.trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Every `path:line` across every workspace crate's `src` whose production source
@@ -180,6 +479,86 @@ pub(crate) fn incomplete_settled_known_destructures(source: &str) -> (usize, Vec
     (total, incomplete)
 }
 
+/// Asserts every cell of the frame drawn around `area`: the four corners *and* every cell of
+/// the four runs, since a [`border::Set`](ratatui::symbols::border::Set) names eight slots and
+/// a corner-only sample leaves the four runs asserted nowhere.
+///
+/// `title` is whatever the surface writes into its own top border, `""` for a frame with none;
+/// it is spliced in one column from the left corner, where ratatui's default title position
+/// puts it, so the horizontal run either side of it is still counted.
+pub(crate) fn assert_frame_drawn_with(
+    buf: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    border: crate::glyphs::Border,
+    title: &str,
+    surface: &str,
+) {
+    assert!(
+        area.width >= 2 && area.height >= 2,
+        "{surface}: a frame needs at least 2x2 to have a border at all, got {area:?}"
+    );
+    let crate::glyphs::Border {
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+        horizontal,
+        vertical,
+    } = border;
+
+    let row = |y: u16| -> String {
+        (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    };
+    let run = usize::from(area.width) - 2;
+    let title_width = title.chars().count();
+    assert!(
+        title_width <= run,
+        "{surface}: the title {title:?} does not fit between the corners of {area:?}, so this \
+         helper cannot say which cells of the top run it covers"
+    );
+    let expected_top = format!(
+        "{top_left}{title}{}{top_right}",
+        horizontal.to_string().repeat(run - title_width)
+    );
+    let expected_bottom = format!(
+        "{bottom_left}{}{bottom_right}",
+        horizontal.to_string().repeat(run)
+    );
+    assert_eq!(
+        row(area.y),
+        expected_top,
+        "{surface}: the whole top border, corners and horizontal run alike, must come from the \
+         glyph table"
+    );
+    assert_eq!(
+        row(area.bottom() - 1),
+        expected_bottom,
+        "{surface}: the whole bottom border, corners and horizontal run alike, must come from \
+         the glyph table"
+    );
+
+    let sides = (area.y + 1)..(area.bottom() - 1);
+    assert!(
+        !sides.is_empty(),
+        "{surface}: {area:?} has no row between its top and bottom borders, so the two vertical \
+         runs would go unchecked"
+    );
+    for y in sides {
+        assert_eq!(
+            buf[(area.x, y)].symbol(),
+            vertical.to_string(),
+            "{surface}: row {y} of the left border must come from the glyph table"
+        );
+        assert_eq!(
+            buf[(area.right() - 1, y)].symbol(),
+            vertical.to_string(),
+            "{surface}: row {y} of the right border must come from the glyph table"
+        );
+    }
+}
+
 /// Runs `f` under a subscriber that captures every log line to a string, rather than the
 /// process-wide default `logging::init` installs (never called in a unit test):
 /// `tracing::subscriber::with_default` scopes the override to the current thread only, so
@@ -222,6 +601,39 @@ pub(crate) fn capture_tracing(f: impl FnOnce()) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blindness this helper answers: a `contains` scan proving a match exhaustive read
+    /// the vocabulary out of the trailing `unreachable!` message, so deleting the arm and
+    /// naming the action in the prose passed.
+    #[test]
+    fn a_panic_message_naming_an_action_does_not_satisfy_a_scan_for_that_arm() {
+        let source = "match dispatch(key) {\n    Some(other) => unreachable!(\n        \
+                      \"only the input vocabulary, including Action::AcceptCompletion, got \
+                      {other:?}\"\n    ),\n}\n";
+        let normalised = normalised_production(source);
+        assert!(
+            !normalised.contains("Action::AcceptCompletion"),
+            "the panic message's prose still reads as code: {normalised}"
+        );
+        assert!(
+            normalised.contains("unreachable!"),
+            "the call around the message must survive: {normalised}"
+        );
+    }
+
+    /// A `'` opens a lifetime as often as a literal, and `'\"'` is a real production
+    /// spelling: mistaking either for a string start swallows the code that follows and
+    /// silently shrinks every scan built on this.
+    #[test]
+    fn a_quote_in_a_character_literal_does_not_swallow_the_code_after_it() {
+        let source = "fn parse<'a>(text: &'a str) -> Option<&'a str> {\n    \
+                      text.strip_prefix('\"')?.split_once('\"').map(Action::Named)\n}\n";
+        let normalised = normalised_production(source);
+        assert!(
+            normalised.contains("split_once") && normalised.contains("Action::Named"),
+            "code after a quote-bearing character literal went missing: {normalised}"
+        );
+    }
 
     /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
     /// there, or every real production line after it goes unscanned.

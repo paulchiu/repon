@@ -2015,7 +2015,19 @@ impl App {
         self.render(tui)
     }
 
-    /// The already-scheduled render tick's one read of the Core's table: exactly one
+    /// The already-scheduled render tick: claims a frame from the terminal, hands it to
+    /// [`Self::draw_frame`], and reports whichever draw failed on the message channel.
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut error = None;
+        tui.draw(|frame| error = self.draw_frame(frame))?;
+        if let Some(err) = error {
+            self.message_tx
+                .send(Message::Error(format!("could not draw: {err:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// One whole frame, and the tick's one read of the Core's table: exactly one
     /// [`Snapshot`] is cloned here, and every panel this tick draws shares that same clone.
     /// The help overlay, the warning overlay, the Action palette and the Set picker, in that
     /// priority, each take the whole frame in place of everything else when open; otherwise
@@ -2027,22 +2039,24 @@ impl App {
     /// There is no permanently pinned bottom output pane: an Action's own output, once
     /// wired, lives inside the detail pane rather than a fourth region here.
     ///
-    /// Returns the drawing error a component reported, if any, for [`Self::render`] to turn
-    /// into a `Message::Error`. A method taking a `Frame` rather than the body of
-    /// `render`'s own `tui.draw` closure, so a test can drive a real frame with a
-    /// `ratatui::backend::TestBackend` and no [`Tui`] at all: `Tui::new` asks the terminal
-    /// for its size and fails with `EAGAIN` where there is no controlling one, so nothing
-    /// inside that closure could otherwise be asserted about at all.
+    /// A method rather than a closure inside [`Self::render`] so a test can drive these call
+    /// sites against a [`ratatui::Terminal<ratatui::backend::TestBackend>`]:
+    /// [`crate::tui::Tui`] hardcodes `CrosstermBackend<Stdout>`, and a test that cannot reach
+    /// here can only assert on each surface's own `draw`, which leaves what this method hands
+    /// them (the live glyph table, the live theme) pinned by nothing. Returns whichever draw
+    /// failed, for `render` to report, since the message channel is not this method's to send
+    /// on mid-frame.
     fn draw_frame(&mut self, frame: &mut Frame) -> Option<color_eyre::Report> {
+        let mut error = None;
         let snapshot = self.core.snapshot();
         let pane_entity = self
             .pane
             .as_ref()
             .and_then(|key| snapshot.entities.iter().find(|entity| &entity.key == key));
         let warnings = self.current_warnings();
-        // The identical computation `Self::choose_highlighted_action` reads: read once,
-        // before the frame-drawing closure below borrows `self` immutably, so the border
-        // title can never show a different number than a real choice would act on.
+        // The identical computation `Self::choose_highlighted_action` reads, taken once up
+        // front so the border title can never show a different number than a real choice
+        // would act on.
         let action_palette_operable_count = self.action_palette_operable_count();
         // Read from the plan the gate was built with, never rebuilt here: a `delete` gate's
         // own risk read costs a git read per Repo, and a frame must not pay it.
@@ -2069,7 +2083,6 @@ impl App {
         // keeps rendering whatever was already showing while `q`/`Ctrl+C` silently wait for
         // `y`/`n`/Esc. The behaviour is complete and tested; a themed modal matching
         // `ActionPalette`'s own `Stage::Confirming` render is follow-on work.
-        let mut error = None;
         let area = frame.area();
         // Help is a reading surface, not a chooser, so unlike a palette it always takes
         // the whole frame rather than leaving anything visible around it
@@ -2097,11 +2110,19 @@ impl App {
                 &self.document.actions,
                 action_palette_operable_count.unwrap_or(0),
                 &management_lines,
+                self.glyphs,
             );
             return None;
         }
         if let Some(picker) = &self.set_picker {
-            picker.draw(frame, area, &self.document.sets, &self.active_set.name);
+            picker.draw(
+                frame,
+                area,
+                &self.document.sets,
+                &self.active_set.name,
+                &self.theme,
+                self.glyphs,
+            );
             return None;
         }
         // The Filter narrowing this frame's list, live while `self.filter_line` is open
@@ -2201,23 +2222,16 @@ impl App {
             let (launchers, entity_name) = launcher_palette_view
                 .as_ref()
                 .expect("computed above whenever launcher_palette is Some");
-            palette.draw(frame, area, &self.theme, launchers, entity_name);
+            palette.draw(
+                frame,
+                area,
+                &self.theme,
+                launchers,
+                entity_name,
+                self.glyphs,
+            );
         }
         error
-    }
-
-    /// One render tick: claims the terminal's back buffer and hands it to
-    /// [`Self::draw_frame`], which is where the whole frame is composed.
-    fn render(&mut self, tui: &mut Tui) -> Result<()> {
-        let mut error = None;
-        tui.draw(|frame| {
-            error = self.draw_frame(frame);
-        })?;
-        if let Some(err) = error {
-            self.message_tx
-                .send(Message::Error(format!("could not draw: {err:?}")))?;
-        }
-        Ok(())
     }
 }
 
@@ -2309,6 +2323,7 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyModifiers};
+    use repon_core::liveness::{FIXTURE_LIFETIME, wait_for};
     use repon_core::{CoreSpec, SetSpec};
 
     use super::*;
@@ -2922,6 +2937,97 @@ mod tests {
     }
 
     // =====================================================================================
+    // Ticket 167: every framed surface `App` draws takes its border from the glyph table
+    // `App` is holding, not from a table named at the call site. `App::draw_frame` is a
+    // method rather than a closure precisely so this can drive the real call sites against a
+    // `ratatui::Terminal<TestBackend>`, the same workaround `render_status_row` above uses.
+    // =====================================================================================
+
+    /// The whole frame `App` would put on the terminal this tick, drawn through the real
+    /// `draw_frame` so every argument it passes a surface is the one under test.
+    pub(crate) fn render_app_frame(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                app.draw_frame(frame);
+            })
+            .expect("draw the frame");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Opens each overlay `App` frames in turn and asserts the frame it draws, corners and
+    /// runs alike, is the one `self.glyphs` names. Hardcoding any one of these call sites to
+    /// `glyphs::FULL` renders `╭╮╰╯` where the panels under `glyphs = "ascii"` draw `+`, which
+    /// is issue 167's own screenshot with the tables swapped, and nothing else in the
+    /// workspace reads what `App` hands these three surfaces.
+    #[test]
+    fn every_overlay_app_frames_takes_its_border_from_the_glyph_table_app_is_holding() {
+        // No repo under the root, so discovery never produces an Entity and the two titles
+        // that read live state (the Action palette's operable count, the Launcher popup's
+        // Entity name) hold still while the frame is drawn.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let (width, height) = (60u16, 16u16);
+        let whole_frame = Rect::new(0, 0, width, height);
+
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let mut app = test_app(&root);
+            app.glyphs = glyphs;
+
+            app.help = Some(HelpOverlay::default());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                crate::help::BORDER_TITLE,
+                "the help overlay App drew",
+            );
+            app.help = None;
+
+            app.action_palette = Some(ActionPalette::new());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                &ActionPalette::border_title(0),
+                "the Action palette App drew",
+            );
+            app.action_palette = None;
+
+            app.set_picker = Some(SetPicker::new());
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                whole_frame,
+                glyphs.border,
+                crate::set_picker::BORDER_TITLE,
+                "the Set picker App drew",
+            );
+            app.set_picker = None;
+
+            let palette = LauncherPalette::new();
+            let launchers = crate::launcher::resolve(&app.document);
+            let popup = palette.popup_area(whole_frame, &launchers, "");
+            app.launcher_palette = Some(palette);
+            let buf = render_app_frame(&mut app, width, height);
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                popup,
+                glyphs.border,
+                &LauncherPalette::border_title(""),
+                "the Launcher popup App drew",
+            );
+            app.launcher_palette = None;
+        }
+    }
+
     // Ticket 179: the help overlay is searchable, as a mode inside it rather than a switch
     // away from `Context::Overlay`. `/` (`Action::Search`) enters search mode; `Esc` there
     // leaves it and clears the query (one rung of help's own unwind ladder, one short of
@@ -3383,9 +3489,9 @@ mod tests {
              this line is the discriminator"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
     }
 
@@ -3420,9 +3526,9 @@ mod tests {
         );
         assert_eq!(app.notice(), Some("Action palette: Action already running"));
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
     }
 
@@ -3541,10 +3647,116 @@ mod tests {
             "! must never answer with the inert-binding Notice the other four do"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
+    }
+
+    /// Every action `dispatch(Context::Input, _)` can return is named arm by arm in every
+    /// handler that dispatches through that context, so an action joining the input
+    /// vocabulary is a red test rather than a runtime `unreachable!` on the key press. The
+    /// trailing catch-all arm those matches carry cannot make that claim: it compiles
+    /// whatever the vocabulary becomes. The vocabulary is read off the compiled table plus
+    /// `dispatch`'s own printable-character fallback, never listed here, and it is looked for
+    /// in the arms' own patterns, so neither the catch-all's message nor any other mention
+    /// inside a body counts as a handled action.
+    #[test]
+    fn every_input_handler_names_every_action_the_input_context_dispatches() {
+        let mut vocabulary = crate::keys::action_names_bound_in(Context::Input);
+        let text = BindingTable::compiled_default()
+            .dispatch(
+                Context::Input,
+                press(KeyCode::Char('x'), KeyModifiers::NONE),
+            )
+            .expect("a printable character is text in the input context");
+        let text = format!("{text:?}");
+        let text = text.split('(').next().expect("a variant name").to_string();
+        assert!(
+            !vocabulary.contains(&text),
+            "{text:?} is now a compiled row as well as `dispatch`'s fallback, so this test \
+             is counting it twice"
+        );
+        vocabulary.push(text);
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut handlers = 0usize;
+        for path in crate::test_support::production_rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            for block in crate::test_support::match_blocks_over(&source, "dispatch(Context::Input")
+            {
+                handlers += 1;
+                let named = match_arm_patterns(&block).join(" ");
+                for action in &vocabulary {
+                    assert!(
+                        named.contains(&format!("Action::{action}")),
+                        "{}'s input handler has no arm whose pattern names \
+                         `Action::{action}`, which `dispatch(Context::Input, _)` can return; \
+                         its catch-all arm sends that key to `unreachable!` at runtime \
+                         instead. Its arms match {named}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            handlers, 3,
+            "expected the Action palette, the Filter line and the Launcher palette to be \
+             the three handlers dispatching through the input context, found {handlers}"
+        );
+    }
+
+    /// The pattern of each of `block`'s own arms, every body and nested match excluded: the
+    /// text run to each `=>` sitting at the match's own bracket depth. Depth rather than
+    /// indentation, so a `|`-joined pattern rustfmt wrapped over four lines reads as one
+    /// pattern; comments and literals are gone first, so a `=>` inside a panic message opens
+    /// no arm. Losing an arm can only fail a caller's containment check, never satisfy one.
+    fn match_arm_patterns(block: &str) -> Vec<String> {
+        let code = crate::test_support::code_only(block);
+        let chars: Vec<char> = code.chars().collect();
+        let mut index = match code.find('{') {
+            Some(brace) => code[..brace].chars().count() + 1,
+            None => return Vec::new(),
+        };
+        let mut patterns = Vec::new();
+        let mut pattern = String::new();
+        let mut depth = 0usize;
+        let mut in_body = false;
+        while index < chars.len() {
+            let character = chars[index];
+            index += 1;
+            if !in_body {
+                if character == '=' && chars.get(index) == Some(&'>') && depth == 0 {
+                    index += 1;
+                    patterns.push(pattern.split_whitespace().collect::<Vec<_>>().join(" "));
+                    pattern.clear();
+                    in_body = true;
+                    continue;
+                }
+                if "([{".contains(character) {
+                    depth += 1;
+                } else if "}])".contains(character) {
+                    if depth == 0 {
+                        break; // the brace closing the match itself
+                    }
+                    depth -= 1;
+                }
+                pattern.push(character);
+                continue;
+            }
+            if "([{".contains(character) {
+                depth += 1;
+            } else if "}])".contains(character) {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                in_body = depth > 0 || character != '}';
+            } else if character == ',' && depth == 0 {
+                in_body = false;
+            }
+        }
+        patterns
     }
 
     // =====================================================================================
@@ -3631,6 +3843,7 @@ mod tests {
                     &app.document.actions,
                     1,
                     &[],
+                    app.glyphs,
                 )
             })
             .expect("draw the palette");
@@ -4210,9 +4423,9 @@ mod tests {
         // left running past the test, since a confirmed quit orphans it in production but
         // this test's own `Core` still needs to drop cleanly.
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Esc while the quit confirm dialog is open must decline it, never quit: `Context::Confirm`
@@ -4242,9 +4455,9 @@ mod tests {
         assert!(!app.should_quit, "esc must never quit, at any depth");
 
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Ctrl+Z is deliberately never gated the way `q`/`Ctrl+C` are: suspending is reversible
@@ -4287,9 +4500,9 @@ mod tests {
         );
 
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     // =====================================================================================
@@ -4299,17 +4512,21 @@ mod tests {
     // one, and the levels not yet reached stay untouched.
     // =====================================================================================
 
-    /// An Action whose one step never dies from its own accord (untrapped, so a single
-    /// SIGTERM from `stop_action` kills it almost immediately): long enough that this test
-    /// could never wait it out by accident, which is what makes "it finished because Esc
-    /// cancelled it" the only honest explanation for `action_running` going false during
-    /// this test's own bounded wait.
+    /// An Action whose one step never dies of its own accord (untrapped, so a single
+    /// SIGTERM from `stop_action` kills it almost immediately). It sleeps
+    /// [`FIXTURE_LIFETIME`], ten times the backstop behind every `wait_for` below, which is
+    /// what makes "it finished because Esc cancelled it" the only honest explanation for
+    /// `action_running` going false inside one of those waits.
     fn long_running_action_config(name: &str) -> document::ActionConfig {
         document::ActionConfig {
             name: toml::Spanned::new(0..0, name.to_string()),
             description: None,
             steps: vec![document::StepConfig {
-                args: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                args: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("sleep {}", FIXTURE_LIFETIME.as_secs()),
+                ],
                 shell: false,
                 env: std::collections::BTreeMap::new(),
             }],
@@ -4385,9 +4602,9 @@ mod tests {
             app.filter.is_active(),
             "the committed Filter must be untouched by the first press"
         );
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the first press must actually have cancelled the fan-out"
+        wait_for(
+            "the first press to actually have cancelled the fan-out",
+            || !app.core.action_running(),
         );
 
         // Press 2: only the range anchor unwinds.
@@ -6278,8 +6495,16 @@ mod tests {
         }
     }
 
-    /// Runs [`failing_action_config`] on the visible row at `index` and waits for the real
-    /// subprocess to finish, leaving that row's `last_action` a genuine failed receipt.
+    /// Runs [`failing_action_config`] on the visible row at `index` and returns once that
+    /// row reads Failed, which is what every caller then walks the cursor to.
+    ///
+    /// The wait below is this fixture's own assertion, run at every call site: it panics
+    /// naming the postcondition rather than handing a caller a row that does not read Failed
+    /// yet. A separate test calling this fixture could not add to that, since on an idle
+    /// machine the postcondition already holds by the time such a test could read it; the
+    /// production fact the wait exists for is pinned instead by
+    /// `a_failed_last_action_is_outranked_while_the_row_still_holds_no_values` in
+    /// `repon-core`'s `snapshot.rs`.
     fn run_failing_action_on(app: &mut App, index: usize) {
         app.set_cursor(index);
         app.document.actions.push(failing_action_config("break"));
@@ -6287,25 +6512,18 @@ mod tests {
             .expect("open the palette");
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("choose the highlighted entry");
-        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
-        assert!(finished, "expected the failing Action to actually finish");
-        // A finished Action starts its own Generation, and a row whose cells hold nothing
-        // yet folds to InFlight ahead of the receipt's own failure, so a caller reading the
-        // summary straight after this would be racing the probes rather than reading them.
-        app.core.settle(Duration::from_secs(10));
-    }
-
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if condition() {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The postcondition every caller actually reads, waited on directly rather than
+        // through a proxy: a row whose cells hold nothing yet folds to InFlight ahead of the
+        // receipt's own failure, so "the fan-out finished" is not yet "this row reads
+        // Failed". `Core::settle` cannot stand in for it either, at any deadline, because
+        // `run_action`'s completion clears `action_running` before it dispatches the
+        // Generation that raises the settle gate, so a settle called in that window finds
+        // the gate at zero and returns at once. Once a row does read Failed it stays that
+        // way: a later Generation marks its cells in flight without discarding their values.
+        wait_for(
+            &format!("row {index} to read Failed once its failing Action has finished"),
+            || !app.core.action_running() && app.visible_failed().get(index) == Some(&true),
+        );
     }
 
     // Criterion 1: two distinct keys, no shared entry point. `!` (OpenLauncher) must never
@@ -6890,8 +7108,7 @@ mod tests {
             app.action_palette.is_none(),
             "the palette closes once the run is dispatched"
         );
-        let ran = wait_until(Duration::from_secs(5), || marker.exists());
-        assert!(ran, "expected `touch marker` to have actually run");
+        wait_for("`touch marker` to have actually run", || marker.exists());
     }
 
     #[test]
@@ -7033,10 +7250,9 @@ mod tests {
             "confirm = false must close the palette immediately rather than entering a \
              confirm stage"
         );
-        let ran = wait_until(Duration::from_secs(5), || marker.exists());
-        assert!(
-            ran,
-            "expected the confirm = false Action to have run without a gate"
+        wait_for(
+            "the confirm = false Action to have run without a gate",
+            || marker.exists(),
         );
     }
 
@@ -7055,9 +7271,12 @@ mod tests {
         app.handle_paste_event(text);
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("run the ad hoc command");
-        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
-        assert!(finished, "expected the ad hoc run to actually finish");
-        app.core.settle(Duration::from_secs(10));
+        // Every caller reads the receipt, which the fan-out writes before it clears
+        // `action_running`; the completion Generation this used to settle for touches
+        // nothing any of them assert on.
+        wait_for("the ad hoc run to actually finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Criterion 1, end to end, all three claims in one fixture because they interact: a
@@ -7659,15 +7878,15 @@ mod tests {
         app.core
             .refresh(&dispatch_order(keys.first(), &keys, &keys));
 
-        assert!(
-            wait_until(Duration::from_secs(5), || {
+        wait_for(
+            "every entity to settle before this test's own claim can be checked",
+            || {
                 app.core
                     .snapshot()
                     .entities
                     .iter()
                     .all(|entity| entity.branch.settled().is_some())
-            }),
-            "expected every entity to settle before this test's own claim can be checked"
+            },
         );
 
         app.filter = Filter::parse("shown");

@@ -29,11 +29,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::entity::{StepOutcome, StepResult};
+use crate::entity::{CaptureElision, StepOutcome, StepResult};
 
-/// Head lines kept from a step's captured output before the elision line.
+/// Head lines kept from a step's captured output before the bound's own drop.
 const CAPTURE_HEAD_LINES: usize = 200;
-/// Tail lines kept from a step's captured output after the elision line.
+/// Tail lines kept from a step's captured output after the bound's own drop.
 const CAPTURE_TAIL_LINES: usize = 200;
 /// The PTY's fixed column width. A constant rather than a config key, so output wraps
 /// once at capture time and never re-wraps between two readings at different pane
@@ -231,11 +231,13 @@ pub(crate) fn run_step(
         None => StepOutcome::Failed(-1),
     };
 
+    let (output, elision) = bound_head_and_tail(&normalize_carriage_returns(&raw));
     StepResult {
         label,
         outcome,
-        output: Arc::from(bound_head_and_tail(&normalize_carriage_returns(&raw))),
+        output: Arc::from(output),
         elapsed: start.elapsed(),
+        elision,
     }
 }
 
@@ -722,6 +724,7 @@ fn step_failure(
         outcome: StepOutcome::Failed(code),
         output: Arc::from(output.into_bytes()),
         elapsed,
+        elision: None,
     }
 }
 
@@ -785,33 +788,35 @@ fn split_into_lines(normalized: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Bounds `normalized` to its head [`CAPTURE_HEAD_LINES`] plus tail [`CAPTURE_TAIL_LINES`]
-/// lines, with an elision line naming the dropped count, leaving shorter output
-/// untouched. Every cut lands on a `\n` byte, which can never sit inside a multi-byte
-/// UTF-8 character, so this never truncates mid-character
-/// (`docs/spec/actions.md`'s "Truncation walks to a char boundary, never a raw byte
-/// offset").
-fn bound_head_and_tail(normalized: &[u8]) -> Vec<u8> {
+/// lines, returning the kept bytes and, when anything was dropped, a [`CaptureElision`]
+/// naming the drop. Shorter output is left untouched and reports no elision. Every cut
+/// lands on a `\n` byte, which can never sit inside a multi-byte UTF-8 character, so this
+/// never truncates mid-character (`docs/spec/actions.md`'s "Truncation walks to a char
+/// boundary, never a raw byte offset").
+///
+/// Nothing is written between the kept head and the kept tail: the mark that stands in for
+/// the gap belongs to the consumer's glyph set, which this crate cannot see.
+fn bound_head_and_tail(normalized: &[u8]) -> (Vec<u8>, Option<CaptureElision>) {
     let lines = split_into_lines(normalized);
     let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
     if lines.len() <= bound {
-        return normalized.to_vec();
+        return (normalized.to_vec(), None);
     }
     let dropped = lines.len() - bound;
     let mut out = Vec::new();
     for line in &lines[..CAPTURE_HEAD_LINES] {
         out.extend_from_slice(line);
     }
-    out.extend_from_slice(elision_line(dropped).as_bytes());
     for line in &lines[lines.len() - CAPTURE_TAIL_LINES..] {
         out.extend_from_slice(line);
     }
-    out
-}
-
-/// The elision line naming how many lines a bound dropped, matching the mark
-/// `docs/spec/actions.md`'s own detail-pane mock renders (`··· 212 lines elided ···`).
-fn elision_line(dropped: usize) -> String {
-    format!("\u{b7}\u{b7}\u{b7} {dropped} lines elided \u{b7}\u{b7}\u{b7}\n")
+    (
+        out,
+        Some(CaptureElision {
+            dropped_lines: dropped,
+            kept_head_lines: CAPTURE_HEAD_LINES,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -820,6 +825,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::liveness::{BACKSTOP, FIXTURE_LIFETIME, wait_for};
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -852,7 +858,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(BACKSTOP)
             .expect("a child reading a null stdin must terminate rather than hang");
 
         assert_eq!(result.outcome, StepOutcome::Ok);
@@ -972,23 +978,6 @@ mod tests {
             .next()
     }
 
-    /// Polls [`process_state`] until it matches `wanted` or `timeout` elapses, since a
-    /// signal this test just sent has not necessarily already landed the instant `kill`
-    /// returns. Bounded so a regression (the signal never lands, or lands as the wrong one)
-    /// fails this test rather than hanging it.
-    fn wait_for_process_state(pid: libc::pid_t, wanted: char, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if process_state(pid) == Some(wanted) {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Spawns `argv` under a real PTY and `setsid`, exactly as [`run_step`] would, but
     /// returns the raw pieces rather than blocking to completion, so a test can act on the
     /// live child before it exits.
@@ -1010,19 +999,22 @@ mod tests {
     /// were mutated to send only SIGTERM, which is exactly the regression this criterion
     /// exists to catch; trapping TERM here is what rules that mutation out.
     ///
-    /// Bounded end to end by `recv_timeout` on a real child spawned to sleep 30s: the grace
-    /// plus SIGKILL together take well under a second, so a regression that drops the
-    /// SIGKILL follow-up fails this test's own timeout rather than hanging the suite for
-    /// 30s or forever.
+    /// Bounded end to end by `recv_timeout` at [`BACKSTOP`], against a child spawned to
+    /// sleep [`FIXTURE_LIFETIME`], ten times that: the grace plus SIGKILL together take well
+    /// under a second, and the fixture cannot end on its own inside the receive, so a
+    /// regression that drops the SIGKILL follow-up fails this test's own bound rather than
+    /// being waited out by a child that finished by itself.
     #[test]
     fn a_child_that_traps_sigterm_still_dies_once_cancel_escalates_to_sigkill() {
         let dir = tempdir();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let (master, keepalive, child, pgid) = spawn_controlled(
-                &["sh", "-c", "trap '' TERM; echo ready; sleep 30"],
-                dir.path(),
+            let sleep_past_the_backstop = format!(
+                "trap '' TERM; echo ready; sleep {}",
+                FIXTURE_LIFETIME.as_secs()
             );
+            let (master, keepalive, child, pgid) =
+                spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
             let control = RunControl::new();
             control.register(pgid);
 
@@ -1044,7 +1036,7 @@ mod tests {
         });
 
         let status = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(BACKSTOP)
             .expect("a TERM-trapping child must still die once cancel escalates to SIGKILL");
         assert!(
             status.is_some_and(|status| !status.success()),
@@ -1064,16 +1056,19 @@ mod tests {
         control.register(pgid);
 
         control.hold();
-        assert!(
-            wait_for_process_state(pgid, 'T', Duration::from_secs(2)),
-            "SIGSTOP must leave the child's own process state Stopped"
+        // A signal just sent has not necessarily landed by the time `kill` returns, so both
+        // waits below are on the state itself. One predicate over both live states rather
+        // than a wait per state: the second of two sequential waits would only ever be
+        // reached after the first had run its whole backstop out.
+        wait_for(
+            "SIGSTOP to leave the child's own process state Stopped",
+            || process_state(pgid) == Some('T'),
         );
 
         control.continue_run();
-        assert!(
-            wait_for_process_state(pgid, 'S', Duration::from_secs(2))
-                || wait_for_process_state(pgid, 'R', Duration::from_secs(2)),
-            "SIGCONT must move the child back out of the Stopped state"
+        wait_for(
+            "SIGCONT to move the child back out of the Stopped state",
+            || matches!(process_state(pgid), Some('S') | Some('R')),
         );
 
         control.deregister(pgid);
@@ -1552,8 +1547,10 @@ print(1 if inherited else 0)"
             .parse()
             .expect("the head line count is an integer");
         let after_tail = parts.next().expect("a tail line count and beyond");
+        // Split on the bare word, not on a following punctuation mark: what comes after the
+        // count is prose that may be re-worded.
         let tail: usize = after_tail
-            .split(" lines,")
+            .split(" lines")
             .next()
             .expect("a tail line count")
             .parse()
@@ -1617,22 +1614,71 @@ print(1 if inherited else 0)"
     #[test]
     fn short_output_is_never_bounded_or_elided() {
         let input = b"a\nb\nc\n".to_vec();
-        assert_eq!(bound_head_and_tail(&input), input);
+        assert_eq!(bound_head_and_tail(&input), (input, None));
     }
 
+    /// The predicate's own boundary, which decides whether a step gets an elision row at
+    /// all: output of exactly the bound lost nothing, so it must report no elision. One
+    /// line either side of the bound pins the comparison rather than the constant, since
+    /// the pane draws its mark on any `Some` and would otherwise announce a drop of zero
+    /// over output that kept every line.
     #[test]
-    fn long_output_is_bounded_to_head_and_tail_with_an_elision_line_naming_the_drop() {
+    fn output_of_exactly_the_bound_is_never_reported_as_elided() {
+        let numbered = |total: usize| {
+            let mut input = String::new();
+            for n in 0..total {
+                input.push_str(&format!("line {n}\n"));
+            }
+            input.into_bytes()
+        };
+        let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
+
+        let at_bound = numbered(bound);
+        let (kept, elision) = bound_head_and_tail(&at_bound);
+        assert_eq!(
+            elision, None,
+            "output of exactly the bound lost nothing and must report no elision"
+        );
+        assert!(
+            kept == at_bound,
+            "output of exactly the bound must be handed back untouched"
+        );
+        assert_eq!(
+            bound_head_and_tail(&numbered(bound - 1)).1,
+            None,
+            "one line under the bound must report no elision"
+        );
+        assert_eq!(
+            bound_head_and_tail(&numbered(bound + 1)).1,
+            Some(CaptureElision {
+                dropped_lines: 1,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            }),
+            "one line over the bound must report a drop of exactly that one line"
+        );
+    }
+
+    /// The boundary the elision is reported across: the bound drops lines and says so as
+    /// two counts, and the bytes it hands over are the kept head followed straight by the
+    /// kept tail, with nothing written between them. A mark in the bytes is a mark the
+    /// consumer cannot re-choose, and a step whose own output prints one is then
+    /// indistinguishable from a real elision.
+    #[test]
+    fn a_bounded_capture_reports_the_drop_as_counts_and_writes_no_mark_into_the_bytes() {
         let total = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES + 37;
         let mut input = String::new();
         for n in 0..total {
             input.push_str(&format!("line {n}\n"));
         }
 
-        let bounded = bound_head_and_tail(input.as_bytes());
+        let (bounded, elision) = bound_head_and_tail(input.as_bytes());
+        let elision = elision.expect("output past the bound must report its own elision");
         let bounded = String::from_utf8(bounded).expect("valid utf8");
         let lines: Vec<&str> = bounded.lines().collect();
 
-        assert_eq!(lines.len(), CAPTURE_HEAD_LINES + 1 + CAPTURE_TAIL_LINES);
+        assert_eq!(elision.dropped_lines, 37);
+        assert_eq!(elision.kept_head_lines, CAPTURE_HEAD_LINES);
+        assert_eq!(lines.len(), CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES);
         assert_eq!(lines[0], "line 0");
         assert_eq!(
             lines[CAPTURE_HEAD_LINES - 1],
@@ -1640,13 +1686,60 @@ print(1 if inherited else 0)"
         );
         assert_eq!(
             lines[CAPTURE_HEAD_LINES],
-            "\u{b7}\u{b7}\u{b7} 37 lines elided \u{b7}\u{b7}\u{b7}"
-        );
-        assert_eq!(
-            lines[CAPTURE_HEAD_LINES + 1],
-            format!("line {}", total - CAPTURE_TAIL_LINES)
+            format!("line {}", total - CAPTURE_TAIL_LINES),
+            "the kept tail must follow the kept head directly, with no line between them"
         );
         assert_eq!(lines[lines.len() - 1], format!("line {}", total - 1));
+        assert!(
+            !bounded.contains("elided"),
+            "the core must report the drop as structure, never as a formatted line: {bounded:?}"
+        );
+    }
+
+    /// The wiring between the bound and the receipt, which nothing else exercises: every
+    /// render-side test builds a `CaptureElision` by hand, so `run_step` could drop the one
+    /// the bound computed and the mark would silently vanish from every real long run. A
+    /// real child through the real PTY, not `bound_head_and_tail` called directly.
+    #[test]
+    fn a_real_steps_result_carries_the_elision_its_own_capture_bound_computed() {
+        let dir = tempdir();
+        let dropped = 61;
+        let total = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES + dropped;
+        // A POSIX shell loop rather than `seq`, so the fixture depends on no external
+        // program's presence or numbering.
+        let long = run_shell(
+            &format!("i=0; while [ $i -lt {total} ]; do echo \"line $i\"; i=$((i+1)); done"),
+            dir.path(),
+        );
+
+        assert_eq!(long.outcome, StepOutcome::Ok);
+        assert_eq!(
+            long.elision,
+            Some(CaptureElision {
+                dropped_lines: dropped,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            })
+        );
+        let text = String::from_utf8(long.output.to_vec()).expect("valid utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES);
+        assert_eq!(
+            lines[CAPTURE_HEAD_LINES - 1],
+            format!("line {}", CAPTURE_HEAD_LINES - 1)
+        );
+        assert_eq!(
+            lines[CAPTURE_HEAD_LINES],
+            format!("line {}", total - CAPTURE_TAIL_LINES),
+            "the kept tail must follow the kept head with nothing between them"
+        );
+
+        let short = run_shell("echo one; echo two", dir.path());
+
+        assert_eq!(short.outcome, StepOutcome::Ok);
+        assert_eq!(
+            short.elision, None,
+            "output that fitted whole must report no elision"
+        );
     }
 
     /// The claim most likely to be faked by an ASCII-only test: a multi-byte UTF-8
@@ -1663,11 +1756,11 @@ print(1 if inherited else 0)"
             input.push_str(&format!("line {n} \u{4e2d}\u{6587}\n"));
         }
 
-        let bounded = bound_head_and_tail(input.as_bytes());
+        let (bounded, elision) = bound_head_and_tail(input.as_bytes());
 
+        assert_eq!(elision.expect("an elision past the bound").dropped_lines, 5);
         let decoded = String::from_utf8(bounded).expect("bounded output must stay valid UTF-8");
         assert!(decoded.contains("\u{4e2d}\u{6587}"));
-        assert!(decoded.contains("lines elided"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style, symbols::border, widgets::Block};
+use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use repon_core::{
     Cell, DirtyCounts, EntityState, Filter, Head, Kind, RowSummary, Settled, Snapshot, SyncState,
     WorktreeState, summary,
@@ -18,7 +18,7 @@ use repon_core::{
 use super::Component;
 use crate::{
     config::Config,
-    glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
+    glyphs::{BorderScratch, FULL_SPINNER_INTERVAL, GlyphSet},
     selection::Selection,
     theme::{self, Meaning, Role, Theme},
 };
@@ -151,22 +151,9 @@ impl List {
             FULL_SPINNER_INTERVAL,
             self.started_at.elapsed(),
         );
-        let border = glyphs.border;
-        let (mut tl, mut tr, mut bl, mut br, mut vl, mut vr, mut ht, mut hb) = (
-            [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4], [0u8; 4],
-        );
-        let border_set = border::Set {
-            top_left: border.top_left.encode_utf8(&mut tl),
-            top_right: border.top_right.encode_utf8(&mut tr),
-            bottom_left: border.bottom_left.encode_utf8(&mut bl),
-            bottom_right: border.bottom_right.encode_utf8(&mut br),
-            vertical_left: border.vertical.encode_utf8(&mut vl),
-            vertical_right: border.vertical.encode_utf8(&mut vr),
-            horizontal_top: border.horizontal.encode_utf8(&mut ht),
-            horizontal_bottom: border.horizontal.encode_utf8(&mut hb),
-        };
-        let block = Block::bordered()
-            .border_set(border_set)
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
             .border_style(theme::DEFAULT.style_for(theme::Role::BorderFocused))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
@@ -1967,14 +1954,46 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 0, 0, 1), "╭");
-        assert_eq!(cell_text(buf, 139, 0, 1), "╮");
-        assert_eq!(cell_text(buf, 0, 23, 1), "╰");
-        assert_eq!(cell_text(buf, 139, 23, 1), "╯");
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            Rect::new(0, 0, 140, 24),
+            GlyphSet::for_config(crate::config::document::Glyphs::Full).border,
+            " repos ",
+            "the list panel's frame",
+        );
         assert_eq!(
             buf[(0, 0)].fg,
             Color::LightBlue,
             "the border must show theming.md's documented border_focused default, light-blue"
+        );
+    }
+
+    /// The counterpart to the rounded-corners test above, under the other table: the panel's
+    /// frame degrades with `glyphs = "ascii"` like everything else this key governs, rather
+    /// than being the one surface pinned to the full table's characters.
+    #[test]
+    fn the_panels_frame_degrades_to_the_ascii_tables_own_characters() {
+        let mut list = List::default();
+        list.register_config_handler(crate::config::Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document: crate::config::document::Document {
+                glyphs: crate::config::document::Glyphs::Ascii,
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+            zero_config: false,
+        })
+        .expect("register config");
+
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            Rect::new(0, 0, 140, 24),
+            GlyphSet::for_config(crate::config::document::Glyphs::Ascii).border,
+            " repos ",
+            "the list panel's frame under the ascii table",
         );
     }
 

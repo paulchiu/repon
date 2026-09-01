@@ -13,6 +13,7 @@ mod cli;
 mod components;
 mod config;
 mod degrade;
+mod edit_buffer;
 mod editor;
 mod errors;
 mod filter_line;
@@ -297,28 +298,264 @@ fn existence(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{production_source_at, rust_source_files};
+    use std::path::{Path, PathBuf};
 
-    /// The name of every `pub fn` in `source` (a `production_source_at` read) whose own doc
-    /// comment names `test` or `tests` as a whole word and which is not already gated behind
-    /// `cfg(test)` or `feature = "test-util"`: the two facts `Timestamp::at` carried together
-    /// before #83, one in prose and one missing in code.
-    fn undocumented_test_only_pub_fns(source: &str) -> Vec<String> {
+    use crate::test_support::{
+        SourceLine, all_lines_where, production_lines_under_containing, production_source_at,
+        rust_source_files, workspace_crate_src_dirs, workspace_rust_source_dirs,
+    };
+
+    /// A wall clock read, as it reads in source. One half of a deadline: the other is the
+    /// comparison that turns a reading into a decision, which is why this line can spell
+    /// both reads out without being a match for the scan it feeds.
+    const WALL_CLOCK_READS: [&str; 2] = [".elapsed()", "Instant::now()"];
+
+    /// Every ordering comparison Rust spells.
+    ///
+    /// Exhaustive on purpose. The scan this feeds used to look for `>=` alone, which let the
+    /// same polling loop written `while start.elapsed() < budget`, the more idiomatic
+    /// spelling of the two, walk straight past it. A `match` in [`Comparison::spelling`] is
+    /// what makes a fifth spelling a compile error rather than a silent miss.
+    #[derive(Clone, Copy)]
+    enum Comparison {
+        Less,
+        LessOrEqual,
+        Greater,
+        GreaterOrEqual,
+    }
+
+    impl Comparison {
+        const ALL: [Self; 4] = [
+            Self::Less,
+            Self::LessOrEqual,
+            Self::Greater,
+            Self::GreaterOrEqual,
+        ];
+
+        fn spelling(self) -> &'static str {
+            match self {
+                Self::Less => "<",
+                Self::LessOrEqual => "<=",
+                Self::Greater => ">",
+                Self::GreaterOrEqual => ">=",
+            }
+        }
+    }
+
+    /// Rust's two arrow tokens, both of which carry a `>` that compares nothing. Removed
+    /// before [`is_a_deadline_shape`] looks for a comparison, or every match arm holding a
+    /// stopwatch would read as a deadline.
+    const ARROWS: [&str; 2] = ["=>", "->"];
+
+    /// True if `line` reads a wall clock and compares it, in either operand order: the shape
+    /// a hand-rolled deadline takes whichever way round its author wrote it.
+    fn is_a_deadline_shape(line: &str) -> bool {
+        if !WALL_CLOCK_READS.iter().any(|read| line.contains(read)) {
+            return false;
+        }
+        let mut without_arrows = line.to_string();
+        for arrow in ARROWS {
+            without_arrows = without_arrows.replace(arrow, " ");
+        }
+        Comparison::ALL
+            .iter()
+            .any(|comparison| without_arrows.contains(comparison.spelling()))
+    }
+
+    /// One line matching [`is_a_deadline_shape`] that is *not* a test waiting on a liveness
+    /// property: the text of the line, the file and the enclosing item it was written for,
+    /// and last the reason it is allowed, recorded for a reader rather than read by code.
+    type NonWaitDeadline = (String, &'static str, &'static str, &'static str);
+
+    /// Every deadline in this workspace that bounds something other than a test's wait.
+    ///
+    /// An allowlist rather than a denylist, the same shape `check-core-isolation` takes:
+    /// a deadline cannot join this workspace without someone writing down what it bounds,
+    /// which is exactly what nobody did for the forty that made tests flaky under load.
+    /// Matched on the trimmed line text, not a line number, so ordinary edits above it do
+    /// not silently rebind an entry to a different line.
+    ///
+    /// Each entry is bound to the file and the enclosing item it was written for, all three
+    /// of which must match. Text alone made every entry global: the one written for
+    /// `liveness::wait_within` blessed `if start.elapsed() >= deadline {` anywhere in the
+    /// workspace, so a hand-rolled wait re-added to the pty harness passed the scan as long
+    /// as it spelled its bound `deadline`. Binding is still per line, never per file:
+    /// excluding one legitimate deadline is right, excluding the file it sits in is how a
+    /// scan quietly stops checking.
+    fn non_wait_deadlines() -> Vec<NonWaitDeadline> {
+        let elapsed_ge = format!("{}{}", WALL_CLOCK_READS[0], " >=");
+        vec![
+            (
+                format!("if set_at{elapsed_ge} self.document.notice_timeout {{"),
+                "repon/src/app.rs",
+                "notice",
+                "production: a Notice expiring on screen",
+            ),
+            (
+                format!("&& at{elapsed_ge} threshold"),
+                "repon-core/src/cell.rs",
+                "age_into_stale",
+                "production: a status Cell ageing into Stale",
+            ),
+            (
+                format!("if started{elapsed_ge} abandon_after {{"),
+                "repon-core/src/discovery.rs",
+                "walk",
+                "production: discovery abandoning a walk that will not finish",
+            ),
+            (
+                format!("assert!(past{elapsed_ge} Duration::from_secs(90));"),
+                "repon-core/src/cell.rs",
+                "elapsed_reads_a_positive_duration_for_a_timestamp_in_the_past",
+                "a claim about a fabricated Timestamp's own arithmetic, not a wait on anything",
+            ),
+            (
+                format!("if start{elapsed_ge} deadline {{"),
+                "repon-core/src/liveness.rs",
+                "wait_within",
+                "`liveness::wait_within`, the one polling wait every other wait goes through",
+            ),
+        ]
+    }
+
+    /// The name in the nearest `fn` declaration at or above `number` in `path`, or `None`
+    /// for a line inside no function at all.
+    ///
+    /// What binds an allowlist entry to the item it was written for. A comment line is
+    /// skipped, so prose naming a function above the real declaration cannot stand in for
+    /// it; nothing else about the enclosing scope is read, since the nearest declaration
+    /// above is already enough to tell one file's two deadlines apart.
+    fn enclosing_item(path: &Path, number: usize) -> Option<String> {
+        let source = std::fs::read_to_string(path).expect("read a workspace source file");
         let lines: Vec<&str> = source.lines().collect();
-        let mut names = Vec::new();
+        lines[..number.min(lines.len())]
+            .iter()
+            .rev()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .find_map(|line| {
+                let after = line.split_once("fn ")?.1;
+                let name = after
+                    .split(['(', '<', ' ', '\t'])
+                    .next()
+                    .filter(|name| !name.is_empty())?;
+                Some(name.to_string())
+            })
+    }
+
+    /// True if `line` is the allowlist entry `allowed`: same text, same file, same
+    /// enclosing item.
+    fn is_the_allowed_deadline(line: &SourceLine, allowed: &NonWaitDeadline) -> bool {
+        let (text, file, item, _reason) = allowed;
+        *text == line.text
+            && line.path.ends_with(file)
+            && enclosing_item(&line.path, line.number).as_deref() == Some(*item)
+    }
+
+    /// The survey behind this scan, kept true rather than only written down: a test waiting
+    /// on a liveness property must go through `repon_core::liveness`, never a deadline of
+    /// its own. A wait with its own number is a wait whose number was guessed against one
+    /// machine, and the four that existed before this scan were guessed against an idle one.
+    ///
+    /// Scanned over both crates' `src` *and* `tests` through [`workspace_rust_source_dirs`],
+    /// whole files rather than a `production_source` cut, since every hazard this is about
+    /// lives in exactly the region that cut discards. What it catches: a wall clock read
+    /// compared against anything, in either operand order and under any of the four
+    /// comparisons Rust spells, anywhere in the workspace, `liveness.rs` included.
+    ///
+    /// What it misses, all of it recorded here rather than left for a reader to discover:
+    /// a wait spelled without a clock at all (a `recv_timeout` given a literal, a bare
+    /// `sleep` long enough to "probably" be enough), and a clock read whose comparison
+    /// happens on another line through a binding (`let waited = start.elapsed();` on one
+    /// line, `if waited > budget` on the next), which no line scan can see.
+    #[test]
+    fn no_test_owns_a_wall_clock_deadline_of_its_own() {
+        let dirs = workspace_rust_source_dirs();
+        let allowed = non_wait_deadlines();
+
+        let offending: Vec<String> = all_lines_where(&dirs, is_a_deadline_shape)
+            .into_iter()
+            .filter(|line| {
+                !allowed
+                    .iter()
+                    .any(|entry| is_the_allowed_deadline(line, entry))
+            })
+            .map(|line| format!("{}:{}: {}", line.path.display(), line.number, line.text))
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "found a wall-clock deadline outside `repon_core::liveness` and outside the \
+             allowlist of deadlines that bound something other than a test's wait: \
+             {offending:?}. Wait through `liveness::wait_for` (or take `liveness::BACKSTOP` \
+             for a loop with cleanup of its own); add an entry to `non_wait_deadlines` only \
+             for a deadline that is not a test waiting on a liveness property."
+        );
+    }
+
+    /// A kind of public item this scan reads, and how a real use of one reads in source.
+    ///
+    /// Three kinds rather than functions alone: `liveness` reaches the crate root as a
+    /// `pub mod` and its backstop as a `pub const`, so a scan that only knew `pub fn` would
+    /// have watched one of that module's four public items and let the other three, and the
+    /// module gate itself, be deleted without a word.
+    #[derive(Clone, Copy)]
+    enum PublicItem {
+        Function,
+        Constant,
+        Module,
+    }
+
+    impl PublicItem {
+        const ALL: [Self; 3] = [Self::Function, Self::Constant, Self::Module];
+
+        /// How the item's declaration opens, after the line's own indentation.
+        fn declaration(self) -> &'static str {
+            match self {
+                Self::Function => "pub fn ",
+                Self::Constant => "pub const ",
+                Self::Module => "pub mod ",
+            }
+        }
+
+        /// The textual shapes a real use of `name` takes. A function is called; a constant
+        /// and a module are reached through a path.
+        fn use_shapes(self, name: &str) -> Vec<String> {
+            match self {
+                Self::Function => vec![format!(".{name}("), format!("::{name}(")],
+                Self::Constant | Self::Module => vec![format!("::{name}")],
+            }
+        }
+    }
+
+    /// Every public item in `source` (a `production_source_at` read) whose own doc comment
+    /// names `test` or `tests` as a whole word and which is not already gated behind
+    /// `cfg(test)` or `feature = "test-util"`: the two facts `Timestamp::at` carried together
+    /// before #83, one in prose and one missing in code. Each is paired with its own kind, so
+    /// the caller asks after a use of it in the shape that kind actually takes.
+    fn undocumented_test_only_public_items(source: &str) -> Vec<(PublicItem, String)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut items = Vec::new();
         for (index, line) in lines.iter().enumerate() {
-            let Some(rest) = line.trim_start().strip_prefix("pub fn ") else {
+            let trimmed = line.trim_start();
+            let Some((kind, rest)) = PublicItem::ALL
+                .into_iter()
+                .find_map(|kind| Some((kind, trimmed.strip_prefix(kind.declaration())?)))
+            else {
                 continue;
             };
             if is_test_gated_above(&lines, index) || !doc_comment_names_test_above(&lines, index) {
                 continue;
             }
-            let name = rest.split(['(', '<']).next().unwrap_or(rest).trim();
+            let name = rest
+                .split(['(', '<', ':', ';', ' ', '='])
+                .next()
+                .unwrap_or(rest)
+                .trim();
             if !name.is_empty() {
-                names.push(name.to_string());
+                items.push((kind, name.to_string()));
             }
         }
-        names
+        items
     }
 
     /// True if a `#[cfg(...)]` attribute mentioning `test` sits directly above `index`, doc
@@ -366,10 +603,17 @@ mod tests {
             .any(|word| word.eq_ignore_ascii_case("test") || word.eq_ignore_ascii_case("tests"))
     }
 
-    /// True if `name` reads as called somewhere in `source`, either as a method (`.name(`) or
-    /// through a path (`::name(`), the two textual shapes a real call site of a `pub fn` takes.
-    fn is_called_in(source: &str, name: &str) -> bool {
-        source.contains(&format!(".{name}(")) || source.contains(&format!("::{name}("))
+    /// True if `name` reads as used in the production source under `dirs`, in whichever
+    /// shapes its own [`PublicItem`] kind takes.
+    ///
+    /// Through [`production_lines_under_containing`] rather than a `contains` over the
+    /// concatenated files, because that helper excludes comment lines: one intra-doc link
+    /// to `crate::liveness::wait_for` is a mention, not a use site, and reading it as one
+    /// would let the gate this test watches be deleted in silence.
+    fn is_used_under(dirs: &[PathBuf], kind: PublicItem, name: &str) -> bool {
+        kind.use_shapes(name)
+            .iter()
+            .any(|shape| !production_lines_under_containing(dirs, shape).is_empty())
     }
 
     /// The criterion #83 asks for beyond its one fix: a check that fails if another test-only
@@ -382,35 +626,28 @@ mod tests {
     /// an item that only ever needed to exist for a test. Both crates' production source is
     /// read through [`rust_source_files`] and [`production_source_at`], the pair this crate's
     /// every other scan already shares, so the cut can never quietly stop at a file's first
-    /// `#[cfg(test)]`.
+    /// `#[cfg(test)]`; the use site itself is looked for through [`is_used_under`], so a
+    /// comment naming the item is a mention rather than a use.
     ///
-    /// What this catches: an ungated `pub fn` whose own doc comment names `test`/`tests` and
-    /// whose only real callers, if any, would read textually as `.name(` or `::name(`, with
-    /// none outside a test module in either crate. What it misses: the same hazard on an item
-    /// whose doc comment does not say why it exists (this project's own convention is to say
-    /// why, but nothing enforces it), a call reached only through a macro or a trait object, and
-    /// a name collision with an unrelated function elsewhere in the workspace that would mask a
-    /// real hazard by supplying a false call site. It is a canary tuned to this defect's actual
-    /// shape, not a proof that no test-only item ships.
+    /// What this catches: an ungated `pub fn`, `pub const` or `pub mod` whose own doc comment
+    /// names `test`/`tests` and whose only real uses, if any, would read textually in the
+    /// shapes [`PublicItem::use_shapes`] gives that kind, with none outside a test module in
+    /// either crate. What it misses: the same hazard on an item whose doc comment does not say
+    /// why it exists (this project's own convention is to say why, but nothing enforces it), a
+    /// use reached only through a macro or a trait object, and a name collision with an
+    /// unrelated item elsewhere in the workspace that would mask a real hazard by supplying a
+    /// false use site. It is a canary tuned to this defect's actual shape, not a proof that no
+    /// test-only item ships.
     #[test]
-    fn every_pub_fn_documented_as_test_only_is_either_gated_or_has_a_production_call_site() {
+    fn every_pub_item_documented_as_test_only_is_either_gated_or_has_a_production_use_site() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let core_src = manifest_dir.join("../repon-core/src");
-        let repon_src = manifest_dir.join("src");
-
-        let mut all_production = String::new();
-        for path in rust_source_files(&core_src)
-            .into_iter()
-            .chain(rust_source_files(&repon_src))
-        {
-            all_production.push_str(&production_source_at(&path));
-            all_production.push('\n');
-        }
+        let production_dirs = workspace_crate_src_dirs();
 
         let mut unguarded = Vec::new();
         for path in rust_source_files(&core_src) {
-            for name in undocumented_test_only_pub_fns(&production_source_at(&path)) {
-                if !is_called_in(&all_production, &name) {
+            for (kind, name) in undocumented_test_only_public_items(&production_source_at(&path)) {
+                if !is_used_under(&production_dirs, kind, &name) {
                     unguarded.push(format!("{}: {name}", path.display()));
                 }
             }
@@ -418,8 +655,8 @@ mod tests {
 
         assert!(
             unguarded.is_empty(),
-            "found a public repon-core function whose own doc comment names a test as its \
-             reason to exist, with no production call site anywhere in the workspace, and no \
+            "found a public repon-core item whose own doc comment names a test as its \
+             reason to exist, with no production use site anywhere in the workspace, and no \
              `cfg(test)` or `feature = \"test-util\"` gate keeping it off the default build: \
              {unguarded:?}"
         );
