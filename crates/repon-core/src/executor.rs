@@ -1627,6 +1627,47 @@ print(1 if inherited else 0)"
         assert_eq!(bound_head_and_tail(&input), (input, None));
     }
 
+    /// The predicate's own boundary, which decides whether a step gets an elision row at
+    /// all: output of exactly the bound lost nothing, so it must report no elision. One
+    /// line either side of the bound pins the comparison rather than the constant, since
+    /// the pane draws its mark on any `Some` and would otherwise announce a drop of zero
+    /// over output that kept every line.
+    #[test]
+    fn output_of_exactly_the_bound_is_never_reported_as_elided() {
+        let numbered = |total: usize| {
+            let mut input = String::new();
+            for n in 0..total {
+                input.push_str(&format!("line {n}\n"));
+            }
+            input.into_bytes()
+        };
+        let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
+
+        let at_bound = numbered(bound);
+        let (kept, elision) = bound_head_and_tail(&at_bound);
+        assert_eq!(
+            elision, None,
+            "output of exactly the bound lost nothing and must report no elision"
+        );
+        assert!(
+            kept == at_bound,
+            "output of exactly the bound must be handed back untouched"
+        );
+        assert_eq!(
+            bound_head_and_tail(&numbered(bound - 1)).1,
+            None,
+            "one line under the bound must report no elision"
+        );
+        assert_eq!(
+            bound_head_and_tail(&numbered(bound + 1)).1,
+            Some(CaptureElision {
+                dropped_lines: 1,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            }),
+            "one line over the bound must report a drop of exactly that one line"
+        );
+    }
+
     /// The boundary the elision is reported across: the bound drops lines and says so as
     /// two counts, and the bytes it hands over are the kept head followed straight by the
     /// kept tail, with nothing written between them. A mark in the bytes is a mark the
@@ -1662,6 +1703,52 @@ print(1 if inherited else 0)"
         assert!(
             !bounded.contains("elided"),
             "the core must report the drop as structure, never as a formatted line: {bounded:?}"
+        );
+    }
+
+    /// The wiring between the bound and the receipt, which nothing else exercises: every
+    /// render-side test builds a `CaptureElision` by hand, so `run_step` could drop the one
+    /// the bound computed and the mark would silently vanish from every real long run. A
+    /// real child through the real PTY, not `bound_head_and_tail` called directly.
+    #[test]
+    fn a_real_steps_result_carries_the_elision_its_own_capture_bound_computed() {
+        let dir = tempdir();
+        let dropped = 61;
+        let total = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES + dropped;
+        // A POSIX shell loop rather than `seq`, so the fixture depends on no external
+        // program's presence or numbering.
+        let long = run_shell(
+            &format!("i=0; while [ $i -lt {total} ]; do echo \"line $i\"; i=$((i+1)); done"),
+            dir.path(),
+        );
+
+        assert_eq!(long.outcome, StepOutcome::Ok);
+        assert_eq!(
+            long.elision,
+            Some(CaptureElision {
+                dropped_lines: dropped,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            })
+        );
+        let text = String::from_utf8(long.output.to_vec()).expect("valid utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES);
+        assert_eq!(
+            lines[CAPTURE_HEAD_LINES - 1],
+            format!("line {}", CAPTURE_HEAD_LINES - 1)
+        );
+        assert_eq!(
+            lines[CAPTURE_HEAD_LINES],
+            format!("line {}", total - CAPTURE_TAIL_LINES),
+            "the kept tail must follow the kept head with nothing between them"
+        );
+
+        let short = run_shell("echo one; echo two", dir.path());
+
+        assert_eq!(short.outcome, StepOutcome::Ok);
+        assert_eq!(
+            short.elision, None,
+            "output that fitted whole must report no elision"
         );
     }
 
