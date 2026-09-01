@@ -16,14 +16,14 @@
 /// NO-BREAK SPACE (macOS Option+Space) is two bytes, U+2003 EM SPACE three.
 pub(crate) fn delete_previous_word(buffer: &mut String) {
     let trimmed = buffer.trim_end();
-    // scan: the one reverse search for whitespace begin
+    // scan: the one whitespace search begin
     let cut = trimmed
         .char_indices()
         .rev()
         .find(|(_, character)| character.is_whitespace())
         .map(|(index, character)| index + character.len_utf8())
         .unwrap_or(0);
-    // scan: the one reverse search for whitespace end
+    // scan: the one whitespace search end
     buffer.truncate(cut);
 }
 
@@ -90,14 +90,16 @@ mod tests {
         assert_eq!(after_delete("alpha beta gamma"), "alpha beta ");
     }
 
-    /// The name-independent form of the defect: one reverse search for whitespace exists in
-    /// the whole workspace, and it is the one this module blesses with a `// scan:` pair.
-    /// A `rfind` result names the separator's first byte, so a cut one past it splits a
-    /// multi-byte separator. Banning the shape rather than the one spelling
-    /// `rfind(char::is_whitespace)` leaves no room for a closure predicate, a rustfmt line
-    /// wrap, or a fourth surface's own private copy of the correct cut.
+    /// The name-independent form of the defect: one whitespace search exists in the whole
+    /// workspace's production code, and it is the one this module blesses with a `// scan:`
+    /// pair. A byte offset taken off a whitespace boundary names that separator's first byte,
+    /// so a cut one past it splits a multi-byte separator, and the spelling that arrives at
+    /// the offset is not the point: `rfind`, `rposition`, `.rev()`, `rsplit_once` and a
+    /// forward loop keeping the last hit all reach it. Banning the search itself rather than
+    /// any list of the calls that perform one leaves no room for a fourth surface's own
+    /// private copy of the cut.
     #[test]
-    fn the_workspace_holds_one_reverse_search_for_whitespace_and_this_module_blesses_it() {
+    fn the_workspace_holds_one_whitespace_search_and_this_module_blesses_it() {
         let mut offending: Vec<String> = Vec::new();
         let mut blessed = 0usize;
         for dir in crate::test_support::workspace_crate_src_dirs() {
@@ -107,7 +109,7 @@ mod tests {
                 let this_module = path.ends_with("edit_buffer.rs");
                 assert!(
                     region.is_none() || this_module,
-                    "{} blesses a reverse search for whitespace of its own; the cut lives in \
+                    "{} blesses a whitespace search of its own; the cut lives in \
                      `edit_buffer` alone so that one correction reaches every surface",
                     path.display()
                 );
@@ -120,19 +122,19 @@ mod tests {
                     }
                     _ => production,
                 };
-                for site in reverse_whitespace_searches(&scanned) {
+                for site in whitespace_searches(&scanned) {
                     offending.push(format!("{}: {site}", path.display()));
                 }
             }
         }
         assert_eq!(
             blessed, 1,
-            "expected this module to bless exactly one reverse search for whitespace with a \
+            "expected this module to bless exactly one whitespace search with a \
              `// scan: {BLESSED_REGION}` pair, found {blessed}"
         );
         assert!(
             offending.is_empty(),
-            "a byte index a reverse whitespace search returns names that character's first \
+            "a byte index taken off a whitespace boundary names that character's first \
              byte, so truncating one past it can split a character; delete a word through \
              `edit_buffer::delete_previous_word` instead, at: {offending:?}"
         );
@@ -234,30 +236,50 @@ mod tests {
     /// The one dispatch every text field answers `Ctrl+W` through.
     const INPUT_DISPATCH: &str = "dispatch(Context::Input";
 
-    /// The `// scan:` pair naming the one place a reverse search for whitespace is legitimate.
-    const BLESSED_REGION: &str = "the one reverse search for whitespace";
+    /// The `// scan:` pair naming the one place a whitespace search is legitimate.
+    const BLESSED_REGION: &str = "the one whitespace search";
 
     /// The one surface keybindings.md's `input` row names that is not a buffer of its own.
     const SHARES_THE_ACTION_PALETTES_BUFFER: &str = "ad hoc command field";
 
-    /// Every reverse search for whitespace in `production`, as the normalised text around it.
-    /// Read over the source with its whole-line comments dropped and its whitespace collapsed,
-    /// so neither a doc comment naming the shape nor a rustfmt wrap changes the answer, and
-    /// keyed on the reversal rather than on one spelling of the predicate.
-    fn reverse_whitespace_searches(production: &str) -> Vec<String> {
+    /// Every whitespace search in `production`, as the normalised text around it. The shape
+    /// recognised is literal: the word `whitespace` in code, so `is_whitespace`,
+    /// `is_ascii_whitespace` and a `WHITESPACE` constant all count and no list of the calls
+    /// that might consume one has to stay complete. Read over the source with its comments
+    /// and string literals gone and its whitespace collapsed, so neither prose naming the
+    /// shape nor a rustfmt wrap changes the answer.
+    ///
+    /// [`WHITESPACE_ITERATORS`] is the one exemption, and it is an allow-list of what is safe
+    /// rather than a deny-list of what is not, so an unforeseen spelling is reported rather
+    /// than missed. A whitespace test spelled without the word (`character == ' '`) is
+    /// invisible here and is the residual this scan does not cover;
+    /// [`every_ctrl_w_the_input_context_dispatches_reaches_this_module`] is what covers a
+    /// surface the `input` context really dispatches to, however it spells its cut.
+    fn whitespace_searches(production: &str) -> Vec<String> {
         const WINDOW: usize = 160;
         let normalised = crate::test_support::normalised_production(production);
+        let lowercased = normalised.to_ascii_lowercase();
         let mut sites = Vec::new();
-        for reversal in ["rfind", "rposition", ".rev()"] {
-            for (offset, _) in normalised.match_indices(reversal) {
-                let window: String = normalised[offset..].chars().take(WINDOW).collect();
-                if window.contains("is_whitespace") {
-                    sites.push(window);
-                }
+        for (offset, needle) in lowercased.match_indices("whitespace") {
+            let start = lowercased[..offset]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+                .last()
+                .map_or(offset, |(index, _)| index);
+            let call = &lowercased[start..offset + needle.len()];
+            if WHITESPACE_ITERATORS.contains(&call) {
+                continue;
             }
+            sites.push(normalised[offset..].chars().take(WINDOW).collect());
         }
         sites
     }
+
+    /// The whitespace calls that cannot produce this defect: both yield the substrings between
+    /// separators and never a byte offset into the original, so no arithmetic on the result can
+    /// land inside a multi-byte separator.
+    const WHITESPACE_ITERATORS: [&str; 2] = ["split_whitespace", "rsplit_whitespace"];
 
     /// Every `receiver.method(` name in `text`, in order: what a dispatch arm really calls,
     /// whatever that method happens to be named.

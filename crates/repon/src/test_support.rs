@@ -58,14 +58,15 @@ pub(crate) fn production_rust_source_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `source` with every whole-line comment dropped and every whitespace run collapsed to one
-/// space. A needle a rustfmt line wrap split reads as one string again, and a doc comment
-/// naming the very shape a scan bans can neither trip it nor satisfy it.
+/// `source` as [`code_only`] with every whitespace run collapsed to one space and its blank
+/// lines dropped. A needle a rustfmt line wrap split reads as one string again, and prose
+/// naming the very shape a scan bans can neither trip it nor satisfy it, whether that prose
+/// is a comment or an `unreachable!` message.
 pub(crate) fn normalised_production(source: &str) -> String {
     let mut normalised = String::new();
-    for line in source.lines() {
+    for line in code_only(source).lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if trimmed.is_empty() {
             continue;
         }
         if !normalised.is_empty() {
@@ -74,6 +75,140 @@ pub(crate) fn normalised_production(source: &str) -> String {
         normalised.push_str(&trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
     }
     normalised
+}
+
+/// `source` with every comment removed and every string, byte-string and character literal
+/// emptied to its delimiters, so a scan over the result reads what the compiler reads rather
+/// than what the file says. A panic message quoting the vocabulary it is proving exhaustive,
+/// or a doc comment naming the shape a scan bans, satisfied a `contains` check over the raw
+/// text and no longer can.
+pub(crate) fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut code = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '/' && chars.get(index + 1) == Some(&'/') {
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if character == '/' && chars.get(index + 1) == Some(&'*') {
+            index = block_comment_end(&chars, index);
+            code.push(' ');
+            continue;
+        }
+        if let Some(end) = raw_string_end(&chars, index) {
+            code.push_str("\"\"");
+            index = end;
+            continue;
+        }
+        if character == '"' {
+            index = string_end(&chars, index);
+            code.push_str("\"\"");
+            continue;
+        }
+        if let Some(end) = char_literal_end(&chars, index) {
+            code.push_str("''");
+            index = end;
+            continue;
+        }
+        code.push(character);
+        index += 1;
+    }
+    code
+}
+
+/// One past the `*/` closing the block comment opening at `start`, counting nested pairs as
+/// rustc does, or the end of input when the comment is never closed.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = start + 2;
+    while index < chars.len() && depth > 0 {
+        if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+            depth += 1;
+            index += 2;
+        } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+            depth -= 1;
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+/// One past the `"` closing the ordinary string literal opening at `start`, `\` escaping the
+/// character after it, or the end of input when the literal is never closed.
+fn string_end(chars: &[char], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// One past the end of the raw string literal (`r"`, `r#"`, `br"`, ...) opening at `start`,
+/// or `None` when `start` opens no such literal. A raw string honours no escape, so only a
+/// `"` followed by the opener's own hash count closes it.
+fn raw_string_end(chars: &[char], start: usize) -> Option<usize> {
+    let previous = start.checked_sub(1).and_then(|before| chars.get(before));
+    if previous.is_some_and(|character| character.is_alphanumeric() || *character == '_') {
+        return None;
+    }
+    let mut index = start;
+    if chars.get(index) == Some(&'b') {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'r') {
+        return None;
+    }
+    index += 1;
+    let first_hash = index;
+    while chars.get(index) == Some(&'#') {
+        index += 1;
+    }
+    let hashes = index - first_hash;
+    if chars.get(index) != Some(&'"') {
+        return None;
+    }
+    index += 1;
+    while index < chars.len() {
+        if chars[index] == '"' && (1..=hashes).all(|offset| chars.get(index + offset) == Some(&'#'))
+        {
+            return Some(index + 1 + hashes);
+        }
+        index += 1;
+    }
+    Some(chars.len())
+}
+
+/// One past the `'` closing the character literal opening at `start`, or `None` when `start`
+/// opens no such literal: a lifetime, a loop label, or any other character. `'x'` and `'\''`
+/// close on their own third or later character; `'a` in `&'a str` never closes at all.
+fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
+    if chars.get(start) != Some(&'\'') {
+        return None;
+    }
+    if chars.get(start + 1) == Some(&'\\') {
+        let mut index = start + 2;
+        while index < chars.len() {
+            if chars[index] == '\'' {
+                return Some(index + 1);
+            }
+            index += 1;
+        }
+        return None;
+    }
+    if chars.get(start + 2) == Some(&'\'') {
+        return Some(start + 3);
+    }
+    None
 }
 
 /// The block the 0-based line `start` opens, that line included, ending at the first later
@@ -332,6 +467,39 @@ pub(crate) fn capture_tracing(f: impl FnOnce()) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blindness this helper answers: a `contains` scan proving a match exhaustive read
+    /// the vocabulary out of the trailing `unreachable!` message, so deleting the arm and
+    /// naming the action in the prose passed.
+    #[test]
+    fn a_panic_message_naming_an_action_does_not_satisfy_a_scan_for_that_arm() {
+        let source = "match dispatch(key) {\n    Some(other) => unreachable!(\n        \
+                      \"only the input vocabulary, including Action::AcceptCompletion, got \
+                      {other:?}\"\n    ),\n}\n";
+        let normalised = normalised_production(source);
+        assert!(
+            !normalised.contains("Action::AcceptCompletion"),
+            "the panic message's prose still reads as code: {normalised}"
+        );
+        assert!(
+            normalised.contains("unreachable!"),
+            "the call around the message must survive: {normalised}"
+        );
+    }
+
+    /// A `'` opens a lifetime as often as a literal, and `'\"'` is a real production
+    /// spelling: mistaking either for a string start swallows the code that follows and
+    /// silently shrinks every scan built on this.
+    #[test]
+    fn a_quote_in_a_character_literal_does_not_swallow_the_code_after_it() {
+        let source = "fn parse<'a>(text: &'a str) -> Option<&'a str> {\n    \
+                      text.strip_prefix('\"')?.split_once('\"').map(Action::Named)\n}\n";
+        let normalised = normalised_production(source);
+        assert!(
+            normalised.contains("split_once") && normalised.contains("Action::Named"),
+            "code after a quote-bearing character literal went missing: {normalised}"
+        );
+    }
 
     /// A `#[cfg(test)]`-gated item ahead of the tests module must not truncate the scan
     /// there, or every real production line after it goes unscanned.
