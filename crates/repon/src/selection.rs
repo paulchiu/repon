@@ -27,10 +27,9 @@ impl Selection {
         Self::default()
     }
 
-    /// How many rows the Selection currently holds. The live count
-    /// [keybindings.md](../../../../docs/spec/keybindings.md) promises the header and the
-    /// palettes; neither consumer exists yet, so this is the seam they read it from.
-    #[allow(dead_code)]
+    /// How many rows the Selection currently holds. Read by [`crate::components::list::List`]
+    /// for the list's own `title_bottom` counter
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md)).
     pub(crate) fn count(&self) -> usize {
         self.selected.len()
     }

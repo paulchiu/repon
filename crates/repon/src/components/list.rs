@@ -171,12 +171,26 @@ impl List {
             FULL_SPINNER_INTERVAL,
             self.started_at.elapsed(),
         );
+        // Computed ahead of the block below so the bottom border's own position counter can
+        // read `row_order.len()` before the block is built, rather than after.
+        let row_order = visible_row_order(
+            &snapshot.entities,
+            self.show_worktrees,
+            self.show_submodules,
+            &self.filter,
+        );
+
         let mut scratch = BorderScratch::new();
-        let block = glyphs
+        let mut block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme::DEFAULT.style_for(theme::Role::BorderFocused))
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
+        if let Some(counter) =
+            position_counter(row_order.len(), self.cursor, self.selection.count())
+        {
+            block = block.title_bottom(ratatui::text::Line::from(counter).right_aligned());
+        }
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -187,12 +201,6 @@ impl List {
         if !compact {
             draw_header(buf, interior);
         }
-        let row_order = visible_row_order(
-            &snapshot.entities,
-            self.show_worktrees,
-            self.show_submodules,
-            &self.filter,
-        );
         if row_order.is_empty() {
             // Nothing to draw below the header: say so rather than leaving a bordered box
             // with no rows, indistinguishable from a hang. Which sentence depends on whether
@@ -379,6 +387,26 @@ pub(crate) fn write_cell_runs(
         let (next_x, _) = buf.set_stringn(cursor, y, text, (end - cursor) as usize, *style);
         cursor = next_x;
     }
+}
+
+/// The list's own `title_bottom` text: the cursor's 1-indexed position among `total` visible
+/// rows, plus a third `/`-separated number for the Selection's own count once it is
+/// non-empty. `None` once `total` is zero, since the empty-state message above already says
+/// there is nothing to number.
+///
+/// [ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
+/// "Digits and `/` only, no new glyph" is why the checked count is a third plain number
+/// rather than a word or an icon.
+fn position_counter(total: usize, cursor: usize, checked: usize) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let position = cursor.saturating_add(1).min(total);
+    Some(if checked > 0 {
+        format!("{position}/{total}/{checked}")
+    } else {
+        format!("{position}/{total}")
+    })
 }
 
 /// Whether `kind`'s row is ever drawn: a Repo always, a Worktree while `show_worktrees` is
@@ -2101,6 +2129,115 @@ mod tests {
             GlyphSet::for_config(crate::config::document::Glyphs::Ascii).border,
             " repos ",
             "the list panel's frame under the ascii table",
+        );
+    }
+
+    /// The bottom border's own row, read the way `warnings.rs`'s own `CLOSE_HINT` test reads
+    /// its bottom row: the corner comes from the glyph table, the counter sits right against
+    /// it.
+    fn bottom_row_text(buf: &Buffer, area: Rect) -> String {
+        (area.x..area.right())
+            .map(|x| buf[(x, area.bottom() - 1)].symbol())
+            .collect()
+    }
+
+    /// Defect 2 (the list half): the bottom border carries the cursor's 1-indexed position
+    /// among the visible rows and the total, right-aligned against the bottom-right corner.
+    #[test]
+    fn the_bottom_border_carries_the_cursors_position_and_the_total_visible_rows() {
+        let mut list = List::default();
+        list.set_cursor(1);
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render_with_list(
+            &mut list,
+            area.width,
+            area.height,
+            &snapshot(vec![entity("alpha"), entity("beta"), entity("gamma")]),
+        );
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_tail = format!("2/3{}", border.bottom_right);
+        assert!(
+            bottom_row_text(buf, area).ends_with(&expected_tail),
+            "expected the cursor's position (2) and the total (3) right-aligned against the \
+             bottom-right corner, got: {:?}",
+            bottom_row_text(buf, area)
+        );
+    }
+
+    /// The other half: once the Selection is non-empty, a third `/`-separated number joins
+    /// the counter, digits and `/` only per ADR 0020.
+    #[test]
+    fn the_bottom_border_also_carries_the_checked_count_once_the_selection_is_non_empty() {
+        let mut list = List::default();
+        list.set_cursor(1);
+        let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
+        let checked_key = entities[0].key.clone();
+        list.set_selection(checked_selection([checked_key]));
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render_with_list(&mut list, area.width, area.height, &snapshot(entities));
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_tail = format!("2/3/1{}", border.bottom_right);
+        assert!(
+            bottom_row_text(buf, area).ends_with(&expected_tail),
+            "expected the checked count to join the counter as a third number, got: {:?}",
+            bottom_row_text(buf, area)
+        );
+    }
+
+    /// The counter must not appear at all once there is nothing to number: an empty list
+    /// already says so on its own first row (defect 1), and a plain dash run must still fill
+    /// the bottom border rather than a stray `0/0`.
+    #[test]
+    fn the_bottom_border_carries_no_counter_when_the_list_is_empty() {
+        let area = Rect::new(0, 0, 140, 24);
+        let terminal = render(area.width, area.height, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        let border = GlyphSet::for_config(crate::config::document::Glyphs::Full).border;
+        let expected_bottom = format!(
+            "{}{}{}",
+            border.bottom_left,
+            border
+                .horizontal
+                .to_string()
+                .repeat(area.width as usize - 2),
+            border.bottom_right
+        );
+        assert_eq!(
+            bottom_row_text(buf, area),
+            expected_bottom,
+            "expected a plain dash run with no counter when there is nothing to number"
+        );
+    }
+
+    /// [`position_counter`] proven directly, independent of any rendering: the pure function
+    /// the two render-level tests above exercise end to end.
+    #[test]
+    fn position_counter_reads_cursor_and_selection_into_one_slash_separated_string() {
+        assert_eq!(
+            position_counter(0, 0, 0),
+            None,
+            "nothing to number when total is zero"
+        );
+        assert_eq!(position_counter(5, 0, 0), Some("1/5".to_string()));
+        assert_eq!(
+            position_counter(5, 4, 0),
+            Some("5/5".to_string()),
+            "0-indexed cursor 4 of 5 rows is position 5"
+        );
+        assert_eq!(
+            position_counter(5, 99, 0),
+            Some("5/5".to_string()),
+            "a cursor past the row count must clamp to the last row rather than overrun it"
+        );
+        assert_eq!(
+            position_counter(5, 2, 3),
+            Some("3/5/3".to_string()),
+            "a non-empty Selection appends its count as a third number"
         );
     }
 

@@ -1208,8 +1208,10 @@ mod tests {
 
         app.set_picker = None;
         let buf = render_app_frame(&mut app, width, height);
-        // The list pane sits between the status row and the footer, one row of each.
-        crate::test_support::assert_frame_drawn_with(
+        // The list pane sits between the status row and the footer, one row of each. Not
+        // `assert_frame_drawn_with`: with a real repo discovered, the bottom border now
+        // carries the list's own position counter rather than a plain dash run.
+        crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
             &buf,
             ratatui::layout::Rect::new(0, 1, width, height - 2),
             ascii,
