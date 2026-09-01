@@ -119,6 +119,7 @@ The active Set is named on screen, as the status row's first item, ahead of the 
 | `args` | array of strings | The argv vector; with `shell = true`, one element holding the command string |
 | `from_env` | string | Names an environment variable to read the argv from; mutually exclusive with `args` |
 | `shell` | bool, default `false` | Run through `$SHELL -c` |
+| `takes_terminal` | bool, default `true` | Whether the command takes over the terminal; `false` runs it without leaving the screen |
 | `env` | map of string to string | Merged over the guaranteed set |
 | `disabled` | bool, default `false` | Drops a shipped default |
 
@@ -130,7 +131,15 @@ Every Launcher starts in the entity's own working directory. `cwd` is not a fiel
 
 Four Launchers ship as defaults: lazygit, tuicr, an editor via `from_env`, and a shell. Declaring a `[[launcher]]` with a shipped name replaces it in place; `disabled = true` drops it.
 
-Launchers suspend and exec in the same terminal. The terminal-state contract is [keybindings.md](keybindings.md#terminal-state)'s and lives there in full: five pieces claimed on entry, the four Repon enables released on every exit from the screen, and mouse capture held off and never released. It is not restated here, because a count kept in two places is how the two documents came to disagree ([0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)). What belongs to this document is the mechanics: crossterm 0.29 documents every piece as an independent enable/disable pair with no automatic restoration, and ratatui's own panic-hook example restores only the alternate screen and raw mode, so the recipe cannot be copied as written.
+A Launcher that takes the terminal suspends and execs in the same one. The terminal-state contract is [keybindings.md](keybindings.md#terminal-state)'s and lives there in full: five pieces claimed on entry, the four Repon enables released on every exit from the screen, and mouse capture held off and never released. It is not restated here, because a count kept in two places is how the two documents came to disagree ([0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)). What belongs to this document is the mechanics: crossterm 0.29 documents every piece as an independent enable/disable pair with no automatic restoration, and ratatui's own panic-hook example restores only the alternate screen and raw mode, so the recipe cannot be copied as written.
+
+`takes_terminal = false` says the command draws nothing and returns: a multiplexer pane (`tmux split-window`), or a GUI editor such as `code`, `cursor` or `zed`. Repon keeps its own screen for the whole of that child's run, so there is no teardown and no reclaim, and no flicker for a command that returns in milliseconds. That child's stdin, stdout and stderr are all `/dev/null`, which is what makes keeping the screen safe: a byte it wrote would land inside the frame Repon is still painting, and a stdin it shared would race the event thread that owns the terminal's input for keystrokes meant for Repon. Nothing else about the child changes: it starts in the entity's own working directory with the environment contract below, and `shell = true` still means what it means everywhere else here. Only the terminal is withheld, never the process group or the session, so the child stays an ordinary child of Repon rather than a daemon.
+
+Repon waits for it either way, because the declaration is that the command returns, and an exit status cannot be read without waiting. What differs is what a failure does. A Launcher that took the terminal wrote its own error onto the terminal the user was watching, so its non-zero exit needs nothing further. One that did not wrote to `/dev/null` and left no visible trace at all, so Repon raises a Notice naming it and its exit status; a child that could not be spawned raises the same Notice. Declaring `takes_terminal = false` on a command that never returns leaves Repon waiting on it with the screen held and no way to reach it, which is the price of a wrong declaration rather than a case Repon second-guesses.
+
+All four shipped defaults take the terminal, which is why `true` is the default. `from_env` is where the declaration earns its keep: `EDITOR="code --wait"` takes the terminal and `EDITOR=code` does not, and the resolved argv cannot be told apart from the outside, so the entry says which and Repon never infers it.
+
+Configure, do not detect. Repon does not read `$TMUX`, `$DISPLAY` or a terminal-program variable to work this out, and does not offer the choice at launch time. [0007](../adr/0007-launchers-are-argv-vectors.md) makes the argv vector the extension point the user writes, so detecting would have Repon guess at something the entry has already stated, and an offer is a decision point on a hot key for a preference that does not change between presses. That draws a line against the one thing Repon does sniff, `TERM=linux` selecting the `ascii` glyph set: sniff to fix a correctness failure the user cannot see, such as a mark that renders as a different mark, and do not sniff to second-guess a preference expressible in one config line.
 
 ## The environment contract
 
@@ -284,6 +293,14 @@ from_env = "EDITOR"
 name = "log"
 args = ["git log --oneline -20 | less"]
 shell = true
+
+# tmux returns the instant the pane exists, so Repon keeps its screen rather than
+# tearing it down and reclaiming it for nothing.
+[[launcher]]
+name = "pane"
+args = ['tmux split-window -c "$REPON_REPO_PATH" lazygit']
+shell = true
+takes_terminal = false
 
 # Step two runs only if step one exited zero.
 [[action]]

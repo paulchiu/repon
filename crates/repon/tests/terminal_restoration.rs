@@ -759,6 +759,106 @@ fn a_launcher_handoff_restores_the_terminal_before_the_child_runs_and_reclaims_i
     );
 }
 
+/// The other half of the Launcher handoff: a `[[launcher]]` declaring `takes_terminal = false`
+/// ([config.md](../../../docs/spec/config.md#launchers)) must run its child without ever
+/// leaving the screen, and must hand it no terminal at all. Both halves are asserted on real
+/// bytes rather than described: the alternate screen is claimed once and released once for the
+/// whole process, and the child's own marker never reaches the pty, which is what a frame
+/// Repon is still holding being safe from that child actually means. The child reports, into a
+/// file nothing else writes, whether each of its three streams is a terminal, so a build that
+/// inherited them fails here naming the stream it inherited rather than with an absence.
+///
+/// Runs through `--launcher-marker-after-tui-enter`, the same flag the handoff test above
+/// uses: that flag resolves a `[[launcher]]` named `test` through the real `config.toml`
+/// pipeline, so what differs between the two tests is the config line under test and nothing
+/// else.
+#[test]
+fn a_launcher_that_keeps_the_screen_never_leaves_it_and_gets_no_terminal_of_its_own() {
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    let child_dir = tempfile::tempdir().expect("create tempdir for the child's own files");
+    let script = child_dir.path().join("probe.sh");
+    let report = child_dir.path().join("streams");
+    const MARKER: &str = "KEPT_SCREEN_LAUNCHER_MARKER";
+
+    // `exec 9>` rather than redirecting the loop itself: a `> file` on the block would make
+    // fd 1 the report file, and the `-t 1` answer below meaningless. The sleep is what makes
+    // "Repon waits for it" observable rather than raced: a build that spawned and walked away
+    // would exit long before the report below is written, leaving the file created and empty.
+    std::fs::write(
+        &script,
+        format!(
+            "sleep 1\n\
+             exec 9> \"$1\"\n\
+             for fd in 0 1 2; do\n\
+             if [ -t \"$fd\" ]; then printf '%s=tty ' \"$fd\" >&9\n\
+             else printf '%s=notty ' \"$fd\" >&9\n\
+             fi\n\
+             done\n\
+             printf {MARKER}\n\
+             printf {MARKER} >&2\n"
+        ),
+    )
+    .expect("write the child's stream-probing script");
+
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        format!(
+            "[[launcher]]\n\
+             name = \"test\"\n\
+             takes_terminal = false\n\
+             args = [\"sh\", \"{}\", \"{}\"]\n",
+            script.display(),
+            report.display()
+        ),
+    )
+    .expect("write a config.toml declaring the screen-keeping test launcher");
+
+    let (status, output) = run_over_pty(
+        &["--launcher-marker-after-tui-enter"],
+        &[(
+            "REPON_CONFIG",
+            config_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    let streams = std::fs::read_to_string(&report)
+        .expect("the child must have run: nothing else writes its report file");
+    assert_eq!(
+        streams.trim_end(),
+        "0=notty 1=notty 2=notty",
+        "a child run without leaving the screen must be handed no terminal on any stream"
+    );
+
+    assert!(
+        !output.contains(MARKER),
+        "the child's own output must never reach the terminal Repon is still holding: \
+         {output:?}"
+    );
+
+    let enter_at = indices_of(&output, &ansi(crossterm::terminal::EnterAlternateScreen));
+    let leave_at = indices_of(&output, &ansi(crossterm::terminal::LeaveAlternateScreen));
+    assert_eq!(
+        enter_at.len(),
+        1,
+        "expected the alternate screen claimed exactly once, with no reclaim: a second claim \
+         means the screen was torn down for a Launcher that declared it would not take the \
+         terminal: {output:?}"
+    );
+    assert_eq!(
+        leave_at.len(),
+        1,
+        "expected exactly one restore, the process's own on exit: {output:?}"
+    );
+    assert!(
+        enter_at[0] < leave_at[0],
+        "the one restore must be the exit's, after the claim: {output:?}"
+    );
+}
+
 /// Criterion 2's clean path for the ad hoc-editor caller (`editor::edit`): the same handoff
 /// machinery the Launcher test above exercises, proven through a second, independent caller
 /// whose own interface never mentions a Launcher. `--editor-marker-after-tui-enter` forces

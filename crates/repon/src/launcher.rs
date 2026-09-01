@@ -3,9 +3,11 @@
 //! [config.md](../../../../docs/spec/config.md#launchers) and
 //! [ADR 0007](../../../../docs/adr/0007-launchers-are-argv-vectors.md). [`resolve`] turns
 //! the four shipped defaults plus a document's declared `[[launcher]]` entries into the list
-//! the palette shows; [`run`] is one of the two callers of
+//! the palette shows; [`run`] picks between
 //! [`Tui::suspend_for_child`](crate::tui::Tui::suspend_for_child), the shared terminal-handoff
-//! machinery [`crate::editor`] is the other.
+//! machinery [`crate::editor`] is the other caller of, and
+//! [`Tui::keep_screen_for_child`](crate::tui::Tui::keep_screen_for_child) for a Launcher whose
+//! `takes_terminal` says it does not take the terminal.
 
 use std::collections::BTreeMap;
 use std::process::{Command, ExitStatus};
@@ -17,12 +19,17 @@ use crate::config::document::{Document, LauncherConfig};
 use crate::tui::Tui;
 
 /// One Launcher ready for the palette: its name, how its argv is produced, and its own
-/// config-declared shell opt-in and environment overrides.
+/// config-declared shell opt-in, terminal declaration and environment overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launcher {
     pub name: String,
     pub source: Source,
     pub shell: bool,
+    /// Whether this Launcher's command takes over the terminal
+    /// ([config.md](../../../../docs/spec/config.md#launchers)'s `takes_terminal`). `false`
+    /// keeps Repon's screen for the whole run and gives the child no terminal at all; the
+    /// user declares it, since a resolved argv cannot be told apart from the outside.
+    pub takes_terminal: bool,
     pub env: BTreeMap<String, String>,
 }
 
@@ -93,24 +100,28 @@ fn shipped_defaults() -> Vec<Launcher> {
             name: "lazygit".to_string(),
             source: Source::Args(vec!["lazygit".to_string()]),
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         },
         Launcher {
             name: "tuicr".to_string(),
             source: Source::Args(vec!["tuicr".to_string()]),
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         },
         Launcher {
             name: "editor".to_string(),
             source: Source::EditorChain,
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         },
         Launcher {
             name: "shell".to_string(),
             source: Source::ShellFallback,
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         },
     ]
@@ -127,6 +138,7 @@ impl Launcher {
             name: config.name.get_ref().clone(),
             source,
             shell: config.shell,
+            takes_terminal: config.takes_terminal,
             env: config.env.clone(),
         }
     }
@@ -158,14 +170,22 @@ pub fn resolve(document: &Document) -> Vec<Launcher> {
     result
 }
 
-/// Runs `launcher` against `entity`'s own working directory, suspending Repon's terminal for
-/// the handoff and reclaiming it once the child exits. `cwd` is not a config field
+/// Runs `launcher` against `entity`'s own working directory and returns what its child
+/// exited with. `cwd` is not a config field
 /// ([config.md](../../../../docs/spec/config.md#launchers)): every Launcher starts in the
 /// entity's own working directory. `launcher.env` is merged over the environment contract's
 /// guaranteed pairs, so a declared override always wins.
+///
+/// `takes_terminal` picks which half of the handoff machinery runs it: the terminal is
+/// suspended and reclaimed for a Launcher that takes it, and Repon's screen is held for one
+/// that does not. Repon waits either way, which is why both halves return an `ExitStatus`.
 pub fn run(tui: &mut Tui, launcher: &Launcher, entity: &EntityState) -> Result<ExitStatus> {
     let mut command = build_command(launcher, entity);
-    tui.suspend_for_child(&mut command)
+    if launcher.takes_terminal {
+        tui.suspend_for_child(&mut command)
+    } else {
+        tui.keep_screen_for_child(&mut command)
+    }
 }
 
 /// `argv[0]` as the program, the rest as its arguments; an empty `argv` runs an empty
@@ -228,6 +248,7 @@ mod tests {
             args: args.map(|args| args.into_iter().map(str::to_string).collect()),
             from_env: from_env.map(str::to_string),
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
             disabled,
         }
@@ -376,6 +397,45 @@ mod tests {
         assert_eq!(resolved, shipped_defaults());
     }
 
+    // config.md: "All four shipped defaults take the terminal, which is why `true` is the
+    // default." Asserted on every shipped entry rather than on the count, so a fifth default
+    // arriving with the screen kept has to be argued for here.
+    #[test]
+    fn every_shipped_default_takes_the_terminal() {
+        let kept: Vec<String> = shipped_defaults()
+            .into_iter()
+            .filter(|launcher| !launcher.takes_terminal)
+            .map(|launcher| launcher.name)
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "a shipped default that does not take the terminal needs its own entry in \
+             config.md's Launchers section: {kept:?}"
+        );
+    }
+
+    // A declared entry's own `takes_terminal` survives the merge, and touches nothing else:
+    // replacing one shipped name with a screen-keeping entry must not quietly flip the three
+    // it did not name.
+    #[test]
+    fn a_declared_terminal_declaration_reaches_the_resolved_launcher_and_only_that_one() {
+        let mut document = Document::default();
+        let mut declared = launcher_config("editor", Some(vec!["code"]), None, false);
+        declared.takes_terminal = false;
+        document.launchers.push(declared);
+
+        let resolved = resolve(&document);
+
+        for launcher in &resolved {
+            let expected = launcher.name != "editor";
+            assert_eq!(
+                launcher.takes_terminal, expected,
+                "`{}` resolved with the wrong terminal declaration",
+                launcher.name
+            );
+        }
+    }
+
     // Source resolution.
 
     #[test]
@@ -504,6 +564,7 @@ mod tests {
             name: "test".to_string(),
             source: Source::Args(vec!["echo".to_string(), "a && b; c | d`e`".to_string()]),
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         };
 
@@ -529,6 +590,7 @@ mod tests {
             name: "log".to_string(),
             source: Source::Args(vec!["git log --oneline -20 | less".to_string()]),
             shell: true,
+            takes_terminal: true,
             env: BTreeMap::new(),
         };
 
@@ -561,6 +623,7 @@ mod tests {
             name: "test".to_string(),
             source: Source::Args(vec!["true".to_string()]),
             shell: false,
+            takes_terminal: true,
             env,
         };
 
@@ -635,6 +698,7 @@ mod tests {
             name: "probe".to_string(),
             source: Source::Args(vec!["printenv".to_string(), "REPON_BRANCH".to_string()]),
             shell: false,
+            takes_terminal: true,
             env: BTreeMap::new(),
         };
 

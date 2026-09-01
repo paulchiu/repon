@@ -1850,6 +1850,7 @@ mod tests {
             name: "lazygit".to_string(),
             source: crate::launcher::Source::Args(vec!["true".to_string()]),
             shell: false,
+            takes_terminal: true,
             env: std::collections::BTreeMap::new(),
         }];
         let mut launcher_palette = LauncherPalette::new();
