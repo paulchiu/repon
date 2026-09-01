@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/repon", "crates/repon-core"]
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 # The floor twelve lockfile packages already set, and the number `cargo update`
 # resolves against: undeclared, it resolves against whatever toolchain is installed.
@@ -21,7 +21,7 @@ categories = ["command-line-utilities", "development-tools"]
 crossbeam-channel = "0.5.16"
 # The version is what makes the workspace publishable at all, and `cargo
 # set-version --workspace` rewrites it with the rest on a bump.
-repon-core = { path = "crates/repon-core", version = "0.1.25" }
+repon-core = { path = "crates/repon-core", version = "0.1.26" }
 
 # Read the optimization guideline for more details:
 # https://ratatui.rs/recipes/apps/release-your-app/#optimizations
