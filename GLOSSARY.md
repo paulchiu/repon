@@ -64,13 +64,16 @@ Two halves returning one Entity list. The boundary-stop walk turns a Set's roots
 ## Acting
 
 **Launcher**:
-A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an argv vector rather than a shell string. Repo context reaches it through the environment, never interpolated into a command. Not a Handoff, which names the act rather than the thing.
+A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an argv vector rather than a shell string. Repo context reaches it through the environment, never interpolated into a command. Each one declares whether it takes over the terminal; one that does not is run with the screen still held and with no terminal of its own on any of its three streams. Not a Handoff, which names the act rather than the thing.
 
 **Action**:
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
 **Action spec**:
 An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps and its concurrency, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.
+
+**Applicability**:
+How an Action's `when` predicate divides the rows it would operate on, after excluded rows are already subtracted: applicable, inapplicable, and unresolved because a Cell the predicate reads has not settled. Three counts and no verdict, since an unresolved row is not an inapplicable one and folding it into either side is an absent value becoming a zero. It narrows what the palette reports, never which Repos the Action fans out over.
 
 **Step**:
 One act in an Action's ordered list: either a command as the core receives it, its argv already split rather than a shell string with any per-step environment overrides already resolved, or one act Repon performs itself with no child process at all, which is what a Management operation's single Step is. Distinct from a Step result, which is what running one produces.
@@ -127,7 +130,7 @@ The one line above the frame. It carries a Notice alone, or otherwise one list o
 The record that the user has read the outstanding Warnings, made by opening the expanded list. It frees the Warning's message from the Status row and leaves the indicator, a `!` and a count, which is reserved ahead of every item and is the one thing on that row that never drops.
 
 **Terminal state**:
-The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
+The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff that takes the terminal, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
 
 **Residue**:
 Anything Repon enabled in the terminal that is still on after Repon has given the terminal back. The contract is that there is none; it is not that the terminal is as it was, since a state Repon turned off may legitimately stay off.

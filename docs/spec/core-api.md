@@ -20,6 +20,7 @@ One table settles every ownership question this document answers in detail below
 | The environment contract as data | core | It is derived entirely from git facts the core already holds |
 | Action fan-out | core | No terminal is involved |
 | The Filter predicate | core | The decision to apply it is the consumer's; the language is [filter.md](filter.md) |
+| An Action's applicability tally | core | It is the Filter predicate over the very rows the core already partitions for a fan-out |
 | Config file discovery and parsing | consumer | The core never reads a file or an environment variable |
 | The terminal | consumer | The whole point of [0005](../adr/0005-rendering-agnostic-core.md) |
 | The Launcher | consumer | Suspending and exec-ing are terminal acts |
@@ -122,7 +123,7 @@ pub struct EntityState {
 }
 ```
 
-A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`. On a `Submodule` row `state` and `base` are both `NotApplicable`, because [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) records that population's default branch as known-wrong with no local detector, so a proof computed against it would be a confident lie ([discovery.md](discovery.md)). Detachment is not the reason. [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) shows Merged needs a commit and a default branch rather than a branch name, so a detached Worktree, whose default branch resolves normally, computes both cells.
+A struct rather than a map, because the grid is not rectangular and because a struct gives both consumers a fixed schema and lets each cell carry its own payload type, where a map forces one union type across every column. `Kind` is `Repo`, `Worktree` or `Submodule`. On a `Submodule` row `state` and `base` are both `Unknown`, because [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) records that population's default branch as known-wrong with no local detector, so a proof computed against it would be a confident lie: a question that applies and has no answer Repon can stand behind, not a question with no meaning on the row, so `Unknown` rather than `NotApplicable` ([discovery.md](discovery.md), [ADR 0017](../adr/0017-discovery-stops-at-the-repo-boundary.md)'s "Amended by #173"). Detachment is not the reason. [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) shows Merged needs a commit and a default branch rather than a branch name, so a detached Worktree, whose default branch resolves normally, computes both cells.
 
 ### HEAD's three shapes
 

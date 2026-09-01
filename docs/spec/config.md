@@ -119,6 +119,7 @@ The active Set is named on screen, as the status row's first item, ahead of the 
 | `args` | array of strings | The argv vector; with `shell = true`, one element holding the command string |
 | `from_env` | string | Names an environment variable to read the argv from; mutually exclusive with `args` |
 | `shell` | bool, default `false` | Run through `$SHELL -c` |
+| `takes_terminal` | bool, default `true` | Whether the command takes over the terminal; `false` runs it without leaving the screen |
 | `env` | map of string to string | Merged over the guaranteed set |
 | `disabled` | bool, default `false` | Drops a shipped default |
 
@@ -130,7 +131,15 @@ Every Launcher starts in the entity's own working directory. `cwd` is not a fiel
 
 Four Launchers ship as defaults: lazygit, tuicr, an editor via `from_env`, and a shell. Declaring a `[[launcher]]` with a shipped name replaces it in place; `disabled = true` drops it.
 
-Launchers suspend and exec in the same terminal. The terminal-state contract is [keybindings.md](keybindings.md#terminal-state)'s and lives there in full: five pieces claimed on entry, the four Repon enables released on every exit from the screen, and mouse capture held off and never released. It is not restated here, because a count kept in two places is how the two documents came to disagree ([0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)). What belongs to this document is the mechanics: crossterm 0.29 documents every piece as an independent enable/disable pair with no automatic restoration, and ratatui's own panic-hook example restores only the alternate screen and raw mode, so the recipe cannot be copied as written.
+A Launcher that takes the terminal suspends and execs in the same one. The terminal-state contract is [keybindings.md](keybindings.md#terminal-state)'s and lives there in full: five pieces claimed on entry, the four Repon enables released on every exit from the screen, and mouse capture held off and never released. It is not restated here, because a count kept in two places is how the two documents came to disagree ([0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)). What belongs to this document is the mechanics: crossterm 0.29 documents every piece as an independent enable/disable pair with no automatic restoration, and ratatui's own panic-hook example restores only the alternate screen and raw mode, so the recipe cannot be copied as written.
+
+`takes_terminal = false` says the command draws nothing and returns: a multiplexer pane (`tmux split-window`), or a GUI editor such as `code`, `cursor` or `zed`. Repon keeps its own screen for the whole of that child's run, so there is no teardown and no reclaim, and no flicker for a command that returns in milliseconds. That child's stdin, stdout and stderr are all `/dev/null`, which is what makes keeping the screen safe: a byte it wrote would land inside the frame Repon is still painting, and a stdin it shared would race the event thread that owns the terminal's input for keystrokes meant for Repon. Nothing else about the child changes: it starts in the entity's own working directory with the environment contract below, and `shell = true` still means what it means everywhere else here. Only the terminal is withheld, never the process group or the session, so the child stays an ordinary child of Repon rather than a daemon.
+
+Repon waits for it either way, because the declaration is that the command returns, and an exit status cannot be read without waiting. What differs is what a failure does. A Launcher that took the terminal wrote its own error onto the terminal the user was watching, so its non-zero exit needs nothing further. One that did not wrote to `/dev/null` and left no visible trace at all, so Repon raises a Notice naming it and its exit status; a child that could not be spawned raises the same Notice. Declaring `takes_terminal = false` on a command that never returns leaves Repon waiting on it with the screen held and no way to reach it, which is the price of a wrong declaration rather than a case Repon second-guesses.
+
+All four shipped defaults take the terminal, which is why `true` is the default. `from_env` is where the declaration earns its keep: `EDITOR="code --wait"` takes the terminal and `EDITOR=code` does not, and the resolved argv cannot be told apart from the outside, so the entry says which and Repon never infers it.
+
+Configure, do not detect. Repon does not read `$TMUX`, `$DISPLAY` or a terminal-program variable to work this out, and does not offer the choice at launch time. [0007](../adr/0007-launchers-are-argv-vectors.md) makes the argv vector the extension point the user writes, so detecting would have Repon guess at something the entry has already stated, and an offer is a decision point on a hot key for a preference that does not change between presses. That draws a line against the one thing Repon does sniff, `TERM=linux` selecting the `ascii` glyph set: sniff to fix a correctness failure the user cannot see, such as a mark that renders as a different mark, and do not sniff to second-guess a preference expressible in one config line.
 
 ## The environment contract
 
@@ -147,7 +156,7 @@ Every child, Launcher or Action step, receives:
 | `REPON_DEFAULT_BRANCH` | The resolved default branch | |
 | `REPON_ACTION` | The Action's name | Actions only, absent for a Launcher |
 
-An Unknown or Not applicable value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher. Not applicable matters on a Submodule row, where `base` and the default branch are settled facts rather than missing ones, and setting the variable would substitute a default branch [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records as wrong there. It matters again on `REPON_BRANCH`, which would otherwise carry an object id on 121 of the 163 measured Worktrees, so `git push -u origin "$REPON_BRANCH"` in a `shell = true` step would push a sha as a branch name; `REPON_HEAD` is where a step that wants the commit goes ([head.md](head.md)).
+An Unknown or Not applicable value means the variable is unset, never set to empty, so `${REPON_DEFAULT_BRANCH:-main}` behaves in a `shell = true` Launcher. Unknown matters on a Submodule row, where `state` and `base` are settled facts rather than missing ones ([#173](https://github.com/paulchiu/repon/issues/173)), and setting the variable would substitute a default branch [0012](../adr/0012-the-default-branch-is-a-remote-tracking-ref.md) already records as wrong there. It matters again on `REPON_BRANCH`, which would otherwise carry an object id on 121 of the 163 measured Worktrees, so `git push -u origin "$REPON_BRANCH"` in a `shell = true` step would push a sha as a branch name; `REPON_HEAD` is where a step that wants the commit goes ([head.md](head.md)).
 
 Repon unsets all fifteen of git's local environment variables from every child: `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_OBJECT_DIRECTORY`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_GRAFT_FILE`, `GIT_INDEX_FILE`, `GIT_NO_REPLACE_OBJECTS`, `GIT_REPLACE_REF_BASE`, `GIT_PREFIX`, `GIT_SHALLOW_FILE`, `GIT_COMMON_DIR`. That is the output of `git rev-parse --local-env-vars` on git 2.50.1, and git's own hook documentation instructs a caller to clear them before running git against another repository.
 
@@ -162,8 +171,11 @@ Repon exports nothing of its own selection state. `REPON_SET` stays an input var
 | `steps` | ordered list of step tables, required | Each step has `args`, and optionally `shell` and `env` |
 | `confirm` | bool, default `true` | Ask before fanning out |
 | `concurrency` | integer, default `4` | Entities in flight at once |
+| `when` | string, optional | A predicate in the Filter grammar ([filter.md](filter.md)), evaluated over already-settled Cells: how many of the Selection the palette counts this Action as applicable to ([actions.md](actions.md)) |
 
 Steps run in order and stop at the first failure, where failure is a nonzero exit. Gating is implicit, following GitHub Actions' shape: there is no `on_success` field to write, and a later step that ran is proof the earlier ones succeeded.
+
+`when` reuses [filter.md](filter.md)'s language rather than extending it, and is never a load error of any grade: that grammar is total, so an unrecognised term inside a `when` is advisory exactly as it is on the Filter line, and there is no entry for it under "Cross-key validity" below. An entry with no `when` is applicable everywhere, which is what an Action without one already meant. It narrows the count the palette shows and not the set the fan-out acts on; [actions.md](actions.md) settles the readings of the border title that count produces.
 
 `confirm = true` renders the count Repon already knows: `run "reinstall" on 12 repos?`. Concurrency is per-Action rather than global, because opening a shell and reinstalling dependencies across 99 Repos have nothing in common; 4 is the same number `fetch.concurrency` carries. [refresh.md](refresh.md)'s probe fan-out shape is separate and not configurable. The fan-out runs on its own pool rather than rayon's global one, because a step blocked in `wait()` removes a worker from that pool and a `concurrency` at or above the pool's thread count stops the refresh entirely; [actions.md](actions.md) carries the measurement.
 
@@ -284,6 +296,14 @@ from_env = "EDITOR"
 name = "log"
 args = ["git log --oneline -20 | less"]
 shell = true
+
+# tmux returns the instant the pane exists, so Repon keeps its screen rather than
+# tearing it down and reclaiming it for nothing.
+[[launcher]]
+name = "pane"
+args = ['tmux split-window -c "$REPON_REPO_PATH" lazygit']
+shell = true
+takes_terminal = false
 
 # Step two runs only if step one exited zero.
 [[action]]

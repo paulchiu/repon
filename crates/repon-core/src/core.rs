@@ -51,6 +51,7 @@ use crate::entity::{
 };
 use crate::environment;
 use crate::executor;
+use crate::filter::{Applicability, Filter};
 use crate::git;
 use crate::landing;
 use crate::patch_equivalence;
@@ -985,6 +986,20 @@ impl Core {
             .iter()
             .filter(|entity| entity.presence == Presence::Vanished)
             .count()
+    }
+
+    /// How an Action's `when` predicate divides the very rows [`Self::operable_count`]
+    /// counts: the identical partition runs first, so an excluded row is subtracted before
+    /// the predicate ever sees it and `when` narrows what is left rather than replacing that
+    /// subtraction
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate").
+    ///
+    /// The tally lives here rather than in the consumer for that reason alone:
+    /// `partition_operable` is this type's own, so a caller cannot count applicability over
+    /// a set the run would not act on.
+    pub fn applicability(&self, order: &[EntityKey], when: &Filter) -> Applicability {
+        when.applicability(self.partition_operable(order).0.iter())
     }
 
     /// `true` while one Action fan-out's steps are still running, the consumer-facing read
@@ -2880,9 +2895,9 @@ fn sweep_deadline(
             let cells: [&mut dyn TimeoutableCell; 6] =
                 [branch, sync, base, dirty, state, default_branch];
             for cell in cells {
-                // Only a cell actually marked in flight times out: a Repo or
-                // Submodule's `state` (`NotApplicable`, never probed) and any
-                // cell no probe yet reaches (`sync`, `base`) are never in
+                // Only a cell actually marked in flight times out: a Repo's or a
+                // Submodule's `state` (never probed, by `EntityState::probes_state`)
+                // and any cell no probe yet reaches (`sync`, `base`) are never in
                 // flight, so this never overwrites them with a lie.
                 if cell.is_in_flight() {
                     cell.time_out(*generation);
@@ -2934,8 +2949,9 @@ fn begin_probes(entity: &mut EntityState) {
     // refresh.md's "Scope and order" makes scope never a partial dial, so `dirty` carries
     // no `probes_state`-style condition of its own.
     dirty.begin_probe();
-    // Only a Worktree's `state` is ever (re)probed: a Repo or Submodule's is
-    // `NotApplicable` from construction, and marking it in flight here would
+    // Only a Worktree's `state` is ever (re)probed: a Repo's is `NotApplicable`
+    // and a Submodule's is `Unknown` from construction, neither ever revisited
+    // (`EntityState::probes_state`), and marking either in flight here would
     // leave it in-flight forever, since nothing would ever call `settle` on it.
     if probes_state {
         state.begin_probe();
@@ -5212,6 +5228,56 @@ mod tests {
             actually_ran,
             "operable_count must report exactly how many rows run_action actually ran a \
              step against, not merely how many keys resolved"
+        );
+    }
+
+    /// An excluded row is subtracted before an Action's `when` ever sees it, so the
+    /// predicate narrows what is left rather than replacing that subtraction
+    /// (`docs/spec/actions.md`'s "The Selection and the gate").
+    ///
+    /// Proven against `operable_count` itself rather than against a hand-written expectation:
+    /// a predicate every remaining row satisfies must leave a total identical to that count,
+    /// which it cannot do if the excluded row reached the tally under any of the three
+    /// headings.
+    #[test]
+    fn applicability_subtracts_an_excluded_row_before_the_predicate_reads_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let excluded_repo = root.join("excluded");
+        let normal_repo = root.join("normal");
+        init_repo_with_a_commit(&excluded_repo);
+        init_repo_with_a_commit(&normal_repo);
+
+        let core = Core::start(spec_with_overrides(
+            vec![root],
+            vec![RepoOverride {
+                path: excluded_repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        ));
+        let order: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        assert_eq!(order.len(), 2, "the fixture must discover both repos");
+
+        let counts = core.applicability(&order, &Filter::parse("kind:repo"));
+
+        assert_eq!(
+            counts.total(),
+            core.operable_count(&order),
+            "the predicate must be counted over exactly the rows `operable_count` keeps"
+        );
+        assert_eq!(
+            counts,
+            Applicability {
+                applicable: 1,
+                inapplicable: 0,
+                unresolved: 0,
+            }
         );
     }
 
@@ -7630,15 +7696,17 @@ mod tests {
         );
     }
 
-    /// A Submodule's `base` cell must stay `NotApplicable` through a real refresh
-    /// cycle, not only at construction: [`EntityState::probes_base`] is what stops
-    /// `refresh`'s dispatch from ever calling `probe_base` for it again. The
-    /// Submodule here is a real, valid repository with a real remote and a
-    /// resolvable default branch ahead of its own tip, so if the gate were
-    /// missing this would settle a genuine live count rather than merely fail to
-    /// open.
+    /// A Submodule's `state` and `base` cells must stay `Unknown` through a real
+    /// refresh cycle, not only at construction:
+    /// [`EntityState::probes_state`] and [`EntityState::probes_base`] are what
+    /// stop `refresh`'s dispatch from ever calling `landing::probe` or
+    /// `probe_base` for it again. The Submodule here is a real, valid repository
+    /// with a real remote and a resolvable default branch ahead of its own tip
+    /// (in fact an ancestor of it, so ancestry alone would prove `Merged`), so if
+    /// either gate were missing this would settle a genuine live answer rather
+    /// than merely fail to open.
     #[test]
-    fn a_submodules_base_cell_stays_not_applicable_through_a_real_refresh() {
+    fn a_submodules_state_and_base_cells_stay_unknown_through_a_real_refresh() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let parent = root.join("parent");
@@ -7688,11 +7756,20 @@ mod tests {
         assert!(
             matches!(
                 submodule_entity.base.settled(),
-                Some(Settled::NotApplicable)
+                Some(Settled::Unknown(Unknown::NoDefaultBranch))
             ),
-            "expected a Submodule's base to stay Not applicable through a real refresh, \
+            "expected a Submodule's base to stay Unknown through a real refresh, \
              got {:?}",
             submodule_entity.base.settled()
+        );
+        assert!(
+            matches!(
+                submodule_entity.state.settled(),
+                Some(Settled::Unknown(Unknown::NoDefaultBranch))
+            ),
+            "expected a Submodule's state to stay Unknown through a real refresh, \
+             rather than settling Merged off an untrusted default branch, got {:?}",
+            submodule_entity.state.settled()
         );
     }
 

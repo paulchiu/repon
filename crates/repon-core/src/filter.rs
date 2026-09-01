@@ -374,16 +374,40 @@ impl Filter {
         !self.terms.is_empty()
     }
 
+    /// This Filter's own Trilean against `entity`: every term ANDed, `True` for a Filter
+    /// carrying no terms at all, which is the identity the fold starts from.
+    fn evaluate(&self, entity: &EntityState) -> Trilean {
+        self.terms
+            .iter()
+            .map(|term| eval_term(term, entity))
+            .fold(Trilean::True, Trilean::and)
+    }
+
     /// Whether `entity` matches every term (terms always AND). Only a term's `True` counts;
     /// `Unprovable` never matches, so a row still being probed is excluded rather than shown
     /// on a guess.
     pub fn matches(&self, entity: &EntityState) -> bool {
-        let result = self
-            .terms
-            .iter()
-            .map(|term| eval_term(term, entity))
-            .fold(Trilean::True, Trilean::and);
-        matches!(result, Trilean::True)
+        matches!(self.evaluate(entity), Trilean::True)
+    }
+
+    /// How this Filter divides `entities`, for an Action's `when`
+    /// ([actions.md](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate"). Sits beside [`Self::matches`] rather than being folded
+    /// into it: the list collapses `Unprovable` to a non-match, where a count that has to be
+    /// honest while a Generation is in flight keeps it apart.
+    pub(crate) fn applicability<'a>(
+        &self,
+        entities: impl IntoIterator<Item = &'a EntityState>,
+    ) -> Applicability {
+        let mut counts = Applicability::default();
+        for entity in entities {
+            match self.evaluate(entity) {
+                Trilean::True => counts.applicable += 1,
+                Trilean::False => counts.inapplicable += 1,
+                Trilean::Unprovable => counts.unresolved += 1,
+            }
+        }
+        counts
     }
 
     /// Whether this Filter carries a non-negated `kind:` term explicitly naming `kind`,
@@ -397,6 +421,36 @@ impl Filter {
                 && term.key == Key::Kind
                 && term.values.iter().any(|value| value == kind_keyword(kind))
         })
+    }
+}
+
+/// How an Action's `when` predicate divides the rows it would operate on, once a `[[repo]]`
+/// `exclude = true` has already been subtracted: three counts and no verdict.
+///
+/// Unresolved is its own count rather than a share of either other one, because a Repo whose
+/// Cells have not settled is unprovable rather than inapplicable, and folding it into either
+/// side is [ADR 0001](https://github.com/paulchiu/repon/blob/main/docs/adr/0001-per-cell-provenance.md)'s
+/// absent value becoming a zero one abstraction up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Applicability {
+    /// Rows the predicate proved.
+    pub applicable: usize,
+    /// Rows the predicate disproved.
+    pub inapplicable: usize,
+    /// Rows the predicate could settle neither way, because a Cell it reads has not settled.
+    pub unresolved: usize,
+}
+
+impl Applicability {
+    /// Every row counted, whichever way it fell: the same number the excluded-row
+    /// subtraction produced, since `when` narrows that count rather than replacing it.
+    pub fn total(self) -> usize {
+        let Applicability {
+            applicable,
+            inapplicable,
+            unresolved,
+        } = self;
+        applicable + inapplicable + unresolved
     }
 }
 
@@ -740,5 +794,88 @@ mod tests {
         let repo = entity("alpha", Kind::Repo);
         assert!(Filter::parse("kind:worktree,repo").matches(&repo));
         assert!(!Filter::parse("kind:worktree,submodule").matches(&repo));
+    }
+
+    // --- an Action's `when`: the same predicate, counted three ways ---
+
+    /// The whole reason a `when` needs its own evaluation beside [`Filter::matches`]: a row
+    /// whose Cells have not settled is unprovable, which is neither applicable nor
+    /// inapplicable, and a count that folds it into either side is lying about a Generation
+    /// still in flight (`docs/spec/actions.md`'s "The Selection and the gate").
+    ///
+    /// The three rows are built so exactly one lands in each count, and `matches` is
+    /// asserted over the identical three in the same breath: the Filter line still collapses
+    /// unprovable to a non-match, and this ticket must not have moved it.
+    #[test]
+    fn applicability_counts_an_unsettled_row_apart_from_both_answers() {
+        let mut attached = entity("attached", Kind::Repo);
+        settle_branch(
+            &mut attached,
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: gix::hash::Kind::Sha1.null(),
+            },
+        );
+        let mut detached = entity("detached", Kind::Repo);
+        settle_branch(&mut detached, Head::Detached(gix::hash::Kind::Sha1.null()));
+        // Nothing settled it, so `head:` can read no value off it at all.
+        let loading = entity("loading", Kind::Repo);
+        let rows = [&attached, &detached, &loading];
+
+        let filter = Filter::parse("head:branch");
+
+        assert_eq!(
+            filter.applicability(rows),
+            Applicability {
+                applicable: 1,
+                inapplicable: 1,
+                unresolved: 1,
+            }
+        );
+        assert_eq!(
+            rows.iter().filter(|row| filter.matches(row)).count(),
+            1,
+            "`matches` must still count only the proved row, unprovable collapsing to a \
+             non-match exactly as the Filter line has always read it"
+        );
+    }
+
+    /// An Action declaring no `when` behaves exactly as one always did, which is what an
+    /// empty predicate has to mean: every row applicable, nothing unresolved, so the total
+    /// is the operable count untouched.
+    #[test]
+    fn an_empty_predicate_leaves_every_row_applicable_and_the_total_is_the_row_count() {
+        let loading = entity("loading", Kind::Repo);
+        let rows = [&entity("alpha", Kind::Repo), &loading];
+
+        let counts = Filter::parse("").applicability(rows);
+
+        assert_eq!(
+            counts,
+            Applicability {
+                applicable: 2,
+                inapplicable: 0,
+                unresolved: 0,
+            }
+        );
+        assert_eq!(counts.total(), 2);
+    }
+
+    /// An unrecognised term is advisory, never a failure grade: it is a fact about the text
+    /// typed rather than about a cell, so it settles every row inapplicable and leaves
+    /// nothing unresolved (`docs/spec/actions.md`: "a `when` naming an unrecognised term
+    /// takes the advisory treatment the Filter line already gives it").
+    #[test]
+    fn an_unrecognised_term_in_a_predicate_settles_rows_rather_than_leaving_them_unresolved() {
+        let rows = [&entity("alpha", Kind::Repo), &entity("beta", Kind::Repo)];
+
+        assert_eq!(
+            Filter::parse("is:banana").applicability(rows),
+            Applicability {
+                applicable: 0,
+                inapplicable: 2,
+                unresolved: 0,
+            }
+        );
     }
 }

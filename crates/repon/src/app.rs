@@ -11,7 +11,7 @@ use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot}
 use tracing::debug;
 
 use crate::{
-    action_palette::{ActionPalette, Decision, Entry, Run, Stage},
+    action_palette::{ActionPalette, Count, Decision, Entry, Narrowed, Run, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
@@ -1536,11 +1536,17 @@ impl App {
     /// one, so a test that builds a real one passes on a developer's machine and cannot run
     /// on CI at all; `launcher::run` under a real terminal is covered by the pty harness in
     /// `tests/terminal_restoration.rs`, the one place allowed to drive one.
-    fn run_handoff_over_entity<T>(
+    ///
+    /// A Launcher that kept the screen also gets its failure raised as a Notice
+    /// ([config.md](../../../docs/spec/config.md#launchers)): its child's own output went to
+    /// `/dev/null`, so nothing else would ever tell the user it failed. One that took the
+    /// terminal wrote its error onto the terminal the user was watching, and gets the log
+    /// line alone.
+    fn run_handoff_over_entity(
         &mut self,
         entity_key: &EntityKey,
         chosen: &Launcher,
-        handoff: impl FnOnce(&EntityState) -> Result<T>,
+        handoff: impl FnOnce(&EntityState) -> Result<std::process::ExitStatus>,
     ) {
         let Some(entity) = self
             .core
@@ -1552,23 +1558,29 @@ impl App {
             return;
         };
         let result = self.around_entity_handoff(entity_key, || handoff(&entity));
-        if let Err(err) = result {
+        if let Err(err) = &result {
             tracing::error!("Launcher {:?} failed: {err:#}", chosen.name);
+        }
+        if let Some(failure) = handoff_failure(&result)
+            && !chosen.takes_terminal
+        {
+            self.set_notice(kept_screen_launcher_failure_notice(&chosen.name, &failure));
         }
     }
 
-    /// How many entities a choice made right now would actually run against: the
-    /// Selection narrowed by [`repon_core::Core::operable_count`], which is the same
-    /// partition the fan-out itself uses, so the border title can never show a number a
-    /// real choice would not act on. `None` while no palette is open.
-    fn action_palette_operable_count(&self) -> Option<usize> {
+    /// What the Action palette's border title counts right now: how many entities a choice
+    /// made this instant would actually run against, which is the Selection narrowed by
+    /// [`repon_core::Core::operable_count`]'s own partition, the same one the fan-out uses,
+    /// so the border title can never show a number a real choice would not act on. `None`
+    /// while no palette is open.
+    fn action_palette_count(&self) -> Option<Count> {
         let palette = self.action_palette.as_ref()?;
         // A live gate's own count, so the border and the gate can never name two numbers.
         if let Some(plan) = &self.management_plan {
-            return Some(plan.eligible_count());
+            return Some(Count::selection(plan.eligible_count()));
         }
         let Some(cursor_key) = self.cursor_key() else {
-            return Some(0);
+            return Some(Count::selection(0));
         };
         let targets = self.selection.targets(&cursor_key);
         Some(match palette.highlighted(&self.document.actions) {
@@ -1576,11 +1588,35 @@ impl App {
             // `operable_count` subtracts: `unignore`'s eligible set is exactly the
             // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
             // operations table), which the Action gate's own subtraction would zero.
-            Some(Entry::Builtin(operation)) => self
-                .management_plan_for(operation, &targets)
-                .eligible_count(),
-            Some(Entry::Configured(_)) | None => self.core.operable_count(&targets),
+            Some(Entry::Builtin(operation)) => Count::selection(
+                self.management_plan_for(operation, &targets)
+                    .eligible_count(),
+            ),
+            Some(Entry::Configured(_)) | None => self.narrowed_count(palette, &targets),
         })
+    }
+
+    /// [`Self::action_palette_count`]'s configured half: the operable count, narrowed by the
+    /// entry in hand's own `when` when it declares one
+    /// ([actions.md](../../docs/spec/actions.md)'s "The Selection and the gate").
+    /// [`repon_core::Core::applicability`] runs the identical excluded-row partition
+    /// `operable_count` does, so the total it reports is that same count and the predicate
+    /// only ever narrows what is left of it.
+    fn narrowed_count(&self, palette: &ActionPalette, targets: &[EntityKey]) -> Count {
+        let when = palette
+            .narrowing_entry(&self.document.actions)
+            .and_then(|action| Some((action, action.when.as_deref()?)));
+        let Some((action, when)) = when else {
+            return Count::selection(self.core.operable_count(targets));
+        };
+        let applicability = self.core.applicability(targets, &Filter::parse(when));
+        Count {
+            operable: applicability.total(),
+            narrowed: Some(Narrowed {
+                label: action.name.get_ref().clone(),
+                applicability,
+            }),
+        }
     }
 
     /// The cheap half of a built-in's gate: eligibility read from the snapshot, with no risk
@@ -2097,7 +2133,7 @@ impl App {
         // The identical computation `Self::choose_highlighted_action` reads, taken once up
         // front so the border title can never show a different number than a real choice
         // would act on.
-        let action_palette_operable_count = self.action_palette_operable_count();
+        let action_palette_count = self.action_palette_count();
         // Read from the plan the gate was built with, never rebuilt here: a `delete` gate's
         // own risk read costs a git read per Repo, and a frame must not pay it.
         let management_lines: Vec<String> = self
@@ -2107,7 +2143,7 @@ impl App {
             .unwrap_or_default();
         // The identical read `Self::choose_highlighted_launcher` does: the resolved Launcher
         // list and the cursor row's own name, computed once here for the same reason
-        // `action_palette_operable_count` is, so the border title can never name a different
+        // `action_palette_count` is, so the border title can never name a different
         // Entity than a real choice would act on.
         let launcher_palette_view = self.launcher_palette.as_ref().map(|_| {
             let launchers = launcher::resolve(&self.document);
@@ -2149,7 +2185,7 @@ impl App {
                 &self.theme,
                 Run {
                     actions: &self.document.actions,
-                    operable_count: action_palette_operable_count.unwrap_or(0),
+                    count: action_palette_count.unwrap_or_else(|| Count::selection(0)),
                     management_lines: &management_lines,
                 },
                 self.glyphs,
@@ -2275,6 +2311,24 @@ impl App {
         }
         error
     }
+}
+
+/// The one-line failure text a handoff's outcome carries, or `None` for a child that ran and
+/// exited zero. A child that could not be spawned and one that ran and failed are the same
+/// answer to the only question a Launcher's caller asks of it.
+fn handoff_failure(result: &Result<std::process::ExitStatus>) -> Option<String> {
+    match result {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(status.to_string()),
+        Err(err) => Some(err.to_string()),
+    }
+}
+
+/// The Notice a failed Launcher that kept the screen raises
+/// ([config.md](../../../docs/spec/config.md#launchers)): the only channel it has, since its
+/// child wrote to `/dev/null` and Repon's own screen never left.
+fn kept_screen_launcher_failure_notice(name: &str, failure: &str) -> String {
+    format!("launcher `{name}` failed: {failure}")
 }
 
 /// The Notice [`App::restore_session_state`] raises for a Filter that restores active,
@@ -3038,7 +3092,7 @@ mod tests {
                 &buf,
                 whole_frame,
                 glyphs.border,
-                &ActionPalette::border_title(0),
+                &ActionPalette::border_title(&Count::selection(0)),
                 "the Action palette App drew",
             );
             app.action_palette = None;
@@ -3467,6 +3521,24 @@ mod tests {
     // other tests). Each answers with a Notice instead of the silence it gives today.
     // =====================================================================================
 
+    /// An Action carrying an applicability predicate, the one field the palette's border
+    /// title reads for anything beyond the Selection count. `confirm` is left on, so nothing
+    /// here runs a step.
+    fn action_with_when(name: &str, when: &str) -> document::ActionConfig {
+        document::ActionConfig {
+            name: toml::Spanned::new(0..0, name.to_string()),
+            description: None,
+            steps: vec![document::StepConfig {
+                args: vec!["true".to_string()],
+                shell: false,
+                env: std::collections::BTreeMap::new(),
+            }],
+            confirm: true,
+            concurrency: 4,
+            when: Some(when.to_string()),
+        }
+    }
+
     /// An Action whose one step sleeps long enough for a test to act on
     /// `Core::run_action`'s own synchronous `action_running` flip before the fan-out settles.
     fn slow_action(name: &str) -> document::ActionConfig {
@@ -3480,6 +3552,7 @@ mod tests {
             }],
             confirm: false,
             concurrency: 1,
+            when: None,
         }
     }
 
@@ -3619,6 +3692,57 @@ mod tests {
             confirming.contains("unignore on 1 repos?"),
             "and the gate itself counts it too, got:\n{confirming}"
         );
+    }
+
+    /// An Action's `when` reaching the border title on a real frame, over a Selection whose
+    /// excluded row has already been subtracted: the predicate narrows what is left of that
+    /// count rather than replacing the subtraction
+    /// ([actions.md](../../docs/spec/actions.md)'s "The Selection and the gate").
+    ///
+    /// Three entries over the same two-row fixture, so the numbers move for the predicate
+    /// alone: `kind:repo` holds on the one operable row, `kind:worktree` holds on neither,
+    /// and an entry declaring no predicate at all leaves the title exactly the Selection
+    /// count it has always been. A title built from the Selection instead would read `2` on
+    /// the first two, and one that never subtracted the excluded row would read `of 2`.
+    #[test]
+    fn an_actions_when_narrows_the_border_title_and_its_absence_leaves_it_as_it_was() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let excluded = root.join("repo-excluded");
+        init_repo(&excluded);
+        init_repo(&root.join("repo-operable"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: excluded.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        let visible = app.visible_keys();
+        assert_eq!(visible.len(), 2, "the fixture must discover both repos");
+        app.selection.select_all_visible(&visible);
+
+        for (predicate, expected) in [
+            (Some("kind:repo"), "run \"reinstall\" on 1 of 1 selected"),
+            (
+                Some("kind:worktree"),
+                "run \"reinstall\" on 0 of 1 selected",
+            ),
+            (None, "run on 1 repos"),
+        ] {
+            app.document.actions = vec![match predicate {
+                Some(predicate) => action_with_when("reinstall", predicate),
+                None => action_config("reinstall", true, &root.join("unused")),
+            }];
+            app.action_palette = Some(ActionPalette::new());
+            let frame = render_to_lines(&mut app, 80, 24).join("\n");
+            assert!(
+                frame.contains(expected),
+                "expected the border title to read {expected:?} under {predicate:?}, \
+                 got:\n{frame}"
+            );
+        }
     }
 
     /// The mirror of the above: `ignore` over a row that is already excluded is refused, and
@@ -3884,7 +4008,7 @@ mod tests {
                     &app.theme,
                     Run {
                         actions: &app.document.actions,
-                        operable_count: 1,
+                        count: Count::selection(1),
                         management_lines: &[],
                     },
                     app.glyphs,
@@ -4684,6 +4808,7 @@ mod tests {
             }],
             confirm: false,
             concurrency: 1,
+            when: None,
         }
     }
 
@@ -6781,6 +6906,7 @@ mod tests {
             }],
             confirm,
             concurrency: 4,
+            when: None,
         }
     }
 
@@ -6799,6 +6925,7 @@ mod tests {
             }],
             confirm: false,
             concurrency: 4,
+            when: None,
         }
     }
 
@@ -6881,6 +7008,7 @@ mod tests {
             args: Some(args.into_iter().map(str::to_string).collect()),
             from_env: None,
             shell: false,
+            takes_terminal: true,
             env: Default::default(),
             disabled,
         }
@@ -7357,6 +7485,111 @@ mod tests {
         );
     }
 
+    /// A resolved Launcher with a literal argv, its terminal declaration the one thing a
+    /// caller varies.
+    fn resolved_launcher(name: &str, args: Vec<&str>, takes_terminal: bool) -> Launcher {
+        Launcher {
+            name: name.to_string(),
+            source: launcher::Source::Args(args.into_iter().map(str::to_string).collect()),
+            shell: false,
+            takes_terminal,
+            env: Default::default(),
+        }
+    }
+
+    /// Runs `chosen`'s handoff over the first row of an `App` on a fresh repository and
+    /// returns the Notice it left behind. The child's argv reaches a real process; only the
+    /// terminal-owning half is stood in for, since `Tui::new` cannot be built without a
+    /// controlling terminal.
+    fn notice_after_handoff(root: &std::path::Path, chosen: &Launcher) -> Option<String> {
+        let mut app = test_app(root);
+        let entity_key = app
+            .core
+            .snapshot()
+            .entities
+            .first()
+            .expect("one discovered row")
+            .key
+            .clone();
+        app.run_handoff_over_entity(&entity_key, chosen, |entity| {
+            Ok(launcher::build_command(chosen, entity).status()?)
+        });
+        app.notice().map(str::to_string)
+    }
+
+    // config.md's "Launchers": a Launcher that kept the screen wrote its own output to
+    // /dev/null, so its failure has no other channel and Repon raises a Notice naming it and
+    // its exit status.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_failed_raises_a_notice_naming_it_and_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("pane", vec!["false"], false))
+            .expect("a failed launcher that kept the screen must raise a Notice");
+
+        assert!(
+            notice.contains("pane"),
+            "the Notice must name the Launcher that failed, got: {notice:?}"
+        );
+        assert!(
+            notice.contains('1'),
+            "the Notice must carry the child's own exit status, got: {notice:?}"
+        );
+    }
+
+    // The same failure, on a Launcher that took the terminal: no Notice, because the child
+    // wrote its error onto the terminal the user was watching. Proven separately, so a build
+    // that raised the Notice for every failure would still fail here.
+    #[test]
+    fn a_launcher_that_took_the_terminal_and_failed_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("shell", vec!["false"], true));
+
+        assert_eq!(
+            notice, None,
+            "a Launcher that took the terminal showed the user its own error already"
+        );
+    }
+
+    // A Launcher that kept the screen and exited zero says nothing: the Notice reports a
+    // failure, not a run.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_succeeded_raises_no_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(&root, &resolved_launcher("pane", vec!["true"], false));
+
+        assert_eq!(notice, None, "a successful run is not a failure to report");
+    }
+
+    // A child that could never be spawned is the same answer as one that ran and failed, and
+    // reaches the user the same way: the terminal was never handed over either time, so the
+    // spawn error itself has nowhere else to appear.
+    #[test]
+    fn a_launcher_that_kept_the_screen_and_could_not_be_spawned_raises_the_same_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let notice = notice_after_handoff(
+            &root,
+            &resolved_launcher("pane", vec!["repon-test-binary-that-does-not-exist"], false),
+        )
+        .expect("a launcher that could not be spawned must raise a Notice too");
+
+        assert!(
+            notice.contains("pane"),
+            "the Notice must name the Launcher that failed, got: {notice:?}"
+        );
+    }
+
     #[test]
     fn cancel_closes_the_action_palette_without_choosing_anything() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7483,7 +7716,7 @@ mod tests {
             .expect("open the palette");
 
         assert_eq!(
-            app.action_palette_operable_count(),
+            app.action_palette_count().map(|count| count.operable),
             Some(2),
             "three selected rows with one excluded must count two, not three and not one"
         );

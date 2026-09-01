@@ -60,6 +60,14 @@ name = "log"
 args = ["git log --oneline -20 | less"]
 shell = true
 
+# tmux returns the instant the pane exists, so Repon keeps its screen rather than
+# tearing it down and reclaiming it for nothing.
+[[launcher]]
+name = "pane"
+args = ['tmux split-window -c "$REPON_REPO_PATH" lazygit']
+shell = true
+takes_terminal = false
+
 # Step two runs only if step one exited zero.
 [[action]]
 name = "reinstall"
