@@ -375,6 +375,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::layout::Size;
+    use repon_core::liveness::wait_for;
 
     use super::*;
     use crate::{
@@ -956,19 +957,6 @@ mod tests {
     // discriminator that tells a computed reason from a fixed one.
     // =====================================================================================
 
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if condition() {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     /// An Action whose one step sleeps long enough for a test to observe
     /// `Core::action_running() == true` and act on it before the fan-out settles.
     fn slow_action_spec() -> repon_core::ActionSpec {
@@ -1028,9 +1016,9 @@ mod tests {
             "expected a Notice naming the run in progress rather than silence or a real switch"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
     }
 
@@ -1071,9 +1059,10 @@ mod tests {
              different texts, not one fixed string for SwitchToSet as a whole"
         );
 
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
+        );
     }
 
     // =====================================================================================
