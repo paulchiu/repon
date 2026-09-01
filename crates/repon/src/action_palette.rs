@@ -1126,21 +1126,32 @@ mod tests {
         );
     }
 
-    /// The dropped requirement must stay recorded as an open want, not silently disappear:
-    /// [`docs/spec/actions.md`] carries it under "Not built" as something that "stays open
-    /// rather than settled as never."
+    /// The dropped requirement must not silently disappear. It is no longer an open want:
+    /// applicability returns as a predicate in the Filter grammar, so actions.md records the
+    /// answer rather than the gap, and the register entry that tracked it is gone.
     #[test]
-    fn actions_md_still_records_the_per_repo_defining_count_as_an_open_want() {
+    fn actions_md_records_the_settled_answer_for_per_repo_applicability() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let actions_md = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
             .expect("read docs/spec/actions.md");
         assert!(
-            actions_md.contains("Per-Repo Action applicability"),
-            "expected actions.md to still name the dropped requirement"
+            actions_md.contains("Per-Repo applicability"),
+            "expected actions.md to still name the requirement"
         );
         assert!(
-            actions_md.contains("stays open rather than settled as never"),
-            "expected actions.md to still record it as an open want, not settled as never"
+            actions_md.contains("Filter grammar"),
+            "expected actions.md to name the Filter grammar as where applicability comes from"
+        );
+        assert!(
+            !actions_md.contains("stays open rather than settled as never"),
+            "actions.md still records applicability as an open want, which it no longer is"
+        );
+
+        let register = std::fs::read_to_string(manifest_dir.join("../../docs/open-questions.md"))
+            .expect("read docs/open-questions.md");
+        assert!(
+            !register.contains("## Per-Repo Action applicability"),
+            "the register keeps an entry its owning document has now answered"
         );
     }
 
