@@ -74,12 +74,12 @@ fn message_item(
     })
 }
 
-/// The `!` plus the count of outstanding warnings, reserved out of the row's budget before
-/// any item is laid out and drawn whether or not rank 2's message survives; `None`, costing
-/// no columns, with nothing outstanding
+/// The bracketed count of outstanding warnings, reserved out of the row's budget before any
+/// item is laid out and drawn whether or not rank 2's message survives; `None`, costing no
+/// columns, with nothing outstanding
 /// ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
 fn indicator(warnings: &[Warning]) -> Option<String> {
-    (!warnings.is_empty()).then(|| format!("!{}", warnings.len()))
+    (!warnings.is_empty()).then(|| format!("[{}]", warnings.len()))
 }
 
 /// [`render`]'s selection: the reserved indicator, if any, and the surviving items already
@@ -210,7 +210,7 @@ mod tests {
         // "work 403 entities" alone is 17 columns, wider than this width; even the reserved
         // indicator's own budget leaves nothing for it.
         let rendered = render(&content, &bindings(), 5).to_string();
-        assert_eq!(rendered, "!1");
+        assert_eq!(rendered, "[1]");
         assert!(
             !rendered.contains("entities"),
             "the entity count must not survive at this width, got {rendered:?}"
@@ -255,7 +255,7 @@ mod tests {
             "reserving the indicator's own columns must leave less room for rank 1 at the \
              identical width, proving the reservation was truly free when absent"
         );
-        assert!(with_indicator.starts_with('!'));
+        assert!(with_indicator.starts_with('['));
         assert!(
             with_indicator.chars().count() <= width as usize,
             "must never overrun the given width, got {with_indicator:?}"
@@ -293,7 +293,7 @@ mod tests {
             "the message must leave the row once acknowledged, got {after:?}"
         );
         assert!(
-            before.starts_with("!1") && after.starts_with("!1"),
+            before.starts_with("[1]") && after.starts_with("[1]"),
             "the indicator must keep its full count either way: before {before:?}, after \
              {after:?}"
         );
@@ -322,11 +322,11 @@ mod tests {
         let after = render(&after_a_new_condition_arrives, &bindings(), 150).to_string();
 
         assert_eq!(
-            before, "!1 work 403 entities",
+            before, "[1] work 403 entities",
             "sanity: with everything acknowledged and nothing new, the message stays gone"
         );
         assert!(
-            after.starts_with("!2"),
+            after.starts_with("[2]"),
             "the indicator must count both outstanding conditions, got {after:?}"
         );
         assert!(
@@ -495,8 +495,8 @@ mod tests {
     }
 
     /// The acknowledged ladder is [actions.md](../../../../docs/spec/actions.md#the-run-on-screen)'s
-    /// own published ladder, shifted three columns by the reserved indicator, plus the
-    /// 2-column floor [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)
+    /// own published ladder, shifted four columns by the reserved indicator, plus the
+    /// 3-column floor [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)
     /// states in prose rather than a block.
     #[test]
     fn status_row_matches_the_acknowledged_ladder_derived_from_the_headers_own_published_widths() {
@@ -520,8 +520,8 @@ mod tests {
         let bindings = bindings();
 
         for (header_width, header_text) in header_rows {
-            let width = header_width + 3;
-            let expected = format!("!1 {header_text}");
+            let width = header_width + 4;
+            let expected = format!("[1] {header_text}");
             assert_eq!(
                 render(&content, &bindings, width as u16).to_string(),
                 expected,
@@ -529,8 +529,8 @@ mod tests {
             );
         }
 
-        // The 2-column floor layout-and-provenance.md states in prose: the indicator alone.
-        assert_eq!(render(&content, &bindings, 2).to_string(), "!1");
+        // The 3-column floor layout-and-provenance.md states in prose: the indicator alone.
+        assert_eq!(render(&content, &bindings, 3).to_string(), "[1]");
     }
 
     // --- draw wires render into the buffer at the right row, indicator and rest styled
@@ -586,14 +586,14 @@ mod tests {
 
         let warn_style = theme_mod::DEFAULT.style_for(theme_mod::Role::Warn);
         let dim_style = theme_mod::DEFAULT.style_for(theme_mod::Role::Dim);
-        assert_eq!(buf[(0, 0)].style().fg, warn_style.fg, "indicator's own `!`");
+        assert_eq!(buf[(0, 0)].style().fg, warn_style.fg, "indicator's own `[`");
         assert_eq!(
             buf[(1, 0)].style().fg,
             warn_style.fg,
             "indicator's own count"
         );
         assert_eq!(
-            buf[(3, 0)].style().fg,
+            buf[(4, 0)].style().fg,
             dim_style.fg,
             "rank 1 after the indicator"
         );

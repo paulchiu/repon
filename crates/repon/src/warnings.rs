@@ -833,11 +833,11 @@ mod tests {
 
         let (floor_width, floor) = ladder.last().expect("the ladder has rungs");
         assert!(
-            floor.starts_with('!') && floor.chars().count() == *floor_width,
+            floor.starts_with('[') && floor.chars().count() == *floor_width,
             "the narrowest rung is the reserved indicator alone, got `{floor}`"
         );
         assert!(
-            ladder.iter().all(|(_, rendered)| rendered.starts_with('!')),
+            ladder.iter().all(|(_, rendered)| rendered.starts_with('[')),
             "the indicator is reserved ahead of every item, so no rung may drop it"
         );
     }
@@ -892,11 +892,11 @@ mod tests {
 
         let shifted: Vec<String> = header
             .iter()
-            .map(|(width, _)| (width + 3).to_string())
+            .map(|(width, _)| (width + 4).to_string())
             .collect();
         let layout = spec("layout-and-provenance.md");
         let stated = layout
-            .split("shifted three columns by the reserved indicator: ")
+            .split("shifted four columns by the reserved indicator: ")
             .nth(1)
             .expect("layout-and-provenance.md states the acknowledged ladder")
             .split(", and the same")
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(
             stated,
             shifted.join(", "),
-            "the acknowledged ladder must be the header's own plus the indicator's three columns"
+            "the acknowledged ladder must be the header's own plus the indicator's four columns"
         );
     }
 

@@ -6254,7 +6254,7 @@ mod tests {
             "the message must leave the row once acknowledged, got {after:?}"
         );
         assert!(
-            before.starts_with("!1") && after.starts_with("!1"),
+            before.starts_with("[1]") && after.starts_with("[1]"),
             "the indicator must keep its own full count either way: before {before:?}, after \
              {after:?}"
         );
@@ -6277,7 +6277,7 @@ mod tests {
             .expect("press w to acknowledge the one outstanding warning");
         let acknowledged_only = status_row_text(&mut app, 150);
         assert!(
-            acknowledged_only.starts_with("!1") && !acknowledged_only.contains("unknown"),
+            acknowledged_only.starts_with("[1]") && !acknowledged_only.contains("unknown"),
             "sanity: the message must be gone once the only warning is acknowledged, got \
              {acknowledged_only:?}"
         );
@@ -6285,7 +6285,7 @@ mod tests {
         app.config_warnings = vec![document::Warning::SetNamedAll];
         let after = status_row_text(&mut app, 150);
         assert!(
-            after.starts_with("!2"),
+            after.starts_with("[2]"),
             "the indicator must count both outstanding conditions, got {after:?}"
         );
         assert!(

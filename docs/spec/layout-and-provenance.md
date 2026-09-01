@@ -28,7 +28,7 @@ A live Notice takes the whole row, alone, and nothing else is drawn while one st
 
 Otherwise the row is **one list of items**, degraded by one drop table, under the mechanics [keybindings.md](keybindings.md#the-footer)'s fourth footer rule fixes for every degrading line in Repon: the ` ...` ellipsis reserved inside the budget rather than appended after it, every item width-checked including the first, and the last surviving item dropping the ellipsis rather than itself. This row's separator is ` · `. A warning is an item in that list, not a surface competing with the header for the row.
 
-The **warning indicator** is `!` and the count of outstanding warnings, and it is reserved out of the budget before any item is laid out, so it is the one thing on this row that can never be dropped. It sits at the head of the row, before the first surviving item, and it is drawn whether or not the message below it survives; with nothing outstanding it is absent and costs no columns. `!` carries no provenance meaning here: [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) scopes the disjoint-glyph rule to the row interior, and this row is above the frame.
+The **warning indicator** is `[N]`, a bracketed count of outstanding warnings, and it is reserved out of the budget before any item is laid out, so it is the one thing on this row that can never be dropped. It sits at the head of the row, before the first surviving item, and it is drawn whether or not the message below it survives; with nothing outstanding it is absent and costs no columns. Brackets are not used as a status glyph anywhere else on this row, which is what stops the indicator reading as a Set or launcher badge: `!` shares its meaning with the Failed gutter mark and, above the frame, with the Launcher's own opening key and query prefix ([0026](../adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)'s amendment).
 
 Priority, after the indicator is reserved:
 
@@ -52,17 +52,17 @@ Rank 1 names the **active Set**, where the program's own name used to sit: `work
 One warning outstanding and unacknowledged, a run in flight, so every item is live:
 
 ```
-157  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
-151  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
-117  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
- 96  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
- 85  !1 work 403 entities · theme `solarized-dark` named in config.toml does not exist ...
- 24  !1 work 403 entities ...
- 20  !1 work 403 entities
-  2  !1
+158  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
+152  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
+118  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
+ 97  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
+ 86  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist ...
+ 25  [1] work 403 entities ...
+ 21  [1] work 403 entities
+  3  [1]
 ```
 
-Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted three columns by the reserved indicator: 96, 90, 56, 35, 24, 20, and the same 2-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
+Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted four columns by the reserved indicator: 97, 91, 57, 36, 25, 21, and the same 3-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
 
 ## The list
 
