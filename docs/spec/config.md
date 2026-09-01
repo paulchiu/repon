@@ -52,7 +52,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
 | `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
 | `notice_timeout` | humantime string | `"3s"` | How long a Notice stays on the status row ([theming.md](theming.md)). `"0s"` turns the timer off, not Notices: the next keypress or a replacement still clears one. There is no key that disables Notices, since a refusal nobody is told about is the defect [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) exists to remove |
-| `on_refresh` | string | unset | Names one declared `[[action]]` to run after a Refresh the user asked for, `r` and `R` alone ([actions.md](actions.md)'s "The refresh hook", [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)). A bare scalar rather than a table, since it is about the whole program and names one thing |
+| `on_refresh` | string | unset | Names one declared `[[action]]` to run after a Refresh the user asked for, `r` and `R` alone ([actions.md](actions.md)'s "The refresh hook", [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)). A bare scalar rather than a table, since it is about the whole program and names one thing. It fires unattended on that keypress with no confirm gate, whatever the named Action's own `confirm` says, so an Action that destroys anything does not belong in it |
 
 `glyphs`'s default is the one conditional value on this page: `ascii` when the process environment has `TERM=linux`, `full` for every other value, absent included. An explicit `glyphs` in the file always wins over the conditional default, in both directions, since pinning it either way is the whole point of writing it down. The signal is capped at this one check on purpose: the Linux console's own fallback substitution table is fixed and knowable ([0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)), where a terminal emulator's is not, so no table of emulator names is ever read to make this decision.
 
@@ -271,13 +271,14 @@ name = "dev"
 roots = ["~/dev", "~/dev-misc"]
 
 # One client, minus the graveyard. Globs are case-sensitive. Its own on_refresh
-# runs reinstall instead of the top-level sync while this Set is active.
+# names sync explicitly, so a later edit to the top-level default cannot retarget
+# this Set's refresh key by accident.
 [[set]]
 name = "work"
 roots = ["~/dev"]
 include = ["**/acme/**"]
 exclude = ["**/archive/**", "**/node_modules/**"]
-on_refresh = "reinstall"
+on_refresh = "sync"
 
 # origin/HEAD on this one still says master; pin it.
 [[repo]]

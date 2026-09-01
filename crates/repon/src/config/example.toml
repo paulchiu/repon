@@ -29,13 +29,14 @@ name = "dev"
 roots = ["~/dev", "~/dev-misc"]
 
 # One client, minus the graveyard. Globs are case-sensitive. Its own on_refresh
-# runs reinstall instead of the top-level sync while this Set is active.
+# names sync explicitly, so a later edit to the top-level default cannot retarget
+# this Set's refresh key by accident.
 [[set]]
 name = "work"
 roots = ["~/dev"]
 include = ["**/acme/**"]
 exclude = ["**/archive/**", "**/node_modules/**"]
-on_refresh = "reinstall"
+on_refresh = "sync"
 
 # origin/HEAD on this one still says master; pin it.
 [[repo]]
