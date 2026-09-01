@@ -114,6 +114,8 @@ gix checks the flag once per index entry, so one Repo stops in 0.5 to 0.9ms, and
 
 Per-entry polling means a walk short enough to run out of entries between the flag flipping and the walk finishing can still return `Ok`, not an error: cancellation observed genuinely mid-read is not guaranteed to surface as gix's own error. The error is therefore not the mechanism that keeps a cancelled read from landing. `Core::probe_status` owns the same flag it handed to gix and re-checks it once the read returns, on the `Ok` arm as well as the `Err` one, and drops either result the same way once `cancel` reads true. A cancelled generation's read can finish and answer `Ok`; it is this re-check, not gix's own interruption, that stops it from being settled.
 
+An entity's in-flight entry belongs to the generation that dispatched it. A cancelled probe still runs to completion, so one arriving late clears that entry only if its own generation still owns it. Clearing it by entity alone deletes the newer generation's entry, and Supersession above then finds no flag to set, so the newer generation's own probe runs on uncancelled and nothing is left for the deadline sweep to time out.
+
 ## The generation deadline
 
 There is no per-cell timeout. A rayon task cannot be pre-empted, so a per-cell deadline could only mark a cell while the work carried on underneath it, and a probe that is still running has not asked and got nothing back, which is what Unknown means under [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md). Instead a generation is cancelled after 30 seconds, comfortably clear of the measured 4.4 second full probe, and every cell still Loading in that generation becomes Unknown at that moment.
