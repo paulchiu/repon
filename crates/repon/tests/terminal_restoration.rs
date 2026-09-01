@@ -4,15 +4,18 @@
 //! `termios` call or a real panic unwind, and no crate on the dependency allowlist opens a
 //! pty, so this reaches four POSIX functions directly via `extern "C"`.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_int, c_ulong};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use repon_core::liveness::{backstop, wait_for_or};
 
 // Safety contract: every call site below passes a valid, currently-open fd and, for
 // `ptsname_r`, a buffer at least as long as the `buflen` it also passes; for `ioctl`, a
@@ -58,6 +61,40 @@ struct Winsize {
 const TIOCSWINSZ: c_ulong = 0x8008_7467;
 #[cfg(target_os = "linux")]
 const TIOCSWINSZ: c_ulong = 0x5414;
+
+/// How often the warning test re-reads the pty for its next chunk. An interval, never a
+/// deadline: the wait it sits inside is backstopped by `liveness::wait_for_or`.
+const CHUNK_POLL: Duration = Duration::from_millis(50);
+
+/// How long the same test keeps draining after the child has already exited, waiting on the
+/// pty to close rather than on anything to happen.
+const DRAIN_POLL: Duration = Duration::from_millis(200);
+
+/// Blocks until `child` exits, killing it and failing the test if it never does.
+///
+/// `what` names the invocation, so a run that hangs says which one. Every test in this file
+/// spawns a real binary against a real pty, which is the slowest thing this workspace waits
+/// on and so the wait most easily defeated by a five-second deadline of its own.
+fn wait_for_exit(child: &mut Child, what: &str) -> ExitStatus {
+    let child = RefCell::new(child);
+    let exited = Cell::new(None);
+    wait_for_or(
+        &format!("{what} to exit"),
+        || {
+            exited.set(child.borrow_mut().try_wait().expect("poll child status"));
+            exited.get().is_some()
+        },
+        || {
+            let mut child = child.borrow_mut();
+            let _ = child.kill();
+            let _ = child.wait();
+            "refusing to trust a hung process's terminal state".to_string()
+        },
+    );
+    exited
+        .get()
+        .expect("the wait returns only once the child has exited")
+}
 
 /// Opens a fresh pseudo-terminal pair and returns the master end, already unlocked and
 /// granted, plus the slave's device path. The window size is not set here: on this
@@ -166,8 +203,8 @@ fn wifstopped(status: c_int) -> bool {
 }
 
 /// Spawns `repon` with `args` and `envs` over a real pty, drains the pty concurrently with
-/// the child (the same reason every test above does its own draining), waits up to 5s, and
-/// returns the exit status alongside everything the child wrote. Shared by the handoff tests
+/// the child (the same reason every test above does its own draining), waits for it to exit,
+/// and returns the exit status alongside everything the child wrote. Shared by the handoff tests
 /// below, which only care about the final output and exit code rather than an intermediate
 /// state like `suspend_restores_the_terminal_before_the_process_actually_stops` does.
 fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
@@ -187,24 +224,10 @@ fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStat
         let _ = output_tx.send(output);
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "repon {args:?} did not exit within 5s; refusing to trust a hung process's \
-                 terminal state"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_exit(&mut child, &format!("repon {args:?}"));
 
     let output = output_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(backstop())
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     (status, String::from_utf8_lossy(&output).into_owned())
@@ -224,8 +247,9 @@ fn indices_of(haystack: &str, needle: &str) -> Vec<usize> {
 /// test alone and 156 of the whole file at up to twelve concurrent copies. Four causes were
 /// ruled out with evidence, so the next investigator can start past them: the assertions hold
 /// no raw descriptor or pid a concurrent actor could reuse; the seven ANSI sequences searched
-/// for are pairwise non-overlapping; the two 5s budgets below are not tight, the whole file
-/// finishing in 1.5s worst case under heavier load than CI applies; and the reader's `Err`
+/// for are pairwise non-overlapping; the two waits below are not tight, the whole file
+/// finishing in 1.5s worst case under heavier load than CI applies, and both now draw on
+/// `liveness::backstop` rather than a five-second budget of their own; and the reader's `Err`
 /// arm masks nothing, every one of 539 observed drains ending on `Ok(0)`.
 ///
 /// If it recurs, keep the failing assertion's message and the full captured `output` rather
@@ -250,22 +274,7 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
         let _ = output_tx.send(output);
     });
 
-    // Bounded, so a process that never exits fails this test loudly rather than hanging it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "repon --panic-after-tui-enter did not exit within 5s; refusing to trust a \
-                 hung process's terminal state"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_exit(&mut child, "repon --panic-after-tui-enter");
     assert_eq!(
         status.code(),
         Some(1),
@@ -275,7 +284,7 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     // The exited child has closed its slave descriptors, so the reader reports back almost
     // immediately; this timeout is a final safety net, not the expected path.
     let output = output_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(backstop())
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -364,15 +373,10 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
         let _ = stop_tx.send((rc, status));
     });
 
-    let (rc, status) = stop_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_else(|_| {
-            let _ = child.kill();
-            panic!(
-                "waitpid did not report a state change within 5s; the child may never have \
-             stopped"
-            )
-        });
+    let (rc, status) = stop_rx.recv_timeout(backstop()).unwrap_or_else(|_| {
+        let _ = child.kill();
+        panic!("waitpid did not report a state change; the child may never have stopped")
+    });
     assert_eq!(
         rc, pid,
         "waitpid must report on the child this test spawned"
@@ -388,7 +392,7 @@ fn suspend_restores_the_terminal_before_the_process_actually_stops() {
     let _ = child.wait();
 
     let output = output_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(backstop())
         .expect("pty reader thread did not report back after the child was killed");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -439,25 +443,11 @@ fn a_missing_theme_named_on_the_flag_never_lets_the_terminal_be_claimed() {
         let _ = output_tx.send(output);
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "repon --theme does-not-exist-anywhere did not exit within 5s; refusing to \
-                 trust a hung process's terminal state"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_exit(&mut child, "repon --theme does-not-exist-anywhere");
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
     let output = output_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(backstop())
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -518,25 +508,11 @@ fn a_keys_collision_exits_before_the_terminal_is_claimed_naming_both_actions_and
         let _ = output_tx.send(output);
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "repon with a colliding [keys] block did not exit within 5s; refusing to \
-                 trust a hung process's terminal state"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_exit(&mut child, "repon with a colliding [keys] block");
     assert_eq!(status.code(), Some(1), "expected a non-zero exit");
 
     let output = output_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(backstop())
         .expect("pty reader thread did not report back after the child exited");
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output);
@@ -937,7 +913,7 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
         "bogus_top_level_key = \"x\"\n",
     )
     .expect("write a config.toml with an unknown top-level key");
-    let mut child = spawn_attached_to_pty_with(
+    let child = spawn_attached_to_pty_with(
         &slave_path,
         &[],
         &[(
@@ -981,52 +957,61 @@ fn no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claime
     // alone would let `q` win the race and quit the app before it ever draws the slot this
     // test means to inspect.
     let warning_text = "unknown config key `bogus_top_level_key`";
-    let mut output: Vec<u8> = Vec::new();
-    let mut sent_quit = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match chunk_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => output.extend_from_slice(&chunk),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        if !sent_quit
-            && output
-                .windows(warning_text.len())
-                .any(|window| window == warning_text.as_bytes())
-        {
-            writer.write_all(b"q").expect("write q to the pty master");
-            sent_quit = true;
-        }
-        if child.try_wait().expect("poll child status").is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
+    // Shared between the wait's own condition and the report it makes on giving up, which is
+    // why each is a cell rather than a plain local.
+    let output = RefCell::new(Vec::<u8>::new());
+    let sent_quit = Cell::new(false);
+    let child_cell = RefCell::new(child);
+    wait_for_or(
+        "repon with an outstanding config warning to exit",
+        || {
+            match chunk_rx.recv_timeout(CHUNK_POLL) {
+                Ok(chunk) => output.borrow_mut().extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            }
+            if !sent_quit.get()
+                && output
+                    .borrow()
+                    .windows(warning_text.len())
+                    .any(|window| window == warning_text.as_bytes())
+            {
+                writer.write_all(b"q").expect("write q to the pty master");
+                sent_quit.set(true);
+            }
+            child_cell
+                .borrow_mut()
+                .try_wait()
+                .expect("poll child status")
+                .is_some()
+        },
+        || {
+            let mut child = child_cell.borrow_mut();
             let _ = child.kill();
             let _ = child.wait();
-            panic!(
-                "repon with an outstanding config warning did not exit within 5s{}; refusing \
-                 to trust a hung process's terminal state, output so far: {:?}",
-                if sent_quit {
-                    " after q was sent"
+            format!(
+                "{}, output so far: {:?}",
+                if sent_quit.get() {
+                    "q was sent and it still did not exit"
                 } else {
-                    " and the warning never reached the screen, so q was never sent"
+                    "the warning never reached the screen, so q was never sent"
                 },
-                String::from_utf8_lossy(&output)
-            );
-        }
-    }
+                String::from_utf8_lossy(&output.borrow())
+            )
+        },
+    );
     // Drain whatever the reader thread already queued between the last check above and the
     // child actually exiting, and whatever it collects before the pty finally closes.
-    while let Ok(chunk) = chunk_rx.recv_timeout(Duration::from_millis(200)) {
+    let mut output = output.into_inner();
+    while let Ok(chunk) = chunk_rx.recv_timeout(DRAIN_POLL) {
         output.extend_from_slice(&chunk);
     }
     let _ = reader.join();
     let output = String::from_utf8_lossy(&output).into_owned();
 
     assert!(
-        sent_quit,
-        "expected the terminal to be claimed before this test's 5s deadline, got: {output:?}"
+        sent_quit.get(),
+        "expected the terminal to be claimed before the wait above gave up, got: {output:?}"
     );
     let claimed_at = output
         .find(&enter_alt)

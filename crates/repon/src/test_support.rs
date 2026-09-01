@@ -82,6 +82,58 @@ pub(crate) fn workspace_crate_src_dirs() -> Vec<PathBuf> {
     ]
 }
 
+/// Every directory of Rust source either workspace crate owns, `tests` as well as `src`.
+///
+/// [`workspace_crate_src_dirs`] is the right reach for a claim about production code; this
+/// is the right reach for one about test code, which lives in a crate's `tests` target as
+/// well as inside its `src` files. A scan that took the narrower list would have missed the
+/// five hand-rolled deadlines in `repon/tests/terminal_restoration.rs` entirely.
+pub(crate) fn workspace_rust_source_dirs() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        manifest_dir.join("src"),
+        manifest_dir.join("tests"),
+        manifest_dir.join("../repon-core/src"),
+        manifest_dir.join("../repon-core/tests"),
+    ]
+}
+
+/// One non-comment line under a scanned directory: its file, its 1-based number, and its
+/// own text trimmed, so a caller can allow a line by what it says rather than by where it
+/// currently sits.
+pub(crate) struct SourceLine {
+    pub(crate) path: PathBuf,
+    pub(crate) number: usize,
+    pub(crate) text: String,
+}
+
+/// Every line under `dirs` whose *whole* file contains `needle`, comment lines excluded.
+///
+/// No [`production_source`] cut, deliberately: a claim about test code is a claim about
+/// exactly the region that cut discards, so cutting here would be the check quietly
+/// stopping checking.
+pub(crate) fn all_lines_containing(dirs: &[PathBuf], needle: &str) -> Vec<SourceLine> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        for path in rust_source_files(dir) {
+            let source = std::fs::read_to_string(&path).expect("read a workspace source file");
+            for (index, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(needle) {
+                    found.push(SourceLine {
+                        path: path.clone(),
+                        number: index + 1,
+                        text: line.trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Every `path:line` across every workspace crate's `src` whose production source
 /// contains `needle`, comment lines (`//`, `///`, `//!`) excluded so a doc comment
 /// naming the very pattern this scan bans does not trip it.

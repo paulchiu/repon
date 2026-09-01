@@ -296,7 +296,103 @@ fn existence(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{production_source_at, rust_source_files};
+    use crate::test_support::{
+        all_lines_containing, production_source_at, rust_source_files, workspace_rust_source_dirs,
+    };
+
+    /// The two textual shapes a hand-rolled wall-clock deadline takes in this workspace:
+    /// a stopwatch compared against a budget, and a fixed instant compared against now.
+    ///
+    /// Assembled from fragments rather than written whole, so this function and the
+    /// allowlist below are never themselves matches for the scan they feed.
+    fn deadline_shapes() -> [String; 2] {
+        [
+            format!("{}{}", ".elapsed()", " >="),
+            format!("{}{}", "Instant::now()", " >="),
+        ]
+    }
+
+    /// Every line matching [`deadline_shapes`] that is *not* a test waiting on a liveness
+    /// property, each named by the text of the line itself and the reason it is allowed.
+    ///
+    /// An allowlist rather than a denylist, the same shape `check-core-isolation` takes:
+    /// a deadline cannot join this workspace without someone writing down what it bounds,
+    /// which is exactly what nobody did for the forty that made tests flaky under load.
+    /// Matched on the trimmed line text, not a line number, so ordinary edits above it do
+    /// not silently rebind an entry to a different line.
+    fn non_wait_deadlines() -> Vec<(String, &'static str)> {
+        let [elapsed, _] = deadline_shapes();
+        vec![
+            (
+                format!("if set_at{elapsed} self.document.notice_timeout {{"),
+                "production: a Notice expiring on screen",
+            ),
+            (
+                format!("&& at{elapsed} threshold"),
+                "production: a status Cell ageing into Stale",
+            ),
+            (
+                format!("if started{elapsed} abandon_after {{"),
+                "production: discovery abandoning a walk that will not finish",
+            ),
+            (
+                format!("assert!(past{elapsed} Duration::from_secs(90));"),
+                "a claim about a fabricated Timestamp's own arithmetic, not a wait on anything",
+            ),
+        ]
+    }
+
+    /// The one file allowed to own a polling wait loop: every other wait goes through it.
+    const LIVENESS_HELPER: &str = "liveness.rs";
+
+    /// The survey behind #185, kept true rather than only written down: a test waiting on a
+    /// liveness property must go through `repon_core::liveness`, never a deadline of its
+    /// own. A wait with its own number is a wait whose number was guessed against one
+    /// machine, and the four that existed before this scan were guessed against an idle one.
+    ///
+    /// Scanned over both crates' `src` *and* `tests` through [`workspace_rust_source_dirs`],
+    /// whole files rather than a `production_source` cut, since every hazard this is about
+    /// lives in exactly the region that cut discards. What it catches: a stopwatch or an
+    /// instant compared against a budget anywhere in the workspace. What it misses: a wait
+    /// spelled some third way (a `recv_timeout` given a literal, a bare `sleep` long enough
+    /// to "probably" be enough), which is why `liveness`'s own module doc records those as
+    /// prose rather than pretending this scan covers them.
+    #[test]
+    fn no_test_owns_a_wall_clock_deadline_of_its_own() {
+        let dirs = workspace_rust_source_dirs();
+        let allowed = non_wait_deadlines();
+
+        let mut offending = Vec::new();
+        for shape in deadline_shapes() {
+            for line in all_lines_containing(&dirs, &shape) {
+                if line
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == LIVENESS_HELPER)
+                {
+                    continue;
+                }
+                if allowed.iter().any(|(text, _)| *text == line.text) {
+                    continue;
+                }
+                offending.push(format!(
+                    "{}:{}: {}",
+                    line.path.display(),
+                    line.number,
+                    line.text
+                ));
+            }
+        }
+
+        assert!(
+            offending.is_empty(),
+            "found a wall-clock deadline outside `repon_core::liveness` and outside the \
+             allowlist of deadlines that bound something other than a test's wait: \
+             {offending:?}. Wait through `liveness::wait_for` (or take `liveness::backstop()` \
+             for a loop with cleanup of its own); add an entry to `non_wait_deadlines` only \
+             for a deadline that is not a test waiting on a liveness property."
+        );
+    }
 
     /// The name of every `pub fn` in `source` (a `production_source_at` read) whose own doc
     /// comment names `test` or `tests` as a whole word and which is not already gated behind

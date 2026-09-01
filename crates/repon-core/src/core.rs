@@ -3738,6 +3738,7 @@ mod tests {
 
     use super::*;
     use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
+    use crate::liveness::wait_for;
     use crate::snapshot::{RowSummary, summary};
     use crate::test_support::{git, head_sha, loose_object_count};
 
@@ -3891,10 +3892,6 @@ mod tests {
         dir.path().canonicalize().expect("canonicalize temp dir")
     }
 
-    /// Polls `condition` every 10ms until it is `true` or `timeout` elapses, returning
-    /// which happened: `run_action` returns before its own fan-out and completion
-    /// Generation finish, so a test that wants to see the far side of one needs to wait
-    /// for it rather than asserting immediately.
     /// Sets every polled gitdir entry's modification time ten seconds into the past, so any
     /// write that follows reads as newer than the baseline by more than a filesystem's
     /// timestamp granularity. Without it a commit made microseconds after the baseline sweep
@@ -3949,19 +3946,6 @@ mod tests {
             path.display(),
             std::io::Error::last_os_error()
         );
-    }
-
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = Instant::now();
-        loop {
-            if condition() {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     fn step(argv: &[&str]) -> Step {
@@ -4621,8 +4605,9 @@ mod tests {
         let started = core.run_action(action("reinstall", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "the fan-out must finish and write a receipt");
+        wait_for("the fan-out to finish and write a receipt", || {
+            !core.action_running()
+        });
         let receipt = core.snapshot().entities[0]
             .last_action
             .clone()
@@ -4665,8 +4650,9 @@ mod tests {
         let started = core.run_action(action("ordering", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "the fan-out must finish and write a receipt");
+        wait_for("the fan-out to finish and write a receipt", || {
+            !core.action_running()
+        });
         let receipt = core.snapshot().entities[0]
             .last_action
             .clone()
@@ -4714,16 +4700,15 @@ mod tests {
         // one: under a slow or busy machine the first step (`true`) can still be the one
         // reported running the first time this poll checks, which would assert the wrong
         // step's own shape below rather than a flaky pass.
-        let seen_mid_run = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities[0]
-                .last_action
-                .as_ref()
-                .and_then(|receipt| receipt.running.as_ref())
-                .is_some_and(|running| running.label.contains("sleep"))
-        });
-        assert!(
-            seen_mid_run,
-            "expected a receipt naming the second step running before the run finished"
+        wait_for(
+            "a receipt naming the second step running before the run finished",
+            || {
+                core.snapshot().entities[0]
+                    .last_action
+                    .as_ref()
+                    .and_then(|receipt| receipt.running.as_ref())
+                    .is_some_and(|running| running.label.contains("sleep"))
+            },
         );
         let mid_run = core.snapshot().entities[0]
             .last_action
@@ -4742,8 +4727,7 @@ mod tests {
             running.label
         );
 
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "the fan-out must finish");
+        wait_for("the fan-out to finish", || !core.action_running());
         let finished = core.snapshot().entities[0]
             .last_action
             .clone()
@@ -4777,8 +4761,9 @@ mod tests {
         let started = core.run_action(action("shell-step", steps), std::slice::from_ref(&key));
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "the fan-out must finish and write a receipt");
+        wait_for("the fan-out to finish and write a receipt", || {
+            !core.action_running()
+        });
         let receipt = core.snapshot().entities[0]
             .last_action
             .clone()
@@ -4822,9 +4807,9 @@ mod tests {
         );
         // Drain the fan-out and its completion refresh so this test's background
         // thread does not outlive it.
-        assert!(wait_until(Duration::from_secs(5), || {
+        wait_for("the fan-out and its completion refresh to drain", || {
             !core.action_running()
-        }));
+        });
     }
 
     /// Criterion 3's second half, and the double-refresh mutation this test is written
@@ -4861,22 +4846,21 @@ mod tests {
         );
 
         assert!(started);
-        let settled = wait_until(Duration::from_secs(5), || {
-            core.snapshot().entities.iter().all(|entity| {
-                matches!(
-                    entity.branch.settled(),
-                    Some(Settled::Known {
-                        value: _,
-                        at: _,
-                        stale: _
-                    })
-                )
-            })
-        });
-        assert!(
-            settled,
-            "the completion Generation must eventually probe every known entity, including \
-             the one the Action never touched"
+        wait_for(
+            "the completion Generation to probe every known entity, including the one the \
+             Action never touched",
+            || {
+                core.snapshot().entities.iter().all(|entity| {
+                    matches!(
+                        entity.branch.settled(),
+                        Some(Settled::Known {
+                            value: _,
+                            at: _,
+                            stale: _
+                        })
+                    )
+                })
+            },
         );
         assert_eq!(
             core.snapshot().generation,
@@ -4939,8 +4923,7 @@ mod tests {
         // executing step before it finishes (`docs/spec/actions.md`'s "The run on screen"),
         // so `last_action.is_some()` alone can be true well before `normal_key`'s own step
         // has actually run.
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled);
+        wait_for("the fan-out to finish", || !core.action_running());
 
         let after = core.snapshot();
         let receipt_of = |key: &EntityKey| {
@@ -5011,7 +4994,7 @@ mod tests {
         let started = core.run_action(action("reinstall", vec![step(&["true"])]), &order);
         assert!(started);
 
-        let settled = wait_until(Duration::from_secs(5), || {
+        wait_for("every entity in the order to carry a receipt", || {
             let snapshot = core.snapshot();
             order.iter().all(|key| {
                 snapshot
@@ -5022,7 +5005,6 @@ mod tests {
                     .is_some()
             })
         });
-        assert!(settled);
 
         let after = core.snapshot();
         let actually_ran = after
@@ -5064,7 +5046,7 @@ mod tests {
 
     /// Criterion 6. The second call is rejected synchronously (`action_running`'s
     /// `compare_exchange` fails before anything else runs), so this needs no waiting to
-    /// observe; only the cleanup wait at the end needs `wait_until`.
+    /// observe; only the cleanup wait at the end needs [`wait_for`].
     #[test]
     fn only_one_action_fan_out_runs_at_a_time_a_second_call_is_rejected_while_one_is_live() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5085,8 +5067,9 @@ mod tests {
             !second_started,
             "a second run_action call must be rejected while the first is still in flight"
         );
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled);
+        wait_for("the accepted first fan-out to finish", || {
+            !core.action_running()
+        });
         let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
         assert_eq!(
             &*receipt.label, "first",
@@ -5119,13 +5102,12 @@ mod tests {
         let two_seconds = action("brief", vec![step(&["sh", "-c", "sleep 2"])]);
 
         assert!(core.run_action(two_seconds, std::slice::from_ref(&key)));
-        let started = wait_until(Duration::from_secs(5), || {
+        wait_for("the two-second step to actually start running", || {
             core.snapshot().entities[0]
                 .last_action
                 .as_ref()
                 .is_some_and(|receipt| receipt.running.is_some())
         });
-        assert!(started, "the two-second step must actually start running");
 
         // The receipt's own `running: Some(_)` is written just before `run_step` is even
         // called, so it can race that call's own spawn, which is when the step's process
@@ -5147,8 +5129,9 @@ mod tests {
         );
 
         core.continue_action();
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "continue_action must let the held step finish");
+        wait_for("continue_action to let the held step finish", || {
+            !core.action_running()
+        });
         let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
         assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
     }
@@ -5185,10 +5168,9 @@ mod tests {
     /// own SIGKILL follow-up entirely, which is exactly the regression this criterion
     /// exists to catch.
     ///
-    /// Bounded so a regression fails rather than hangs: the step sleeps 30s, comfortably
-    /// longer than this test could ever wait on purpose, and every wait below has its own
-    /// timeout well under that, so a `stop_action` that stops working reads back as this
-    /// test's own `wait_until` returning `false`, never as the suite blocking on the child.
+    /// Bounded so a regression fails rather than hangs: the step sleeps 30s, and every wait
+    /// below is backstopped by [`wait_for`], so a `stop_action` that stops working reads back
+    /// as a named wait giving up rather than as the suite blocking on the child.
     #[test]
     fn stop_action_escalates_from_sigterm_to_sigkill_against_a_trapping_step() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5204,23 +5186,21 @@ mod tests {
         );
 
         assert!(core.run_action(trapping, std::slice::from_ref(&key)));
-        let started = wait_until(Duration::from_secs(5), || {
+        wait_for("the trapping step to actually start running", || {
             core.snapshot().entities[0]
                 .last_action
                 .as_ref()
                 .is_some_and(|receipt| receipt.running.is_some())
         });
-        assert!(started, "the trapping step must actually start running");
         // Gives the shell time to install its own trap before any signal can arrive; the
         // outcome asserted below is the actual proof, not this fixed delay.
         thread::sleep(Duration::from_millis(100));
 
         core.stop_action();
 
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(
-            settled,
-            "a SIGTERM-trapping step must still come down from the follow-up SIGKILL"
+        wait_for(
+            "a SIGTERM-trapping step to come down from the follow-up SIGKILL",
+            || !core.action_running(),
         );
         let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
         assert_eq!(receipt.steps.len(), 1);
@@ -5289,30 +5269,30 @@ mod tests {
         // `fail` must have already finished (both its steps recorded) while `slow` is
         // still running its own first step: the two entities' own outcomes are captured
         // at the same moment, which is what makes them "shown together".
-        let both_ready = wait_until(Duration::from_secs(5), || {
-            let snapshot = core.snapshot();
-            let fail_done = snapshot
-                .entities
-                .iter()
-                .find(|entity| entity.key == fail_key)
-                .and_then(|entity| entity.last_action.as_ref())
-                .is_some_and(|receipt| receipt.steps.len() == 2);
-            let slow_running = snapshot
-                .entities
-                .iter()
-                .find(|entity| entity.key == slow_key)
-                .and_then(|entity| entity.last_action.as_ref())
-                .is_some_and(|receipt| receipt.running.is_some());
-            fail_done && slow_running
-        });
-        assert!(
-            both_ready,
-            "expected `fail` finished and `slow` still running before cancelling"
+        wait_for(
+            "`fail` finished and `slow` still running before cancelling",
+            || {
+                let snapshot = core.snapshot();
+                let fail_done = snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == fail_key)
+                    .and_then(|entity| entity.last_action.as_ref())
+                    .is_some_and(|receipt| receipt.steps.len() == 2);
+                let slow_running = snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == slow_key)
+                    .and_then(|entity| entity.last_action.as_ref())
+                    .is_some_and(|receipt| receipt.running.is_some());
+                fail_done && slow_running
+            },
         );
 
         core.stop_action();
-        let settled = wait_until(Duration::from_secs(5), || !core.action_running());
-        assert!(settled, "the fan-out must finish once cancelled");
+        wait_for("the fan-out to finish once cancelled", || {
+            !core.action_running()
+        });
 
         let snapshot = core.snapshot();
         let fail_receipt = snapshot
@@ -5388,12 +5368,9 @@ mod tests {
         // panics on the now-poisoned lock, unwinds out of `pool.install` and skips the
         // `action_running.store(false, ...)` line entirely, leaving the flag stuck
         // true for the life of this `Core`.
-        let flag_reset = wait_until(Duration::from_secs(5), || {
-            !core.action_running.load(Ordering::Acquire)
-        });
-        assert!(
-            flag_reset,
-            "a panicking fan-out must still reset action_running rather than leave it stuck true"
+        wait_for(
+            "a panicking fan-out to reset action_running rather than leave it stuck true",
+            || !core.action_running.load(Ordering::Acquire),
         );
 
         // Clears the poison this test itself introduced to force the panic, an
@@ -5410,7 +5387,7 @@ mod tests {
             second_started,
             "a later Action must be able to start once the panicking one has finished"
         );
-        let settled = wait_until(Duration::from_secs(5), || {
+        wait_for("the second Action to run to completion", || {
             core.snapshot()
                 .entities
                 .iter()
@@ -5418,7 +5395,6 @@ mod tests {
                 .and_then(|entity| entity.last_action.as_ref())
                 .is_some_and(|receipt| &*receipt.label == "second")
         });
-        assert!(settled, "the second Action must actually run to completion");
     }
 
     /// Asserts `entity` reads exactly as a Vanished row must: still in the table,
@@ -6031,11 +6007,10 @@ mod tests {
     /// [`run_poll_sweep`], not merely that [`Core::poll_once_for_test`]'s direct
     /// call does the right thing: a mutation deleting the call inside
     /// `spawn_clock_thread` would leave every other poll test in this file green
-    /// while failing only this one. `wait_until` (already used elsewhere in this
-    /// file for `run_action`'s own genuinely asynchronous completion) bounds the
-    /// wait rather than asserting any particular latency: the two ticks are sent
-    /// from this thread and merely need to be picked up by the idle dedicated
-    /// thread, not to land within a stated budget.
+    /// while failing only this one. [`wait_for`] backstops the wait rather than
+    /// asserting any particular latency: the two ticks are sent from this thread
+    /// and merely need to be picked up by the idle dedicated thread, not to land
+    /// within a stated budget.
     #[test]
     fn a_real_tick_through_the_dedicated_thread_reaches_the_poll_sweep_and_reprobes_a_moved_entity()
     {
@@ -6056,10 +6031,9 @@ mod tests {
         tick_tx
             .send(Instant::now())
             .expect("send the baseline tick");
-        assert!(
-            wait_until(Duration::from_secs(2), || core.poll_sweep_count_for_test()
-                >= 1),
-            "a tick sent on the real channel must reach the poll sweep"
+        wait_for(
+            "a tick sent on the real channel to reach the poll sweep",
+            || core.poll_sweep_count_for_test() >= 1,
         );
         assert!(core.poll_reprobed_for_test().is_empty());
 
@@ -6068,11 +6042,9 @@ mod tests {
         tick_tx
             .send(Instant::now())
             .expect("send the movement tick");
-        assert!(
-            wait_until(Duration::from_secs(2), || {
-                core.poll_reprobed_for_test() == vec![key.clone()]
-            }),
-            "the real tick channel must reach the poll sweep and reprobe the moved entity"
+        wait_for(
+            "the real tick channel to reach the poll sweep and reprobe the moved entity",
+            || core.poll_reprobed_for_test() == vec![key.clone()],
         );
         drop(tick_tx);
     }
@@ -9766,6 +9738,7 @@ mod tests {
     #[cfg(feature = "fetch")]
     mod fetch_scheduler {
         use super::*;
+        use crate::liveness::wait_for_or;
 
         fn fetch_spec(enabled: bool, root: PathBuf) -> CoreSpec {
             let mut spec = spec(vec![root]);
@@ -9819,11 +9792,9 @@ mod tests {
             );
             let core = started.core;
 
-            assert!(
-                wait_until(Duration::from_secs(10), || {
-                    core.fetch_cycle_count_for_test() >= 1
-                }),
-                "the periodic fetch must run its first cycle without waiting for a tick"
+            wait_for(
+                "the periodic fetch to run its first cycle without waiting for a tick",
+                || core.fetch_cycle_count_for_test() >= 1,
             );
         }
 
@@ -9846,23 +9817,17 @@ mod tests {
             );
             let core = started.core;
 
-            assert!(
-                wait_until(Duration::from_secs(10), || {
-                    core.fetch_cycle_count_for_test() >= 1
-                }),
-                "the immediate cycle must have run first"
-            );
+            wait_for("the immediate cycle to have run first", || {
+                core.fetch_cycle_count_for_test() >= 1
+            });
 
             fetch_tick_tx
                 .send(Instant::now())
                 .expect("send a fetch tick");
 
-            assert!(
-                wait_until(Duration::from_secs(10), || {
-                    core.fetch_cycle_count_for_test() >= 2
-                }),
-                "a tick on the fetch channel must run a second cycle"
-            );
+            wait_for("a tick on the fetch channel to run a second cycle", || {
+                core.fetch_cycle_count_for_test() >= 2
+            });
         }
 
         /// [`crate::test_support::push_new_commit`], but onto `branch` rather than
@@ -9937,31 +9902,35 @@ mod tests {
             );
             let core = started.core;
 
-            let gone = wait_until(Duration::from_secs(10), || {
-                core.snapshot()
-                    .entities
-                    .iter()
-                    .filter(|entity| matches!(entity.kind, Kind::Worktree))
-                    .any(|entity| {
-                        matches!(
-                            entity.state.settled(),
-                            Some(Settled::Known {
-                                value: WorktreeState::Gone,
-                                at: _,
-                                stale: _,
-                            })
-                        )
-                    })
-            });
-            assert!(
-                gone,
-                "a finished fetch's own Generation must land the pruned Worktree as Gone \
-                 without the test ever calling refresh; snapshot: {:?}",
-                core.snapshot()
-                    .entities
-                    .iter()
-                    .map(|entity| (entity.kind, entity.state.settled().cloned()))
-                    .collect::<Vec<_>>()
+            wait_for_or(
+                "a finished fetch's own Generation to land the pruned Worktree as Gone \
+                 without the test ever calling refresh",
+                || {
+                    core.snapshot()
+                        .entities
+                        .iter()
+                        .filter(|entity| matches!(entity.kind, Kind::Worktree))
+                        .any(|entity| {
+                            matches!(
+                                entity.state.settled(),
+                                Some(Settled::Known {
+                                    value: WorktreeState::Gone,
+                                    at: _,
+                                    stale: _,
+                                })
+                            )
+                        })
+                },
+                || {
+                    format!(
+                        "snapshot: {:?}",
+                        core.snapshot()
+                            .entities
+                            .iter()
+                            .map(|entity| (entity.kind, entity.state.settled().cloned()))
+                            .collect::<Vec<_>>()
+                    )
+                },
             );
         }
 
@@ -10017,11 +9986,9 @@ mod tests {
             );
             let core = started.core;
 
-            assert!(
-                wait_until(Duration::from_secs(10), || {
-                    core.fetch_cycle_count_for_test() >= 1
-                }),
-                "the periodic fetch must still have run its immediate cycle"
+            wait_for(
+                "the periodic fetch to still run its immediate cycle",
+                || core.fetch_cycle_count_for_test() >= 1,
             );
             assert_eq!(
                 rev_parse(&parent, "refs/heads/main"),
@@ -10059,12 +10026,10 @@ mod tests {
             // which would stop the immediate cycle this test is waiting on.
             let _core = started.core;
 
-            assert!(
-                wait_until(Duration::from_secs(10), || {
-                    rev_parse(&parent, "refs/heads/main") == remote_tip
-                }),
-                "the eligible branch must fast-forward on the immediate cycle alone, \
-                 with no fetch tick and no auto-update tick of its own"
+            wait_for(
+                "the eligible branch to fast-forward on the immediate cycle alone, with no \
+                 fetch tick and no auto-update tick of its own",
+                || rev_parse(&parent, "refs/heads/main") == remote_tip,
             );
         }
     }

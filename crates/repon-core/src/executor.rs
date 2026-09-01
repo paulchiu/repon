@@ -820,6 +820,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::liveness::{backstop, wait_for};
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -852,7 +853,7 @@ mod tests {
         });
 
         let result = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(backstop())
             .expect("a child reading a null stdin must terminate rather than hang");
 
         assert_eq!(result.outcome, StepOutcome::Ok);
@@ -972,23 +973,6 @@ mod tests {
             .next()
     }
 
-    /// Polls [`process_state`] until it matches `wanted` or `timeout` elapses, since a
-    /// signal this test just sent has not necessarily already landed the instant `kill`
-    /// returns. Bounded so a regression (the signal never lands, or lands as the wrong one)
-    /// fails this test rather than hanging it.
-    fn wait_for_process_state(pid: libc::pid_t, wanted: char, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if process_state(pid) == Some(wanted) {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Spawns `argv` under a real PTY and `setsid`, exactly as [`run_step`] would, but
     /// returns the raw pieces rather than blocking to completion, so a test can act on the
     /// live child before it exits.
@@ -1044,7 +1028,7 @@ mod tests {
         });
 
         let status = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(backstop())
             .expect("a TERM-trapping child must still die once cancel escalates to SIGKILL");
         assert!(
             status.is_some_and(|status| !status.success()),
@@ -1064,16 +1048,19 @@ mod tests {
         control.register(pgid);
 
         control.hold();
-        assert!(
-            wait_for_process_state(pgid, 'T', Duration::from_secs(2)),
-            "SIGSTOP must leave the child's own process state Stopped"
+        // A signal just sent has not necessarily landed by the time `kill` returns, so both
+        // waits below are on the state itself. One predicate over both live states rather
+        // than a wait per state: the second of two sequential waits would only ever be
+        // reached after the first had run its whole backstop out.
+        wait_for(
+            "SIGSTOP to leave the child's own process state Stopped",
+            || process_state(pgid) == Some('T'),
         );
 
         control.continue_run();
-        assert!(
-            wait_for_process_state(pgid, 'S', Duration::from_secs(2))
-                || wait_for_process_state(pgid, 'R', Duration::from_secs(2)),
-            "SIGCONT must move the child back out of the Stopped state"
+        wait_for(
+            "SIGCONT to move the child back out of the Stopped state",
+            || matches!(process_state(pgid), Some('S') | Some('R')),
         );
 
         control.deregister(pgid);

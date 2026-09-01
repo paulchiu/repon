@@ -3,7 +3,9 @@
 //! Its public surface is flat, re-exported from the crate root rather than through
 //! `fanout`, `git`, `entity` or `snapshot`, which stay private: a generic scatter
 //! primitive and a single branch read are not vocabulary a second consumer needs,
-//! and neither is which file happens to define `EntityState` or `Snapshot`. The
+//! and neither is which file happens to define `EntityState` or `Snapshot`. The one
+//! exception is `liveness`, a `test-util`-gated module of test waits that names
+//! nothing git-shaped and so belongs under a namespace rather than at the root. The
 //! entry points on `Core` itself (`start`, `refresh`, `snapshot`, `settle`, ...)
 //! land in later work and get re-exported the same way once they exist.
 //!
@@ -68,6 +70,11 @@ mod fetch;
 mod filter;
 mod git;
 mod landing;
+// The one module reachable by name rather than re-exported flat: it holds no vocabulary a
+// consumer needs, only the wait a test in either crate uses for a liveness property, and a
+// namespace is what keeps names that generic out of the crate root. Gated with it.
+#[cfg(any(test, feature = "test-util"))]
+pub mod liveness;
 mod patch_equivalence;
 mod poll;
 mod snapshot;

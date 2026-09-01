@@ -2087,6 +2087,7 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyModifiers};
+    use repon_core::liveness::wait_for;
     use repon_core::{CoreSpec, SetSpec};
 
     use super::*;
@@ -2824,9 +2825,9 @@ mod tests {
              this line is the discriminator"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
     }
 
@@ -2865,9 +2866,9 @@ mod tests {
             "! must never answer with the inert-binding Notice the other four do"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the fan-out must finish before this test's own Core is dropped"
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
         );
     }
 
@@ -2970,9 +2971,9 @@ mod tests {
         // left running past the test, since a confirmed quit orphans it in production but
         // this test's own `Core` still needs to drop cleanly.
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Esc while the quit confirm dialog is open must decline it, never quit: `Context::Confirm`
@@ -3002,9 +3003,9 @@ mod tests {
         assert!(!app.should_quit, "esc must never quit, at any depth");
 
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Ctrl+Z is deliberately never gated the way `q`/`Ctrl+C` are: suspending is reversible
@@ -3047,9 +3048,9 @@ mod tests {
         );
 
         app.core.stop_action();
-        assert!(wait_until(Duration::from_secs(5), || !app
-            .core
-            .action_running()));
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     // =====================================================================================
@@ -3145,9 +3146,9 @@ mod tests {
             app.filter.is_active(),
             "the committed Filter must be untouched by the first press"
         );
-        assert!(
-            wait_until(Duration::from_secs(5), || !app.core.action_running()),
-            "the first press must actually have cancelled the fan-out"
+        wait_for(
+            "the first press to actually have cancelled the fan-out",
+            || !app.core.action_running(),
         );
 
         // Press 2: only the range anchor unwinds.
@@ -3407,6 +3408,32 @@ mod tests {
         assert_eq!(
             app.cursor, 1,
             "`N` from row 2 must land on the failed row behind it, not the one `n` finds"
+        );
+    }
+
+    /// The fixture's own postcondition, asserted at the fixture rather than three steps
+    /// downstream of it.
+    ///
+    /// Every `NextFailed`/`PreviousFailed` test above reads `run_failing_action_on`'s result
+    /// through a cursor position, so a fixture that returned before its row read Failed
+    /// reported as a cursor landing on the wrong index, with nothing in the message naming
+    /// the wait that had actually given up. Pinned here so the fixture's contract has a
+    /// failure of its own.
+    #[test]
+    fn run_failing_action_on_returns_only_once_its_row_reads_failed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+
+        run_failing_action_on(&mut app, 2);
+
+        assert_eq!(
+            app.visible_failed(),
+            vec![false, false, true],
+            "the row the Action ran on must read Failed, and no other row may"
         );
     }
 
@@ -5038,8 +5065,8 @@ mod tests {
         }
     }
 
-    /// Runs [`failing_action_config`] on the visible row at `index` and waits for the real
-    /// subprocess to finish, leaving that row's `last_action` a genuine failed receipt.
+    /// Runs [`failing_action_config`] on the visible row at `index` and returns once that
+    /// row reads Failed, which is what every caller then walks the cursor to.
     fn run_failing_action_on(app: &mut App, index: usize) {
         app.set_cursor(index);
         app.document.actions.push(failing_action_config("break"));
@@ -5047,25 +5074,18 @@ mod tests {
             .expect("open the palette");
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("choose the highlighted entry");
-        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
-        assert!(finished, "expected the failing Action to actually finish");
-        // A finished Action starts its own Generation, and a row whose cells hold nothing
-        // yet folds to InFlight ahead of the receipt's own failure, so a caller reading the
-        // summary straight after this would be racing the probes rather than reading them.
-        app.core.settle(Duration::from_secs(10));
-    }
-
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if condition() {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The postcondition every caller actually reads, waited on directly rather than
+        // through a proxy: a row whose cells hold nothing yet folds to InFlight ahead of the
+        // receipt's own failure, so "the fan-out finished" is not yet "this row reads
+        // Failed". `Core::settle` cannot stand in for it either, at any deadline, because
+        // `run_action`'s completion clears `action_running` before it dispatches the
+        // Generation that raises the settle gate, so a settle called in that window finds
+        // the gate at zero and returns at once. Once a row does read Failed it stays that
+        // way: a later Generation marks its cells in flight without discarding their values.
+        wait_for(
+            &format!("row {index} to read Failed once its failing Action has finished"),
+            || !app.core.action_running() && app.visible_failed().get(index) == Some(&true),
+        );
     }
 
     // Criterion 1: two distinct keys, no shared entry point. `!` (OpenLauncher) must never
@@ -5650,8 +5670,7 @@ mod tests {
             app.action_palette.is_none(),
             "the palette closes once the run is dispatched"
         );
-        let ran = wait_until(Duration::from_secs(5), || marker.exists());
-        assert!(ran, "expected `touch marker` to have actually run");
+        wait_for("`touch marker` to have actually run", || marker.exists());
     }
 
     #[test]
@@ -5793,10 +5812,9 @@ mod tests {
             "confirm = false must close the palette immediately rather than entering a \
              confirm stage"
         );
-        let ran = wait_until(Duration::from_secs(5), || marker.exists());
-        assert!(
-            ran,
-            "expected the confirm = false Action to have run without a gate"
+        wait_for(
+            "the confirm = false Action to have run without a gate",
+            || marker.exists(),
         );
     }
 
@@ -5815,9 +5833,12 @@ mod tests {
         app.handle_paste_event(text);
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("run the ad hoc command");
-        let finished = wait_until(Duration::from_secs(5), || !app.core.action_running());
-        assert!(finished, "expected the ad hoc run to actually finish");
-        app.core.settle(Duration::from_secs(10));
+        // Every caller reads the receipt, which the fan-out writes before it clears
+        // `action_running`; the completion Generation this used to settle for touches
+        // nothing any of them assert on.
+        wait_for("the ad hoc run to actually finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// Criterion 1, end to end, all three claims in one fixture because they interact: a
@@ -6419,15 +6440,15 @@ mod tests {
         app.core
             .refresh(&dispatch_order(keys.first(), &keys, &keys));
 
-        assert!(
-            wait_until(Duration::from_secs(5), || {
+        wait_for(
+            "every entity to settle before this test's own claim can be checked",
+            || {
                 app.core
                     .snapshot()
                     .entities
                     .iter()
                     .all(|entity| entity.branch.settled().is_some())
-            }),
-            "expected every entity to settle before this test's own claim can be checked"
+            },
         );
 
         app.filter = Filter::parse("shown");
