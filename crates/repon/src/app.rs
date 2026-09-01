@@ -270,6 +270,11 @@ pub struct App {
     /// `handle_key_event` never holds one. Cleared the moment it is handed to
     /// [`Self::run_action_editor_handoff`], so a handoff runs at most once per press.
     pending_action_editor_handoff: bool,
+    /// `true` between `Action::EditConfig` (`e`) firing and [`Self::run`]'s own loop draining
+    /// it with a live [`Tui`] in hand, the identical reason `pending_action_editor_handoff` is
+    /// a flag rather than an immediate call. Cleared the moment it is handed to
+    /// [`Self::run_config_editor_handoff`], so a handoff runs at most once per press.
+    pending_config_editor_handoff: bool,
     /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s`) and
     /// closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
@@ -503,6 +508,7 @@ impl App {
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
+            pending_config_editor_handoff: false,
             set_picker: None,
             notice: None,
             notice_set_at: None,
@@ -786,6 +792,10 @@ impl App {
                 self.pending_action_editor_handoff = false;
                 self.run_action_editor_handoff(&mut tui);
             }
+            if self.pending_config_editor_handoff {
+                self.pending_config_editor_handoff = false;
+                self.run_config_editor_handoff(&mut tui);
+            }
             if self.should_suspend {
                 // refresh.md's "Suspension": all background work stops while the TUI is
                 // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
@@ -1010,6 +1020,20 @@ impl App {
                     self.set_notice(action_running_notice("Reload config"));
                 } else {
                     self.reload_config();
+                }
+                None
+            }
+            // `handle_key_event` never holds a `Tui`, so this only queues the handoff; `run`
+            // drains `pending_config_editor_handoff` with one in hand, the same shape
+            // `pending_action_editor_handoff` and `pending_launcher_handoff` already take.
+            // Gated the same way `Ctrl+R` is: the handoff ends in the identical
+            // `reload_config` call, which can rebuild `self.core` outright and must never
+            // race a fan-out's own completion Generation.
+            Some(Action::EditConfig) => {
+                if self.action_running() {
+                    self.set_notice(action_running_notice("Edit config"));
+                } else {
+                    self.pending_config_editor_handoff = true;
                 }
                 None
             }
@@ -2221,6 +2245,50 @@ impl App {
         }
     }
 
+    /// Drains `self.pending_config_editor_handoff`: opens `self.config_file` (the resolved
+    /// path [`crate::config::config_file`] fixed this session to) in `$EDITOR` through
+    /// [`editor::edit`], the identical handoff machinery [`Self::run_action_editor_handoff`]
+    /// reuses. A failed handoff, including the editor never spawning at all, is logged and
+    /// leaves `config.toml` untouched: [`crate::tui::Tui::suspend_for_child`]'s own doc
+    /// comment already guarantees the terminal is reclaimed either way, so there is nothing
+    /// left for this to do but decline to write.
+    ///
+    /// [ADR 0014](../../../docs/adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)
+    /// bans Repon rewriting `config.toml` programmatically; copying back exactly what the
+    /// user's own editor produced is not that, the same way `git commit` hands a message file
+    /// to `$EDITOR` without git composing the message.
+    fn run_config_editor_handoff(&mut self, tui: &mut Tui) {
+        let initial = Self::config_editor_seed(&self.config_file);
+        let edited = self.around_ad_hoc_editor_handoff(|| editor::edit(tui, &initial));
+        match edited {
+            Ok(text) => self.write_and_reload_config(text),
+            Err(err) => tracing::error!("config $EDITOR handoff failed: {err:#}"),
+        }
+    }
+
+    /// The text `$EDITOR` opens on for `path`: its own bytes if it exists, otherwise
+    /// `repon config --example`'s own annotated example, per config.md's "If the file does
+    /// not exist yet ... the first edit starts from something readable rather than an empty
+    /// buffer". The owner's own machine has no `config.toml` at all, so this is the common
+    /// case this session hits, not the edge.
+    fn config_editor_seed(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|_| config::document::annotated_example().to_string())
+    }
+
+    /// Writes `text` to `self.config_file` ([`config::write_edited`]) then reloads through
+    /// [`Self::reload_config`], the identical path `Action::ReloadConfig` runs: config
+    /// reaches the running app one way, and a write here cannot produce a state the file
+    /// alone would not reproduce. A write failure is logged and the previous configuration is
+    /// kept, the same grade [`Self::reload_config`] itself gives a bad read.
+    fn write_and_reload_config(&mut self, text: String) {
+        if let Err(err) = config::write_edited(&self.config_file, &text) {
+            tracing::error!("could not write config.toml: {err:#}");
+            return;
+        }
+        self.reload_config();
+    }
+
     fn handle_messages(&mut self, tui: &mut Tui) -> Result<()> {
         while let Ok(message) = self.message_rx.try_recv() {
             if message != Message::Tick && message != Message::Render {
@@ -2710,6 +2778,7 @@ mod tests {
             launcher_palette: None,
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
+            pending_config_editor_handoff: false,
             set_picker: None,
             notice: None,
             notice_set_at: None,
@@ -5012,9 +5081,9 @@ mod tests {
     /// distinct surfaces the count must come to is read from
     /// [keybindings.md](../../../docs/spec/keybindings.md) at test time, and each one is
     /// named as well as counted, so neither a call site reusing an existing label nor a spec
-    /// that grew a fifth surface can pass as still reading the same.
+    /// that grew a sixth surface can pass as still reading the same.
     #[test]
-    fn exactly_the_four_declared_surfaces_are_gated_on_action_running_and_no_more() {
+    fn exactly_the_five_declared_surfaces_are_gated_on_action_running_and_no_more() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
             .expect("read docs/spec/keybindings.md");
@@ -5050,11 +5119,12 @@ mod tests {
                 // both are inert for the identical reason and say the identical thing.
                 "Action palette",
                 "Action palette",
+                "Edit config",
                 "Reload config",
                 "Set picker",
                 "Set switch"
             ],
-            "expected exactly the four surfaces keybindings.md names, no more and no \
+            "expected exactly the five surfaces keybindings.md names, no more and no \
              fewer, found: {call_sites:?}"
         );
 
@@ -8859,13 +8929,14 @@ mod tests {
         );
     }
 
-    /// A future reader who sees `Action::OpenInEditor` handled here and wonders whether it
-    /// reaches `Tui::suspend_for_child` through a second implementation needs the answer
-    /// sitting in this file's own source, not only in this test's passing: exactly one call
-    /// to `editor::edit`, this file's own reuse of the Launcher's own handoff machinery, and
-    /// no direct call to `suspend_for_child` or a raw `Command` spawn attempting a second one.
+    /// A future reader who sees `Action::OpenInEditor` or `Action::EditConfig` handled here
+    /// and wonders whether either reaches `Tui::suspend_for_child` through an implementation
+    /// of its own needs the answer sitting in this file's own source, not only in this test's
+    /// passing: exactly two calls to `editor::edit`, one per handoff, both this file's own
+    /// reuse of the Launcher's own handoff machinery, and no direct call to
+    /// `suspend_for_child` or a raw `Command` spawn attempting a third implementation.
     #[test]
-    fn the_ad_hoc_editor_chord_calls_editor_edit_rather_than_a_second_terminal_handover() {
+    fn the_editor_handoff_chords_call_editor_edit_rather_than_a_second_terminal_handover() {
         let source = crate::test_support::production_source_at(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
         );
@@ -8878,8 +8949,9 @@ mod tests {
             .filter(|line| line.contains("editor::edit("))
             .count();
         assert_eq!(
-            edit_calls, 1,
-            "expected exactly one call to `editor::edit` in app.rs's own production code"
+            edit_calls, 2,
+            "expected exactly two calls to `editor::edit` in app.rs's own production code, \
+             one for the ad hoc command field and one for editing config.toml"
         );
         assert!(
             !code_lines
@@ -8887,6 +8959,164 @@ mod tests {
                 .any(|line| line.contains("suspend_for_child(")),
             "app.rs must reach the terminal handover only through `editor::edit` and \
              `launcher::run`, never by calling `Tui::suspend_for_child` a second, direct way"
+        );
+    }
+
+    // =====================================================================================
+    // `e` opens config.toml in `$EDITOR` and reloads on return.
+    // =====================================================================================
+
+    /// `e` must queue the handoff for `run`'s own loop to drain with a live `Tui`, never run
+    /// one on the spot, the same shape `ctrl_e_queues_the_editor_handoff_rather_than_running_it_inline`
+    /// proves for the ad hoc command field's own chord.
+    #[test]
+    fn e_queues_the_config_editor_handoff_rather_than_running_it_inline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert!(!app.pending_config_editor_handoff);
+
+        app.handle_key_event(press(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("press e");
+
+        assert!(
+            app.pending_config_editor_handoff,
+            "e must queue the handoff for `run`'s own loop"
+        );
+        assert_eq!(app.notice(), None, "queuing must raise no Notice");
+    }
+
+    /// `e` ends in the identical `reload_config` a live fan-out must never race, so it is
+    /// gated the same way `Ctrl+R` already is: refused with a Notice, and the handoff never
+    /// queued, while an Action is fanning out.
+    #[test]
+    fn e_is_inert_with_a_notice_while_an_action_is_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(app.core.action_running(), "sanity: the fan-out is live");
+
+        app.handle_key_event(press(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("press e while an Action is fanning out");
+
+        assert!(
+            !app.pending_config_editor_handoff,
+            "an inert e must never queue the handoff while a fan-out is live"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("Edit config: Action already running"),
+            "expected a Notice naming the run in progress rather than silence"
+        );
+
+        app.core.stop_action();
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
+    }
+
+    /// config.md's "If the file does not exist yet ... seeded with the annotated example":
+    /// the owner's own machine has no `config.toml` at all, so this is the common case, not
+    /// the edge, and it is what a first `e` press hits with nothing configured yet.
+    #[test]
+    fn a_missing_config_file_is_seeded_with_the_annotated_example() {
+        let missing = tempfile::tempdir()
+            .expect("temp dir")
+            .path()
+            .join("does-not-exist")
+            .join("config.toml");
+        assert_eq!(
+            App::config_editor_seed(&missing),
+            config::document::annotated_example(),
+            "a missing config file must seed the editor with the annotated example verbatim"
+        );
+    }
+
+    /// The negative control: an existing file is read back byte for byte, never replaced by
+    /// the example, so a real edit in progress is never clobbered by this seeding.
+    #[test]
+    fn an_existing_config_file_seeds_the_editor_with_its_own_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# a hand-written comment\ntheme = \"custom\"\n")
+            .expect("write a real config.toml");
+
+        assert_eq!(
+            App::config_editor_seed(&path),
+            "# a hand-written comment\ntheme = \"custom\"\n",
+            "an existing file must seed the editor with its own bytes, not the example"
+        );
+    }
+
+    /// The whole write-then-reload round trip, driven directly at `write_and_reload_config`
+    /// rather than through a live `Tui` (which `editor::edit` needs and a unit test cannot
+    /// supply): text handed back from `$EDITOR` lands on disk at the resolved path, and the
+    /// running app picks up a key only a real reload of that file could have produced,
+    /// proving this went through `reload_config` rather than merely holding the text.
+    #[test]
+    fn write_and_reload_config_writes_the_file_and_reloads_through_reload_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        assert!(
+            !app.document.show_submodules,
+            "sanity: the starting document has show_submodules off"
+        );
+
+        let edited = format!(
+            "# a comment the write must not eat\nshow_submodules = true\n\n[[set]]\nname = \
+             \"test\"\nroots = [\"{}\"]\n",
+            root.display()
+        );
+        app.write_and_reload_config(edited.clone());
+
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
+            edited,
+            "the edited text must land on disk verbatim at the resolved path"
+        );
+        assert!(
+            app.document.show_submodules,
+            "expected the reloaded document to carry the edited value, proving this reached \
+             reload_config rather than only writing the file"
+        );
+    }
+
+    /// The owner's own machine has no `~/.config/repon` directory at all, so the first `e`
+    /// press must create it rather than fail to write: this is the common case, not the edge.
+    #[test]
+    fn write_and_reload_config_creates_a_missing_config_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let nowhere_yet = tempfile::tempdir()
+            .expect("temp dir")
+            .path()
+            .join("repon-config-does-not-exist-yet");
+        app.config_dir = nowhere_yet.clone();
+        app.config_file = nowhere_yet.join("config.toml");
+        assert!(!nowhere_yet.exists(), "sanity: the directory is absent");
+
+        let edited = format!(
+            "[[set]]\nname = \"test\"\nroots = [\"{}\"]\n",
+            root.display()
+        );
+        app.write_and_reload_config(edited.clone());
+
+        assert_eq!(
+            std::fs::read_to_string(&app.config_file).expect("read the newly created file"),
+            edited,
+            "the file must exist at the resolved path once the directory is created"
         );
     }
 

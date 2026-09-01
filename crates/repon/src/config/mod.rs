@@ -9,7 +9,7 @@ use std::{
     sync::OnceLock,
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use directories::ProjectDirs;
 use etcetera::{BaseStrategy, choose_base_strategy};
 use tracing::warn;
@@ -204,6 +204,24 @@ pub fn themes_dir() -> PathBuf {
 
 fn themes_dir_under(config_dir: &Path) -> PathBuf {
     config_dir.join("themes")
+}
+
+/// Writes `contents` to `path` verbatim, creating its parent directory first: the owner's
+/// own machine starts with no `~/.config/repon` at all, so writing back what the user's own
+/// `$EDITOR` produced must not depend on that directory already existing.
+///
+/// Distinct from `repo_entry::write`, which edits one `[[repo]]` table in place and leaves
+/// the rest of the file untouched: this replaces the whole file with exactly what was handed
+/// in. [ADR 0014](../../../../docs/adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)
+/// bans Repon composing `config.toml`'s content itself; copying back what the user's own
+/// editor produced is not that, the same way `git commit` hands a message file to `$EDITOR`
+/// without git composing the message.
+pub fn write_edited(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).wrap_err("create the config directory")?;
+    }
+    std::fs::write(path, contents).wrap_err("write config.toml")?;
+    Ok(())
 }
 
 /// The directory holding `state.toml` and the log, fixed for the process on first read.
