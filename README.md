@@ -1,6 +1,6 @@
 # Repon
 
-A terminal UI for seeing and acting across many git repositories at once.
+Repon is short for 'Repo-N', where N stands in for many. It is a terminal UI for seeing and acting across many git repositories at once.
 
 ## What it is
 
@@ -8,7 +8,9 @@ Repon owns the outer loop: the combined state of many Repos, and acting on many 
 
 ## Status
 
-Pre-alpha. The skeleton compiles and runs: it starts, draws a frame and exits, with the git backend and the worker model wired underneath but no features on top of them. The design decisions needed to build those features are being recorded as ADRs in [docs/adr/](docs/adr/) and specifications in [docs/spec/](docs/spec/), backed by the research in [docs/research/](docs/research/).
+Pre-alpha, but no longer the skeleton this section once described. Repon discovers Repos, Worktrees and Submodules and refreshes their state in a cancellable background generation. The list filters live against a total, three-valued Filter language, where an unsettled cell answers neither a term nor its negation. Configured or typed Actions fan out across a Selection as PTY-backed child processes, with the detail pane showing each step's output as it runs. A Launcher hands off to lazygit, an editor or a shell in the Repo under the cursor and restores the terminal on return. `ignore`, `unignore` and `delete` manage the `[[repo]]` entries Repon owns. Themes correct the terminal's own palette, degrading to a vetted ASCII glyph set when a font lacks the full one.
+
+What's designed but not shipped: the periodic fetch and the fast-forward-only auto-update it can carry exist in `repon-core` behind a cargo feature the `repon` binary never enables, so no build fetches a remote or moves a branch on its own yet. Still no crates.io, still Unix-only. What's cleared and what's left before the first publish is [docs/spec/releasing.md](docs/spec/releasing.md).
 
 ## Installing
 

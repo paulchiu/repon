@@ -134,7 +134,8 @@ const fn binding_not_built(
     (context, code, modifiers, action, false)
 }
 
-/// The spec's own words for an action, read by [`BindingTable::describe`] for the help overlay,
+/// The spec's own words for an action, read by [`BindingTable::describe_own`] and
+/// [`BindingTable::describe_global`] for the help overlay,
 /// by `App::notify_not_implemented` for the shared warning slot's "not implemented yet"
 /// message, and by this module's own spec-conformance test. Deriving it from the [`Action`]
 /// rather than storing it per row means a mislabelled binding permutes its description too, so
@@ -656,9 +657,9 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
 
 /// A live binding table: the compiled default, or the compiled default with a `[keys]` block
 /// merged over it by [`merge`]. `App` holds one of these; the footer and the help overlay
-/// read it through [`Self::dispatch`], [`Self::primary_chord`] and [`Self::describe`], so a
-/// config reload changes what they show with no code change of their own, only a new table
-/// handed to the same read methods.
+/// read it through [`Self::dispatch`], [`Self::primary_chord`], [`Self::describe_own`] and
+/// [`Self::describe_global`], so a config reload changes what they show with no code change
+/// of their own, only a new table handed to the same read methods.
 #[derive(Debug, Clone)]
 pub(crate) struct BindingTable(Vec<Binding>);
 
@@ -718,28 +719,56 @@ impl BindingTable {
             .is_some_and(|(_, _, _, _, built)| *built)
     }
 
-    /// Every distinct action live in `context`, as `(keys, description)`, current context
-    /// first then `global` where it is live alongside it
-    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)). A row bound to
-    /// more than one key (`` `j`, `Down` ``) collapses to one entry, its keys joined with `, `
-    /// in table order, because the help overlay shows one line per action, not per key. The
-    /// help overlay's only source of content: nothing here is transcribed.
+    /// Every distinct action live in `context` alone, with no `global` merge, as
+    /// `(keys, description)`. A row bound to more than one key (`` `j`, `Down` ``) collapses to
+    /// one entry, its keys joined with `, ` in table order, because the help overlay shows one
+    /// line per action, not per key. The help overlay's own current-context section reads
+    /// this, [`Self::describe_global`] its own `global` section.
     ///
     /// Carries only Built bindings
     /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)):
     /// an unbuilt row is skipped here the same way [`lookup`] skips it for dispatch, so the
-    /// help overlay, this method's only reader, never advertises a key that does nothing.
-    pub(crate) fn describe(&self, context: Context) -> Vec<(String, &'static str)> {
-        let mut contexts = vec![context];
-        if matches!(context, Context::List | Context::Detail) {
-            contexts.push(Context::Global);
-        }
+    /// help overlay never advertises a key that does nothing.
+    pub(crate) fn describe_own(&self, context: Context) -> Vec<(String, &'static str)> {
+        Self::describe_rows(&self.0, &[context])
+    }
 
+    /// The `global` bindings live alongside `context`
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts): `global` is live
+    /// in `list` and `detail` only, suspended in the other four), empty for every other
+    /// context. The help overlay's own second section reads this, so a context where `global`
+    /// is suspended shows no such section at all rather than an empty heading standing over
+    /// nothing.
+    pub(crate) fn describe_global(&self, context: Context) -> Vec<(String, &'static str)> {
+        if matches!(context, Context::List | Context::Detail) {
+            Self::describe_rows(&self.0, &[Context::Global])
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every distinct action live in `context`, as `(keys, description)`, current context
+    /// first then `global` where it is live alongside it
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)): [`Self::describe_own`]
+    /// then [`Self::describe_global`], concatenated. Test-only: the help overlay's own render
+    /// path reads the two sections separately now, so this flat shape only remains to let a
+    /// test compare against it.
+    #[cfg(test)]
+    pub(crate) fn describe(&self, context: Context) -> Vec<(String, &'static str)> {
+        let mut rows = self.describe_own(context);
+        rows.extend(self.describe_global(context));
+        rows
+    }
+
+    /// The shared loop [`Self::describe_own`] and [`Self::describe_global`] both read: one
+    /// distinct action per `contexts` slice, in table order, its keys joined with `, ` for a
+    /// row bound to more than one.
+    fn describe_rows(bindings: &[Binding], contexts: &[Context]) -> Vec<(String, &'static str)> {
         let mut order: Vec<&'static str> = Vec::new();
         let mut keys_by_description: std::collections::HashMap<&'static str, Vec<String>> =
             std::collections::HashMap::new();
-        for ctx in contexts {
-            for &(row_context, code, modifiers, action, built) in &self.0 {
+        for &ctx in contexts {
+            for &(row_context, code, modifiers, action, built) in bindings {
                 if row_context != ctx || !built {
                     continue;
                 }

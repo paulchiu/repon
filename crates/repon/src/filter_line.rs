@@ -24,6 +24,13 @@ pub(crate) struct FilterLine {
     input: String,
 }
 
+/// The row's own text while [`FilterLine::input`] is empty, replaced by the prompt character
+/// and typed text on the first keystroke; kept parallel with
+/// [`crate::action_palette::QUERY_PLACEHOLDER`] and
+/// [`crate::launcher_palette::QUERY_PLACEHOLDER`], each the prompt character, a verb, then
+/// what it acts on.
+pub(crate) const QUERY_PLACEHOLDER: &str = "/ filter repos";
+
 impl FilterLine {
     /// Opens prefilled with `committed`'s own text and the cursor at the end
     /// ([filter.md](../../../docs/spec/filter.md): "prefilled with the committed Filter",
@@ -61,28 +68,79 @@ impl FilterLine {
         Filter::parse(&self.input)
     }
 
-    /// Draws the line at `area`'s own row: a leading `/` marking the surface, then the typed
-    /// text, both in [`Role::Text`]. `area` is expected to be exactly one row tall
-    /// ([filter.md](../../../docs/spec/filter.md): "one real row directly above the footer").
+    /// Draws the line at `area`'s own row: a leading `/` marking the surface, then either the
+    /// typed text in [`Role::Text`] or, while empty, [`QUERY_PLACEHOLDER`] in [`Role::Dim`].
+    /// `area` is expected to be exactly one row tall ([filter.md](../../../docs/spec/filter.md):
+    /// "one real row directly above the footer").
     pub(crate) fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let buf: &mut Buffer = frame.buffer_mut();
-        let line = format!("/ {}", self.input);
-        buf.set_stringn(
-            area.x,
-            area.y,
-            &line,
-            area.width as usize,
-            theme.style_for(Role::Text),
-        );
+        let (line, style) = if self.input.is_empty() {
+            (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
+        } else {
+            (format!("/ {}", self.input), theme.style_for(Role::Text))
+        };
+        buf.set_stringn(area.x, area.y, &line, area.width as usize, style);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
     use super::*;
 
     fn committed(text: &str) -> Filter {
         Filter::parse(text)
+    }
+
+    fn draw_to_buffer(line: &FilterLine, theme: &Theme) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| line.draw(frame, frame.area(), theme))
+            .expect("draw the frame");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    /// The empty state must say what `/` does, and that placeholder must be gone the moment
+    /// there is real input, never the two overlapping.
+    #[test]
+    fn shows_placeholder_only_while_empty_and_in_the_dim_role() {
+        let theme = Theme::default();
+
+        let empty = FilterLine::new(&committed(""));
+        let empty_buf = draw_to_buffer(&empty, &theme);
+        assert!(
+            row_text(&empty_buf).starts_with(QUERY_PLACEHOLDER),
+            "expected the placeholder on an empty Filter line: {:?}",
+            row_text(&empty_buf)
+        );
+        assert_eq!(
+            empty_buf[(0, 0)].fg,
+            theme.dim,
+            "the placeholder must paint in the dim role"
+        );
+
+        let mut typed = FilterLine::new(&committed(""));
+        typed.type_char('k');
+        let typed_buf = draw_to_buffer(&typed, &theme);
+        assert!(
+            !row_text(&typed_buf).contains("filter repos"),
+            "the placeholder must not linger once there is typed text: {:?}",
+            row_text(&typed_buf)
+        );
+        assert!(row_text(&typed_buf).starts_with("/ k"));
+        assert_eq!(
+            typed_buf[(0, 0)].fg,
+            theme.text,
+            "typed text must paint in the text role, not dim"
+        );
     }
 
     #[test]

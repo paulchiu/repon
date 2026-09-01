@@ -1,8 +1,8 @@
 //! The help overlay [keybindings.md](../../../../docs/spec/keybindings.md#the-help-overlay)
 //! describes: generated from the same table as the footer, current context first then
 //! `global`, then a glyph legend, scrolling, and closing on `Esc` or `q`. Content comes
-//! straight from [`BindingTable::describe`] and [`GlyphSet::row_interior`]; nothing here is
-//! transcribed.
+//! straight from [`BindingTable::describe_own`], [`BindingTable::describe_global`] and
+//! [`GlyphSet::row_interior`]; nothing here is transcribed.
 //!
 //! Two modes, both dispatched through `Context::Overlay`
 //! ([keybindings.md](../../../../docs/spec/keybindings.md#the-help-overlay)): reading, the
@@ -14,8 +14,9 @@
 //! tells the two apart on a keystroke; this module only holds [`HelpOverlay`]'s own state
 //! and renders whichever mode it is in.
 //!
-//! The overlay's own chrome (border, title, the fixed key gutter, the degrade threshold) is
-//! a presentation decision this crate makes rather than one
+//! The overlay's own chrome (border, title, the fixed key gutter, the degrade threshold, the
+//! three sections' own headings, the query line's own edge, the version on the bottom
+//! border) is a presentation decision this crate makes rather than one
 //! [keybindings.md](../../../../docs/spec/keybindings.md#the-help-overlay) fixes; the choice
 //! is recorded there under "The help overlay's own chrome". Help stays full-frame: it is a
 //! reading surface, not a chooser, so the popup treatment [0008](../../../../docs/adr/0008-two-palettes-not-one.md)
@@ -26,6 +27,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
+    text::Line,
 };
 
 use crate::glyphs::{BorderScratch, GlyphSet, Meaning, bordered_interior};
@@ -50,29 +52,47 @@ const MIN_BORDERED_HEIGHT: u16 = BORDER_HEIGHT + MIN_CONTENT_HEIGHT;
 /// help overlay's own chrome" and named once here so no reader of it holds a second copy.
 pub(crate) const BORDER_TITLE: &str = " help (esc or q closes) ";
 
+/// `repon <version>`, right-aligned on the panel's own bottom border: the one place this
+/// crate's own build version reaches the screen, since `--version` (`cli.rs`) exits before
+/// the terminal is claimed. Not the status row, which [0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)
+/// and [0027](../../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)
+/// close to this, nor the footer, which [0016](../../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)
+/// fixes as derived from the binding table alone.
+fn version_title() -> String {
+    format!("repon {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// The interior's list rows when the query matches nothing, the same convention
 /// [`crate::launcher_palette::NO_MATCHES_MESSAGE`] uses for the same fact on a different
 /// surface: shown once in place of the list rather than an empty area, so a query that
 /// matches nothing is told apart from a query nobody has typed anything into yet.
 pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 
-/// The legend section's own heading text, painted in one solid role the way no binding or
-/// legend row is (each of those splits two roles across its own line), so the two sections
-/// read apart on screen with no second border between them.
+/// The `global` section's own heading text.
+pub(crate) const GLOBAL_HEADING: &str = "Global";
+
+/// The legend section's own heading text.
 pub(crate) const LEGEND_HEADING: &str = "Glyphs";
 
-/// One line the overlay can render: a keybinding row from [`BindingTable::describe`], the
-/// legend section's own heading, or a legend row naming what one row-interior glyph means.
-/// Kept as its own line kind rather than squeezing a legend row into a binding row's shape,
-/// because a legend row's two columns (glyph, meaning) are not a key and a description, and
-/// filtering must not conflate the two.
+/// One line the overlay can render: a section heading, a blank row separating two sections, a
+/// keybinding row from [`BindingTable::describe_own`]/[`BindingTable::describe_global`], or a
+/// legend row naming what one row-interior glyph means. Kept as its own line kind rather than
+/// squeezing a legend row into a binding row's shape, because a legend row's two columns
+/// (glyph, meaning) are not a key and a description, and filtering must not conflate the two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HelpLine {
+    /// One of the overlay's three section headings: the current context's own name, `global`,
+    /// or the glyph legend's ([`HelpOverlay::assemble_sections`]'s own blank-row rule puts one
+    /// above every heading but the first that survives a query).
+    Heading(&'static str),
+    /// The one blank row [`HelpOverlay::assemble_sections`] inserts above every heading but
+    /// the first, so the groups it separates read apart by whitespace rather than sitting
+    /// flush.
+    Blank,
     Binding {
         keys: String,
         description: &'static str,
     },
-    LegendHeading,
     Legend {
         glyph: String,
         meaning: &'static str,
@@ -100,7 +120,42 @@ fn meaning_text(meaning: Meaning) -> &'static str {
         Meaning::Behind => "behind by n",
         Meaning::Changed => "n changed files",
         Meaning::ChildRow => "child row",
+        Meaning::Checked => "checked (the Selection's own marker)",
     }
+}
+
+/// The current-context section's own heading text
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts) names the six
+/// contexts this matches). No `_` arm: a context added to [`Context`] fails to compile here
+/// until this overlay says what its own section is called, rather than falling back to
+/// something generic no reader asked for.
+fn context_heading(context: Context) -> &'static str {
+    match context {
+        Context::Global => GLOBAL_HEADING,
+        Context::List => "List",
+        Context::Detail => "Detail",
+        Context::Input => "Input",
+        Context::Overlay => "Overlay",
+        Context::Confirm => "Confirm",
+    }
+}
+
+/// One [`HelpLine::Binding`] per `(keys, description)` pair, kept apart rather than joined
+/// into one string: [theming.md](../../../../docs/spec/theming.md) fixes the keys' own role
+/// as `accent` and the description's as `dim`, and that split only survives if nothing here
+/// bakes it together before [`HelpOverlay::draw`] paints it.
+fn bindings_to_lines(rows: Vec<(String, &'static str)>) -> Vec<HelpLine> {
+    rows.into_iter()
+        .map(|(keys, description)| HelpLine::Binding { keys, description })
+        .collect()
+}
+
+/// One [`HelpLine::Legend`] per `(glyph, meaning)` pair, [`HelpOverlay::legend_rows`]'s own
+/// output kept apart the same way [`bindings_to_lines`] keeps a binding's two columns apart.
+fn legend_to_lines(rows: Vec<(String, &'static str)>) -> Vec<HelpLine> {
+    rows.into_iter()
+        .map(|(glyph, meaning)| HelpLine::Legend { glyph, meaning })
+        .collect()
 }
 
 /// Whether `frame_area` is drawn as a bordered panel or, below the size that needs, degraded
@@ -165,13 +220,13 @@ pub(crate) struct HelpOverlay {
 }
 
 impl HelpOverlay {
-    /// One line per action live in `context`, as `(keys, description)` kept apart rather
-    /// than joined into one string: [theming.md](../../../../docs/spec/theming.md) fixes
-    /// the keys' role as `accent` and the description's as `dim`, and that split only
-    /// survives if nothing here bakes it together before [`Self::draw`] paints it. Current
-    /// context first then `global`, exactly as `table`'s own `describe` orders them; `table`
-    /// is `App`'s live binding table, so a rebind changes this overlay with no code change
-    /// here.
+    /// One line per action live in `context`, as `(keys, description)`, current context first
+    /// then `global`: [`BindingTable::describe`]'s own flat shape, kept for whatever wants the
+    /// overlay's content with no section boundary. [`Self::lines`] reads
+    /// [`BindingTable::describe_own`] and [`BindingTable::describe_global`] instead, since it
+    /// is the boundary between them that carries a heading. Test-only: nothing in the render
+    /// path needs the two merged back together once they draw as separate sections.
+    #[cfg(test)]
     pub(crate) fn content(table: &BindingTable, context: Context) -> Vec<(String, &'static str)> {
         table.describe(context)
     }
@@ -198,30 +253,50 @@ impl HelpOverlay {
             .collect()
     }
 
-    /// The overlay's full content with no query typed: `context`'s own bindings then
-    /// `global`'s ([`Self::content`]), a [`HelpLine::LegendHeading`], then one legend row per
-    /// row-interior [`Meaning`] ([`Self::legend_rows`]).
-    fn lines(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> Vec<HelpLine> {
-        let mut lines: Vec<HelpLine> = Self::content(table, context)
+    /// Folds `sections` into one line list: each section's own heading immediately followed
+    /// by its content, a [`HelpLine::Blank`] above every heading but the first that survives.
+    /// A section whose content is empty is dropped entirely, heading included, so a query that
+    /// empties one never leaves its heading standing over nothing; that rule is what already
+    /// held for the legend heading alone and now covers all three.
+    fn assemble_sections(sections: [(&'static str, Vec<HelpLine>); 3]) -> Vec<HelpLine> {
+        let mut lines = Vec::new();
+        for (heading, content) in sections
             .into_iter()
-            .map(|(keys, description)| HelpLine::Binding { keys, description })
-            .collect();
-        lines.push(HelpLine::LegendHeading);
-        lines.extend(
-            Self::legend_rows(glyphs)
-                .into_iter()
-                .map(|(glyph, meaning)| HelpLine::Legend { glyph, meaning }),
-        );
+            .filter(|(_, content)| !content.is_empty())
+        {
+            if !lines.is_empty() {
+                lines.push(HelpLine::Blank);
+            }
+            lines.push(HelpLine::Heading(heading));
+            lines.extend(content);
+        }
         lines
+    }
+
+    /// The overlay's full content with no query typed: three sections, each under its own
+    /// heading ([`Self::assemble_sections`]) — `context`'s own bindings
+    /// ([`BindingTable::describe_own`]), the `global` bindings live alongside it
+    /// ([`BindingTable::describe_global`]), and one legend row per row-interior [`Meaning`]
+    /// ([`Self::legend_rows`]).
+    fn lines(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> Vec<HelpLine> {
+        Self::assemble_sections([
+            (
+                context_heading(context),
+                bindings_to_lines(table.describe_own(context)),
+            ),
+            (
+                GLOBAL_HEADING,
+                bindings_to_lines(table.describe_global(context)),
+            ),
+            (LEGEND_HEADING, legend_to_lines(Self::legend_rows(glyphs))),
+        ])
     }
 
     /// [`Self::lines`] narrowed to `query`: a binding row matches on its own key text or
     /// description, a legend row on its own glyph or meaning, both a case-insensitive
     /// substring, the same convention [`crate::launcher_palette::matching`] and
-    /// [`crate::action_palette::ActionPalette::matches`] already match their own lists with. An empty
-    /// query matches everything. `LegendHeading` survives only when at least one legend row
-    /// does, so a query that empties the legend never leaves its own heading standing over
-    /// nothing.
+    /// [`crate::action_palette::ActionPalette::matches`] already match their own lists with.
+    /// An empty query matches everything.
     pub(crate) fn filtered_lines(
         table: &BindingTable,
         context: Context,
@@ -229,25 +304,43 @@ impl HelpOverlay {
         query: &str,
     ) -> Vec<HelpLine> {
         let query = query.to_lowercase();
-        let mut lines: Vec<HelpLine> = Self::content(table, context)
-            .into_iter()
-            .filter(|(keys, description)| {
-                keys.to_lowercase().contains(&query) || description.to_lowercase().contains(&query)
-            })
-            .map(|(keys, description)| HelpLine::Binding { keys, description })
-            .collect();
-        let legend: Vec<HelpLine> = Self::legend_rows(glyphs)
-            .into_iter()
-            .filter(|(glyph, meaning)| {
-                glyph.to_lowercase().contains(&query) || meaning.to_lowercase().contains(&query)
-            })
-            .map(|(glyph, meaning)| HelpLine::Legend { glyph, meaning })
-            .collect();
-        if !legend.is_empty() {
-            lines.push(HelpLine::LegendHeading);
-            lines.extend(legend);
-        }
-        lines
+        let binding_matches = |(keys, description): &(String, &'static str)| {
+            keys.to_lowercase().contains(&query) || description.to_lowercase().contains(&query)
+        };
+        let legend_matches = |(glyph, meaning): &(String, &'static str)| {
+            glyph.to_lowercase().contains(&query) || meaning.to_lowercase().contains(&query)
+        };
+        Self::assemble_sections([
+            (
+                context_heading(context),
+                bindings_to_lines(
+                    table
+                        .describe_own(context)
+                        .into_iter()
+                        .filter(binding_matches)
+                        .collect(),
+                ),
+            ),
+            (
+                GLOBAL_HEADING,
+                bindings_to_lines(
+                    table
+                        .describe_global(context)
+                        .into_iter()
+                        .filter(binding_matches)
+                        .collect(),
+                ),
+            ),
+            (
+                LEGEND_HEADING,
+                legend_to_lines(
+                    Self::legend_rows(glyphs)
+                        .into_iter()
+                        .filter(legend_matches)
+                        .collect(),
+                ),
+            ),
+        ])
     }
 
     /// How many lines [`Self::filtered_lines`] would have for `query`: what the scroll clamp
@@ -272,9 +365,9 @@ impl HelpOverlay {
     }
 
     /// The overlay's real interior height for `frame_area`: the bordered panel's own
-    /// interior, one row shorter only while [`Self::shows_query_line`] has something to put
-    /// there. The caller's scroll clamp must use this, since the border and (conditionally)
-    /// the query row both cost it.
+    /// interior, one row shorter only while [`Self::shows_query_line`] has something to put on
+    /// the interior's own last row. The caller's scroll clamp must use this, since the border
+    /// and (conditionally) the query row both cost it.
     pub(crate) fn viewport_height(&self, frame_area: Rect) -> u16 {
         let interior = HelpLayout::compute(frame_area)
             .content_area(frame_area)
@@ -348,12 +441,14 @@ impl HelpOverlay {
         self.scroll = scroll_after(self.scroll, action, content_len, viewport_height);
     }
 
-    /// Draws the overlay into `frame_area`: the house-style bordered panel, or (below
-    /// [`HelpLayout::compute`]'s threshold) flush content with no border, the query as the
-    /// first row, then keys/glyphs in `accent` and descriptions/meanings in `dim`
-    /// ([theming.md](../../../../docs/spec/theming.md)), each line's own key or glyph column
-    /// padded to one fixed width, computed from the whole unfiltered content so it never
-    /// shifts as the query narrows the list on screen.
+    /// Draws the overlay into `frame_area`: the house-style bordered panel (its own bottom
+    /// border carrying this crate's version, right-aligned) or, below
+    /// [`HelpLayout::compute`]'s threshold, flush content with no border; the section headings
+    /// and binding/legend rows above the query line, which takes the interior's own last row
+    /// while [`Self::shows_query_line`] holds. Keys/glyphs paint in `accent`, headings in bold
+    /// `accent`, descriptions/meanings in `dim` ([theming.md](../../../../docs/spec/theming.md)),
+    /// each line's own key or glyph column padded to one fixed width, computed from the whole
+    /// unfiltered content so it never shifts as the query narrows the list on screen.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -372,41 +467,29 @@ impl HelpOverlay {
             let block = glyphs
                 .bordered_block(&mut scratch)
                 .border_style(theme.style_for(Role::BorderFocused))
-                .title(BORDER_TITLE);
+                .title(BORDER_TITLE)
+                .title_bottom(Line::from(version_title()).right_aligned());
             frame.render_widget(block, frame_area);
         }
         let content_area = layout.content_area(frame_area);
         let buf = frame.buffer_mut();
         let end = content_area.right();
 
-        // The query line only draws while there is something to show for it: actively
-        // searching (the `/` prompt itself, even before anything is typed), or reading mode
-        // with a filter still committed from an earlier search. A fresh, never-searched
-        // overlay draws nothing here and keeps the whole interior for content, the overlay's
-        // pre-search shape.
-        let list_area = if self.shows_query_line() {
-            let mut qx = content_area.x;
-            let query_line = format!("/ {}", self.query);
-            paint_run(
-                buf,
-                &mut qx,
-                content_area.y,
-                end,
-                &query_line,
-                theme.style_for(Role::Text),
-            );
-            if content_area.height < 2 {
-                return;
-            }
-            Rect::new(
-                content_area.x,
-                content_area.y + 1,
-                content_area.width,
-                content_area.height - 1,
-            )
+        // The list gets the whole interior except the one row the query line costs while
+        // `Self::shows_query_line` holds; that row sits at the interior's own bottom edge,
+        // never at the top where the query used to sit, so it lines up with where the main
+        // screen puts its own Filter line, directly above the footer.
+        let list_height = if self.shows_query_line() {
+            content_area.height.saturating_sub(1)
         } else {
-            content_area
+            content_area.height
         };
+        let list_area = Rect::new(
+            content_area.x,
+            content_area.y,
+            content_area.width,
+            list_height,
+        );
 
         let visible = Self::filtered_lines(table, context, glyphs, &self.query);
         if visible.is_empty() {
@@ -419,63 +502,78 @@ impl HelpOverlay {
                 NO_MATCHES_MESSAGE,
                 theme.style_for(Role::Dim),
             );
-            return;
-        }
+        } else {
+            // One fixed width for every line's own key/glyph column, from the whole unfiltered
+            // content (not only what a query currently keeps, and not only what fits on
+            // screen), so the gutter neither shifts as a scroll brings a longer or shorter key
+            // into view nor as typing narrows the list.
+            let key_width = Self::lines(table, context, glyphs)
+                .iter()
+                .map(|line| match line {
+                    HelpLine::Binding { keys, .. } => keys.chars().count(),
+                    HelpLine::Legend { glyph, .. } => glyph.chars().count(),
+                    HelpLine::Heading(_) | HelpLine::Blank => 0,
+                })
+                .max()
+                .unwrap_or(0);
 
-        // One fixed width for every line's own key/glyph column, from the whole unfiltered
-        // content (not only what a query currently keeps, and not only what fits on
-        // screen), so the gutter neither shifts as a scroll brings a longer or shorter key
-        // into view nor as typing narrows the list.
-        let key_width = Self::lines(table, context, glyphs)
-            .iter()
-            .map(|line| match line {
-                HelpLine::Binding { keys, .. } => keys.chars().count(),
-                HelpLine::Legend { glyph, .. } => glyph.chars().count(),
-                HelpLine::LegendHeading => 0,
-            })
-            .max()
-            .unwrap_or(0);
-
-        for (row, line) in visible
-            .iter()
-            .skip(self.scroll as usize)
-            .take(list_area.height as usize)
-            .enumerate()
-        {
-            let y = list_area.y + row as u16;
-            let mut x = list_area.x;
-            match line {
-                HelpLine::Binding { keys, description } => {
-                    let padded_keys = format!("{keys:<key_width$}");
-                    paint_run(
-                        buf,
-                        &mut x,
-                        y,
-                        end,
-                        &padded_keys,
-                        theme.style_for(Role::Accent),
-                    );
-                    paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
-                    paint_run(buf, &mut x, y, end, description, theme.style_for(Role::Dim));
-                }
-                HelpLine::Legend { glyph, meaning } => {
-                    let padded_glyph = format!("{glyph:<key_width$}");
-                    paint_run(
-                        buf,
-                        &mut x,
-                        y,
-                        end,
-                        &padded_glyph,
-                        theme.style_for(Role::Accent),
-                    );
-                    paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
-                    paint_run(buf, &mut x, y, end, meaning, theme.style_for(Role::Dim));
-                }
-                HelpLine::LegendHeading => {
-                    let heading_style = theme.style_for(Role::Accent).add_modifier(Modifier::BOLD);
-                    paint_run(buf, &mut x, y, end, LEGEND_HEADING, heading_style);
+            for (row, line) in visible
+                .iter()
+                .skip(self.scroll as usize)
+                .take(list_area.height as usize)
+                .enumerate()
+            {
+                let y = list_area.y + row as u16;
+                let mut x = list_area.x;
+                match line {
+                    HelpLine::Binding { keys, description } => {
+                        let padded_keys = format!("{keys:<key_width$}");
+                        paint_run(
+                            buf,
+                            &mut x,
+                            y,
+                            end,
+                            &padded_keys,
+                            theme.style_for(Role::Accent),
+                        );
+                        paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
+                        paint_run(buf, &mut x, y, end, description, theme.style_for(Role::Dim));
+                    }
+                    HelpLine::Legend { glyph, meaning } => {
+                        let padded_glyph = format!("{glyph:<key_width$}");
+                        paint_run(
+                            buf,
+                            &mut x,
+                            y,
+                            end,
+                            &padded_glyph,
+                            theme.style_for(Role::Accent),
+                        );
+                        paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
+                        paint_run(buf, &mut x, y, end, meaning, theme.style_for(Role::Dim));
+                    }
+                    HelpLine::Heading(text) => {
+                        let heading_style =
+                            theme.style_for(Role::Accent).add_modifier(Modifier::BOLD);
+                        paint_run(buf, &mut x, y, end, text, heading_style);
+                    }
+                    HelpLine::Blank => {}
                 }
             }
+        }
+
+        if self.shows_query_line() {
+            let mut qx = content_area.x;
+            let query_line = format!("/ {}", self.query);
+            let query_y = content_area.y + list_height;
+            paint_run(
+                buf,
+                &mut qx,
+                query_y,
+                end,
+                &query_line,
+                theme.style_for(Role::Text),
+            );
         }
     }
 }
@@ -568,23 +666,34 @@ mod tests {
         panic!("text {text:?} not found on row {y} within {area:?}");
     }
 
-    /// The content area's list portion, mode-aware: one row below its own origin while
-    /// `overlay` shows a query line ([`HelpOverlay::shows_query_line`]), flush against the
-    /// origin otherwise. Reading a fresh, never-searched `overlay`'s own state here rather
-    /// than assuming a fixed offset is what keeps this helper honest about the one thing
-    /// this whole rework is about: reading mode costs no row at all.
+    /// The content area's list portion, mode-aware: one row shorter than the interior while
+    /// `overlay` shows a query line ([`HelpOverlay::shows_query_line`]), which now takes the
+    /// interior's own last row rather than its first, so the list still starts flush at the
+    /// origin either way and only its height changes. Reading a fresh, never-searched
+    /// `overlay`'s own state here rather than assuming a fixed offset is what keeps this
+    /// helper honest about the one thing the heading rework is about: reading mode costs no
+    /// row at all.
     fn list_area(overlay: &HelpOverlay, frame: Rect) -> Rect {
         let content_area = HelpLayout::compute(frame).content_area(frame);
-        if overlay.shows_query_line() {
-            Rect::new(
-                content_area.x,
-                content_area.y + 1,
-                content_area.width,
-                content_area.height - 1,
-            )
+        let height = if overlay.shows_query_line() {
+            content_area.height - 1
         } else {
-            content_area
-        }
+            content_area.height
+        };
+        Rect::new(content_area.x, content_area.y, content_area.width, height)
+    }
+
+    /// `line`'s own leading character, whichever variant it is: a heading's own text, a
+    /// binding's keys or a legend's glyph. What a test reads to check the very first rendered
+    /// line lands where it should, without assuming that line is a binding.
+    fn leading_char(line: &HelpLine) -> char {
+        let text = match line {
+            HelpLine::Heading(text) => text,
+            HelpLine::Binding { keys, .. } => keys.as_str(),
+            HelpLine::Legend { glyph, .. } => glyph.as_str(),
+            HelpLine::Blank => panic!("expected a real line, not the blank separator"),
+        };
+        text.chars().next().expect("expected a non-empty line")
     }
 
     // --- content is derived, not transcribed, and stays unjoined ---
@@ -863,7 +972,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| matches!(line, HelpLine::LegendHeading)),
+                .any(|line| matches!(line, HelpLine::Heading(text) if *text == LEGEND_HEADING)),
             "the legend heading must survive alongside its one surviving row"
         );
     }
@@ -936,7 +1045,7 @@ mod tests {
     // --- Criterion: the query is visible on screen, only while it means something ---
 
     #[test]
-    fn the_typed_query_renders_on_the_overlays_own_first_row_while_searching() {
+    fn the_typed_query_renders_on_the_overlays_own_last_row_while_searching() {
         let mut overlay = HelpOverlay::default();
         overlay.enter_search();
         for c in "move".chars() {
@@ -951,12 +1060,14 @@ mod tests {
         );
         let buf = terminal.backend().buffer();
         let content_area = HelpLayout::compute(ROOMY_FRAME).content_area(ROOMY_FRAME);
+        let last_row = content_area.bottom() - 1;
         let row_text: String = (content_area.x..content_area.right())
-            .map(|x| buf[(x, content_area.y)].symbol())
+            .map(|x| buf[(x, last_row)].symbol())
             .collect();
         assert!(
             row_text.contains("/ move"),
-            "expected the query line to show what was typed, got {row_text:?}"
+            "expected the query line to show what was typed on the interior's last row, got \
+             {row_text:?}"
         );
     }
 
@@ -1138,7 +1249,11 @@ mod tests {
         let last_text = match last_line {
             HelpLine::Binding { description, .. } => description,
             HelpLine::Legend { meaning, .. } => meaning,
-            HelpLine::LegendHeading => LEGEND_HEADING,
+            HelpLine::Heading(text) => text,
+            HelpLine::Blank => panic!(
+                "fixture sanity: the legend always has at least one row, so the last line is \
+                 never the blank separator above a heading"
+            ),
         };
         let area = list_area(&overlay, frame);
         let last_row_y = area.bottom() - 1;
@@ -1169,22 +1284,30 @@ mod tests {
         );
 
         let buf = terminal.backend().buffer();
-        let lines = HelpOverlay::content(&table, Context::List);
+        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
+        let (row, first_keys, first_description) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| match line {
+                HelpLine::Binding { keys, description } => Some((row, keys, *description)),
+                _ => None,
+            })
+            .expect("expected at least one binding row");
         let area = list_area(&overlay, ROOMY_FRAME);
-        let (first_keys, first_description) = &lines[0];
+        let y = area.y + row as u16;
         assert!(!first_keys.is_empty(), "expected a non-empty first key");
         assert_eq!(
-            buf[(area.x, area.y)].fg,
+            buf[(area.x, y)].fg,
             theme.role_color(Role::Accent),
-            "expected the first line's keys painted in the theme's accent role"
+            "expected the first binding row's keys painted in the theme's accent role"
         );
 
-        let value_x = find_text_start_x(buf, area, area.y, first_description);
+        let value_x = find_text_start_x(buf, area, y, first_description);
         assert!(!first_description.is_empty());
         assert_eq!(
-            buf[(value_x, area.y)].fg,
+            buf[(value_x, y)].fg,
             theme.role_color(Role::Dim),
-            "expected the first line's description painted in the theme's dim role"
+            "expected the first binding row's description painted in the theme's dim role"
         );
     }
 
@@ -1207,7 +1330,7 @@ mod tests {
         let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
         let heading_index = lines
             .iter()
-            .position(|line| matches!(line, HelpLine::LegendHeading))
+            .position(|line| matches!(line, HelpLine::Heading(text) if *text == LEGEND_HEADING))
             .expect("expected a legend heading line");
         let heading_y = area.y + heading_index as u16;
         let heading_row: String = (area.x..area.right())
@@ -1225,42 +1348,124 @@ mod tests {
 
         // A binding row's own key cell must not carry that same bold modifier: the heading
         // is what stands apart, not every row on screen.
+        let binding_index = lines
+            .iter()
+            .position(|line| matches!(line, HelpLine::Binding { .. }))
+            .expect("expected at least one binding row");
+        let binding_y = area.y + binding_index as u16;
         assert!(
-            !buf[(area.x, area.y)]
+            !buf[(area.x, binding_y)]
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD),
             "expected an ordinary binding row's key cell to carry no bold modifier"
         );
     }
 
+    /// The three sections in the order [keybindings.md](../../../../docs/spec/keybindings.md#the-help-overlay)
+    /// fixes: `context`'s own bindings, then `global`'s, then the glyph legend, each under its
+    /// own heading with a blank row above every heading but the first. `Context::List` gets a
+    /// `global` section ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)),
+    /// so all three sections are exercised at once.
     #[test]
-    fn the_legend_section_appears_after_the_binding_rows_with_its_own_heading_between_them() {
+    fn the_three_sections_appear_in_order_each_under_its_own_heading_with_a_blank_row_between() {
         let table = default_table();
-        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
-        let heading_index = lines
+        let context = Context::List;
+        let lines = HelpOverlay::lines(&table, context, full_glyphs());
+
+        let own_heading = lines
             .iter()
-            .position(|line| matches!(line, HelpLine::LegendHeading))
+            .position(
+                |line| matches!(line, HelpLine::Heading(text) if *text == context_heading(context)),
+            )
+            .expect("expected the current context's own heading");
+        let global_heading = lines
+            .iter()
+            .position(|line| matches!(line, HelpLine::Heading(text) if *text == GLOBAL_HEADING))
+            .expect("expected List's own `global` section, live alongside it per keybindings.md");
+        let legend_heading = lines
+            .iter()
+            .position(|line| matches!(line, HelpLine::Heading(text) if *text == LEGEND_HEADING))
             .expect("expected a legend heading");
         assert!(
-            lines[..heading_index]
-                .iter()
-                .all(|line| matches!(line, HelpLine::Binding { .. })),
-            "expected only binding rows before the legend heading"
+            own_heading < global_heading && global_heading < legend_heading,
+            "expected {}, then {GLOBAL_HEADING}, then {LEGEND_HEADING}, got {lines:?}",
+            context_heading(context)
+        );
+
+        assert_eq!(
+            own_heading, 0,
+            "expected no blank row above the very first heading"
         );
         assert!(
-            lines[heading_index + 1..]
+            matches!(lines[global_heading - 1], HelpLine::Blank),
+            "expected a blank row between the own-context section and {GLOBAL_HEADING}'s own \
+             heading, got {:?}",
+            lines[global_heading - 1]
+        );
+        assert!(
+            matches!(lines[legend_heading - 1], HelpLine::Blank),
+            "expected a blank row between the `global` section and {LEGEND_HEADING}'s own \
+             heading, got {:?}",
+            lines[legend_heading - 1]
+        );
+
+        assert!(
+            lines[own_heading + 1..global_heading - 1]
+                .iter()
+                .all(|line| matches!(line, HelpLine::Binding { .. })),
+            "expected only binding rows between the own-context heading and the blank row \
+             above {GLOBAL_HEADING}, got {lines:?}"
+        );
+        assert!(
+            !lines[own_heading + 1..global_heading - 1].is_empty(),
+            "expected at least one of List's own bindings"
+        );
+        assert!(
+            lines[global_heading + 1..legend_heading - 1]
+                .iter()
+                .all(|line| matches!(line, HelpLine::Binding { .. })),
+            "expected only binding rows between {GLOBAL_HEADING}'s own heading and the blank \
+             row above {LEGEND_HEADING}, got {lines:?}"
+        );
+        assert!(
+            !lines[global_heading + 1..legend_heading - 1].is_empty(),
+            "expected at least one `global` binding"
+        );
+        assert!(
+            lines[legend_heading + 1..]
                 .iter()
                 .all(|line| matches!(line, HelpLine::Legend { .. })),
             "expected only legend rows after the legend heading"
         );
         assert!(
-            !lines[heading_index + 1..].is_empty(),
+            !lines[legend_heading + 1..].is_empty(),
             "expected at least one legend row"
+        );
+    }
+
+    /// A context `global` is suspended in
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)) shows no
+    /// `global` section at all, not an empty heading standing over nothing.
+    #[test]
+    fn a_context_with_no_global_section_shows_no_global_heading() {
+        let table = default_table();
+        let lines = HelpOverlay::lines(&table, Context::Confirm, full_glyphs());
+        assert!(
+            !lines
+                .iter()
+                .any(|line| matches!(line, HelpLine::Heading(text) if *text == GLOBAL_HEADING)),
+            "expected Confirm, where global is suspended, to carry no {GLOBAL_HEADING} \
+             heading, got {lines:?}"
         );
     }
 
     // --- Criterion: house-style border and title, at the position the house style puts them ---
 
+    /// The bottom border no longer draws as a plain run once it carries the version
+    /// ([`the_bottom_border_carries_the_crates_own_version_right_aligned`]), so this reads
+    /// [`crate::test_support::assert_bordered_frame_and_top_title_drawn_with`] rather than
+    /// [`crate::test_support::assert_frame_drawn_with`], which every other bordered surface's
+    /// own bottom-border-has-nothing-on-it assumption still holds for.
     #[test]
     fn draws_the_house_styles_border_and_a_title_naming_the_overlay_and_its_close_keys() {
         let overlay = HelpOverlay::default();
@@ -1275,23 +1480,51 @@ mod tests {
 
         let buf = terminal.backend().buffer();
         let glyphs = full_glyphs();
-        let outer = ROOMY_FRAME;
-        let title = BORDER_TITLE;
 
-        crate::test_support::assert_frame_drawn_with(
+        crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
             buf,
-            outer,
+            ROOMY_FRAME,
             glyphs.border,
-            title,
+            BORDER_TITLE,
             "the help overlay's frame",
+        );
+    }
+
+    /// `keybindings.md`'s own "The help overlay's own chrome" fixes the border and title;
+    /// this ticket adds the version to the bottom one, right-aligned.
+    #[test]
+    fn the_bottom_border_carries_the_crates_own_version_right_aligned() {
+        let overlay = HelpOverlay::default();
+        let table = default_table();
+        let terminal = render(
+            &overlay,
+            ROOMY_FRAME.width,
+            ROOMY_FRAME.height,
+            Context::List,
+            &table,
+        );
+
+        let buf = terminal.backend().buffer();
+        let outer = ROOMY_FRAME;
+        let bottom_y = outer.bottom() - 1;
+        let expected = version_title();
+        let expected_len = expected.chars().count() as u16;
+        let start_x = outer.right() - 1 - expected_len;
+        let got: String = (start_x..outer.right() - 1)
+            .map(|x| buf[(x, bottom_y)].symbol())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "expected the version right-aligned on the bottom border, ending one cell before \
+             the right corner"
         );
     }
 
     // --- Criterion: content draws at the block's own interior origin, not over the border ---
 
-    /// A fresh, reading-mode overlay's first binding line draws at the block's own
-    /// `inner()` origin, not over the border, and not shifted down for a query line it is
-    /// not showing.
+    /// A fresh, reading-mode overlay's first rendered line (a section heading) draws at the
+    /// block's own `inner()` origin, not over the border, and not shifted down for a query
+    /// line it is not showing.
     #[test]
     fn content_draws_at_the_blocks_own_interior_origin_not_over_the_border_in_reading_mode() {
         let overlay = HelpOverlay::default();
@@ -1312,9 +1545,8 @@ mod tests {
             "expected the border's own corner untouched by content"
         );
 
-        let lines = HelpOverlay::content(&table, Context::List);
-        let (first_keys, _) = &lines[0];
-        let first_char = first_keys.chars().next().expect("expected a non-empty key");
+        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
+        let first_char = leading_char(&lines[0]);
         assert_eq!(
             buf[(ROOMY_FRAME.x + 1, ROOMY_FRAME.y + 1)].symbol(),
             first_char.to_string(),
@@ -1322,10 +1554,13 @@ mod tests {
         );
     }
 
-    /// While searching, the query line takes that same interior origin instead, and the
-    /// first binding row moves one row below it.
+    /// While searching, the interior's own origin still holds the first content line (a
+    /// section heading, here): the query line takes the interior's own *last* row instead,
+    /// the same edge the main screen's Filter line sits above its own footer
+    /// ([filter.md](../../../../docs/spec/filter.md)), and the list above it just loses that
+    /// one row rather than being pushed down from the top.
     #[test]
-    fn the_query_line_takes_the_interior_origin_while_searching_and_content_moves_below_it() {
+    fn the_query_line_takes_the_interiors_own_last_row_while_content_keeps_the_origin() {
         let mut overlay = HelpOverlay::default();
         overlay.enter_search();
         let table = default_table();
@@ -1338,20 +1573,21 @@ mod tests {
         );
 
         let buf = terminal.backend().buffer();
+        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
+        let first_char = leading_char(&lines[0]);
         assert_eq!(
             buf[(ROOMY_FRAME.x + 1, ROOMY_FRAME.y + 1)].symbol(),
-            "/",
-            "expected the query line's own leading mark at the block's own interior origin"
+            first_char.to_string(),
+            "expected the first content line's own leading character still at the block's own \
+             interior origin while searching"
         );
 
-        let lines = HelpOverlay::content(&table, Context::List);
-        let (first_keys, _) = &lines[0];
-        let first_char = first_keys.chars().next().expect("expected a non-empty key");
-        let area = list_area(&overlay, ROOMY_FRAME);
+        let content_area = HelpLayout::compute(ROOMY_FRAME).content_area(ROOMY_FRAME);
+        let last_row = content_area.bottom() - 1;
         assert_eq!(
-            buf[(area.x, area.y)].symbol(),
-            first_char.to_string(),
-            "expected the first binding line's first character one row below the query line"
+            buf[(content_area.x, last_row)].symbol(),
+            "/",
+            "expected the query line's own leading mark on the interior's own last row"
         );
     }
 
@@ -1364,19 +1600,27 @@ mod tests {
         let overlay = HelpOverlay::default();
         let table = default_table();
         let context = Context::List;
-        let lines = HelpOverlay::content(&table, context);
-        let (shortest_index, (shortest_keys, shortest_description)) = lines
+        let lines = HelpOverlay::lines(&table, context, full_glyphs());
+        let bindings: Vec<(usize, &str, &str)> = lines
             .iter()
             .enumerate()
-            .min_by_key(|(_, (keys, _))| keys.chars().count())
-            .expect("expected at least one line");
-        let (longest_index, (longest_keys, longest_description)) = lines
+            .filter_map(|(row, line)| match line {
+                HelpLine::Binding { keys, description } => Some((row, keys.as_str(), *description)),
+                _ => None,
+            })
+            .collect();
+        let (shortest_row, _, shortest_description) = *bindings
             .iter()
-            .enumerate()
-            .max_by_key(|(_, (keys, _))| keys.chars().count())
-            .expect("expected at least one line");
+            .min_by_key(|(_, keys, _)| keys.chars().count())
+            .expect("expected at least one binding row");
+        let (longest_row, longest_keys, longest_description) = *bindings
+            .iter()
+            .max_by_key(|(_, keys, _)| keys.chars().count())
+            .expect("expected at least one binding row");
         assert!(
-            shortest_keys.chars().count() < longest_keys.chars().count(),
+            bindings
+                .iter()
+                .any(|(_, keys, _)| keys.chars().count() < longest_keys.chars().count()),
             "fixture sanity: List's own content must have two lines of different key length"
         );
 
@@ -1390,8 +1634,8 @@ mod tests {
         let buf = terminal.backend().buffer();
         let area = list_area(&overlay, ROOMY_FRAME);
 
-        let shortest_y = area.y + shortest_index as u16;
-        let longest_y = area.y + longest_index as u16;
+        let shortest_y = area.y + shortest_row as u16;
+        let longest_y = area.y + longest_row as u16;
         let shortest_x = find_text_start_x(buf, area, shortest_y, shortest_description);
         let longest_x = find_text_start_x(buf, area, longest_y, longest_description);
         assert_eq!(
@@ -1408,15 +1652,22 @@ mod tests {
         let overlay = HelpOverlay::default();
         let table = default_table();
         let context = Context::List;
-        let lines = HelpOverlay::content(&table, context);
-        let (_, first_description) = &lines[0];
+        let lines = HelpOverlay::lines(&table, context, full_glyphs());
+        let (first_row, first_description) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| match line {
+                HelpLine::Binding { description, .. } => Some((row, *description)),
+                _ => None,
+            })
+            .expect("expected at least one binding row");
 
         let narrower = render(&overlay, 100, 40, context, &table);
         let narrower_area = list_area(&overlay, Rect::new(0, 0, 100, 40));
         let narrower_x = find_text_start_x(
             narrower.backend().buffer(),
             narrower_area,
-            narrower_area.y,
+            narrower_area.y + first_row as u16,
             first_description,
         );
 
@@ -1425,7 +1676,7 @@ mod tests {
         let wider_x = find_text_start_x(
             wider.backend().buffer(),
             wider_area,
-            wider_area.y,
+            wider_area.y + first_row as u16,
             first_description,
         );
 
@@ -1473,14 +1724,16 @@ mod tests {
         );
 
         let buf = terminal.backend().buffer();
-        let lines = HelpOverlay::content(&table, Context::List);
-        let (first_keys, _) = &lines[0];
-        // With no border and no query line, the first key starts at the frame's own
+        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
+        // With no border and no query line, the first line starts at the frame's own
         // top-left corner, exactly where a border's top-left glyph would otherwise sit.
-        let first_char = first_keys.chars().next().expect("expected a non-empty key");
+        let first_char = leading_char(&lines[0]);
         assert_eq!(buf[(0, 0)].symbol(), first_char.to_string());
     }
 
+    /// Degraded and searching, the query line still claims the interior's own last row
+    /// (here, `frame_area` itself, one row shorter than reading mode): the list occupies row
+    /// `0`, the query row `1`.
     #[test]
     fn a_too_small_frame_degrades_to_flush_query_line_with_no_border_while_searching() {
         let mut overlay = HelpOverlay::default();
@@ -1496,6 +1749,7 @@ mod tests {
         );
 
         let buf = terminal.backend().buffer();
-        assert_eq!(buf[(0, 0)].symbol(), "/");
+        let query_y = tiny_frame.bottom() - 1;
+        assert_eq!(buf[(0, query_y)].symbol(), "/");
     }
 }
