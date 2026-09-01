@@ -535,36 +535,33 @@ pub(crate) fn kind_is_visible(
     }
 }
 
-/// The rows a consumer should draw or count as visible: `entities` reordered and narrowed by
-/// the show-worktrees and show-submodules preferences ([`kind_is_visible`]) and by `filter`
-/// ([`repon_core::Filter::matches`]). Shared by [`List::render`] and
-/// `crate::app::App::visible_keys` so the two can never disagree about which rows exist or
-/// what order they come in.
+/// The rows a consumer should draw or count as visible: `entities` narrowed by the
+/// show-worktrees and show-submodules preferences ([`kind_is_visible`]) and by `filter`
+/// ([`repon_core::Filter::matches`]), then grouped by parent ([`grouped_row_order`]).
+/// Shared by [`List::render`] and `crate::app::App::visible_keys` so the two can never
+/// disagree about which rows exist or what order they come in.
 ///
-/// With no Filter active this groups each Repo with its own Worktrees and Submodules
-/// immediately after it ([`grouped_row_order`]). An active Filter flattens instead, keeping
-/// discovery order and dropping the grouping entirely
-/// ([filter.md](../../../../docs/spec/filter.md)'s "What a Filter does to the list": a
-/// non-matching parent is never dragged in as context).
+/// Narrowing happens first and grouping runs over whatever survives, whether a row is
+/// dropped by the Filter or by a preference: a non-matching parent is never dragged in as
+/// context ([filter.md](../../../../docs/spec/filter.md)'s "What a Filter does to the
+/// list"), and a child whose own parent did not survive is appended after every group
+/// rather than dropped
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
+/// list"). With every row surviving, this is identical to grouping the whole list.
 pub(crate) fn visible_row_order(
     entities: &[EntityState],
     show_worktrees: bool,
     show_submodules: bool,
     filter: &Filter,
 ) -> Vec<usize> {
-    let base_order: Vec<usize> = if filter.is_active() {
-        (0..entities.len()).collect()
-    } else {
-        grouped_row_order(entities)
-    };
-    base_order
-        .into_iter()
+    let candidates: Vec<usize> = (0..entities.len())
         .filter(|&index| {
             let entity = &entities[index];
             kind_is_visible(entity.kind, show_worktrees, show_submodules, filter)
                 && filter.matches(entity)
         })
-        .collect()
+        .collect();
+    grouped_row_order(entities, &candidates)
 }
 
 /// A child entity's own group key: the common dir of the Repo (or Worktree) whose
@@ -583,43 +580,54 @@ fn group_key(entity: &EntityState) -> &Path {
     }
 }
 
-/// Reorders `entities` so each Repo is immediately followed by its own Worktrees and
-/// Submodules, preserving each Repo's own relative order and each child's own relative
+/// Reorders `candidates` (indices into `entities`, in the order a caller wants them
+/// considered) so each included Repo is immediately followed by its own included Worktrees
+/// and Submodules, preserving each Repo's own relative order and each child's own relative
 /// order within its parent's group. Discovery returns one flat list with no such grouping
 /// ([discovery.md](../../../../docs/spec/discovery.md): "one combined entity list with
 /// nothing recording which half produced a given entry"), so this is the one place that
 /// turns it into what the table actually draws, per
 /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The list":
-/// "each Repo is followed immediately by its own Worktrees and Submodules".
-/// A child whose own group's Repo is not present in `entities` at all (should not happen:
-/// discovery always finds a Worktree's or a Submodule's own parent boundary first) is
-/// appended at the end in its original relative order, rather than silently dropped.
-/// Returns indices into `entities` rather than a reordered clone, so a caller filtering by
-/// visibility can do so on this order without a second allocation.
-pub(crate) fn grouped_row_order(entities: &[EntityState]) -> Vec<usize> {
-    let mut order = Vec::with_capacity(entities.len());
-    let mut placed = vec![false; entities.len()];
+/// "each Repo is followed immediately by its own Worktrees and Submodules". Passing every
+/// index in `entities`, in order, groups the whole list.
+///
+/// A child whose own group's Repo is not among `candidates` at all, whether because
+/// discovery never found it, a Filter dropped it, or a show-worktrees/show-submodules
+/// preference hid it, is appended at the end in its original relative order rather than
+/// silently dropped ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
+/// "The list": "A child whose parent is absent from the list is appended after every group
+/// rather than dropped, so a row can never vanish because its parent did"). Returns indices
+/// into `entities` rather than a reordered clone, so a caller filtering by visibility can do
+/// so on this order without a second allocation.
+pub(crate) fn grouped_row_order(entities: &[EntityState], candidates: &[usize]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(candidates.len());
+    let mut placed = vec![false; candidates.len()];
 
-    for (index, entity) in entities.iter().enumerate() {
+    for (position, &index) in candidates.iter().enumerate() {
+        let entity = &entities[index];
         if !matches!(entity.kind, Kind::Repo) {
             continue;
         }
         order.push(index);
-        placed[index] = true;
+        placed[position] = true;
         let repo_common_dir: &Path = &entity.common_dir;
-        for (child_index, child) in entities.iter().enumerate() {
-            if placed[child_index] || matches!(child.kind, Kind::Repo) {
+        for (child_position, &child_index) in candidates.iter().enumerate() {
+            if placed[child_position] {
+                continue;
+            }
+            let child = &entities[child_index];
+            if matches!(child.kind, Kind::Repo) {
                 continue;
             }
             if group_key(child) == repo_common_dir {
                 order.push(child_index);
-                placed[child_index] = true;
+                placed[child_position] = true;
             }
         }
     }
-    for (index, already_placed) in placed.into_iter().enumerate() {
+    for (position, already_placed) in placed.into_iter().enumerate() {
         if !already_placed {
-            order.push(index);
+            order.push(candidates[position]);
         }
     }
     order
@@ -3453,6 +3461,12 @@ mod tests {
         )
     }
 
+    /// Every index into `entities`, in order: the candidate set that makes
+    /// [`grouped_row_order`] group the whole list rather than a narrowed subset of it.
+    fn every_index(entities: &[EntityState]) -> Vec<usize> {
+        (0..entities.len()).collect()
+    }
+
     /// [`grouped_row_order`] proven directly, independent of any rendering: a hand-built,
     /// out-of-order entity list with two Repo groups interleaved, checked against a literal
     /// expected order rather than one this test would derive by calling the function under
@@ -3470,7 +3484,7 @@ mod tests {
             entity_of_kind("worktree-a", Kind::Worktree, "/repo-a"),
         ];
 
-        let order = grouped_row_order(&entities);
+        let order = grouped_row_order(&entities, &every_index(&entities));
 
         assert_eq!(
             order,
@@ -3491,7 +3505,7 @@ mod tests {
             entity_of_kind("orphan-submodule", Kind::Submodule, "/missing/modules/lib"),
         ];
 
-        let order = grouped_row_order(&entities);
+        let order = grouped_row_order(&entities, &every_index(&entities));
 
         assert_eq!(
             order,
@@ -3503,6 +3517,131 @@ mod tests {
             order.len(),
             entities.len(),
             "every entity must reach the table exactly once"
+        );
+    }
+
+    /// Criterion 1's own words: with a Filter matching every row, the order must be
+    /// **identical to the unfiltered order**, checked here against [`grouped_row_order`]'s
+    /// own answer on the same list rather than a hand-written sequence, so a future change
+    /// to the grouping rule cannot make this test drift out of sync with it. The fixture is
+    /// the same interleaved, multi-group list `grouped_row_order_places_each_repos_children_
+    /// immediately_after_it_in_original_order` uses, which is what makes a flattened answer
+    /// visibly different from a grouped one instead of coincidentally equal.
+    #[test]
+    fn a_filter_matching_every_row_leaves_the_order_identical_to_unfiltered() {
+        let entities = vec![
+            entity_of_kind("worktree-b-x", Kind::Worktree, "/repo-b"),
+            entity_of_kind("repo-a-x", Kind::Repo, "/repo-a"),
+            entity_of_kind("submodule-a-x", Kind::Submodule, "/repo-a/modules/lib"),
+            entity_of_kind("repo-b-x", Kind::Repo, "/repo-b"),
+            entity_of_kind("worktree-a-x", Kind::Worktree, "/repo-a"),
+        ];
+        let filter = Filter::parse("x");
+        assert!(
+            filter.is_active(),
+            "fixture's own filter must be active, or this proves nothing"
+        );
+        for entity in &entities {
+            assert!(
+                filter.matches(entity),
+                "fixture must have every row match {:?}, or this is not the case this test names",
+                entity.name
+            );
+        }
+
+        let visible = visible_row_order(&entities, true, true, &filter);
+        let unfiltered = grouped_row_order(&entities, &every_index(&entities));
+
+        assert_eq!(
+            visible, unfiltered,
+            "a Filter matching every row must produce exactly the unfiltered, grouped order"
+        );
+    }
+
+    /// Criterion 2: a Filter matching only children leaves both parents absent, so
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "a child
+    /// whose parent is absent from the list is appended after every group" applies to both,
+    /// in their own original relative order, and neither Repo is dragged in as context.
+    #[test]
+    fn a_filter_matching_only_children_appends_them_with_no_parent_dragged_in() {
+        let entities = vec![
+            entity_of_kind("worktree-b", Kind::Worktree, "/repo-b"),
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("submodule-a", Kind::Submodule, "/repo-a/modules/lib"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+            entity_of_kind("worktree-a", Kind::Worktree, "/repo-a"),
+        ];
+        let filter = Filter::parse("worktree");
+
+        let visible = visible_row_order(&entities, true, true, &filter);
+
+        assert_eq!(
+            visible,
+            vec![0, 4],
+            "expected only the two Worktrees, in their own original relative order, with \
+             neither Repo dragged in"
+        );
+    }
+
+    /// Criterion 3: a Filter matching a Repo and one of its own children groups them, even
+    /// when the child sits ahead of its parent in discovery's own raw order, and drops every
+    /// row belonging to the other group entirely.
+    #[test]
+    fn a_filter_matching_a_parent_and_some_of_its_children_groups_them() {
+        let entities = vec![
+            entity_of_kind("child-worktree", Kind::Worktree, "/repo-a"),
+            entity_of_kind("keep-submodule", Kind::Submodule, "/repo-a/modules/lib"),
+            entity_of_kind("keep-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("other-repo", Kind::Repo, "/repo-b"),
+            entity_of_kind("other-worktree", Kind::Worktree, "/repo-b"),
+        ];
+        let filter = Filter::parse("keep");
+
+        let visible = visible_row_order(&entities, true, true, &filter);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["keep-a", "keep-submodule"],
+            "the matching Repo must lead, immediately followed by its own matching \
+             Submodule, even though the Submodule preceded its Repo in discovery order"
+        );
+    }
+
+    /// Criterion 5: a child hidden by `show_worktrees` behaves exactly like one a Filter
+    /// dropped, orphaning its sibling Submodule out from under `repo-a` in the same way a
+    /// Filter term would. Run with an active Filter matching every surviving row (the
+    /// branch the old flattening code took), so this also proves grouping and preference
+    /// narrowing now compose correctly rather than one disabling the other.
+    #[test]
+    fn a_parent_hidden_by_a_preference_behaves_like_one_the_filter_dropped() {
+        let entities = vec![
+            entity_of_kind("repo-a-x", Kind::Repo, "/repo-a"),
+            entity_of_kind("worktree-b-x", Kind::Worktree, "/repo-b"),
+            entity_of_kind("repo-b-x", Kind::Repo, "/repo-b"),
+            entity_of_kind("submodule-a-x", Kind::Submodule, "/repo-a/modules/lib"),
+            entity_of_kind("worktree-a-x", Kind::Worktree, "/repo-a"),
+        ];
+        let filter = Filter::parse("x");
+        assert!(
+            filter.is_active(),
+            "fixture's own filter must be active, or this proves nothing"
+        );
+
+        let visible = visible_row_order(&entities, false, true, &filter);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["repo-a-x", "submodule-a-x", "repo-b-x"],
+            "both Worktrees must be hidden by show_worktrees, and submodule-a-x must still \
+             group immediately under repo-a-x rather than trailing after repo-b-x"
         );
     }
 
@@ -3794,7 +3933,7 @@ mod tests {
         snapshot: &'a repon_core::Snapshot,
         name: &str,
     ) -> (usize, &'a EntityState) {
-        grouped_row_order(&snapshot.entities)
+        grouped_row_order(&snapshot.entities, &every_index(&snapshot.entities))
             .into_iter()
             .map(|index| &snapshot.entities[index])
             .enumerate()
