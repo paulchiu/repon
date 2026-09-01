@@ -68,26 +68,32 @@ macro_rules! glyph_set {
             pub capture_elision: &'static str,
         }
 
-        /// One named meaning a row interior glyph renders, gutter or value alike.
-        ///
-        /// Read outside `#[cfg(test)]` only once a renderer consumes
-        /// [`GlyphSet::row_interior`]; until then the tests below are its only caller.
+        /// One named meaning a row interior glyph renders, gutter or value alike. Consumed by
+        /// [`crate::help`]'s glyph legend, the renderer this type and [`GlyphSet::row_interior`]
+        /// were built ahead of.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        #[allow(dead_code)]
         pub enum Meaning {
             $( $g_variant, )*
             $( $v_variant, )*
             Loading,
         }
 
+        impl Meaning {
+            /// Every variant, generated from the same list the enum itself is declared from
+            /// ([`count_idents`] sizes the array), so the help legend can iterate "every
+            /// meaning" without a hand-kept list that could drift from a variant added above.
+            pub const ALL: [Meaning; count_idents!($($g_variant),*) + count_idents!($($v_variant),*) + 1] = [
+                $( Meaning::$g_variant, )*
+                $( Meaning::$v_variant, )*
+                Meaning::Loading,
+            ];
+        }
+
         impl GlyphSet {
             /// Every glyph this table draws inside the row interior, paired with the meaning
             /// it renders. Every entry reads one of this table's own fields, so a change to a
             /// field (deliberate or not) is what a caller of this method sees, never a copy.
-            ///
-            /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests
-            /// below are its only caller.
-            #[allow(dead_code)]
+            /// [`crate::help`]'s glyph legend is what consumes this outside `#[cfg(test)]`.
             pub fn row_interior(&self) -> Vec<(Meaning, char)> {
                 let mut glyphs = vec![
                     $( (Meaning::$g_variant, self.$g_field), )*

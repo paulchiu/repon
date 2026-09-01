@@ -90,6 +90,10 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 
 ### overlay
 
+The expanded warning list, the Set picker, and the help overlay all dispatch through this one
+context. `Search` is a help-only addition: neither the warning list nor the Set picker reads it
+out of their own key handler, so it does nothing for either.
+
 | key | action |
 | --- | --- |
 | `j` | Scroll down |
@@ -100,6 +104,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Ctrl+U` | Half page up |
 | `Enter` | Choose (Set picker only) |
 | `Esc`, `q` | Close |
+| `/` | Search |
 
 ### confirm
 
@@ -166,7 +171,7 @@ The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothin
 
 Selection is per row, so a Worktree is selected independently of its Repo and selecting a Repo does not select its Worktrees. The Repo row and its Worktree rows have different working directories, so a Launcher on one and a Launcher on the other are different acts. `j` and `k` step over every visible row without regard to depth.
 
-When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes CONTEXT.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
+When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes GLOSSARY.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
 
 ## The ad hoc command field
 
@@ -215,7 +220,19 @@ The other three are short enough to survive almost any frame: `enter apply  esc 
 
 ## The help overlay
 
-Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`. It scrolls, and closes with Esc or `q`. `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`, then a legend naming what the `sync`, `base`, `dirty` and `state` glyphs mean ([layout-and-provenance.md](layout-and-provenance.md)). `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+
+### The help overlay is searchable, as a mode inside `overlay` rather than a switch to `input`
+
+Help opens in reading mode, `overlay`'s own original shape: `q` and `Esc` close it, `j`/`k`/`g`/`G`/`Ctrl+D`/`Ctrl+U` scroll, nothing is filtered. It is a reading surface, and a reading surface that captured every printable key the moment it opened would have stopped being one; typing has to be an explicit act rather than the default.
+
+`/` (`Action::Search`, `overlay`'s own new row above) enters search mode. A query line becomes the overlay's own first row, and typing narrows both the binding list and the glyph legend to whatever it matches (key or glyph column, and description or meaning), the same case-insensitive substring convention the two palettes already use for their own lists. An empty result says so rather than rendering blank. While searching, a printable key is query text before `overlay`'s own table is even consulted, `q` included: without that ordering `q` would close help mid-query, which is exactly the swallowing a close key must never do. `Ctrl+D`/`Ctrl+U` are not printable, so they still reach `overlay`'s own half-page bindings even while searching.
+
+`Esc` from search mode leaves it and clears the query, returning to an unfiltered reading mode without closing help: one rung of the same one-level-at-a-time philosophy Global's own `Esc`/`Action::Unwind` already walks elsewhere (cancel a range, then close the pane, then clear a Filter), scoped here to help's own two levels (search, then closed). A second `Esc` (or `q`, now that reading mode has the keyboard back) closes it. `Enter` from search mode leaves it too, but keeps the query applied instead of clearing it, so `j`/`k` then scroll the narrowed list; this is `overlay`'s own `Enter`/`Action::Choose`, reused the way it already means something only the Set picker gives it. Pressing `/` again, from reading mode with a filter still committed, reopens search mode without disturbing that query, the same way the Filter line reopens prefilled with what was already committed.
+
+The expanded warning list and the Set picker are unaffected: `Action::Search` is help's own addition to `overlay`'s vocabulary, and neither of the other two reads it out of their own key handler, so it does nothing for either.
+
+Backspace edits the query, looked up in `input`'s own table rather than added to `overlay`'s, so help's query deletes a character through the one compiled row every other text surface reads. It is checked before the printable test for the same reason the printable test comes before `overlay`'s own bindings: while the query is open, an editing key belongs to it. On an empty query it does nothing, so it is not a second way out of search mode.
 
 ### The help overlay's own chrome
 
@@ -223,7 +240,7 @@ This spec fixes the overlay's content and behaviour above but says nothing about
 
 Help stays full-frame rather than becoming a centred popup: it is a reading surface, not a chooser, so nothing is lost by covering the screen with it and the row under the cursor does not need to stay visible behind it. The popup treatment stays reserved for the palettes, which are choosers ([0008](../adr/0008-two-palettes-not-one.md)), and is tracked on issue 162.
 
-Every line's own key text is padded to one fixed width, the longest key text this context has, so every description lines up in the same column instead of each line finding its own spacing from a shorter or longer key; the gutter's width comes from the content alone; a wide frame with a short two-column table is not stretched to spread it across the extra space. Below a frame too short or too narrow to hold the border and at least one row and column of content, the panel degrades to flush, borderless content rather than clipping its own border against a frame that cannot hold it.
+Every line's own key or glyph text is padded to one fixed width, the longest either column has across the whole unfiltered content, so every description or meaning lines up in the same column instead of each line finding its own spacing, and the column does not shift as a query narrows what is on screen; the gutter's width comes from the content alone; a wide frame with a short two-column table is not stretched to spread it across the extra space. The query line only exists while it means something: absent in reading mode with no filter committed, present as the panel's own first interior row (one row shorter for the scrollable list beneath it) while searching or once a search has been committed with `Enter`. Below a frame too short or too narrow to hold the border and at least one row and column of content, the panel degrades to flush, borderless content rather than clipping its own border against a frame that cannot hold it.
 
 ## Configuration
 
@@ -268,4 +285,4 @@ Each item below is also listed, with its reopening condition, in [the open-quest
 
 - Fold vocabulary for collapsing a Repo's Worktrees under it (`za`, `zo`, `zc`, `zR`, `zM`). Not v1: `show_worktrees` in [config.md](config.md) and a Worktrees Filter already say the same thing two ways, and a third would need a multi-key sequence the rest of the map does not have. Reopenable if either existing route turns out not to cover the need, or if the map grows multi-key sequences for an unrelated reason.
 - Mouse support. Ruled out above for a stated reason rather than an absent one, and the reopening condition is someone wanting to try it.
-- The dismiss gesture has no undo. Whether it needs one, and whether a Vanished row wants a Filter of its own, is open in [layout-and-provenance.md](layout-and-provenance.md).
+- The dismiss gesture has no undo, and needs none ([#171](https://github.com/paulchiu/repon/issues/171)). What `d` discards is a frozen snapshot of a directory that is no longer there: [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) keeps session state out of any cache, so nothing durable is lost, and a Repo that comes back is rediscovered by the next Generation. A mis-press costs a stale reading of something that is not there. The Filter half was already settled in [filter.md](filter.md) as `presence:vanished`, and the gutter half is settled in [layout-and-provenance.md](layout-and-provenance.md).

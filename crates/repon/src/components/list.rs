@@ -19,6 +19,7 @@ use super::Component;
 use crate::{
     config::Config,
     glyphs::{FULL_SPINNER_INTERVAL, GlyphSet},
+    selection::Selection,
     theme::{self, Meaning, Role, Theme},
 };
 
@@ -108,6 +109,11 @@ pub struct List {
     /// The theme [`Theme::selection_style`] highlights the cursor row from, handed in every
     /// frame ([`Self::set_theme`]).
     theme: Theme,
+    /// The Selection's own checked rows, handed in every frame ([`Self::set_selection`]) the
+    /// same way `filter` is: which rows are checked is per-frame session state, not
+    /// something a config handshake carries. Marked with [`Theme::checked_style`]
+    /// (theming.md's "The Selection").
+    selection: Selection,
 }
 
 impl Default for List {
@@ -121,6 +127,7 @@ impl Default for List {
             cursor: 0,
             offset: 0,
             theme: Theme::default(),
+            selection: Selection::default(),
         }
     }
 }
@@ -216,6 +223,15 @@ impl List {
                     self.theme.selection_style(),
                 );
             }
+            // The Selection's own mark, painted the same way and over the same width as the
+            // cursor's above: a second, independent patch, so a row that is both keeps both
+            // (theming.md's "The Selection"), rather than one replacing the other.
+            if self.selection.contains(&entity.key) {
+                buf.set_style(
+                    Rect::new(interior.x, y, interior.width, 1),
+                    self.theme.checked_style(),
+                );
+            }
         }
     }
 
@@ -283,6 +299,13 @@ impl List {
     /// [`Self::set_filter`] is.
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Hands this draw the Selection's own checked rows, read fresh every frame the same way
+    /// [`Self::set_filter`] is: which rows are checked can change between keystrokes without
+    /// the cursor or the Filter changing at all.
+    pub(crate) fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
     }
 }
 
@@ -1423,12 +1446,20 @@ mod tests {
     /// resolve two different roles read from theming.md itself. A version of `draw_row` that
     /// hands every cell one flat style (this ticket's predecessor shape) fails here because
     /// `base_fg` and `dirty_fg` would be equal.
+    ///
+    /// The cursor is moved off row 0 deliberately: `List::default`'s own cursor sits at 0,
+    /// which is this fixture's only row, and the cursor highlight now patches its own row's
+    /// foreground to a uniform `reset` before reversing it (theming.md's "The cursor row"),
+    /// so leaving the cursor at its default would test the highlight's own colour instead of
+    /// the two roles this test means to compare.
     #[test]
     fn two_adjacent_value_cells_take_their_own_meanings_role_not_one_flat_row_style() {
         let snapshot = settled_snapshot_with_a_nonzero_base_and_dirty_count();
         assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
 
-        let terminal = render(140, 24, &snapshot);
+        let mut list = List::default();
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
         let buf = terminal.backend().buffer();
         let y = entity_row_y(0);
 
@@ -2394,12 +2425,19 @@ mod tests {
     /// `draw_row` reads [`sync_cell_runs`], not [`sync_glyph`], and the two join their runs
     /// separately, so the separator has to be asserted on the path that renders. Dropping it
     /// there leaves every other test in this file green while the cell reads `↑1↓1`.
+    ///
+    /// The cursor is moved off row 0 for the same reason
+    /// `two_adjacent_value_cells_take_their_own_meanings_role_not_one_flat_row_style` does:
+    /// this fixture's only row sits at the cursor's own default, and the cursor highlight now
+    /// forces a uniform foreground onto it before reversing.
     #[test]
     fn the_rendered_sync_cell_keeps_a_space_between_an_ahead_and_a_behind_run() {
         let snapshot = settled_snapshot_with_an_ahead_and_behind_sync();
         assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
 
-        let terminal = render(140, 24, &snapshot);
+        let mut list = List::default();
+        list.set_cursor(1);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
         let buf = terminal.backend().buffer();
         let y = entity_row_y(0);
 
@@ -4030,6 +4068,59 @@ mod tests {
         }
     }
 
+    /// The load-bearing test for the banding defect. Every test above reads only
+    /// `Modifier::REVERSED`, which is applied uniformly across the row regardless of
+    /// banding, so none of them can see the actual defect: each cell keeping its *own* role
+    /// foreground into the reversal, which promotes that per-cell foreground to a per-cell
+    /// background. This reads every column's own foreground colour on a row built from
+    /// `settled_snapshot_with_a_nonzero_base_and_dirty_count`, whose `base` and `dirty`
+    /// cells resolve two different theming.md roles before the highlight ever lands
+    /// (the same fixture and roles
+    /// `two_adjacent_value_cells_take_their_own_meanings_role_not_one_flat_row_style` proves
+    /// for the un-highlighted row); a version that reversed each cell's own foreground rather
+    /// than patching it to a uniform `reset` first would leave those two colours standing
+    /// apart after the highlight, which is exactly the banding this test exists to catch and
+    /// exactly what counting every column, not sampling one, is required to see.
+    #[test]
+    fn the_cursor_rows_foreground_is_uniform_across_every_column_not_banded_by_role_colour() {
+        let snapshot = settled_snapshot_with_a_nonzero_base_and_dirty_count();
+        assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
+
+        let base_role = role_named_in_theming_md("Behind count");
+        let dirty_role = role_named_in_theming_md("Dirty");
+        assert_ne!(
+            theme::DEFAULT.role_color(base_role),
+            theme::DEFAULT.role_color(dirty_role),
+            "sanity: the fixture must exercise two different role colours"
+        );
+
+        let mut list = List::default();
+        list.set_cursor(0);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+        let interior_width: u16 = 138; // 140 columns minus the panel's left and right border.
+
+        let mut distinct_colours = std::collections::HashSet::new();
+        let mut columns_checked = 0;
+        for x in 1..1 + interior_width {
+            distinct_colours.insert(buf[(x, y)].fg);
+            columns_checked += 1;
+        }
+
+        assert_eq!(
+            columns_checked, 138,
+            "must read every column of the row's interior, not sample one"
+        );
+        assert_eq!(
+            distinct_colours,
+            std::collections::HashSet::from([Color::Reset]),
+            "expected all {columns_checked} columns to share one uniform reset foreground \
+             once the cursor highlights the row; got distinct foregrounds {distinct_colours:?}, \
+             which is exactly the per-cell banding this test exists to catch"
+        );
+    }
+
     /// Renders three rows so the assertion cannot pass for the wrong reason: with only one
     /// row, that row is trivially both "the cursor row" and "every row", so a highlight
     /// applied unconditionally would still pass. The other two rows must carry no highlight
@@ -4345,4 +4436,190 @@ mod tests {
     // crate yet (see `List::cursor_screen_row`'s own doc comment); a test asserting a
     // clamped-offset interaction against machinery that cannot clamp anything would pass
     // vacuously. Left for whichever ticket lands `List::set_offset`.
+
+    // --- The Selection's own mark: `List::render` paints `Theme::checked_style()` over a
+    // checked row's own interior width the same way it paints the cursor's highlight, so the
+    // two independent tests below (full-width coverage, composition with the cursor) mirror
+    // the cursor row's own tests above.
+
+    fn is_underlined(buf: &Buffer, x: u16, y: u16) -> bool {
+        buf[(x, y)].modifier.contains(Modifier::UNDERLINED)
+    }
+
+    fn checked_selection(keys: impl IntoIterator<Item = EntityKey>) -> Selection {
+        let mut selection = Selection::new();
+        selection.select_all_visible(&keys.into_iter().collect::<Vec<_>>());
+        selection
+    }
+
+    /// Counts across the whole rendered row rather than sampling one column, the same
+    /// discipline the cursor row's own full-width test uses: a mark that only reached the
+    /// gutter and the name text would still pass a name-cell-only assertion.
+    #[test]
+    fn a_checked_rows_underline_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
+        let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
+        let checked_key = entities[1].key.clone();
+        let snap = snapshot(entities);
+        let mut list = List::default();
+        list.set_selection(checked_selection([checked_key]));
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+        let interior_width = 138; // 140 columns minus the panel's left and right border.
+
+        for x in 1..1 + interior_width {
+            assert!(
+                is_underlined(buf, x, entity_row_y(1)),
+                "checked row cell at x={x} must be underlined, not just the cells with text \
+                 in them"
+            );
+        }
+        for row in [0, 2] {
+            for x in 1..1 + interior_width {
+                assert!(
+                    !is_underlined(buf, x, entity_row_y(row)),
+                    "row {row} cell at x={x} is not checked and must not be underlined"
+                );
+            }
+        }
+    }
+
+    /// The distinguishing half of the ticket's own criterion: a checked row that is not the
+    /// cursor must read differently from the cursor row itself, not merely "differently from
+    /// an ordinary row". Underlined without being reversed is the concrete claim, not "not
+    /// identical to the cursor row", which an accidental difference could also satisfy.
+    #[test]
+    fn a_checked_row_that_is_not_the_cursor_is_underlined_but_not_reversed() {
+        let entities = vec![entity("alpha"), entity("beta")];
+        let checked_key = entities[1].key.clone();
+        let snap = snapshot(entities);
+        let mut list = List::default();
+        list.set_cursor(0);
+        list.set_selection(checked_selection([checked_key]));
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            is_underlined(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "the checked row (\"beta\") must be underlined"
+        );
+        assert!(
+            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "the checked row is not the cursor and must not be reversed"
+        );
+    }
+
+    /// The other half: the cursor row, while it is not checked, must be reversed but never
+    /// underlined, so the two treatments never bleed into one another by accident.
+    #[test]
+    fn the_cursor_row_that_is_not_checked_is_reversed_but_not_underlined() {
+        let snap = snapshot(vec![entity("alpha"), entity("beta")]);
+        let mut list = List::default();
+        list.set_cursor(0);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "the cursor row must be reversed"
+        );
+        assert!(
+            !is_underlined(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "the cursor row is not checked and must not be underlined"
+        );
+    }
+
+    /// theming.md's own resolution of "a row that is both is unambiguous": the two
+    /// treatments compose rather than one replacing the other, so a row that is both the
+    /// cursor and checked carries both marks at once, distinct from either alone (the two
+    /// tests above).
+    #[test]
+    fn a_row_that_is_both_the_cursor_and_checked_is_reversed_and_underlined_at_once() {
+        let entities = vec![entity("alpha"), entity("beta")];
+        let checked_key = entities[0].key.clone();
+        let snap = snapshot(entities);
+        let mut list = List::default();
+        list.set_cursor(0);
+        list.set_selection(checked_selection([checked_key]));
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "a row that is both must still be reversed"
+        );
+        assert!(
+            is_underlined(buf, absolute_x(NAME_X), entity_row_y(0)),
+            "a row that is both must still be underlined"
+        );
+        assert!(
+            !is_underlined(buf, absolute_x(NAME_X), entity_row_y(1)),
+            "the other row is neither the cursor nor checked and must carry no mark"
+        );
+    }
+
+    /// The sidebar seam: [`List::draw_sidebar`] must apply the same checked mark
+    /// [`List::draw`] does, mirroring the cursor highlight's own sidebar test.
+    #[test]
+    fn the_sidebar_also_underlines_a_checked_row_and_no_other() {
+        let entities = vec![entity("alpha"), entity("beta"), entity("gamma")];
+        let checked_key = entities[1].key.clone();
+        let snap = snapshot(entities);
+        let mut list = List::default();
+        list.set_selection(checked_selection([checked_key]));
+        let terminal = {
+            let backend = TestBackend::new(SIDEBAR_WIDTH, 24);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    list.draw_sidebar(frame, area, &snap)
+                        .expect("draw the sidebar");
+                })
+                .expect("draw the frame");
+            terminal
+        };
+        let buf = terminal.backend().buffer();
+        // The sidebar has no header row, so its entity rows start one line below the
+        // border rather than two (see `entity_row_y`'s own doc comment).
+        let sidebar_row_y = |row: u16| 1 + row;
+
+        assert!(
+            is_underlined(buf, absolute_x(NAME_X), sidebar_row_y(1)),
+            "the sidebar's checked row must be underlined"
+        );
+        for row in [0, 2] {
+            assert!(
+                !is_underlined(buf, absolute_x(NAME_X), sidebar_row_y(row)),
+                "sidebar row {row} is not checked and must not be underlined"
+            );
+        }
+    }
+
+    /// Defect species 2's guard for this pair of criteria: theming.md's own "The Selection"
+    /// section, read at test time, must still name the underline treatment and the composed,
+    /// unambiguous resolution this test module's behavioural tests above pin in code, rather
+    /// than the two drifting apart silently.
+    #[test]
+    fn theming_md_names_the_selections_underline_treatment_and_its_composition_with_the_cursor() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let section = spec
+            .split("### The Selection")
+            .nth(1)
+            .expect("theming.md must contain a \"### The Selection\" section")
+            .split("## Colour is never the only carrier")
+            .next()
+            .expect("\"### The Selection\" must precede the next top-level heading");
+
+        assert!(
+            section.contains("underlined"),
+            "expected theming.md's \"The Selection\" section to name the underline treatment"
+        );
+        assert!(
+            section.contains("reversed") && section.contains("underlined"),
+            "expected theming.md to name the composed, both-at-once treatment for a row that \
+             is both the cursor and checked"
+        );
+    }
 }

@@ -1257,7 +1257,7 @@ mod tests {
     }
 
     /// Reads `docs/spec/config.md` at test time via `CARGO_MANIFEST_DIR` rather than
-    /// `include_str!`, following repon-core's precedent for `CONTEXT.md`: the spec lives
+    /// `include_str!`, following repon-core's precedent for `GLOSSARY.md`: the spec lives
     /// outside this crate's directory, so `include_str!` would compile fine in the
     /// workspace checkout but fail the packaged crate's build with no test to report it.
     fn read_config_spec() -> String {
