@@ -25,6 +25,7 @@ use ratatui::{
 };
 
 use crate::{
+    edit_buffer,
     launcher::Launcher,
     theme::{Role, Theme},
 };
@@ -113,12 +114,7 @@ impl LauncherPalette {
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
     pub(crate) fn delete_previous_word(&mut self, launchers: &[Launcher]) {
-        let trimmed = self.query.trim_end();
-        let cut = trimmed
-            .rfind(char::is_whitespace)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.query.truncate(cut);
+        edit_buffer::delete_previous_word(&mut self.query);
         self.clamp_cursor(launchers);
     }
 
@@ -530,6 +526,63 @@ mod tests {
             "query is now just \"re \" (with a trailing space), which is not a substring of \
              \"reinstall\""
         );
+    }
+
+    /// macOS Option+Space types U+00A0 NO-BREAK SPACE (two bytes) and U+2003 EM SPACE is
+    /// three, so a cut derived by adding one byte to the separator's start lands inside a
+    /// character; the accented letters pin that a multi-byte *non*-whitespace character
+    /// before the cut survives it. The third Launcher is what separates deleting one word
+    /// from clearing the whole query, which would match every entry rather than two.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_a_multi_byte_whitespace() {
+        let launchers = vec![
+            launcher("café\u{00A0}naïve"),
+            launcher("café\u{00A0}encore"),
+            launcher("zzz"),
+        ];
+        let mut palette = LauncherPalette::new();
+        for c in "café\u{00A0}naïve".chars() {
+            palette.type_char(c, &launchers);
+        }
+        assert_eq!(palette.matches(&launchers).len(), 1);
+
+        palette.delete_previous_word(&launchers);
+
+        let matched: Vec<&str> = palette
+            .matches(&launchers)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            matched,
+            vec!["café\u{00A0}naïve", "café\u{00A0}encore"],
+            "the query is now \"café\u{00A0}\": one whole word gone, neither one character \
+             nor the whole query"
+        );
+    }
+
+    /// The same claim as the U+00A0 case for a three-byte separator, so the cut is derived
+    /// rather than tuned to the two-byte width macOS happens to type.
+    #[test]
+    fn delete_previous_word_cuts_on_a_character_boundary_after_an_em_space() {
+        let launchers = vec![
+            launcher("café\u{2003}naïve"),
+            launcher("café\u{2003}encore"),
+            launcher("zzz"),
+        ];
+        let mut palette = LauncherPalette::new();
+        for c in "café\u{2003}naïve".chars() {
+            palette.type_char(c, &launchers);
+        }
+
+        palette.delete_previous_word(&launchers);
+
+        let matched: Vec<&str> = palette
+            .matches(&launchers)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(matched, vec!["café\u{2003}naïve", "café\u{2003}encore"]);
     }
 
     #[test]
