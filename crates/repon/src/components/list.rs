@@ -2,9 +2,11 @@
 //!
 //! Column geometry is [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
 //! and [default-branch.md](../../../../docs/spec/default-branch.md)'s "The list": a
-//! one-character Selection marker, name 28, branch 24, sync 9, base 6, dirty 6, state 10,
-//! left-packed behind a one-character gutter, single-space gaps, ninety-two columns before
-//! the filler column that absorbs the slack.
+//! one-character Selection marker, name 28 to 40, branch 24 to 75, sync 9, base 6, dirty 6,
+//! state 10, left-packed behind a one-character gutter, single-space gaps, ninety-two columns
+//! of minimums before the filler column that absorbs what is left. `name` and `branch` are the
+//! two that grow into the frame's slack, so every column's position is a [`Columns`] computed
+//! per frame rather than a constant.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -33,8 +35,19 @@ const GUTTER_WIDTH: u16 = 1;
 /// second axis was refused there, for a different mark, on reasoning that applies here
 /// unchanged, since Selection is user state rather than anything a Probe settled).
 const SELECTED_WIDTH: u16 = 1;
-const NAME_WIDTH: u16 = 28;
-const BRANCH_WIDTH: u16 = 24;
+/// The name column's floor, the width it has on every frame with no slack to share out, and
+/// the figure [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md) and
+/// [default-branch.md](../../../../docs/spec/default-branch.md) state first of the pair.
+const NAME_MIN_WIDTH: u16 = 28;
+/// The name column's cap: the longest name in the surveyed population, so slack past this
+/// buys nothing and stays in the filler
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "Growing
+/// `name` and `branch`").
+const NAME_MAX_WIDTH: u16 = 40;
+const BRANCH_MIN_WIDTH: u16 = 24;
+/// The branch column's cap, chosen the same way [`NAME_MAX_WIDTH`] is: the longest branch
+/// name in the surveyed population.
+const BRANCH_MAX_WIDTH: u16 = 75;
 const SYNC_WIDTH: u16 = 9;
 const BASE_WIDTH: u16 = 6;
 const DIRTY_WIDTH: u16 = 6;
@@ -60,12 +73,24 @@ const NO_MATCHES_MESSAGE: &str = "no matches";
 
 const GUTTER_X: u16 = 0;
 const SELECTED_X: u16 = GUTTER_X + GUTTER_WIDTH + GAP;
+/// The name column's own start, the last position that is the same on every frame: nothing
+/// to its left grows, and everything to its right is a [`Columns`] field instead.
 const NAME_X: u16 = SELECTED_X + SELECTED_WIDTH + GAP;
-const BRANCH_X: u16 = NAME_X + NAME_WIDTH + GAP;
-const SYNC_X: u16 = BRANCH_X + BRANCH_WIDTH + GAP;
-const BASE_X: u16 = SYNC_X + SYNC_WIDTH + GAP;
-const DIRTY_X: u16 = BASE_X + BASE_WIDTH + GAP;
-const STATE_X: u16 = DIRTY_X + DIRTY_WIDTH + GAP;
+/// The whole row at its minimum widths: the gutter, the marker, the six value columns and
+/// the single-space gaps between them. A panel interior wider than this has slack, and
+/// [`grown_name_and_branch`] decides what happens to it.
+const PACKED_MIN_WIDTH: u16 = NAME_X
+    + NAME_MIN_WIDTH
+    + GAP
+    + BRANCH_MIN_WIDTH
+    + GAP
+    + SYNC_WIDTH
+    + GAP
+    + BASE_WIDTH
+    + GAP
+    + DIRTY_WIDTH
+    + GAP
+    + STATE_WIDTH;
 
 /// Row where the header sits, and where entity rows start: one line below the header.
 const HEADER_ROW: u16 = 0;
@@ -84,12 +109,100 @@ const CHILD_ROW_INDENT_WIDTH: u16 = 4;
 const CHILD_ROW_GAP_WIDTH: u16 = GAP;
 /// Every column the name field spends on a child row before its own name text starts: the
 /// indent, the marker and the gap. `child_name_budget_matches_the_adrs_own_arithmetic` reads
-/// ADR 0020's own "28 minus 6 = 22" sentence at test time and checks this figure against it,
-/// rather than restating "6" as a second literal the ADR's own number could drift from.
+/// ADR 0020's own "28 minus 6 = 22 ... 40 minus 6 = 34" sentence at test time and checks this
+/// figure against it, rather than restating "6" as a second literal the ADR's own number
+/// could drift from.
 const CHILD_ROW_PREFIX_WIDTH: u16 =
     CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
-/// A child row's own name text budget: the name column's width, minus the prefix above.
-const CHILD_ROW_NAME_WIDTH: u16 = NAME_WIDTH - CHILD_ROW_PREFIX_WIDTH;
+
+/// One column's own start and width, both relative to the panel interior's left edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Column {
+    x: u16,
+    width: u16,
+}
+
+/// Where each of the six value columns sits on one frame. The row is left-packed, so every
+/// column's start is the sum of the widths to its left, and `name` and `branch` are the two
+/// whose widths depend on the frame
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "Growing
+/// `name` and `branch`"). Built once per draw in [`List::render`] and handed to every cell,
+/// so the header and the rows can never disagree about where a column starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Columns {
+    name: Column,
+    branch: Column,
+    sync: Column,
+    base: Column,
+    dirty: Column,
+    state: Column,
+}
+
+impl Columns {
+    /// The row's geometry inside a panel interior `width` columns wide. Anything past
+    /// [`PACKED_MIN_WIDTH`] is the slack pool [`grown_name_and_branch`] shares out; a
+    /// narrower interior has none, and every column keeps its minimum and its usual place,
+    /// clipped by [`clipped_cell_width`] rather than moved.
+    fn for_interior_width(width: u16) -> Self {
+        let (name_width, branch_width) =
+            grown_name_and_branch(width.saturating_sub(PACKED_MIN_WIDTH));
+        let name = Column {
+            x: NAME_X,
+            width: name_width,
+        };
+        let branch = Column {
+            x: name.x + name.width + GAP,
+            width: branch_width,
+        };
+        let sync = Column {
+            x: branch.x + branch.width + GAP,
+            width: SYNC_WIDTH,
+        };
+        let base = Column {
+            x: sync.x + sync.width + GAP,
+            width: BASE_WIDTH,
+        };
+        let dirty = Column {
+            x: base.x + base.width + GAP,
+            width: DIRTY_WIDTH,
+        };
+        let state = Column {
+            x: dirty.x + dirty.width + GAP,
+            width: STATE_WIDTH,
+        };
+        Columns {
+            name,
+            branch,
+            sync,
+            base,
+            dirty,
+            state,
+        }
+    }
+
+    /// A child row's own name text budget on this frame: the name column's width less the
+    /// indent, marker and gap its prefix spends, so a grown name column widens child names
+    /// by exactly what it widens top-level ones.
+    fn child_name_width(self) -> u16 {
+        self.name.width - CHILD_ROW_PREFIX_WIDTH
+    }
+}
+
+/// How wide `name` and `branch` are with `slack` spare columns to share: `name` grows to its
+/// cap first, then `branch` to its own, and anything neither can take stays in the filler.
+/// The order is measured rather than aesthetic
+/// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "Growing
+/// `name` and `branch`"): `name` saturates twelve columns above its minimum while branch
+/// names buy nothing until the pool is nearly fifty, so filling `name` first never truncates
+/// more cells than an even or proportional split and truncates fewer on a narrow frame.
+fn grown_name_and_branch(slack: u16) -> (u16, u16) {
+    let name_growth = slack.min(NAME_MAX_WIDTH - NAME_MIN_WIDTH);
+    let branch_growth = (slack - name_growth).min(BRANCH_MAX_WIDTH - BRANCH_MIN_WIDTH);
+    (
+        NAME_MIN_WIDTH + name_growth,
+        BRANCH_MIN_WIDTH + branch_growth,
+    )
+}
 
 /// The repos panel. Holds no row data of its own: every draw reads the [`Snapshot`] the
 /// caller hands it, cloned once from the Core for that render tick.
@@ -213,8 +326,11 @@ impl List {
         // The sidebar has no header row to leave room for: the mockup's rows start
         // immediately below the border, not one row down as the full list's do.
         let first_row = if compact { 0 } else { FIRST_ENTITY_ROW };
+        // One geometry per draw, shared by the header and every row: the sidebar computes it
+        // from its own narrow interior, which leaves no slack and so keeps every minimum.
+        let columns = Columns::for_interior_width(interior.width);
         if !compact {
-            draw_header(buf, interior, &self.theme);
+            draw_header(buf, interior, columns, &self.theme);
         }
         if row_order.is_empty() {
             // Nothing to draw below the header: say so rather than leaving a bordered box
@@ -248,6 +364,7 @@ impl List {
             glyphs,
             loading_frame,
             theme: &self.theme,
+            columns,
         };
         for (screen_row, entity) in row_order
             .into_iter()
@@ -406,10 +523,11 @@ fn write_cell(
 /// exactly like a whole one
 /// ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md)'s
 /// tenth value meaning, `Truncated`; ADR 0027's "a rendered `wo` names neither of them while
-/// looking exactly like a name"). Used by [`draw_name_cell`] alone: every other column this
-/// crate draws is bounded well inside its own width by the values it can legitimately hold
-/// (ADR 0020's own sweep puts `sync`'s worst case at five of its nine columns), so a name is
-/// the one cell long enough to need this.
+/// looking exactly like a name"). Used by [`draw_name_cell`] and by the `branch` cell in
+/// [`draw_row`], the two columns holding a user-supplied string long enough to overflow:
+/// every other column this crate draws is bounded well inside its own width by the values it
+/// can legitimately hold (ADR 0020's own sweep puts `sync`'s worst case at five of its nine
+/// columns).
 /// The text a [`write_truncating_cell`] call writes, paired with its own truncation mark:
 /// bundled into one argument rather than two so this crate's own
 /// `clippy::too_many_arguments` budget has room for it alongside the geometry
@@ -664,22 +782,27 @@ pub(crate) fn name_cell_meaning(kind: Kind) -> Meaning {
 
 /// Draws the name cell: a top-level row's name at the column's own start, or a child row's
 /// name indented behind the active table's one-character child marker, in the reduced budget
-/// [`CHILD_ROW_NAME_WIDTH`] reserves for it. The one place [`is_child_row`] and the child-row
-/// geometry constants are read, so [`draw_row`] and [`draw_row_compact`] can never draw a
-/// child row two different ways. The marker itself is structural, like the gutter, and stays
-/// unstyled; only the name text takes [`name_cell_meaning`]'s role, since the marker names no
-/// meaning of its own in theming.md.
+/// [`Columns::child_name_width`] reserves for it. The one place [`is_child_row`] and the
+/// child-row geometry constants are read, so [`draw_row`] and [`draw_row_compact`] can never
+/// draw a child row two different ways. The marker itself is structural, like the gutter, and
+/// stays unstyled; only the name text takes [`name_cell_meaning`]'s role, since the marker
+/// names no meaning of its own in theming.md.
 fn draw_name_cell(
     buf: &mut Buffer,
     interior: Rect,
     y: u16,
     entity: &EntityState,
-    glyphs: &'static GlyphSet,
-    theme: &Theme,
+    ctx: &RowContext,
 ) {
+    let RowContext {
+        glyphs,
+        theme,
+        columns,
+        ..
+    } = *ctx;
     let name_style = theme.style_for(name_cell_meaning(entity.kind).role());
-    if is_child_row(entity.kind) {
-        let marker_x = interior.x + NAME_X + CHILD_ROW_INDENT_WIDTH;
+    let (name_x, name_width) = if is_child_row(entity.kind) {
+        let marker_x = interior.x + columns.name.x + CHILD_ROW_INDENT_WIDTH;
         write_cell(
             buf,
             interior,
@@ -689,94 +812,60 @@ fn draw_name_cell(
             &glyphs.child_row.to_string(),
             Style::new(),
         );
-        let name_x = marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
-        write_truncating_cell(
-            buf,
-            interior,
-            name_x,
-            y,
-            CHILD_ROW_NAME_WIDTH,
-            TruncatingText {
-                text: &entity.name,
-                mark: glyphs.truncated,
-            },
-            name_style,
-        );
+        (
+            marker_x + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH,
+            columns.child_name_width(),
+        )
     } else {
-        write_truncating_cell(
-            buf,
-            interior,
-            interior.x + NAME_X,
-            y,
-            NAME_WIDTH,
-            TruncatingText {
-                text: &entity.name,
-                mark: glyphs.truncated,
-            },
-            name_style,
-        );
-    }
+        (interior.x + columns.name.x, columns.name.width)
+    };
+    write_truncating_cell(
+        buf,
+        interior,
+        name_x,
+        y,
+        name_width,
+        TruncatingText {
+            text: &entity.name,
+            mark: glyphs.truncated,
+        },
+        name_style,
+    );
 }
 
-fn draw_header(buf: &mut Buffer, interior: Rect, theme: &Theme) {
+fn draw_header(buf: &mut Buffer, interior: Rect, columns: Columns, theme: &Theme) {
     let y = interior.y + HEADER_ROW;
     // A column header is `dim` per theming.md's meaning-to-role map, a foreground colour
     // rather than the DIM text attribute this used to draw with.
     let style = theme.style_for(theme::Role::Dim);
-    write_cell(
-        buf,
-        interior,
-        interior.x + NAME_X,
-        y,
-        NAME_WIDTH,
-        "name",
-        style,
-    );
-    write_cell(
-        buf,
-        interior,
-        interior.x + BRANCH_X,
-        y,
-        BRANCH_WIDTH,
-        "branch",
-        style,
-    );
-    write_cell(
-        buf,
-        interior,
-        interior.x + SYNC_X,
-        y,
-        SYNC_WIDTH,
-        "sync",
-        style,
-    );
-    write_cell(
-        buf,
-        interior,
-        interior.x + BASE_X,
-        y,
-        BASE_WIDTH,
-        "base",
-        style,
-    );
-    write_cell(
-        buf,
-        interior,
-        interior.x + DIRTY_X,
-        y,
-        DIRTY_WIDTH,
-        "dirty",
-        style,
-    );
-    write_cell(
-        buf,
-        interior,
-        interior.x + STATE_X,
-        y,
-        STATE_WIDTH,
-        "state",
-        style,
-    );
+    // Destructured rather than reached into field by field, so a seventh column has to be
+    // named here rather than quietly going unlabelled.
+    let Columns {
+        name,
+        branch,
+        sync,
+        base,
+        dirty,
+        state,
+    } = columns;
+    for (column, label) in [
+        (name, "name"),
+        (branch, "branch"),
+        (sync, "sync"),
+        (base, "base"),
+        (dirty, "dirty"),
+        (state, "state"),
+    ] {
+        write_cell(
+            buf,
+            interior,
+            interior.x + column.x,
+            y,
+            column.width,
+            label,
+            style,
+        );
+    }
 }
 
 /// Writes the Selection's own marker at [`SELECTED_X`]: `glyphs.checked` for a checked row,
@@ -820,6 +909,9 @@ struct RowContext<'a> {
     glyphs: &'static GlyphSet,
     loading_frame: char,
     theme: &'a Theme,
+    /// This frame's own column geometry, computed once in [`List::render`] from the panel
+    /// interior's width.
+    columns: Columns,
 }
 
 fn draw_row(
@@ -834,6 +926,7 @@ fn draw_row(
         glyphs,
         loading_frame,
         theme,
+        columns,
     } = *ctx;
     let row_summary = summary(entity);
     let gutter = gutter_glyph_for(row_summary, glyphs, loading_frame).to_string();
@@ -858,14 +951,21 @@ fn draw_row(
         Style::new(),
     );
     draw_selected_marker(buf, interior, y, checked, glyphs, theme);
-    draw_name_cell(buf, interior, y, entity, glyphs, theme);
-    write_cell(
+    draw_name_cell(buf, interior, y, entity, ctx);
+    // The one other column long enough to overflow its own budget, now that it grows into
+    // the frame's slack: a branch cut silently at a grapheme boundary reads exactly like a
+    // whole branch name, which is why `name` already carries the mark (ADR 0020's tenth
+    // value meaning, `Truncated`).
+    write_truncating_cell(
         buf,
         interior,
-        interior.x + BRANCH_X,
+        interior.x + columns.branch.x,
         y,
-        BRANCH_WIDTH,
-        &format_head(&entity.branch, cell_loading_glyph),
+        columns.branch.width,
+        TruncatingText {
+            text: &format_head(&entity.branch, cell_loading_glyph),
+            mark: glyphs.truncated,
+        },
         theme.style_for(cell_role(
             entity.branch.settled(),
             |_| Meaning::FreshValue,
@@ -875,9 +975,9 @@ fn draw_row(
     write_cell_runs(
         buf,
         interior,
-        interior.x + SYNC_X,
+        interior.x + columns.sync.x,
         y,
-        SYNC_WIDTH,
+        columns.sync.width,
         &sync_cell_runs(&entity.sync, glyphs, cell_loading_glyph)
             .into_iter()
             .map(|(text, role)| (text, theme.style_for(role)))
@@ -886,9 +986,9 @@ fn draw_row(
     write_cell(
         buf,
         interior,
-        interior.x + BASE_X,
+        interior.x + columns.base.x,
         y,
-        BASE_WIDTH,
+        columns.base.width,
         &format_base(&entity.base, glyphs, cell_loading_glyph),
         theme.style_for(cell_role(
             entity.base.settled(),
@@ -899,9 +999,9 @@ fn draw_row(
     write_cell(
         buf,
         interior,
-        interior.x + DIRTY_X,
+        interior.x + columns.dirty.x,
         y,
-        DIRTY_WIDTH,
+        columns.dirty.width,
         &format_dirty(&entity.dirty, glyphs, cell_loading_glyph),
         theme.style_for(cell_role(
             entity.dirty.settled(),
@@ -912,9 +1012,9 @@ fn draw_row(
     write_cell(
         buf,
         interior,
-        interior.x + STATE_X,
+        interior.x + columns.state.x,
         y,
-        STATE_WIDTH,
+        columns.state.width,
         &format_state(&entity.state, cell_loading_glyph),
         theme.style_for(cell_role(
             entity.state.settled(),
@@ -943,6 +1043,7 @@ fn draw_row_compact(
         glyphs,
         loading_frame,
         theme,
+        ..
     } = *ctx;
     let gutter = gutter_glyph(entity, glyphs, loading_frame).to_string();
     write_cell(
@@ -955,7 +1056,7 @@ fn draw_row_compact(
         Style::new(),
     );
     draw_selected_marker(buf, interior, y, checked, glyphs, theme);
-    draw_name_cell(buf, interior, y, entity, glyphs, theme);
+    draw_name_cell(buf, interior, y, entity, ctx);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -1373,8 +1474,8 @@ mod tests {
         );
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, absolute_x(NAME_X), 1, 5), "first");
-        assert_eq!(cell_text(buf, absolute_x(NAME_X), 2, 6), "second");
+        assert_eq!(cell_text(buf, name_x(buf), 1, 5), "first");
+        assert_eq!(cell_text(buf, name_x(buf), 2, 6), "second");
     }
 
     /// Inits a real disposable git repository at `path` with one empty commit, on a named
@@ -1700,12 +1801,12 @@ mod tests {
         let y = entity_row_y(0);
 
         assert_eq!(
-            cell_text(buf, absolute_x(BASE_X), y, 2),
+            cell_text(buf, base_x(buf), y, 2),
             "↓1",
             "sanity: base must show a nonzero behind count"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(DIRTY_X), y, 2),
+            cell_text(buf, dirty_x(buf), y, 2),
             "●1",
             "sanity: dirty must show a nonzero changed count"
         );
@@ -1717,8 +1818,8 @@ mod tests {
             "sanity: the fixture must exercise two different roles"
         );
 
-        let base_fg = buf[(absolute_x(BASE_X), y)].fg;
-        let dirty_fg = buf[(absolute_x(DIRTY_X), y)].fg;
+        let base_fg = buf[(base_x(buf), y)].fg;
+        let dirty_fg = buf[(dirty_x(buf), y)].fg;
 
         assert_eq!(
             base_fg,
@@ -1755,21 +1856,13 @@ mod tests {
         let terminal = render_with_list(&mut list, 140, 24, &snapshot);
         let buf = terminal.backend().buffer();
 
-        // `absolute_x(NAME_X)` is the top-level name column's own absolute start,
-        // `absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH)` the child name column's own start
+        // `name_x(buf)` is the top-level name column's own absolute start,
+        // `child_name_x(buf)` the child name column's own start
         // behind the marker and its gap, both already fixed by
         // `a_child_row_is_indented_and_marked_while_its_parent_row_is_not` above.
-        let repo_fg = buf[(absolute_x(NAME_X), entity_row_y(repo_row))].fg;
-        let worktree_fg = buf[(
-            absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
-            entity_row_y(worktree_row),
-        )]
-            .fg;
-        let submodule_fg = buf[(
-            absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
-            entity_row_y(submodule_row),
-        )]
-            .fg;
+        let repo_fg = buf[(name_x(buf), entity_row_y(repo_row))].fg;
+        let worktree_fg = buf[(child_name_x(buf), entity_row_y(worktree_row))].fg;
+        let submodule_fg = buf[(child_name_x(buf), entity_row_y(submodule_row))].fg;
 
         assert_eq!(
             repo_fg,
@@ -1801,16 +1894,30 @@ mod tests {
         assert_eq!(snapshot.entities.len(), 1, "expected one discovered repo");
 
         let full = render(140, 24, &snapshot);
+        let full_buf = full.backend().buffer();
         assert_eq!(
-            cell_text(full.backend().buffer(), absolute_x(BRANCH_X), 2, 19).trim_end(),
+            cell_text(full_buf, branch_x(full_buf), 2, 19).trim_end(),
             "a-real-branch-name",
             "the full list must show the real branch value at its usual column"
         );
 
-        // `SIDEBAR_WIDTH` leaves the interior exactly filled by the gutter, the marker and
-        // the name, with no slack column left to pin a single "branch would start here"
-        // offset to; reading the whole row's text instead proves the branch value's absence
-        // regardless of how snugly the interior is packed.
+        // `SIDEBAR_WIDTH` leaves an interior narrower than `PACKED_MIN_WIDTH`, so the sidebar
+        // has no slack to share out and its interior is exactly filled by the gutter, the
+        // marker and the name at its minimum, with no offset a "branch would start here"
+        // probe could be pinned to. Asserted rather than assumed, since the name column now
+        // grows on a wide enough frame. Reading the whole row's text instead proves the
+        // branch value's absence regardless of how snugly the interior is packed.
+        const {
+            assert!(
+                SIDEBAR_WIDTH - 2 < PACKED_MIN_WIDTH,
+                "the sidebar's interior must stay below the width at which any column grows"
+            );
+            assert!(
+                SIDEBAR_WIDTH - 2 == GUTTER_WIDTH + GAP + SELECTED_WIDTH + GAP + NAME_MIN_WIDTH,
+                "the sidebar's interior must be exactly the gutter, the marker and a minimum \
+                 name"
+            );
+        }
         let compact = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot);
         let compact_row = cell_text(compact.backend().buffer(), 0, 1, SIDEBAR_WIDTH);
         assert!(
@@ -1868,25 +1975,22 @@ mod tests {
             "the gutter must show the row's least-settled settled state, not an outstanding \
              cell's own loading mark"
         );
+        assert_eq!(cell_text(buf, name_x(buf), 2, name.len() as u16), name);
+        assert_eq!(cell_text(buf, branch_x(buf), 2, 4), "main");
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), 2, name.len() as u16),
-            name
-        );
-        assert_eq!(cell_text(buf, absolute_x(BRANCH_X), 2, 4), "main");
-        assert_eq!(
-            cell_text(buf, absolute_x(SYNC_X), 2, 1),
+            cell_text(buf, sync_x(buf), 2, 1),
             glyphs.no_upstream.to_string(),
             "sync is probed, and an unborn HEAD has no branch to configure an upstream on, \
              so it must show its settled value rather than a loading mark"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(BASE_X), 2, BASE_WIDTH),
+            cell_text(buf, base_x(buf), 2, BASE_WIDTH),
             " ".repeat(BASE_WIDTH as usize),
             "base is Not applicable on an unborn HEAD and must render blank, never the \
              loading mark and never a raw zero"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(DIRTY_X), 2, 1),
+            cell_text(buf, dirty_x(buf), 2, 1),
             glyphs.clean.to_string(),
             "dirty is probed too, and this fixture's working tree is clean, so it must show \
              its settled value rather than a loading mark"
@@ -1907,11 +2011,11 @@ mod tests {
 
         assert_eq!(cell_text(buf, 1, 2, 1), glyphs.loading[0].to_string());
         for x in [
-            absolute_x(BRANCH_X),
-            absolute_x(SYNC_X),
-            absolute_x(BASE_X),
-            absolute_x(DIRTY_X),
-            absolute_x(STATE_X),
+            branch_x(buf),
+            sync_x(buf),
+            base_x(buf),
+            dirty_x(buf),
+            state_x(buf),
         ] {
             assert_eq!(
                 cell_text(buf, x, 2, 1),
@@ -1951,12 +2055,12 @@ mod tests {
 
         // Row 1 (y=2): holds nothing, so the gutter alone spins and every cell is blank.
         assert_eq!(cell_text(buf, 1, 2, 1), frame);
-        assert_eq!(cell_text(buf, absolute_x(BASE_X), 2, 1), " ");
+        assert_eq!(cell_text(buf, base_x(buf), 2, 1), " ");
 
         // Row 2 (y=3): fully settled, so the gutter is blank (Fresh) and `base` (Not
         // applicable on this unborn HEAD) renders blank too, never row 1's own spinner.
         assert_eq!(cell_text(buf, 1, 3, 1), " ");
-        assert_eq!(cell_text(buf, absolute_x(BASE_X), 3, 1), " ");
+        assert_eq!(cell_text(buf, base_x(buf), 3, 1), " ");
     }
 
     // --- Criteria 4 and 5: the mark moves, including on an already-populated row ---
@@ -2050,14 +2154,20 @@ mod tests {
             ..List::default()
         };
         let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
-        let base_first = cell_text(first_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
+        let base_first = {
+            let buf = first_tick.backend().buffer();
+            cell_text(buf, base_x(buf), 2, 1)
+        };
 
         let mut later = List {
             started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
             ..List::default()
         };
         let second_tick = render_with_list(&mut later, 140, 24, &snap);
-        let base_second = cell_text(second_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
+        let base_second = {
+            let buf = second_tick.backend().buffer();
+            cell_text(buf, base_x(buf), 2, 1)
+        };
 
         assert_eq!(base_first, glyphs.loading[0].to_string());
         assert_eq!(base_second, glyphs.loading[5].to_string());
@@ -2080,7 +2190,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), 1, 17),
+            cell_text(buf, name_x(buf), 1, 17),
             "acquiring-gateway",
             "with no header row, the first entity must render one row below the border"
         );
@@ -2102,7 +2212,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), 1 + FIRST_ENTITY_ROW, 8),
+            cell_text(buf, name_x(buf), 1 + FIRST_ENTITY_ROW, 8),
             "repo-two",
             "an offset of 1 must skip the first row and start drawing from the second"
         );
@@ -2124,7 +2234,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), 1 + FIRST_ENTITY_ROW, 10),
+            cell_text(buf, name_x(buf), 1 + FIRST_ENTITY_ROW, 10),
             "repo-three",
             "a wildly stale offset must still leave the table's own last row drawn"
         );
@@ -2136,23 +2246,49 @@ mod tests {
             .collect()
     }
 
-    /// Column starts (name 5, branch 34, sync 59, base 69, dirty 76, state 83), hand-summed
-    /// from [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
-    /// list", one character wider behind the gutter than it once was for the Selection's own
-    /// marker column and its gap. Literal and independent of the production constants above:
-    /// a mutation to `NAME_X` et al. must move where this test looks, not the other way
-    /// around.
+    /// The header labels' own absolute buffer columns, hand-summed from
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
+    /// list" for three frame widths, one on each side of the rule and one in the middle:
+    ///
+    /// | frame | slack | name wide | branch wide | name at | branch at | sync at | base at | dirty at | state at |
+    /// | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    /// | 94 | 0 | 28 | 24 | 5 | 34 | 59 | 69 | 76 | 83 |
+    /// | 140 | 46 | 40 | 58 | 5 | 46 | 105 | 115 | 122 | 129 |
+    /// | 220 | 126 | 40 | 75 | 5 | 46 | 122 | 132 | 139 | 146 |
+    ///
+    /// Each start is one column right of the sum of the widths to its left (the panel's own
+    /// left border), and 94 is the narrowest frame the whole row fits in: the gutter, the
+    /// marker, the six minimums, six gaps and two borders. Literal and independent of the
+    /// production geometry above: a mutation to `Columns` or to either cap must move where
+    /// this test looks, not the other way around.
     #[test]
     fn the_header_row_places_every_column_name_at_its_literal_spec_offset() {
-        let terminal = render(140, 24, &snapshot(vec![]));
-        let buf = terminal.backend().buffer();
-
+        let at_minimum = render(94, 24, &snapshot(vec![]));
+        let buf = at_minimum.backend().buffer();
         assert_eq!(cell_text(buf, 5, 1, 4), "name");
         assert_eq!(cell_text(buf, 34, 1, 6), "branch");
         assert_eq!(cell_text(buf, 59, 1, 4), "sync");
         assert_eq!(cell_text(buf, 69, 1, 4), "base");
         assert_eq!(cell_text(buf, 76, 1, 5), "dirty");
         assert_eq!(cell_text(buf, 83, 1, 5), "state");
+
+        let mid = render(140, 24, &snapshot(vec![]));
+        let buf = mid.backend().buffer();
+        assert_eq!(cell_text(buf, 5, 1, 4), "name");
+        assert_eq!(cell_text(buf, 46, 1, 6), "branch");
+        assert_eq!(cell_text(buf, 105, 1, 4), "sync");
+        assert_eq!(cell_text(buf, 115, 1, 4), "base");
+        assert_eq!(cell_text(buf, 122, 1, 5), "dirty");
+        assert_eq!(cell_text(buf, 129, 1, 5), "state");
+
+        let past_both_caps = render(220, 24, &snapshot(vec![]));
+        let buf = past_both_caps.backend().buffer();
+        assert_eq!(cell_text(buf, 5, 1, 4), "name");
+        assert_eq!(cell_text(buf, 46, 1, 6), "branch");
+        assert_eq!(cell_text(buf, 122, 1, 4), "sync");
+        assert_eq!(cell_text(buf, 132, 1, 4), "base");
+        assert_eq!(cell_text(buf, 139, 1, 5), "dirty");
+        assert_eq!(cell_text(buf, 146, 1, 5), "state");
     }
 
     #[test]
@@ -2194,26 +2330,26 @@ mod tests {
 
     #[test]
     fn a_name_longer_than_its_column_is_truncated_at_the_boundary_not_spilled_into_branch() {
-        let long_name = "n".repeat(40);
+        let long_name = "n".repeat(60);
         let terminal = render(140, 24, &snapshot(vec![entity(&long_name)]));
         let buf = terminal.backend().buffer();
 
-        // The name column is 28 wide starting at x=5 (see the header test above), so its
-        // last character sits at x=32, the single-space gap before branch is at x=33, and
-        // branch itself starts at x=34. Defect 5: the cut reserves the column's own last
-        // character for the truncation mark rather than filling all 28 with the name's own
-        // text, so a truncated name never looks exactly like a whole one (ADR 0020's tenth
-        // value meaning).
+        // On a 140-column frame the name column is at its 40-column cap, starting at x=5
+        // (see the header test above), so its last character sits at x=44, the single-space
+        // gap before branch is at x=45, and branch itself starts at x=46. Defect 5: the cut
+        // reserves the column's own last character for the truncation mark rather than
+        // filling all 40 with the name's own text, so a truncated name never looks exactly
+        // like a whole one (ADR 0020's tenth value meaning).
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
-        let expected = format!("{}{}", "n".repeat(27), glyphs.truncated);
-        assert_eq!(cell_text(buf, 5, 2, 28), expected);
+        let expected = format!("{}{}", "n".repeat(39), glyphs.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 40), expected);
         assert_eq!(
-            cell_text(buf, 33, 2, 1),
+            cell_text(buf, 45, 2, 1),
             " ",
             "the gap before branch must not carry name overflow"
         );
         assert_eq!(
-            cell_text(buf, 34, 2, 1),
+            cell_text(buf, 46, 2, 1),
             " ",
             "the branch column must not carry name overflow"
         );
@@ -2223,11 +2359,11 @@ mod tests {
     /// when a cut actually happens, never appended just because a name reaches the edge.
     #[test]
     fn a_name_exactly_as_wide_as_its_column_carries_no_truncation_mark() {
-        let exact_name = "n".repeat(NAME_WIDTH as usize);
+        let exact_name = "n".repeat(40);
         let terminal = render(140, 24, &snapshot(vec![entity(&exact_name)]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 5, 2, NAME_WIDTH), exact_name);
+        assert_eq!(cell_text(buf, 5, 2, 40), exact_name);
     }
 
     /// The ascii table's own truncation mark, `$` per ADR 0020's tenth value meaning, the
@@ -2247,41 +2383,77 @@ mod tests {
             zero_config: false,
         })
         .expect("register config");
-        let long_name = "n".repeat(40);
+        let long_name = "n".repeat(60);
         let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![entity(&long_name)]));
         let buf = terminal.backend().buffer();
 
         let ascii = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
-        let expected = format!("{}{}", "n".repeat(27), ascii.truncated);
-        assert_eq!(cell_text(buf, 5, 2, 28), expected);
+        let expected = format!("{}{}", "n".repeat(39), ascii.truncated);
+        assert_eq!(cell_text(buf, 5, 2, 40), expected);
     }
 
-    /// A child row's own reduced name budget ([`CHILD_ROW_NAME_WIDTH`]) truncates the same
-    /// way the top-level name column does: the mark comes out of the child's own budget, not
-    /// appended past it.
+    /// A child row's own reduced name budget ([`Columns::child_name_width`]) truncates the
+    /// same way the top-level name column does: the mark comes out of the child's own
+    /// budget, not appended past it, and the budget follows the grown column rather than the
+    /// minimum.
     #[test]
     fn a_truncated_child_row_name_also_carries_the_mark_inside_its_own_reduced_budget() {
-        let long_branch_name = "b".repeat(40);
+        let long_child_name = "b".repeat(60);
         let parent = entity("parent-repo");
-        let mut child = entity(&long_branch_name);
+        let mut child = entity(&long_child_name);
         child.kind = Kind::Worktree;
         let terminal = render(140, 24, &snapshot(vec![parent, child]));
         let buf = terminal.backend().buffer();
 
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         // Indent (4) + marker (1) + gap (1) = 6 columns before the child's own name text
-        // starts, per `CHILD_ROW_PREFIX_WIDTH`; its own budget is `NAME_WIDTH - 6` = 22.
-        let child_name_x =
-            5 + CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
-        let expected = format!(
-            "{}{}",
-            "b".repeat(CHILD_ROW_NAME_WIDTH as usize - 1),
-            glyphs.truncated
-        );
-        assert_eq!(
-            cell_text(buf, child_name_x, entity_row_y(1), CHILD_ROW_NAME_WIDTH),
-            expected
-        );
+        // starts, per `CHILD_ROW_PREFIX_WIDTH`; on a 140-column frame the name column is at
+        // its 40-column cap, so the child's own budget is 40 minus 6 = 34.
+        let expected = format!("{}{}", "b".repeat(33), glyphs.truncated);
+        assert_eq!(cell_text(buf, 11, entity_row_y(1), 34), expected);
+    }
+
+    /// `branch` carries the same mark `name` does once a value overflows it: a branch cut
+    /// silently at a grapheme boundary reads exactly like a whole branch name, which is the
+    /// reason ADR 0020 gives for marking `name`.
+    #[test]
+    fn a_branch_longer_than_its_column_carries_the_truncation_mark() {
+        let long_branch = "b".repeat(90);
+        let snapshot = settled_snapshot_with_a_known_branch(&long_branch);
+        let terminal = render(140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        // On a 140-column frame the branch column runs 58 wide from x=46, the whole slack
+        // left once `name` has taken its own cap (see the header test above).
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let expected = format!("{}{}", "b".repeat(57), glyphs.truncated);
+        assert_eq!(cell_text(buf, 46, 2, 58), expected);
+    }
+
+    /// The ascii table's own mark reaches `branch` too, not only `name`: both tables spell
+    /// `Truncated` `$`, and the branch cell reads it from the same [`GlyphSet`] field.
+    #[test]
+    fn a_truncated_branch_carries_the_ascii_tables_own_mark_under_glyphs_ascii() {
+        let mut list = List::default();
+        list.register_config_handler(crate::config::Config {
+            config_dir: std::path::PathBuf::new(),
+            data_dir: std::path::PathBuf::new(),
+            document: crate::config::document::Document {
+                glyphs: crate::config::document::Glyphs::Ascii,
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+            zero_config: false,
+        })
+        .expect("register config");
+        let long_branch = "b".repeat(90);
+        let snapshot = settled_snapshot_with_a_known_branch(&long_branch);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        let ascii = GlyphSet::for_config(crate::config::document::Glyphs::Ascii);
+        let expected = format!("{}{}", "b".repeat(57), ascii.truncated);
+        assert_eq!(cell_text(buf, 46, 2, 58), expected);
     }
 
     /// [`truncate_with_mark`] proven directly, independent of any rendering: the pure
@@ -2314,18 +2486,19 @@ mod tests {
         );
     }
 
+    /// Growth stops at the caps rather than stretching the row to the frame's right edge:
+    /// on a 220-column frame `name` and `branch` are both capped, so `state` ends 63 columns
+    /// short of the panel's own right border and every one of them is filler.
     #[test]
-    fn columns_are_left_packed_rather_than_stretched_to_fill_a_wider_frame() {
-        let narrow = render(100, 24, &snapshot(vec![]));
+    fn growth_stops_at_the_caps_and_the_rest_of_a_wide_frame_stays_filler() {
         let wide = render(220, 24, &snapshot(vec![]));
+        let buf = wide.backend().buffer();
 
+        assert_eq!(cell_text(buf, 146, 1, 5), "state");
         assert_eq!(
-            cell_text(narrow.backend().buffer(), absolute_x(STATE_X), 1, 5),
-            "state"
-        );
-        assert_eq!(
-            cell_text(wide.backend().buffer(), absolute_x(STATE_X), 1, 5),
-            "state"
+            cell_text(buf, 156, 1, 63),
+            " ".repeat(63),
+            "everything past the last column must stay filler, never a stretched column"
         );
     }
 
@@ -2619,46 +2792,48 @@ mod tests {
 
         let sentence = spec
             .lines()
-            .find(|line| line.starts_with("Name 28, branch 24, sync 9, base 6"))
+            .find(|line| line.starts_with("Name ") && line.contains(", then the filler column"))
             .expect("default-branch.md must state the list's column widths");
         let widths_text = sentence
             .split(", then the filler column")
             .next()
             .expect("the column widths sentence must name a filler column");
 
-        let mut widths: Vec<(String, u16)> = Vec::new();
+        // Each entry is either "<column> <width>" for a fixed column or "<column> <minimum>
+        // to <cap>" for one that grows, so a column changing from one shape to the other is
+        // read here rather than silently parsed as the old shape.
+        let mut widths: Vec<(String, u16, u16)> = Vec::new();
         for entry in widths_text.split(", ") {
-            let mut parts = entry.split_whitespace();
-            let name = parts
-                .next()
-                .unwrap_or_else(|| panic!("empty column width entry: {entry:?}"))
-                .to_lowercase();
-            let width: u16 = parts
-                .next()
-                .unwrap_or_else(|| panic!("column width entry has no number: {entry:?}"))
-                .parse()
-                .unwrap_or_else(|_| {
-                    panic!("column width entry's number does not parse: {entry:?}")
-                });
-            widths.push((name, width));
+            let parts: Vec<&str> = entry.split_whitespace().collect();
+            let (name, min, max) = match parts.as_slice() {
+                [name, width] => (name, width, width),
+                [name, min, "to", max] => (name, min, max),
+                _ => panic!("unreadable column width entry: {entry:?}"),
+            };
+            let parse = |token: &str| -> u16 {
+                token
+                    .parse()
+                    .unwrap_or_else(|_| panic!("not a column width: {token:?} in {entry:?}"))
+            };
+            widths.push((name.to_lowercase(), parse(min), parse(max)));
         }
 
         let by_name = |name: &str| {
-            widths
+            let column = widths
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, _, _)| n == name)
                 .unwrap_or_else(|| {
                     panic!("default-branch.md's column widths sentence has no {name:?} column")
-                })
-                .1
+                });
+            (column.1, column.2)
         };
         let sync_index = widths
             .iter()
-            .position(|(n, _)| n == "sync")
+            .position(|(n, _, _)| n == "sync")
             .expect("a sync column");
         let base_index = widths
             .iter()
-            .position(|(n, _)| n == "base")
+            .position(|(n, _, _)| n == "base")
             .expect("a base column");
         assert_eq!(
             base_index,
@@ -2667,26 +2842,68 @@ mod tests {
         );
 
         assert_eq!(
-            BASE_WIDTH,
+            (BASE_WIDTH, BASE_WIDTH),
             by_name("base"),
-            "BASE_WIDTH must match default-branch.md's stated width"
+            "BASE_WIDTH must match default-branch.md's stated width, which base neither grows \
+             past nor shrinks below"
+        );
+        assert_eq!(
+            (NAME_MIN_WIDTH, NAME_MAX_WIDTH),
+            by_name("name"),
+            "the name column's minimum and cap must match default-branch.md's stated pair"
+        );
+        assert_eq!(
+            (BRANCH_MIN_WIDTH, BRANCH_MAX_WIDTH),
+            by_name("branch"),
+            "the branch column's minimum and cap must match default-branch.md's stated pair"
         );
 
-        let expected_base_x = GUTTER_WIDTH
-            + GAP
-            + SELECTED_WIDTH
-            + GAP
-            + by_name("name")
-            + GAP
-            + by_name("branch")
-            + GAP
-            + by_name("sync")
-            + GAP;
+        // The row's own packed totals, summed from the spec's numbers rather than from
+        // `PACKED_MIN_WIDTH`, and checked against the two figures the spec states in prose.
+        let gaps = GAP * (widths.len() as u16 - 1);
+        let lead = GUTTER_WIDTH + GAP + SELECTED_WIDTH + GAP;
+        let packed_min = lead + widths.iter().map(|(_, min, _)| min).sum::<u16>() + gaps;
+        let packed_max = lead + widths.iter().map(|(_, _, max)| max).sum::<u16>() + gaps;
         assert_eq!(
-            BASE_X, expected_base_x,
-            "base must sit at the position default-branch.md's own stated widths for name, \
-             branch and sync (plus gaps) predict, immediately after sync"
+            packed_min,
+            number_after_in(sentence, "the minimums are "),
+            "default-branch.md's own stated minimum total must be the sum of its own widths"
         );
+        assert_eq!(
+            packed_max,
+            number_after_in(sentence, "both caps together are "),
+            "default-branch.md's own stated capped total must be the sum of its own caps"
+        );
+
+        // `base` sits immediately after `sync` at both ends of the rule: with no slack to
+        // share out, and on a frame wide enough that `name` and `branch` are both capped.
+        let expected_base_x =
+            |name: u16, branch: u16| lead + name + GAP + branch + GAP + by_name("sync").0 + GAP;
+        assert_eq!(
+            Columns::for_interior_width(packed_min).base.x,
+            expected_base_x(by_name("name").0, by_name("branch").0),
+            "with no slack, base must sit where default-branch.md's own minimums predict"
+        );
+        assert_eq!(
+            Columns::for_interior_width(packed_max).base.x,
+            expected_base_x(by_name("name").1, by_name("branch").1),
+            "past both caps, base must sit where default-branch.md's own caps predict"
+        );
+    }
+
+    /// The first run of digits after `needle` in `text`, parsed. Panics rather than
+    /// defaulting, so a spec sentence that loses the phrase fails loudly here.
+    fn number_after_in(text: &str, needle: &str) -> u16 {
+        let after = text
+            .split(needle)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the spec sentence must still say {needle:?}: {text:?}"));
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        after[..end]
+            .parse()
+            .unwrap_or_else(|_| panic!("no number after {needle:?} in {text:?}"))
     }
 
     #[test]
@@ -3059,13 +3276,13 @@ mod tests {
         let y = entity_row_y(0);
 
         assert_eq!(
-            cell_text(buf, absolute_x(SYNC_X), y, 5),
+            cell_text(buf, sync_x(buf), y, 5),
             "↑1 ↓1",
             "the cell that renders must carry the separator, not only `sync_glyph`'s own join"
         );
 
-        let ahead_fg = buf[(absolute_x(SYNC_X), y)].fg;
-        let behind_fg = buf[(absolute_x(SYNC_X) + 3, y)].fg;
+        let ahead_fg = buf[(sync_x(buf), y)].fg;
+        let behind_fg = buf[(sync_x(buf) + 3, y)].fg;
         assert_eq!(
             ahead_fg,
             theme::DEFAULT.role_color(role_named_in_theming_md("Ahead count")),
@@ -3115,17 +3332,17 @@ mod tests {
             "the border must read the live theme, not theme::DEFAULT"
         );
         assert_eq!(
-            buf[(absolute_x(NAME_X), 1)].fg,
+            buf[(name_x(buf), 1)].fg,
             live_theme.dim,
             "the column header must read the live theme"
         );
         assert_eq!(
-            buf[(absolute_x(NAME_X), y)].fg,
+            buf[(name_x(buf), y)].fg,
             live_theme.text,
             "the name cell must read the live theme"
         );
         assert_eq!(
-            buf[(absolute_x(SYNC_X), y)].fg,
+            buf[(sync_x(buf), y)].fg,
             live_theme.ok,
             "the ahead count cell must read the live theme"
         );
@@ -3923,10 +4140,59 @@ mod tests {
         1 + FIRST_ENTITY_ROW + row as u16
     }
 
-    /// A column's own absolute buffer `x`, one column right of the constant above (which
+    /// A column's own absolute buffer `x`, one column right of the geometry above (which
     /// is relative to `interior`) to account for the panel's own left border.
     fn absolute_x(relative: u16) -> u16 {
         1 + relative
+    }
+
+    /// The column geometry `List::render` laid `buf` out with: the same
+    /// [`Columns::for_interior_width`] over the interior a one-column border leaves inside
+    /// the drawn frame. Read from the buffer rather than passed in, so a test that changes
+    /// the frame width it renders at cannot leave a stale expectation behind.
+    fn columns_of(buf: &Buffer) -> Columns {
+        Columns::for_interior_width(buf.area.width - 2)
+    }
+
+    fn name_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).name.x)
+    }
+
+    fn name_width(buf: &Buffer) -> u16 {
+        columns_of(buf).name.width
+    }
+
+    /// A child row's own name text start, behind the indent, the marker and the gap.
+    fn child_name_x(buf: &Buffer) -> u16 {
+        name_x(buf) + CHILD_ROW_PREFIX_WIDTH
+    }
+
+    fn child_name_width(buf: &Buffer) -> u16 {
+        columns_of(buf).child_name_width()
+    }
+
+    fn branch_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).branch.x)
+    }
+
+    fn branch_width(buf: &Buffer) -> u16 {
+        columns_of(buf).branch.width
+    }
+
+    fn sync_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).sync.x)
+    }
+
+    fn base_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).base.x)
+    }
+
+    fn dirty_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).dirty.x)
+    }
+
+    fn state_x(buf: &Buffer) -> u16 {
+        absolute_x(columns_of(buf).state.x)
     }
 
     fn find_entity_row<'a>(
@@ -3960,23 +4226,18 @@ mod tests {
         let worktree_y = entity_row_y(worktree_row);
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), repo_y, 6),
+            cell_text(buf, name_x(buf), repo_y, 6),
             "parent",
             "the top-level Repo row's name must start flush at the name column's own start"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), worktree_y, 4),
+            cell_text(buf, name_x(buf), worktree_y, 4),
             "    ",
             "a child row's own indent must leave the name column's own start blank"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
-                worktree_y,
-                1
-            ),
+            cell_text(buf, name_x(buf) + CHILD_ROW_INDENT_WIDTH, worktree_y, 1),
             glyphs.child_row.to_string(),
             "expected the active table's own child marker, read from the table rather than \
              restated"
@@ -3984,7 +4245,7 @@ mod tests {
         assert_eq!(
             cell_text(
                 buf,
-                absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
+                child_name_x(buf),
                 worktree_y,
                 "feature-worktree".len() as u16
             ),
@@ -4032,18 +4293,10 @@ mod tests {
 
             let worktree_y = entity_row_y(worktree_row);
             let submodule_y = entity_row_y(submodule_row);
-            let worktree_marker = cell_text(
-                buf,
-                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
-                worktree_y,
-                1,
-            );
-            let submodule_marker = cell_text(
-                buf,
-                absolute_x(NAME_X + CHILD_ROW_INDENT_WIDTH),
-                submodule_y,
-                1,
-            );
+            let worktree_marker =
+                cell_text(buf, name_x(buf) + CHILD_ROW_INDENT_WIDTH, worktree_y, 1);
+            let submodule_marker =
+                cell_text(buf, name_x(buf) + CHILD_ROW_INDENT_WIDTH, submodule_y, 1);
 
             assert_eq!(
                 worktree_marker, submodule_marker,
@@ -4076,38 +4329,28 @@ mod tests {
         let y = entity_row_y(row);
 
         assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(NAME_X + CHILD_ROW_PREFIX_WIDTH),
-                y,
-                "vendor/lib".len() as u16
-            ),
+            cell_text(buf, child_name_x(buf), y, "vendor/lib".len() as u16),
             "vendor/lib",
             "expected the submodule's declared relative path as its name"
         );
         assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(BRANCH_X),
-                y,
-                BRANCH_CELL_OBJECT_ID_WIDTH as u16
-            ),
+            cell_text(buf, branch_x(buf), y, BRANCH_CELL_OBJECT_ID_WIDTH as u16),
             short_id,
             "expected the real commit's own nine-character abbreviated id in branch"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
         assert_eq!(
-            cell_text(buf, absolute_x(SYNC_X), y, 1),
+            cell_text(buf, sync_x(buf), y, 1),
             glyphs.no_upstream.to_string(),
             "expected no-upstream in sync, since a detached Submodule has no branch at all"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(BASE_X), y, BASE_WIDTH),
+            cell_text(buf, base_x(buf), y, BASE_WIDTH),
             " ".repeat(BASE_WIDTH as usize),
             "base is Unknown for a Submodule and must still render blank"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(STATE_X), y, STATE_WIDTH),
+            cell_text(buf, state_x(buf), y, STATE_WIDTH),
             " ".repeat(STATE_WIDTH as usize),
             "state is Unknown for a Submodule and must still render blank"
         );
@@ -4175,17 +4418,17 @@ mod tests {
             "expected the unknown gutter mark on an uninitialised Submodule's row"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(BRANCH_X), y, BRANCH_WIDTH),
-            " ".repeat(BRANCH_WIDTH as usize),
+            cell_text(buf, branch_x(buf), y, branch_width(buf)),
+            " ".repeat(branch_width(buf) as usize),
             "branch must render blank rather than any value at all"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(SYNC_X), y, SYNC_WIDTH),
+            cell_text(buf, sync_x(buf), y, SYNC_WIDTH),
             " ".repeat(SYNC_WIDTH as usize),
             "sync must render blank rather than any value at all"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(DIRTY_X), y, DIRTY_WIDTH),
+            cell_text(buf, dirty_x(buf), y, DIRTY_WIDTH),
             " ".repeat(DIRTY_WIDTH as usize),
             "dirty must render blank rather than any value at all"
         );
@@ -4225,11 +4468,42 @@ mod tests {
         );
     }
 
-    /// The name-column geometry ADR 0020 measures rather than this test restating: reads
-    /// "A child name gets 28 minus 6 = 22 columns behind a one-character marker" straight
-    /// out of the ADR file and checks this crate's own constants against those three
-    /// numbers, so a change to either side is what this test would catch, not a change to
-    /// only one of two copies of the same figure.
+    /// Every "<total> minus <cost> = <budget>" a sentence spells out, in the order it
+    /// spells them. Panics rather than skipping a malformed one, so a sentence that stops
+    /// stating its own arithmetic fails the test that reads it.
+    fn arithmetic_triples(sentence: &str) -> Vec<[u16; 3]> {
+        sentence
+            .match_indices(" minus ")
+            .map(|(at, separator)| {
+                let before = &sentence[..at];
+                let total_start = before
+                    .rfind(|c: char| !c.is_ascii_digit())
+                    .map_or(0, |index| index + 1);
+                let rest = &sentence[at + separator.len()..];
+                let (cost, after) = rest
+                    .split_once(" = ")
+                    .unwrap_or_else(|| panic!("a \" minus \" with no \" = \": {sentence:?}"));
+                let budget_end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
+                let number = |text: &str| -> u16 {
+                    text.parse()
+                        .unwrap_or_else(|_| panic!("not a number: {text:?} in {sentence:?}"))
+                };
+                [
+                    number(&before[total_start..]),
+                    number(cost),
+                    number(&after[..budget_end]),
+                ]
+            })
+            .collect()
+    }
+
+    /// The name-column geometry ADR 0020 measures rather than this test restating: reads the
+    /// ADR's own "A child name gets ..." sentence straight out of the file and checks the
+    /// child budget this crate computes against both of the sentence's own sums, the one at
+    /// the name column's minimum and the one at its cap. A change to either side is what
+    /// this test catches, not a change to only one of two copies of the same figure.
     #[test]
     fn child_name_budget_matches_the_adrs_own_arithmetic() {
         let adr_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4241,28 +4515,50 @@ mod tests {
             .find(needle)
             .expect("expected the ADR to still state the child-name-budget sentence")
             + needle.len();
-        let sentence = &adr[start..start + 40];
-        let numbers: Vec<u16> = sentence
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|token| !token.is_empty())
-            .map(|token| token.parse().expect("a numeric token"))
-            .take(3)
-            .collect();
-        let [total, cost, budget] = numbers[..] else {
-            panic!("expected exactly three numbers in {sentence:?}, got {numbers:?}");
+        let sentence = &adr[start
+            ..start
+                + adr[start..]
+                    .find(". ")
+                    .expect("the child-name-budget sentence must end")];
+
+        let triples = arithmetic_triples(sentence);
+        let [
+            [minimum, minimum_cost, minimum_budget],
+            [cap, cap_cost, cap_budget],
+        ] = triples[..]
+        else {
+            panic!("expected the ADR to state one sum per end of the rule, got {triples:?}");
         };
-        assert_eq!(total - cost, budget, "the ADR's own arithmetic must hold");
         assert_eq!(
-            NAME_WIDTH, total,
-            "the name column width must match the ADR's own figure"
+            minimum - minimum_cost,
+            minimum_budget,
+            "the ADR's own arithmetic must hold at the name column's minimum"
         );
         assert_eq!(
-            CHILD_ROW_PREFIX_WIDTH, cost,
-            "the reserved prefix (indent, marker, gap) must match the ADR's own figure"
+            cap - cap_cost,
+            cap_budget,
+            "the ADR's own arithmetic must hold at the name column's cap"
         );
         assert_eq!(
-            CHILD_ROW_NAME_WIDTH, budget,
-            "the child name budget must match the ADR's own figure"
+            (NAME_MIN_WIDTH, NAME_MAX_WIDTH),
+            (minimum, cap),
+            "the name column's minimum and cap must match the ADR's own two figures"
+        );
+        assert_eq!(
+            (CHILD_ROW_PREFIX_WIDTH, CHILD_ROW_PREFIX_WIDTH),
+            (minimum_cost, cap_cost),
+            "the reserved prefix (indent, marker, gap) must match the ADR's own figure, and \
+             must not change between the two ends of the rule"
+        );
+        assert_eq!(
+            Columns::for_interior_width(PACKED_MIN_WIDTH).child_name_width(),
+            minimum_budget,
+            "a child name on a frame with no slack must get the ADR's own minimum budget"
+        );
+        assert_eq!(
+            Columns::for_interior_width(u16::MAX).child_name_width(),
+            cap_budget,
+            "a child name on a frame past the cap must get the ADR's own capped budget"
         );
     }
 
@@ -4461,16 +4757,17 @@ mod tests {
         format!("{text:<width$}", width = width as usize)
     }
 
-    /// A child row's own 28-column name cell in full: the fixed indent and marker, the active
-    /// table's own gap, then `name` padded out to the child budget. Built once here so the
-    /// matrix test below never restates the geometry `draw_name_cell` itself computes.
-    fn child_name_cell(glyphs: &'static GlyphSet, name: &str) -> String {
+    /// A child row's own name cell in full, for the frame `buf` was drawn at: the fixed
+    /// indent and marker, the active table's own gap, then `name` padded out to the child
+    /// budget. Built once here so the matrix test below never restates the geometry
+    /// `draw_name_cell` itself computes.
+    fn child_name_cell(buf: &Buffer, glyphs: &'static GlyphSet, name: &str) -> String {
         format!(
             "{}{}{}{}",
             " ".repeat(CHILD_ROW_INDENT_WIDTH as usize),
             glyphs.child_row,
             " ".repeat(CHILD_ROW_GAP_WIDTH as usize),
-            padded(name, CHILD_ROW_NAME_WIDTH)
+            padded(name, child_name_width(buf))
         )
     }
 
@@ -4510,7 +4807,7 @@ mod tests {
             Row {
                 name: "manage",
                 gutter: glyphs.fresh,
-                name_cell: padded("manage", NAME_WIDTH),
+                name_cell: padded("manage", name_width(buf)),
                 branch: ids.manage_detached_id.as_str(),
                 sync: "-",
                 base: "↓1",
@@ -4520,7 +4817,7 @@ mod tests {
             Row {
                 name: "feature-worktree",
                 gutter: glyphs.fresh,
-                name_cell: child_name_cell(glyphs, "feature-worktree"),
+                name_cell: child_name_cell(buf, glyphs, "feature-worktree"),
                 branch: "feature",
                 sync: "-",
                 base: "↓1",
@@ -4530,7 +4827,7 @@ mod tests {
             Row {
                 name: "pr-920",
                 gutter: glyphs.fresh,
-                name_cell: child_name_cell(glyphs, "pr-920"),
+                name_cell: child_name_cell(buf, glyphs, "pr-920"),
                 branch: ids.pr_920_detached_id.as_str(),
                 sync: "-",
                 base: "≡",
@@ -4540,7 +4837,7 @@ mod tests {
             Row {
                 name: "vendor/lib",
                 gutter: glyphs.unknown,
-                name_cell: child_name_cell(glyphs, "vendor/lib"),
+                name_cell: child_name_cell(buf, glyphs, "vendor/lib"),
                 branch: ids.vendor_lib_detached_id.as_str(),
                 sync: "-",
                 base: "",
@@ -4550,7 +4847,7 @@ mod tests {
             Row {
                 name: "brand-new",
                 gutter: glyphs.fresh,
-                name_cell: padded("brand-new", NAME_WIDTH),
+                name_cell: padded("brand-new", name_width(buf)),
                 branch: "main",
                 sync: "-",
                 base: "",
@@ -4571,37 +4868,37 @@ mod tests {
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(NAME_X), y, NAME_WIDTH),
+                cell_text(buf, name_x(buf), y, name_width(buf)),
                 row.name_cell,
                 "{}: name",
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(BRANCH_X), y, BRANCH_WIDTH),
-                padded(row.branch, BRANCH_WIDTH),
+                cell_text(buf, branch_x(buf), y, branch_width(buf)),
+                padded(row.branch, branch_width(buf)),
                 "{}: branch",
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(SYNC_X), y, SYNC_WIDTH),
+                cell_text(buf, sync_x(buf), y, SYNC_WIDTH),
                 padded(row.sync, SYNC_WIDTH),
                 "{}: sync",
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(BASE_X), y, BASE_WIDTH),
+                cell_text(buf, base_x(buf), y, BASE_WIDTH),
                 padded(row.base, BASE_WIDTH),
                 "{}: base",
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(DIRTY_X), y, DIRTY_WIDTH),
+                cell_text(buf, dirty_x(buf), y, DIRTY_WIDTH),
                 padded(row.dirty, DIRTY_WIDTH),
                 "{}: dirty",
                 row.name
             );
             assert_eq!(
-                cell_text(buf, absolute_x(STATE_X), y, STATE_WIDTH),
+                cell_text(buf, state_x(buf), y, STATE_WIDTH),
                 padded(row.state, STATE_WIDTH),
                 "{}: state",
                 row.name
@@ -4682,8 +4979,8 @@ mod tests {
 
         let (attached_row, _) = find_entity_row(&snapshot, "feature-worktree");
         let (detached_row, _) = find_entity_row(&snapshot, "manage");
-        let attached_fg = buf[(absolute_x(BRANCH_X), entity_row_y(attached_row))].fg;
-        let detached_fg = buf[(absolute_x(BRANCH_X), entity_row_y(detached_row))].fg;
+        let attached_fg = buf[(branch_x(buf), entity_row_y(attached_row))].fg;
+        let detached_fg = buf[(branch_x(buf), entity_row_y(detached_row))].fg;
 
         assert_eq!(
             attached_fg, detached_fg,
@@ -4764,12 +5061,7 @@ mod tests {
             let y = entity_row_y(0);
 
             assert_eq!(
-                cell_text(
-                    buf,
-                    absolute_x(BRANCH_X),
-                    y,
-                    BRANCH_CELL_OBJECT_ID_WIDTH as u16
-                ),
+                cell_text(buf, branch_x(buf), y, BRANCH_CELL_OBJECT_ID_WIDTH as u16),
                 expected_id,
                 "core.abbrev={abbrev}: expected the fixed nine-character id regardless of \
                  the repository's own abbreviation setting"
@@ -4836,8 +5128,8 @@ mod tests {
         let buf = terminal.backend().buffer();
         let y = entity_row_y(0);
 
-        let ahead_text = cell_text(buf, absolute_x(SYNC_X), y, 2);
-        let behind_text = cell_text(buf, absolute_x(SYNC_X) + 3, y, 2);
+        let ahead_text = cell_text(buf, sync_x(buf), y, 2);
+        let behind_text = cell_text(buf, sync_x(buf) + 3, y, 2);
 
         assert_eq!(ahead_text.trim(), "↑1");
         assert_eq!(behind_text.trim(), "↓1");
@@ -4861,18 +5153,8 @@ mod tests {
         // clean): theming.md's own "Dirty carries its count" pair.
         let (dirty_row, _) = find_entity_row(&snapshot, "feature-worktree");
         let (clean_row, _) = find_entity_row(&snapshot, "pr-920");
-        let dirty_text = cell_text(
-            buf,
-            absolute_x(DIRTY_X),
-            entity_row_y(dirty_row),
-            DIRTY_WIDTH,
-        );
-        let clean_text = cell_text(
-            buf,
-            absolute_x(DIRTY_X),
-            entity_row_y(clean_row),
-            DIRTY_WIDTH,
-        );
+        let dirty_text = cell_text(buf, dirty_x(buf), entity_row_y(dirty_row), DIRTY_WIDTH);
+        let clean_text = cell_text(buf, dirty_x(buf), entity_row_y(clean_row), DIRTY_WIDTH);
         assert_ne!(
             dirty_text.trim(),
             clean_text.trim(),
@@ -4900,18 +5182,9 @@ mod tests {
         // of which this hermetic fixture can reach.
         let (local_only_row, _) = find_entity_row(&snapshot, "feature-worktree");
         let (merged_row, _) = find_entity_row(&snapshot, "pr-920");
-        let local_only_text = cell_text(
-            buf,
-            absolute_x(STATE_X),
-            entity_row_y(local_only_row),
-            STATE_WIDTH,
-        );
-        let merged_text = cell_text(
-            buf,
-            absolute_x(STATE_X),
-            entity_row_y(merged_row),
-            STATE_WIDTH,
-        );
+        let local_only_text =
+            cell_text(buf, state_x(buf), entity_row_y(local_only_row), STATE_WIDTH);
+        let merged_text = cell_text(buf, state_x(buf), entity_row_y(merged_row), STATE_WIDTH);
         assert_eq!(local_only_text.trim(), "local only");
         assert_eq!(merged_text.trim(), "merged");
         assert_ne!(local_only_text.trim(), merged_text.trim());
@@ -4942,26 +5215,28 @@ mod tests {
             ..List::default()
         };
         let first_tick = render_with_list(&mut at_zero, 140, 24, &snap);
-        let base_first = cell_text(first_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
-        let branch_first = cell_text(
-            first_tick.backend().buffer(),
-            absolute_x(BRANCH_X),
-            entity_row_y(0),
-            BRANCH_WIDTH,
-        );
+        let base_first = {
+            let buf = first_tick.backend().buffer();
+            cell_text(buf, base_x(buf), 2, 1)
+        };
+        let branch_first = {
+            let buf = first_tick.backend().buffer();
+            cell_text(buf, branch_x(buf), entity_row_y(0), branch_width(buf))
+        };
 
         let mut later = List {
             started_at: Instant::now() - FULL_SPINNER_INTERVAL * 5,
             ..List::default()
         };
         let second_tick = render_with_list(&mut later, 140, 24, &snap);
-        let base_second = cell_text(second_tick.backend().buffer(), absolute_x(BASE_X), 2, 1);
-        let branch_second = cell_text(
-            second_tick.backend().buffer(),
-            absolute_x(BRANCH_X),
-            entity_row_y(0),
-            BRANCH_WIDTH,
-        );
+        let base_second = {
+            let buf = second_tick.backend().buffer();
+            cell_text(buf, base_x(buf), 2, 1)
+        };
+        let branch_second = {
+            let buf = second_tick.backend().buffer();
+            cell_text(buf, branch_x(buf), entity_row_y(0), branch_width(buf))
+        };
 
         assert_ne!(
             base_first, base_second,
@@ -5080,13 +5355,13 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            is_reversed(buf, name_x(buf), entity_row_y(1)),
             "the cursor row (offset 1, \"beta\") must render reversed with no theme selection \
              colours set"
         );
         for (row, name) in [(0, "alpha"), (2, "gamma")] {
             assert!(
-                !is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)),
+                !is_reversed(buf, name_x(buf), entity_row_y(row)),
                 "row {row} (\"{name}\") is not the cursor row and must not be reversed"
             );
         }
@@ -5109,7 +5384,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         let highlighted_rows = (0..4)
-            .filter(|&row| is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)))
+            .filter(|&row| is_reversed(buf, name_x(buf), entity_row_y(row)))
             .count();
 
         assert_eq!(
@@ -5137,16 +5412,16 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), entity_row_y(0), 4),
+            cell_text(buf, name_x(buf), entity_row_y(0), 4),
             "beta",
             "an offset of 1 must put the cursor's own row, `beta`, on screen row 0"
         );
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            is_reversed(buf, name_x(buf), entity_row_y(0)),
             "the cursor row must carry the highlight at its screen row, not at its row_order index"
         );
         assert!(
-            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            !is_reversed(buf, name_x(buf), entity_row_y(1)),
             "`gamma` is not the cursor row and must carry no highlight"
         );
     }
@@ -5169,7 +5444,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         let highlighted_rows = (0..2)
-            .filter(|&row| is_reversed(buf, absolute_x(NAME_X), entity_row_y(row)))
+            .filter(|&row| is_reversed(buf, name_x(buf), entity_row_y(row)))
             .count();
 
         assert_eq!(
@@ -5200,11 +5475,11 @@ mod tests {
         {
             let buf = terminal.backend().buffer();
             assert!(
-                is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+                is_reversed(buf, name_x(buf), entity_row_y(0)),
                 "row 0 must be reversed while the cursor sits on it"
             );
             assert!(
-                !is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+                !is_reversed(buf, name_x(buf), entity_row_y(1)),
                 "row 1 must not be reversed before the cursor ever reaches it"
             );
         }
@@ -5218,11 +5493,11 @@ mod tests {
             .expect("draw the frame");
         let buf = terminal.backend().buffer();
         assert!(
-            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            !is_reversed(buf, name_x(buf), entity_row_y(0)),
             "row 0 must lose the highlight once the cursor moves off it"
         );
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            is_reversed(buf, name_x(buf), entity_row_y(1)),
             "row 1 must gain the highlight once the cursor moves onto it"
         );
     }
@@ -5244,7 +5519,7 @@ mod tests {
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
 
-        let cursor_cell = &buf[(absolute_x(NAME_X), entity_row_y(0))];
+        let cursor_cell = &buf[(name_x(buf), entity_row_y(0))];
         assert_eq!(cursor_cell.fg, Color::Black);
         assert_eq!(cursor_cell.bg, Color::LightBlue);
         assert!(
@@ -5252,7 +5527,7 @@ mod tests {
             "an explicit selection colour must not also be reversed"
         );
 
-        let other_cell = &buf[(absolute_x(NAME_X), entity_row_y(1))];
+        let other_cell = &buf[(name_x(buf), entity_row_y(1))];
         assert_ne!(
             other_cell.bg,
             Color::LightBlue,
@@ -5286,12 +5561,12 @@ mod tests {
         let sidebar_row_y = |row: u16| 1 + row;
 
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), sidebar_row_y(1)),
+            is_reversed(buf, name_x(buf), sidebar_row_y(1)),
             "the sidebar's cursor row must be reversed"
         );
         for row in [0, 2] {
             assert!(
-                !is_reversed(buf, absolute_x(NAME_X), sidebar_row_y(row)),
+                !is_reversed(buf, name_x(buf), sidebar_row_y(row)),
                 "sidebar row {row} is not the cursor row and must not be reversed"
             );
         }
@@ -5311,12 +5586,9 @@ mod tests {
         let mut full_list = List::default();
         full_list.set_cursor(0);
         let full_terminal = render_with_list(&mut full_list, 140, 24, &snap);
+        let full_buf = full_terminal.backend().buffer();
         assert!(
-            is_reversed(
-                full_terminal.backend().buffer(),
-                absolute_x(NAME_X),
-                entity_row_y(0)
-            ),
+            is_reversed(full_buf, name_x(full_buf), entity_row_y(0)),
             "the full list must highlight its own row 0 at cursor 0"
         );
 
@@ -5335,8 +5607,9 @@ mod tests {
                 .expect("draw the frame");
             terminal
         };
+        let sidebar_buf = sidebar_terminal.backend().buffer();
         assert!(
-            is_reversed(sidebar_terminal.backend().buffer(), absolute_x(NAME_X), 1),
+            is_reversed(sidebar_buf, name_x(sidebar_buf), 1),
             "the sidebar must highlight its own row 0 (y=1, one line higher than the full \
              list's row 0 because it has no header) at cursor 0"
         );
@@ -5357,22 +5630,22 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), entity_row_y(0), 5),
+            cell_text(buf, name_x(buf), entity_row_y(0), 5),
             "alpha",
             "sanity: beta filtered out, alpha is still offset 0"
         );
         assert_eq!(
-            cell_text(buf, absolute_x(NAME_X), entity_row_y(1), 5),
+            cell_text(buf, name_x(buf), entity_row_y(1), 5),
             "gamma",
             "sanity: with beta filtered out, gamma is now offset 1"
         );
 
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(1)),
+            is_reversed(buf, name_x(buf), entity_row_y(1)),
             "gamma, now at the cursor's offset, must carry the highlight"
         );
         assert!(
-            !is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            !is_reversed(buf, name_x(buf), entity_row_y(0)),
             "alpha must not carry the highlight"
         );
     }
@@ -5473,7 +5746,7 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            is_reversed(buf, name_x(buf), entity_row_y(0)),
             "the cursor row must be reversed"
         );
         assert_eq!(
@@ -5503,7 +5776,7 @@ mod tests {
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
 
         assert!(
-            is_reversed(buf, absolute_x(NAME_X), entity_row_y(0)),
+            is_reversed(buf, name_x(buf), entity_row_y(0)),
             "a row that is both must still be reversed"
         );
         assert_eq!(
