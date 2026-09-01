@@ -153,6 +153,7 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
             env: Vec::new(),
         }],
         concurrency: 2,
+        when: None,
     };
     let started = core.run_action(action, &blocked_keys);
     assert!(started, "the Action fan-out must start");

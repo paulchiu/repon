@@ -47,11 +47,11 @@ use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
     ActionReceipt, DefaultBranch, DeleteRisk, DirtyCounts, EntityKey, EntityState, Head, Kind,
-    OwnWork, Presence, RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
+    OwnWork, Presence, RunningStep, Skip, StepOutcome, StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
-use crate::filter::{Applicability, Filter};
+use crate::filter::{Applicability, Filter, Partition};
 use crate::git;
 use crate::landing;
 use crate::patch_equivalence;
@@ -112,13 +112,19 @@ pub struct Step {
 /// Action's name, or the ad hoc command string typed into the palette. `name` is
 /// `REPON_ACTION`'s own value and is `None` for an ad hoc run, exactly as
 /// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
-/// environment contract already treats a Launcher's absent `REPON_ACTION`.
+/// environment contract already treats a Launcher's absent `REPON_ACTION`. `when` is
+/// `None` for a built-in, a typed command or a configured entry that declares none, in
+/// which case every operable row runs; `Some` is what [`Core::run_action`] itself now
+/// decides the fan-out by, not only what a palette reports about it
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "The Selection and the gate").
 #[derive(Debug, Clone)]
 pub struct ActionSpec {
     pub label: Arc<str>,
     pub name: Option<Arc<str>>,
     pub steps: Vec<Step>,
     pub concurrency: u32,
+    pub when: Option<Filter>,
 }
 
 /// A [`RepoOverride`]'s probe-input half with its common dir already resolved, built
@@ -1019,10 +1025,12 @@ impl Core {
             .partition(|entity| !entity.excluded)
     }
 
-    /// How many of `order` an Action would actually operate on: [`Self::run_action`]'s own
+    /// How many of `order` are operable, i.e. not excluded: [`Self::run_action`]'s own
     /// first move is the identical partition this method itself calls, so this is the one
     /// number a confirm gate and a palette border can both read without either ever
-    /// drifting from what a run really does.
+    /// drifting from what that first move keeps. Not the final count a run acts on once
+    /// `action.when` is `Some`: [`Self::applicability`] narrows this same set further, and
+    /// [`Self::run_action`] itself only ever runs the rows that narrowing proves.
     pub fn operable_count(&self, order: &[EntityKey]) -> usize {
         self.partition_operable(order).0.len()
     }
@@ -1045,7 +1053,10 @@ impl Core {
     /// the predicate ever sees it and `when` narrows what is left rather than replacing that
     /// subtraction
     /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-    /// "The Selection and the gate").
+    /// "The Selection and the gate"). A palette calls this ahead of time, to report a count
+    /// before a choice is even made; [`Self::run_action`] runs the identical classification
+    /// against the identical rows once a choice is confirmed, over `ActionSpec::when` rather
+    /// than an argument of its own, so a preview and a real run can never disagree.
     ///
     /// The tally lives here rather than in the consumer for that reason alone:
     /// `partition_operable` is this type's own, so a caller cannot count applicability over
@@ -1087,11 +1098,20 @@ impl Core {
     ///
     /// An entity in `order` carrying a matching `[[repo]]` `exclude = true`
     /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries))
-    /// never runs a step: it receives a `not_applicable` receipt with an empty step list
-    /// immediately, the one legitimate producer of that outcome
+    /// never runs a step: it receives a [`Skip::Excluded`] receipt with an empty step list
+    /// immediately, the one legitimate producer of `Not applicable`
     /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
     /// "The Selection and the gate"). An unknown key in `order` (already dismissed, or
     /// never discovered) is silently skipped, the same fallback `refresh` gives one.
+    ///
+    /// `action.when`, once every excluded row is already subtracted, decides what runs
+    /// rather than only what a palette reported about it: a row it proves is handed a
+    /// step, a row it disproves gets a [`Skip::Inapplicable`] receipt instead, and a row it
+    /// cannot settle (a Cell it reads has not settled) gets [`Skip::Unresolved`], since an
+    /// unprovable row is not a provable one and a run has no basis to touch it either
+    /// (`docs/spec/actions.md`'s "The Selection and the gate", reversing what that
+    /// paragraph originally decided). `None` runs every operable row, exactly as before
+    /// `when` reached this call.
     ///
     /// Starting a run cancels any in-flight Generation outright rather than sharing
     /// execution with it, and completion starts exactly one normal Generation over
@@ -1114,23 +1134,42 @@ impl Core {
         // outright, never sharing the machine with it.
         cancel_in_flight(&self.table, &self.settle_gate);
 
-        let (included, excluded) = self.partition_operable(order);
+        let (operable, excluded) = self.partition_operable(order);
 
-        if !excluded.is_empty() {
+        let write_skip_receipts = |entities: &[EntityState], skip: Skip| {
+            if entities.is_empty() {
+                return;
+            }
             let finished_at = Timestamp::now();
             let mut table = self.table.write().unwrap();
-            for entity in &excluded {
+            for entity in entities {
                 if let Some(&idx) = table.index.get(&entity.key) {
                     table.entities[idx].last_action = Some(ActionReceipt {
                         label: Arc::clone(&action.label),
                         steps: Arc::from(Vec::new()),
-                        not_applicable: true,
+                        skip: Some(skip),
                         finished_at,
                         running: None,
                     });
                 }
             }
-        }
+        };
+
+        write_skip_receipts(&excluded, Skip::Excluded);
+
+        let included = match &action.when {
+            Some(when) => {
+                let Partition {
+                    applicable,
+                    inapplicable,
+                    unresolved,
+                } = when.partition(operable);
+                write_skip_receipts(&inapplicable, Skip::Inapplicable);
+                write_skip_receipts(&unresolved, Skip::Unresolved);
+                applicable
+            }
+            None => operable,
+        };
 
         let table_handle = Arc::clone(&self.table);
         let action_running = Arc::clone(&self.action_running);
@@ -1293,9 +1332,10 @@ impl Core {
     /// `OwnWork`).
     ///
     /// The receipt is built here rather than handed in whole, so a consumer supplies only
-    /// what Repon did and the words for it: `not_applicable` stays false, since a refusal is
-    /// not an excluded row, `running` stays `None`, since the work is already done, and the
-    /// step count stays one, since the operation is one act rather than an ordered list.
+    /// what Repon did and the words for it: `skip` stays `None`, since a refusal is a row
+    /// that was operated on rather than one of the three ways a row is skipped, `running`
+    /// stays `None`, since the work is already done, and the step count stays one, since the
+    /// operation is one act rather than an ordered list.
     /// `label` is the operation's own name and doubles as the single step's label; the step's
     /// captured output is empty, there being no other program's screen to quote.
     ///
@@ -1321,7 +1361,7 @@ impl Core {
                     elapsed: *elapsed,
                     elision: None,
                 }]),
-                not_applicable: false,
+                skip: None,
                 finished_at,
                 running: None,
             });
@@ -2278,9 +2318,9 @@ impl Core {
 /// One entity's whole Action run: every step in `action.steps`, in order, stopping at
 /// the first failure, with every step after it recorded `NotRun` rather than silently
 /// skipped ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
-/// "Actions", `docs/spec/actions.md`'s "Step outcomes"). Never called for an excluded
-/// entity: [`Core::run_action`] gives those their `not_applicable` receipt itself and
-/// never reaches this function for them.
+/// "Actions", `docs/spec/actions.md`'s "Step outcomes"). Never called for an excluded,
+/// inapplicable or unresolved entity: [`Core::run_action`] gives those their own `Skip`
+/// receipt itself and never reaches this function for them.
 ///
 /// `control` is the same `RunControl` every other entity's run in this fan-out shares:
 /// checked before every step starts, so a step not yet reached when `control.cancel` fires
@@ -2328,7 +2368,7 @@ fn run_action_for_entity(
         report(ActionReceipt {
             label: Arc::clone(&action.label),
             steps: Arc::from(results.clone()),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: Some(RunningStep {
                 label: Arc::clone(&label),
@@ -2358,7 +2398,7 @@ fn run_action_for_entity(
     ActionReceipt {
         label: Arc::clone(&action.label),
         steps: Arc::from(results),
-        not_applicable: false,
+        skip: None,
         finished_at: Timestamp::now(),
         running: None,
     }
@@ -4598,6 +4638,16 @@ mod tests {
             name: Some(Arc::from(label)),
             steps,
             concurrency: 4,
+            when: None,
+        }
+    }
+
+    /// [`action`], narrowed by `when`, a Filter grammar predicate
+    /// (`docs/spec/actions.md`'s "The Selection and the gate").
+    fn action_with_when(label: &str, steps: Vec<Step>, when: &str) -> ActionSpec {
+        ActionSpec {
+            when: Some(Filter::parse(when)),
+            ..action(label, steps)
         }
     }
 
@@ -5675,12 +5725,12 @@ mod tests {
                 .unwrap()
         };
         let excluded_receipt = receipt_of(&excluded_key);
-        assert!(excluded_receipt.not_applicable);
+        assert!(excluded_receipt.not_applicable());
         assert!(excluded_receipt.steps.is_empty());
 
         let normal_receipt = receipt_of(&normal_key);
         assert!(
-            !normal_receipt.not_applicable,
+            !normal_receipt.not_applicable(),
             "a row that actually ran a step, even a failing one, must never read as \
              not_applicable: an excluded row is the one legitimate producer of that outcome"
         );
@@ -5753,7 +5803,7 @@ mod tests {
                 entity
                     .last_action
                     .as_ref()
-                    .is_some_and(|receipt| !receipt.not_applicable)
+                    .is_some_and(|receipt| !receipt.not_applicable())
             })
             .count();
 
@@ -5762,6 +5812,80 @@ mod tests {
             actually_ran,
             "operable_count must report exactly how many rows run_action actually ran a \
              step against, not merely how many keys resolved"
+        );
+    }
+
+    /// The reversed decision itself: `when` now decides what runs, not only what a palette
+    /// reports about it. A row the predicate proves runs a real step; a row it disproves
+    /// gets a `Skip::Inapplicable` receipt with no steps and never spawns a child process at
+    /// all, which the failing command below would have surfaced as a `Failed` step had it
+    /// run (`docs/spec/actions.md`'s "The Selection and the gate", reversing what that
+    /// section originally decided).
+    #[test]
+    fn run_action_skips_a_row_its_when_predicate_disproves_rather_than_running_it_anyway() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let proved_repo = root.join("alpha");
+        let disproved_repo = root.join("beta");
+        init_repo_with_a_commit(&proved_repo);
+        init_repo_with_a_commit(&disproved_repo);
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let snapshot = core.snapshot();
+        let find = |path: &Path| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.key.path() == path)
+                .unwrap_or_else(|| panic!("entity at {path:?} present"))
+                .key
+                .clone()
+        };
+        let proved_key = find(&proved_repo);
+        let disproved_key = find(&disproved_repo);
+        let order = [proved_key.clone(), disproved_key.clone()];
+
+        // A command that would mark a real run `Failed` if it ever ran, so a disproved row
+        // that wrongly ran a step is caught by its own outcome rather than only by `skip`.
+        let started = core.run_action(
+            action_with_when(
+                "reinstall",
+                vec![step(&["sh", "-c", "exit 3"])],
+                "name:alpha",
+            ),
+            &order,
+        );
+        assert!(started);
+        wait_for("the fan-out to finish", || !core.action_running());
+
+        let after = core.snapshot();
+        let receipt_of = |key: &EntityKey| {
+            after
+                .entities
+                .iter()
+                .find(|entity| entity.key == *key)
+                .unwrap()
+                .last_action
+                .clone()
+                .unwrap()
+        };
+
+        let proved_receipt = receipt_of(&proved_key);
+        assert_eq!(
+            proved_receipt.skip, None,
+            "the row the predicate proved must actually run"
+        );
+        assert!(proved_receipt.failed(), "its own step still ran and failed");
+
+        let disproved_receipt = receipt_of(&disproved_key);
+        assert!(
+            disproved_receipt.inapplicable(),
+            "the row the predicate disproved must be skipped rather than run"
+        );
+        assert!(disproved_receipt.steps.is_empty());
+        assert!(
+            !disproved_receipt.failed(),
+            "a skipped row never ran a step, so it cannot have failed one"
         );
     }
 
@@ -6278,7 +6402,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         };
@@ -6318,7 +6442,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         };
@@ -7712,7 +7836,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         };
@@ -11595,7 +11719,7 @@ mod tests {
     // =====================================================================================
 
     /// One receipt per named row, and the shape the caller never gets to choose: `running` is
-    /// `None`, `not_applicable` is false (a refusal is not an excluded row), and there is
+    /// `None`, `skip` is `None` (a refusal is not an excluded row), and there is
     /// exactly one step, because such an operation is one act rather than an ordered list.
     #[test]
     fn record_own_work_leaves_one_receipt_per_row_it_names_and_none_elsewhere() {
@@ -11629,7 +11753,10 @@ mod tests {
             .and_then(|entity| entity.last_action.clone())
             .expect("the row it named carries a receipt");
         assert_eq!(&*receipt.label, "ignore");
-        assert!(!receipt.not_applicable, "a refusal is not an excluded row");
+        assert!(
+            !receipt.not_applicable(),
+            "a refusal is not an excluded row"
+        );
         assert!(receipt.running.is_none(), "the work is already done");
         assert_eq!(receipt.steps.len(), 1, "one act, not an ordered list");
         assert_eq!(&*receipt.steps[0].label, "ignore");

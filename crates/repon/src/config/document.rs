@@ -193,8 +193,10 @@ fn default_action_concurrency() -> u32 {
 /// (`concurrency` is a bare `u32`, so the only ceiling is the type's own, never a
 /// deliberate one this schema imposes), and the optional `when`.
 /// [`crate::action_palette::to_action_spec`] turns this, plus its `steps`, into
-/// `repon_core::ActionSpec` and `repon_core::Step`; `when` is deliberately not among what
-/// crosses, since it narrows what the palette counts and never what the fan-out runs on.
+/// `repon_core::ActionSpec` and `repon_core::Step`; `when` crosses too, parsed once there
+/// into a `repon_core::Filter`, since `Core::run_action` now decides the fan-out by it
+/// rather than only reporting a count over it
+/// ([actions.md](../../../../docs/spec/actions.md)'s "The Selection and the gate").
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionConfig {
     pub name: toml::Spanned<String>,

@@ -174,7 +174,7 @@ fn unknown_keyword(reason: Unknown) -> Option<&'static str> {
 /// The worst outcome in `receipt`'s own steps, or `"none"` for no receipt at all, per
 /// `docs/spec/filter.md`'s `action:` row: "the worst `StepOutcome` in `last_action`, or its
 /// absence". A failing step outranks a refusal, which outranks a `Cancelled` one, and an
-/// all-`Ok` (or empty, the `not_applicable` shape) receipt reads `"ok"`.
+/// all-`Ok` (or empty, a `skip` shape) receipt reads `"ok"`.
 ///
 /// Both classifications come from [`ActionReceipt`] itself rather than a second reading here,
 /// so this term and the row summary fold cannot disagree about what failed.
@@ -557,6 +557,24 @@ impl Filter {
         counts
     }
 
+    /// `entities`, split by this Filter's own Trilean verdict for each one: [`Self::applicability`]'s
+    /// owned counterpart, dispatching through the identical [`Self::evaluate`] call so a run
+    /// and a report of that run can never classify one row two different ways
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate"). `Core::run_action` is this method's own consumer: the
+    /// applicable bucket is what actually runs, and the other two are what it skips.
+    pub(crate) fn partition(&self, entities: Vec<EntityState>) -> Partition {
+        let mut partition = Partition::default();
+        for entity in entities {
+            match self.evaluate(&entity) {
+                Trilean::True => partition.applicable.push(entity),
+                Trilean::False => partition.inapplicable.push(entity),
+                Trilean::Unprovable => partition.unresolved.push(entity),
+            }
+        }
+        partition
+    }
+
     /// Byte ranges in [`Self::as_str`] of every unrecognised term
     /// ([filter.md](https://github.com/paulchiu/repon/blob/main/docs/spec/filter.md)'s
     /// advisory slot): a keyed term whose value falls outside its own key's closed
@@ -600,6 +618,16 @@ pub struct Applicability {
     pub inapplicable: usize,
     /// Rows the predicate could settle neither way, because a Cell it reads has not settled.
     pub unresolved: usize,
+}
+
+/// [`Filter::partition`]'s own three buckets, the rows behind [`Applicability`]'s three
+/// counts rather than their lengths alone: `Core::run_action` fans out over `applicable` and
+/// writes a Skip receipt to every row in the other two.
+#[derive(Debug, Default)]
+pub(crate) struct Partition {
+    pub(crate) applicable: Vec<EntityState>,
+    pub(crate) inapplicable: Vec<EntityState>,
+    pub(crate) unresolved: Vec<EntityState>,
 }
 
 impl Applicability {
@@ -1015,7 +1043,7 @@ mod tests {
                 elapsed: std::time::Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         });
@@ -1039,7 +1067,7 @@ mod tests {
                 elapsed: std::time::Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         };
@@ -1154,6 +1182,50 @@ mod tests {
             1,
             "`matches` must still count only the proved row, unprovable collapsing to a \
              non-match exactly as the Filter line has always read it"
+        );
+    }
+
+    /// [`Filter::partition`]'s own three buckets must hold exactly the rows
+    /// [`Filter::applicability`] counts over the identical split: `Core::run_action` fans
+    /// out over the `applicable` bucket alone and writes a Skip receipt to the other two, so
+    /// a bucket with the wrong row in it would run the wrong Repos rather than merely
+    /// misreport a count (`docs/spec/actions.md`'s "The Selection and the gate", reversing
+    /// what that section originally decided: `when` now decides what runs, not only what the
+    /// palette reports).
+    #[test]
+    fn partition_puts_each_row_in_the_bucket_its_own_applicability_count_already_names() {
+        let mut attached = entity("attached", Kind::Repo);
+        settle_branch(
+            &mut attached,
+            Head::Branch {
+                name: Arc::from("main"),
+                commit: gix::hash::Kind::Sha1.null(),
+            },
+        );
+        let mut detached = entity("detached", Kind::Repo);
+        settle_branch(&mut detached, Head::Detached(gix::hash::Kind::Sha1.null()));
+        // Nothing settled it, so `head:` can read no value off it at all.
+        let loading = entity("loading", Kind::Repo);
+        let rows = vec![attached, detached, loading];
+
+        let filter = Filter::parse("head:branch");
+        let counts = filter.applicability(&rows);
+        let partition = filter.partition(rows);
+
+        fn names(bucket: &[EntityState]) -> Vec<&str> {
+            bucket.iter().map(|entity| &*entity.name).collect()
+        }
+        assert_eq!(names(&partition.applicable), vec!["attached"]);
+        assert_eq!(names(&partition.inapplicable), vec!["detached"]);
+        assert_eq!(names(&partition.unresolved), vec!["loading"]);
+        assert_eq!(
+            (
+                partition.applicable.len(),
+                partition.inapplicable.len(),
+                partition.unresolved.len(),
+            ),
+            (counts.applicable, counts.inapplicable, counts.unresolved),
+            "a report of a run and the run itself must classify every row the same way"
         );
     }
 

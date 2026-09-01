@@ -219,7 +219,7 @@ mod tests {
         ActionReceipt {
             label: Arc::from("action"),
             steps: Arc::from(steps),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         }
