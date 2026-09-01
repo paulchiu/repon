@@ -33,6 +33,7 @@ use crate::{
     notice,
     selection::Selection,
     set_picker::SetPicker,
+    sort::{RowOrder, SortColumn},
     state,
     status_row::{self, StatusRowContent},
     theme::{self, Theme},
@@ -43,6 +44,13 @@ use crate::{
 
 pub(crate) mod reload;
 pub(crate) mod status;
+
+/// What one key press inside the sort menu means. Both arms close the menu; only `Order`
+/// changes anything, which is what lets `Esc` and `o` cancel without reordering.
+enum SortMenuChoice {
+    Order(RowOrder),
+    Close,
+}
 
 use reload::{ActiveSet, action_running_notice};
 
@@ -428,6 +436,17 @@ pub struct App {
     /// session, then never cleared: a later refresh key press replaces it rather than
     /// leaving a gap.
     refresh_run: Option<RefreshRun>,
+    /// The order the table is listed in. Session state, never persisted and never read from
+    /// config: a restart opens on the natural grouped order
+    /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+    /// Nothing but `Action::SortNatural` and the six column actions writes it, so a Refresh,
+    /// a Filter and a Set switch all leave it standing.
+    row_order: RowOrder,
+    /// `true` while the sort menu has focus, opened by `Action::OpenSortMenu` (`o`) and
+    /// closed by any of its own keys. The table keeps its current order underneath, so
+    /// opening the menu moves nothing; only the footer changes
+    /// ([`Self::handle_sort_menu_key`]).
+    sort_menu_open: bool,
 }
 
 impl App {
@@ -550,6 +569,8 @@ impl App {
             quit_confirm: false,
             action_run: None,
             refresh_run: None,
+            row_order: RowOrder::default(),
+            sort_menu_open: false,
         };
         app.restore_session_state(flag_filter.as_deref());
         Ok(app)
@@ -690,6 +711,7 @@ impl App {
             self.document.show_worktrees,
             self.document.show_submodules,
             &filter,
+            self.row_order,
         );
         let filter_match_count = filter.is_active().then_some(visible.len());
         let worktrees_override =
@@ -727,6 +749,7 @@ impl App {
             warnings,
             acknowledged: &self.acknowledged_warnings,
             refresh,
+            sort: self.row_order.label(self.glyphs),
         }
     }
 
@@ -1017,6 +1040,11 @@ impl App {
             return Ok(());
         }
 
+        if self.sort_menu_open {
+            self.handle_sort_menu_key(key);
+            return Ok(());
+        }
+
         if self.filter_line.is_some() {
             self.handle_filter_line_key(key);
             return Ok(());
@@ -1203,6 +1231,10 @@ impl App {
                 }
                 None
             }
+            Some(Action::OpenSortMenu) => {
+                self.sort_menu_open = true;
+                None
+            }
             Some(Action::OpenLauncher) => {
                 self.launcher_palette = Some(LauncherPalette::new());
                 None
@@ -1317,6 +1349,21 @@ impl App {
             ) => unreachable!(
                 "Input/Overlay/Confirm-only actions never reach the List/Detail dispatch"
             ),
+            // The sort menu's own vocabulary is bound in `Context::Sort` alone, which
+            // `dispatch(List | Detail, key)` never consults, and which `handle_sort_menu_key`
+            // claims before this match is reached at all. This arm is what keeps the six
+            // column keys off the list: were one of them ever bound globally, it would land
+            // here rather than compiling into a wildcard.
+            Some(
+                Action::SortByName
+                | Action::SortByBranch
+                | Action::SortBySync
+                | Action::SortByBase
+                | Action::SortByDirty
+                | Action::SortByState
+                | Action::SortNatural
+                | Action::CloseSortMenu,
+            ) => unreachable!("sort-menu-only actions never reach the List/Detail dispatch"),
             None => None,
         };
         // scan: key_event_dispatch end
@@ -1338,6 +1385,76 @@ impl App {
         if let Some(palette) = &mut self.action_palette {
             palette.paste(text, &self.document.actions);
         }
+    }
+
+    /// Every key event while the sort menu is open, dispatched through `Context::Sort` and
+    /// nothing else: `Global` is suspended there, so the menu swallows every key it does not
+    /// bind rather than letting one through to the table underneath.
+    ///
+    /// The six column keys are rows of `Context::Sort` alone. That is what lets `b`, `s`,
+    /// `n`, `d` and `a` keep every meaning they already have outside the menu, and what stops
+    /// a letter meaning "sort by name" here from reordering the table from underneath the
+    /// list when it is pressed there ([ADR
+    /// 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+    ///
+    /// Every key the menu binds closes it: a column applies its order, `0` restores the
+    /// natural grouped order, and `Esc` or `o` leaves the order exactly as it was.
+    fn handle_sort_menu_key(&mut self, key: KeyEvent) {
+        let Some(choice) = self.sort_menu_choice(key) else {
+            return;
+        };
+        self.sort_menu_open = false;
+        if let SortMenuChoice::Order(order) = choice {
+            self.reorder(order);
+        }
+    }
+
+    /// What one key press means inside the sort menu, or `None` for a key the menu binds
+    /// nothing to, which it swallows rather than passing on. The match names every action
+    /// `dispatch(Context::Sort, _)` can return, arm by arm, so an action added to that
+    /// context is a compile error here rather than an `unreachable!` on the press.
+    fn sort_menu_choice(&self, key: KeyEvent) -> Option<SortMenuChoice> {
+        match self.bindings.dispatch(Context::Sort, key) {
+            Some(Action::SortByName) => Some(self.ordered_by(SortColumn::Name)),
+            Some(Action::SortByBranch) => Some(self.ordered_by(SortColumn::Branch)),
+            Some(Action::SortBySync) => Some(self.ordered_by(SortColumn::Sync)),
+            Some(Action::SortByBase) => Some(self.ordered_by(SortColumn::Base)),
+            Some(Action::SortByDirty) => Some(self.ordered_by(SortColumn::Dirty)),
+            Some(Action::SortByState) => Some(self.ordered_by(SortColumn::State)),
+            Some(Action::SortNatural) => Some(SortMenuChoice::Order(RowOrder::Natural)),
+            Some(Action::CloseSortMenu) => Some(SortMenuChoice::Close),
+            Some(other) => unreachable!(
+                "the sort context only ever dispatches the sort menu's own actions, got \
+                 {other:?}"
+            ),
+            None => None,
+        }
+    }
+
+    /// The order choosing `column` from the menu produces, which is a reversal when it is
+    /// already the active column and that column's own natural direction otherwise
+    /// ([`RowOrder::choose`]).
+    fn ordered_by(&self, column: SortColumn) -> SortMenuChoice {
+        SortMenuChoice::Order(self.row_order.choose(column))
+    }
+
+    /// Puts the table in `order` and leaves the cursor on the row it was already on. A sort
+    /// is a pure reorder of the same rows, so a cursor that stayed at its old offset would
+    /// land on whichever row the reorder happened to move under it; the Filter's own clamp
+    /// ([`Self::follow_cursor`]) is the right answer for a view that gains and loses rows,
+    /// and the wrong one for a view that only rearranges them.
+    fn reorder(&mut self, order: RowOrder) {
+        let cursor_key = self.cursor_key();
+        self.row_order = order;
+        if let Some(key) = cursor_key {
+            let visible = self.visible_keys();
+            self.cursor = visible
+                .iter()
+                .position(|candidate| candidate == &key)
+                .unwrap_or(self.cursor)
+                .min(visible.len().saturating_sub(1));
+        }
+        self.follow_cursor();
     }
 
     /// Every key event while `self.quit_confirm` is `true`, dispatched through
@@ -2007,6 +2124,7 @@ impl App {
             self.document.show_worktrees,
             self.document.show_submodules,
             &filter,
+            self.row_order,
         )
         .into_iter()
         .map(|index| snapshot.entities[index].key.clone())
@@ -2028,6 +2146,8 @@ impl App {
     fn footer_context(&self) -> Context {
         if self.quit_confirm {
             Context::Confirm
+        } else if self.sort_menu_open {
+            Context::Sort
         } else if self.filter_line.is_some() {
             Context::Input
         } else {
@@ -2118,6 +2238,7 @@ impl App {
             self.document.show_worktrees,
             self.document.show_submodules,
             &filter,
+            self.row_order,
         )
         .into_iter()
         .map(|index| {
@@ -2503,6 +2624,7 @@ impl App {
         // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
         // `self.list` the same per-frame way as the cursor and the Filter above.
         self.list.set_selection(self.selection.clone());
+        self.list.set_row_order(self.row_order);
         // A row for the Filter line takes real height only while it is open, shifting
         // the list up ([filter.md](../../../docs/spec/filter.md)'s "one rule covers the
         // screen: a change on a mode switch takes a real row").
@@ -2967,6 +3089,8 @@ mod tests {
             quit_confirm: false,
             action_run: None,
             refresh_run: None,
+            row_order: RowOrder::default(),
+            sort_menu_open: false,
         }
     }
 
@@ -3250,6 +3374,7 @@ mod tests {
                 keys::Context::Input => keys::Context::Input,
                 keys::Context::Overlay => keys::Context::Overlay,
                 keys::Context::Confirm => keys::Context::Confirm,
+                keys::Context::Sort => keys::Context::Sort,
             };
             let warnings_before = app.current_warnings(&app.core.snapshot()).len();
 
@@ -3300,6 +3425,7 @@ mod tests {
             warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         }
     }
 
@@ -6683,6 +6809,300 @@ mod tests {
             footer::render(&app.bindings, Context::List, 80),
             "the detail footer's own content must differ from the list's, which is what a \
              hardcoded Context::List would fail to produce"
+        );
+    }
+
+    // =====================================================================================
+    // The sort menu: the mode key, the keys it swallows, and what it leaves alone
+    // (ADR 0030).
+    // =====================================================================================
+
+    /// `o` opens the menu, the footer changes to the sort context's own keys, and the table
+    /// underneath does not move until a column is picked.
+    #[test]
+    fn o_opens_the_sort_menu_and_the_table_holds_still_until_a_column_is_picked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+
+        let mut app = test_app(&root);
+        let before = app.visible_keys();
+
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("press o");
+
+        assert!(app.sort_menu_open);
+        assert_eq!(app.footer_context(), Context::Sort);
+        assert!(
+            footer::render(&app.bindings, Context::Sort, 80).contains("n name"),
+            "the footer must advertise the column keys while the menu is open"
+        );
+        assert_eq!(app.row_order, RowOrder::Natural);
+        assert_eq!(
+            app.visible_keys(),
+            before,
+            "opening the menu must reorder nothing"
+        );
+    }
+
+    /// The whole cycle in one test: a column sorts, the same key reverses, a different column
+    /// opens at its own natural direction, `0` restores the natural order, and `Esc` closes
+    /// the menu leaving the order exactly as it was.
+    #[test]
+    fn the_sort_menus_keys_choose_reverse_restore_and_cancel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+
+        let mut app = test_app(&root);
+        let natural = app.visible_keys();
+
+        press_keys(&mut app, "on");
+        assert!(!app.sort_menu_open, "picking a column closes the menu");
+        assert_eq!(
+            app.row_order,
+            RowOrder::By {
+                column: SortColumn::Name,
+                direction: crate::sort::Direction::Ascending,
+            }
+        );
+        let ascending = visible_names(&app);
+        assert_eq!(
+            ascending,
+            ["apex", "zed"],
+            "name ascending must list the rows A to Z"
+        );
+
+        press_keys(&mut app, "on");
+        assert_eq!(
+            visible_names(&app),
+            ["zed", "apex"],
+            "the same key again must reverse the rows"
+        );
+
+        press_keys(&mut app, "od");
+        assert_eq!(
+            app.row_order,
+            RowOrder::By {
+                column: SortColumn::Dirty,
+                direction: SortColumn::Dirty.natural(),
+            },
+            "a different column opens at its own natural direction"
+        );
+
+        press_keys(&mut app, "o0");
+        assert_eq!(app.row_order, RowOrder::Natural);
+        assert_eq!(app.visible_keys(), natural);
+
+        press_keys(&mut app, "on");
+        let sorted = app.row_order;
+        press_keys(&mut app, "o\u{1b}");
+        assert!(!app.sort_menu_open, "esc closes the menu");
+        assert_eq!(app.row_order, sorted, "and changes nothing about the order");
+    }
+
+    /// The display names of every visible row, in the order the table lists them.
+    fn visible_names(app: &App) -> Vec<String> {
+        let snapshot = app.core.snapshot();
+        app.visible_keys()
+            .iter()
+            .map(|key| {
+                snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| &entity.key == key)
+                    .map(|entity| entity.name.to_string())
+                    .expect("every visible key names an entity")
+            })
+            .collect()
+    }
+
+    /// Presses each character of `keys` in turn; `\u{1b}` stands for Esc.
+    fn press_keys(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            let key = if c == '\u{1b}' {
+                press(KeyCode::Esc, KeyModifiers::NONE)
+            } else {
+                press(KeyCode::Char(c), KeyModifiers::NONE)
+            };
+            app.handle_key_event(key).expect("press a sort menu key");
+        }
+    }
+
+    /// The mutation this catches: binding a column key in `Context::Global` or
+    /// `Context::List` instead of `Context::Sort`. Every letter the menu claims is checked
+    /// against the meaning it already has outside the menu, read off the compiled table
+    /// rather than restated, and no column action may be reachable from the list or the
+    /// detail pane at all.
+    #[test]
+    fn the_sort_menus_column_keys_mean_nothing_outside_the_menu() {
+        let table = BindingTable::compiled_default();
+        let column_actions = [
+            Action::SortByName,
+            Action::SortByBranch,
+            Action::SortBySync,
+            Action::SortByBase,
+            Action::SortByDirty,
+            Action::SortByState,
+            Action::SortNatural,
+        ];
+
+        for action in column_actions {
+            let (code, modifiers) = table
+                .primary_chord(Context::Sort, action)
+                .expect("every sort action is bound in the sort context");
+            for context in [
+                Context::Global,
+                Context::List,
+                Context::Detail,
+                Context::Input,
+                Context::Overlay,
+                Context::Confirm,
+            ] {
+                assert!(
+                    table.primary_chord(context, action).is_none(),
+                    "{action:?} is bound in {context:?} as well as the sort menu, so a key \
+                     outside the menu can reorder the table"
+                );
+                if matches!(context, Context::List | Context::Detail) {
+                    assert!(
+                        !column_actions.contains(
+                            &table
+                                .dispatch(context, press(code, modifiers))
+                                .unwrap_or(Action::Quit)
+                        ),
+                        "{action:?}'s chord dispatches a sort action in {context:?}, so a \
+                         stray press would reorder the table from outside the menu"
+                    );
+                }
+            }
+        }
+
+        // The meanings those same letters keep, named here because losing one of them is the
+        // other half of the same mistake: a column key that took a letter over.
+        for (letter, context, expected) in [
+            ('b', Context::List, Action::RederiveDefaultBranches),
+            ('s', Context::List, Action::OpenSetPicker),
+            ('n', Context::List, Action::NextFailed),
+            ('d', Context::List, Action::DismissVanished),
+            ('a', Context::List, Action::SelectAllVisible),
+            ('0', Context::List, Action::Quit),
+        ] {
+            let dispatched =
+                table.dispatch(context, press(KeyCode::Char(letter), KeyModifiers::NONE));
+            if letter == '0' {
+                assert_eq!(
+                    dispatched, None,
+                    "`0` is bound in the sort context alone and must stay unbound in {context:?}"
+                );
+            } else {
+                assert_eq!(
+                    dispatched,
+                    Some(expected),
+                    "`{letter}` must keep the meaning it already had in {context:?}"
+                );
+            }
+        }
+    }
+
+    /// A sort is view state, not a reading: it must outlive everything that recomputes the
+    /// table. `r` and `R` start a Generation, and a Filter narrows and widens the row set;
+    /// none of the three touches the order.
+    #[test]
+    fn a_sort_survives_a_refresh_and_a_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+
+        let mut app = test_app(&root);
+        press_keys(&mut app, "on");
+        let sorted = app.row_order;
+        let order = app.visible_keys();
+
+        for key in [
+            press(KeyCode::Char('r'), KeyModifiers::NONE),
+            press(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        ] {
+            app.handle_key_event(key).expect("refresh");
+            assert_eq!(app.row_order, sorted, "a refresh must not reset the order");
+        }
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+        for c in "zed".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the filter");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(
+            app.row_order, sorted,
+            "committing a Filter must not reset it"
+        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear the filter");
+        assert_eq!(app.row_order, sorted, "and neither must clearing one");
+        assert_eq!(app.visible_keys(), order);
+    }
+
+    /// The cursor stays on the row it was on. A sort is a pure reorder of the same rows, so
+    /// a cursor left at its old offset would land on whichever row the reorder moved under
+    /// it, which is a different defect from the Filter's own clamp.
+    #[test]
+    fn sorting_leaves_the_cursor_on_the_row_it_was_already_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+
+        let mut app = test_app(&root);
+        let cursor_key = app.cursor_key().expect("a row under the cursor");
+
+        press_keys(&mut app, "on");
+
+        assert_eq!(app.cursor_key(), Some(cursor_key));
+    }
+
+    /// Every action `dispatch(Context::Sort, _)` can return is named arm by arm in the sort
+    /// menu's own handler, so an action joining that context's vocabulary is a red test
+    /// rather than a runtime `unreachable!` on the key press. The same shape
+    /// `every_input_handler_names_every_action_the_input_context_dispatches` uses, and the
+    /// same reason: the handler's trailing catch-all compiles whatever the vocabulary
+    /// becomes.
+    #[test]
+    fn the_sort_menu_handler_names_every_action_the_sort_context_dispatches() {
+        let vocabulary = crate::keys::action_names_bound_in(Context::Sort);
+        assert!(
+            !vocabulary.is_empty(),
+            "the sort context binds nothing, so this test read an empty table"
+        );
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut handlers = 0usize;
+        for path in crate::test_support::production_rust_source_files(&manifest_dir.join("src")) {
+            let source = production_source_at(&path);
+            for block in crate::test_support::match_blocks_over(&source, "dispatch(Context::Sort") {
+                handlers += 1;
+                let named = match_arm_patterns(&block).join(" ");
+                for action in &vocabulary {
+                    assert!(
+                        named.contains(&format!("Action::{action}")),
+                        "{}'s sort handler has no arm whose pattern names \
+                         `Action::{action}`, which `dispatch(Context::Sort, _)` can return. \
+                         Its arms match {named}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            handlers, 1,
+            "expected the sort menu to be the one handler dispatching through the sort \
+             context, found {handlers}"
         );
     }
 

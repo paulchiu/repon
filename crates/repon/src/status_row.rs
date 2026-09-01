@@ -7,6 +7,10 @@
 //! [0027](../../../../docs/adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md).
 //! `crate::app` decides whether a live Notice pre-empts this module's whole row; this module
 //! owns only the row's other shape, the one list under one drop table.
+//!
+//! Every item's [`Priority::Drop`] is `9` less its published rank, this module's own four and
+//! [`crate::header::trailing_items`]'s four alike, so a rank read off the spec's table is the
+//! number in the code with no second mapping to keep in step.
 
 use std::fmt;
 
@@ -33,6 +37,10 @@ pub(crate) struct StatusRowContent<'a> {
     pub(crate) warnings: &'a [Warning],
     pub(crate) acknowledged: &'a [Warning],
     pub(crate) refresh: Option<RefreshRowContent>,
+    /// How the table is ordered, already rendered
+    /// ([`crate::sort::RowOrder::label`]), or `None` in the natural grouped order, which is
+    /// the absence of a sort rather than a sort with nothing to say.
+    pub(crate) sort: Option<String>,
 }
 
 /// Which Refresh the refresh key dispatched: every known Entity (`Action::RefreshAll`, `r`
@@ -88,7 +96,7 @@ fn message_item(
     }
     warnings::slot_line(warnings, bindings).map(|content| degrade::Item {
         content,
-        priority: Priority::Drop(6),
+        priority: Priority::Drop(7),
     })
 }
 
@@ -115,6 +123,18 @@ fn refresh_item(refresh: Option<&RefreshRowContent>) -> Option<degrade::Item<Str
     };
     Some(degrade::Item {
         content: format!("{verb} {scope} {}", refresh.entity_count),
+        priority: Priority::Drop(6),
+    })
+}
+
+/// Rank 4: the order the table is in, present only while the user has chosen one, in words
+/// rather than the header's own arrow so it stays legible on a frame too narrow to show the
+/// sorted column at all. It ranks below rank 3 because this row is the sort's second witness
+/// and the Refresh's only one: the sorted column's header carries an arrow of its own
+/// ([0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+fn sort_item(sort: Option<&String>) -> Option<degrade::Item<String>> {
+    sort.map(|content| degrade::Item {
+        content: content.clone(),
         priority: Priority::Drop(5),
     })
 }
@@ -168,6 +188,7 @@ pub(crate) fn render(
         bindings,
     ));
     items.extend(refresh_item(content.refresh.as_ref()));
+    items.extend(sort_item(content.sort.as_ref()));
     items.extend(header::trailing_items(&content.header));
 
     let rest =
@@ -253,6 +274,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         // "work 403 entities" alone is 17 columns, wider than this width; even the reserved
         // indicator's own budget leaves nothing for it.
@@ -277,6 +299,7 @@ mod tests {
                 warnings: &no_warnings,
                 acknowledged: &[],
                 refresh: None,
+                sort: None,
             },
             &bindings(),
             width,
@@ -294,6 +317,7 @@ mod tests {
                 warnings: &one_warning,
                 acknowledged: &one_warning,
                 refresh: None,
+                sort: None,
             },
             &bindings(),
             width,
@@ -323,6 +347,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         let acknowledged = StatusRowContent {
             set_name: "work",
@@ -330,6 +355,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &warnings,
             refresh: None,
+            sort: None,
         };
 
         let before = render(&unacknowledged, &bindings(), 88).to_string();
@@ -362,6 +388,7 @@ mod tests {
             warnings: &seen,
             acknowledged: &seen,
             refresh: None,
+            sort: None,
         };
         let after_a_new_condition_arrives = StatusRowContent {
             set_name: "work",
@@ -369,6 +396,7 @@ mod tests {
             warnings: &now_outstanding,
             acknowledged: &seen,
             refresh: None,
+            sort: None,
         };
 
         let before = render(&acknowledged_before_the_new_one_arrived, &bindings(), 150).to_string();
@@ -409,6 +437,7 @@ mod tests {
             warnings: &[],
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         // Wide enough that a name cut to some short prefix (a truncating implementation's
         // typical failure mode) would still fit; the real 60-`x` name must not.
@@ -432,6 +461,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         // Wide enough for the indicator and rank 1, far too narrow for the 200-column message.
         let rendered = render(&content, &bindings(), 25).to_string();
@@ -519,6 +549,38 @@ mod tests {
             .unwrap_or_else(|_| panic!("read docs/spec/{name}"))
     }
 
+    /// The sort names itself in words, so an order survives a frame too narrow to show the
+    /// column carrying its arrow. Absent in the natural order, which is the absence of a
+    /// sort rather than a sort with nothing to say, and costs no columns there.
+    #[test]
+    fn the_status_row_names_the_sort_in_text_and_says_nothing_in_the_natural_order() {
+        let bindings = bindings();
+        let sorted = StatusRowContent {
+            set_name: "work",
+            header: empty_header(),
+            warnings: &[],
+            acknowledged: &[],
+            refresh: None,
+            sort: Some("sort dirty \u{2193}".to_string()),
+        };
+        let rendered = render(&sorted, &bindings, 160).to_string();
+        assert!(
+            rendered.contains("sort dirty \u{2193}"),
+            "expected the sort named on the row, got {rendered:?}"
+        );
+
+        let natural = StatusRowContent {
+            sort: None,
+            ..sorted
+        };
+        assert!(
+            !render(&natural, &bindings, 160)
+                .to_string()
+                .contains("sort"),
+            "the natural order must spend no columns on a sort item"
+        );
+    }
+
     /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)'s
     /// own worked example: one warning outstanding and unacknowledged, a run in flight, so
     /// every item is live.
@@ -539,6 +601,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         let bindings = bindings();
         for (width, expected) in rows {
@@ -573,6 +636,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &warnings,
             refresh: None,
+            sort: None,
         };
         let bindings = bindings();
 
@@ -592,6 +656,40 @@ mod tests {
 
     // --- criterion: the refresh item has a spec'd rank and drops by the same rule as
     // everything else on the row ---
+
+    /// The two items that both landed on this row at once, ranked deliberately rather than
+    /// by whichever arrived first: the sort drops before the Refresh's state, because a
+    /// Refresh has no other surface on the screen and a sort still has its own header arrow.
+    /// A renumbering that swapped them fails here.
+    #[test]
+    fn the_sort_drops_before_the_refreshes_own_state() {
+        let content = StatusRowContent {
+            set_name: "work",
+            header: empty_header(),
+            warnings: &[],
+            acknowledged: &[],
+            refresh: Some(RefreshRowContent {
+                scope: RefreshScope::All,
+                entity_count: 403,
+                running: true,
+            }),
+            sort: Some("sort dirty \u{2193}".to_string()),
+        };
+        let bindings = bindings();
+
+        let full = render(&content, &bindings, 999).to_string();
+        assert!(full.contains("refreshing all 403") && full.contains("sort dirty"));
+
+        let narrowed = render(&content, &bindings, full.chars().count() as u16 - 1).to_string();
+        assert!(
+            !narrowed.contains("sort dirty"),
+            "the sort must be the first of the two to go, got {narrowed:?}"
+        );
+        assert!(
+            narrowed.contains("refreshing all 403"),
+            "and the Refresh's own state must outlast it, got {narrowed:?}"
+        );
+    }
 
     /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)'s
     /// own worked example for rank 3: one warning outstanding and unacknowledged, a Refresh
@@ -617,6 +715,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: Some(refresh),
+            sort: None,
         };
         let bindings = bindings();
         for (width, expected) in rows {
@@ -646,6 +745,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: Some(refresh),
+            sort: None,
         };
         let bindings = bindings();
         // One column narrower than the full line: only the least-priority survivor may
@@ -675,6 +775,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 3);
@@ -699,6 +800,7 @@ mod tests {
             warnings: &warnings,
             acknowledged: &[],
             refresh: None,
+            sort: None,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 1);

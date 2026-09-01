@@ -23,6 +23,7 @@ use crate::{
     config::Config,
     glyphs::{BorderScratch, FULL_SPINNER_INTERVAL, GlyphSet},
     selection::Selection,
+    sort::{RowOrder, SortColumn, order_candidates},
     theme::{self, Meaning, Role, Theme},
 };
 
@@ -61,7 +62,7 @@ const BRANCH_CELL_OBJECT_ID_WIDTH: usize = 9;
 /// puts between every column, gutter included.
 const GAP: u16 = 1;
 
-/// Shown in place of the row list once `row_order` is empty and no Filter is narrowing the
+/// Shown in place of the row list once the visible row list is empty and no Filter is narrowing the
 /// view: nothing was discovered, rather than everything being filtered out
 /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "An empty result says so rather
 /// than rendering blank", which both palettes already follow for their own empty state).
@@ -180,6 +181,20 @@ impl Columns {
         }
     }
 
+    /// Where `column` sits on this frame. The one place a [`SortColumn`] becomes a position,
+    /// so the header, the arrow and the cells can never disagree about which column a sort
+    /// key names. Exhaustive, so a seventh sortable column has to be placed here.
+    fn for_sort_column(self, column: SortColumn) -> Column {
+        match column {
+            SortColumn::Name => self.name,
+            SortColumn::Branch => self.branch,
+            SortColumn::Sync => self.sync,
+            SortColumn::Base => self.base,
+            SortColumn::Dirty => self.dirty,
+            SortColumn::State => self.state,
+        }
+    }
+
     /// A child row's own name text budget on this frame: the name column's width less the
     /// indent, marker and gap its prefix spends, so a grown name column widens child names
     /// by exactly what it widens top-level ones.
@@ -230,9 +245,10 @@ pub struct List {
     /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
     /// every row) until one arrives, which is every unit test in this module.
     filter: Filter,
-    /// The cursor's offset into `row_order`, handed in every frame ([`Self::set_cursor`]).
+    /// The cursor's offset into the visible row list, handed in every frame
+    /// ([`Self::set_cursor`]).
     cursor: usize,
-    /// How many leading rows of `row_order` this draw skips, handed in every frame by
+    /// How many leading rows of the visible row list this draw skips, handed in every frame by
     /// [`crate::app::App::render`] ([`Self::set_offset`]) the same way `filter` is: `App`
     /// owns the viewport math ([`crate::list_viewport::offset_following_cursor`]); this
     /// component only draws the window it is told. Clamped against the real row count inside
@@ -247,6 +263,10 @@ pub struct List {
     /// something a config handshake carries. Marked with [`Theme::checked_style`]
     /// (theming.md's "The Selection").
     selection: Selection,
+    /// The order this draw lists rows in, handed in every frame ([`Self::set_row_order`]) the
+    /// same way `filter` is: the order is session state a keystroke sets, not a config field
+    /// ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+    row_order: RowOrder,
 }
 
 impl Default for List {
@@ -261,6 +281,7 @@ impl Default for List {
             offset: 0,
             theme: Theme::default(),
             selection: Selection::default(),
+            row_order: RowOrder::default(),
         }
     }
 }
@@ -292,12 +313,13 @@ impl List {
             self.started_at.elapsed(),
         );
         // Computed ahead of the block below so the bottom border's own position counter can
-        // read `row_order.len()` before the block is built, rather than after.
-        let row_order = visible_row_order(
+        // read the row count before the block is built, rather than after.
+        let visible_rows = visible_row_order(
             &snapshot.entities,
             self.show_worktrees,
             self.show_submodules,
             &self.filter,
+            self.row_order,
         );
 
         // `Component::draw`'s own doc comment: focus is communicated by border colour
@@ -315,7 +337,7 @@ impl List {
             // Drops the mockup's "(enter opens detail)": no detail pane exists yet to open.
             .title(" repos ");
         if let Some(counter) =
-            position_counter(row_order.len(), self.cursor, self.selection.count())
+            position_counter(visible_rows.len(), self.cursor, self.selection.count())
         {
             block = block.title_bottom(ratatui::text::Line::from(counter).right_aligned());
         }
@@ -330,9 +352,9 @@ impl List {
         // from its own narrow interior, which leaves no slack and so keeps every minimum.
         let columns = Columns::for_interior_width(interior.width);
         if !compact {
-            draw_header(buf, interior, columns, &self.theme);
+            draw_header(buf, interior, columns, &self.theme, self.row_order, glyphs);
         }
-        if row_order.is_empty() {
+        if visible_rows.is_empty() {
             // Nothing to draw below the header: say so rather than leaving a bordered box
             // with no rows, indistinguishable from a hang. Which sentence depends on whether
             // a Filter is the reason nothing is showing.
@@ -356,9 +378,9 @@ impl List {
         }
         // Clamped against the real row count rather than trusted as-is: a stale `self.offset`
         // (computed against a wider table, before a filter narrowed this one) must never
-        // blank the list, so this stops one row short of `row_order.len()` rather than at it,
+        // blank the list, so this stops one row short of the row count rather than at it,
         // leaving at least the last row drawn whenever there is any row at all.
-        let skip = row_order.len().saturating_sub(1).min(self.offset);
+        let skip = visible_rows.len().saturating_sub(1).min(self.offset);
         let cursor_screen_row = self.cursor_screen_row(skip);
         let ctx = RowContext {
             glyphs,
@@ -366,7 +388,7 @@ impl List {
             theme: &self.theme,
             columns,
         };
-        for (screen_row, entity) in row_order
+        for (screen_row, entity) in visible_rows
             .into_iter()
             .skip(skip)
             .map(|index| &snapshot.entities[index])
@@ -485,6 +507,12 @@ impl List {
     /// the cursor or the Filter changing at all.
     pub(crate) fn set_selection(&mut self, selection: Selection) {
         self.selection = selection;
+    }
+
+    /// Hands this draw the order the table is in, read fresh every frame the same way
+    /// [`Self::set_filter`] is: the sort menu can change it between two keystrokes.
+    pub(crate) fn set_row_order(&mut self, order: RowOrder) {
+        self.row_order = order;
     }
 }
 
@@ -659,6 +687,11 @@ pub(crate) fn kind_is_visible(
 /// Shared by [`List::render`] and `crate::app::App::visible_keys` so the two can never
 /// disagree about which rows exist or what order they come in.
 ///
+/// `order` is applied between the two, over the flat candidate list
+/// ([`order_candidates`]): grouping then walks the Repos in that order and each Repo's own
+/// children in that order, so a sort reorders Repos among themselves and each Repo's
+/// Worktrees and Submodules within that Repo, and a child never leaves its parent.
+///
 /// Narrowing happens first and grouping runs over whatever survives, whether a row is
 /// dropped by the Filter or by a preference: a non-matching parent is never dragged in as
 /// context ([filter.md](../../../../docs/spec/filter.md)'s "What a Filter does to the
@@ -671,14 +704,16 @@ pub(crate) fn visible_row_order(
     show_worktrees: bool,
     show_submodules: bool,
     filter: &Filter,
+    order: RowOrder,
 ) -> Vec<usize> {
-    let candidates: Vec<usize> = (0..entities.len())
+    let mut candidates: Vec<usize> = (0..entities.len())
         .filter(|&index| {
             let entity = &entities[index];
             kind_is_visible(entity.kind, show_worktrees, show_submodules, filter)
                 && filter.matches(entity)
         })
         .collect();
+    order_candidates(entities, &mut candidates, order);
     grouped_row_order(entities, &candidates)
 }
 
@@ -833,36 +868,36 @@ fn draw_name_cell(
     );
 }
 
-fn draw_header(buf: &mut Buffer, interior: Rect, columns: Columns, theme: &Theme) {
+/// Draws the header row: each column's label at that column's own start, the sorted column's
+/// carrying `order`'s arrow and no other one carrying a glyph at all. The arrow is appended
+/// with no space before it, because `base` and `dirty` are six columns wide and `dirty ↓` is
+/// seven: one spacing rule that fits every column beats a space that silently costs the two
+/// narrowest columns their arrow.
+fn draw_header(
+    buf: &mut Buffer,
+    interior: Rect,
+    columns: Columns,
+    theme: &Theme,
+    order: RowOrder,
+    glyphs: &'static GlyphSet,
+) {
     let y = interior.y + HEADER_ROW;
     // A column header is `dim` per theming.md's meaning-to-role map, a foreground colour
     // rather than the DIM text attribute this used to draw with.
     let style = theme.style_for(theme::Role::Dim);
-    // Destructured rather than reached into field by field, so a seventh column has to be
-    // named here rather than quietly going unlabelled.
-    let Columns {
-        name,
-        branch,
-        sync,
-        base,
-        dirty,
-        state,
-    } = columns;
-    for (column, label) in [
-        (name, "name"),
-        (branch, "branch"),
-        (sync, "sync"),
-        (base, "base"),
-        (dirty, "dirty"),
-        (state, "state"),
-    ] {
+    for sort_column in SortColumn::ALL {
+        let column = columns.for_sort_column(sort_column);
+        let label = match order.arrow_for(sort_column, glyphs) {
+            Some(arrow) => format!("{}{arrow}", sort_column.label()),
+            None => sort_column.label().to_string(),
+        };
         write_cell(
             buf,
             interior,
             interior.x + column.x,
             y,
             column.width,
-            label,
+            &label,
             style,
         );
     }
@@ -1180,18 +1215,22 @@ fn cell_role<T>(
 /// measured and rejected in the same ADR; no such recovery exists anywhere in this
 /// workspace.
 fn format_head(cell: &Cell<Head>, loading_glyph: Option<char>) -> String {
-    render_cell(
-        cell.settled(),
-        |value| match value {
-            Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
-            Head::Detached(oid) => oid
-                .to_string()
-                .chars()
-                .take(BRANCH_CELL_OBJECT_ID_WIDTH)
-                .collect(),
-        },
-        loading_glyph,
-    )
+    render_cell(cell.settled(), head_text, loading_glyph)
+}
+
+/// The branch cell's own text for a settled [`Head`], apart from the provenance
+/// [`format_head`] wraps it in. Its own function so `branch`'s sort key
+/// ([`crate::sort`]) orders rows by the text this cell draws rather than by a second reading
+/// of the same value.
+pub(crate) fn head_text(value: &Head) -> String {
+    match value {
+        Head::Branch { name, .. } | Head::Unborn(name) => name.to_string(),
+        Head::Detached(oid) => oid
+            .to_string()
+            .chars()
+            .take(BRANCH_CELL_OBJECT_ID_WIDTH)
+            .collect(),
+    }
 }
 
 /// `sync`'s glyph, split into its own ordered runs before they are joined: one run for every
@@ -2289,6 +2328,57 @@ mod tests {
         assert_eq!(cell_text(buf, 132, 1, 4), "base");
         assert_eq!(cell_text(buf, 139, 1, 5), "dirty");
         assert_eq!(cell_text(buf, 146, 1, 5), "state");
+    }
+
+    /// The sorted column's header carries the arrow and no other header carries a glyph,
+    /// at the narrowest frame the table draws: `base` and `dirty` are six columns wide, so
+    /// this is where a space before the arrow would silently cost them theirs.
+    #[test]
+    fn only_the_sorted_columns_header_carries_the_arrow() {
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        // `(x, width, label)` for each column, at the 94-column frame's own literal offsets.
+        let columns = [
+            (5u16, 6u16, SortColumn::Name),
+            (34, 8, SortColumn::Branch),
+            (59, 6, SortColumn::Sync),
+            (69, 6, SortColumn::Base),
+            (76, 6, SortColumn::Dirty),
+            (83, 7, SortColumn::State),
+        ];
+
+        for sorted in SortColumn::ALL {
+            let order = RowOrder::default().choose(sorted);
+            let mut list = List::default();
+            list.set_row_order(order);
+            let terminal = render_with_list(&mut list, 94, 24, &snapshot(vec![]));
+            let buf = terminal.backend().buffer();
+            let arrow = order
+                .arrow_for(sorted, glyphs)
+                .expect("the sorted column carries an arrow");
+
+            for (x, width, column) in columns {
+                let drawn = cell_text(buf, x, 1, width);
+                let expected = if column == sorted {
+                    format!("{}{arrow}", column.label())
+                } else {
+                    column.label().to_string()
+                };
+                assert_eq!(
+                    drawn.trim_end(),
+                    expected,
+                    "sorted by {sorted:?}, {column:?}'s header drew {drawn:?}"
+                );
+            }
+        }
+    }
+
+    /// The natural order is the absence of a sort, so no header carries a glyph at all.
+    #[test]
+    fn the_natural_order_leaves_every_header_bare() {
+        let terminal = render(94, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+        assert_eq!(cell_text(buf, 76, 1, 6).trim_end(), "dirty");
+        assert_eq!(cell_text(buf, 83, 1, 7).trim_end(), "state");
     }
 
     #[test]
@@ -3711,6 +3801,94 @@ mod tests {
         );
     }
 
+    /// The invariant a sort must not break, and the reason `order_candidates` runs over the
+    /// flat candidate list rather than over the finished table: sorting reorders the Repos
+    /// among themselves and each Repo's own children within that Repo, and a Worktree never
+    /// leaves its parent. Every column and both directions, over a list whose Repos and
+    /// children are deliberately interleaved so a flattened answer is visibly different from
+    /// a grouped one.
+    #[test]
+    fn a_sort_reorders_within_each_group_and_never_flattens_them() {
+        let entities = vec![
+            entity_of_kind("zed-worktree", Kind::Worktree, "/zed"),
+            entity_of_kind("apex", Kind::Repo, "/apex"),
+            entity_of_kind("apex-worktree-z", Kind::Worktree, "/apex"),
+            entity_of_kind("zed", Kind::Repo, "/zed"),
+            entity_of_kind("apex-worktree-a", Kind::Worktree, "/apex"),
+        ];
+        let filter = Filter::default();
+
+        for column in SortColumn::ALL {
+            let natural = RowOrder::default().choose(column);
+            for order in [natural, natural.choose(column)] {
+                let rows: Vec<&EntityState> =
+                    visible_row_order(&entities, true, true, &filter, order)
+                        .into_iter()
+                        .map(|index| &entities[index])
+                        .collect();
+                let names: Vec<&str> = rows.iter().map(|row| row.name.as_ref()).collect();
+                assert_eq!(
+                    rows.len(),
+                    entities.len(),
+                    "{order:?} lost a row: {names:?}"
+                );
+
+                // Each Repo opens its own run and every row after it, up to the next Repo,
+                // shares its common dir: one pass proves both that the groups are contiguous
+                // and that no child outlives its parent.
+                let mut group: Option<&Path> = None;
+                for row in &rows {
+                    match row.kind {
+                        Kind::Repo => group = Some(&row.common_dir),
+                        _ => assert_eq!(
+                            Some(group_key(row)),
+                            group,
+                            "{order:?} put {:?} outside its own Repo's group: {names:?}",
+                            row.name
+                        ),
+                    }
+                }
+                assert_eq!(
+                    rows.iter().filter(|row| row.kind == Kind::Repo).count(),
+                    2,
+                    "{order:?} lost a Repo: {names:?}"
+                );
+            }
+        }
+    }
+
+    /// Name ascending puts `apex` ahead of `zed`, and each Repo's own Worktrees are sorted
+    /// inside that Repo rather than joining one flat list: the exact order, written out, so a
+    /// comparator that ordered the whole table flat and then regrouped, or one that sorted
+    /// the Repos and left the children alone, fails here rather than passing the invariant
+    /// check above.
+    #[test]
+    fn a_name_sort_orders_the_repos_and_each_repos_own_children() {
+        let entities = vec![
+            entity_of_kind("zed-worktree", Kind::Worktree, "/zed"),
+            entity_of_kind("apex", Kind::Repo, "/apex"),
+            entity_of_kind("apex-worktree-z", Kind::Worktree, "/apex"),
+            entity_of_kind("zed", Kind::Repo, "/zed"),
+            entity_of_kind("apex-worktree-a", Kind::Worktree, "/apex"),
+        ];
+        let order = RowOrder::default().choose(SortColumn::Name);
+        let names: Vec<&str> = visible_row_order(&entities, true, true, &Filter::default(), order)
+            .into_iter()
+            .map(|index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "apex",
+                "apex-worktree-a",
+                "apex-worktree-z",
+                "zed",
+                "zed-worktree"
+            ]
+        );
+    }
+
     /// The orphan branch, which the grouping test above never reaches:
     /// `layout-and-provenance.md` says a child whose parent is absent is appended rather
     /// than dropped, so the row count must survive a list with no Repo in it at all.
@@ -3766,7 +3944,7 @@ mod tests {
             );
         }
 
-        let visible = visible_row_order(&entities, true, true, &filter);
+        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
         let unfiltered = grouped_row_order(&entities, &every_index(&entities));
 
         assert_eq!(
@@ -3790,7 +3968,7 @@ mod tests {
         ];
         let filter = Filter::parse("worktree");
 
-        let visible = visible_row_order(&entities, true, true, &filter);
+        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
 
         assert_eq!(
             visible,
@@ -3814,7 +3992,7 @@ mod tests {
         ];
         let filter = Filter::parse("keep");
 
-        let visible = visible_row_order(&entities, true, true, &filter);
+        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -3848,7 +4026,7 @@ mod tests {
             "fixture's own filter must be active, or this proves nothing"
         );
 
-        let visible = visible_row_order(&entities, false, true, &filter);
+        let visible = visible_row_order(&entities, false, true, &filter, RowOrder::Natural);
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -4917,7 +5095,7 @@ mod tests {
         let (snapshot, _ids) = settled_snapshot_for_the_head_shape_matrix();
         let filter = Filter::parse("head:detached");
 
-        let visible = visible_row_order(&snapshot.entities, true, true, &filter);
+        let visible = visible_row_order(&snapshot.entities, true, true, &filter, RowOrder::Natural);
         let names: std::collections::BTreeSet<&str> = visible
             .iter()
             .map(|&index| snapshot.entities[index].name.as_ref())

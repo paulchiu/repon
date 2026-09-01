@@ -209,6 +209,23 @@ impl<T> Default for Cell<T> {
 }
 
 impl<T> Cell<T> {
+    /// A Cell already in `settled`, with nothing in flight against it.
+    ///
+    /// `settle` is every real writer's way in, and it is `pub(crate)` because only a
+    /// probe's result may reach a Cell in production. This exists so a consumer's own
+    /// test can build a table of settled values without running a probe against a real
+    /// repository, and is gated behind `test-util` (on by default under `cfg(test)` for
+    /// this crate's own tests) so it never ships on the default published surface, per
+    /// [ADR 0021](https://github.com/paulchiu/repon/blob/main/docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn already_settled(settled: Settled<T>) -> Self {
+        Cell {
+            settled: Some(settled),
+            in_flight: false,
+            generation: Generation::default(),
+        }
+    }
+
     /// The settled state, or `None` while absent (loading, or never yet probed).
     /// The only way to a `T`.
     pub fn settled(&self) -> Option<&Settled<T>> {

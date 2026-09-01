@@ -153,8 +153,11 @@ One switch, two vetted sets, no way to mix them:
 | child row | `└` | `` ` `` |
 | checked (the Selection's own marker) | `✓` | `+` |
 | truncated name | `$` | `$` |
+| sort arrow (ascending, descending) | `↑↓` | `^v` |
 | panel border | `╭╮╰╯─│` | `+ + + + - |` |
 | capture elision | `···` | `...` |
+
+The sort arrow is the one row of that table outside the row interior, alongside the panel border and the capture elision, so it is exempt from the disjointness obligation below and the help overlay's own legend does not carry it. Under `full` it is deliberately the same `↑` and `↓` the ahead and behind counts already use: a header arrow sits against a column label rather than inside a row, and reading it as a count would mean reading the header as a row. Under `ascii` the pair is `^` and `v`, since `>` and `<` are already ahead and behind there. [layout-and-provenance.md](layout-and-provenance.md#the-order-the-user-chooses) fixes where it is drawn.
 
 The same screen, [head.md](head.md)'s, under each setting. Every line is exactly 94 columns, none of these rows checked, so the Selection's own marker column sits blank throughout.
 
