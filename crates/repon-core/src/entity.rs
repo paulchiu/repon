@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cell::{Cell, Generation, Settled, Timestamp};
+use crate::cell::{Cell, Generation, Settled, Timestamp, Unknown};
 use crate::default_branch;
 use crate::git::{InProgressOperation, RecentCommit};
 
@@ -508,14 +508,18 @@ impl EntityState {
     /// A freshly discovered Entity: every Cell unset, Present, no last run.
     ///
     /// A Submodule is constructed with `state` and `base` already
-    /// [`Settled::NotApplicable`], because its default branch is known-wrong with
-    /// no local detector, so a proof computed against it would be a confident lie.
-    /// A Repo is constructed with `state` already `NotApplicable` too: the four
-    /// Worktree states describe a Worktree's own branch, and a Repo row has none
-    /// to describe, by kind rather than by HEAD's shape. Leaving `state` unset
-    /// instead would fold the row to Unknown rather than excluding the cell, which
-    /// is what would put a question mark in the gutter of every Repo row on
-    /// screen.
+    /// `Unknown(NoDefaultBranch)`: [ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)
+    /// records that population's default branch as known-wrong with no local
+    /// detector, so a proof computed against it would be a confident lie, and
+    /// that is a question with an answer Repon cannot stand behind rather than a
+    /// question with no meaning on the row
+    /// (see [ADR 0017](https://github.com/paulchiu/repon/blob/main/docs/adr/0017-discovery-stops-at-the-repo-boundary.md),
+    /// as amended). A Repo is constructed with `state` already
+    /// `NotApplicable`: the four Worktree states describe a Worktree's own
+    /// branch, and a Repo row has none to describe, by kind rather than by HEAD's
+    /// shape. Leaving `state` unset instead would fold the row to Unknown rather
+    /// than excluding the cell, which is what would put a question mark in the
+    /// gutter of every Repo row on screen.
     pub fn new(key: EntityKey, name: Arc<str>, common_dir: Arc<Path>, kind: Kind) -> Self {
         let mut entity = EntityState {
             key,
@@ -536,15 +540,20 @@ impl EntityState {
             recent_commits: Vec::new(),
         };
 
-        if matches!(entity.kind, Kind::Submodule | Kind::Repo) {
+        if matches!(entity.kind, Kind::Repo) {
             entity
                 .state
                 .settle(Generation::default(), Settled::NotApplicable);
         }
         if matches!(entity.kind, Kind::Submodule) {
-            entity
-                .base
-                .settle(Generation::default(), Settled::NotApplicable);
+            entity.state.settle(
+                Generation::default(),
+                Settled::Unknown(Unknown::NoDefaultBranch),
+            );
+            entity.base.settle(
+                Generation::default(),
+                Settled::Unknown(Unknown::NoDefaultBranch),
+            );
         }
 
         entity
@@ -596,24 +605,32 @@ impl EntityState {
         applied
     }
 
-    /// Whether this Entity's `state` cell is ever (re)probed: `false` once
-    /// construction has settled it `NotApplicable` (a Repo or a Submodule),
-    /// `true` for a Worktree. Reads the cell itself rather than re-deriving the
-    /// rule from `kind`, so [`EntityState::new`] stays the one place that
-    /// decides it.
+    /// Whether this Entity's `state` cell is ever (re)probed: `false` for a Repo,
+    /// whose `state` construction settled `NotApplicable`, and `false` for a
+    /// Submodule too, even though construction settled its `state` `Unknown`
+    /// rather than `NotApplicable`: a Submodule's default branch has no local
+    /// detector for the confident-wrong case
+    /// ([ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)),
+    /// so re-probing could settle a confident lie even on a Generation where the
+    /// entity's own `default_branch` cell happens to resolve. `true` for a
+    /// Worktree. `kind` is checked explicitly here rather than read off the
+    /// cell's own settled state, because `Unknown` is also the shape a Worktree's
+    /// `state` legitimately settles to (its own default branch unresolved) and
+    /// must go on being re-probed.
     pub(crate) fn probes_state(&self) -> bool {
-        !matches!(self.state.settled(), Some(Settled::NotApplicable))
+        !matches!(self.kind, Kind::Submodule)
+            && !matches!(self.state.settled(), Some(Settled::NotApplicable))
     }
 
-    /// Whether this Entity's `base` cell is ever (re)probed: `false` once construction
-    /// has settled it `NotApplicable` (a Submodule; its default branch is
-    /// known-wrong with no local detector, per
-    /// [ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md),
-    /// so a count computed against it would be a confident lie), `true` for a Repo
-    /// or a Worktree. The same reasoning as [`Self::probes_state`], reading the
-    /// cell itself rather than re-deriving the rule from `kind`.
+    /// Whether this Entity's `base` cell is ever (re)probed: `false` for a
+    /// Submodule, for the same reason and by the same `kind` check as
+    /// [`Self::probes_state`]. Otherwise unchanged: `true` for a Repo or a
+    /// Worktree until `base` itself settles `NotApplicable` (a row on its own
+    /// default branch, or a Repo with no remote), the same as before this
+    /// method also checked `kind`.
     pub(crate) fn probes_base(&self) -> bool {
-        !matches!(self.base.settled(), Some(Settled::NotApplicable))
+        !matches!(self.kind, Kind::Submodule)
+            && !matches!(self.base.settled(), Some(Settled::NotApplicable))
     }
 
     /// Marks this Entity Vanished: it stays in the table with its last known
@@ -722,8 +739,13 @@ mod tests {
         EntityKey::new(Arc::from(Path::new(path)))
     }
 
+    /// [ADR 0017](https://github.com/paulchiu/repon/blob/main/docs/adr/0017-discovery-stops-at-the-repo-boundary.md),
+    /// as amended: a Submodule's default branch has no local detector for its
+    /// known-wrong case, so a proof against it would be a confident lie. That is
+    /// a question with an answer Repon cannot stand behind, `Unknown`, not a
+    /// question with no meaning on the row, `NotApplicable`.
     #[test]
-    fn a_submodule_is_constructed_with_state_and_base_not_applicable() {
+    fn a_submodule_is_constructed_with_state_and_base_unknown() {
         let entity = EntityState::new(
             key("/repo/vendor/lib"),
             Arc::from("lib"),
@@ -733,19 +755,20 @@ mod tests {
 
         assert!(matches!(
             entity.state.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
         assert!(matches!(
             entity.base.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
     }
 
-    /// The third named producer of `NotApplicable`, alongside the Submodule rule
-    /// and the two `base` exemptions: Worktree state describes a Worktree's own
-    /// branch, and a Repo row has none, by kind rather than by HEAD's shape. Left
-    /// unset instead, the cell would fold to Unknown rather than being excluded,
-    /// putting a question mark in the gutter of every Repo row on screen.
+    /// One of `NotApplicable`'s named producers, alongside the two `base`
+    /// exemptions [`crate::cell::Settled`] documents: Worktree state describes a
+    /// Worktree's own branch, and a Repo row has none, by kind rather than by
+    /// HEAD's shape. Left unset instead, the cell would fold to Unknown rather
+    /// than being excluded, putting a question mark in the gutter of every Repo
+    /// row on screen.
     #[test]
     fn a_repo_rows_worktree_state_is_not_applicable_so_no_parent_row_carries_a_question_mark() {
         let entity = EntityState::new(
@@ -1159,11 +1182,11 @@ mod tests {
         }
     }
 
-    /// A Submodule's construction-time `NotApplicable` cells must survive being
+    /// A Submodule's construction-time `Unknown` cells must survive being
     /// marked Vanished untouched: forcing staleness applies only to a settled
-    /// `Known` value, never to a settled fact that simply does not apply here.
+    /// `Known` value, never to a settled fact this crate has no better answer for.
     #[test]
-    fn marking_a_submodule_vanished_leaves_its_not_applicable_cells_untouched() {
+    fn marking_a_submodule_vanished_leaves_its_unknown_cells_untouched() {
         let mut entity = EntityState::new(
             key("/repo/vendor/lib"),
             Arc::from("lib"),
@@ -1176,11 +1199,11 @@ mod tests {
         assert_eq!(entity.presence, Presence::Vanished);
         assert!(matches!(
             entity.state.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
         assert!(matches!(
             entity.base.settled(),
-            Some(Settled::NotApplicable)
+            Some(Settled::Unknown(Unknown::NoDefaultBranch))
         ));
     }
 
