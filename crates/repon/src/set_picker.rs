@@ -221,6 +221,7 @@ mod tests {
             roots: vec!["/dev/null".to_string()],
             include: None,
             exclude: None,
+            on_refresh: None,
         }
     }
 

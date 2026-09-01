@@ -86,6 +86,15 @@ pub struct SetConfig {
     pub include: Option<Vec<String>>,
     #[serde(default)]
     pub exclude: Option<Vec<String>>,
+    /// Names one declared `[[action]]` to run after a Refresh the user asked for while this
+    /// Set is active, read ahead of the top-level `on_refresh` key
+    /// ([actions.md](../../../../docs/spec/actions.md)'s "The refresh hook", amended by
+    /// [0029](../../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)).
+    /// A name no `[[action]]` declares is [`Warning::SetOnRefreshNamesNoAction`] at load
+    /// rather than an exit, naming this Set so a typo shared by two Sets still produces two
+    /// distinguishable warnings.
+    #[serde(default)]
+    pub on_refresh: Option<String>,
 }
 
 /// A `[[repo]]` entry: rung 1 of [default-branch.md](../../../../docs/spec/default-branch.md)'s
@@ -283,6 +292,11 @@ pub enum Warning {
     FetchEnabledButNotBuilt,
     /// `on_refresh` naming an Action no `[[action]]` declares, so the hook can never fire.
     OnRefreshNamesNoAction { name: String },
+    /// A `[[set]].on_refresh` naming an Action no `[[action]]` declares, so the hook can
+    /// never fire while that Set is active. Carries the Set's own name so two Sets sharing
+    /// the same bad value produce two distinguishable warnings rather than one that could
+    /// belong to either.
+    SetOnRefreshNamesNoAction { set: String, name: String },
 }
 
 impl std::fmt::Display for Warning {
@@ -314,6 +328,11 @@ impl std::fmt::Display for Warning {
             Warning::OnRefreshNamesNoAction { name } => write!(
                 f,
                 "on_refresh names `{name}`, which no [[action]] declares, so nothing runs after a refresh"
+            ),
+            Warning::SetOnRefreshNamesNoAction { set, name } => write!(
+                f,
+                "set `{set}`'s on_refresh names `{name}`, which no [[action]] declares, so \
+                 nothing runs after a refresh while `{set}` is active"
             ),
         }
     }
@@ -475,6 +494,7 @@ fn implicit_all_set(root: PathBuf) -> SetConfig {
         roots: vec![root.to_string_lossy().into_owned()],
         include: None,
         exclude: None,
+        on_refresh: None,
     }
 }
 
@@ -626,6 +646,25 @@ fn duplicate<'a, T>(
     None
 }
 
+/// [config.md](../../../../docs/spec/config.md)'s "Sets" resolution chain for `on_refresh`,
+/// amending [0029](../../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md):
+/// the Set named `active_set_name`'s own `on_refresh` first, then the top-level key, then no
+/// hook. A pure function of `document` and the active Set's own name rather than something
+/// resolved once and cached, since the active Set changes at runtime under `s` and `1` to `9`
+/// and a hook latched at startup would keep firing the Set the process launched with; the app
+/// crate calls this fresh every time a Refresh fires ([`crate::app::App::on_refresh_action`]).
+pub(crate) fn resolve_on_refresh_name<'a>(
+    document: &'a Document,
+    active_set_name: &str,
+) -> Option<&'a str> {
+    document
+        .sets
+        .iter()
+        .find(|set| set.name.get_ref() == active_set_name)
+        .and_then(|set| set.on_refresh.as_deref())
+        .or(document.on_refresh.as_deref())
+}
+
 /// The checks [config.md](../../../../docs/spec/config.md#cross-key-validity) runs at
 /// load, each a warning rather than an exit. Run against the sets as declared, before the
 /// implicit `all` Set (if any) is added, since that Set always matches everything under the
@@ -654,6 +693,17 @@ fn cross_key_warnings(document: &Document) -> Vec<Warning> {
         let name = set.name.get_ref();
         if name == "all" {
             warnings.push(Warning::SetNamedAll);
+        }
+        if let Some(on_refresh) = set.on_refresh.as_ref().filter(|on_refresh| {
+            !document
+                .actions
+                .iter()
+                .any(|action| action.name.get_ref().as_str() == on_refresh.as_str())
+        }) {
+            warnings.push(Warning::SetOnRefreshNamesNoAction {
+                set: name.clone(),
+                name: on_refresh.clone(),
+            });
         }
         for glob in set.include.iter().chain(&set.exclude).flatten() {
             if !set_glob_matches_something(set, glob) {
@@ -1472,6 +1522,126 @@ mod tests {
             "got: {:?}",
             loaded.warnings
         );
+    }
+
+    // Issue #250: `[[set]].on_refresh` parses, and an unknown key inside `[[set]]` still
+    // warns rather than exits.
+    #[test]
+    fn a_set_on_refresh_key_parses() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"sync\"\n\n\
+             [[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+        assert_eq!(loaded.document.sets[0].on_refresh.as_deref(), Some("sync"));
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_set_that_also_declares_on_refresh_still_warns() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"sync\"\ntypo = 1\n",
+        );
+        assert!(
+            loaded.warnings.iter().any(
+                |warning| matches!(warning, Warning::UnknownKey(path) if path.ends_with("typo"))
+            ),
+            "expected the stray key to still warn beside a real on_refresh, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // Issue #250: a `[[set]].on_refresh` naming no declared `[[action]]` warns on the
+    // existing warnings path and names the Set, so two Sets with the same bad name produce
+    // two distinguishable warnings rather than one ambiguous one.
+    #[test]
+    fn a_set_on_refresh_naming_no_declared_action_warns_and_names_the_set() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"nothing-declares-this\"\n",
+        );
+        assert!(
+            loaded
+                .warnings
+                .contains(&Warning::SetOnRefreshNamesNoAction {
+                    set: "work".to_string(),
+                    name: "nothing-declares-this".to_string(),
+                }),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn two_sets_with_the_same_bad_on_refresh_name_produce_two_distinguishable_warnings() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"nothing-declares-this\"\n\n\
+             [[set]]\nname = \"personal\"\nroots = [\"~/dev-misc\"]\non_refresh = \"nothing-declares-this\"\n",
+        );
+        let set_names: Vec<&str> = loaded
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                Warning::SetOnRefreshNamesNoAction { set, .. } => Some(set.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            set_names,
+            vec!["work", "personal"],
+            "each Set's own bad on_refresh must warn on its own, naming that Set, got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn a_set_on_refresh_naming_a_declared_action_does_not_warn() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"sync\"\n\n\
+             [[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::SetOnRefreshNamesNoAction { .. })),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // Issue #250: the chain over all three rungs from one document. A pure function of
+    // `Document`, so this needs no `App`/`Core` at all to prove the resolution rather than
+    // the firing.
+    #[test]
+    fn on_refresh_resolves_over_all_three_rungs_from_one_document() {
+        let loaded = parse_ok(
+            "on_refresh = \"top-level\"\n\n\
+             [[set]]\nname = \"own-hook\"\nroots = [\"~/dev\"]\non_refresh = \"set-scoped\"\n\n\
+             [[set]]\nname = \"falls-through\"\nroots = [\"~/dev\"]\n\n\
+             [[set]]\nname = \"third-set-has-one\"\nroots = [\"~/dev\"]\non_refresh = \"set-scoped\"\n\n\
+             [[action]]\nname = \"set-scoped\"\nsteps = [{ args = [\"true\"] }]\n\n\
+             [[action]]\nname = \"top-level\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+
+        assert_eq!(
+            resolve_on_refresh_name(&loaded.document, "own-hook"),
+            Some("set-scoped"),
+            "a Set with its own hook must resolve to it, ahead of the top-level key"
+        );
+        assert_eq!(
+            resolve_on_refresh_name(&loaded.document, "falls-through"),
+            Some("top-level"),
+            "a Set with no on_refresh of its own must fall through to the top-level key"
+        );
+        assert_eq!(
+            resolve_on_refresh_name(&loaded.document, "third-set-has-one"),
+            Some("set-scoped"),
+            "a third Set's own hook must resolve independently of what another Set declares"
+        );
+    }
+
+    #[test]
+    fn on_refresh_resolves_to_none_when_neither_the_set_nor_the_top_level_declares_one() {
+        let loaded = parse_ok("[[set]]\nname = \"quiet\"\nroots = [\"~/dev\"]\n");
+        assert_eq!(resolve_on_refresh_name(&loaded.document, "quiet"), None);
     }
 
     // Cross-key check: a [[set]] named `all` warns, and the declaration still wins (it is

@@ -421,6 +421,7 @@ mod tests {
             roots: vec![root.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         }
     }
 
@@ -567,6 +568,7 @@ mod tests {
             roots: vec![root_b.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         });
 
         app.reload_active_set(&document);
@@ -658,6 +660,7 @@ mod tests {
             roots: vec![root.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         });
 
         let logs = capture_tracing(|| app.reload_active_set(&document));
@@ -689,6 +692,7 @@ mod tests {
             roots: vec!["/dev/null".to_string()],
             include: None,
             exclude: None,
+            on_refresh: None,
         }
     }
 
@@ -815,6 +819,7 @@ mod tests {
                 roots: vec![root_b.to_string_lossy().into_owned()],
                 include: None,
                 exclude: None,
+                on_refresh: None,
             },
         ];
 
@@ -879,6 +884,7 @@ mod tests {
                 roots: vec![root_b.to_string_lossy().into_owned()],
                 include: None,
                 exclude: None,
+                on_refresh: None,
             },
         ];
 
@@ -982,6 +988,7 @@ mod tests {
                 roots: vec![root.to_string_lossy().into_owned()],
                 include: None,
                 exclude: None,
+                on_refresh: None,
             },
         ];
 
@@ -1029,6 +1036,7 @@ mod tests {
                 roots: vec![root.to_string_lossy().into_owned()],
                 include: None,
                 exclude: None,
+                on_refresh: None,
             },
         ];
         let keys: Vec<_> = app

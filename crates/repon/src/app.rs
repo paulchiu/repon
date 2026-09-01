@@ -1881,12 +1881,20 @@ impl App {
         }
     }
 
-    /// The `[[action]]` the top-level `on_refresh` key names, if the file declares one.
-    /// `None` with the key unset, and `None` when it names an Action nothing declares, which
-    /// [`config::document::Warning::OnRefreshNamesNoAction`] already said at load rather than
-    /// this repeating it once per keypress.
+    /// The `[[action]]` `on_refresh` names for the Set currently active: the active Set's own
+    /// `on_refresh` first, then the top-level key, then `None`
+    /// ([`config::document::resolve_on_refresh_name`], amending
+    /// [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)).
+    /// Resolved fresh from `self.document` and `self.active_set.name` on every call rather
+    /// than cached, since the active Set changes at runtime under `s` and `1` to `9` and a
+    /// hook latched at startup would keep firing the Set the process launched with. `None`
+    /// when the resolved name is unset or names an Action nothing declares, which
+    /// [`config::document::Warning::OnRefreshNamesNoAction`] or
+    /// [`config::document::Warning::SetOnRefreshNamesNoAction`] already said at load rather
+    /// than this repeating it once per keypress.
     fn on_refresh_action(&self) -> Option<&config::document::ActionConfig> {
-        let name = self.document.on_refresh.as_deref()?;
+        let name =
+            config::document::resolve_on_refresh_name(&self.document, &self.active_set.name)?;
         self.document
             .actions
             .iter()
@@ -1914,12 +1922,15 @@ impl App {
         self.start_action_over(spec, order.to_vec());
     }
 
-    /// The Action `on_refresh` names, paired with how many rows its last run left holding a
-    /// failed step, or `None` with no hook declared. Read fresh from the live snapshot rather
-    /// than latched, the same shape the Vanished count takes: a later run replaces those
-    /// receipts and the condition clears itself.
+    /// The Action `on_refresh` names for the Set currently active, paired with how many rows
+    /// its last run left holding a failed step, or `None` with no hook resolved
+    /// ([`config::document::resolve_on_refresh_name`]). Read fresh from the live snapshot
+    /// rather than latched, the same shape the Vanished count takes: a later run replaces
+    /// those receipts and the condition clears itself.
     fn on_refresh_failures(&self, snapshot: &Snapshot) -> Option<(String, usize)> {
-        let name = self.document.on_refresh.clone()?;
+        let name =
+            config::document::resolve_on_refresh_name(&self.document, &self.active_set.name)?
+                .to_string();
         let failures = snapshot
             .entities
             .iter()
@@ -2895,6 +2906,7 @@ mod tests {
                     roots: vec![root.to_string_lossy().into_owned()],
                     include: None,
                     exclude: None,
+                    on_refresh: None,
                 });
                 document
             },
@@ -4023,6 +4035,7 @@ mod tests {
             roots: vec![root.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         });
 
         let logs = capture_tracing(|| {
@@ -7701,6 +7714,146 @@ mod tests {
         assert!(app.notice.is_none());
     }
 
+    // --- Issue #250: a `[[set]].on_refresh` scopes the hook to the Set rather than the whole
+    // program, resolved the active Set's own value first, then the top-level key.
+
+    /// A Set with its own `on_refresh` runs that Action rather than the top-level one, even
+    /// though both are declared and both would otherwise apply.
+    #[test]
+    fn the_active_sets_own_on_refresh_wins_over_the_top_level_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        const SET_MARKER: &str = "set-hook-ran";
+        const TOP_MARKER: &str = "top-level-hook-ran";
+
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(hook_action_config("set-hook", &["touch", SET_MARKER]));
+        app.document
+            .actions
+            .push(hook_action_config("top-level-hook", &["touch", TOP_MARKER]));
+        app.document.on_refresh = Some("top-level-hook".to_string());
+        app.document.sets[0].on_refresh = Some("set-hook".to_string());
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            repo.join(SET_MARKER).exists(),
+            "the active Set's own on_refresh must run"
+        );
+        assert!(
+            !repo.join(TOP_MARKER).exists(),
+            "the top-level on_refresh must not also run once the Set names its own"
+        );
+    }
+
+    /// A Set declaring no `on_refresh` of its own falls through to the top-level key, the
+    /// second rung of the chain.
+    #[test]
+    fn a_set_with_no_on_refresh_of_its_own_falls_through_to_the_top_level_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        const TOP_MARKER: &str = "top-level-hook-ran";
+
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(hook_action_config("top-level-hook", &["touch", TOP_MARKER]));
+        app.document.on_refresh = Some("top-level-hook".to_string());
+        assert_eq!(
+            app.document.sets[0].on_refresh, None,
+            "sanity: the active Set declares no on_refresh of its own"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            repo.join(TOP_MARKER).exists(),
+            "a Set with no hook of its own must fall through to the top-level key"
+        );
+    }
+
+    /// The criterion most likely to be quietly skipped: the hook follows a Set switch made
+    /// after launch, rather than staying latched to the Set the process launched with. The
+    /// process launches on `test`, whose own hook is `hook-a`; after switching to `second`
+    /// at runtime, `r` must run `hook-b` and never `hook-a` again, proven by removing
+    /// `hook-a`'s own marker between the two presses so its reappearance would mean the
+    /// switch was not actually honoured.
+    #[test]
+    fn the_on_refresh_hook_follows_a_set_switch_rather_than_the_set_the_process_launched_with() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        const MARKER_A: &str = "hook-a-ran";
+        const MARKER_B: &str = "hook-b-ran";
+
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(hook_action_config("hook-a", &["touch", MARKER_A]));
+        app.document
+            .actions
+            .push(hook_action_config("hook-b", &["touch", MARKER_B]));
+        // The Set the process launched with, `test`, names its own hook.
+        app.document.sets[0].on_refresh = Some("hook-a".to_string());
+        // A second declared Set, not yet active, naming a different hook and sharing the
+        // same roots so switching to it rebuilds no `Core` and races no fresh discovery.
+        app.document.sets.push(document::SetConfig {
+            name: toml::Spanned::new(0..0, "second".to_string()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include: None,
+            exclude: None,
+            on_refresh: Some("hook-b".to_string()),
+        });
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll on the Set launched with");
+        wait_for("the launch Set's own hook to finish", || {
+            !app.core.action_running()
+        });
+        assert!(
+            repo.join(MARKER_A).exists(),
+            "sanity: the Set the process launched with must have fired its own hook"
+        );
+        std::fs::remove_file(repo.join(MARKER_A)).expect("remove hook-a's own marker");
+
+        app.switch_to_set(2);
+        assert_eq!(
+            app.active_set.name, "second",
+            "sanity: the runtime switch landed on the second Set"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll after the switch");
+        wait_for("the switched-to Set's own hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            repo.join(MARKER_B).exists(),
+            "the newly active Set's own hook must fire after a runtime switch"
+        );
+        assert!(
+            !repo.join(MARKER_A).exists(),
+            "the Set the process launched with must never fire again once a different Set is \
+             active; a rebuild would mean the hook stayed latched to the launch Set"
+        );
+    }
+
     /// The specs of record for this trigger, and the link every one of them carries to the
     /// decision behind it. Read at test time rather than trusted: a renamed or deleted ADR
     /// would otherwise leave four documents pointing at nothing and this crate's own doc
@@ -9371,6 +9524,7 @@ mod tests {
             roots: vec![root.to_string_lossy().into_owned()],
             include: None,
             exclude: None,
+            on_refresh: None,
         }
     }
 
