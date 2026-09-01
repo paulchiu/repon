@@ -97,7 +97,7 @@ Selection order: `--set <name>`, then `REPON_SET`, then the first declared Set, 
 
 With no file at all there is one implicit Set, `all`, rooted at the working directory, everything included.
 
-The active Set is named on screen, as the status row's first item, ahead of the entity count it bounds: `work 403 entities`, or `all 403 entities` running zero-config. [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the row and [keybindings.md](keybindings.md) the picker `s` opens; what belongs here is that a Set the user cannot see is a scope they cannot check, which is the readable half of the same rule that makes an unresolvable name exit ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)).
+The active Set is named on screen, as the status row's first item, ahead of the entity count it bounds: `work 403 entities`, or `all 403 entities` running zero-config. [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the row and [keybindings.md](keybindings.md) the picker `s` and `Tab` open; what belongs here is that a Set the user cannot see is a scope they cannot check, which is the readable half of the same rule that makes an unresolvable name exit ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)).
 
 ## Per-Repo entries
 
