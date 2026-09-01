@@ -376,17 +376,17 @@ pub struct RunningStep {
 pub struct ActionReceipt {
     /// The Action's name, or the typed command string.
     pub label: Arc<str>,
-    /// The steps that have finished so far, in order. Empty when `not_applicable`, and not
+    /// The steps that have finished so far, in order. Empty when `skip` is `Some`, and not
     /// yet the whole Action's step list while `running` is `Some`: a step neither finished
     /// nor currently executing has no representation here at all
     /// (`docs/spec/actions.md`'s "The run on screen").
     pub steps: Arc<[StepResult]>,
-    /// An excluded row that was in the Selection: nothing failed and nothing was
-    /// blocked, the row was simply never operated on.
-    pub not_applicable: bool,
+    /// Why this row carries no steps, or `None` for a row that actually ran
+    /// ([`Skip`], `docs/spec/actions.md`'s "The Selection and the gate").
+    pub skip: Option<Skip>,
     pub finished_at: Timestamp,
     /// The step executing right now, or `None` once every step has finished (or none ever
-    /// ran, as for a `not_applicable` receipt). `Core::run_action` writes this receipt to
+    /// ran, as for a receipt carrying `skip`). `Core::run_action` writes this receipt to
     /// the table once per step, so a reader sees it update as the run progresses rather
     /// than only once at the very end.
     ///
@@ -402,6 +402,26 @@ pub struct ActionReceipt {
     pub running: Option<RunningStep>,
 }
 
+/// Why a row's Action receipt carries no steps and was never operated on, the three ways
+/// `Core::run_action` decides a row out before the fan-out starts
+/// (`docs/spec/actions.md`'s "The Selection and the gate"). Closed and matched exhaustively
+/// rather than three booleans, so a fourth reason to skip a row is a compile error here
+/// rather than a silent omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum Skip {
+    /// A `[[repo]]` entry with `exclude = true`: the row was in the Selection and never
+    /// operated on. The one legitimate producer of `Not applicable`.
+    Excluded,
+    /// The Action's own `when` predicate disproved this row: it was operable, but `when`
+    /// said the row does not apply, so it was never handed a step.
+    Inapplicable,
+    /// The Action's own `when` predicate could not settle on this row, because a Cell it
+    /// reads has not settled. Not excluded and not disproved: a run has no basis to touch
+    /// an unprovable row, so it is skipped exactly as a disproved one is.
+    Unresolved,
+}
+
 impl ActionReceipt {
     /// Whether any step in this run failed, which is what widens the row summary fold
     /// even though every Cell reads fine
@@ -410,6 +430,24 @@ impl ActionReceipt {
     /// `Failed` one.
     pub fn failed(&self) -> bool {
         self.steps.iter().any(|step| step.outcome.is_failure())
+    }
+
+    /// An excluded row that was in the Selection: nothing failed and nothing was blocked,
+    /// the row was simply never operated on. The one legitimate producer of `Not
+    /// applicable` (`docs/spec/actions.md`'s "The Selection and the gate").
+    pub fn not_applicable(&self) -> bool {
+        self.skip == Some(Skip::Excluded)
+    }
+
+    /// The Action's own `when` disproved this row, so it never ran.
+    pub fn inapplicable(&self) -> bool {
+        self.skip == Some(Skip::Inapplicable)
+    }
+
+    /// The Action's own `when` could not settle on this row, so it never ran either: not
+    /// excluded, not disproved, and not operated on.
+    pub fn unresolved(&self) -> bool {
+        self.skip == Some(Skip::Unresolved)
     }
 
     /// Whether this run refused rather than acted: a step Repon performed itself would not
@@ -971,7 +1009,7 @@ mod tests {
         ActionReceipt {
             label: Arc::from(label),
             steps: Arc::from(steps),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         }
@@ -988,7 +1026,7 @@ mod tests {
         let ActionReceipt {
             label,
             steps,
-            not_applicable,
+            skip,
             finished_at: _,
             running: _,
         } = original;
@@ -1001,7 +1039,7 @@ mod tests {
         } = steps[0].clone();
 
         assert_eq!(&*label, "reinstall");
-        assert!(!not_applicable);
+        assert_eq!(skip, None);
         assert_eq!(&*step_label, "rm -rf node_modules");
         assert_eq!(outcome, StepOutcome::Ok);
     }
@@ -1388,7 +1426,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         };

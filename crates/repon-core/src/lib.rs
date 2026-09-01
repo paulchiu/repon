@@ -109,6 +109,7 @@ pub use entity::Kind;
 pub use entity::OwnWork;
 pub use entity::Presence;
 pub use entity::RunningStep;
+pub use entity::Skip;
 pub use entity::StepOutcome;
 pub use entity::StepResult;
 pub use entity::SyncState;

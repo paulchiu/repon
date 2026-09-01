@@ -5040,7 +5040,7 @@ mod tests {
                 .as_ref()
                 .unwrap_or_else(|| panic!("{name} carries a receipt"));
             assert!(
-                !receipt.not_applicable,
+                !receipt.not_applicable(),
                 "{name} was operated on, so it is not the excluded row Not applicable names"
             );
             assert_eq!(

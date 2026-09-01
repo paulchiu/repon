@@ -73,16 +73,19 @@ A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an a
 A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
 
 **Action spec**:
-An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps and its concurrency, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.
+An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps, its concurrency and its optional `when` predicate, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.
 
 **Applicability**:
-How an Action's `when` predicate divides the rows it would operate on, after excluded rows are already subtracted: applicable, inapplicable, and unresolved because a Cell the predicate reads has not settled. Three counts and no verdict, since an unresolved row is not an inapplicable one and folding it into either side is an absent value becoming a zero. It narrows what the palette reports, never which Repos the Action fans out over.
+How an Action's `when` predicate divides the rows it would operate on, after excluded rows are already subtracted: applicable, inapplicable, and unresolved because a Cell the predicate reads has not settled. Three counts and no verdict, since an unresolved row is not an inapplicable one and folding it into either side is an absent value becoming a zero. It decides which Repos the Action fans out over, not only what the palette reports: the applicable rows run, and the inapplicable and unresolved rows are both Skipped, for different reasons.
+
+**Skip**:
+Why an Action receipt carries no Steps and was never operated on: Excluded (a `[[repo]]` entry with `exclude = true`, the one legitimate `Not applicable` producer), Inapplicable (the `when` predicate disproved the row) or Unresolved (the `when` predicate could not settle on the row because a Cell it reads has not settled). Closed at three so a fourth reason is a compile error rather than a silent omission. Not Own work, which is a Step Repon performed itself on a row that was operated on; a Skip is a row a run never touched at all.
 
 **Step**:
 One act in an Action's ordered list: either a command as the core receives it, its argv already split rather than a shell string with any per-step environment overrides already resolved, or one act Repon performs itself with no child process at all, which is what a Management operation's single Step is. Distinct from a Step result, which is what running one produces.
 
 **Action receipt**:
-An Entity's most recent Action run: its label, the Step results finished so far, whether the row was excluded and never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes. Not an Action run or an Action result; receipt is the settled word.
+An Entity's most recent Action run: its label, the Step results finished so far, its Skip if the row was never operated on, when it was last written, and the Running step if one is still in flight. A receipt of something Repon did, not a reading of the world, so it carries no Generation, never goes stale, is never superseded, and lives only in memory for the session. Written once per Step while the run is still going, not only once at the end, which is what lets a reader see a Step's own output as it arrives rather than only once the whole run finishes. Not an Action run or an Action result; receipt is the settled word.
 
 **Step result**:
 One Step's own record inside an Action receipt, present once that Step has finished: its label, its Step outcome, its captured output, its elapsed time and its Capture elision if the output was bounded. A Step of Own work has nothing to capture, so its output is empty and its Capture elision absent; its words live in its Step outcome instead.

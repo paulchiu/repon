@@ -1019,6 +1019,7 @@ mod tests {
                 env: Vec::new(),
             }],
             concurrency: 1,
+            when: None,
         }
     }
 

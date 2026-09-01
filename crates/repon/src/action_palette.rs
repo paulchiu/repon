@@ -33,7 +33,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use repon_core::{ActionSpec, Applicability, Step};
+use repon_core::{ActionSpec, Applicability, Filter, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
@@ -217,7 +217,10 @@ fn to_steps(steps: &[StepConfig]) -> Vec<Step> {
 /// `config` turned into the plain data [`repon_core::Core::run_action`] receives. `name` is
 /// always `Some` here; an ad hoc run's own [`to_ad_hoc_action_spec`] is the one path that
 /// leaves it unset, per [config.md](../../../docs/spec/config.md)'s "Actions" and the
-/// environment contract's `REPON_ACTION`.
+/// environment contract's `REPON_ACTION`. `when` parses once here, the seam that carries the
+/// predicate from the consumer's own TOML shape into the core's plain data so
+/// `Core::run_action` decides the fan-out by it, not only the palette's own preview
+/// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
 pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
     let name: std::sync::Arc<str> = std::sync::Arc::from(config.name.get_ref().as_str());
     ActionSpec {
@@ -225,6 +228,7 @@ pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
         name: Some(name),
         steps: to_steps(&config.steps),
         concurrency: config.concurrency,
+        when: config.when.as_deref().map(Filter::parse),
     }
 }
 
@@ -262,13 +266,15 @@ fn ad_hoc_steps(text: &str) -> Option<Vec<Step>> {
 /// for a Launcher, since a typed command has no name and `REPON_ACTION` is required and
 /// unique in the file
 /// ([actions.md](../../../docs/spec/actions.md)). `label` is the typed text itself, trimmed,
-/// which is what the pane names the run by.
+/// which is what the pane names the run by. `when` is always `None`: an ad hoc command has no
+/// config entry in which a predicate could be declared, so it always runs every operable row.
 fn to_ad_hoc_action_spec(text: &str, steps: Vec<Step>) -> ActionSpec {
     ActionSpec {
         label: std::sync::Arc::from(text.trim()),
         name: None,
         steps,
         concurrency: AD_HOC_CONCURRENCY,
+        when: None,
     }
 }
 
@@ -360,6 +366,19 @@ impl Count {
         Count {
             operable,
             narrowed: None,
+        }
+    }
+
+    /// How many rows a choice made right now would actually run against: the applicable
+    /// count once a `when` narrows it, and the operable count otherwise. The confirm gate's
+    /// own question reads this, the same number [`ActionPalette::border_title`] already
+    /// puts in the border above it, so the two can never name two different totals
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate": "`when`
+    /// decides what runs").
+    pub(crate) fn run_count(&self) -> usize {
+        match &self.narrowed {
+            Some(narrowed) => narrowed.applicability.applicable,
+            None => self.operable,
         }
     }
 }
@@ -649,7 +668,7 @@ impl ActionPalette {
             count,
             management_lines,
         } = run;
-        let operable_count = count.operable;
+        let run_count = count.run_count();
         let mut scratch = BorderScratch::new();
         let block = glyphs
             .bordered_block(&mut scratch)
@@ -662,7 +681,7 @@ impl ActionPalette {
             Stage::Confirming(chosen) => {
                 let rows: Vec<String> = match chosen {
                     Chosen::Configured(entry) => vec![format!(
-                        "run \"{}\" on {operable_count} repos?",
+                        "run \"{}\" on {run_count} repos?",
                         entry.name.get_ref()
                     )],
                     // The built-in's own gate is `App`'s [`crate::management::Plan`], which
@@ -1780,6 +1799,53 @@ mod tests {
         assert!(
             row_text(1).contains("run \"reinstall\" on 12 repos?"),
             "expected actions.md's own confirm sentence, got: {:?}",
+            row_text(1)
+        );
+    }
+
+    /// `when` decides what runs, not only what the border reports
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate"), so the
+    /// confirm gate's own question must name the applicable count, not the wider operable
+    /// one: a gate that still asked "run on 12 repos?" over an entry narrowed to 8 would ask
+    /// permission for four rows the fan-out was never going to touch.
+    #[test]
+    fn draw_in_stage_confirming_over_a_narrowed_entry_asks_about_the_applicable_count() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.choose(&actions, 8);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    Run {
+                        actions: &actions,
+                        count: narrowed(8, 3, 1),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                );
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let row_text =
+            |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert!(
+            row_text(1).contains("run \"reinstall\" on 8 repos?"),
+            "expected the confirm gate to name the applicable count alone, got: {:?}",
+            row_text(1)
+        );
+        assert!(
+            !row_text(1).contains("12 repos?"),
+            "the operable total must never be what the gate asks to run, got: {:?}",
             row_text(1)
         );
     }

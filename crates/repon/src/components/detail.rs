@@ -966,7 +966,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         }
@@ -995,7 +995,7 @@ mod tests {
         ActionReceipt {
             label: Arc::from(label),
             steps: Arc::from(steps),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running,
         }
@@ -1795,7 +1795,7 @@ mod tests {
                 elapsed: Duration::from_millis(3),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         }
@@ -2962,6 +2962,7 @@ mod tests {
                 name: None,
                 steps,
                 concurrency: 1,
+                when: None,
             },
             std::slice::from_ref(&key),
         );

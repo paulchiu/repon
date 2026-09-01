@@ -396,7 +396,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
             }]),
-            not_applicable: false,
+            skip: None,
             finished_at: Timestamp::now(),
             running: None,
         });
