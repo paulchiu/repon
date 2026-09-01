@@ -2945,6 +2945,125 @@ mod tests {
         sha.chars().take(BRANCH_CELL_OBJECT_ID_WIDTH).collect()
     }
 
+    /// [`init_detached_repo_with_a_commit`], plus a real `refs/remotes/origin/HEAD` symref
+    /// naming `origin/main`: a genuinely resolvable `default_branch`, the shape
+    /// [ADR 0012](https://github.com/paulchiu/repon/blob/main/docs/adr/0012-the-default-branch-is-a-remote-tracking-ref.md)
+    /// says a normal clone of the real population already has, wrong value and all. Lets a
+    /// test isolate "`state`/`base` are `Unknown` by kind" from "`default_branch` itself
+    /// could not resolve", which a Submodule with no fetched remote-tracking ref at all
+    /// cannot distinguish.
+    fn init_detached_repo_with_a_resolvable_default_branch(path: &Path) -> String {
+        let short_id = init_detached_repo_with_a_commit(path);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(output.status.success());
+        let sha = String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["update-ref", "refs/remotes/origin/main", &sha])
+            .status()
+            .expect("run git update-ref");
+        assert!(status.success());
+        let remote_refs_dir = path
+            .join(".git")
+            .join("refs")
+            .join("remotes")
+            .join("origin");
+        std::fs::create_dir_all(&remote_refs_dir).expect("create refs/remotes/origin dir");
+        std::fs::write(
+            remote_refs_dir.join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .expect("write refs/remotes/origin/HEAD");
+        short_id
+    }
+
+    /// The accepted consequence of `state` and `base` moving to `Unknown`, proven so it
+    /// cannot be mistaken for the unrelated case where a Submodule's own
+    /// `default_branch` simply cannot resolve: even with a real, resolvable `default_branch`
+    /// (a genuine `origin/HEAD` symref, matching a normal clone per ADR 0012), `state` and
+    /// `base` still settle `Unknown` by kind rather than computing off it
+    /// (`EntityState::probes_state`/`probes_base`), so the gutter still carries `?` where a
+    /// Not-applicable pair would have left it a plain space.
+    #[test]
+    fn a_shown_submodules_row_carries_the_unknown_gutter_mark_even_with_its_own_default_branch_resolved()
+     {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo_on_branch(&parent, "main");
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        init_detached_repo_with_a_resolvable_default_branch(&parent.join("vendor").join("lib"));
+
+        let core = Core::start(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: true,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: std::time::Duration::from_secs(3600),
+                concurrency: 4,
+            },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let snapshot = core.settle(Duration::from_secs(5));
+
+        let (row, entity) = find_entity_row(&snapshot, "vendor/lib");
+        assert!(matches!(entity.kind, Kind::Submodule));
+        assert!(
+            matches!(
+                entity.default_branch.settled(),
+                Some(Settled::Known {
+                    value: _,
+                    at: _,
+                    stale: _
+                })
+            ),
+            "expected this fixture's own default_branch to resolve, got {:?}",
+            entity.default_branch.settled()
+        );
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(row);
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, absolute_x(GUTTER_X), y, 1),
+            glyphs.unknown.to_string(),
+            "expected the unknown gutter mark even though this Submodule's own default \
+             branch resolved, since state/base are Unknown by kind rather than by a probe \
+             against it"
+        );
+    }
+
     /// A real, settled `Snapshot` off one Repo with a linked Worktree and a real,
     /// initialised, detached Submodule both attached to it, `show_submodules` on: what
     /// every test below needing a genuine child row of each kind, on screen together,
@@ -3139,7 +3258,10 @@ mod tests {
     /// Criterion 3's positive cells, at the list level rather than the detail pane: a real,
     /// initialised, detached Submodule renders its relative path as the name, a
     /// nine-character object id in branch, `-` (no upstream) in sync, and blank base and
-    /// state.
+    /// state, since `Unknown` renders blank exactly like `NotApplicable` does: `state` and
+    /// `base` are `Unknown` rather than `NotApplicable` on this row now
+    /// ([ADR 0017](../../../../docs/adr/0017-discovery-stops-at-the-repo-boundary.md), as
+    /// amended), but only the gutter tells the two apart.
     #[test]
     fn a_shown_submodules_row_renders_its_path_a_short_id_and_blank_base_and_state() {
         let (snapshot, short_id) = settled_snapshot_with_a_worktree_and_a_submodule();
@@ -3175,12 +3297,12 @@ mod tests {
         assert_eq!(
             cell_text(buf, absolute_x(BASE_X), y, BASE_WIDTH),
             " ".repeat(BASE_WIDTH as usize),
-            "base is Not applicable for a Submodule and must render blank"
+            "base is Unknown for a Submodule and must still render blank"
         );
         assert_eq!(
             cell_text(buf, absolute_x(STATE_X), y, STATE_WIDTH),
             " ".repeat(STATE_WIDTH as usize),
-            "state is Not applicable for a Submodule and must render blank"
+            "state is Unknown for a Submodule and must still render blank"
         );
     }
 
