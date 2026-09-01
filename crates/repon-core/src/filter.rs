@@ -171,14 +171,19 @@ fn unknown_keyword(reason: Unknown) -> Option<&'static str> {
 
 /// The worst outcome in `receipt`'s own steps, or `"none"` for no receipt at all, per
 /// `docs/spec/filter.md`'s `action:` row: "the worst `StepOutcome` in `last_action`, or its
-/// absence". A `Failed` step outranks a `Cancelled` one, and an all-`Ok` (or empty, the
-/// `not_applicable` shape) receipt reads `"ok"`.
+/// absence". A failing step outranks a refusal, which outranks a `Cancelled` one, and an
+/// all-`Ok` (or empty, the `not_applicable` shape) receipt reads `"ok"`.
+///
+/// Both classifications come from [`ActionReceipt`] itself rather than a second reading here,
+/// so this term and the row summary fold cannot disagree about what failed.
 fn action_keyword(receipt: Option<&ActionReceipt>) -> &'static str {
     match receipt {
         None => "none",
         Some(receipt) => {
-            if receipt.steps.iter().any(|step| step.outcome.is_failure()) {
+            if receipt.failed() {
                 "failed"
+            } else if receipt.refused() {
+                "refused"
             } else if receipt
                 .steps
                 .iter()
@@ -402,7 +407,7 @@ mod tests {
 
     use super::*;
     use crate::cell::{Generation, Timestamp};
-    use crate::entity::{AheadBehind, DirtyCounts, EntityKey, StepResult};
+    use crate::entity::{AheadBehind, DirtyCounts, EntityKey, OwnWork, StepResult};
     use crate::git::ProbeError;
 
     fn entity(name: &str, kind: Kind) -> EntityState {
@@ -647,6 +652,43 @@ mod tests {
         assert!(!Filter::parse("action:none").matches(&failed_run));
         assert!(Filter::parse("action:failed").matches(&failed_run));
         assert!(!Filter::parse("action:failed").matches(&untouched));
+    }
+
+    /// `action:refused` is its own value rather than folded into `ok`: a Management operation
+    /// that would not act neither succeeded nor failed, and reading it as `ok` would hide it
+    /// from the one term that can find it (`docs/spec/filter.md`'s `action:` row).
+    #[test]
+    fn action_refused_is_neither_ok_nor_failed() {
+        let own_work = |work: OwnWork| ActionReceipt {
+            label: Arc::from("ignore"),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from("ignore"),
+                outcome: StepOutcome::OwnWork(work),
+                output: Arc::from(&b""[..]),
+                elapsed: std::time::Duration::from_millis(1),
+                elision: None,
+            }]),
+            not_applicable: false,
+            finished_at: Timestamp::now(),
+            running: None,
+        };
+
+        let mut refused = entity("refused", Kind::Repo);
+        refused.last_action = Some(own_work(OwnWork::Refused(Arc::from("already ignored"))));
+        let mut did = entity("did", Kind::Repo);
+        did.last_action = Some(own_work(OwnWork::Did(Arc::from("ignored"))));
+        let mut could_not = entity("could-not", Kind::Repo);
+        could_not.last_action = Some(own_work(OwnWork::CouldNotAct(Arc::from("boom"))));
+
+        assert!(Filter::parse("action:refused").matches(&refused));
+        assert!(!Filter::parse("action:ok").matches(&refused));
+        assert!(!Filter::parse("action:failed").matches(&refused));
+
+        assert!(Filter::parse("action:ok").matches(&did));
+        assert!(!Filter::parse("action:refused").matches(&did));
+
+        assert!(Filter::parse("action:failed").matches(&could_not));
+        assert!(!Filter::parse("action:refused").matches(&could_not));
     }
 
     #[test]

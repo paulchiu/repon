@@ -47,7 +47,7 @@ use crate::default_branch;
 use crate::discovery::{self, SetSpec};
 use crate::entity::{
     ActionReceipt, DefaultBranch, DeleteRisk, DirtyCounts, EntityKey, EntityState, Head, Kind,
-    Presence, RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
+    OwnWork, Presence, RunningStep, StepOutcome, StepResult, SyncState, WorktreeState,
 };
 use crate::environment;
 use crate::executor;
@@ -1204,6 +1204,48 @@ impl Core {
     pub fn set_show_submodules(&self, show_submodules: bool) {
         self.show_submodules
             .store(show_submodules, Ordering::Release);
+    }
+
+    /// Writes one receipt per row for work Repon did itself, with no child process anywhere
+    /// in it: what a Management operation leaves behind
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "Receipts", [`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// `OwnWork`).
+    ///
+    /// The receipt is built here rather than handed in whole, so a consumer supplies only
+    /// what Repon did and the words for it: `not_applicable` stays false, since a refusal is
+    /// not an excluded row, `running` stays `None`, since the work is already done, and the
+    /// step count stays one, since the operation is one act rather than an ordered list.
+    /// `label` is the operation's own name and doubles as the single step's label; the step's
+    /// captured output is empty, there being no other program's screen to quote.
+    ///
+    /// Starts no Generation and dispatches nothing, for the same reason
+    /// [`Core::set_exclusions`] does not: a receipt is something Repon did rather than a
+    /// reading of the world, so nothing here can make a cell any more or less true. A key the
+    /// table no longer holds is skipped, the same fallback every key-addressed entry point
+    /// here gives one.
+    pub fn record_own_work(&self, label: &str, results: &[(EntityKey, OwnWork, Duration)]) {
+        let label: Arc<str> = Arc::from(label);
+        let finished_at = Timestamp::now();
+        let mut table = self.table.write().unwrap();
+        for (key, work, elapsed) in results {
+            let Some(&idx) = table.index.get(key) else {
+                continue;
+            };
+            table.entities[idx].last_action = Some(ActionReceipt {
+                label: Arc::clone(&label),
+                steps: Arc::from(vec![StepResult {
+                    label: Arc::clone(&label),
+                    outcome: StepOutcome::OwnWork(work.clone()),
+                    output: Arc::from(&b""[..]),
+                    elapsed: *elapsed,
+                    elision: None,
+                }]),
+                not_applicable: false,
+                finished_at,
+                running: None,
+            });
+        }
     }
 
     /// Replaces the live `exclude` half of `[[repo]]` and re-applies it over every row the
@@ -10499,6 +10541,93 @@ mod tests {
             before,
             "a default_branch override reaches a session only through a rebuilt Core"
         );
+    }
+
+    // =====================================================================================
+    // `record_own_work`: the receipt a Management operation leaves, docs/spec/repo-management.md
+    // =====================================================================================
+
+    /// One receipt per named row, and the shape the caller never gets to choose: `running` is
+    /// `None`, `not_applicable` is false (a refusal is not an excluded row), and there is
+    /// exactly one step, because such an operation is one act rather than an ordered list.
+    #[test]
+    fn record_own_work_leaves_one_receipt_per_row_it_names_and_none_elsewhere() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo-a"));
+        init_repo_with_a_commit(&root.join("repo-b"));
+
+        let core = Core::start(spec(vec![root]));
+        let entities = core.settle(Duration::from_secs(10)).entities;
+        let named = entities
+            .iter()
+            .find(|entity| &*entity.name == "repo-a")
+            .expect("repo-a is discovered")
+            .key
+            .clone();
+
+        core.record_own_work(
+            "ignore",
+            &[(
+                named.clone(),
+                OwnWork::Refused(Arc::from("refused, already ignored")),
+                Duration::from_millis(7),
+            )],
+        );
+
+        let after = core.snapshot().entities;
+        let receipt = after
+            .iter()
+            .find(|entity| entity.key == named)
+            .and_then(|entity| entity.last_action.clone())
+            .expect("the row it named carries a receipt");
+        assert_eq!(&*receipt.label, "ignore");
+        assert!(!receipt.not_applicable, "a refusal is not an excluded row");
+        assert!(receipt.running.is_none(), "the work is already done");
+        assert_eq!(receipt.steps.len(), 1, "one act, not an ordered list");
+        assert_eq!(&*receipt.steps[0].label, "ignore");
+        assert_eq!(receipt.steps[0].elapsed, Duration::from_millis(7));
+        assert!(receipt.steps[0].output.is_empty(), "nothing to quote");
+        assert!(receipt.steps[0].elision.is_none());
+        assert_eq!(
+            receipt.steps[0].outcome,
+            StepOutcome::OwnWork(OwnWork::Refused(Arc::from("refused, already ignored"))),
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|entity| entity.key != named)
+                .all(|entity| entity.last_action.is_none()),
+            "no row this did not name takes a receipt"
+        );
+    }
+
+    /// A key the table no longer holds is skipped rather than panicking or landing on the
+    /// wrong row, the same fallback every key-addressed entry point here gives one: a `delete`
+    /// whose Repo is already gone is exactly this case.
+    #[test]
+    fn record_own_work_skips_a_key_the_table_no_longer_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo-a"));
+
+        let core = Core::start(spec(vec![root]));
+        let entities = core.settle(Duration::from_secs(10)).entities;
+        let stranger = EntityKey::new(Arc::from(std::path::Path::new("/nowhere/at/all")));
+
+        core.record_own_work(
+            "delete",
+            &[(stranger, OwnWork::Did(Arc::from("gone")), Duration::ZERO)],
+        );
+
+        assert!(
+            core.snapshot()
+                .entities
+                .iter()
+                .all(|entity| entity.last_action.is_none()),
+            "an unknown key writes nothing anywhere"
+        );
+        assert_eq!(core.snapshot().entities.len(), entities.len());
     }
 
     // =====================================================================================

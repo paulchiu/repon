@@ -321,12 +321,32 @@ pub fn annotated_example() -> &'static str {
 }
 
 /// Reads and parses `path`. A missing file is not an error: it resolves to the compiled
-/// defaults with one implicit Set, `all`, rooted at the working directory.
+/// defaults, `glyphs` included, with one implicit Set, `all`, rooted at the working directory.
+///
+/// `glyphs`'s own default is conditional ([`conditional_glyphs_default`]); the real `TERM`
+/// is read here, once, and handed down as plain data, so nothing below this point touches
+/// the environment.
 pub fn load(path: &Path) -> Result<Loaded> {
+    load_with_term(path, term_signal().as_deref())
+}
+
+/// The one environment read this decision ever makes, isolated so [`load`] stays a thin
+/// wrapper and every other function in this module stays a pure function of its input.
+fn term_signal() -> Option<String> {
+    env::var("TERM").ok()
+}
+
+/// [`load`] with `TERM` passed in rather than read live, which is what lets a test drive
+/// both the Linux-console branch and the everything-else branch without calling
+/// `std::env::set_var` (unsafe on this edition, and racy across threads).
+fn load_with_term(path: &Path, term: Option<&str>) -> Result<Loaded> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let mut document = Document::default();
+            let mut document = Document {
+                glyphs: conditional_glyphs_default(term),
+                ..Document::default()
+            };
             document.sets.push(implicit_all_set(working_directory()));
             return Ok(Loaded {
                 document,
@@ -338,10 +358,47 @@ pub fn load(path: &Path) -> Result<Loaded> {
             return Err(err).wrap_err_with(|| format!("could not read {}", path.display()));
         }
     };
-    parse(&text, path)
+    parse_with_term(&text, path, term)
 }
 
+/// [`parse_with_term`] with no `TERM` signal, which is `full` either way: every existing test
+/// below that does not care about the conditional default calls this, unchanged. Test-only:
+/// nothing in the running program parses a document without an explicit `TERM` signal to
+/// resolve `glyphs` against.
+#[cfg(test)]
 fn parse(text: &str, path: &Path) -> Result<Loaded> {
+    parse_with_term(text, path, None)
+}
+
+/// `ascii` when the process is talking to the Linux virtual console (`TERM=linux`), `full`
+/// otherwise ([ADR 0020](../../../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md),
+/// and `docs/spec/config.md`'s `glyphs` entry). That console's kernel fallback table is fixed
+/// and knowable, which is what makes this one check defensible; a table of terminal emulator
+/// names is refused, because an emulator's own substitution table is neither fixed nor
+/// knowable the way the console's is. This is the only signal ever consulted for this
+/// decision: no second `TERM` value and no second environment variable, a claim
+/// `glyphs_default_reads_exactly_one_term_value_and_no_other_variable` below checks against
+/// this function's own source.
+fn conditional_glyphs_default(term: Option<&str>) -> Glyphs {
+    if term == Some("linux") {
+        Glyphs::Ascii
+    } else {
+        Glyphs::Full
+    }
+}
+
+/// Whether the file's own top-level table names `glyphs` at all, independent of what value the
+/// struct-level `#[serde(default)]` deep merge already gave it: an absent key and one written
+/// explicitly as the compiled default both deserialize to the same `Glyphs::Full`, so telling
+/// them apart (needed to pin an explicit `full` against the conditional default flipping it)
+/// means asking the source text directly rather than the already-merged `Document`.
+fn glyphs_key_declared(text: &str) -> bool {
+    text.parse::<toml::Table>()
+        .map(|table| table.contains_key("glyphs"))
+        .unwrap_or(false)
+}
+
+fn parse_with_term(text: &str, path: &Path, term: Option<&str>) -> Result<Loaded> {
     let deserializer =
         toml::de::Deserializer::parse(text).map_err(|err| render_error(path, text, &err))?;
 
@@ -354,6 +411,12 @@ fn parse(text: &str, path: &Path) -> Result<Loaded> {
     reject_duplicate_names(&document, text, path)?;
     reject_reserved_action_names(&document, text, path)?;
     reject_launchers_declaring_both_argv_forms(&document, text, path)?;
+
+    // An explicit `glyphs` pins the value in both directions (docs/spec/config.md's `glyphs`
+    // entry): only an absent key defers to the conditional default.
+    if !glyphs_key_declared(text) {
+        document.glyphs = conditional_glyphs_default(term);
+    }
 
     let mut warnings: Vec<Warning> = unknown_paths.into_iter().map(Warning::UnknownKey).collect();
     warnings.extend(cross_key_warnings(&document));
@@ -653,7 +716,17 @@ mod tests {
             .to_string()
     }
 
-    // The five bare top-level keys parse with their exact stated defaults.
+    /// [`parse`] with the `TERM` signal named explicitly, for the tests below that exercise
+    /// `glyphs`'s conditional default directly rather than through [`parse_ok`]'s fixed
+    /// "not the Linux console" signal.
+    fn parse_ok_with_term(text: &str, term: Option<&str>) -> Loaded {
+        parse_with_term(text, Path::new("config.toml"), term)
+            .expect("expected the document to parse")
+    }
+
+    // The five bare top-level keys parse with their exact stated defaults. `glyphs` here
+    // reads its non-Linux-console default, since `parse_ok` fixes `TERM` to `None`; the
+    // conditional half is its own test below.
     #[test]
     fn an_empty_file_carries_the_stated_top_level_defaults() {
         let loaded = parse_ok("");
@@ -662,6 +735,133 @@ mod tests {
         assert!(loaded.document.show_worktrees);
         assert!(!loaded.document.show_submodules);
         assert_eq!(loaded.document.notice_timeout, Duration::from_secs(3));
+    }
+
+    /// ADR 0020 / this ticket's decision: an absent `glyphs` key defaults to `ascii` on the
+    /// Linux console's own `TERM=linux` and to `full` for every other `TERM`, including one
+    /// that merely contains "linux" as a substring (a mutation this negative case would let
+    /// through if the comparison ever loosened to a `contains` check).
+    #[test]
+    fn an_absent_glyphs_key_defaults_to_ascii_on_term_linux_and_full_otherwise() {
+        assert_eq!(
+            parse_ok_with_term("", Some("linux")).document.glyphs,
+            Glyphs::Ascii
+        );
+
+        for term in [
+            None,
+            Some(""),
+            Some("xterm-256color"),
+            Some("screen"),
+            Some("tmux-256color"),
+            Some("linux-256color"),
+            Some("LINUX"),
+        ] {
+            assert_eq!(
+                parse_ok_with_term("", term).document.glyphs,
+                Glyphs::Full,
+                "expected full for TERM={term:?}"
+            );
+        }
+    }
+
+    /// The whole point of a conditional default is that an explicit value still wins, in
+    /// both directions: `full` written under `TERM=linux` is not overridden to `ascii`, and
+    /// `ascii` written with no Linux console in sight is not overridden to `full`.
+    #[test]
+    fn an_explicit_glyphs_key_pins_the_value_against_the_conditional_default_either_way() {
+        let pinned_full = parse_ok_with_term("glyphs = \"full\"\n", Some("linux"));
+        assert_eq!(pinned_full.document.glyphs, Glyphs::Full);
+
+        let pinned_ascii = parse_ok_with_term("glyphs = \"ascii\"\n", None);
+        assert_eq!(pinned_ascii.document.glyphs, Glyphs::Ascii);
+    }
+
+    /// The zero-config path (no file at all) applies the same conditional default as a file
+    /// that merely omits the key, since [`load_with_term`]'s missing-file branch builds its
+    /// `Document` without going through [`parse_with_term`] at all.
+    #[test]
+    fn a_missing_file_still_applies_the_conditional_glyphs_default() {
+        let missing = Path::new("/does/not/exist/repon-glyphs-default-test/config.toml");
+
+        assert_eq!(
+            load_with_term(missing, Some("linux"))
+                .expect("a missing file is not an error")
+                .document
+                .glyphs,
+            Glyphs::Ascii
+        );
+        assert_eq!(
+            load_with_term(missing, None)
+                .expect("a missing file is not an error")
+                .document
+                .glyphs,
+            Glyphs::Full
+        );
+    }
+
+    /// This ticket's own refusal, pinned against the source rather than left as prose:
+    /// `TERM` is read from the real environment in exactly one place across both crates, and
+    /// [`conditional_glyphs_default`] itself takes that one value as a plain argument and
+    /// reads nothing further, comparing it against exactly one significant value, `"linux"`.
+    /// A second `TERM` read anywhere in the workspace, a second environment read inside the
+    /// decision itself, or a second value the decision treats as significant, fails this
+    /// rather than landing unnoticed.
+    ///
+    /// Mutation run: changed `conditional_glyphs_default`'s guard to
+    /// `term == Some("linux") || term == Some("screen.linux")`, simulating a second console
+    /// name creeping into the one check the decision refuses to grow a table of. The
+    /// `significant_values` assertion below failed with "expected exactly one TERM value to
+    /// matter to the decision, got: ... Some(\"linux\") ... Some(\"screen.linux\") ...".
+    #[test]
+    fn glyphs_default_reads_exactly_one_term_value_and_no_other_variable() {
+        use crate::test_support::{
+            all_lines_where, blocks_opened_by, production_source_at, workspace_crate_src_dirs,
+        };
+
+        let dirs = workspace_crate_src_dirs();
+        let term_reads = all_lines_where(&dirs, |line| {
+            line.contains("env::var(\"TERM\")") || line.contains("env::var_os(\"TERM\")")
+        });
+        assert_eq!(
+            term_reads.len(),
+            1,
+            "expected exactly one live `TERM` read across the workspace, found: {:?}",
+            term_reads
+                .iter()
+                .map(|line| format!("{}:{}", line.path.display(), line.number))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            term_reads[0].path.ends_with("config/document.rs"),
+            "expected the one TERM read to live in config/document.rs, found: {}",
+            term_reads[0].path.display()
+        );
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = production_source_at(&manifest_dir.join("src/config/document.rs"));
+
+        let decision_blocks = blocks_opened_by(&source, "fn conditional_glyphs_default");
+        assert_eq!(
+            decision_blocks.len(),
+            1,
+            "expected exactly one conditional_glyphs_default function"
+        );
+        let decision_body = &decision_blocks[0];
+        assert!(
+            !decision_body.contains("env::"),
+            "conditional_glyphs_default must stay a pure function of its `term` argument, but \
+             its body reads the environment directly: {decision_body}"
+        );
+        let significant_values = decision_body.matches("Some(\"").count();
+        assert_eq!(
+            significant_values, 1,
+            "expected exactly one TERM value to matter to the decision, got: {decision_body}"
+        );
+        assert!(
+            decision_body.contains("Some(\"linux\")"),
+            "expected the one significant value to be \"linux\", got: {decision_body}"
+        );
     }
 
     /// `"0s"` turns the Notice timer off, per this field's own doc comment and
