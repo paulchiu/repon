@@ -1780,20 +1780,13 @@ mod tests {
                 })
                 .expect("draw the frame");
 
-            let buf = terminal.backend().buffer();
-            let border = glyphs.border;
-            for (x, y, expected, corner) in [
-                (0, 0, border.top_left, "top left"),
-                (39, 0, border.top_right, "top right"),
-                (0, 9, border.bottom_left, "bottom left"),
-                (39, 9, border.bottom_right, "bottom right"),
-            ] {
-                assert_eq!(
-                    buf[(x, y)].symbol(),
-                    expected.to_string(),
-                    "the detail pane's {corner} corner must be the glyph table's own"
-                );
-            }
+            crate::test_support::assert_frame_drawn_with(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, 40, 10),
+                glyphs.border,
+                " detail (esc closes) ",
+                "the detail pane's frame",
+            );
         }
     }
 

@@ -198,6 +198,13 @@ impl LauncherPalette {
         frame_area.centered(Constraint::Length(width), Constraint::Length(height))
     }
 
+    /// The title the popup draws into its own top border: the Entity the chosen Launcher
+    /// would act on, named once here so the popup's own width arithmetic and every reader of
+    /// the drawn title agree with what is drawn.
+    pub(crate) fn border_title(entity_name: &str) -> String {
+        format!(" {entity_name} ")
+    }
+
     /// Draws as a centred popup over `frame`, `entity_name` in the border title
     /// ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md)'s "The
     /// Launcher palette popup"). The first interior row is always the typed query and the
@@ -218,7 +225,7 @@ impl LauncherPalette {
         let block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Role::BorderFocused))
-            .title(format!(" {entity_name} "));
+            .title(Self::border_title(entity_name));
         let interior = block.inner(popup);
         frame.render_widget(block, popup);
 
@@ -857,30 +864,14 @@ mod tests {
             let palette = LauncherPalette::new();
             let buf = draw_to_buffer(&palette, &launchers, &Theme::default(), "repo-a", glyphs);
             let popup = palette.popup_area(frame_area(), &launchers, "repo-a");
-            let border = glyphs.border;
 
-            for (x, y, expected, corner) in [
-                (popup.x, popup.y, border.top_left, "top left"),
-                (popup.right() - 1, popup.y, border.top_right, "top right"),
-                (
-                    popup.x,
-                    popup.bottom() - 1,
-                    border.bottom_left,
-                    "bottom left",
-                ),
-                (
-                    popup.right() - 1,
-                    popup.bottom() - 1,
-                    border.bottom_right,
-                    "bottom right",
-                ),
-            ] {
-                assert_eq!(
-                    buf[(x, y)].symbol(),
-                    expected.to_string(),
-                    "the popup's {corner} corner must be the glyph table's own"
-                );
-            }
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                popup,
+                glyphs.border,
+                " repo-a ",
+                "the Launcher popup's frame",
+            );
         }
     }
 

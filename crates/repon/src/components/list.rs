@@ -1923,10 +1923,13 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(cell_text(buf, 0, 0, 1), "╭");
-        assert_eq!(cell_text(buf, 139, 0, 1), "╮");
-        assert_eq!(cell_text(buf, 0, 23, 1), "╰");
-        assert_eq!(cell_text(buf, 139, 23, 1), "╯");
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            Rect::new(0, 0, 140, 24),
+            GlyphSet::for_config(crate::config::document::Glyphs::Full).border,
+            " repos ",
+            "the list panel's frame",
+        );
         assert_eq!(
             buf[(0, 0)].fg,
             Color::LightBlue,
@@ -1954,20 +1957,13 @@ mod tests {
 
         let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
-        let border = GlyphSet::for_config(crate::config::document::Glyphs::Ascii).border;
-
-        for (x, y, expected, corner) in [
-            (0, 0, border.top_left, "top left"),
-            (139, 0, border.top_right, "top right"),
-            (0, 23, border.bottom_left, "bottom left"),
-            (139, 23, border.bottom_right, "bottom right"),
-        ] {
-            assert_eq!(
-                cell_text(buf, x, y, 1),
-                expected.to_string(),
-                "the panel's {corner} corner must be the ascii table's own"
-            );
-        }
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            Rect::new(0, 0, 140, 24),
+            GlyphSet::for_config(crate::config::document::Glyphs::Ascii).border,
+            " repos ",
+            "the list panel's frame under the ascii table",
+        );
     }
 
     #[test]

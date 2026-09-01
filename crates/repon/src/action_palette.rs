@@ -379,7 +379,7 @@ impl ActionPalette {
 
     /// The border title theming.md fixes: "the Action palette ... puts the Selection count
     /// in the border title, so it reads `run on 12 repos`" before anything is typed.
-    fn border_title(operable_count: usize) -> String {
+    pub(crate) fn border_title(operable_count: usize) -> String {
         format!(" run on {operable_count} repos ")
     }
 
@@ -937,20 +937,13 @@ mod tests {
                 })
                 .expect("draw the frame");
 
-            let buf = terminal.backend().buffer();
-            let border = glyphs.border;
-            for (x, y, expected, corner) in [
-                (0, 0, border.top_left, "top left"),
-                (39, 0, border.top_right, "top right"),
-                (0, 9, border.bottom_left, "bottom left"),
-                (39, 9, border.bottom_right, "bottom right"),
-            ] {
-                assert_eq!(
-                    buf[(x, y)].symbol(),
-                    expected.to_string(),
-                    "the palette's {corner} corner must be the glyph table's own"
-                );
-            }
+            crate::test_support::assert_frame_drawn_with(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, 40, 10),
+                glyphs.border,
+                &ActionPalette::border_title(3),
+                "the Action palette's frame",
+            );
         }
     }
 

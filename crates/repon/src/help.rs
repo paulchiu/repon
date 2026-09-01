@@ -30,6 +30,10 @@ const MIN_CONTENT_HEIGHT: u16 = 1;
 const MIN_BORDERED_WIDTH: u16 = BORDER_WIDTH + MIN_CONTENT_WIDTH;
 const MIN_BORDERED_HEIGHT: u16 = BORDER_HEIGHT + MIN_CONTENT_HEIGHT;
 
+/// The title the overlay draws into its own top border, recorded in keybindings.md's "The
+/// help overlay's own chrome" and named once here so no reader of it holds a second copy.
+pub(crate) const BORDER_TITLE: &str = " help (esc or q closes) ";
+
 /// Whether `frame_area` is drawn as a bordered panel or, below the size that needs, degraded
 /// to flush content with no border: [`HelpOverlay::draw`] and [`HelpOverlay::viewport_height`]
 /// both read this so neither can disagree with the other about which shape is on screen.
@@ -132,7 +136,7 @@ impl HelpOverlay {
             let block = glyphs
                 .bordered_block(&mut scratch)
                 .border_style(theme.style_for(Role::BorderFocused))
-                .title(" help (esc or q closes) ");
+                .title(BORDER_TITLE);
             frame.render_widget(block, frame_area);
         }
         let content_area = layout.content_area(frame_area);
@@ -483,30 +487,14 @@ mod tests {
         let buf = terminal.backend().buffer();
         let glyphs = full_glyphs();
         let outer = ROOMY_FRAME;
-        assert_eq!(
-            buf[(outer.x, outer.y)].symbol(),
-            glyphs.border.top_left.to_string()
-        );
-        assert_eq!(
-            buf[(outer.right() - 1, outer.y)].symbol(),
-            glyphs.border.top_right.to_string()
-        );
-        assert_eq!(
-            buf[(outer.x, outer.bottom() - 1)].symbol(),
-            glyphs.border.bottom_left.to_string()
-        );
-        assert_eq!(
-            buf[(outer.right() - 1, outer.bottom() - 1)].symbol(),
-            glyphs.border.bottom_right.to_string()
-        );
+        let title = BORDER_TITLE;
 
-        let title = " help (esc or q closes) ";
-        let title_row: String = (outer.x..outer.right())
-            .map(|x| buf[(x, outer.y)].symbol())
-            .collect();
-        assert!(
-            title_row.contains(title),
-            "expected the title {title:?} on the box's own top border, got {title_row:?}"
+        crate::test_support::assert_frame_drawn_with(
+            buf,
+            outer,
+            glyphs.border,
+            title,
+            "the help overlay's frame",
         );
     }
 

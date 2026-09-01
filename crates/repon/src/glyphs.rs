@@ -24,18 +24,6 @@ use ratatui::{layout::Rect, symbols::border, widgets::Block};
 
 use crate::config::document::Glyphs;
 
-/// One panel border's four corners plus its two straight runs. Outside the row interior, so
-/// exempt from the disjointness obligation `GlyphSet`'s other fields carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Border {
-    pub top_left: char,
-    pub top_right: char,
-    pub bottom_left: char,
-    pub bottom_right: char,
-    pub horizontal: char,
-    pub vertical: char,
-}
-
 /// Counts the identifiers passed to it, for sizing an array without a hand-maintained number
 /// that could drift from the list it is generated from. Shared with `theme.rs`'s
 /// `enum_with_all!`.
@@ -46,6 +34,39 @@ macro_rules! count_idents {
     };
 }
 pub(crate) use count_idents;
+
+/// Declares [`Border`]'s fields and [`Border::chars`] from one list, the same way
+/// `glyph_set!` below declares the row interior's: the width obligation reads exactly the
+/// characters the frame is drawn from rather than a retyped copy of the field names, so a
+/// seventh frame character cannot join the struct without joining that population too.
+macro_rules! border {
+    ($($field:ident),* $(,)?) => {
+        /// One panel border's four corners plus its two straight runs. Outside the row
+        /// interior, so exempt from the disjointness obligation `GlyphSet`'s other fields
+        /// carry.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct Border {
+            $( pub $field: char, )*
+        }
+
+        impl Border {
+            /// Every character this frame draws, in the order `docs/spec/theming.md`'s own
+            /// "panel border" row lists them.
+            pub fn chars(&self) -> [char; count_idents!($($field),*)] {
+                [ $( self.$field ),* ]
+            }
+        }
+    };
+}
+
+border!(
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
+    horizontal,
+    vertical
+);
 
 /// Declares `GlyphSet`'s row-interior char fields, the [`Meaning`] enum and
 /// [`GlyphSet::row_interior`] from one meaning-to-field list, each entry marked `gutter` or
@@ -102,7 +123,9 @@ macro_rules! glyph_set {
             /// Every glyph in this table, row interior and frame alike: the population the
             /// width obligation covers, since `docs/spec/theming.md` requires every glyph
             /// Repon draws, not only the row interior, to measure one column under the
-            /// renderer's width function.
+            /// renderer's width function. The frame comes through [`Border::chars`], which is
+            /// generated from `Border`'s own field list, so a seventh frame character joins
+            /// this population by existing rather than by being remembered here.
             ///
             /// Read outside `#[cfg(test)]` only once a renderer exists; until then the tests
             /// below are its only caller.
@@ -110,14 +133,7 @@ macro_rules! glyph_set {
             pub fn all_glyphs(&self) -> Vec<char> {
                 let mut glyphs: Vec<char> =
                     self.row_interior().into_iter().map(|(_, c)| c).collect();
-                glyphs.extend([
-                    self.border.top_left,
-                    self.border.top_right,
-                    self.border.bottom_left,
-                    self.border.bottom_right,
-                    self.border.horizontal,
-                    self.border.vertical,
-                ]);
+                glyphs.extend(self.border.chars());
                 glyphs.extend(self.capture_elision.chars());
                 glyphs
             }
@@ -684,10 +700,40 @@ mod tests {
     const BORDER_REGION: &str = "the one bordered block";
 
     /// Every way ratatui's own square default reaches a surface: the constructor a bordered
-    /// block is built with, the `Borders` bitflags `Block::new().borders(..)` takes, and the
-    /// `symbols::border` module the stock `PLAIN`/`ROUNDED` sets live in. A surface framing
-    /// itself without going through [`GlyphSet::bordered_block`] has to name one of these.
-    const BORDER_CONSTRUCTION_NEEDLES: [&str; 3] = ["Block::bordered", "Borders::", "border::"];
+    /// block is built with, the `Borders` bitflags `Block::new().borders(..)` takes, the
+    /// `symbols::border` module the stock `PLAIN`/`ROUNDED` sets live in, and the two setters
+    /// that replace a block's set after it is built. `border_type` is on the list because
+    /// ratatui documents it as overwriting `border_set`, so a surface that took its frame from
+    /// this table and then chained one call would put the stock square set on screen while
+    /// naming no border at all. A surface framing itself without going through
+    /// [`GlyphSet::bordered_block`] has to name one of these.
+    const BORDER_CONSTRUCTION_NEEDLES: [&str; 5] = [
+        "Block::bordered",
+        "Borders::",
+        "border::",
+        "BorderType",
+        "border_set",
+    ];
+
+    /// One real construction per needle, each written the way a surface would actually write
+    /// it. Every needle needs a case here, which is what keeps a needle that names nothing
+    /// (a typo, or a ratatui rename) from joining the list unnoticed.
+    const BORDER_CONSTRUCTION_CASES: [(&str, &str); 5] = [
+        ("Block::bordered", "    ratatui::widgets::Block::bordered()"),
+        (
+            "Borders::",
+            "    block().borders(ratatui::widgets::Borders::ALL)",
+        ),
+        (
+            "border::",
+            "    block().border_set(ratatui::symbols::border::PLAIN)",
+        ),
+        (
+            "BorderType",
+            "    block().border_type(ratatui::widgets::BorderType::Plain)",
+        ),
+        ("border_set", "    block().border_set(house_set())"),
+    ];
 
     /// This file's path and the 1-based line numbers of [`BORDER_REGION`]'s own interior,
     /// the marker lines themselves excluded.
@@ -760,36 +806,54 @@ mod tests {
     /// Proves the mechanism before trusting it over the workspace, the same way
     /// [`crate::theme::tests::the_hardcoded_colour_scan_would_catch_a_real_color_variant`]
     /// does for its own scan: a real second constructor in a disposable fixture file must be
-    /// caught, at the line it sits on.
+    /// caught, at the line it sits on. Every needle is planted in turn, so a needle that has
+    /// stopped naming anything (`border_type` renamed upstream, say) fails here rather than
+    /// leaving the workspace scan quietly passing on one fewer way in.
     #[test]
     fn the_border_scan_would_catch_a_surface_that_built_its_own_bordered_block() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("offender.rs"),
-            "fn frame() -> ratatui::widgets::Block<'static> {\n    \
-             ratatui::widgets::Block::bordered()\n}\n",
-        )
-        .expect("write fixture file");
+        for needle in BORDER_CONSTRUCTION_NEEDLES {
+            assert!(
+                BORDER_CONSTRUCTION_CASES
+                    .iter()
+                    .any(|(covered, _)| *covered == needle),
+                "{needle:?} is scanned for but never planted, so nothing proves it still names \
+                 a way a border is built"
+            );
+        }
 
-        let offending = crate::test_support::production_lines_under_containing(
-            &[dir.path().to_path_buf()],
-            BORDER_CONSTRUCTION_NEEDLES[0],
-        );
+        for (needle, construction) in BORDER_CONSTRUCTION_CASES {
+            let dir = tempfile::tempdir().expect("temp dir");
+            std::fs::write(
+                dir.path().join("offender.rs"),
+                format!("fn frame() -> ratatui::widgets::Block<'static> {{\n{construction}\n}}\n"),
+            )
+            .expect("write fixture file");
 
-        assert_eq!(
-            offending.len(),
-            1,
-            "expected the scan to catch exactly the one planted constructor, got: {offending:?}"
-        );
-        assert!(offending[0].contains("offender.rs:2"), "got {offending:?}");
+            let offending = crate::test_support::production_lines_under_containing(
+                &[dir.path().to_path_buf()],
+                needle,
+            );
+
+            assert_eq!(
+                offending.len(),
+                1,
+                "expected the scan for {needle:?} to catch exactly the one planted \
+                 construction, got: {offending:?}"
+            );
+            assert!(
+                offending[0].contains("offender.rs:2"),
+                "expected {needle:?} caught on the construction's own line, got {offending:?}"
+            );
+        }
     }
 
     /// Reads `docs/spec/theming.md`'s own "panel border" row at test time and compares both
     /// cells against both tables, so the frame characters can never drift from the design of
     /// record. The row's ascii cell contains a literal `|`, so the cells are read as the
     /// row's backtick-delimited spans rather than by splitting the row on its own pipes.
-    /// Each table is destructured exhaustively: a seventh field on [`Border`] fails to
-    /// compile here rather than going unchecked.
+    /// Each table's frame is read through [`Border::chars`], generated from `Border`'s own
+    /// field list, so a seventh frame character shows up in this comparison rather than
+    /// going unchecked.
     #[test]
     fn both_tables_frame_characters_match_theming_mds_own_panel_border_row() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -810,27 +874,41 @@ mod tests {
         };
 
         for (label, cell, table) in [("full", full_cell, &FULL), ("ascii", ascii_cell, &ASCII)] {
-            let Border {
-                top_left,
-                top_right,
-                bottom_left,
-                bottom_right,
-                horizontal,
-                vertical,
-            } = table.border;
-            let drawn: String = [
-                top_left,
-                top_right,
-                bottom_left,
-                bottom_right,
-                horizontal,
-                vertical,
-            ]
-            .into_iter()
-            .collect();
+            let drawn: String = table.border.chars().into_iter().collect();
             assert_eq!(
                 &drawn, cell,
                 "the {label} table's frame disagrees with theming.md's panel border row"
+            );
+        }
+    }
+
+    /// The eight slots of the [`border::Set`] `bordered_block` fills, counted on screen rather
+    /// than sampled at the corners: a run slot fed the wrong field (`vertical_left` taking
+    /// `horizontal`, say) draws the wrong character down a whole side of every framed surface
+    /// in the program, which four corner assertions cannot see. Rendered through a real
+    /// terminal, so this reads what ratatui actually paints from the set rather than the set
+    /// this method hands it.
+    #[test]
+    fn the_bordered_block_draws_every_cell_of_the_frame_from_this_tables_own_characters() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (label, table) in [("full", &FULL), ("ascii", &ASCII)] {
+            let area = Rect::new(0, 0, 12, 5);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| {
+                    let mut scratch = BorderScratch::new();
+                    frame.render_widget(table.bordered_block(&mut scratch), area);
+                })
+                .expect("draw the frame");
+
+            crate::test_support::assert_frame_drawn_with(
+                terminal.backend().buffer(),
+                area,
+                table.border,
+                "",
+                &format!("the {label} table's own bordered block"),
             );
         }
     }

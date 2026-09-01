@@ -15,6 +15,11 @@ use crate::{
     theme::{Role, Theme},
 };
 
+/// The title the picker draws into its own top border, named once here and read back from
+/// [keybindings.md](../../../docs/spec/keybindings.md)'s picker paragraph by the tests below,
+/// so the string on screen cannot drift from the design of record.
+pub(crate) const BORDER_TITLE: &str = " sets ";
+
 /// The picker's own cursor over the declared Sets' file order. Carries no copy of the Sets
 /// themselves: [`crate::app::App`] hands [`Self::apply`] and [`Self::draw`] the live
 /// `document.sets` on every call, the same pattern
@@ -89,7 +94,7 @@ impl SetPicker {
         let block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Role::BorderFocused))
-            .title(" sets ");
+            .title(BORDER_TITLE);
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -184,31 +189,65 @@ mod tests {
             let sets = vec![set("alpha")];
             let picker = SetPicker::new();
             let buf = draw_to_buffer(&picker, &sets, "alpha", glyphs);
-            let border = glyphs.border;
 
-            for (x, y, expected, corner) in [
-                (FRAME.x, FRAME.y, border.top_left, "top left"),
-                (FRAME.right() - 1, FRAME.y, border.top_right, "top right"),
-                (
-                    FRAME.x,
-                    FRAME.bottom() - 1,
-                    border.bottom_left,
-                    "bottom left",
-                ),
-                (
-                    FRAME.right() - 1,
-                    FRAME.bottom() - 1,
-                    border.bottom_right,
-                    "bottom right",
-                ),
-            ] {
-                assert_eq!(
-                    buf[(x, y)].symbol(),
-                    expected.to_string(),
-                    "the picker's {corner} corner must be the glyph table's own"
-                );
-            }
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                FRAME,
+                glyphs.border,
+                BORDER_TITLE,
+                "the picker's frame",
+            );
         }
+    }
+
+    /// keybindings.md names the picker's title itself, read here at test time rather than
+    /// restated: an invented string in the code and a spec that never mentions it is the shape
+    /// this repository's own precedent (the help overlay's chrome paragraph) exists to avoid.
+    #[test]
+    fn the_border_title_is_the_one_keybindings_md_names_for_the_picker() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read the keybindings specification");
+        let paragraph = spec
+            .lines()
+            .find(|line| line.starts_with("The picker's own chrome"))
+            .expect("keybindings.md still carries the picker's own chrome paragraph");
+        let quoted = paragraph
+            .split("titled `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("that paragraph still names the title in a backtick span");
+
+        assert_eq!(BORDER_TITLE, quoted);
+    }
+
+    /// A Set name is user-supplied and unbounded, so a long one must stop at the interior
+    /// rather than paint over the frame's own right border. Asserted on the whole frame, not
+    /// on the one cell beside the name: an overrun writes down the border's own column.
+    #[test]
+    fn a_set_name_wider_than_the_interior_never_paints_over_the_frames_right_border() {
+        let long = "production-monorepo-and-everything-else-we-own-twice-over";
+        assert!(
+            long.len() > FRAME.width as usize,
+            "the name has to be wider than the whole frame for this to test anything"
+        );
+        let sets = vec![set(long)];
+        let picker = SetPicker::new();
+
+        let buf = draw_to_buffer(&picker, &sets, long, &crate::glyphs::FULL);
+
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            FRAME,
+            crate::glyphs::FULL.border,
+            BORDER_TITLE,
+            "the picker's frame beside an over-long Set name",
+        );
+        assert!(
+            row_text(&buf, 0).starts_with("> 1 production-monorepo"),
+            "the name must still be drawn up to the interior's own edge, got {:?}",
+            row_text(&buf, 0)
+        );
     }
 
     // --- criterion 1: every declared Set is listed, in file order, none dropped or doubled ---

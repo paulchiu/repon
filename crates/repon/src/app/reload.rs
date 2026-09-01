@@ -16,6 +16,7 @@ use crate::{
         Config,
         document::{self, Document},
     },
+    glyphs::GlyphSet,
     keys, theme,
 };
 
@@ -189,6 +190,14 @@ impl App {
                 tracing::error!("config reload failed to load theme `{theme_name}`: {err:#}");
             }
         }
+
+        // [config.md](../../../../docs/spec/config.md)'s Reload list names `glyphs` among the
+        // keys that re-apply immediately. `List` picks the new table up through
+        // `register_config_handler` below; every other framed surface draws from this field,
+        // so without this line a reload to `ascii` would leave the palettes, the picker, the
+        // detail pane and the help overlay framed in the startup table beside a list already
+        // wearing the new one.
+        self.glyphs = GlyphSet::for_config(new_config.document.glyphs);
 
         if let Err(err) = self.list.register_config_handler(new_config.clone()) {
             tracing::error!("config reload failed to hand the new config to a component: {err:#}");
@@ -369,7 +378,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::tests::{init_repo, press, test_app, write_gitmodules},
+        app::tests::{init_repo, press, render_app_frame, test_app, write_gitmodules},
         keys::Context,
         test_support::capture_tracing,
     };
@@ -1136,6 +1145,54 @@ mod tests {
     /// `apply_reloaded_config`, the same path `Action::ReloadConfig` takes, rather than
     /// assigning `app.document` directly, so this proves the wiring, not only that `notice()`
     /// reads whatever `document.notice_timeout` happens to hold.
+    /// config.md's Reload list names `glyphs` among the keys that re-apply immediately, and
+    /// theming.md says the same. `List` reads the reloaded table through its own
+    /// `register_config_handler`; every other framed surface reads `App::glyphs`, so leaving
+    /// that field at its startup value puts the list pane's `+---+` on screen beside a picker
+    /// still framed in `╭───╮`, which is the screenshot this ticket's issue opens with. Both
+    /// surfaces are asserted in one test for exactly that reason: either alone would pass
+    /// while the two disagreed.
+    #[test]
+    fn the_glyphs_key_re_applies_on_reload_for_the_picker_as_well_as_the_list() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let (width, height) = (60u16, 16u16);
+        assert_eq!(
+            app.glyphs,
+            &crate::glyphs::FULL,
+            "sanity: the run starts on the full table"
+        );
+
+        let mut reloaded = app.document.clone();
+        reloaded.glyphs = document::Glyphs::Ascii;
+        reloaded.sets = vec![matching_set_config(&root)];
+        app.apply_reloaded_config(config_with_document(reloaded));
+
+        let ascii = crate::glyphs::ASCII.border;
+        app.set_picker = Some(crate::set_picker::SetPicker::new());
+        let buf = render_app_frame(&mut app, width, height);
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            ratatui::layout::Rect::new(0, 0, width, height),
+            ascii,
+            crate::set_picker::BORDER_TITLE,
+            "the Set picker after a reload to `ascii`",
+        );
+
+        app.set_picker = None;
+        let buf = render_app_frame(&mut app, width, height);
+        // The list pane sits between the status row and the footer, one row of each.
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            ratatui::layout::Rect::new(0, 1, width, height - 2),
+            ascii,
+            " repos ",
+            "the list pane after a reload to `ascii`",
+        );
+    }
+
     #[test]
     fn notice_timeout_re_applies_immediately_on_reload_with_no_new_press() {
         let dir = tempfile::tempdir().expect("temp dir");
