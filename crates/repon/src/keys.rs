@@ -83,6 +83,10 @@ pub(crate) enum Action {
     // overlay (Scroll* variants above are reused for j/k/g/G/Ctrl+D/Ctrl+U here too)
     Choose,
     Close,
+    /// `/`: enters the help overlay's own search mode. Bound only in `Context::Overlay`;
+    /// the expanded warning list and the Set picker never see it fire, since neither reads
+    /// it out of their own key handler.
+    Search,
 
     // confirm
     Run,
@@ -178,6 +182,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::OpenInEditor => "Open the field in `$EDITOR`",
         Action::Choose => "Choose (Set picker only)",
         Action::Close => "Close",
+        Action::Search => "Search",
         Action::Run => "Run",
         Action::Decline => "Decline",
     }
@@ -482,6 +487,7 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Overlay, KeyCode::Enter, NONE, Action::Choose),
     binding(Context::Overlay, KeyCode::Esc, NONE, Action::Close),
     binding(Context::Overlay, KeyCode::Char('q'), NONE, Action::Close),
+    binding(Context::Overlay, KeyCode::Char('/'), NONE, Action::Search),
     // confirm (every other key is `dispatch`'s fallback of "nothing happens", not a row here)
     binding(Context::Confirm, KeyCode::Char('y'), NONE, Action::Run),
     binding(Context::Confirm, KeyCode::Char('n'), NONE, Action::Decline),
@@ -543,7 +549,11 @@ fn lookup(bindings: &[Binding], context: Context, key: KeyEvent) -> Option<Actio
 /// A character an input field can hold: printable, and typed with at most the modifier an
 /// uppercase letter carries. Excludes anything with CONTROL, which is either a reserved
 /// chord already matched by [`lookup`] or an unbound chord this context stays silent on.
-fn printable(key: KeyEvent) -> Option<char> {
+/// `pub(crate)` rather than module-private: [`crate::help`]'s own search mode reads this
+/// directly to decide, for a key `Context::Overlay` would otherwise resolve to a scroll or
+/// close action, that typing wins instead, the same rule [`BindingTable::dispatch`]'s own
+/// `Context::Input` arm already encodes below.
+pub(crate) fn printable(key: KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
         _ => None,
@@ -747,6 +757,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::OpenInEditor => "open_in_editor",
         Action::Choose => "choose",
         Action::Close => "close",
+        Action::Search => "search",
         Action::Run => "run",
         Action::Decline => "decline",
     })
@@ -1268,11 +1279,23 @@ mod tests {
     #[test]
     fn global_bindings_never_dispatch_while_overlay_is_focused() {
         for (code, modifiers) in GLOBAL_PROBE_KEYS {
-            assert_eq!(
-                dispatch(Context::Overlay, press(code, modifiers)),
-                None,
-                "{code:?} must not reach a Global action while Overlay is focused"
-            );
+            let action = dispatch(Context::Overlay, press(code, modifiers));
+            if code == KeyCode::Char('/') && modifiers == NONE {
+                // `/` is bound in `Overlay`'s own table too, to `Action::Search`
+                // (the help overlay's own search mode): a real Overlay row, not Global's
+                // `EnterFilter` leaking through. `Some(Action::Search)` is what proves the
+                // isolation this test checks; `Some(Action::EnterFilter)` would be the leak.
+                assert_eq!(
+                    action,
+                    Some(Action::Search),
+                    "expected `/` to reach Overlay's own Search binding, not Global's"
+                );
+            } else {
+                assert_eq!(
+                    action, None,
+                    "{code:?} must not reach a Global action while Overlay is focused"
+                );
+            }
         }
     }
 

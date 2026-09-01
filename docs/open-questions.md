@@ -98,21 +98,17 @@ one.
   question) and [`spec/layout-and-provenance.md`](spec/layout-and-provenance.md#open)
   (the gutter mark).
 
-## Help's search has no half-page scroll or Backspace
+## Help's search has no Backspace
 
-The help overlay dispatches through `input` while its search is open, which is
-what makes typing a letter query text instead of `overlay`'s own `j`/`k`/`g`/`G`
-navigation. `Ctrl+D`/`Ctrl+U` as half page down/up and the `g`/`G` jumps to the
-ends are casualties of that: `input` has no half-page or jump vocabulary of its
-own, so once help's search has focus only `Up`/`Down` (one line at a time) are
-left to move through the list underneath a query. Separately, `input` itself has
-no Backspace binding yet, so a mistyped character in help's query cannot be
-deleted one character at a time; `Ctrl+U` (clear) and `Ctrl+W` (delete the
-previous word) are the only edits available in the meantime.
+Help's search mode is `overlay`'s own addition rather than a switch to `input`
+(`spec/keybindings.md`'s own "The help overlay is searchable"), so its query is
+edited with whatever a plain append-only buffer allows: typing extends it, and
+`Esc` clears it outright by leaving search mode entirely. There is no
+per-character delete, because no context anywhere in the compiled binding table
+has a Backspace row yet; a mistyped character cannot be fixed without starting
+the query over.
 
-- **Reopens if**: `input` gains Backspace (closing the second half on its own,
-  with no code change in the help overlay, since it reads whatever `input`
-  dispatches), or a user finds losing `overlay`'s half-page/jump keys while
-  searching costly enough to want a dedicated scroll vocabulary restored
-  alongside the query.
+- **Reopens if**: a context gains a Backspace binding elsewhere in the table
+  first, at which point help's own query can adopt the same one-character-delete
+  behaviour deliberately rather than waiting on it by accident.
 - **Owned by**: [`spec/keybindings.md`](spec/keybindings.md#the-help-overlay).
