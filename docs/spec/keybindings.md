@@ -132,7 +132,7 @@ The bindings below are reserved and specified but not built: `crates/repon/src/k
 
 Advertising has not caught up with the flag yet. An unbuilt binding here still shows in the footer and the help overlay, though pressing it now produces nothing: [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) deleted the "not implemented" warning this section used to describe. Wiring the footer and the help overlay to filter on `built` is [#119](https://github.com/paulchiu/repon/issues/119), not this list.
 
-- `d` dismiss a Vanished row
+Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/171)) was the last row in this state, and this list is its own stated end point rather than a defect in the check that reads it.
 
 ## Why these keys and not others
 

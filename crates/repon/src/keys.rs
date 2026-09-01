@@ -120,6 +120,11 @@ const fn binding(
 // TODO(#119): an unbuilt row is still shown in the footer and the help overlay and still
 // answers on press, because nothing yet filters on this flag; 0023 rules that it should be
 // offered nowhere.
+//
+// `#[allow(dead_code)]`: BINDINGS has no unbuilt row today (`d` was the last one, #171), so
+// nothing currently calls this, which is the list's own stated end state rather than a defect;
+// the next Action that ships ahead of its own dispatch arm calls it again.
+#[allow(dead_code)]
 const fn binding_not_built(
     context: Context,
     code: KeyCode,
@@ -240,6 +245,22 @@ pub(crate) fn unbuilt_bindings() -> Vec<(Context, KeyCode, KeyModifiers, Action)
 #[cfg(test)]
 pub(crate) fn compiled_binding_count() -> usize {
     BINDINGS.len()
+}
+
+/// A one-row table binding `code`/`modifiers` to `action` in `context`, unbuilt, for a test
+/// that proves a property of an unbuilt binding without depending on `BINDINGS` currently
+/// carrying one (`d`, the last currently-unbuilt row, is now built). `BindingTable`'s own
+/// tuple field is private to this module, so
+/// a caller outside it (`help.rs`'s own tests) reaches a synthetic unbuilt table through this
+/// constructor rather than the field.
+#[cfg(test)]
+pub(crate) fn single_unbuilt_binding_table(
+    context: Context,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    action: Action,
+) -> BindingTable {
+    BindingTable(vec![binding_not_built(context, code, modifiers, action)])
 }
 
 /// The `Action` variant names [`dispatch`] can return in `context`, each without its payload
@@ -425,7 +446,7 @@ const BINDINGS: &[Binding] = &[
         Action::ClearSelection,
     ),
     binding(Context::List, KeyCode::Enter, NONE, Action::OpenDetail),
-    binding_not_built(
+    binding(
         Context::List,
         KeyCode::Char('d'),
         NONE,
@@ -805,14 +826,18 @@ fn action_name(action: Action) -> Option<&'static str> {
     })
 }
 
-/// The action named `name` among [`BINDINGS`]'s own rows for `context`, paired with whether
+/// The action named `name` among `bindings`'s own rows for `context`, paired with whether
 /// that row is Built, the ground truth for which actions a `[keys.<context>]` table may name:
-/// looked up against the compiled table rather than a table already under construction, so
-/// which names are known never depends on what a merge has done so far. [`merge`] carries the
-/// Built flag onto the row it rebinds, so a merged table still marks an unbuilt action
-/// unbuilt.
-fn find_action_by_name(context: Context, name: &str) -> Option<(Action, bool)> {
-    BINDINGS
+/// [`merge_over`] passes its own fixed starting table here rather than the mutating one it
+/// builds up, so which names are known never depends on what the merge has done so far.
+/// [`merge_over`] carries the Built flag onto the row it rebinds, so a merged table still
+/// marks an unbuilt action unbuilt.
+fn find_action_by_name(
+    bindings: &[Binding],
+    context: Context,
+    name: &str,
+) -> Option<(Action, bool)> {
+    bindings
         .iter()
         .filter(|(row_context, _, _, _, _)| *row_context == context)
         .map(|(_, _, _, action, built)| (*action, *built))
@@ -1047,7 +1072,20 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
     #[cfg(debug_assertions)]
     debug_assert_compiled_default_has_no_collision();
 
-    let BindingTable(mut bindings) = BindingTable::compiled_default();
+    merge_over(&BindingTable::compiled_default().0, document_keys)
+}
+
+/// [`merge`]'s own body, over `base` rather than always
+/// [`BindingTable::compiled_default()`]: production always calls it with exactly that, and the
+/// seam exists so a test can start from a table carrying a deliberately unbuilt row without
+/// needing one to exist in [`BINDINGS`] itself. `base` is also what [`find_action_by_name`]
+/// looks names up against, fixed for the whole call rather than the `bindings` vec this
+/// function accumulates into, per that function's own doc comment.
+fn merge_over(
+    base: &[Binding],
+    document_keys: &toml::Table,
+) -> Result<(BindingTable, Vec<KeysWarning>)> {
+    let mut bindings = base.to_vec();
     let mut warnings = Vec::new();
 
     for (context_name_text, context_value) in document_keys {
@@ -1063,7 +1101,7 @@ pub(crate) fn merge(document_keys: &toml::Table) -> Result<(BindingTable, Vec<Ke
             ));
         };
         for (action_name_text, key_value) in context_table {
-            let Some((action, built)) = find_action_by_name(context, action_name_text) else {
+            let Some((action, built)) = find_action_by_name(base, context, action_name_text) else {
                 warnings.push(KeysWarning::UnknownAction {
                     context: context_name_text.clone(),
                     action: action_name_text.clone(),
@@ -1993,45 +2031,55 @@ mod tests {
     // --- an unbuilt binding dispatches nothing and advertises nowhere ---
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
-    /// an unbuilt binding "does not dispatch". Every row `unbuilt_bindings` names, pressed at
-    /// its own context, must come back `None`, the same as if the chord claimed no row at
-    /// all; a `List` or `Detail` row must also not fall through to `Global`, since none of
-    /// today's unbuilt chords are bound there either.
+    /// an unbuilt binding "does not dispatch". Built against a synthetic single-row table
+    /// rather than off `unbuilt_bindings()`: with `d` built,
+    /// `BINDINGS` carries no unbuilt row at all today, and this property is about
+    /// [`BindingTable::dispatch`]'s own filter on the `built` flag, not about which row
+    /// happens to be in that state this week. A `List` row must also not fall through to
+    /// `Global`, since a table with nothing bound in `Global` proves the fallback finds
+    /// nothing rather than the unbuilt row leaking through it.
     #[test]
     fn dispatch_never_fires_a_chord_bound_only_to_an_unbuilt_binding() {
-        let unbuilt = unbuilt_bindings();
-        assert!(
-            !unbuilt.is_empty(),
-            "no unbuilt binding left to prove dispatch filters one out; revisit this test \
-             once keybindings.md's \"Not built yet\" list is empty"
+        let table = single_unbuilt_binding_table(
+            Context::List,
+            KeyCode::Char('x'),
+            NONE,
+            Action::DismissVanished,
         );
-        let table = BindingTable::compiled_default();
-        for (context, code, modifiers, action) in unbuilt {
-            assert_eq!(
-                table.dispatch(context, press(code, modifiers)),
-                None,
-                "{action:?} is unbuilt in {context:?}, but its chord still dispatched"
-            );
-        }
+
+        assert_eq!(
+            table.dispatch(Context::List, press(KeyCode::Char('x'), NONE)),
+            None,
+            "an unbuilt binding's own chord must not dispatch in its own context"
+        );
+        assert_eq!(
+            table.dispatch(Context::Global, press(KeyCode::Char('x'), NONE)),
+            None,
+            "an unbuilt List binding must not fall through to Global either"
+        );
     }
 
     /// [`BindingTable::describe`] is the help overlay's only source of content; an unbuilt
-    /// action must never appear in it, in any context that binds it.
+    /// action must never appear in it. Built against a synthetic single-row table for the
+    /// same reason [`dispatch_never_fires_a_chord_bound_only_to_an_unbuilt_binding`] is:
+    /// `BINDINGS` carries no unbuilt row today, and this is a property of `describe`'s own
+    /// filter rather than of this week's production data.
     #[test]
     fn describe_excludes_every_currently_unbuilt_binding() {
-        let unbuilt = unbuilt_bindings();
-        assert!(
-            !unbuilt.is_empty(),
-            "no unbuilt binding left to prove describe() filters one out; revisit this test \
-             once keybindings.md's \"Not built yet\" list is empty"
+        let table = single_unbuilt_binding_table(
+            Context::List,
+            KeyCode::Char('x'),
+            NONE,
+            Action::DismissVanished,
         );
-        for (context, _, _, action) in unbuilt {
-            let rows = describe(context);
-            assert!(
-                !rows.iter().any(|(_, desc)| *desc == description(action)),
-                "{action:?} is unbuilt in {context:?} but still appears in describe(): {rows:?}"
-            );
-        }
+
+        let rows = table.describe(Context::List);
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, desc)| *desc == description(Action::DismissVanished)),
+            "an unbuilt action must not appear in describe(): {rows:?}"
+        );
     }
 
     // =====================================================================================
@@ -2277,23 +2325,39 @@ mod tests {
     /// binding is ignored outright, leaving the action's reserved chord exactly as
     /// unreachable as it was before this entry was ever read.
     ///
-    /// Picks whichever action is currently unbuilt in any context off [`unbuilt_bindings`]
-    /// rather than naming one, so this keeps checking the real thing as bindings move from
-    /// unbuilt to built over time instead of drifting onto an action that has since shipped.
-    /// Not pinned to `Global` specifically: that context can run dry (as it did once `b`
-    /// was built), while `List` still carries `d` and the List-only half of the page
-    /// bindings.
+    /// Built against [`merge_over`]'s own seam rather than off [`unbuilt_bindings`]: with `d`
+    /// built, `BINDINGS` carries no
+    /// unbuilt row today, so this test supplies its own base, the compiled default with
+    /// `Action::DismissVanished` in `List` swapped for an unbuilt row at a different chord.
+    /// That keeps this criterion holding regardless of how many production rows are
+    /// currently unbuilt, rather than needing revisiting every time that count reaches zero.
     #[test]
     fn a_known_action_that_is_not_built_yet_warns_saying_so_rather_than_unknown_and_is_ignored() {
-        let (unbuilt_context, unbuilt_code, unbuilt_modifiers, unbuilt_action) =
-            unbuilt_bindings().into_iter().next().expect(
-                "expected at least one currently-unbuilt action to test this criterion against",
-            );
+        let unbuilt_context = Context::List;
+        let unbuilt_code = KeyCode::Char('x');
+        let unbuilt_modifiers = NONE;
+        let unbuilt_action = Action::DismissVanished;
+
+        let BindingTable(mut base) = BindingTable::compiled_default();
+        base.retain(|(row_context, _, _, row_action, _)| {
+            !(*row_context == unbuilt_context && *row_action == unbuilt_action)
+        });
+        base.push(binding_not_built(
+            unbuilt_context,
+            unbuilt_code,
+            unbuilt_modifiers,
+            unbuilt_action,
+        ));
+
         let action_name =
             action_name(unbuilt_action).expect("an unbuilt action must still have a config name");
         let context_name_text = context_name(unbuilt_context);
 
-        let (bindings, warnings) = merge_ok(&[(context_name_text, &[(action_name, "f5")])]);
+        let (bindings, warnings) = merge_over(
+            &base,
+            &keys_block(&[(context_name_text, &[(action_name, "f5")])]),
+        )
+        .expect("expected the keys block to merge");
         assert_eq!(
             warnings,
             vec![KeysWarning::NotBuilt {

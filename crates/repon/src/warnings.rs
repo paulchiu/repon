@@ -1,18 +1,23 @@
 //! The one shared warning population [config.md](../../../../docs/spec/config.md) amends
-//! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings and
-//! an abandoned discovery fold into one [`Warning`] list. This module is an item source for
-//! [`crate::status_row`], not a renderer: [`slot_line`] computes the single most severe
-//! warning's own text, the same text the status row shows as its rank-2 item while any
-//! condition is unacknowledged, and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
+//! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings, an
+//! abandoned discovery and vanished entities fold into one [`Warning`] list. This module is
+//! an item source for [`crate::status_row`], not a renderer: [`slot_line`] computes the
+//! single most severe warning's own text, the same text the status row shows as its rank-2
+//! item while any condition is unacknowledged, and `w` ([keybindings.md](../../../../docs/spec/keybindings.md))
 //! expands the population to the full list ([`draw_overlay`]), still drawn from here since
 //! the overlay is its own screen rather than an item in the status row's list
 //! ([0026](../../../../docs/adr/0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md)).
 //! [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" fixes the
-//! population to these three **standing conditions of the session**: a bound-but-unbuilt key
+//! population to these four **standing conditions of the session**: a bound-but-unbuilt key
 //! the user just pressed was a fourth source here until
 //! [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
 //! removed it, since a reply to a keystroke is not a standing condition and this module never
-//! clears one on its own; [`crate::notice`] is where that reply now lives instead.
+//! clears one on its own; [`crate::notice`] is where that reply now lives instead. Vanished
+//! entities are the real fourth source, an abandoned discovery's mirror: an
+//! abandoned walk means rows may be missing, and a Vanished row means one is present that no
+//! longer exists. Unlike the other three, this source is never latched: [`WarningSources`] is
+//! built fresh every frame from the live snapshot, so the condition clears itself the instant
+//! the last Vanished row is dismissed or rediscovered, with nothing to reset by hand.
 //!
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
@@ -26,29 +31,39 @@ use crate::{
     theme::{self, Theme},
 };
 
-/// Every source the shared warning slot can carry, one variant per source. Adding a fourth
+/// Every source the shared warning slot can carry, one variant per source. Adding a fifth
 /// source means adding a variant here, which leaves [`Warning::rank`] and [`Warning`]'s own
 /// `Display` impl refusing to compile until the new variant is folded in: neither match below
-/// has a catch-all arm, so a fourth source cannot go silently unranked.
+/// has a catch-all arm, so a fifth source cannot go silently unranked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Warning {
     Theme(theme::ThemeWarning),
     Config(config::document::Warning),
     DiscoveryAbandoned(String),
+    /// How many Entities are currently Vanished
+    /// rows present that no longer
+    /// exist, the mirror of [`Warning::DiscoveryAbandoned`], which means rows may be missing
+    /// instead.
+    Vanished(usize),
 }
 
 impl Warning {
     /// Higher ranks are more severe. Ranked by how much of what is already on screen the
-    /// condition puts in doubt: an abandoned walk means the table itself may be missing
-    /// Repos, a config warning means some of this session's own behaviour silently fell back
-    /// to a default, and a theme warning is cosmetic only. Exhaustive by construction: a
-    /// fourth [`Warning`] variant leaves this `match` refusing to compile until it is ranked
-    /// too.
+    /// condition puts in doubt: a Vanished row and an abandoned walk are ranked together at
+    /// the top, one meaning rows on screen no longer exist and the other meaning rows are
+    /// missing from it, a config warning means some of this session's own behaviour silently
+    /// fell back to a default, and a theme warning is cosmetic only.
+    /// [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" states the
+    /// population in this same order, least severe first, which this module's own
+    /// `rank_matches_theming_mds_own_severity_order` test pins this match against rather than
+    /// restating the order by hand. Exhaustive by construction: a fifth [`Warning`] variant
+    /// leaves this `match` refusing to compile until it is ranked too.
     fn rank(&self) -> u8 {
         match self {
             Warning::Theme(_) => 1,
             Warning::Config(_) => 2,
             Warning::DiscoveryAbandoned(_) => 3,
+            Warning::Vanished(_) => 4,
         }
     }
 }
@@ -59,6 +74,7 @@ impl std::fmt::Display for Warning {
             Warning::Theme(warning) => write!(f, "{warning}"),
             Warning::Config(warning) => write!(f, "{warning}"),
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
+            Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
         }
     }
 }
@@ -73,6 +89,11 @@ pub(crate) struct WarningSources {
     pub(crate) theme: Vec<theme::ThemeWarning>,
     pub(crate) config: Vec<config::document::Warning>,
     pub(crate) discovery_abandoned: Option<String>,
+    /// How many Entities are Vanished right now, read fresh from the live snapshot every
+    /// time this struct is built rather than latched, which is what lets the condition clear
+    /// itself the instant the count returns to zero with nothing to reset by hand
+    /// Zero contributes no warning.
+    pub(crate) vanished: usize,
 }
 
 impl WarningSources {
@@ -83,6 +104,7 @@ impl WarningSources {
             theme,
             config,
             discovery_abandoned,
+            vanished,
         } = self;
         let mut warnings: Vec<Warning> = theme.into_iter().map(Warning::Theme).collect();
         warnings.extend(config.into_iter().map(Warning::Config));
@@ -91,6 +113,9 @@ impl WarningSources {
                 .into_iter()
                 .map(Warning::DiscoveryAbandoned),
         );
+        if vanished > 0 {
+            warnings.push(Warning::Vanished(vanished));
+        }
         warnings
     }
 }
@@ -186,6 +211,10 @@ mod tests {
         Warning::DiscoveryAbandoned(format!("discovery: stopped at {directories} directories"))
     }
 
+    fn vanished(count: usize) -> Warning {
+        Warning::Vanished(count)
+    }
+
     // --- WarningSources: the compile-time forcing function ---
 
     #[test]
@@ -196,6 +225,7 @@ mod tests {
             }],
             config: vec![document::Warning::SetNamedAll],
             discovery_abandoned: Some("discovery: stopped at 5 directories".to_string()),
+            vanished: 2,
         };
 
         let warnings = sources.into_warnings();
@@ -206,22 +236,44 @@ mod tests {
                 theme_unknown_key("x"),
                 config_set_named_all(),
                 discovery_abandoned(5),
+                vanished(2),
             ]
         );
     }
 
     #[test]
-    fn a_missing_discovery_warning_contributes_nothing_to_the_flat_list() {
+    fn a_missing_discovery_warning_and_a_zero_vanished_count_contribute_nothing_to_the_flat_list() {
         let sources = WarningSources {
             theme: Vec::new(),
             config: Vec::new(),
             discovery_abandoned: None,
+            vanished: 0,
         };
 
         assert!(sources.into_warnings().is_empty());
     }
 
     // --- criterion: the slot shows the single most severe outstanding condition ---
+
+    #[test]
+    fn most_severe_picks_vanished_over_discovery_config_and_theme_even_arriving_last_and_outnumbered()
+     {
+        // Every lower-severity condition arrives first; Vanished, the newest and now the most
+        // severe source, arrives last
+        // and alone. A ranking that merely took the first or the most common condition would
+        // get this wrong.
+        let warnings = vec![
+            theme_unknown_key("a"),
+            theme_unknown_key("b"),
+            config_set_named_all(),
+            discovery_abandoned(412_000),
+            vanished(7),
+        ];
+
+        let winner = most_severe(&warnings).expect("expected a most-severe warning");
+
+        assert_eq!(winner, &vanished(7));
+    }
 
     #[test]
     fn most_severe_picks_discovery_over_config_and_theme_even_arriving_last_and_outnumbered() {
@@ -448,6 +500,61 @@ mod tests {
     // ranked, which `rank`'s own match (no wildcard arm) enforces at build time rather than
     // at test time. There is nothing a runtime test can assert about a variant that does not
     // exist yet; the guarantee lives in the match itself.
+
+    // --- criterion: Vanished ranks against theming.md's own stated order, not a number
+    // chosen here and merely restated by `rank`'s doc comment ---
+
+    /// [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" names the
+    /// warning slot's population in one sentence, least severe standing condition first: "a
+    /// theme that half-applied, a config key that fell back, an abandoned discovery, entities
+    /// that vanished and are still listed". Reads that sentence at test time and asserts
+    /// [`Warning::rank`] increases in the same order, rather than hand-copying "theme, config,
+    /// discovery, vanished" into the assertion, which would let this test and `rank` drift
+    /// independently of the document both are supposed to agree with.
+    #[test]
+    fn rank_matches_theming_mds_own_severity_order() {
+        let theming = spec("theming.md");
+        let sentence = theming
+            .split("The warning slot carries **standing conditions of the session only**: ")
+            .nth(1)
+            .expect("theming.md still introduces the warning slot's population in that sentence");
+        let (clauses_text, _) = sentence
+            .split_once('.')
+            .expect("the standing-conditions sentence ends with a full stop");
+        let clauses: Vec<&str> = clauses_text.split(", ").collect();
+        assert_eq!(
+            clauses.len(),
+            4,
+            "expected theming.md to name exactly the four standing conditions `Warning` has \
+             variants for, got: {clauses:?}"
+        );
+
+        let ranks: Vec<u8> = clauses
+            .iter()
+            .map(|clause| {
+                if clause.contains("theme") {
+                    theme_unknown_key("x").rank()
+                } else if clause.contains("config") {
+                    config_set_named_all().rank()
+                } else if clause.contains("discovery") {
+                    discovery_abandoned(5).rank()
+                } else if clause.contains("vanished") {
+                    vanished(1).rank()
+                } else {
+                    panic!(
+                        "theming.md names a standing condition this test cannot classify \
+                         against a `Warning` variant: {clause:?}"
+                    )
+                }
+            })
+            .collect();
+
+        assert!(
+            ranks.windows(2).all(|pair| pair[0] < pair[1]),
+            "`Warning::rank` must increase in the same order theming.md lists the standing \
+             conditions, least severe first; got ranks {ranks:?} for clauses {clauses:?}"
+        );
+    }
 
     // --- the status row contract, pinned in the documents status_row.rs builds against ---
 

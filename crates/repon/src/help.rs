@@ -627,26 +627,28 @@ mod tests {
     }
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
-    /// the help overlay carries only Built bindings. Reads whichever action is currently
-    /// unbuilt in any context off [`keys::unbuilt_bindings`]
-    /// ([keybindings.md](../../../../docs/spec/keybindings.md#not-built-yet)) rather than
-    /// naming one, so this keeps checking the real thing as bindings move from unbuilt to
-    /// built over time instead of drifting onto an action that has since shipped. Not
-    /// pinned to `Global` specifically: that context can run dry (as it did once `b` was
-    /// built), while `List` still carries `d` and the List-only half of the page bindings.
+    /// the help overlay carries only Built bindings. Built against
+    /// [`keys::single_unbuilt_binding_table`]'s synthetic table rather than off
+    /// [`keys::unbuilt_bindings`]: with `d` built,
+    /// `BINDINGS` carries no unbuilt row today, and `content`'s own filter is what this test
+    /// proves, not which production row happens to be in that state this week.
     #[test]
     fn content_excludes_a_currently_unbuilt_binding() {
-        let (unbuilt_context, _, _, unbuilt_action) =
-            crate::keys::unbuilt_bindings().into_iter().next().expect(
-                "expected at least one currently-unbuilt binding to test this criterion against",
-            );
+        let unbuilt_context = Context::List;
+        let unbuilt_action = Action::DismissVanished;
+        let table = crate::keys::single_unbuilt_binding_table(
+            unbuilt_context,
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+            unbuilt_action,
+        );
         let unbuilt_description = crate::keys::description(unbuilt_action);
-        let lines = HelpOverlay::content(&default_table(), unbuilt_context);
+        let lines = HelpOverlay::content(&table, unbuilt_context);
         assert!(
             !lines
                 .iter()
                 .any(|(_, description)| *description == unbuilt_description),
-            "expected {unbuilt_description:?}, unbuilt today in {unbuilt_context:?}, to be \
+            "expected {unbuilt_description:?}, unbuilt in this synthetic table, to be \
              absent from the help overlay, got: {lines:?}"
         );
     }

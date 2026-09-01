@@ -975,6 +975,19 @@ impl Core {
         self.partition_operable(order).0.len()
     }
 
+    /// How many Entities in the live table are Vanished. Reads the table in place rather
+    /// than through [`Self::snapshot`], so a caller needing only the count does not pay for
+    /// a clone of the whole table and its staleness pass on every frame.
+    pub fn vanished_count(&self) -> usize {
+        self.table
+            .read()
+            .unwrap()
+            .entities
+            .iter()
+            .filter(|entity| entity.presence == Presence::Vanished)
+            .count()
+    }
+
     /// How an Action's `when` predicate divides the very rows [`Self::operable_count`]
     /// counts: the identical partition runs first, so an excluded row is subtracted before
     /// the predicate ever sees it and `when` narrows what is left rather than replacing that
