@@ -1385,7 +1385,7 @@ mod tests {
             .expect("run git checkout --detach");
         assert!(status.success());
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -1638,7 +1638,7 @@ mod tests {
         .expect("write .gitmodules");
         init_repo_with_a_resolvable_default_branch(&submodule_path, "feature-distinct-branch");
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -2871,7 +2871,7 @@ mod tests {
         assert!(status.success());
         git(&root, &["commit", "--allow-empty", "-m", "first"]);
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.clone()],

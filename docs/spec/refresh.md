@@ -10,7 +10,7 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 
 | trigger | what it does |
 | --- | --- |
-| Startup | Generation 1 over everything, with an empty prior state. |
+| Startup | Generation 1 over everything, with an empty prior state. `Core::start` returns before its own discovery has landed, so this Generation resolves its order after its own walk rather than from a table the consumer could name. |
 | The refresh key | A new generation over everything, on `r`, settled in [keybindings.md](keybindings.md). |
 | Refreshing the Selection | A new generation over the Selection only, on `R`. A separate explicit gesture, not the default, because after acting on three Repos you want those three re-read now rather than a four second sweep. |
 | Returning from a Launcher | The entity that was handed off is re-probed first and synchronously, then a normal generation starts. |
@@ -114,6 +114,14 @@ gix checks the flag once per index entry, so one Repo stops in 0.5 to 0.9ms, and
 There is no per-cell timeout. A rayon task cannot be pre-empted, so a per-cell deadline could only mark a cell while the work carried on underneath it, and a probe that is still running has not asked and got nothing back, which is what Unknown means under [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md). Instead a generation is cancelled after 30 seconds, comfortably clear of the measured 4.4 second full probe, and every cell still Loading in that generation becomes Unknown at that moment.
 
 Unknown carries a reason, which the detail pane reports in words: timed out, or no default branch. Both render `?` in the gutter. This sentence previously listed four reasons; [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`, and [core-api.md](core-api.md) records the set as closed at two. `unknown:timed-out` reaches the first from the Filter line ([filter.md](filter.md)).
+
+## Discovery is never on the calling thread
+
+Discovery rides on every Generation, and no Generation's walk runs on the thread that asked for it. `Core::start` spawns the first walk and returns against an empty table, so the terminal is claimed and a first frame drawn while it runs; every later Generation reserves its number on the calling thread and runs the walk and the fan-out on one of its own. Measured against a directory of 309 Repos, the headless settle was 3.3 seconds of wall clock and 38.5 seconds of system time, all of it ahead of the first frame, and `r`, focus gained and resume each paid a full walk on the render thread.
+
+Two properties survive that move, and both are what the threading is shaped around. The Generation number is reserved on the calling thread, so the numbers stay in gesture order however long the walks take; and the bodies then run in that same order, so an older Generation can never reach the table behind a newer one, set that newer one's interrupt flags and record itself as the live one, which is Supersession below read backwards.
+
+Discovery still lands in one batch at the end of its walk. Rows are not streamed as boundaries are found.
 
 ## Whose clocks these are
 

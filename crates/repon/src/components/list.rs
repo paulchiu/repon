@@ -1205,7 +1205,7 @@ mod tests {
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo_on_branch(&root, branch);
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -1282,7 +1282,7 @@ mod tests {
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_unborn_repo_on_branch(&root, branch);
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.clone()],
@@ -1391,7 +1391,7 @@ mod tests {
         assert!(status.success());
         std::fs::write(root.join("untracked.txt"), "scratch").expect("write untracked file");
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.clone()],
@@ -2487,7 +2487,7 @@ mod tests {
             "config branch merge",
         );
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.clone()],
@@ -3085,7 +3085,7 @@ mod tests {
         write_gitmodules(&parent, "lib", "vendor/lib");
         init_detached_repo_with_a_resolvable_default_branch(&parent.join("vendor").join("lib"));
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -3161,7 +3161,7 @@ mod tests {
         let submodule_short_id =
             init_detached_repo_with_a_commit(&parent.join("vendor").join("lib"));
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -3427,7 +3427,7 @@ mod tests {
         write_gitmodules(&parent, "lib", "vendor/lib");
         // Deliberately never initialised: no directory at all at the declared path.
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -3708,7 +3708,7 @@ mod tests {
         let brand_new = root.join("brand-new");
         init_unborn_repo_on_branch(&brand_new, "main");
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root],
@@ -4011,7 +4011,7 @@ mod tests {
         use repon_core::{Core, CoreSpec, SetSpec};
         use std::time::Duration;
 
-        let core = Core::start(CoreSpec {
+        let core = Core::start_discovered(CoreSpec {
             set: SetSpec {
                 name: "test".to_string(),
                 roots: vec![root.to_path_buf()],

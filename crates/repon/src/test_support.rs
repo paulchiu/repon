@@ -1335,21 +1335,30 @@ mod tests {
     // empty scan already fails the exact-count assertion, and the extra guards are kept for the
     // same reason that test's are, to name the right cause when one does.
 
-    /// The `repon` crate's own production call sites into the public `Core::refresh`: the
-    /// seven triggers that have a cursor and a viewport to order by, which `repon-core` has
-    /// neither (`dispatch_order`'s own doc comment in `app.rs`), so the other two triggers
-    /// (an Action starting and finishing) never call this method at all. Startup (`App::new`),
+    /// The `repon` crate's own production call sites into the two public Generation
+    /// starters: the seven triggers that have a cursor and a viewport to order by, which
+    /// `repon-core` has neither (`dispatch_order`'s own doc comment in `app.rs`), so the
+    /// other two triggers (an Action starting and finishing) never call either method at
+    /// all.
+    ///
+    /// Four go through `Core::refresh`, which takes the order the caller computed:
     /// returning from suspension (`App::on_resume`, shared by a bare `SIGTSTP` and a
     /// Launcher's own handoff), `Action::RefreshAll`, terminal focus gained
-    /// (`App::on_focus_gained`), `Action::RefreshSelection`, a Set switch
+    /// (`App::on_focus_gained`) and `Action::RefreshSelection`.
+    ///
+    /// Three go through `Core::refresh_all`, which reads the order off the table after its
+    /// own discovery has run: startup (`App::new`), a Set switch
     /// (`reload::apply_active_set`) and `repon status`'s own one-shot dispatch
     /// (`app::status::settle_document`, a separate, short-lived `Core` this process starts,
-    /// refreshes once and drops): seven call sites for seven triggers, one each. Scanned across
-    /// both crates' `src` (via `production_lines_containing`) rather than `repon`'s alone, so
-    /// a stray production call newly appearing in `repon-core` would still be caught instead
-    /// of silently falling outside the scan's own boundary.
+    /// refreshes once and drops). All three follow a fresh `Core::start`, which returns
+    /// before its own discovery has landed, so none of them has a key to name yet.
+    ///
+    /// Seven call sites for seven triggers, one each. Scanned across both crates' `src`
+    /// (via `production_lines_containing`) rather than `repon`'s alone, so a stray
+    /// production call newly appearing in `repon-core` would still be caught instead of
+    /// silently falling outside the scan's own boundary.
     #[test]
-    fn exactly_seven_production_call_sites_call_core_refresh_from_the_repon_crate() {
+    fn exactly_seven_production_call_sites_start_a_generation_from_the_repon_crate() {
         let files: usize = workspace_crate_src_dirs()
             .iter()
             .map(|dir| rust_source_files(dir).len())
@@ -1360,20 +1369,30 @@ mod tests {
              longer exists, and this scan would otherwise pass on having inspected nothing"
         );
 
-        let offending = production_lines_containing(&format!(".{}(", "refresh"));
+        let ordered = production_lines_containing(&format!(".{}(", "refresh"));
+        let over_everything = production_lines_containing(&format!(".{}(", "refresh_all"));
 
         assert!(
-            !offending.is_empty(),
-            "found zero calls to `Core::refresh`; this scan's own needle broke rather than \
-             every trigger disappearing, and would otherwise pass vacuously"
+            !ordered.is_empty() && !over_everything.is_empty(),
+            "found zero calls to one of `Core::refresh` and `Core::refresh_all`; this scan's \
+             own needles broke rather than every trigger disappearing, and it would \
+             otherwise pass vacuously"
         );
         assert_eq!(
-            offending.len(),
-            7,
-            "expected exactly seven production call sites into `Core::refresh` (Startup, \
-             returning from suspension, RefreshAll, terminal focus gained, RefreshSelection, \
-             a Set switch and `repon status`'s own one-shot dispatch); a count that moved \
-             means a trigger was added, removed, or a call site duplicated, at: {offending:?}"
+            ordered.len(),
+            4,
+            "expected exactly four production call sites into `Core::refresh` (returning \
+             from suspension, RefreshAll, terminal focus gained and RefreshSelection); a \
+             count that moved means a trigger was added, removed, or a call site \
+             duplicated, at: {ordered:?}"
+        );
+        assert_eq!(
+            over_everything.len(),
+            3,
+            "expected exactly three production call sites into `Core::refresh_all` \
+             (Startup, a Set switch and `repon status`'s own one-shot dispatch); a count \
+             that moved means a trigger was added, removed, or a call site duplicated, at: \
+             {over_everything:?}"
         );
     }
 
@@ -1381,18 +1400,21 @@ mod tests {
     /// (`core.rs`'s own doc comment on `Core::refresh`); it is private to `repon-core`, so a
     /// call to it can only ever live there, and confining the scan to that crate is the
     /// claim's own shape rather than a scan quietly narrowing what it inspects: the thing
-    /// scanned for cannot live anywhere else. Its three production callers are `Core::refresh`
-    /// itself (the funnel every one of the seven `repon`-side triggers above shares),
-    /// `Core::run_action`'s own completion (an Action finishing), and the periodic fetch's own
-    /// completion inside `run_fetch_cycle` (a finished fetch,
+    /// scanned for cannot live anywhere else. `RefreshHandles::dispatch`'s three production
+    /// callers are `Core::refresh` itself (the funnel the four ordered `repon`-side triggers
+    /// above share), `Core::run_action`'s own completion (an Action finishing), and the
+    /// periodic fetch's own completion inside `run_fetch_cycle` (a finished fetch,
     /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
     /// "The periodic fetch": "a finished fetch starts a normal generation"); all three bypass
-    /// `Core::refresh` because none has a cursor to order by. Confining the scan is also what
-    /// lets the needle be the bare `.dispatch(`, which no line wrap can split: qualifying it by
-    /// the receiver, to dodge `BindingTable::dispatch` over in `repon`, would make a call
-    /// rustfmt wrapped onto its own line invisible to this count.
+    /// `Core::refresh` because none has a cursor to order by. Its sibling
+    /// `RefreshHandles::dispatch_over_everything` has exactly one, `Core::refresh_all`, and is
+    /// counted separately rather than folded in: two needles for two primitives is what makes
+    /// a new caller of either one show up as a moved count. Confining the scan is also what
+    /// lets the first needle be the bare `.dispatch(`, which no line wrap can split:
+    /// qualifying it by the receiver, to dodge `BindingTable::dispatch` over in `repon`, would
+    /// make a call rustfmt wrapped onto its own line invisible to this count.
     #[test]
-    fn exactly_three_production_call_sites_mint_a_new_generation_in_repon_core() {
+    fn exactly_four_production_call_sites_mint_a_new_generation_in_repon_core() {
         let core_src = vec![workspace_crate_src_dirs()[1].clone()];
         assert!(
             !rust_source_files(&core_src[0]).is_empty(),
@@ -1400,21 +1422,33 @@ mod tests {
              resolves, and this scan would otherwise pass on having inspected nothing"
         );
 
-        let offending = production_lines_under_containing(&core_src, &format!(".{}(", "dispatch"));
+        let ordered = production_lines_under_containing(&core_src, &format!(".{}(", "dispatch"));
+        let over_everything = production_lines_under_containing(
+            &core_src,
+            &format!(".{}(", "dispatch_over_everything"),
+        );
 
         assert!(
-            !offending.is_empty(),
-            "found zero calls to `RefreshHandles::dispatch`; this scan's own needle broke \
-             rather than every Generation-minting call site disappearing, and would otherwise \
+            !ordered.is_empty() && !over_everything.is_empty(),
+            "found zero calls to one of `RefreshHandles::dispatch` and \
+             `RefreshHandles::dispatch_over_everything`; this scan's own needles broke rather \
+             than every Generation-minting call site disappearing, and it would otherwise \
              pass vacuously"
         );
         assert_eq!(
-            offending.len(),
+            ordered.len(),
             3,
-            "expected exactly three production call sites that mint a new Generation \
+            "expected exactly three production call sites into `RefreshHandles::dispatch` \
              (`Core::refresh`'s own body, an Action's completion inside `Core::run_action`, and \
              a finished periodic fetch's completion inside `run_fetch_cycle`); a count that \
-             moved means a new place starts one, at: {offending:?}"
+             moved means a new place starts one, at: {ordered:?}"
+        );
+        assert_eq!(
+            over_everything.len(),
+            1,
+            "expected exactly one production call site into \
+             `RefreshHandles::dispatch_over_everything` (`Core::refresh_all`'s own body); a \
+             count that moved means a new place starts one, at: {over_everything:?}"
         );
     }
 

@@ -179,6 +179,7 @@ There is no notification channel. The terminal interface's event thread already 
 impl Core {
     pub fn start(spec: CoreSpec) -> Core;
     pub fn refresh(&self, order: &[EntityKey]) -> Generation;
+    pub fn refresh_all(&self) -> Generation;
     pub fn probe_now(&self, key: &EntityKey) -> EntityState;
     pub fn snapshot(&self) -> Snapshot;
     pub fn settle(&self, within: Duration) -> Snapshot;
@@ -195,11 +196,12 @@ They group into four concerns.
 | concern | signature | purpose |
 | --- | --- | --- |
 | Lifecycle | `start`, `pause`, `resume`, `Drop` | Spawn the threads, stop them for a suspension, join them at the end |
-| Refreshing | `refresh`, `probe_now`, `dismiss` | Start a Generation, re-probe one entity synchronously, drop a Vanished row |
+| Refreshing | `refresh`, `refresh_all`, `probe_now`, `dismiss` | Start a Generation over an order the caller computed or over everything discovery finds, re-probe one entity synchronously, drop a Vanished row |
 | Reading | `snapshot`, `settle` | Clone the table now, or block until it settles |
 | Counting | `count` | Match a `SetSpec` with no probing and no provenance |
 
 - `refresh` takes an already-ordered list of keys and attaches no meaning to an empty one. [refresh.md](refresh.md) dispatches phase C cursor row first, then the visible rows, then the rest in discovery order; the caller computes that order, which costs the core nothing because the order was already 'by position, not by predicted cost'.
+- `refresh_all` is the same Generation with its order resolved after that Generation's own discovery rather than by the caller. It exists because `start` returns before its discovery has landed, so a consumer at launch, at a Set switch or in `repon status` holds an empty table and has no key to name; nothing is lost to it, because none of the three has a cursor or a viewport yet either. Every other trigger has both, and takes `refresh`.
 - `probe_now` is the Launcher return: [refresh.md](refresh.md) requires the handed-off entity to be re-probed first and synchronously before a normal Generation starts.
 - `pause` and `resume` exist because all background work stops while the terminal interface is suspended. The core is not told why.
 - `settle` is the machine-readable consumer's whole loop: it blocks until nothing is in flight or the deadline passes, then returns.
@@ -213,7 +215,7 @@ The check lives in the core and nowhere else. That is the whole reason the core 
 
 ## Threads and lifecycle
 
-`Core::start` rather than `Core::new`, because it spawns. Probes go on rayon's global pool, as the existing fan-out already does, one task per entity with gix's per-repository thread limit at 1, which [refresh.md](refresh.md) fixes and marks not configurable. The two second metadata poll and the thirty second Generation deadline share one dedicated thread, since a 1.79 millisecond sweep every two seconds does not earn a pool. `Drop` joins them.
+`Core::start` rather than `Core::new`, because it spawns. It spawns the first discovery too, so it returns against an empty table and the terminal is claimed and a first frame drawn while the walk runs; `settle` waits for that walk like it waits for a probe, so the machine-readable consumer is unaffected. Every Generation's own discovery runs on the same footing: `refresh` and `refresh_all` reserve the Generation number on the calling thread and run the walk and the fan-out on one of their own, so no keystroke and no focus event holds the render loop for the length of a walk. Reserving on the calling thread is what keeps the Generation numbers in gesture order; the bodies then queue on that order, so an older Generation can never insert its in-flight entries behind a newer one's and cancel them. Probes go on rayon's global pool, as the existing fan-out already does, one task per entity with gix's per-repository thread limit at 1, which [refresh.md](refresh.md) fixes and marks not configurable. The two second metadata poll and the thirty second Generation deadline share one dedicated thread, since a 1.79 millisecond sweep every two seconds does not earn a pool. `Drop` joins them.
 
 `gix::Repository` is `Send` and `Clone` but not `Sync`, because it holds a `RefCell` free-list of buffers; `gix::ThreadSafeRepository` is `Send`, `Sync` and `Clone`. So one `Repository` per task, never shared across them.
 
