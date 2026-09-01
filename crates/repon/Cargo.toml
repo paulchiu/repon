@@ -15,6 +15,14 @@ categories.workspace = true
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
+# Off by default, forwarding to `repon-core/fetch` (see that feature's own comment): this is
+# the one knob that reaches it from a binary a user can actually install. `cargo install`
+# has no `--features repon-core/fetch` of its own to type, since a workspace path dependency
+# is invisible to it; `--features fetch` on this crate is the only way in
+# (`docs/spec/releasing.md`'s "Where Repon can be installed from").
+[features]
+fetch = ["repon-core/fetch"]
+
 [dependencies]
 # Parses a captured Action step's raw ANSI SGR bytes into ratatui spans at render time
 # (`docs/spec/actions.md`'s "The run on screen"): ratatui-core itself drops every control
@@ -38,13 +46,15 @@ humantime-serde = "1.1.1"
 ratatui = "0.30"
 # `serde` turns on the settled document's wire format (ADR 0015): `repon status` is the
 # one caller that needs it. `repon-core`'s own `fetch` feature is deliberately never
-# requested here: it gates the periodic fetch's blocking network client, HTTP transport
-# and credential machinery, and turning it on for this binary's default build put
+# requested by default here: it gates the periodic fetch's blocking network client, HTTP
+# transport and credential machinery, and turning it on for this binary's default build put
 # reqwest, rustls and aws-lc-sys in every ordinary `cargo build`, breaking the Windows
-# cross-compile guard and the point of the feature existing at all. `CoreSpec::fetch`
-# stays plain, always-present bounding data either way (`FetchSpec`'s own doc comment),
-# so this crate's own code needs no `cfg` for it; without the cargo feature the periodic
-# fetch simply never runs, whatever a user's `config.toml` says.
+# cross-compile guard and the point of the feature existing at all. The `[features]` block
+# above forwards it as this crate's own opt-in `fetch` feature instead, so it stays reachable
+# from an install without ever joining `default`. `CoreSpec::fetch` stays plain,
+# always-present bounding data either way (`FetchSpec`'s own doc comment), so this crate's
+# own code needs no `cfg` for it; without the cargo feature the periodic fetch simply never
+# runs, whatever a user's `config.toml` says.
 repon-core = { workspace = true, features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1.14"

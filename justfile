@@ -130,16 +130,20 @@ check-core-isolation:
     # builds, because `repon-core` passing this in isolation already did once while
     # `repon`'s own manifest requested `repon-core/fetch` unconditionally, putting the
     # network stack (and aws-lc-sys's C sources, which fail to cross-compile to
-    # Windows) in every ordinary `cargo build`. `repon` has no `fetch` feature of its
-    # own to turn on, by design (`Cargo.toml`'s own comment on the dependency line), so
-    # only its default build is asserted clean; there is no "on" case to check there.
+    # Windows) in every ordinary `cargo build`. `repon` now carries its own opt-in
+    # `fetch` feature forwarding to `repon-core/fetch` (`Cargo.toml`'s own comment on
+    # the dependency line), the one path `cargo install --features fetch` reaches, so
+    # its "on" case is asserted here too: without it, `repon`'s own `[features]`
+    # entry could be spelled wrong, forward to nothing, or forward to the wrong
+    # feature name, and this check would still pass.
     check_network_stack_is_gated() {
         local -a network_crates=(reqwest rustls hyper-rustls tokio-rustls)
 
-        local core_default_tree core_fetch_tree repon_default_tree
+        local core_default_tree core_fetch_tree repon_default_tree repon_fetch_tree
         core_default_tree=$(cargo tree -p repon-core --edges normal --prefix none)
         core_fetch_tree=$(cargo tree -p repon-core --edges normal --prefix none --features fetch)
         repon_default_tree=$(cargo tree -p repon --edges normal --prefix none)
+        repon_fetch_tree=$(cargo tree -p repon --edges normal --prefix none --features fetch)
 
         for name in "${network_crates[@]}"; do
             if grep -qE "^${name} v" <<<"$core_default_tree"; then
@@ -157,8 +161,14 @@ check-core-isolation:
                 echo "crate the fetch path no longer pulls, so it proves nothing as written" >&2
                 exit 1
             fi
+            if ! grep -qE "^${name} v" <<<"$repon_fetch_tree"; then
+                echo "$name is absent from 'cargo build -p repon --features fetch'; repon's" >&2
+                echo "own fetch feature must forward to repon-core/fetch, the one path" >&2
+                echo "'cargo install --features fetch' actually reaches" >&2
+                exit 1
+            fi
         done
-        echo "repon-core's and repon's own default builds pull none of: ${network_crates[*]}, and repon-core's fetch feature pulls all of them"
+        echo "repon-core's and repon's own default builds pull none of: ${network_crates[*]}, and both crates' fetch feature pulls all of them"
     }
 
     check_network_stack_is_gated
