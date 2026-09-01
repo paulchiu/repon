@@ -3571,11 +3571,18 @@ fn probe_status(
 /// mid-read looks like, and [ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s
 /// precedent is that interrupted work is dropped rather than settled `Failed`, the same as
 /// every cheaper phase's pre-check already does.
+///
+/// gix checks `should_interrupt` per index entry rather than before every read, so a walk
+/// short enough to run out of entries to check between the flag flipping and the walk
+/// finishing can still return `Ok`. `cancel` is re-checked on that arm too, and an `Ok` that
+/// raced ahead of it is dropped the same way an `Err` alongside it already is, so a cancelled
+/// generation never lands a value regardless of which side of that race gix landed on.
 fn classify_status_result(
     result: Result<DirtyCounts, git::ProbeError>,
     cancel: &AtomicBool,
 ) -> Option<Settled<DirtyCounts>> {
     match result {
+        Ok(_) if cancel.load(Ordering::Acquire) => None,
         Ok(value) => Some(Settled::Known {
             value,
             at: Timestamp::now(),
@@ -7761,13 +7768,14 @@ mod tests {
     }
 
     /// Phase C's own cancellation shape, distinct from phase A and B's "before the read
-    /// starts" check: `git::dirty_counts` itself proves cancellation observed genuinely
-    /// mid-read reports as an `Err` (`dirty_counts_reports_an_error_when_cancel_is_already_set`
-    /// in `git.rs`), and this test covers the half that lives here, that `classify_status_result`
-    /// folds that error back to `None` rather than `Settled::Failed` once `cancel` reads
-    /// `true`, per ADR 0013's "interrupted work becomes Unknown rather than Failed". A
-    /// mutation that dropped the `cancel`-aware arm (always settling `Failed` on any error,
-    /// the way the cheaper phases' own errors do) fails this directly.
+    /// starts" check: gix can report a genuinely mid-read cancellation as an `Err`
+    /// (`dirty_counts_threads_the_cancel_flag_into_gix` in `git.rs` proves the flag actually
+    /// reaches gix, which is what makes that `Err` possible at all), and this test covers the
+    /// half that lives here, that `classify_status_result` folds that error back to `None`
+    /// rather than `Settled::Failed` once `cancel` reads `true`, per ADR 0013's "interrupted
+    /// work becomes Unknown rather than Failed". A mutation that dropped the `cancel`-aware
+    /// arm (always settling `Failed` on any error, the way the cheaper phases' own errors do)
+    /// fails this directly.
     #[test]
     fn classify_status_result_drops_an_error_once_cancel_reads_true() {
         let cancel = AtomicBool::new(true);
@@ -7798,6 +7806,53 @@ mod tests {
         assert!(
             matches!(outcome, Some(Settled::Failed(git::ProbeError::Status(_)))),
             "a genuine error with no cancellation must settle Failed, got {outcome:?}"
+        );
+    }
+
+    /// gix polls `should_interrupt` per index entry rather than before every read, so a walk
+    /// short enough to finish between checks (or with nothing left to check against) can
+    /// complete and return `Ok` even though `cancel` was set part way through it. Settling
+    /// that `Ok` anyway would let a cancelled generation write a value, exactly the outcome
+    /// [refresh.md's "Cancellation"](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)
+    /// says cancellation prevents. `classify_status_result` must re-check the same flag it
+    /// owns on the `Ok` arm too, not only on `Err`, and drop the value the same way a
+    /// cancelled `Err` is already dropped.
+    #[test]
+    fn classify_status_result_drops_an_ok_once_cancel_reads_true() {
+        let cancel = AtomicBool::new(true);
+
+        let outcome = classify_status_result(Ok(DirtyCounts::default()), &cancel);
+
+        assert!(
+            outcome.is_none(),
+            "an Ok value that raced ahead of a cancel flag now set must read as cancelled, \
+             not be settled Known, got {outcome:?}"
+        );
+    }
+
+    /// The other side of the same fold: an `Ok` with `cancel` still `false` is a genuine
+    /// completed read and must settle `Known`, not be silently dropped.
+    #[test]
+    fn classify_status_result_settles_known_when_cancel_never_fired() {
+        let cancel = AtomicBool::new(false);
+        let counts = DirtyCounts {
+            modified: 1,
+            untracked: 2,
+            deleted: 3,
+        };
+
+        let outcome = classify_status_result(Ok(counts), &cancel);
+
+        assert!(
+            matches!(
+                outcome,
+                Some(Settled::Known {
+                    value,
+                    at: _,
+                    stale: _
+                }) if value == counts
+            ),
+            "a genuine completed read with no cancellation must settle Known, got {outcome:?}"
         );
     }
 
