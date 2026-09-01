@@ -11,7 +11,7 @@ use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Snapshot};
 use tracing::debug;
 
 use crate::{
-    action_palette::{ActionPalette, Decision, Entry, Stage},
+    action_palette::{ActionPalette, Decision, Entry, Run, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
@@ -2107,9 +2107,11 @@ impl App {
                 frame,
                 area,
                 &self.theme,
-                &self.document.actions,
-                action_palette_operable_count.unwrap_or(0),
-                &management_lines,
+                Run {
+                    actions: &self.document.actions,
+                    operable_count: action_palette_operable_count.unwrap_or(0),
+                    management_lines: &management_lines,
+                },
                 self.glyphs,
             );
             return None;
@@ -3840,9 +3842,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &app.theme,
-                    &app.document.actions,
-                    1,
-                    &[],
+                    Run {
+                        actions: &app.document.actions,
+                        operable_count: 1,
+                        management_lines: &[],
+                    },
                     app.glyphs,
                 )
             })

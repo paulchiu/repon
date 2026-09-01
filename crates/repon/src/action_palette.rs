@@ -308,6 +308,16 @@ pub(crate) struct ActionPalette {
     scope: Scope,
 }
 
+/// What the palette needs to know about the run it is drawing over, bundled into one
+/// argument rather than three so this crate's own `clippy::too_many_arguments` budget has
+/// room for the glyph table. Built at each call site rather than held on the palette, since
+/// every field is a read of live state a frame must not cache.
+pub(crate) struct Run<'a> {
+    pub(crate) actions: &'a [ActionConfig],
+    pub(crate) operable_count: usize,
+    pub(crate) management_lines: &'a [String],
+}
+
 impl ActionPalette {
     /// `;`: every entry, the built-ins listed alongside the config-defined Actions.
     pub(crate) fn new() -> Self {
@@ -545,11 +555,14 @@ impl ActionPalette {
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        actions: &[ActionConfig],
-        operable_count: usize,
-        management_lines: &[String],
+        run: Run<'_>,
         glyphs: &'static GlyphSet,
     ) {
+        let Run {
+            actions,
+            operable_count,
+            management_lines,
+        } = run;
         let mut scratch = BorderScratch::new();
         let block = glyphs
             .bordered_block(&mut scratch)
@@ -1172,9 +1185,11 @@ mod tests {
                         frame,
                         frame.area(),
                         &Theme::default(),
-                        &actions,
-                        3,
-                        &[],
+                        Run {
+                            actions: &actions,
+                            operable_count: 3,
+                            management_lines: &[],
+                        },
                         glyphs,
                     );
                 })
@@ -1215,9 +1230,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &theme,
-                    &actions,
-                    3,
-                    &[],
+                    Run {
+                        actions: &actions,
+                        operable_count: 3,
+                        management_lines: &[],
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1247,9 +1264,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &theme,
-                    &actions,
-                    2,
-                    &[],
+                    Run {
+                        actions: &actions,
+                        operable_count: 2,
+                        management_lines: &[],
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1290,9 +1309,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &theme,
-                    &actions,
-                    12,
-                    &[],
+                    Run {
+                        actions: &actions,
+                        operable_count: 12,
+                        management_lines: &[],
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1372,9 +1393,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &crate::theme::DEFAULT,
-                    &[],
-                    25,
-                    &lines,
+                    Run {
+                        actions: &[],
+                        operable_count: 25,
+                        management_lines: &lines,
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1463,9 +1486,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &crate::theme::DEFAULT,
-                    &[],
-                    1,
-                    &lines,
+                    Run {
+                        actions: &[],
+                        operable_count: 1,
+                        management_lines: &lines,
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1518,9 +1543,11 @@ mod tests {
                     frame,
                     frame.area(),
                     &monochrome,
-                    &actions,
-                    2,
-                    &[],
+                    Run {
+                        actions: &actions,
+                        operable_count: 2,
+                        management_lines: &[],
+                    },
                     &crate::glyphs::FULL,
                 );
             })
@@ -1654,9 +1681,11 @@ mod tests {
                     frame,
                     frame.area(),
                     theme,
-                    actions,
-                    operable_count,
-                    &[],
+                    Run {
+                        actions,
+                        operable_count,
+                        management_lines: &[],
+                    },
                     &crate::glyphs::FULL,
                 )
             })
