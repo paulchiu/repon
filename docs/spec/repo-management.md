@@ -72,3 +72,5 @@ An `ignore` therefore takes effect immediately: the row it names is subtracted f
 ## Receipts
 
 A management operation's result is a receipt in [actions.md](actions.md)'s sense: it records what Repon did, never goes Stale on a poll, is not superseded by a Generation, and does not persist. A `delete` receipt names each Repo and whether its working tree was removed, its config entry was removed, or it was refused, with the refusal's reason.
+
+Not built. What ships is a log line per row and a one-line Notice carrying the counts; nothing reaches the detail pane. The obstacle is [actions.md](actions.md)'s closed set of four step outcomes, every one of them a child process's, and a management operation runs no child process. [The open questions register](../open-questions.md#a-management-result-has-no-receipt-of-its-own) states the gap and what would close it.

@@ -122,7 +122,12 @@ impl App {
     ///
     /// Reads `self.config_file` rather than [`crate::config::config_file`]'s own process-wide
     /// `OnceLock`, which `App::new` already fixed this field from: same path in production,
-    /// and a path a test can point at a tempdir.
+    /// and a path a test can point at a tempdir. Because that field is a resolved path,
+    /// [`crate::config::check_named_paths_exist`] runs first over the paths the user actually
+    /// named: config.md's "Either must exist if given" holds for the whole session, and a
+    /// `REPON_CONFIG` directory or `--config` file deleted mid-session must refuse here rather
+    /// than load as zero config, which would replace every Set, Action, Launcher, theme and
+    /// binding with the implicit defaults on a key pressed as casually as `Ctrl+R`.
     ///
     /// A failure here (malformed TOML, a collision the edit just introduced) is logged and
     /// otherwise swallowed rather than propagated: the terminal is already claimed, so this
@@ -144,6 +149,10 @@ impl App {
     /// key dispatches to a Launcher yet; `[[action]]` needs no re-apply of its own, since
     /// nothing in this crate reads it yet.
     pub(crate) fn reload_config(&mut self) {
+        if let Err(err) = crate::config::check_named_paths_exist(&self.named_config_paths) {
+            tracing::error!("config reload failed, keeping the previous configuration: {err:#}");
+            return;
+        }
         let new_config = match Config::at(self.config_dir.clone(), self.config_file.clone()) {
             Ok(config) => config,
             Err(err) => {

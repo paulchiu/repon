@@ -315,6 +315,11 @@ pub struct App {
     /// round trip against a directory it owns rather than the user's own configuration.
     config_dir: PathBuf,
     config_file: PathBuf,
+    /// The `REPON_CONFIG` directory and `--config` file this run was started with a name for,
+    /// carried so [`Self::reload_config`] can re-run [`config::check_named_paths_exist`]
+    /// against them: a named path that has gone away mid-session must refuse the reload, not
+    /// silently reload as zero config and discard every Set, Action, Launcher and binding.
+    named_config_paths: config::NamedPaths,
     /// Whether this run has no config at all: the default path absent, or a `REPON_CONFIG`
     /// directory holding no `config.toml` ([`config::document::Loaded::zero_config`]). Read
     /// by [`Self::scope_key`], which is the only thing that reads it.
@@ -473,6 +478,7 @@ impl App {
             data_dir: config.data_dir,
             config_dir: config::config_dir(),
             config_file: config::config_file(),
+            named_config_paths: config::named_paths(),
             zero_config: config.zero_config,
             cwd: config::document::working_directory(),
             filter: Filter::default(),
@@ -1487,12 +1493,6 @@ impl App {
         }
     }
 
-    /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count
-    /// from `self.selection.targets(cursor)` through
-    /// [`repon_core::Core::operable_count`], the identical computation
-    /// [`Self::start_action`]'s own confirm dialog reads, then hands it to
-    /// [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
-    /// untouched, the same as choosing with no match at all.
     /// How many entities a choice made right now would actually run against: the
     /// Selection narrowed by [`repon_core::Core::operable_count`], which is the same
     /// partition the fan-out itself uses, so the border title can never show a number a
@@ -1525,6 +1525,11 @@ impl App {
         Plan::new(operation, &self.core.snapshot().entities, targets)
     }
 
+    /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count from
+    /// `self.selection.targets(cursor)` through [`repon_core::Core::operable_count`], the
+    /// identical computation [`Self::start_action`]'s own confirm dialog reads, then hands it
+    /// to [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
+    /// untouched, the same as choosing with no match at all.
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
@@ -2386,6 +2391,9 @@ mod tests {
             // `data_dir` and `themes_dir` above already take.
             config_dir: PathBuf::new(),
             config_file: PathBuf::new(),
+            // Neither path was named, which is what a run with no `REPON_CONFIG` and no
+            // `--config` carries; a test about the named-path refusal sets this itself.
+            named_config_paths: config::NamedPaths::default(),
             zero_config: false,
             cwd: PathBuf::new(),
             filter: Filter::default(),
@@ -3636,18 +3644,80 @@ mod tests {
         );
     }
 
+    /// config.md's "Either must exist if given" holds for the whole session, not only for
+    /// startup: a `REPON_CONFIG` directory that has gone away by the time `Ctrl+R` is pressed
+    /// refuses the reload and keeps the previous reading. Without the check the reload
+    /// succeeds as zero config, and the implicit `all` Set rooted at the working directory
+    /// silently replaces every declared Set, which is the loss this asserts against.
+    #[test]
+    fn a_reload_refuses_once_a_named_config_directory_has_gone_away_and_keeps_the_previous_reading()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.named_config_paths = config::NamedPaths {
+            env_dir: Some(app.config_dir.clone()),
+            flag_file: None,
+        };
+
+        std::fs::remove_dir_all(config_dir.path()).expect("the named directory goes away");
+        let logs = crate::test_support::capture_tracing(|| app.reload_config());
+
+        assert_eq!(
+            app.document
+                .sets
+                .iter()
+                .map(|set| set.name.get_ref().clone())
+                .collect::<Vec<_>>(),
+            vec!["test".to_string()],
+            "the declared Set must survive a reload whose named directory has gone away"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "and the session must still be running the Set it was running"
+        );
+        assert!(
+            logs.contains("REPON_CONFIG") && logs.contains("keeping the previous configuration"),
+            "the refusal must name the variable it refused on, got: {logs:?}"
+        );
+    }
+
+    /// [keybindings.md](../../../docs/spec/keybindings.md)'s own count of conditional
+    /// surfaces, read off the sentence that states it rather than transcribed here. The spec
+    /// writes the number as a word, so an unknown word is a loud panic rather than a silently
+    /// skipped check.
+    fn spec_conditional_surface_count(spec: &str) -> usize {
+        let (before, _) = spec
+            .split_once(" surfaces are already conditional")
+            .expect("keybindings.md still states how many surfaces are conditional");
+        let word = before
+            .rsplit(char::is_whitespace)
+            .next()
+            .expect("a word before that count");
+        match word.to_lowercase().as_str() {
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            other => panic!("keybindings.md's surface count `{other}` is not a number word"),
+        }
+    }
+
     /// Criterion 5's own "and no more": every call site that raises
-    /// `action_running_notice` across both crates, since a Launcher and an Action step's
-    /// executor both spawn child processes and a scan confined to one crate would be
-    /// exactly "a check that quietly stops checking"
-    /// ([`crate::test_support::workspace_crate_src_dirs`]'s own doc comment). Named against
-    /// [keybindings.md](../../../docs/spec/keybindings.md)'s own four surfaces (the Action
-    /// palette, the Set picker, a Set switch and a config reload) rather than merely counted,
-    /// so a call site that happened to reuse one of those names could not slip through as
-    /// still reading the same.
+    /// `action_running_notice`. Scanned over this crate's `src` alone, which is the whole of
+    /// the claim rather than a narrowing of it, because `action_running_notice` is
+    /// `pub(crate)` in `repon` and so has no call site `repon-core` could hold. How many
+    /// distinct surfaces the count must come to is read from
+    /// [keybindings.md](../../../docs/spec/keybindings.md) at test time, and each one is
+    /// named as well as counted, so neither a call site reusing an existing label nor a spec
+    /// that grew a fifth surface can pass as still reading the same.
     #[test]
     fn exactly_the_four_declared_surfaces_are_gated_on_action_running_and_no_more() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read docs/spec/keybindings.md");
         let mut call_sites = Vec::new();
         for path in crate::test_support::rust_source_files(&manifest_dir.join("src")) {
             let source = crate::test_support::production_source_at(&path);
@@ -3686,6 +3756,14 @@ mod tests {
             ],
             "expected exactly the four surfaces keybindings.md names, no more and no \
              fewer, found: {call_sites:?}"
+        );
+
+        let mut surfaces = call_sites.clone();
+        surfaces.dedup();
+        assert_eq!(
+            surfaces.len(),
+            spec_conditional_surface_count(&spec),
+            "the number of gated surfaces is keybindings.md's to declare, found: {surfaces:?}"
         );
     }
 

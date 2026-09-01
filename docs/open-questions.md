@@ -121,6 +121,27 @@ exit code in the detail pane is worse than the gap.
   and [`spec/repo-management.md`](spec/repo-management.md), which asks for the
   receipt.
 
+## A confirm gate too short to show every refusal has no way to reach one
+
+[`spec/repo-management.md`](spec/repo-management.md)'s "A refusal is reported and
+counted in the confirm gate, never silent" is met in its counted half at every
+height: the headline carries `N refused`, and
+[`crates/repon/src/action_palette.rs`](../crates/repon/src/action_palette.rs)'s
+`fit_confirm_rows` replaces the per-Repo lines it cannot fit with one line saying how
+many are not shown. The reported half is not, below a certain height. The fit keeps
+the headline and the last line and gives up the middle, so a refused row's own reason
+can be among the lines dropped, and the gate does not scroll, so there is no way to
+reach it. Below four interior rows there is provably no room for a reason at all.
+Making a reason survive means either a priority the fitting function does not have (it
+is content-blind by design, taking lines rather than a `Plan`) or a scrolling gate,
+which is a feature rather than a fix, so the gap is recorded rather than papered over.
+
+- **Reopens if**: the gate gains scrolling, or `fit_confirm_rows` is given the
+  refusals to prefer, whichever comes first.
+- **Owned by**: [`spec/repo-management.md`](spec/repo-management.md), which owns the
+  promise, and [`spec/theming.md`](spec/theming.md), which owns the palette's own
+  geometry.
+
 ## Two writers to `config.toml`
 
 Repon now writes `[[repo]]` entries, and it takes no lock and runs no watcher, so a
