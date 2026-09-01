@@ -7,24 +7,24 @@
 //! entities subtracted and named) and none of the pty machinery in
 //! [actions.md](../../../docs/spec/actions.md), because no child process runs.
 //!
-//! Deferred rather than built: repo-management.md's "Receipts" asks for a result in
-//! [actions.md](../../../docs/spec/actions.md)'s own sense, which is a
-//! [`repon_core::ActionReceipt`] per Entity. Its step outcomes are a child process's
-//! (`StepOutcome::Failed` carries an exit code, `NotRun` means an earlier step failed,
-//! `Cancelled` means a run was interrupted), and actions.md calls that set closed at four,
-//! so a management operation, which runs no child process, has no honest outcome to take and
-//! writing one would put a fabricated exit code in the detail pane. What this module does
-//! instead: the confirm gate names and counts every refusal before the gesture is accepted,
-//! which is where repo-management.md's own "What `delete` refuses" puts it, and [`Report`]
-//! carries the per-Repo result out to a Notice and to the log afterwards. Widening
-//! `StepOutcome` (or `ActionReceipt`) to carry work Repon did itself is what closing that gap
-//! needs; the gap is in `docs/open-questions.md` under "A management result has no receipt of
-//! its own".
+//! What a run leaves behind, per repo-management.md's "Receipts": an
+//! [`repon_core::ActionReceipt`] whose single Step is the act Repon performed itself, carrying
+//! [`repon_core::OwnWork`] rather than an exit code, since no child process ran. [`Outcome`]
+//! is this module's own vocabulary for what happened to one row and [`own_work`] is the one
+//! place it turns into the receipt's words, which the log line reads too so the two cannot
+//! drift. The receipt does not replace the confirm gate: that still names and counts every
+//! refusal before the gesture is accepted, which is where repo-management.md's own "What
+//! `delete` refuses" puts it.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::{Result, eyre};
-use repon_core::{DeleteRisk, EntityKey, EntityState, Kind};
+use repon_core::{DeleteRisk, EntityKey, EntityState, Kind, OwnWork};
 
 use crate::config::repo_entry::{self, Edit};
 
@@ -362,32 +362,50 @@ pub(crate) enum Outcome {
     Failed(String),
 }
 
-/// One outcome as a sentence, for the log line each row gets after a run: the receipt-shaped
-/// half of repo-management.md's "Receipts" this module can honestly give today (see the
-/// module doc comment for what is deferred and why).
-pub(crate) fn describe(outcome: &Outcome) -> String {
+/// One outcome as the receipt records it: which grade of work Repon did, and its own words
+/// for it (repo-management.md's "Receipts" table). Exhaustive over [`Outcome`], so a seventh
+/// outcome has to say which grade it earns rather than inheriting one.
+///
+/// A refusal and an unchanged row are `Refused` rather than failures: nothing went wrong, so
+/// neither may put a `!` in the gutter of a Repo that reads perfectly well.
+pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
     match outcome {
-        Outcome::Ignored => "ignored".to_string(),
-        Outcome::Unignored => "no longer ignored".to_string(),
+        Outcome::Ignored => OwnWork::Did(Arc::from("ignored")),
+        Outcome::Unignored => OwnWork::Did(Arc::from("no longer ignored")),
         Outcome::Deleted {
             config_entry_removed: true,
-        } => "working tree removed, `[[repo]]` entry removed".to_string(),
+        } => OwnWork::Did(Arc::from("working tree removed, `[[repo]]` entry removed")),
         Outcome::Deleted {
             config_entry_removed: false,
-        } => "working tree removed, no `[[repo]]` entry of its own".to_string(),
-        Outcome::ExcludedByAnInheritedEntry => {
-            "still ignored: the `[[repo]]` entry excluding it names another path".to_string()
+        } => OwnWork::Did(Arc::from(
+            "working tree removed, no `[[repo]]` entry of its own",
+        )),
+        Outcome::ExcludedByAnInheritedEntry => OwnWork::Refused(Arc::from(
+            "still ignored: the `[[repo]]` entry excluding it names another path",
+        )),
+        Outcome::Refused(refusal) => {
+            OwnWork::Refused(Arc::from(format!("refused, {}", refusal.reason())))
         }
-        Outcome::Refused(refusal) => format!("refused, {}", refusal.reason()),
-        Outcome::Failed(error) => format!("failed, {error}"),
+        Outcome::Failed(error) => OwnWork::CouldNotAct(Arc::from(format!("failed, {error}"))),
     }
 }
 
-/// One row's name and what happened to it.
+/// One outcome as a sentence, for the log line each row gets after a run. Read out of
+/// [`own_work`] rather than written a second time, so the log and the detail pane always say
+/// the same thing about the same row.
+pub(crate) fn describe(outcome: &Outcome) -> String {
+    own_work(outcome).said().to_string()
+}
+
+/// One row: which Entity, its name, what happened to it, and how long that took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Record {
+    pub(crate) key: EntityKey,
     pub(crate) name: Arc<str>,
     pub(crate) outcome: Outcome,
+    /// What the act itself took. Real rather than nominal: `delete` walks a whole working
+    /// tree, which is the one management operation that can visibly stall.
+    pub(crate) elapsed: Duration,
 }
 
 /// What a whole run did, per row, for the caller to announce and log.
@@ -398,6 +416,22 @@ pub(crate) struct Report {
 }
 
 impl Report {
+    /// Every row as [`repon_core::Core::record_own_work`] takes it: the Entity, the grade of
+    /// work Repon did with its own words, and how long the act took. The receipt's words come
+    /// from [`own_work`], the same place the log line reads.
+    pub(crate) fn own_work_records(&self) -> Vec<(EntityKey, OwnWork, Duration)> {
+        self.records
+            .iter()
+            .map(|record| {
+                (
+                    record.key.clone(),
+                    own_work(&record.outcome),
+                    record.elapsed,
+                )
+            })
+            .collect()
+    }
+
     /// The one-line summary a Notice carries: the counts, never a silent success.
     pub(crate) fn summary(&self) -> String {
         let mut done = 0usize;
@@ -443,13 +477,19 @@ pub(crate) fn run(plan: &Plan, config_file: &Path) -> Report {
     let records = plan
         .targets
         .iter()
-        .map(|target| Record {
-            name: Arc::clone(&target.name),
-            outcome: match target.eligibility {
+        .map(|target| {
+            let started = Instant::now();
+            let outcome = match target.eligibility {
                 Eligibility::Refused(refusal) => Outcome::Refused(refusal),
                 Eligibility::Eligible => run_one(plan.operation, target, config_file)
                     .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
-            },
+            };
+            Record {
+                key: target.key.clone(),
+                name: Arc::clone(&target.name),
+                outcome,
+                elapsed: started.elapsed(),
+            }
         })
         .collect();
     Report {
@@ -639,22 +679,26 @@ mod tests {
         assert!(tree.exists(), "a linked Worktree is never removed");
         assert!(sub.exists(), "a Submodule is never removed");
         assert_eq!(
-            report.records,
+            report
+                .records
+                .iter()
+                .map(|record| (record.name.to_string(), record.outcome.clone()))
+                .collect::<Vec<_>>(),
             vec![
-                Record {
-                    name: Arc::from("repo"),
-                    outcome: Outcome::Deleted {
+                (
+                    "repo".to_string(),
+                    Outcome::Deleted {
                         config_entry_removed: false
-                    },
-                },
-                Record {
-                    name: Arc::from("tree"),
-                    outcome: Outcome::Refused(Refusal::LinkedWorktreeCannotBeDeleted),
-                },
-                Record {
-                    name: Arc::from("sub"),
-                    outcome: Outcome::Refused(Refusal::SubmoduleCannotBeDeleted),
-                },
+                    }
+                ),
+                (
+                    "tree".to_string(),
+                    Outcome::Refused(Refusal::LinkedWorktreeCannotBeDeleted)
+                ),
+                (
+                    "sub".to_string(),
+                    Outcome::Refused(Refusal::SubmoduleCannotBeDeleted)
+                ),
             ],
             "every row is reported, refusals included"
         );
@@ -909,5 +953,248 @@ mod tests {
 
         assert!(refused.to_string().contains(".git"));
         assert!(not_a_repo.exists(), "and it is still there");
+    }
+
+    // =====================================================================================
+    // The receipt: a management run's own result, docs/spec/repo-management.md's "Receipts".
+    // =====================================================================================
+
+    /// Every [`Outcome`] earns a grade of own work, and no grade is decided by hand at a
+    /// second site: `describe`, the log line's own words, reads them out of [`own_work`]. The
+    /// pairing is the receipts table in repo-management.md, read at test time rather than
+    /// restated, so a sentence that drifted from the specification fails here.
+    #[test]
+    fn every_outcome_maps_to_a_grade_of_own_work_whose_words_the_spec_carries() {
+        let spec = spec_source();
+        let receipts = spec
+            .split("## Receipts")
+            .nth(1)
+            .expect("repo-management.md still carries a Receipts section");
+
+        let cases = [
+            (Outcome::Ignored, "Did"),
+            (Outcome::Unignored, "Did"),
+            (
+                Outcome::Deleted {
+                    config_entry_removed: true,
+                },
+                "Did",
+            ),
+            (
+                Outcome::Deleted {
+                    config_entry_removed: false,
+                },
+                "Did",
+            ),
+            (Outcome::ExcludedByAnInheritedEntry, "Refused"),
+            (Outcome::Refused(Refusal::AlreadyIgnored), "Refused"),
+            (Outcome::Failed("boom".to_string()), "CouldNotAct"),
+        ];
+
+        for (outcome, grade) in cases {
+            let work = own_work(&outcome);
+            let named = match &work {
+                OwnWork::Did(_) => "Did",
+                OwnWork::Refused(_) => "Refused",
+                OwnWork::CouldNotAct(_) => "CouldNotAct",
+            };
+            assert_eq!(named, grade, "{outcome:?} took the wrong grade");
+            assert_eq!(
+                describe(&outcome),
+                work.said().to_string(),
+                "the log line and the receipt must read the same words for {outcome:?}"
+            );
+            assert!(
+                receipts.contains(&format!("`{grade}`")),
+                "repo-management.md's Receipts section no longer names the `{grade}` grade"
+            );
+        }
+    }
+
+    /// The four words the specification's own Receipts table gives the rows nothing else in
+    /// this module composes, read out of the document rather than restated beside it: a
+    /// sentence changed in one place and not the other fails here.
+    #[test]
+    fn the_receipts_own_words_are_repo_management_mds_own() {
+        let spec = spec_source();
+        let receipts = spec
+            .split("## Receipts")
+            .nth(1)
+            .expect("repo-management.md still carries a Receipts section");
+
+        for outcome in [
+            Outcome::Ignored,
+            Outcome::Unignored,
+            Outcome::Deleted {
+                config_entry_removed: true,
+            },
+            Outcome::Deleted {
+                config_entry_removed: false,
+            },
+            Outcome::ExcludedByAnInheritedEntry,
+        ] {
+            let said = describe(&outcome);
+            assert!(
+                receipts.contains(&said),
+                "repo-management.md's Receipts table does not carry {said:?}"
+            );
+        }
+    }
+
+    /// A run's records reach [`repon_core::Core::record_own_work`] whole: every Selection row,
+    /// refusals included, each carrying the Entity it names so a receipt cannot land on the
+    /// wrong row.
+    #[test]
+    fn every_row_of_a_run_including_a_refusal_becomes_an_own_work_record_for_its_own_entity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let repo = dir.path().join("repo");
+        let sub = dir.path().join("sub");
+        let entities = vec![
+            entity(&repo, "repo", Kind::Repo),
+            entity(&sub, "sub", Kind::Submodule),
+        ];
+
+        let report = run(&plan(Operation::Ignore, &entities), &config_file);
+        let records = report.own_work_records();
+
+        assert_eq!(records.len(), 2, "every row is recorded, refusals included");
+        assert_eq!(
+            records[0].0, entities[0].key,
+            "in the Selection's own order"
+        );
+        assert_eq!(records[1].0, entities[1].key);
+        assert!(matches!(records[0].1, OwnWork::Did(_)));
+        assert!(
+            matches!(&records[1].1, OwnWork::Refused(said) if said.contains("Submodule")),
+            "the refused row carries the gate's own reason, got {:?}",
+            records[1].1
+        );
+    }
+
+    /// The register entry this replaced is gone, and the document that owns the answer records
+    /// it rather than the gap: the same shape
+    /// `actions_md_records_the_settled_answer_for_per_repo_applicability` holds for its own
+    /// entry, so a register that kept the entry after the answer landed fails here.
+    #[test]
+    fn repo_management_md_records_the_receipt_and_the_register_no_longer_carries_the_gap() {
+        let spec = spec_source();
+        assert!(
+            !spec.contains("Not built."),
+            "repo-management.md still records the receipt as not built"
+        );
+        assert!(
+            spec.contains("## Receipts"),
+            "repo-management.md must still own the Receipts section"
+        );
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let register = std::fs::read_to_string(manifest_dir.join("../../docs/open-questions.md"))
+            .expect("read docs/open-questions.md");
+        assert!(
+            !register.contains("## A management result has no receipt of its own"),
+            "the register keeps an entry its owning document has now answered"
+        );
+
+        let actions = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read docs/spec/actions.md");
+        assert!(
+            actions.contains("A closed set of five."),
+            "actions.md owns the outcome set and must declare the fifth"
+        );
+        assert!(
+            actions.contains("Why the set grew from four to five"),
+            "actions.md must say why the set grew, not only that it did"
+        );
+    }
+
+    /// Every arm of every `match` over a Step outcome across both crates, and none of them a
+    /// catch-all: `docs/spec/actions.md` calls the set closed and the compiler only enforces
+    /// that where no `_` arm swallows what it has not been taught. `is_failure`'s own doc
+    /// comment makes that promise for one match; this is the promise for the rest.
+    ///
+    /// Both crates' `src`, through [`crate::test_support::workspace_crate_src_dirs`]: the
+    /// outcome is defined in `repon-core` and rendered in this crate, so either half alone is
+    /// a scan that has stopped scanning. A match whose own arms never name the outcome is not
+    /// this claim's subject and is skipped; an arm of a nested match is at a deeper
+    /// indentation than its parent's and belongs to the nested one.
+    #[test]
+    fn no_match_over_a_step_outcome_anywhere_in_either_crate_has_a_catch_all_arm() {
+        let mut offending = Vec::new();
+        let mut matches_checked = 0usize;
+
+        for dir in crate::test_support::workspace_crate_src_dirs() {
+            for path in crate::test_support::rust_source_files(&dir) {
+                let source = crate::test_support::production_source_at(&path);
+                for arms in step_outcome_match_arms(&source) {
+                    matches_checked += 1;
+                    for arm in arms {
+                        if is_catch_all(&arm) {
+                            offending.push(format!("{}: {arm}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            matches_checked, 6,
+            "the six matches over a Step outcome this workspace holds are `is_failure`, \
+             `is_refusal`, `OwnWork::said`, `step_outcome_word`, `step_outcome_meaning` and \
+             `finished_step_line`; a different count means the scan has stopped finding them, \
+             or a seventh landed and belongs on this list"
+        );
+        assert!(
+            offending.is_empty(),
+            "a match over a Step outcome reaches a fifth variant through a catch-all rather \
+             than naming it: {offending:?}"
+        );
+    }
+
+    /// The arm patterns of every `match` block in `source` whose own arms name a Step
+    /// outcome, one `Vec` per block. Arms are the block lines at exactly one indent step
+    /// inside the `match` line's own, which is what keeps a nested match's arms out.
+    fn step_outcome_match_arms(source: &str) -> Vec<Vec<String>> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut blocks = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("match ") || !line.trim_end().ends_with('{') {
+                continue;
+            }
+            let Some(block) = crate::test_support::block_at(source, index) else {
+                continue;
+            };
+            let indent = line.len() - trimmed.len();
+            let arm_indent = " ".repeat(indent + 4);
+            let arms: Vec<String> = block
+                .lines()
+                .skip(1)
+                .filter(|arm| {
+                    arm.starts_with(&arm_indent) && !arm[arm_indent.len()..].starts_with(' ')
+                })
+                .map(|arm| match arm.split_once("=>") {
+                    Some((pattern, _)) => pattern.trim().to_string(),
+                    None => arm.trim().to_string(),
+                })
+                .collect();
+            if arms
+                .iter()
+                .any(|arm| arm.contains("StepOutcome::") || arm.contains("OwnWork::"))
+            {
+                blocks.push(arms);
+            }
+        }
+        blocks
+    }
+
+    /// Whether an arm pattern matches anything the arms above it did not, which is what makes
+    /// a closed set stop being closed. A `_` alone, a `_` behind a guard, and a `_` as one
+    /// alternative of a `|` pattern all count.
+    fn is_catch_all(pattern: &str) -> bool {
+        pattern
+            .split('|')
+            .map(str::trim)
+            .any(|alternative| alternative == "_" || alternative.starts_with("_ if"))
     }
 }

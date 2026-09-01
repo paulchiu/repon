@@ -198,18 +198,55 @@ pub struct Diagnostics {
     pub gitmodules_failed: Option<Arc<str>>,
 }
 
-/// One step's own outcome: a closed set of exactly four
+/// What a step Repon performed itself came to, in Repon's own words
 /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-/// "Step outcomes"). No wildcard arm ever matches this: a fifth variant must be named at
+/// "Why the set grew from four to five"): three grades, matched exhaustively wherever a
+/// [`StepOutcome::OwnWork`] is opened.
+///
+/// Words rather than a code, because Repon knows what it did and can say so, where an exit
+/// code is a number only a child process could have produced. The sentence is the consumer's
+/// to author, the same standing [`ActionReceipt::label`] and [`StepResult::label`] already
+/// have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum OwnWork {
+    /// Repon did the work, and this is what it did.
+    Did(Arc<str>),
+    /// Repon would not act, and this is why. Not a failure: nothing went wrong, so it never
+    /// widens the row summary fold, for the same reason `Cancelled` does not.
+    Refused(Arc<str>),
+    /// Repon tried and could not finish, and this is what stopped it. The one grade that is
+    /// a failure.
+    CouldNotAct(Arc<str>),
+}
+
+impl OwnWork {
+    /// Repon's own words for this outcome, whichever grade it is.
+    pub fn said(&self) -> &Arc<str> {
+        match self {
+            OwnWork::Did(said) | OwnWork::Refused(said) | OwnWork::CouldNotAct(said) => said,
+        }
+    }
+}
+
+/// One step's own outcome: a closed set of exactly five
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "Step outcomes"). No wildcard arm ever matches this: a sixth variant must be named at
 /// every match site or the crate fails to compile.
+///
+/// The first four are a child process's. `OwnWork` is the step Repon performed itself, with
+/// no child process anywhere in it, which is what lets a Management operation leave a receipt
+/// instead of borrowing an outcome that means something else
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "Receipts").
 ///
 /// `Cancelled` is explicitly not a failure and is never themed as one, following
 /// [ADR 0013](https://github.com/paulchiu/repon/blob/main/docs/adr/0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md)'s
 /// precedent that interrupted work becomes Unknown rather than Failed; [`Self::is_failure`]
-/// is the one place that classification lives; a match on the four variants should still
+/// is the one place that classification lives; a match on the five variants should still
 /// name each one rather than borrow this method to skip a step, since the two calls answer
 /// different questions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum StepOutcome {
     /// Ran and exited zero.
@@ -220,19 +257,39 @@ pub enum StepOutcome {
     NotRun,
     /// The run was cancelled before this step finished, or before it started.
     Cancelled,
+    /// No child process ran: Repon did this step itself, and says so in its own words.
+    OwnWork(OwnWork),
 }
 
 impl StepOutcome {
-    /// Whether this outcome counts as a failure for the row summary fold: only
-    /// `Failed`, never `Cancelled`, `NotRun` or `Ok`. One arm per variant, no
-    /// catch-all, so a fifth variant must be classified here or the crate fails
-    /// to compile, rather than silently falling through as a non-failure.
-    pub fn is_failure(self) -> bool {
+    /// Whether this outcome counts as a failure for the row summary fold: `Failed` and own
+    /// work Repon could not finish, never `Cancelled`, `NotRun`, `Ok` or a refusal. One arm
+    /// per variant, no catch-all, so a sixth variant must be classified here or the crate
+    /// fails to compile, rather than silently falling through as a non-failure.
+    pub fn is_failure(&self) -> bool {
         match self {
             StepOutcome::Ok => false,
             StepOutcome::Failed(_) => true,
             StepOutcome::NotRun => false,
             StepOutcome::Cancelled => false,
+            StepOutcome::OwnWork(OwnWork::Did(_)) => false,
+            StepOutcome::OwnWork(OwnWork::Refused(_)) => false,
+            StepOutcome::OwnWork(OwnWork::CouldNotAct(_)) => true,
+        }
+    }
+
+    /// Whether this outcome is a step Repon performed itself that would not act. Kept beside
+    /// [`Self::is_failure`] so the two classifications the fold, the pane and the `action:`
+    /// Filter term all read live in one place and cannot disagree.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            StepOutcome::Ok => false,
+            StepOutcome::Failed(_) => false,
+            StepOutcome::NotRun => false,
+            StepOutcome::Cancelled => false,
+            StepOutcome::OwnWork(OwnWork::Did(_)) => false,
+            StepOutcome::OwnWork(OwnWork::Refused(_)) => true,
+            StepOutcome::OwnWork(OwnWork::CouldNotAct(_)) => false,
         }
     }
 }
@@ -268,10 +325,12 @@ pub struct CaptureElision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct StepResult {
-    /// The step's argv, rendered for display.
+    /// The step's argv, or the operation for a step Repon performed itself, rendered for
+    /// display.
     pub label: Arc<str>,
     pub outcome: StepOutcome,
-    /// Raw bytes, bounded, never interpreted here.
+    /// Raw bytes, bounded, never interpreted here. Empty for a step Repon performed itself,
+    /// which has no other program's screen to quote.
     pub output: Arc<[u8]>,
     pub elapsed: Duration,
     /// What the bound dropped out of `output`, or `None` when the output fitted whole.
@@ -351,6 +410,15 @@ impl ActionReceipt {
     /// `Failed` one.
     pub fn failed(&self) -> bool {
         self.steps.iter().any(|step| step.outcome.is_failure())
+    }
+
+    /// Whether this run refused rather than acted: a step Repon performed itself would not
+    /// act and none failed. Neither a success nor a failure, so it leaves the row summary
+    /// fold alone and earns its own word in the detail pane and its own `action:` Filter
+    /// value ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// `OwnWork`).
+    pub fn refused(&self) -> bool {
+        !self.failed() && self.steps.iter().any(|step| step.outcome.is_refusal())
     }
 }
 
@@ -740,35 +808,118 @@ mod tests {
 
     // --- StepOutcome / StepResult / ActionReceipt: the receipt widening, docs/spec/actions.md ---
 
-    /// Absence claim: the four `StepOutcome` variants are the whole set. This match has no
-    /// wildcard arm, so a fifth variant added to `StepOutcome` fails to compile here rather
-    /// than silently falling through an `_`.
+    /// Absence claim: the five `StepOutcome` variants are the whole set, and the three
+    /// `OwnWork` grades are the whole of that. Neither match has a wildcard arm, so a variant
+    /// added to either fails to compile here rather than silently falling through an `_`.
     #[test]
-    fn step_outcome_is_exactly_four_mutually_exclusive_variants() {
-        fn name(outcome: StepOutcome) -> &'static str {
+    fn step_outcome_is_exactly_five_mutually_exclusive_variants() {
+        fn name(outcome: &StepOutcome) -> &'static str {
             match outcome {
                 StepOutcome::Ok => "ok",
                 StepOutcome::Failed(_) => "failed",
                 StepOutcome::NotRun => "not_run",
                 StepOutcome::Cancelled => "cancelled",
+                StepOutcome::OwnWork(work) => match work {
+                    OwnWork::Did(_) => "own_work_did",
+                    OwnWork::Refused(_) => "own_work_refused",
+                    OwnWork::CouldNotAct(_) => "own_work_could_not_act",
+                },
             }
         }
 
-        assert_eq!(name(StepOutcome::Ok), "ok");
-        assert_eq!(name(StepOutcome::Failed(1)), "failed");
-        assert_eq!(name(StepOutcome::NotRun), "not_run");
-        assert_eq!(name(StepOutcome::Cancelled), "cancelled");
+        assert_eq!(name(&StepOutcome::Ok), "ok");
+        assert_eq!(name(&StepOutcome::Failed(1)), "failed");
+        assert_eq!(name(&StepOutcome::NotRun), "not_run");
+        assert_eq!(name(&StepOutcome::Cancelled), "cancelled");
+        assert_eq!(name(&did("ignored")), "own_work_did");
+        assert_eq!(name(&refused("already ignored")), "own_work_refused");
+        assert_eq!(
+            name(&could_not_act("no such file")),
+            "own_work_could_not_act"
+        );
+    }
+
+    fn did(said: &str) -> StepOutcome {
+        StepOutcome::OwnWork(OwnWork::Did(Arc::from(said)))
+    }
+
+    fn refused(said: &str) -> StepOutcome {
+        StepOutcome::OwnWork(OwnWork::Refused(Arc::from(said)))
+    }
+
+    fn could_not_act(said: &str) -> StepOutcome {
+        StepOutcome::OwnWork(OwnWork::CouldNotAct(Arc::from(said)))
     }
 
     /// `Cancelled` is explicitly not a failure, tested apart from the shape above: the closed
-    /// set's arity says nothing about which of the four count as failing, and a naive
+    /// set's arity says nothing about which of the five count as failing, and a naive
     /// classification (anything but `Ok` fails) would wrongly colour a cancelled step as one.
+    /// Scoped to the four a child process produces; the own-work grades are classified below.
     #[test]
-    fn cancelled_and_not_run_are_not_failures_only_failed_is() {
+    fn among_the_child_process_outcomes_only_failed_is_a_failure() {
         assert!(!StepOutcome::Ok.is_failure());
         assert!(StepOutcome::Failed(1).is_failure());
         assert!(!StepOutcome::NotRun.is_failure());
         assert!(!StepOutcome::Cancelled.is_failure());
+    }
+
+    /// The grade of own work decides the classification, and a refusal is deliberately not a
+    /// failure: `docs/spec/actions.md` gives `Refused` the `dim` role, so a Repo that Repon
+    /// declined to act on must not take the gutter's `!` alongside a Repo that would not read.
+    #[test]
+    fn only_own_work_repon_could_not_finish_is_a_failure_and_only_a_refusal_is_a_refusal() {
+        assert!(!did("ignored").is_failure());
+        assert!(!refused("already ignored").is_failure());
+        assert!(could_not_act("permission denied").is_failure());
+
+        assert!(!did("ignored").is_refusal());
+        assert!(refused("already ignored").is_refusal());
+        assert!(!could_not_act("permission denied").is_refusal());
+        assert!(!StepOutcome::Cancelled.is_refusal());
+        assert!(!StepOutcome::Failed(1).is_refusal());
+    }
+
+    /// Every grade hands back the words it was built with, so nothing has to open the enum a
+    /// second time to read them.
+    #[test]
+    fn own_work_says_its_own_words_whichever_grade_it_is() {
+        let words = |outcome: StepOutcome| match outcome {
+            StepOutcome::OwnWork(work) => work.said().to_string(),
+            StepOutcome::Ok
+            | StepOutcome::Failed(_)
+            | StepOutcome::NotRun
+            | StepOutcome::Cancelled => panic!("built as own work"),
+        };
+
+        assert_eq!(words(did("ignored")), "ignored");
+        assert_eq!(words(refused("already ignored")), "already ignored");
+        assert_eq!(words(could_not_act("boom")), "boom");
+    }
+
+    /// A receipt made of own work reads failed, refused or neither, and the two questions are
+    /// exclusive: a run that failed is never also reported as a refusal, so the pane and the
+    /// `action:` term never have to decide an order of their own.
+    #[test]
+    fn a_receipt_of_own_work_reads_failed_or_refused_but_never_both() {
+        let one = |outcome: StepOutcome| {
+            receipt(
+                "ignore",
+                vec![StepResult {
+                    label: Arc::from("ignore"),
+                    outcome,
+                    output: Arc::from(&b""[..]),
+                    elapsed: Duration::from_millis(1),
+                    elision: None,
+                }],
+            )
+        };
+
+        assert!(!one(did("ignored")).failed());
+        assert!(!one(did("ignored")).refused());
+        assert!(!one(refused("already ignored")).failed());
+        assert!(one(refused("already ignored")).refused());
+        assert!(one(could_not_act("boom")).failed());
+        assert!(!one(could_not_act("boom")).refused());
     }
 
     fn ok_step(label: &str) -> StepResult {

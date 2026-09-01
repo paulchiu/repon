@@ -1634,7 +1634,13 @@ impl App {
     }
 
     /// `y` over a built-in's confirm gate: runs [`Self::management_plan`] against the config
-    /// file, announces what it did and reloads.
+    /// file, leaves a receipt per row, announces what it did and reloads.
+    ///
+    /// The receipt is [`repon_core::Core::record_own_work`]'s, one per Selection row including
+    /// the ones the gate already refused, so the detail pane names per Repo what was done or
+    /// why it was refused (`docs/spec/repo-management.md`'s "Receipts"). It does not replace
+    /// the gate, which still names and counts every refusal beforehand, and its words are
+    /// [`crate::management::own_work`]'s, the same ones the log lines above it carry.
     ///
     /// The plan is the one the gate was built from, so the rows named on screen are the rows
     /// acted on. `operation` is checked against it rather than trusted: the two come from the
@@ -1681,6 +1687,8 @@ impl App {
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
         }
+        self.core
+            .record_own_work(operation.name(), &report.own_work_records());
         self.reload_config();
         // scan: management_write_reload end
         self.set_notice(report.summary());
@@ -4113,6 +4121,114 @@ mod tests {
             "a file with no entry for it is left exactly as it was"
         );
         assert_eq!(app.notice(), Some("delete: 1 done"));
+    }
+
+    /// The Done-when itself, end to end and on screen: an `ignore` leaves a receipt the
+    /// detail pane shows, naming the row by what Repon did to it. Nothing short of a rendered
+    /// frame proves it, since a receipt written to the table that the pane never draws closes
+    /// nothing ([repo-management.md](../../../docs/spec/repo-management.md)'s "Receipts").
+    #[test]
+    fn an_ignore_leaves_a_receipt_the_detail_pane_shows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        assert!(
+            app.core.snapshot().entities[0].last_action.is_none(),
+            "the row starts with no receipt at all"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open the detail pane on the row");
+        let frame = render_to_lines(&mut app, 120, 40).join("\n");
+
+        assert!(
+            frame.contains("ignore"),
+            "the pane names the operation, got:\n{frame}"
+        );
+        assert!(
+            frame.contains("ignored"),
+            "and what Repon did to this Repo, got:\n{frame}"
+        );
+    }
+
+    /// The other half of the Done-when: a row the gate refused gets a receipt of its own
+    /// saying why, and no row carries an outcome that means something a child process did.
+    /// Read off the table rather than the frame, because "no exit code anywhere" is a claim
+    /// about the receipt rather than about what fits on screen.
+    #[test]
+    fn a_refused_row_leaves_a_receipt_saying_why_and_no_row_carries_a_child_processs_outcome() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("sidecar"), "sidecar");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        let entities = app.core.snapshot().entities;
+        let words = |name: &str| -> String {
+            let entity = entities
+                .iter()
+                .find(|entity| &*entity.name == name)
+                .unwrap_or_else(|| panic!("{name} is still a row"));
+            let receipt = entity
+                .last_action
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} carries a receipt"));
+            assert!(
+                !receipt.not_applicable,
+                "{name} was operated on, so it is not the excluded row Not applicable names"
+            );
+            assert_eq!(
+                &*receipt.label, "delete",
+                "{name}'s receipt names the operation"
+            );
+            receipt
+                .steps
+                .iter()
+                .map(|step| match &step.outcome {
+                    repon_core::StepOutcome::OwnWork(work) => work.said().to_string(),
+                    other => panic!("{name} carries a child process's outcome: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        assert_eq!(
+            words("repo-a"),
+            "working tree removed, no `[[repo]]` entry of its own"
+        );
+        assert!(
+            words("sidecar").contains("refused, removing a linked Worktree"),
+            "the refused row says why, got {:?}",
+            words("sidecar")
+        );
+        let receipt_of = |name: &str| {
+            entities
+                .iter()
+                .find(|entity| &*entity.name == name)
+                .and_then(|entity| entity.last_action.clone())
+                .unwrap_or_else(|| panic!("{name} carries a receipt"))
+        };
+        assert!(
+            !receipt_of("repo-a").refused(),
+            "the Repo that was acted on did not refuse"
+        );
+        assert!(
+            receipt_of("sidecar").refused(),
+            "and the row the gate refused reads as a refusal rather than a failure"
+        );
+        assert!(
+            !receipt_of("sidecar").failed(),
+            "a refusal never widens the row summary fold"
+        );
     }
 
     /// The `delete` gate on screen: its headline, the per-Repo risk line computed from the
