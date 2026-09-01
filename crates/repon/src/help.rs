@@ -629,7 +629,7 @@ mod tests {
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
     /// the help overlay carries only Built bindings. Built against
     /// [`keys::single_unbuilt_binding_table`]'s synthetic table rather than off
-    /// [`keys::unbuilt_bindings`]: with `d` built ([#171](https://github.com/paulchiu/repon/issues/171)),
+    /// [`keys::unbuilt_bindings`]: with `d` built,
     /// `BINDINGS` carries no unbuilt row today, and `content`'s own filter is what this test
     /// proves, not which production row happens to be in that state this week.
     #[test]

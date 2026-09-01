@@ -54,8 +54,7 @@ const NO_FAILED_ROWS_NOTICE: &str = "no row has failed";
 
 /// The Notice [`Action::DismissVanished`] raises when the cursor row is not Vanished (or the
 /// list is empty): the glossary scopes a Notice to a keystroke that could not act, and `d`'s
-/// own successful case ([`App::dismiss_vanished_at_cursor`]) never raises one
-/// ([#171](https://github.com/paulchiu/repon/issues/171)).
+/// own successful case ([`App::dismiss_vanished_at_cursor`]) never raises one.
 const CURSOR_NOT_VANISHED_NOTICE: &str = "cursor row is not Vanished";
 
 /// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
@@ -589,8 +588,8 @@ impl App {
     /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
     /// reported twice" (the theme and config halves already log at the point their own load
     /// raises them). The Vanished count is read fresh from the live snapshot the same way,
-    /// with nothing latched: the condition clears itself the moment the count returns to zero
-    /// ([#171](https://github.com/paulchiu/repon/issues/171)). A live Notice is never folded
+    /// with nothing latched: the condition clears itself the moment the count returns to zero.
+    /// A live Notice is never folded
     /// in here: it is not a standing condition of the session, and
     /// [theming.md](../../../docs/spec/theming.md) keeps the two apart.
     fn current_warnings(&mut self) -> Vec<Warning> {
@@ -599,7 +598,7 @@ impl App {
             discovery_abandoned.as_ref(),
             &mut self.discovery_warning_logged,
         );
-        let vanished = self.vanished_count();
+        let vanished = self.core.vanished_count();
         WarningSources {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
@@ -607,18 +606,6 @@ impl App {
             vanished,
         }
         .into_warnings()
-    }
-
-    /// How many Entities in the current Snapshot are Vanished right now
-    /// ([#171](https://github.com/paulchiu/repon/issues/171)), read fresh rather than cached:
-    /// [`Self::current_warnings`]'s own doc comment says why nothing here is latched.
-    fn vanished_count(&self) -> usize {
-        self.core
-            .snapshot()
-            .entities
-            .iter()
-            .filter(|entity| entity.presence == Presence::Vanished)
-            .count()
     }
 
     /// The status row's own content for this frame: the active Set's name, `snapshot`'s
@@ -1824,8 +1811,7 @@ impl App {
     /// empty, is the glossary's Notice case: a keystroke that could not act
     /// ([ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
     /// unavailable case for a Built binding). A successful dismissal never raises a Notice,
-    /// the decision on [#171](https://github.com/paulchiu/repon/issues/171) refuses widening
-    /// the Notice definition to cover a success.
+    /// since widening the Notice definition to cover a success is refused.
     fn dismiss_vanished_at_cursor(&mut self) {
         let Some(key) = self.cursor_key() else {
             self.set_notice(CURSOR_NOT_VANISHED_NOTICE.to_string());
@@ -5117,9 +5103,7 @@ mod tests {
 
     /// `d`'s successful case: the cursor sits on a Vanished row, so the row leaves the table
     /// via `repon_core::Core::dismiss`, the cursor stays valid over the now-shorter table,
-    /// and, per the decision on
-    /// [#171](https://github.com/paulchiu/repon/issues/171), no Notice is raised for a
-    /// success.
+    /// and no Notice is raised for a success.
     #[test]
     fn d_dismisses_the_cursor_row_when_it_is_vanished_and_raises_no_notice() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5226,7 +5210,7 @@ mod tests {
     /// The Warning half of the same decision: `current_warnings` is built fresh every frame
     /// from the live snapshot rather than latched, so dismissing the last Vanished row clears
     /// the condition on its own with no acknowledgement or dismissal of the warning itself
-    /// involved ([#171](https://github.com/paulchiu/repon/issues/171)).
+    /// involved.
     #[test]
     fn dismissing_the_last_vanished_row_clears_the_warning_with_nothing_further_pressed() {
         let dir = tempfile::tempdir().expect("temp dir");

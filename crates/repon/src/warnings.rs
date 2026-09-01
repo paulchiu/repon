@@ -13,8 +13,7 @@
 //! [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)
 //! removed it, since a reply to a keystroke is not a standing condition and this module never
 //! clears one on its own; [`crate::notice`] is where that reply now lives instead. Vanished
-//! entities are the real fourth source, added by
-//! [#171](https://github.com/paulchiu/repon/issues/171) as an abandoned discovery's mirror: an
+//! entities are the real fourth source, an abandoned discovery's mirror: an
 //! abandoned walk means rows may be missing, and a Vanished row means one is present that no
 //! longer exists. Unlike the other three, this source is never latched: [`WarningSources`] is
 //! built fresh every frame from the live snapshot, so the condition clears itself the instant
@@ -42,7 +41,7 @@ pub(crate) enum Warning {
     Config(config::document::Warning),
     DiscoveryAbandoned(String),
     /// How many Entities are currently Vanished
-    /// ([#171](https://github.com/paulchiu/repon/issues/171)): rows present that no longer
+    /// rows present that no longer
     /// exist, the mirror of [`Warning::DiscoveryAbandoned`], which means rows may be missing
     /// instead.
     Vanished(usize),
@@ -93,7 +92,7 @@ pub(crate) struct WarningSources {
     /// How many Entities are Vanished right now, read fresh from the live snapshot every
     /// time this struct is built rather than latched, which is what lets the condition clear
     /// itself the instant the count returns to zero with nothing to reset by hand
-    /// ([#171](https://github.com/paulchiu/repon/issues/171)). Zero contributes no warning.
+    /// Zero contributes no warning.
     pub(crate) vanished: usize,
 }
 
@@ -260,7 +259,7 @@ mod tests {
     fn most_severe_picks_vanished_over_discovery_config_and_theme_even_arriving_last_and_outnumbered()
      {
         // Every lower-severity condition arrives first; Vanished, the newest and now the most
-        // severe source ([#171](https://github.com/paulchiu/repon/issues/171)), arrives last
+        // severe source, arrives last
         // and alone. A ranking that merely took the first or the most common condition would
         // get this wrong.
         let warnings = vec![

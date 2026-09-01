@@ -249,8 +249,8 @@ pub(crate) fn compiled_binding_count() -> usize {
 
 /// A one-row table binding `code`/`modifiers` to `action` in `context`, unbuilt, for a test
 /// that proves a property of an unbuilt binding without depending on `BINDINGS` currently
-/// carrying one ([#171](https://github.com/paulchiu/repon/issues/171) built the last
-/// currently-unbuilt row, `d`). `BindingTable`'s own tuple field is private to this module, so
+/// carrying one (`d`, the last currently-unbuilt row, is now built). `BindingTable`'s own
+/// tuple field is private to this module, so
 /// a caller outside it (`help.rs`'s own tests) reaches a synthetic unbuilt table through this
 /// constructor rather than the field.
 #[cfg(test)]
@@ -2032,7 +2032,7 @@ mod tests {
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md):
     /// an unbuilt binding "does not dispatch". Built against a synthetic single-row table
-    /// rather than off `unbuilt_bindings()`: with `d` built ([#171](https://github.com/paulchiu/repon/issues/171)),
+    /// rather than off `unbuilt_bindings()`: with `d` built,
     /// `BINDINGS` carries no unbuilt row at all today, and this property is about
     /// [`BindingTable::dispatch`]'s own filter on the `built` flag, not about which row
     /// happens to be in that state this week. A `List` row must also not fall through to
@@ -2326,7 +2326,7 @@ mod tests {
     /// unreachable as it was before this entry was ever read.
     ///
     /// Built against [`merge_over`]'s own seam rather than off [`unbuilt_bindings`]: with `d`
-    /// built ([#171](https://github.com/paulchiu/repon/issues/171)), `BINDINGS` carries no
+    /// built, `BINDINGS` carries no
     /// unbuilt row today, so this test supplies its own base, the compiled default with
     /// `Action::DismissVanished` in `List` swapped for an unbuilt row at a different chord.
     /// That keeps this criterion holding regardless of how many production rows are

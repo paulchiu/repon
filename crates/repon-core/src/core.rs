@@ -974,6 +974,19 @@ impl Core {
         self.partition_operable(order).0.len()
     }
 
+    /// How many Entities in the live table are Vanished. Reads the table in place rather
+    /// than through [`Self::snapshot`], so a caller needing only the count does not pay for
+    /// a clone of the whole table and its staleness pass on every frame.
+    pub fn vanished_count(&self) -> usize {
+        self.table
+            .read()
+            .unwrap()
+            .entities
+            .iter()
+            .filter(|entity| entity.presence == Presence::Vanished)
+            .count()
+    }
+
     /// `true` while one Action fan-out's steps are still running, the consumer-facing read
     /// of `action_running` ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
     /// "One Action runs at a time"): what a TUI gates `;`, `s`, `1` to `9` and `Ctrl+R`
