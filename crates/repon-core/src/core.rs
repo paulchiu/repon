@@ -1097,6 +1097,20 @@ impl Core {
         self.action_running.load(Ordering::Acquire)
     }
 
+    /// `true` while any refresh-shaped dispatch this `Core` started still owes the table
+    /// work: a Generation reserved and not yet raised the probes it dispatches, or probes
+    /// raised and not yet landed, cancelled or timed out. The same gate [`Core::settle`]
+    /// blocks on, read here without blocking, so a consumer can report a Refresh's own
+    /// progress on screen while it runs rather than waiting for it to finish
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
+    /// Covers `refresh`, `refresh_all`, `rederive_default_branches`, `probe_now` and the
+    /// startup walk alike; an Action's own fan-out never touches this gate, which is what
+    /// `action_running` reads instead.
+    pub fn refresh_running(&self) -> bool {
+        let (lock, _cvar) = &*self.settle_gate;
+        !lock.lock().unwrap().is_settled()
+    }
+
     /// Runs `action` across every key in `order` that the table currently knows: each
     /// entity's own steps run in order and stop at that entity's first failure, exactly
     /// as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
@@ -5177,6 +5191,45 @@ mod tests {
         assert!(
             Arc::ptr_eq(&before, &after),
             "a refresh must reuse the cached handle, not replace it with a new one"
+        );
+    }
+
+    /// `refresh_running` reads true from the instant `refresh` returns, before its spawned
+    /// dispatch has raised a single probe: `refresh` reserves the Generation and records the
+    /// dispatch debt on the calling thread, so a caller reading this the same frame it
+    /// dispatched must never see a false "nothing outstanding". It reads false again once
+    /// the Generation has fully landed.
+    #[test]
+    fn refresh_running_reads_true_the_instant_refresh_returns_and_false_once_it_settles() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let core = Core::start_discovered(spec(vec![root]));
+        core.settle(Duration::from_secs(5));
+        assert!(
+            !core.refresh_running(),
+            "sanity: nothing outstanding once startup has settled"
+        );
+
+        let keys: Vec<EntityKey> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        assert!(
+            core.refresh_running(),
+            "refresh reserves its Generation and records the dispatch debt before it \
+             returns, so this must already read true"
+        );
+
+        core.settle(Duration::from_secs(5));
+        assert!(
+            !core.refresh_running(),
+            "settle blocks until nothing is outstanding, so this must read false once it \
+             returns"
         );
     }
 

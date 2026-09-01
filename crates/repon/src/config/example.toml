@@ -97,7 +97,7 @@ args = ["sync-repo"]
 
 # Only what changes. Everything else keeps the default map.
 [keys.global]
-refresh_all = "f5"         # move one binding
+refresh_all = "ctrl-l"     # a rebind moves the binding: plain r stops refreshing
 
 [keys.list]
 anchor_range = ""          # unbind it entirely

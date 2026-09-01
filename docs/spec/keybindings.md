@@ -31,7 +31,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `;` | Open the Action palette |
 | `m` | Open the Action palette filtered to management operations |
 | `/` | Enter a Filter |
-| `r` | Refresh everything |
+| `r`, `F5` | Refresh everything |
 | `R` | Refresh the Selection |
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
@@ -152,6 +152,8 @@ Ruling out prefix counts freed `1` to `9`, which lazygit, gitui, k9s and nnn all
 The Ctrl chords all sit inside the set that survives zellij 0.45.0 (which takes Ctrl+g, q, p, n, s, o, t, h and b) and tmux (Ctrl+b). Ctrl+I, Ctrl+M and Ctrl+[ are permanently unavailable because they mean different things on different terminals, which [0016](../adr/0016-one-binding-table-feeds-every-surface.md) records.
 
 `Ctrl+U` is deliberately half-page in three contexts and clear-line in the fourth. Contexts do not overlap, and both meanings are the ones a user already has in their fingers.
+
+`F5` fires the same `Action::RefreshAll` as `r` rather than a binding of its own, because it is the refresh key across other software and a user reaching for it out of habit should get a refresh with no config edit. It is a second chord on the same action rather than a replacement for `r`, since macOS claims F5 for Dictation before the terminal ever sees it: a user on that platform still has `r`, and one whose terminal or window manager leaves F5 alone gets both.
 
 ## Modifiers and matching
 

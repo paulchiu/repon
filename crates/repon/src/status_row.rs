@@ -25,13 +25,31 @@ const ELLIPSIS: &str = " ...";
 
 /// Everything the status row needs once a live Notice does not pre-empt it: the active Set's
 /// name, the header's own five items (its entity count folds into rank 1 below rather than
-/// standing alone), every outstanding warning, and which of them `w` has already
-/// acknowledged.
+/// standing alone), every outstanding warning, which of them `w` has already acknowledged,
+/// and the refresh key's own most recent Refresh, if one has fired this session.
 pub(crate) struct StatusRowContent<'a> {
     pub(crate) set_name: &'a str,
     pub(crate) header: HeaderContent,
     pub(crate) warnings: &'a [Warning],
     pub(crate) acknowledged: &'a [Warning],
+    pub(crate) refresh: Option<RefreshRowContent>,
+}
+
+/// Which Refresh the refresh key dispatched: every known Entity (`Action::RefreshAll`, `r`
+/// and `F5` by default) or the Selection alone (`Action::RefreshSelection`, `R`)
+/// ([GLOSSARY.md](../../../../GLOSSARY.md)'s "Refresh").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshScope {
+    All,
+    Selection,
+}
+
+/// Rank 3's own content: which Refresh the refresh key most recently dispatched, how many
+/// entities it covers, and whether `Core::refresh_running` still reads true for it.
+pub(crate) struct RefreshRowContent {
+    pub(crate) scope: RefreshScope,
+    pub(crate) entity_count: usize,
+    pub(crate) running: bool,
 }
 
 /// Rank 1: the active Set's name and the entity count it bounds, one item so the two can
@@ -70,6 +88,33 @@ fn message_item(
     }
     warnings::slot_line(warnings, bindings).map(|content| degrade::Item {
         content,
+        priority: Priority::Drop(6),
+    })
+}
+
+/// Rank 3, present from the moment the refresh key dispatches a Refresh until a later one
+/// replaces it: `refreshing` while [`RefreshRowContent::running`] holds, `refreshed` once it
+/// settles. Two states rather than a fraction of entities settled, because phases A and B
+/// cover the whole population in about 0.15 seconds
+/// ([refresh.md](../../../../docs/spec/refresh.md)'s "The phases"), so a live count would
+/// jump straight from nothing landed to everything landed with no readable state between,
+/// the same defect refresh.md already recorded once for a static per-row spinner. Persists
+/// past settling, unlike [`header::trailing_items`]'s run progress, which is the point: a
+/// Refresh that finishes inside the frame that started it must still leave something to
+/// read.
+fn refresh_item(refresh: Option<&RefreshRowContent>) -> Option<degrade::Item<String>> {
+    let refresh = refresh?;
+    let verb = if refresh.running {
+        "refreshing"
+    } else {
+        "refreshed"
+    };
+    let scope = match refresh.scope {
+        RefreshScope::All => "all",
+        RefreshScope::Selection => "selection",
+    };
+    Some(degrade::Item {
+        content: format!("{verb} {scope} {}", refresh.entity_count),
         priority: Priority::Drop(5),
     })
 }
@@ -122,6 +167,7 @@ pub(crate) fn render(
         content.acknowledged,
         bindings,
     ));
+    items.extend(refresh_item(content.refresh.as_ref()));
     items.extend(header::trailing_items(&content.header));
 
     let rest =
@@ -206,6 +252,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         // "work 403 entities" alone is 17 columns, wider than this width; even the reserved
         // indicator's own budget leaves nothing for it.
@@ -229,6 +276,7 @@ mod tests {
                 header: empty_header(),
                 warnings: &no_warnings,
                 acknowledged: &[],
+                refresh: None,
             },
             &bindings(),
             width,
@@ -245,6 +293,7 @@ mod tests {
                 header: empty_header(),
                 warnings: &one_warning,
                 acknowledged: &one_warning,
+                refresh: None,
             },
             &bindings(),
             width,
@@ -273,12 +322,14 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         let acknowledged = StatusRowContent {
             set_name: "work",
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &warnings,
+            refresh: None,
         };
 
         let before = render(&unacknowledged, &bindings(), 88).to_string();
@@ -310,12 +361,14 @@ mod tests {
             header: empty_header(),
             warnings: &seen,
             acknowledged: &seen,
+            refresh: None,
         };
         let after_a_new_condition_arrives = StatusRowContent {
             set_name: "work",
             header: empty_header(),
             warnings: &now_outstanding,
             acknowledged: &seen,
+            refresh: None,
         };
 
         let before = render(&acknowledged_before_the_new_one_arrived, &bindings(), 150).to_string();
@@ -355,6 +408,7 @@ mod tests {
             },
             warnings: &[],
             acknowledged: &[],
+            refresh: None,
         };
         // Wide enough that a name cut to some short prefix (a truncating implementation's
         // typical failure mode) would still fit; the real 60-`x` name must not.
@@ -377,6 +431,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         // Wide enough for the indicator and rank 1, far too narrow for the 200-column message.
         let rendered = render(&content, &bindings(), 25).to_string();
@@ -483,6 +538,7 @@ mod tests {
             header: full_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         let bindings = bindings();
         for (width, expected) in rows {
@@ -516,6 +572,7 @@ mod tests {
             header: full_header(),
             warnings: &warnings,
             acknowledged: &warnings,
+            refresh: None,
         };
         let bindings = bindings();
 
@@ -533,6 +590,79 @@ mod tests {
         assert_eq!(render(&content, &bindings, 3).to_string(), "[1]");
     }
 
+    // --- criterion: the refresh item has a spec'd rank and drops by the same rule as
+    // everything else on the row ---
+
+    /// [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)'s
+    /// own worked example for rank 3: one warning outstanding and unacknowledged, a Refresh
+    /// in progress, nothing from the header live.
+    #[test]
+    fn status_row_matches_the_documented_ladder_with_a_refresh_in_progress_at_every_named_width() {
+        let spec = read_spec("layout-and-provenance.md");
+        let rows = parse_ladder(
+            &spec,
+            "One warning outstanding and unacknowledged, a Refresh in progress, nothing from the header live:",
+        );
+        assert!(!rows.is_empty(), "expected at least one documented width");
+
+        let warnings = vec![named_theme_missing("solarized-dark")];
+        let refresh = RefreshRowContent {
+            scope: RefreshScope::All,
+            entity_count: 403,
+            running: true,
+        };
+        let content = StatusRowContent {
+            set_name: "work",
+            header: empty_header(),
+            warnings: &warnings,
+            acknowledged: &[],
+            refresh: Some(refresh),
+        };
+        let bindings = bindings();
+        for (width, expected) in rows {
+            assert_eq!(
+                render(&content, &bindings, width as u16).to_string(),
+                expected,
+                "status row mismatch at width {width}"
+            );
+        }
+    }
+
+    /// Rank 3 drops before rank 2 (the warning message) at the exact width the documented
+    /// ladder's own transition names, proven against the real priority values rather than
+    /// asserted in prose: a future edit that reorders the two ranks fails this rather than
+    /// only reading wrong in the spec's own worked example.
+    #[test]
+    fn the_refresh_item_drops_before_the_warning_message_when_both_compete_for_the_same_room() {
+        let warnings = vec![named_theme_missing("solarized-dark")];
+        let refresh = RefreshRowContent {
+            scope: RefreshScope::All,
+            entity_count: 403,
+            running: true,
+        };
+        let content = StatusRowContent {
+            set_name: "work",
+            header: empty_header(),
+            warnings: &warnings,
+            acknowledged: &[],
+            refresh: Some(refresh),
+        };
+        let bindings = bindings();
+        // One column narrower than the full line: only the least-priority survivor may
+        // drop, and the refresh item is that survivor.
+        let full = render(&content, &bindings, 999).to_string();
+        let narrowed = render(&content, &bindings, full.chars().count() as u16 - 1).to_string();
+        assert!(
+            !narrowed.contains("refreshing"),
+            "the refresh item must be the first thing this row drops, got {narrowed:?}"
+        );
+        assert!(
+            narrowed.contains("does not exist"),
+            "the warning message must still survive one column short of the full line, got \
+             {narrowed:?}"
+        );
+    }
+
     // --- draw wires render into the buffer at the right row, indicator and rest styled
     // separately ---
 
@@ -544,6 +674,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 3);
@@ -567,6 +698,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
+            refresh: None,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 1);

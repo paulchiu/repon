@@ -1769,11 +1769,12 @@ mod tests {
         );
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        // "move one binding": refresh_all moved from `r` to F5, and its old key is gone.
+        // "a rebind moves the binding": refresh_all moved from `r` to Ctrl+L, and its old
+        // key is gone.
         assert_eq!(
             bindings.dispatch(
                 crate::keys::Context::Global,
-                KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
             ),
             Some(crate::keys::Action::RefreshAll)
         );

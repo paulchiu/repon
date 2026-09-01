@@ -188,6 +188,18 @@ impl ActionRun {
     }
 }
 
+/// One dispatch the refresh key made: `Action::RefreshAll` (`r`, `F5`) or
+/// `Action::RefreshSelection` (`R`), and how many entities it covers.
+/// `status_row_content` reads `Core::refresh_running` fresh every frame to decide whether to
+/// show "refreshing" or "refreshed"; this struct only remembers which Refresh dispatched it
+/// and its size, and persists on `App` until a later refresh key press replaces it, which is
+/// what keeps the result legible even when the Refresh settles inside the frame that started
+/// it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B timings).
+struct RefreshRun {
+    scope: status_row::RefreshScope,
+    entity_count: usize,
+}
+
 pub struct App {
     tick_rate: f64,
     frame_rate: f64,
@@ -411,6 +423,11 @@ pub struct App {
     /// while `Core::action_running` is true; a stale value between runs costs nothing since
     /// nothing reads it then.
     action_run: Option<ActionRun>,
+    /// The refresh key's most recent dispatch, read by `status_row_content` every frame
+    /// alongside `Core::refresh_running`. `None` until the refresh key fires once this
+    /// session, then never cleared: a later refresh key press replaces it rather than
+    /// leaving a gap.
+    refresh_run: Option<RefreshRun>,
 }
 
 impl App {
@@ -532,6 +549,7 @@ impl App {
             no_fetch: flag_no_fetch,
             quit_confirm: false,
             action_run: None,
+            refresh_run: None,
         };
         app.restore_session_state(flag_filter.as_deref());
         Ok(app)
@@ -689,6 +707,14 @@ impl App {
             ),
             _ => (None, None),
         };
+        let refresh = self
+            .refresh_run
+            .as_ref()
+            .map(|run| status_row::RefreshRowContent {
+                scope: run.scope,
+                entity_count: run.entity_count,
+                running: self.core.refresh_running(),
+            });
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
@@ -700,6 +726,7 @@ impl App {
             },
             warnings,
             acknowledged: &self.acknowledged_warnings,
+            refresh,
         }
     }
 
@@ -1193,12 +1220,20 @@ impl App {
             Some(Action::RefreshAll) => {
                 let order = self.refresh_everything_order();
                 self.core.refresh(&order);
+                self.refresh_run = Some(RefreshRun {
+                    scope: status_row::RefreshScope::All,
+                    entity_count: order.len(),
+                });
                 self.fire_on_refresh_hook(&order);
                 None
             }
             Some(Action::RefreshSelection) => {
                 if let Some(order) = self.refresh_selection_order() {
                     self.core.refresh(&order);
+                    self.refresh_run = Some(RefreshRun {
+                        scope: status_row::RefreshScope::Selection,
+                        entity_count: order.len(),
+                    });
                     self.fire_on_refresh_hook(&order);
                 }
                 None
@@ -2929,6 +2964,7 @@ mod tests {
             no_fetch: false,
             quit_confirm: false,
             action_run: None,
+            refresh_run: None,
         }
     }
 
@@ -3261,6 +3297,7 @@ mod tests {
             },
             warnings,
             acknowledged: &[],
+            refresh: None,
         }
     }
 
@@ -4342,6 +4379,142 @@ mod tests {
         wait_for(
             "the second run to finish before this test's own Core is dropped",
             || !app.core.action_running(),
+        );
+    }
+
+    // --- Issue #261: a Refresh names itself in the status row while it runs and once it
+    // settles, using rank 3 ([layout-and-provenance.md](../../../docs/spec/layout-and-provenance.md#the-status-row)).
+
+    /// Pressing the refresh key populates the status row's own refresh item in the same
+    /// call that dispatches the Refresh, before anything about it has necessarily settled:
+    /// `status_row_content` must have something to show the very next frame, per the "Done
+    /// when" criterion that a keypress changes the row within one frame.
+    #[test]
+    fn pressing_the_refresh_key_populates_the_status_rows_refresh_item_immediately() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        let before = app.status_row_content(&app.core.snapshot(), &[]);
+        assert!(
+            before.refresh.is_none(),
+            "sanity: nothing to show before the refresh key has ever fired"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        let after = app.status_row_content(&app.core.snapshot(), &[]);
+        let refresh = after
+            .refresh
+            .expect("the refresh item must be populated the instant the key is handled");
+        assert_eq!(refresh.scope, status_row::RefreshScope::All);
+        assert_eq!(refresh.entity_count, 2);
+    }
+
+    /// Once `Core::refresh_running` reads false the item's text switches from "refreshing"
+    /// to settled, and it keeps reporting the same Refresh afterwards rather than reverting
+    /// to absent, which is the "persists long enough to read" half of the same criterion:
+    /// unlike run progress, this is still legible on a frame drawn well after the Refresh
+    /// finished.
+    #[test]
+    fn the_refresh_item_settles_and_then_persists_rather_than_reverting_to_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        wait_for("the Refresh to settle", || !app.core.refresh_running());
+
+        let settled = app.status_row_content(&app.core.snapshot(), &[]);
+        let refresh = settled
+            .refresh
+            .expect("the refresh item must still be present once settled");
+        assert!(
+            !refresh.running,
+            "the Refresh has settled, so running must read false"
+        );
+        assert_eq!(refresh.entity_count, 2);
+
+        // A later, unrelated frame (no new refresh key press in between) must still carry
+        // the same settled result rather than the item quietly disappearing.
+        let later = app.status_row_content(&app.core.snapshot(), &[]);
+        let refresh_later = later
+            .refresh
+            .expect("the settled refresh item must persist across frames until replaced");
+        assert!(!refresh_later.running);
+        assert_eq!(refresh_later.entity_count, 2);
+    }
+
+    /// `R` scopes the item to the Selection's own size, not the whole population, which is
+    /// "which Refresh it was" made concrete: a build that always reported the entity count
+    /// regardless of scope would pass every other test here and still mislead a user who
+    /// pressed `R` over three rows into thinking all of them ran.
+    #[test]
+    fn refreshing_the_selection_scopes_the_status_rows_refresh_item_to_the_selections_own_size() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        init_repo(&repo_a);
+        init_repo(&root.join("repo-b"));
+
+        let mut app = test_app(&root);
+        let key_a = entity_for(&app.core.snapshot(), &repo_a).key.clone();
+        app.selection.toggle(key_a);
+
+        app.handle_key_event(press(KeyCode::Char('R'), KeyModifiers::SHIFT))
+            .expect("handle RefreshSelection");
+
+        let content = app.status_row_content(&app.core.snapshot(), &[]);
+        let refresh = content
+            .refresh
+            .expect("RefreshSelection must populate the refresh item too");
+        assert_eq!(refresh.scope, status_row::RefreshScope::Selection);
+        assert_eq!(
+            refresh.entity_count, 1,
+            "the item must report the Selection's own size, not the whole population's"
+        );
+    }
+
+    /// The "Done when" criterion this issue names directly: a Refresh over an
+    /// already-populated table, on a population small enough to plausibly settle inside one
+    /// frame, still produces a legible settled message rather than nothing changing on
+    /// screen. A single Repo is as small as a real Refresh gets.
+    #[test]
+    fn a_refresh_small_enough_to_settle_within_one_frame_still_produces_a_settled_status_row_message()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        wait_for("the single-entity Refresh to settle", || {
+            !app.core.refresh_running()
+        });
+
+        let content = app.status_row_content(&app.core.snapshot(), &[]);
+        {
+            let refresh = content
+                .refresh
+                .as_ref()
+                .expect("a Refresh finishing fast must still leave a settled item behind");
+            assert!(!refresh.running);
+            assert_eq!(refresh.entity_count, 1);
+        }
+        let bindings = crate::keys::BindingTable::compiled_default();
+        let rendered = status_row::render(&content, &bindings, 200).to_string();
+        assert!(
+            rendered.contains("refreshed all 1"),
+            "the settled Refresh must actually render on the row, got {rendered:?}"
         );
     }
 
@@ -7604,6 +7777,31 @@ mod tests {
         );
     }
 
+    /// `F5` fires `Action::RefreshAll` out of the box, no config edit required, and carries
+    /// the same hook `r` does: it is a second compiled chord on the identical Action, not a
+    /// variant of its own.
+    #[test]
+    fn f5_refreshes_everything_out_of_the_box_and_carries_the_on_refresh_hook() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        init_repo(&repo_a);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+
+        app.handle_key_event(press(KeyCode::F(5), KeyModifiers::NONE))
+            .expect("handle RefreshAll via F5");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            hook_ran_in(&repo_a),
+            "F5 must dispatch RefreshAll and carry its hook exactly as r does"
+        );
+    }
+
     /// The same "Done when" for `R`, plus the scope that key carries: a Selection refresh's
     /// hook runs on the Selection alone. Asserting only that `repo-a` ran would pass on a
     /// build that fanned out over everything, so the load-bearing half is `repo-b`, which is
@@ -8033,6 +8231,48 @@ mod tests {
             region.contains("Some(Action::RefreshAll)")
                 && region.contains("Some(Action::RefreshSelection)"),
             "the marked region must still be the two Refresh-key arms themselves"
+        );
+    }
+
+    /// ADR 0029 (amended by #261): "the refresh key" is whichever chord dispatches
+    /// `Action::RefreshAll`, not the literal `r`. A `[keys]` rebind moves that chord onto
+    /// `z`, unbound in every context by default, and the hook must still fire on `z`, and
+    /// must no longer fire on the now unbound `r`, because the hook is wired to the Action
+    /// `keys::dispatch` resolves rather than to a specific keystroke.
+    #[test]
+    fn on_refresh_still_fires_after_the_user_rebinds_refresh_all_to_a_different_chord() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        init_repo(&repo_a);
+
+        let mut app = test_app(&root);
+        declare_on_refresh_hook(&mut app);
+
+        let rebind: toml::Table = toml::from_str(
+            r#"[global]
+refresh_all = "z""#,
+        )
+        .expect("parse a minimal [keys] block");
+        let (bindings, warnings) = keys::merge(&rebind).expect("the rebind must merge cleanly");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        app.bindings = bindings;
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("r no longer dispatches anything once refresh_all has moved off it");
+        assert!(
+            !hook_ran_in(&repo_a),
+            "the rebind moved refresh_all off r, so r must not start a Refresh or its hook"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('z'), KeyModifiers::NONE))
+            .expect("handle the rebound RefreshAll chord");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+        assert!(
+            hook_ran_in(&repo_a),
+            "the hook must still fire on the chord the user moved refresh_all onto"
         );
     }
 
