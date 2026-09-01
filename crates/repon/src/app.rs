@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect, Size},
 };
-use repon_core::{Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot};
+use repon_core::{ActionReceipt, Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot};
 use tracing::debug;
 
 use crate::{
@@ -146,6 +146,41 @@ impl UnwindLevel for ClearFilterOnUnwind<'_> {
         } else {
             false
         }
+    }
+}
+
+/// The fan-out `start_action` dispatched: each target paired with the receipt it already
+/// held at that moment, plus when dispatch happened. `status_row_content` reads this for
+/// `run n/m` and the elapsed timer while `Core::action_running` is true.
+struct ActionRun {
+    targets: Vec<(EntityKey, Option<ActionReceipt>)>,
+    started_at: std::time::Instant,
+}
+
+impl ActionRun {
+    /// How many targets have finished, read fresh against `snapshot`. A target counts once
+    /// its current receipt's `running` is `None` and that receipt differs from the one it
+    /// held at dispatch: `running.is_none()` alone cannot tell this run's finish from a
+    /// finished receipt the row already carried before this run ever touched it
+    /// (`repon_core::entity::ActionReceipt`'s "Nothing may read this receipt's presence as
+    /// 'the run is over'").
+    fn done(&self, snapshot: &Snapshot) -> usize {
+        self.targets
+            .iter()
+            .filter(|(key, baseline)| {
+                let current = snapshot
+                    .entities
+                    .iter()
+                    .find(|entity| &entity.key == key)
+                    .and_then(|entity| entity.last_action.as_ref());
+                match current {
+                    Some(receipt) => {
+                        receipt.running.is_none() && Some(receipt) != baseline.as_ref()
+                    }
+                    None => false,
+                }
+            })
+            .count()
     }
 }
 
@@ -363,6 +398,10 @@ pub struct App {
     /// `y`/`n`/Esc vocabulary [`Stage::Confirming`] uses; `Action::Suspend` is never gated
     /// this way, since suspending is reversible where quitting is not.
     quit_confirm: bool,
+    /// The most recent fan-out `start_action` dispatched, read by `status_row_content` only
+    /// while `Core::action_running` is true; a stale value between runs costs nothing since
+    /// nothing reads it then.
+    action_run: Option<ActionRun>,
 }
 
 impl App {
@@ -488,6 +527,7 @@ impl App {
             filter_line: None,
             no_fetch: flag_no_fetch,
             quit_confirm: false,
+            action_run: None,
         };
         app.restore_session_state(flag_filter.as_deref());
         Ok(app)
@@ -613,8 +653,8 @@ impl App {
     /// ([`crate::components::list`]) so the header's own count is the identical set the list
     /// draws ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the matching
     /// rows, the header's match count ... are all the same set"). `run_progress` and
-    /// `elapsed` stay `None`: `App` has no in-flight Action progress counter or elapsed timer
-    /// yet ([`crate::header`]'s own doc comment).
+    /// `elapsed` come from `self.action_run` while [`Self::action_running`] is true, and are
+    /// `None` otherwise.
     fn status_row_content<'a>(
         &'a self,
         snapshot: &Snapshot,
@@ -636,14 +676,21 @@ impl App {
                 .filter(|&&index| matches!(snapshot.entities[index].kind, Kind::Worktree))
                 .count()
         });
+        let (run_progress, elapsed) = match (self.action_running(), &self.action_run) {
+            (true, Some(run)) => (
+                Some((run.done(snapshot), run.targets.len())),
+                Some(run.started_at.elapsed()),
+            ),
+            _ => (None, None),
+        };
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
                 entity_count: snapshot.entities.len(),
-                run_progress: None,
+                run_progress,
                 filter_match_count,
                 worktrees_note,
-                elapsed: None,
+                elapsed,
             },
             warnings,
             acknowledged: &self.acknowledged_warnings,
@@ -1736,15 +1783,32 @@ impl App {
     /// the seam every Action-running path in this file uses so a run started from the
     /// confirm gate and one started by a `confirm = false` entry can never diverge in what
     /// they act on. `Core::run_action`'s own `bool` (whether a second fan-out was rejected
-    /// because one is already live) is not surfaced here: making that visible, and making
-    /// the keys `docs/spec/actions.md` names inert while a run is in flight, is issue
-    /// #69's own scope, blocked by this one.
+    /// because one is already live) gates whether `self.action_run` replaces the run already
+    /// in flight; surfacing that rejection to the user is issue #69's own scope, blocked by
+    /// this one.
     fn start_action(&mut self, spec: repon_core::ActionSpec) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
         };
         let targets = self.selection.targets(&cursor_key);
-        let _ = self.core.run_action(spec, &targets);
+        let snapshot = self.core.snapshot();
+        let action_run = ActionRun {
+            targets: targets
+                .iter()
+                .map(|key| {
+                    let baseline = snapshot
+                        .entities
+                        .iter()
+                        .find(|entity| &entity.key == key)
+                        .and_then(|entity| entity.last_action.clone());
+                    (key.clone(), baseline)
+                })
+                .collect(),
+            started_at: std::time::Instant::now(),
+        };
+        if self.core.run_action(spec, &targets) {
+            self.action_run = Some(action_run);
+        }
     }
 
     /// The Filter currently narrowing the list: the edit buffer's own live parse while
@@ -2572,6 +2636,7 @@ mod tests {
             filter_line: None,
             no_fetch: false,
             quit_confirm: false,
+            action_run: None,
         }
     }
 
@@ -3647,6 +3712,167 @@ mod tests {
 
         wait_for(
             "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
+        );
+    }
+
+    /// The exact trap `repon_core::entity::ActionReceipt` documents: a receipt exists before
+    /// its run ends, so reading its mere presence as "finished" would report a row done the
+    /// instant its first step starts. Two targets and `concurrency: 1` keep one target's
+    /// receipt sitting with a step still `running` while the other has not started at all,
+    /// so a naive presence check has something to get wrong.
+    #[test]
+    fn run_progress_does_not_count_a_target_whose_receipt_is_present_but_still_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        app.selection.select_all_visible(&visible);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+
+        wait_for("a receipt with a step still running to appear", || {
+            app.core.snapshot().entities.iter().any(
+                |entity| matches!(&entity.last_action, Some(receipt) if receipt.running.is_some()),
+            )
+        });
+
+        let snapshot = app.core.snapshot();
+        let content = app.status_row_content(&snapshot, &[]);
+        let (done, total) = content
+            .header
+            .run_progress
+            .expect("a run is in flight, so run_progress must be Some");
+        assert_eq!(total, 2, "both selected rows are targets");
+        assert_eq!(
+            done, 0,
+            "a receipt present with a step still running must not count as finished; reading \
+             completion from the receipt's presence rather than `running.is_none()` would \
+             report this row done"
+        );
+
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
+        );
+    }
+
+    /// `run n/m` counts up as targets finish and the elapsed timer runs alongside it, both
+    /// stopping the moment `Core::action_running` does
+    /// ([`crate::header`]'s `run_progress` and `elapsed`).
+    #[test]
+    fn run_progress_counts_up_as_targets_finish_and_stops_with_the_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        app.selection.select_all_visible(&visible);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+
+        let snapshot = app.core.snapshot();
+        let started = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            started.header.run_progress,
+            Some((0, 2)),
+            "nothing has finished the instant the run starts"
+        );
+        assert!(
+            started.header.elapsed.is_some(),
+            "the elapsed timer runs while the Action does"
+        );
+
+        wait_for("one of the two targets to finish", || {
+            let snapshot = app.core.snapshot();
+            app.status_row_content(&snapshot, &[]).header.run_progress == Some((1, 2))
+        });
+
+        wait_for(
+            "the fan-out to finish before this test's own Core is dropped",
+            || !app.core.action_running(),
+        );
+
+        let snapshot = app.core.snapshot();
+        let finished = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            finished.header.run_progress, None,
+            "run progress stops the moment the Action does"
+        );
+        assert_eq!(
+            finished.header.elapsed, None,
+            "the elapsed timer stops the moment the Action does"
+        );
+    }
+
+    /// A second run over the same targets must not read the first run's own finished
+    /// receipts as this run's progress: with `concurrency: 1` at least one of the two rows
+    /// is still carrying the first run's receipt the instant the second dispatches, and
+    /// `running.is_none()` alone cannot tell that apart from this run having already
+    /// finished it.
+    #[test]
+    fn run_progress_does_not_count_a_target_whose_receipt_predates_this_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        app.selection.select_all_visible(&visible);
+        app.document.actions.push(slow_action("slow"));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette for the first run");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("start the first run");
+        wait_for("the first run to finish", || !app.core.action_running());
+        assert!(
+            app.core.snapshot().entities.iter().all(|entity| matches!(
+                &entity.last_action,
+                Some(receipt) if receipt.running.is_none()
+            )),
+            "sanity: both rows must carry a finished receipt from the first run"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette for the second run");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("start the second run");
+        assert!(
+            app.core.action_running(),
+            "sanity: the second run must be live"
+        );
+
+        let snapshot = app.core.snapshot();
+        let content = app.status_row_content(&snapshot, &[]);
+        let (done, total) = content
+            .header
+            .run_progress
+            .expect("a run is in flight, so run_progress must be Some");
+        assert_eq!(total, 2);
+        assert_eq!(
+            done, 0,
+            "a receipt left over from the previous run must not count as this run already \
+             having finished that row"
+        );
+
+        wait_for(
+            "the second run to finish before this test's own Core is dropped",
             || !app.core.action_running(),
         );
     }
