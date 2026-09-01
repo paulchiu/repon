@@ -139,4 +139,6 @@ One addition to the value set: `∅` in the `sync` cell means the Repo has **no 
 
 ## Column widths
 
-Name 28, branch 24, sync 9, base 6, dirty 6, state 10, then the filler column. With the gutter and single-space gaps this is 90 columns, up from 83. Below that the existing rule already gives the frame to the detail pane.
+Name 28 to 40, branch 24 to 75, sync 9, base 6, dirty 6, state 10, then the filler column. A pair is the column's minimum and its cap: `name` and `branch` grow into whatever the frame leaves over, in that order, and the other four never change width ([layout-and-provenance.md](layout-and-provenance.md)'s "Growing `name` and `branch`" carries the rule and the measurement behind it). With the gutter and single-space gaps the minimums are 92 columns and both caps together are 155. Below the minimum the existing rule already gives the frame to the detail pane.
+
+The earlier figure here was 90, and it was wrong when written rather than made wrong by this change: it predates the one-character Selection marker and its gap, which layout-and-provenance.md has counted since.
