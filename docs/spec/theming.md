@@ -48,9 +48,11 @@ The row `j`/`k` moves is not the Selection (the rows marked with space; see "The
 
 ### The Selection
 
-A row that [keybindings.md](keybindings.md#the-selection)'s Selection holds checked (marked with `Space`) is underlined across the same interior width the cursor row's own highlight covers, painted the same way and after the row's own cells, so it reaches every column and every gap between them rather than only the cells a value happened to write text into. The mark carries no colour of its own, so it needs no tenth role, holds on a light terminal exactly as it holds on a dark one by construction, and keeps working under `NO_COLOR`, since crossterm strips colour escape codes and never a text attribute.
+A row that [keybindings.md](keybindings.md#the-selection)'s Selection holds checked (marked with `Space`) carries a glyph in a marker column of its own, immediately left of the name and immediately right of the gutter: `✓` under `full`, `+` under `ascii` ("The two sets" above). Underline was tried first and dropped: it is invisible or near-invisible in several terminals and fights the cursor row's own reverse-video patch, which is a Selection you cannot see, the defect this section now closes. A marker column is not a gutter mark either, even though both are one character wide: the gutter summarises provenance a Probe settled, and Selection is state a keystroke sets, the same distinction [layout-and-provenance.md](layout-and-provenance.md#open) already draws for the Vanished mark it refused to add there.
 
-The two treatments are independent and compose rather than one replacing the other: a checked row that is not the cursor is underlined only, the cursor row when it is not checked is reversed only, and a row that is both is reversed *and* underlined. That composition is what "a row that is both is unambiguous" resolves to on screen, rather than a third colour or a third modifier.
+Unlike the cursor row's own highlight, the marker is a value the row draws into a fixed column rather than a style patched across the row's width, so the two treatments compose by construction instead of needing a rule to keep them from erasing one another: a checked row that is not the cursor shows the marker in plain text, the cursor row when it is not checked is reversed with no marker, and a row that is both shows the marker inside the reversed bar, unambiguous without a third colour or a third modifier. The marker carries no colour of its own, so it needs no tenth role, holds on a light terminal exactly as it holds on a dark one by construction, and keeps working under `NO_COLOR`, since crossterm strips colour escape codes and never a glyph.
+
+The sidebar shows the marker too, alongside the gutter and the name it already kept: a Selection is exactly what you need to see while the detail pane has your attention.
 
 ## Colour is never the only carrier
 
@@ -149,35 +151,36 @@ One switch, two vetted sets, no way to mix them:
 | behind by n | `↓n` | `<n` |
 | n changed files | `●n` | `*n` |
 | child row | `└` | `` ` `` |
+| checked (the Selection's own marker) | `✓` | `+` |
 | panel border | `╭╮╰╯─│` | `+ + + + - |` |
 | capture elision | `···` | `...` |
 
-The same screen, [head.md](head.md)'s, under each setting. Every line is exactly 92 columns.
+The same screen, [head.md](head.md)'s, under each setting. Every line is exactly 94 columns, none of these rows checked, so the Selection's own marker column sits blank throughout.
 
 ```
-╭ repos ───────────────────────────────────────────────────────────────────────────────────╮
-│  name                         branch                   sync      base   dirty  state     │
-│  manage                       main                     ≡                ·                │
-│    └ manage-cad-1958          feature/cad-1958-phase-0 ↑2        ↓12    ●3     Active    │
-│    └ manage-pr-3920           ac7feed53                -         ↓530   ·                │
-│    └ manage-pr-3966           7272ad5e9                -         ↓521   ·      Merged    │
-│  qmk_firmware                 main                     ≡                ·                │
-│    └ lib/chibios              1a2b3c4d5                -                ·                │
-│  HelloWorldCLI                main                     ∅                ●1               │
-╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ repos ─────────────────────────────────────────────────────────────────────────────────────╮
+│    name                         branch                   sync      base   dirty  state     │
+│    manage                       main                     ≡                ·                │
+│      └ manage-cad-1958          feature/cad-1958-phase-0 ↑2        ↓12    ●3     Active    │
+│      └ manage-pr-3920           ac7feed53                -         ↓530   ·                │
+│      └ manage-pr-3966           7272ad5e9                -         ↓521   ·      Merged    │
+│    qmk_firmware                 main                     ≡                ·                │
+│      └ lib/chibios              1a2b3c4d5                -                ·                │
+│    HelloWorldCLI                main                     ∅                ●1               │
+╰────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ```
-+ repos -----------------------------------------------------------------------------------+
-|  name                         branch                   sync      base   dirty  state     |
-|  manage                       main                     =                .                |
-|    ` manage-cad-1958          feature/cad-1958-phase-0 >2        <12    *3     Active    |
-|    ` manage-pr-3920           ac7feed53                -         <530   .                |
-|    ` manage-pr-3966           7272ad5e9                -         <521   .      Merged    |
-|  qmk_firmware                 main                     =                .                |
-|    ` lib/chibios              1a2b3c4d5                -                .                |
-|  HelloWorldCLI                main                     x                *1               |
-+------------------------------------------------------------------------------------------+
++ repos -------------------------------------------------------------------------------------+
+|    name                         branch                   sync      base   dirty  state     |
+|    manage                       main                     =                .                |
+|      ` manage-cad-1958          feature/cad-1958-phase-0 >2        <12    *3     Active    |
+|      ` manage-pr-3920           ac7feed53                -         <530   .                |
+|      ` manage-pr-3966           7272ad5e9                -         <521   .      Merged    |
+|    qmk_firmware                 main                     =                .                |
+|      ` lib/chibios              1a2b3c4d5                -                .                |
+|    HelloWorldCLI                main                     x                *1               |
++--------------------------------------------------------------------------------------------+
 ```
 
 The ascii set costs no columns: every full-set glyph is already one column to ratatui, and the widest `sync` cell in a 540-entity sweep is five characters, `↓1449`, inside a nine-column budget.
