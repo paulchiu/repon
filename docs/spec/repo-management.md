@@ -28,7 +28,11 @@ A refusal is reported and counted in the confirm gate, never silent, the same wa
 
 `delete` names, per Repo, what accepting will destroy:
 
-- whether the working tree has uncommitted changes
+- whether the working tree has uncommitted changes, which means work that is not in a commit: a
+  modified, deleted or untracked file in the worktree, **and** a change that has been staged with
+  `git add` and not yet committed. Staged work is the case most easily lost, because it looks clean
+  to any check that compares only the index against the worktree, so the gate compares against
+  `HEAD` as well.
 - how many commits are unpushed, and on how many branches
 - how many linked Worktrees point into the Repo
 
@@ -54,6 +58,12 @@ exclude = true
 An entry that already exists is modified in place rather than appended a second time, and keeps whatever other keys it carries: `unignore` on an entry holding `default_branch` removes the `exclude` key alone and leaves the table. An entry left with no keys but `path` is removed entirely, and an empty `[[repo]]` array of tables is removed with it, so a file that had none before an `ignore` and an `unignore` is byte-for-byte what it started as.
 
 After a successful write, Repon runs the same path `Action::ReloadConfig` runs. Nothing mutates the in-memory document directly, so config reaches the running app one way and a write cannot produce a state the file alone would not reproduce.
+
+That path does not re-apply most of `[[repo]]`, and deliberately: `crates/repon/src/app/reload.rs` records that `Core` cannot move to a new `CoreSpec` without being rebuilt, and rebuilding it would restart discovery for a reload that changed nothing discovery reads. `exclude` is the exception, and re-applies live.
+
+The exception is not special pleading. `exclude` is not a discovery-time fact at all: [config.md](config.md) defines it as "listed, never operated on", so the entity is still discovered, still probed and still a row, and all `exclude` decides is whether an operation may reach it. That is an operate-time filter over a table that is already correct, which is why it needs no rebuild, and it is the same shape as `show_submodules`, which reload.rs already names as its one live-updating exception. `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and keeps the existing behaviour: it reaches the session it was written in only through a restart. Repon never writes it, so nothing here depends on that.
+
+An `ignore` therefore takes effect immediately: the row it names is subtracted from the Action confirm gate's count and from every operation's eligible set in the same frame the write completes, without a refresh and without a restart.
 
 ## Keys
 
