@@ -48,6 +48,12 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 /// user who has never configured a Launcher has no reason to know where one is declared.
 pub(crate) const NO_LAUNCHERS_CONFIGURED_MESSAGE: &str = "no launchers; see [[launcher]]";
 
+/// The query row's own text while `self.query` is empty, replaced by the prompt character
+/// and typed text on the first keystroke; kept parallel with
+/// [`crate::action_palette::QUERY_PLACEHOLDER`] and [`crate::filter_line::QUERY_PLACEHOLDER`],
+/// each the prompt character, a verb, then what it acts on.
+pub(crate) const QUERY_PLACEHOLDER: &str = "! filter launchers";
+
 /// Case-insensitive substring match against a Launcher's own name, the same convention
 /// [`crate::action_palette::entries`] uses and for the same reason: a plain substring test
 /// never reorders, so a match always reads as "why did this row match". An empty query
@@ -235,13 +241,14 @@ impl LauncherPalette {
         let interior = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let query_line = format!("! {}", self.query);
-        frame.buffer_mut().set_string(
-            interior.x,
-            interior.y,
-            &query_line,
-            theme.style_for(Role::Text),
-        );
+        let (query_line, query_style) = if self.query.is_empty() {
+            (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
+        } else {
+            (format!("! {}", self.query), theme.style_for(Role::Text))
+        };
+        frame
+            .buffer_mut()
+            .set_string(interior.x, interior.y, &query_line, query_style);
 
         let matches = self.matches(launchers);
         let rows_below_query = interior.height.saturating_sub(1) as usize;
@@ -426,6 +433,43 @@ mod tests {
         assert!(!row_text(&buf, interior.y, 40).contains('>'));
         assert!(!row_text(&buf, interior.y + 1, 40).contains('>'));
         assert!(!row_text(&buf, interior.y + 2, 40).contains('>'));
+    }
+
+    /// The empty state must say what `!` does, and that placeholder must be gone the moment
+    /// there is real input, never the two overlapping.
+    #[test]
+    fn draw_shows_placeholder_only_while_empty_and_in_the_dim_role() {
+        let launchers = vec![launcher("lazygit")];
+        let theme = Theme::default();
+        let interior = popup_interior(&LauncherPalette::new(), &launchers, "repo-a");
+
+        let empty = LauncherPalette::new();
+        let empty_buf = draw_to_buffer(&empty, &launchers, &theme, "repo-a", &crate::glyphs::FULL);
+        assert!(
+            row_text(&empty_buf, interior.y, 40).contains(QUERY_PLACEHOLDER),
+            "expected the placeholder on an empty query row: {:?}",
+            row_text(&empty_buf, interior.y, 40)
+        );
+        assert_eq!(
+            empty_buf[(interior.x, interior.y)].fg,
+            theme.dim,
+            "the placeholder must paint in the dim role"
+        );
+
+        let mut typed = LauncherPalette::new();
+        typed.type_char('l', &launchers);
+        let typed_buf = draw_to_buffer(&typed, &launchers, &theme, "repo-a", &crate::glyphs::FULL);
+        assert!(
+            !row_text(&typed_buf, interior.y, 40).contains("filter launchers"),
+            "the placeholder must not linger once there is typed text: {:?}",
+            row_text(&typed_buf, interior.y, 40)
+        );
+        assert!(row_text(&typed_buf, interior.y, 40).contains("! l"));
+        assert_eq!(
+            typed_buf[(interior.x, interior.y)].fg,
+            theme.text,
+            "typed text must paint in the text role, not dim"
+        );
     }
 
     #[test]

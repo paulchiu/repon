@@ -49,6 +49,12 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 /// never configured an Action has no reason to know where one is declared.
 pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
 
+/// The query row's own text while `self.query` is empty, replaced by the prompt character
+/// and typed text on the first keystroke; kept parallel with
+/// [`crate::launcher_palette::QUERY_PLACEHOLDER`] and [`crate::filter_line::QUERY_PLACEHOLDER`],
+/// each the prompt character, a verb, then what it acts on.
+pub(crate) const QUERY_PLACEHOLDER: &str = "; filter actions";
+
 /// The last interior row of [`Stage::Confirming`], always drawn: the gate's own answer
 /// vocabulary, which [repo-management.md](../../../docs/spec/repo-management.md) requires be
 /// on screen whatever the Selection's length.
@@ -672,8 +678,12 @@ impl ActionPalette {
                 }
             }
             Stage::Choosing => {
-                let query_line = format!("; {}", self.query);
-                draw_row(frame, interior, 0, &query_line, theme.style_for(Role::Text));
+                let (query_line, query_style) = if self.query.is_empty() {
+                    (QUERY_PLACEHOLDER.to_string(), theme.style_for(Role::Dim))
+                } else {
+                    (format!("; {}", self.query), theme.style_for(Role::Text))
+                };
+                draw_row(frame, interior, 0, &query_line, query_style);
 
                 let matches = self.matches(actions);
                 let rows_below_query = interior.height.saturating_sub(1) as usize;
@@ -1484,7 +1494,13 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
-        // Row 1 is the query line, row 2 "reinstall", row 3 the cursor's own "deploy".
+        // Row 1 is the query line (the placeholder, since nothing was typed), row 2
+        // "reinstall", row 3 the cursor's own "deploy".
+        assert!(
+            row_text(1).contains(QUERY_PLACEHOLDER),
+            "an untouched query row must show the placeholder: {:?}",
+            row_text(1)
+        );
         assert!(row_text(2).contains("reinstall"));
         assert!(row_text(3).contains("deploy"));
         assert!(
@@ -1763,7 +1779,13 @@ mod tests {
         let buf = terminal.backend().buffer();
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
-        // Row 1 is the query line, row 2 "reinstall", row 3 the cursor's own "deploy".
+        // Row 1 is the query line (the placeholder, since nothing was typed), row 2
+        // "reinstall", row 3 the cursor's own "deploy".
+        assert!(
+            row_text(1).contains(QUERY_PLACEHOLDER),
+            "the placeholder must still read as text even with every role identical: {:?}",
+            row_text(1)
+        );
         assert!(
             row_text(3).contains("> deploy"),
             "with every colour identical, the highlighted row must still read as \
@@ -1903,33 +1925,60 @@ mod tests {
     /// The worthless version of this test types a character that also appears in a listed
     /// name, so a buffer scan cannot tell whether the query line drew it or a match row did.
     /// `"zzq"` appears in neither "reinstall" nor "deploy", so the only way it reaches the
-    /// screen is the query line itself.
+    /// screen is the query line itself. Also covers the empty case: the placeholder must
+    /// appear before typing and again once the query is cleared, and only there.
     #[test]
     fn the_typed_query_is_visible_and_updates_as_characters_are_added_and_removed() {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
+        let theme = Theme::default();
 
-        let empty = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        let empty = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
         assert!(
             !row_text(&empty, 1, 40).contains("zzq"),
             "an unopened query must not already show text nobody typed"
+        );
+        assert!(
+            row_text(&empty, 1, 40).contains(QUERY_PLACEHOLDER),
+            "expected the placeholder on the empty query row: {:?}",
+            row_text(&empty, 1, 40)
+        );
+        assert_eq!(
+            empty[(1, 1)].fg,
+            theme.dim,
+            "the placeholder must paint in the dim role"
         );
 
         for c in "zzq".chars() {
             palette.type_char(c, &actions);
         }
-        let typed = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        let typed = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
         assert!(
             row_text(&typed, 1, 40).contains("zzq"),
             "expected the typed query on the interior's first row: {:?}",
             row_text(&typed, 1, 40)
         );
+        assert!(
+            !row_text(&typed, 1, 40).contains("filter actions"),
+            "the placeholder must not linger once there is typed text: {:?}",
+            row_text(&typed, 1, 40)
+        );
+        assert_eq!(
+            typed[(1, 1)].fg,
+            theme.text,
+            "typed text must paint in the text role, not dim"
+        );
 
         palette.delete_previous_word(&actions);
-        let cleared = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        let cleared = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
         assert!(
             !row_text(&cleared, 1, 40).contains("zzq"),
             "removing the typed characters must remove them from the query row too: {:?}",
+            row_text(&cleared, 1, 40)
+        );
+        assert!(
+            row_text(&cleared, 1, 40).contains(QUERY_PLACEHOLDER),
+            "the placeholder must return once the query is emptied again: {:?}",
             row_text(&cleared, 1, 40)
         );
     }
