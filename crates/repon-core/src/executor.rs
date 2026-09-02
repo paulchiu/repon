@@ -737,36 +737,118 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
         .unwrap_or(-1)
 }
 
-/// Collapses a PTY's own carriage-return conventions into the line endings a step's
-/// output actually means, per `docs/spec/actions.md`'s "Capture": a `\r` immediately
-/// before a `\n` is ONLCR's own doing and is dropped, keeping the `\n`; a bare `\r` is a
-/// progress-frame separator, and only the frame that follows the last one before a real
-/// line ending survives. `\n` bytes never appear as a UTF-8 continuation byte, so this
-/// never risks splitting a multi-byte character.
+/// Collapses a PTY's own redraw conventions into the line endings and final frames a
+/// step's output actually means, per `docs/spec/actions.md`'s "Capture": a `\r`
+/// immediately before a `\n` is ONLCR's own doing and is dropped, keeping the `\n`; a
+/// bare `\r` is a progress-frame separator, and only the frame that follows the last one
+/// before a real line ending survives; a CSI erase-in-line (`ESC [ K`, with or without a
+/// `0`/`1`/`2` parameter) or cursor-to-column-1 (`ESC [ G`, `ESC [ 1 G`) sequence resets
+/// a frame the same way, since a writer that redraws with CSI rather than a bare `\r`
+/// means the same thing by it. Every other CSI sequence, SGR (`ESC [ ... m`) included,
+/// passes through untouched: this is not a terminal emulator, so a sequence it does not
+/// know resets a frame (cursor-up, `ESC [ A`, among them) is left for the pane to render
+/// literally rather than guessed at. `\n` bytes never appear as a UTF-8 continuation
+/// byte, so this never risks splitting a multi-byte character.
 fn normalize_carriage_returns(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut frame_start = 0;
-    let mut bytes = raw.iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
-        match byte {
-            b'\r' if bytes.peek() == Some(&b'\n') => {
-                bytes.next();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'\r' if raw.get(index + 1) == Some(&b'\n') => {
                 out.push(b'\n');
                 frame_start = out.len();
+                index += 2;
             }
             b'\r' => {
                 // A progress-frame separator: drop everything this frame wrote, keeping
                 // only what the line held before it began.
                 out.truncate(frame_start);
+                index += 1;
             }
             b'\n' => {
                 out.push(b'\n');
                 frame_start = out.len();
+                index += 1;
             }
-            other => out.push(other),
+            0x1b if raw.get(index + 1) == Some(&b'[') => match parse_csi(&raw[index..]) {
+                Some(csi) if csi.resets_the_frame() => {
+                    out.truncate(frame_start);
+                    index += csi.len;
+                }
+                Some(csi) => {
+                    out.extend_from_slice(&raw[index..index + csi.len]);
+                    index += csi.len;
+                }
+                // Cut off mid-sequence (the process exited, or the capture bound cut the
+                // buffer) with no final byte to act on: treat this byte literally and
+                // let the rest of the stream fall back to ordinary handling.
+                None => {
+                    out.push(raw[index]);
+                    index += 1;
+                }
+            },
+            other => {
+                out.push(other);
+                index += 1;
+            }
         }
     }
     out
+}
+
+/// One parsed CSI sequence (`ESC [ parameter-bytes intermediate-bytes final-byte`, ECMA-48),
+/// found at the start of the slice `parse_csi` was given: how many bytes it spans and
+/// which parameter and final bytes it carries, enough for [`Csi::resets_the_frame`] to
+/// decide whether it means the same thing as a bare `\r`.
+struct Csi<'a> {
+    len: usize,
+    params: &'a [u8],
+    final_byte: u8,
+}
+
+impl Csi<'_> {
+    /// Whether this sequence redraws the current line the way a bare `\r` does: erase in
+    /// line erases what a subsequent write would otherwise leave stray, and cursor to
+    /// column 1 (no parameter, or an explicit `1`) returns to where a frame begins.
+    /// Anything else, cursor-up included, would need a real screen model to place
+    /// correctly and is left alone (`docs/spec/actions.md`'s "Capture").
+    fn resets_the_frame(&self) -> bool {
+        match self.final_byte {
+            b'K' => true,
+            b'G' => matches!(self.params, b"" | b"1"),
+            _ => false,
+        }
+    }
+}
+
+/// Parses one CSI sequence starting at `raw[0]` (`ESC`, already confirmed followed by
+/// `[` by the caller), returning `None` when the slice ends before a final byte
+/// (0x40..=0x7e) appears.
+fn parse_csi(raw: &[u8]) -> Option<Csi<'_>> {
+    let mut index = 2; // past ESC and '['
+    while raw
+        .get(index)
+        .is_some_and(|byte| (0x30..=0x3f).contains(byte))
+    {
+        index += 1;
+    }
+    let params_end = index;
+    while raw
+        .get(index)
+        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+    {
+        index += 1;
+    }
+    let final_byte = *raw.get(index)?;
+    if !(0x40..=0x7e).contains(&final_byte) {
+        return None;
+    }
+    Some(Csi {
+        len: index + 1,
+        params: &raw[2..params_end],
+        final_byte,
+    })
 }
 
 /// `normalized`, split on every `\n` into lines that each keep their own trailing
@@ -1766,6 +1848,86 @@ print(1 if inherited else 0)"
     #[test]
     fn normalize_carriage_returns_leaves_plain_output_with_no_carriage_returns_untouched() {
         assert_eq!(normalize_carriage_returns(b"a\nb\nc"), b"a\nb\nc");
+    }
+
+    // --- The third rule: CSI redraws collapse a frame the same way a bare `\r` does ---
+
+    #[test]
+    fn a_csi_erase_in_line_sequence_collapses_the_previous_frame_like_a_bare_carriage_return() {
+        assert_eq!(
+            normalize_carriage_returns(b"frame1\x1b[2Kframe2\n"),
+            b"frame2\n"
+        );
+    }
+
+    #[test]
+    fn every_erase_in_line_parameter_variant_collapses_the_previous_frame() {
+        for variant in ["\x1b[K", "\x1b[0K", "\x1b[1K", "\x1b[2K"] {
+            let raw = format!("frame1{variant}frame2\n");
+            assert_eq!(
+                normalize_carriage_returns(raw.as_bytes()),
+                b"frame2\n",
+                "variant {variant:?} must collapse the previous frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_csi_cursor_to_column_one_sequence_collapses_the_previous_frame_like_a_bare_carriage_return()
+     {
+        assert_eq!(
+            normalize_carriage_returns(b"frame1\x1b[Gframe2\n"),
+            b"frame2\n"
+        );
+        assert_eq!(
+            normalize_carriage_returns(b"frame1\x1b[1Gframe2\n"),
+            b"frame2\n"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_immediately_followed_by_an_erase_in_line_sequence_still_collapses_once() {
+        // The `npm install`-style redraw: a coloured braille spinner glyph, then `\r`
+        // then `ESC[K` before the next frame, both asking for the same reset.
+        let raw = format!(
+            "\x1b[36m{}\x1b[39m frame1\r\x1b[K\x1b[36m{}\x1b[39m frame2\r\x1b[K\x1b[36m{}\x1b[39m frame3\n",
+            '\u{280b}', '\u{2819}', '\u{2839}'
+        );
+        let expected = format!("\x1b[36m{}\x1b[39m frame3\n", '\u{2839}');
+
+        assert_eq!(
+            normalize_carriage_returns(raw.as_bytes()),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn sgr_colour_sequences_are_never_treated_as_a_frame_reset_and_survive_untouched() {
+        assert_eq!(
+            normalize_carriage_returns(b"\x1b[31mred\x1b[0m\n"),
+            b"\x1b[31mred\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn a_cursor_up_sequence_is_left_untouched_as_out_of_scope() {
+        assert_eq!(
+            normalize_carriage_returns(b"frame1\x1b[Aframe2\n"),
+            b"frame1\x1b[Aframe2\n"
+        );
+    }
+
+    #[test]
+    fn a_cursor_to_a_later_column_is_left_untouched_since_it_is_not_a_frame_reset() {
+        assert_eq!(
+            normalize_carriage_returns(b"frame1\x1b[5Gframe2\n"),
+            b"frame1\x1b[5Gframe2\n"
+        );
+    }
+
+    #[test]
+    fn a_csi_sequence_truncated_at_the_end_of_the_stream_is_passed_through_rather_than_panicking() {
+        assert_eq!(normalize_carriage_returns(b"abc\x1b[2"), b"abc\x1b[2");
     }
 
     // --- The ENXIO race: retried and normalised, exhaustion retried and still reported ---
