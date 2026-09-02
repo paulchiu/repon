@@ -5861,6 +5861,14 @@ mod tests {
             2,
             "both rows are listed"
         );
+        // Discovery hands the table back in walk order, which a filesystem is free to vary
+        // between runs, so the row this deletes is named rather than assumed to be first.
+        let cursor = app
+            .visible_keys()
+            .iter()
+            .position(|key| row_name(key) == "repo-a")
+            .expect("repo-a is one of the visible rows");
+        app.set_cursor(cursor);
 
         press_through_the_management_gate(&mut app, management::Operation::Delete);
 
