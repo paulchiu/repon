@@ -15,6 +15,7 @@ mod config;
 mod degrade;
 mod edit_buffer;
 mod editor;
+mod elapsed;
 mod errors;
 mod filter_line;
 mod footer;

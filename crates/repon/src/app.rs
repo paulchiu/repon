@@ -3780,7 +3780,7 @@ mod tests {
         assert_eq!(
             row.trim_end(),
             "work 403 entities · run 7/12 · filter: 12 matches · worktrees: 161 (preference \
-             off) · 12000ms"
+             off) · 12.0s"
         );
     }
 

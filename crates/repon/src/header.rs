@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use crate::degrade::{self, Priority};
+use crate::elapsed::format_elapsed;
 
 /// One value for each of the header's five items, already computed by whatever owns that
 /// piece of state. `None` means the item has nothing to report this frame: no run in flight
@@ -70,7 +71,7 @@ pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<Strin
     }
     if let Some(elapsed) = content.elapsed {
         items.push(degrade::Item {
-            content: format!("{}ms", elapsed.as_millis()),
+            content: format_elapsed(elapsed),
             priority: Priority::Drop(1),
         });
     }
@@ -188,6 +189,42 @@ mod tests {
         }
     }
 
+    // --- criterion: the run timer moves up a unit as it crosses one, rather than counting
+    // milliseconds forever ---
+
+    /// Isolates the timing item by dropping every other item, so a low width still keeps it.
+    fn elapsed_only(elapsed: Duration) -> HeaderContent {
+        HeaderContent {
+            entity_count: 403,
+            run_progress: None,
+            filter_match_count: None,
+            worktrees_note: None,
+            elapsed: Some(elapsed),
+        }
+    }
+
+    #[test]
+    fn the_run_timer_moves_up_a_unit_as_it_crosses_one() {
+        let cases = [
+            (Duration::from_millis(0), "0ms"),
+            (Duration::from_millis(168), "168ms"),
+            (Duration::from_millis(999), "999ms"),
+            (Duration::from_millis(1000), "1.0s"),
+            (Duration::from_millis(12000), "12.0s"),
+            (Duration::from_secs(59), "59.0s"),
+            (Duration::from_secs(60), "1m00s"),
+            (Duration::from_secs(168), "2m48s"),
+        ];
+        for (elapsed, expected) in cases {
+            let content = elapsed_only(elapsed);
+            let rendered = render(&content, 999);
+            assert!(
+                rendered.ends_with(expected),
+                "elapsed {elapsed:?}: expected the timer to end with {expected:?}, got {rendered:?}"
+            );
+        }
+    }
+
     // --- criterion: priority while a run is in flight, one discriminating width per pair ---
 
     /// One `width  expected text` row of the documented ladder, the active Set name's own
@@ -281,7 +318,7 @@ mod tests {
         // the second is the width at which the pair is told apart, read off the same parsed
         // ladder the conformance test above pins against the spec, never a hand-typed width.
         let pairs = [
-            ("worktrees: 161 (preference off)", "12000ms"),
+            ("worktrees: 161 (preference off)", "12.0s"),
             ("filter: 12 matches", "worktrees: 161 (preference off)"),
             ("run 7/12", "filter: 12 matches"),
             ("403 entities", "run 7/12"),
