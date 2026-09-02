@@ -3246,6 +3246,7 @@ dependencies = [
  "etcetera",
  "globset",
  "humantime-serde",
+ "libc",
  "ratatui",
  "repon-core",
  "serde",
