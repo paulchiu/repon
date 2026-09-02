@@ -200,7 +200,9 @@ The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothin
 
 Selection is per row, so a Worktree is selected independently of its Repo and selecting a Repo does not select its Worktrees. The Repo row and its Worktree rows have different working directories, so a Launcher on one and a Launcher on the other are different acts. `j` and `k` step over every visible row without regard to depth.
 
-When the Selection is empty, an Action and a Launcher both act on the cursor row, which is what makes GLOSSARY.md's "never empty at the point of acting" true. They do not act on every visible row: under that reading, clearing a Filter would silently widen an Action's reach from three Repos to four hundred between one keystroke and the next, and the count in the confirm dialog would stop being a check. `a` selects every visible row as an explicit gesture instead.
+When the Selection is empty, an Action fans out over every visible row, and a Launcher acts on the cursor row. An Action is the gesture that reaches N Repos, and the palette has already read its own count out in its border title before anything is typed, so a run with nothing checked reaches the rows that count named rather than the one row under the cursor. It is bounded by visibility rather than by the population: clearing a Filter does widen the next run's reach, and the border title and the confirm gate are what say so, both counting from the same resolution the fan-out itself takes. `a` still checks every visible row, which is what fixes a reach against a later Filter change rather than letting it move with one.
+
+The management operations, `delete`, `ignore`, `unignore` and `sync`, keep the cursor row when the Selection is empty. They share the Action confirm gate, but `delete` with nothing checked would put the whole visible list behind a single confirm, and that is not a trade worth making for consistency. GLOSSARY.md's "never empty at the point of acting" holds on both sides: with nothing visible an Action has a count of zero, which does not run and says so.
 
 ## The ad hoc command field
 
