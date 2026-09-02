@@ -49,6 +49,11 @@ const MIN_CONTENT_HEIGHT: u16 = 1;
 const MIN_BORDERED_WIDTH: u16 = BORDER_WIDTH + MIN_CONTENT_WIDTH;
 const MIN_BORDERED_HEIGHT: u16 = BORDER_HEIGHT + MIN_CONTENT_HEIGHT;
 
+/// The gap between the two columns when [`ColumnMetrics::two_columns`] holds: wider than the
+/// two-space key/description gutter every line already carries, so a column boundary reads
+/// as its own break rather than blending into another wrapped line.
+const COLUMN_GUTTER: u16 = 4;
+
 /// The title the overlay draws into its own top border, recorded in keybindings.md's "The
 /// help overlay's own chrome" and named once here so no reader of it holds a second copy.
 pub(crate) const BORDER_TITLE: &str = " help (esc or q closes) ";
@@ -198,6 +203,59 @@ impl HelpLayout {
     }
 }
 
+/// One line's own rendered width at `key_width`: a heading's own text, or the padded
+/// key/glyph column plus the two-space inner gutter plus the description/meaning, matching
+/// exactly what [`HelpOverlay::draw_line`] paints. A blank separator has no width of its own.
+fn line_display_width(line: &HelpLine, key_width: usize) -> usize {
+    match line {
+        HelpLine::Heading(text) => text.chars().count(),
+        HelpLine::Binding { description, .. } => description.chars().count() + key_width + 2,
+        HelpLine::Legend { meaning, .. } => meaning.chars().count() + key_width + 2,
+        HelpLine::Blank => 0,
+    }
+}
+
+/// The overlay's column geometry for one frame width, computed once so [`HelpOverlay::draw`]'s
+/// render loop and [`HelpOverlay::visible_len`]'s own row count can never disagree about what
+/// is on screen. `key_width`, the one fixed key/glyph column figure keybindings.md's own "The
+/// help overlay's own chrome" already fixes, applies across both columns rather than being
+/// computed per column: simpler, and it
+/// keeps the two columns' own key gutters lined up with each other as well as within
+/// themselves. `two_columns` and `column_offset` both come from the widest line the whole
+/// unfiltered content ([`HelpOverlay::lines`]) actually renders, twice over plus one
+/// [`COLUMN_GUTTER`] between them, not a round number picked by hand; reading from the
+/// unfiltered content rather than whatever a query currently narrows to is what keeps the
+/// column count from toggling mid-search the same way `key_width` already does not shift.
+struct ColumnMetrics {
+    key_width: usize,
+    two_columns: bool,
+    /// How far right of the left column's own origin the right one starts, when
+    /// `two_columns` holds. Unused otherwise.
+    column_offset: u16,
+}
+
+impl ColumnMetrics {
+    fn compute(
+        table: &BindingTable,
+        context: Context,
+        glyphs: &GlyphSet,
+        content_width: u16,
+    ) -> ColumnMetrics {
+        let key_width = HelpOverlay::key_width(table, context, glyphs);
+        let widest = HelpOverlay::lines(table, context, glyphs)
+            .iter()
+            .map(|line| line_display_width(line, key_width) as u16)
+            .max()
+            .unwrap_or(0);
+        let two_column_min_width = widest.saturating_mul(2).saturating_add(COLUMN_GUTTER);
+        ColumnMetrics {
+            key_width,
+            two_columns: content_width >= two_column_min_width,
+            column_offset: widest.saturating_add(COLUMN_GUTTER),
+        }
+    }
+}
+
 /// The overlay's own two modes, [`crate::app::App`]'s own key handling decides between on
 /// every keystroke: reading is the overlay's original shape, searching is `/`'s own, and
 /// [`HelpOverlay::draw`] and [`HelpOverlay::viewport_height`] both read this to decide
@@ -263,8 +321,10 @@ impl HelpOverlay {
     /// by its content, a [`HelpLine::Blank`] above every heading but the first that survives.
     /// A section whose content is empty is dropped entirely, heading included, so a query that
     /// empties one never leaves its heading standing over nothing; that rule is what already
-    /// held for the legend heading alone and now covers all three.
-    fn assemble_sections(sections: [(&'static str, Vec<HelpLine>); 3]) -> Vec<HelpLine> {
+    /// held for the legend heading alone and now covers all three. Takes a `Vec` rather than
+    /// the fixed three-element array it once did: [`Self::split_into_columns`] calls this on
+    /// whatever subset of sections a column holds, not always all three at once.
+    fn assemble_sections(sections: Vec<(&'static str, Vec<HelpLine>)>) -> Vec<HelpLine> {
         let mut lines = Vec::new();
         for (heading, content) in sections
             .into_iter()
@@ -279,36 +339,23 @@ impl HelpOverlay {
         lines
     }
 
-    /// The overlay's full content with no query typed: three sections, each under its own
-    /// heading ([`Self::assemble_sections`]) — `context`'s own bindings
+    /// The overlay's three sections narrowed to `query` (empty matches everything, the same
+    /// case-insensitive substring convention [`crate::launcher_palette::matching`] and
+    /// [`crate::action_palette::ActionPalette::matches`] already match their own lists with),
+    /// heading paired with its own content, a section left with no surviving content dropped
+    /// entirely rather than standing over nothing: `context`'s own bindings
     /// ([`BindingTable::describe_own`]), the `global` bindings live alongside it
     /// ([`BindingTable::describe_global`]), and one legend row per row-interior [`Meaning`]
-    /// ([`Self::legend_rows`]).
-    fn lines(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> Vec<HelpLine> {
-        Self::assemble_sections([
-            (
-                context_heading(context),
-                bindings_to_lines(table.describe_own(context)),
-            ),
-            (
-                GLOBAL_HEADING,
-                bindings_to_lines(table.describe_global(context)),
-            ),
-            (LEGEND_HEADING, legend_to_lines(Self::legend_rows(glyphs))),
-        ])
-    }
-
-    /// [`Self::lines`] narrowed to `query`: a binding row matches on its own key text or
-    /// description, a legend row on its own glyph or meaning, both a case-insensitive
-    /// substring, the same convention [`crate::launcher_palette::matching`] and
-    /// [`crate::action_palette::ActionPalette::matches`] already match their own lists with.
-    /// An empty query matches everything.
-    pub(crate) fn filtered_lines(
+    /// ([`Self::legend_rows`]). The one source [`Self::lines`], `Self::filtered_lines` (both
+    /// assembled flat, one column) and [`Self::draw`] (assembled into one or two columns,
+    /// [`Self::split_into_columns`]) all build from, so the shapes can never disagree about
+    /// which sections and rows exist.
+    fn built_sections(
         table: &BindingTable,
         context: Context,
         glyphs: &GlyphSet,
         query: &str,
-    ) -> Vec<HelpLine> {
+    ) -> Vec<(&'static str, Vec<HelpLine>)> {
         let query = query.to_lowercase();
         let binding_matches = |(keys, description): &(String, &'static str)| {
             keys.to_lowercase().contains(&query) || description.to_lowercase().contains(&query)
@@ -316,7 +363,7 @@ impl HelpOverlay {
         let legend_matches = |(glyph, meaning): &(String, &'static str)| {
             glyph.to_lowercase().contains(&query) || meaning.to_lowercase().contains(&query)
         };
-        Self::assemble_sections([
+        [
             (
                 context_heading(context),
                 bindings_to_lines(
@@ -346,18 +393,121 @@ impl HelpOverlay {
                         .collect(),
                 ),
             ),
-        ])
+        ]
+        .into_iter()
+        .filter(|(_, content)| !content.is_empty())
+        .collect()
     }
 
-    /// How many lines [`Self::filtered_lines`] would have for `query`: what the scroll clamp
-    /// folds every action against, now a keystroke can shrink or grow the list underneath it.
+    /// The overlay's full content with no query typed, assembled into one column
+    /// ([`Self::assemble_sections`] over [`Self::built_sections`]).
+    fn lines(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> Vec<HelpLine> {
+        Self::assemble_sections(Self::built_sections(table, context, glyphs, ""))
+    }
+
+    /// [`Self::lines`] narrowed to `query` ([`Self::built_sections`]), assembled into one
+    /// column: the flat shape [`Self::visible_len`] and [`Self::draw`] no longer render
+    /// directly (both lay `query`'s own sections out through [`Self::laid_out`] instead, one
+    /// or two columns depending on the frame), kept as the one-column reference a test can
+    /// still assert content and ordering against. An empty query matches everything.
+    #[cfg(test)]
+    pub(crate) fn filtered_lines(
+        table: &BindingTable,
+        context: Context,
+        glyphs: &GlyphSet,
+        query: &str,
+    ) -> Vec<HelpLine> {
+        Self::assemble_sections(Self::built_sections(table, context, glyphs, query))
+    }
+
+    /// The row count [`Self::draw`] actually puts on screen for `query` at `frame_area`'s own
+    /// width ([`Self::laid_out`]): one column's worth below the two-column threshold
+    /// ([`ColumnMetrics::two_columns`]), the taller of the two column line lists at or above
+    /// it. What the scroll clamp ([`Self::apply`]) must fold every action against, since a
+    /// frame wide enough to split the list into two columns side by side has fewer rows to
+    /// scroll through than the flat line count (`Self::filtered_lines`) would suggest.
     pub(crate) fn visible_len(
         table: &BindingTable,
         context: Context,
         glyphs: &GlyphSet,
         query: &str,
+        frame_area: Rect,
     ) -> usize {
-        Self::filtered_lines(table, context, glyphs, query).len()
+        let sections = Self::built_sections(table, context, glyphs, query);
+        if sections.is_empty() {
+            return 0;
+        }
+        let content_width = HelpLayout::compute(frame_area)
+            .content_area(frame_area)
+            .width;
+        let metrics = ColumnMetrics::compute(table, context, glyphs, content_width);
+        let (left, right) = Self::laid_out(sections, &metrics);
+        left.len().max(right.len())
+    }
+
+    /// `sections` assembled into the shape [`Self::draw`] renders: one column (`right` empty)
+    /// below [`ColumnMetrics::two_columns`], split at a section boundary
+    /// ([`Self::split_into_columns`]) at or above it.
+    fn laid_out(
+        sections: Vec<(&'static str, Vec<HelpLine>)>,
+        metrics: &ColumnMetrics,
+    ) -> (Vec<HelpLine>, Vec<HelpLine>) {
+        if metrics.two_columns {
+            Self::split_into_columns(sections)
+        } else {
+            (Self::assemble_sections(sections), Vec::new())
+        }
+    }
+
+    /// The row count [`Self::assemble_sections`] would produce for `sections`, without paying
+    /// to assemble them: each section costs its own heading plus its content, and every
+    /// section after the first in the slice costs one more for the [`HelpLine::Blank`] above
+    /// it. [`Self::split_into_columns`] calls this on candidate prefixes and suffixes to find
+    /// the boundary that balances the two without assembling every candidate to measure it.
+    fn assembled_len(sections: &[(&'static str, Vec<HelpLine>)]) -> usize {
+        if sections.is_empty() {
+            return 0;
+        }
+        sections
+            .iter()
+            .map(|(_, content)| 1 + content.len())
+            .sum::<usize>()
+            + sections.len()
+            - 1
+    }
+
+    /// Splits `sections` (already narrowed to a query and dropped of any left empty by
+    /// [`Self::built_sections`]) into two column-ordered line lists. A section is never split
+    /// across the boundary: every whole section in `sections`' own order goes to the left
+    /// column up to some index, the rest to the right, at whichever boundary leaves the two
+    /// assembled lengths ([`Self::assembled_len`]) closest. Reading order is preserved, top to
+    /// bottom in the left column, then continuing top to bottom in the right one, exactly the
+    /// order [`Self::assemble_sections`] would use for all of `sections` in one column.
+    ///
+    /// One section that is simply too tall for any boundary to balance well (its own line
+    /// count alone dwarfs the rest) still lands whole in one column; the choice below still
+    /// picks the least-lopsided boundary available, it just cannot make that section's own
+    /// bulk disappear. A single surviving section (a query narrow enough that only one of the
+    /// three matches anything) cannot be split at all: putting it whole on the left and
+    /// leaving the right empty ties with the reverse, and the left is what a reader's eye
+    /// already rests on, so ties favour it (`.rev()` below, so the largest tied boundary is
+    /// the first `min_by_key` sees) rather than leaving the left column blank with everything
+    /// pushed past an empty gutter. Either way the overlay stays one column in every way that
+    /// matters even though [`ColumnMetrics::two_columns`] held.
+    fn split_into_columns(
+        mut sections: Vec<(&'static str, Vec<HelpLine>)>,
+    ) -> (Vec<HelpLine>, Vec<HelpLine>) {
+        let split = (0..=sections.len())
+            .rev()
+            .min_by_key(|&s| {
+                Self::assembled_len(&sections[..s]).abs_diff(Self::assembled_len(&sections[s..]))
+            })
+            .unwrap_or(0);
+        let right = sections.split_off(split);
+        (
+            Self::assemble_sections(sections),
+            Self::assemble_sections(right),
+        )
     }
 
     /// Whether the query line has a row to draw into at all: while actively searching, so
@@ -454,14 +604,84 @@ impl HelpOverlay {
         self.scroll = scroll_after(self.scroll, action, content_len, viewport_height);
     }
 
+    /// The key/glyph column's fixed width across the whole unfiltered content
+    /// ([`Self::lines`]), so it never shifts as a query narrows what is on screen or a scroll
+    /// brings a longer or shorter key into view. Shared by [`Self::draw_line`]'s own padding
+    /// and [`ColumnMetrics::compute`], which needs the same figure to measure a rendered
+    /// line's own width.
+    fn key_width(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> usize {
+        Self::lines(table, context, glyphs)
+            .iter()
+            .map(|line| match line {
+                HelpLine::Binding { keys, .. } => keys.chars().count(),
+                HelpLine::Legend { glyph, .. } => glyph.chars().count(),
+                HelpLine::Heading(_) | HelpLine::Blank => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Paints one `line` at `(x, y)`: a binding's or legend's own key/glyph column padded to
+    /// `key_width` in `accent`, two spaces, then the description or meaning in `dim`
+    /// ([theming.md](../../../../docs/spec/theming.md)); a heading in bold `accent`; a blank
+    /// row paints nothing. The one line-painting path both of [`Self::draw`]'s columns share,
+    /// so a binding's two-tone split ([`bindings_to_lines`]'s own doc) stays one
+    /// implementation rather than two copies a second column could drift out of step with.
+    fn draw_line(
+        buf: &mut Buffer,
+        x: u16,
+        y: u16,
+        end: u16,
+        line: &HelpLine,
+        key_width: usize,
+        theme: &Theme,
+    ) {
+        let mut x = x;
+        match line {
+            HelpLine::Binding { keys, description } => {
+                let padded_keys = format!("{keys:<key_width$}");
+                paint_run(
+                    buf,
+                    &mut x,
+                    y,
+                    end,
+                    &padded_keys,
+                    theme.style_for(Role::Accent),
+                );
+                paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
+                paint_run(buf, &mut x, y, end, description, theme.style_for(Role::Dim));
+            }
+            HelpLine::Legend { glyph, meaning } => {
+                let padded_glyph = format!("{glyph:<key_width$}");
+                paint_run(
+                    buf,
+                    &mut x,
+                    y,
+                    end,
+                    &padded_glyph,
+                    theme.style_for(Role::Accent),
+                );
+                paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
+                paint_run(buf, &mut x, y, end, meaning, theme.style_for(Role::Dim));
+            }
+            HelpLine::Heading(text) => {
+                let heading_style = theme.style_for(Role::Accent).add_modifier(Modifier::BOLD);
+                paint_run(buf, &mut x, y, end, text, heading_style);
+            }
+            HelpLine::Blank => {}
+        }
+    }
+
     /// Draws the overlay into `frame_area`: the house-style bordered panel (its own bottom
     /// border carrying this crate's version, right-aligned) or, below
     /// [`HelpLayout::compute`]'s threshold, flush content with no border; the section headings
     /// and binding/legend rows above the query line, which takes the interior's own last row
-    /// while [`Self::shows_query_line`] holds. Keys/glyphs paint in `accent`, headings in bold
-    /// `accent`, descriptions/meanings in `dim` ([theming.md](../../../../docs/spec/theming.md)),
-    /// each line's own key or glyph column padded to one fixed width, computed from the whole
-    /// unfiltered content so it never shifts as the query narrows the list on screen.
+    /// while [`Self::shows_query_line`] holds. Below [`ColumnMetrics::two_columns`]'s own
+    /// threshold this is one scrolling list, exactly as it always was; at or above it, the
+    /// content is split at a section boundary ([`Self::split_into_columns`]) into two columns
+    /// side by side sharing one scroll position, the row count the taller of the two
+    /// ([`Self::visible_len`], which the caller's scroll clamp must use instead of the flat
+    /// line count once a frame is wide enough for this).
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -504,8 +724,8 @@ impl HelpOverlay {
             list_height,
         );
 
-        let visible = Self::filtered_lines(table, context, glyphs, self.query.as_str());
-        if visible.is_empty() {
+        let sections = Self::built_sections(table, context, glyphs, self.query.as_str());
+        if sections.is_empty() {
             let mut x = list_area.x;
             paint_run(
                 buf,
@@ -516,61 +736,29 @@ impl HelpOverlay {
                 theme.style_for(Role::Dim),
             );
         } else {
-            // One fixed width for every line's own key/glyph column, from the whole unfiltered
-            // content (not only what a query currently keeps, and not only what fits on
-            // screen), so the gutter neither shifts as a scroll brings a longer or shorter key
-            // into view nor as typing narrows the list.
-            let key_width = Self::lines(table, context, glyphs)
-                .iter()
-                .map(|line| match line {
-                    HelpLine::Binding { keys, .. } => keys.chars().count(),
-                    HelpLine::Legend { glyph, .. } => glyph.chars().count(),
-                    HelpLine::Heading(_) | HelpLine::Blank => 0,
-                })
-                .max()
-                .unwrap_or(0);
+            let metrics = ColumnMetrics::compute(table, context, glyphs, content_area.width);
+            let (left, right) = Self::laid_out(sections, &metrics);
+            let row_count = left.len().max(right.len());
 
-            for (row, line) in visible
-                .iter()
-                .skip(self.scroll as usize)
-                .take(list_area.height as usize)
-                .enumerate()
-            {
+            for row in 0..(list_area.height as usize) {
+                let index = row + self.scroll as usize;
+                if index >= row_count {
+                    break;
+                }
                 let y = list_area.y + row as u16;
-                let mut x = list_area.x;
-                match line {
-                    HelpLine::Binding { keys, description } => {
-                        let padded_keys = format!("{keys:<key_width$}");
-                        paint_run(
-                            buf,
-                            &mut x,
-                            y,
-                            end,
-                            &padded_keys,
-                            theme.style_for(Role::Accent),
-                        );
-                        paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
-                        paint_run(buf, &mut x, y, end, description, theme.style_for(Role::Dim));
-                    }
-                    HelpLine::Legend { glyph, meaning } => {
-                        let padded_glyph = format!("{glyph:<key_width$}");
-                        paint_run(
-                            buf,
-                            &mut x,
-                            y,
-                            end,
-                            &padded_glyph,
-                            theme.style_for(Role::Accent),
-                        );
-                        paint_run(buf, &mut x, y, end, "  ", theme.style_for(Role::Dim));
-                        paint_run(buf, &mut x, y, end, meaning, theme.style_for(Role::Dim));
-                    }
-                    HelpLine::Heading(text) => {
-                        let heading_style =
-                            theme.style_for(Role::Accent).add_modifier(Modifier::BOLD);
-                        paint_run(buf, &mut x, y, end, text, heading_style);
-                    }
-                    HelpLine::Blank => {}
+                if let Some(line) = left.get(index) {
+                    Self::draw_line(buf, list_area.x, y, end, line, metrics.key_width, theme);
+                }
+                if let Some(line) = right.get(index) {
+                    Self::draw_line(
+                        buf,
+                        list_area.x + metrics.column_offset,
+                        y,
+                        end,
+                        line,
+                        metrics.key_width,
+                        theme,
+                    );
                 }
             }
         }
@@ -776,11 +964,12 @@ mod tests {
     }
 
     #[test]
-    fn visible_len_matches_filtered_lines_own_length_for_every_query() {
+    fn visible_len_matches_filtered_lines_own_length_for_every_query_below_the_two_column_threshold()
+     {
         let table = default_table();
         for query in ["", "move", "zzz-nothing-matches-this-zzz"] {
             assert_eq!(
-                HelpOverlay::visible_len(&table, Context::List, full_glyphs(), query),
+                HelpOverlay::visible_len(&table, Context::List, full_glyphs(), query, ROOMY_FRAME),
                 HelpOverlay::filtered_lines(&table, Context::List, full_glyphs(), query).len()
             );
         }
@@ -1839,5 +2028,297 @@ mod tests {
         let buf = terminal.backend().buffer();
         let query_y = tiny_frame.bottom() - 1;
         assert_eq!(buf[(0, query_y)].symbol(), "/");
+    }
+
+    // --- Criterion: a wide enough frame lays the content out in two columns ---
+
+    /// A section with `row_count` synthetic binding rows under `heading`, for the splitting
+    /// tests below: their own content does not matter, only how many lines each section
+    /// costs.
+    fn synthetic_section(heading: &'static str, row_count: usize) -> (&'static str, Vec<HelpLine>) {
+        (
+            heading,
+            (0..row_count)
+                .map(|i| HelpLine::Binding {
+                    keys: i.to_string(),
+                    description: "row",
+                })
+                .collect(),
+        )
+    }
+
+    /// [`ColumnMetrics::compute`]'s own two-column threshold for `context`'s content: the
+    /// content_width right at which `two_columns` first turns on. Derived from
+    /// `column_offset` (which does not depend on `content_width`) rather than hard-coded, so
+    /// this stays correct if `context`'s own bindings or descriptions ever change length.
+    fn two_column_threshold(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> u16 {
+        let metrics = ColumnMetrics::compute(table, context, glyphs, u16::MAX);
+        metrics.column_offset * 2 - COLUMN_GUTTER
+    }
+
+    #[test]
+    fn assembled_len_counts_each_sections_own_heading_and_content_plus_one_blank_between_sections()
+    {
+        let sections = vec![synthetic_section("A", 2), synthetic_section("B", 3)];
+        // A: 1 heading + 2 rows = 3. B: 1 heading + 3 rows = 4. One blank between them = 8.
+        assert_eq!(HelpOverlay::assembled_len(&sections), 8);
+        assert_eq!(HelpOverlay::assembled_len(&sections[..1]), 3);
+        assert_eq!(HelpOverlay::assembled_len(&sections[..0]), 0);
+    }
+
+    /// `heading`'s own content must immediately follow its heading in `column`, contiguous and
+    /// in order: the shape [`HelpOverlay::split_into_columns`] must never break, whichever
+    /// column a section lands in.
+    fn assert_section_whole_in(column: &[HelpLine], heading: &'static str, content: &[HelpLine]) {
+        let heading_index = column
+            .iter()
+            .position(|line| matches!(line, HelpLine::Heading(h) if *h == heading))
+            .unwrap_or_else(|| panic!("expected heading {heading:?} in {column:?}"));
+        assert_eq!(
+            &column[heading_index + 1..heading_index + 1 + content.len()],
+            content,
+            "expected {heading:?}'s own content immediately after its own heading in {column:?}"
+        );
+    }
+
+    #[test]
+    fn split_into_columns_keeps_every_sections_heading_together_with_its_own_content() {
+        let sections = vec![
+            synthetic_section("A", 2),
+            synthetic_section("B", 20),
+            synthetic_section("C", 3),
+        ];
+        let (left, right) = HelpOverlay::split_into_columns(sections.clone());
+        for (heading, content) in &sections {
+            let column = if left
+                .iter()
+                .any(|line| matches!(line, HelpLine::Heading(h) if h == heading))
+            {
+                &left
+            } else {
+                &right
+            };
+            assert_section_whole_in(column, heading, content);
+        }
+    }
+
+    /// A, B, C cost 3, 21 and 4 assembled lines on their own. Every whole-section boundary:
+    /// `[]|[A,B,C]` (diff 30), `[A]|[B,C]` (diff 23), `[A,B]|[C]` (diff 21), `[A,B,C]|[]`
+    /// (diff 30). `[A,B]|[C]` is the closest, so B's own bulk lands with A on the left rather
+    /// than forcing a near-even split some other way: sections are never split internally to
+    /// chase a better balance.
+    #[test]
+    fn split_into_columns_chooses_the_section_boundary_that_balances_total_line_count_most_closely()
+    {
+        let sections = vec![
+            synthetic_section("A", 2),
+            synthetic_section("B", 20),
+            synthetic_section("C", 3),
+        ];
+        let (left, right) = HelpOverlay::split_into_columns(sections);
+
+        assert!(
+            left.iter()
+                .any(|line| matches!(line, HelpLine::Heading("A")))
+        );
+        assert!(
+            left.iter()
+                .any(|line| matches!(line, HelpLine::Heading("B")))
+        );
+        assert!(
+            right
+                .iter()
+                .any(|line| matches!(line, HelpLine::Heading("C")))
+        );
+        assert!(
+            !right
+                .iter()
+                .any(|line| matches!(line, HelpLine::Heading("A") | HelpLine::Heading("B")))
+        );
+        assert_eq!(
+            left.len(),
+            25,
+            "expected A and B assembled together: {left:?}"
+        );
+        assert_eq!(right.len(), 4, "expected C alone: {right:?}");
+    }
+
+    /// One section that survives (a query narrow enough that only it matches anything) cannot
+    /// be split at all: every boundary puts it whole in one column and leaves the other empty.
+    /// This is what a single section "too tall" for a balanced split degrades to in the
+    /// extreme: the split stays whole-section, it just cannot make the lone section's own
+    /// bulk disappear, so the overlay ends up one column wide in every way that matters even
+    /// though the frame fits two.
+    #[test]
+    fn split_into_columns_puts_a_lone_surviving_section_whole_in_the_left_column() {
+        let sections = vec![synthetic_section("Only", 30)];
+        let expected = HelpOverlay::assemble_sections(sections.clone());
+
+        let (left, right) = HelpOverlay::split_into_columns(sections);
+
+        assert_eq!(left, expected);
+        assert!(
+            right.is_empty(),
+            "expected the right column empty: {right:?}"
+        );
+    }
+
+    #[test]
+    fn column_metrics_stays_one_column_below_the_threshold_and_switches_to_two_right_at_it() {
+        let table = default_table();
+        let context = Context::List;
+        let glyphs = full_glyphs();
+        let threshold = two_column_threshold(&table, context, glyphs);
+
+        let below = ColumnMetrics::compute(&table, context, glyphs, threshold - 1);
+        assert!(
+            !below.two_columns,
+            "expected one column just under the threshold ({threshold})"
+        );
+
+        let at = ColumnMetrics::compute(&table, context, glyphs, threshold);
+        assert!(
+            at.two_columns,
+            "expected two columns right at the threshold ({threshold})"
+        );
+    }
+
+    /// A query narrow enough to leave only the legend section standing still renders one
+    /// column, even though the frame is wide enough for two: [`Self::split_into_columns`]'s
+    /// own "a lone surviving section cannot be split" rule, exercised through the real table
+    /// and a real query rather than synthetic sections.
+    #[test]
+    fn a_query_leaving_only_the_legend_stays_one_column_even_at_a_frame_wide_enough_for_two() {
+        let table = default_table();
+        let context = Context::List;
+        let glyphs = full_glyphs();
+        let threshold = two_column_threshold(&table, context, glyphs);
+        let frame = Rect::new(0, 0, threshold + BORDER_WIDTH, 40);
+
+        let sections = HelpOverlay::built_sections(&table, context, glyphs, "child row");
+        assert_eq!(
+            sections.len(),
+            1,
+            "fixture sanity: \"child row\" must match only the legend's own ChildRow row"
+        );
+        let content_width = HelpLayout::compute(frame).content_area(frame).width;
+        let metrics = ColumnMetrics::compute(&table, context, glyphs, content_width);
+        assert!(
+            metrics.two_columns,
+            "fixture sanity: the frame must be wide enough for two columns"
+        );
+
+        let (left, right) = HelpOverlay::laid_out(sections, &metrics);
+        assert!(
+            left.iter()
+                .any(|line| matches!(line, HelpLine::Heading(h) if *h == LEGEND_HEADING)),
+            "expected the lone surviving section whole in the left column: {left:?}"
+        );
+        assert!(
+            right.is_empty(),
+            "expected the right column empty: {right:?}"
+        );
+    }
+
+    /// At a frame wide enough for two columns, List's own real content splits List's own
+    /// bindings and `global`'s together into the left column and the legend alone into the
+    /// right one (the same boundary [`split_into_columns_chooses_the_section_boundary_that_balances_total_line_count_most_closely`]
+    /// proves the algorithm picks in the abstract), and `draw` paints them at the two
+    /// x-offsets [`ColumnMetrics::compute`] derives.
+    #[test]
+    fn draw_lays_two_columns_side_by_side_at_a_frame_wide_enough_for_them() {
+        let table = default_table();
+        let context = Context::List;
+        let glyphs = full_glyphs();
+        let threshold = two_column_threshold(&table, context, glyphs);
+        let frame = Rect::new(0, 0, threshold + BORDER_WIDTH, 60);
+
+        let sections = HelpOverlay::built_sections(&table, context, glyphs, "");
+        let content_width = HelpLayout::compute(frame).content_area(frame).width;
+        let metrics = ColumnMetrics::compute(&table, context, glyphs, content_width);
+        assert!(
+            metrics.two_columns,
+            "fixture sanity: this frame must fit two columns"
+        );
+        let (left, right) = HelpOverlay::laid_out(sections, &metrics);
+        assert!(
+            !right.is_empty(),
+            "fixture sanity: the legend must land in its own column"
+        );
+        assert!(
+            matches!(right[0], HelpLine::Heading(LEGEND_HEADING)),
+            "expected no wasted blank row above the right column's own first heading: {right:?}"
+        );
+        assert!(
+            left.len() > right.len(),
+            "fixture sanity: List's own bindings plus global must outlast the legend alone"
+        );
+
+        let overlay = HelpOverlay::default();
+        let terminal = render(&overlay, frame.width, frame.height, context, &table);
+        let buf = terminal.backend().buffer();
+        let area = list_area(&overlay, frame);
+
+        let first_left_char = leading_char(&left[0]);
+        assert_eq!(
+            buf[(area.x, area.y)].symbol(),
+            first_left_char.to_string(),
+            "expected the left column's own first line at the list's own origin"
+        );
+
+        let first_right_char = leading_char(&right[0]);
+        assert_eq!(
+            buf[(area.x + metrics.column_offset, area.y)].symbol(),
+            first_right_char.to_string(),
+            "expected the right column's own first line one column_offset to the right"
+        );
+
+        // Once the shorter (right) column runs out of rows, the left column keeps going and
+        // nothing stray is painted where the right column used to be.
+        let exhausted_row = right.len();
+        assert!(
+            exhausted_row < left.len(),
+            "fixture sanity: the left column must outlast the right one"
+        );
+        let y = area.y + exhausted_row as u16;
+        assert_eq!(
+            buf[(area.x + metrics.column_offset, y)].symbol(),
+            " ",
+            "expected nothing painted in the right column once it runs out of rows"
+        );
+        let left_char = leading_char(&left[exhausted_row]);
+        assert_eq!(
+            buf[(area.x, y)].symbol(),
+            left_char.to_string(),
+            "expected the left column to keep going past where the right one ran out"
+        );
+    }
+
+    /// The scroll clamp folds against the taller column's own row count
+    /// ([`HelpOverlay::visible_len`]), not the flat line total every section would sum to in
+    /// one column: at a frame wide enough for two columns, the two must differ, and
+    /// `visible_len` must agree with a lay-out built by hand from the same sections and
+    /// metrics.
+    #[test]
+    fn visible_len_at_a_wide_frame_is_the_taller_columns_own_row_count_not_the_flat_total() {
+        let table = default_table();
+        let context = Context::List;
+        let glyphs = full_glyphs();
+        let threshold = two_column_threshold(&table, context, glyphs);
+        let frame = Rect::new(0, 0, threshold + BORDER_WIDTH, 60);
+
+        let flat_total = HelpOverlay::filtered_lines(&table, context, glyphs, "").len();
+        let visible = HelpOverlay::visible_len(&table, context, glyphs, "", frame);
+        assert!(
+            visible < flat_total,
+            "expected the two-column row count ({visible}) below the flat total \
+             ({flat_total})"
+        );
+
+        let sections = HelpOverlay::built_sections(&table, context, glyphs, "");
+        let content_width = HelpLayout::compute(frame).content_area(frame).width;
+        let metrics = ColumnMetrics::compute(&table, context, glyphs, content_width);
+        let (left, right) = HelpOverlay::laid_out(sections, &metrics);
+        assert_eq!(visible, left.len().max(right.len()));
     }
 }
