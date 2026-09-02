@@ -152,6 +152,8 @@ The detail pane always reports provenance per cell, which is the escape hatch fr
 - Recent commits.
 - The labelled per-step output of the last Action, each step separately readable, surviving the run.
 
+The pane scrolls, so it carries a scrollbar down its own right border: the track over the interior's own rows, the thumb over the part of the content on screen. A captured step's output is routinely longer than the pane, and without the bar a pane showing its last line reads exactly like one showing its first. It is drawn only when the content is longer than the interior, so a pane showing everything it has is framed exactly as it was before the bar existed. The two characters come from the active glyph set and its colour from the pane's own border role, both fixed in [theming.md](theming.md#the-two-sets); the corners and the bottom border's own close hint are outside the cells it touches.
+
 ## Open
 
 - The palette is settled in [theming.md](theming.md): nine roles named for meaning, defaulting to the terminal's own ANSI slots. The prototype's colour roles carried over intact, so dim still marks unresolved values and known zeros, the accent still marks loading and Worktree names, and Gone, ahead, behind and Dirty keep the colours the prototype gave them.
