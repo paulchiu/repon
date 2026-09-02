@@ -26,7 +26,7 @@ use ratatui::{
 };
 
 use crate::{
-    edit_buffer,
+    edit_buffer::{EditBuffer, Motion},
     glyphs::{BorderScratch, GlyphSet},
     launcher::Launcher,
     theme::{Role, Theme},
@@ -79,7 +79,7 @@ pub(crate) fn matching<'a>(launchers: &'a [Launcher], query: &str) -> Vec<&'a La
 /// narrowed) matches is highlighted.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LauncherPalette {
-    query: String,
+    query: EditBuffer,
     cursor: usize,
 }
 
@@ -91,7 +91,7 @@ impl LauncherPalette {
     /// `launchers` narrowed by the typed query, in `launchers`' own order: never reordered,
     /// per this module's own doc comment on why matching stays a plain substring test.
     pub(crate) fn matches<'a>(&self, launchers: &'a [Launcher]) -> Vec<&'a Launcher> {
-        matching(launchers, &self.query)
+        matching(launchers, self.query.as_str())
     }
 
     /// The row the cursor currently sits on among `launchers` narrowed by the query, if any
@@ -113,23 +113,28 @@ impl LauncherPalette {
     }
 
     pub(crate) fn type_char(&mut self, c: char, launchers: &[Launcher]) {
-        self.query.push(c);
+        self.query.insert_char(c);
         self.clamp_cursor(launchers);
     }
 
-    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
-    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    /// `Backspace`: deletes the character immediately before the cursor.
     pub(crate) fn delete_previous_char(&mut self, launchers: &[Launcher]) {
-        self.query.pop();
+        self.query.delete_previous_char();
         self.clamp_cursor(launchers);
     }
 
-    /// `Ctrl+W`: deletes one trailing whitespace-delimited word, the same shape
+    /// `Ctrl+W`: deletes one whitespace-delimited word ending at the cursor, the same shape
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
     pub(crate) fn delete_previous_word(&mut self, launchers: &[Launcher]) {
-        edit_buffer::delete_previous_word(&mut self.query);
+        self.query.delete_previous_word();
         self.clamp_cursor(launchers);
+    }
+
+    /// The arrow keys, `Alt+B`/`Alt+F` and `Ctrl+A`/`Ctrl+E`: moves the caret within the
+    /// typed text. The match list is untouched, so nothing here clamps the highlight.
+    pub(crate) fn move_cursor(&mut self, motion: Motion) {
+        self.query.move_cursor(motion);
     }
 
     /// The typed query verbatim. Nothing in the running program reads it: this palette has
@@ -139,7 +144,7 @@ impl LauncherPalette {
     /// different cuts of `"café\u{00A0}naïve"` leave the same entries matching.
     #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
-        &self.query
+        self.query.as_str()
     }
 
     pub(crate) fn clear_line(&mut self, launchers: &[Launcher]) {
@@ -203,7 +208,7 @@ impl LauncherPalette {
                     .unwrap_or(0),
             };
         let content_width = list_or_message_width
-            .max(self.query.len() + 2) // the leading "! "
+            .max(self.query.as_str().len() + 2) // the leading "! "
             .max(entity_name.len() + 2); // the border title's own " {name} "
         let width = (content_width as u16)
             .saturating_add(2) // the two border columns
@@ -262,10 +267,10 @@ impl LauncherPalette {
             // [`PROMPT_WIDTH`] is a fixed constant rather than a restated measurement.
             (interior.x + PROMPT_WIDTH).min(row_right)
         } else {
-            // The caret sits at the query's own end, "! " plus whatever has been typed, not
-            // at the end of whichever placeholder text an empty query is showing in its
-            // place: this is where the next keystroke would land. Read back from
-            // `set_stringn`'s own return, the same technique
+            // The caret sits at the query's own cursor, "! " plus whatever has been typed
+            // ahead of it, not at the end of whichever placeholder text an empty query is
+            // showing in its place: this is where the next keystroke would land. Read back
+            // from `set_stringn`'s own return, the same technique
             // [`crate::filter_line::FilterLine::draw`] uses, rather than adding a separately
             // measured query width to a literal prefix width: a changed prefix or a wide
             // character can then never drift the caret from the text it follows.
@@ -277,14 +282,21 @@ impl LauncherPalette {
                 row_right.saturating_sub(interior.x) as usize,
                 theme.style_for(Role::Text),
             );
-            let (x, _) = buf.set_stringn(
+            let (caret_x, _) = buf.set_stringn(
                 x,
                 interior.y,
-                &self.query,
+                self.query.before_cursor(),
                 row_right.saturating_sub(x) as usize,
                 theme.style_for(Role::Text),
             );
-            x.min(row_right)
+            buf.set_stringn(
+                caret_x,
+                interior.y,
+                self.query.after_cursor(),
+                row_right.saturating_sub(caret_x) as usize,
+                theme.style_for(Role::Text),
+            );
+            caret_x.min(row_right)
         };
         // ratatui shows the caret only on a frame where a position was set, so this is the
         // one call that puts one on this palette's query row at all.
@@ -965,6 +977,62 @@ mod tests {
             Position::new(interior.x + 2 + 3, interior.y),
             "the caret must move to the end of the three typed characters"
         );
+    }
+
+    /// The caret marks where the next keystroke lands, so a caret moved back into the typed
+    /// text paints there, counted in painted cells rather than bytes, and the text after it
+    /// stays on the row.
+    #[test]
+    fn draw_places_the_caret_at_the_cursor_rather_than_after_the_last_character() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let launchers = vec![launcher("lazygit")];
+        let mut palette = LauncherPalette::new();
+        for c in "café".chars() {
+            palette.type_char(c, &launchers);
+        }
+        palette.move_cursor(Motion::Left);
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    &launchers,
+                    "repo-a",
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the typed query");
+        let interior = popup_interior(&palette, &launchers, "repo-a");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2 + 3, interior.y),
+            "\"caf\" is three columns, whatever `é` costs in bytes"
+        );
+        assert!(
+            row_text(terminal.backend().buffer(), interior.y, 40).contains("! café"),
+            "the text after the caret must still be painted: {:?}",
+            row_text(terminal.backend().buffer(), interior.y, 40)
+        );
+    }
+
+    #[test]
+    fn typing_and_ctrl_w_act_at_the_caret_rather_than_at_the_end_of_the_query() {
+        let launchers = vec![launcher("lazygit")];
+        let mut palette = LauncherPalette::new();
+        for c in "one two".chars() {
+            palette.type_char(c, &launchers);
+        }
+        palette.move_cursor(Motion::WordLeft);
+        palette.type_char('-', &launchers);
+        assert_eq!(palette.text(), "one -two");
+
+        palette.move_cursor(Motion::WordLeft);
+        palette.delete_previous_word(&launchers);
+        assert_eq!(palette.text(), "-two");
     }
 
     // --- the cursor row's highlight covers its full interior width ---

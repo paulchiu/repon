@@ -19,6 +19,7 @@ use crate::{
     action_palette::{ActionPalette, Count, Decision, Entry, Narrowed, Run, Stage},
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
+    edit_buffer::Motion,
     editor,
     filter_line::FilterLine,
     footer,
@@ -45,6 +46,20 @@ use crate::{
 
 pub(crate) mod reload;
 pub(crate) mod status;
+
+/// The [`Motion`] one of `input`'s six cursor actions names, so all three text surfaces read
+/// the same mapping rather than each spelling out its own six arms.
+fn cursor_motion(action: Action) -> Motion {
+    match action {
+        Action::MoveCursorLeft => Motion::Left,
+        Action::MoveCursorRight => Motion::Right,
+        Action::MoveCursorWordLeft => Motion::WordLeft,
+        Action::MoveCursorWordRight => Motion::WordRight,
+        Action::MoveCursorToLineStart => Motion::LineStart,
+        Action::MoveCursorToLineEnd => Motion::LineEnd,
+        other => unreachable!("{other:?} is not one of the input context's cursor motions"),
+    }
+}
 
 /// What one key press inside the sort menu means. Both arms close the menu; only `Order`
 /// changes anything, which is what lets `Esc` and `o` cancel without reordering.
@@ -287,7 +302,7 @@ pub struct App {
     /// `handle_key_event` itself never holds one. Taken (never merely read) the moment it is
     /// handed to [`Self::run_launcher_handoff`], so a handoff runs at most once per choice.
     pending_launcher_handoff: Option<(EntityKey, Launcher)>,
-    /// `true` between `Action::OpenInEditor` (`Ctrl+E`) firing inside the Action palette's
+    /// `true` between `Action::OpenInEditor` (`Ctrl+O`) firing inside the Action palette's
     /// ad hoc field and [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, the
     /// same reason `pending_launcher_handoff` is a flag rather than an immediate call:
     /// `handle_key_event` never holds one. Cleared the moment it is handed to
@@ -1375,6 +1390,12 @@ impl App {
                 | Action::DeletePreviousWord
                 | Action::ClearLine
                 | Action::OpenInEditor
+                | Action::MoveCursorLeft
+                | Action::MoveCursorRight
+                | Action::MoveCursorWordLeft
+                | Action::MoveCursorWordRight
+                | Action::MoveCursorToLineStart
+                | Action::MoveCursorToLineEnd
                 | Action::Choose
                 | Action::Close
                 | Action::Search
@@ -1523,7 +1544,7 @@ impl App {
     /// silently-absorbing wildcard, the same shape `Self::handle_key_event`'s own dispatch
     /// uses for `ScrollDown`/`ScrollUp`/`Top`/`Bottom`.
     ///
-    /// `OpenInEditor` (`Ctrl+E`) queues `self.pending_action_editor_handoff` for
+    /// `OpenInEditor` (`Ctrl+O`) queues `self.pending_action_editor_handoff` for
     /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
     /// ([`Self::run_action_editor_handoff`]), the same pattern
     /// `Self::choose_highlighted_launcher` already uses for its own handoff.
@@ -1600,6 +1621,18 @@ impl App {
             Some(Action::NextEntry) => {
                 if let Some(palette) = &mut self.action_palette {
                     palette.move_highlight(1, &self.document.actions);
+                }
+            }
+            Some(
+                action @ (Action::MoveCursorLeft
+                | Action::MoveCursorRight
+                | Action::MoveCursorWordLeft
+                | Action::MoveCursorWordRight
+                | Action::MoveCursorToLineStart
+                | Action::MoveCursorToLineEnd),
+            ) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.move_cursor(cursor_motion(action));
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_action(),
@@ -1713,6 +1746,18 @@ impl App {
                     line.accept_highlighted_completion();
                 }
             }
+            Some(
+                action @ (Action::MoveCursorLeft
+                | Action::MoveCursorRight
+                | Action::MoveCursorWordLeft
+                | Action::MoveCursorWordRight
+                | Action::MoveCursorToLineStart
+                | Action::MoveCursorToLineEnd),
+            ) => {
+                if let Some(line) = &mut self.filter_line {
+                    line.move_cursor(cursor_motion(action));
+                }
+            }
             Some(Action::OpenInEditor) => {}
             None => {}
             Some(other) => unreachable!(
@@ -1762,6 +1807,18 @@ impl App {
             Some(Action::NextEntry) => {
                 if let Some(palette) = &mut self.launcher_palette {
                     palette.move_highlight(1, &launcher::resolve(&self.document));
+                }
+            }
+            Some(
+                action @ (Action::MoveCursorLeft
+                | Action::MoveCursorRight
+                | Action::MoveCursorWordLeft
+                | Action::MoveCursorWordRight
+                | Action::MoveCursorToLineStart
+                | Action::MoveCursorToLineEnd),
+            ) => {
+                if let Some(palette) = &mut self.launcher_palette {
+                    palette.move_cursor(cursor_motion(action));
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_launcher(),
@@ -9904,6 +9961,100 @@ refresh_all = "z""#,
         );
     }
 
+    /// The live key path for the cursor: every one of `input`'s six motion chords has to
+    /// reach the Filter line's own buffer through the compiled table, and the edits that
+    /// follow one have to act where it left the caret. Driven through `handle_key_event`
+    /// rather than the surface's own methods, so a missing dispatch arm fails here.
+    #[test]
+    fn the_input_contexts_cursor_chords_move_the_filter_lines_caret_and_edits_land_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("alpha"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+        for c in "kind:repo is:dirty".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a two term filter");
+        }
+
+        for key in [
+            press(KeyCode::Char('b'), KeyModifiers::ALT),
+            press(KeyCode::Left, KeyModifiers::NONE),
+            press(KeyCode::Right, KeyModifiers::NONE),
+        ] {
+            app.handle_key_event(key).expect("move the caret");
+        }
+        app.handle_key_event(press(KeyCode::Char('-'), KeyModifiers::NONE))
+            .expect("type at the caret");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(
+            app.filter.as_str(),
+            "kind:repo -is:dirty",
+            "Alt+B, Left and Right must land the typed character at the caret"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("reopen the filter line prefilled");
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .expect("jump to the start of the line");
+        app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::ALT))
+            .expect("jump forward one word");
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("cut the word before the caret");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(
+            app.filter.as_str(),
+            " -is:dirty",
+            "Ctrl+A then Alt+F then Ctrl+W must cut the first term alone"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("reopen the filter line prefilled");
+        app.handle_key_event(press(KeyCode::Home, KeyModifiers::NONE))
+            .expect("jump to the start of the line");
+        app.handle_key_event(press(KeyCode::End, KeyModifiers::NONE))
+            .expect("jump back to the end of the line");
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("type at the caret");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(
+            app.filter.as_str(),
+            " -is:dirty!",
+            "Home then End must leave the caret at the end of the line"
+        );
+    }
+
+    /// The same live path for the Action palette's own query, where the typed text is also
+    /// the ad hoc command, so an edit landing at the wrong end is a different command run.
+    #[test]
+    fn the_input_contexts_cursor_chords_move_the_action_palettes_caret_and_edits_land_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the action palette");
+        for c in "git status".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type an ad hoc command");
+        }
+        app.handle_key_event(press(KeyCode::Char('b'), KeyModifiers::ALT))
+            .expect("jump back one word");
+        app.handle_key_event(press(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("cut the word before the caret");
+        assert_eq!(
+            app.action_palette.as_ref().map(ActionPalette::text),
+            Some("status"),
+            "Ctrl+W after Alt+B must cut `git ` and leave what follows the caret"
+        );
+    }
+
     /// The Filter line's empty-buffer inertness: see
     /// `backspace_on_an_empty_launcher_palette_query_is_inert_and_does_not_close_it`'s own doc
     /// comment for why the surface staying open is the substance of this check.
@@ -10784,12 +10935,12 @@ refresh_all = "z""#,
         assert_eq!(&*receipt.steps[0].output, b"UNSET");
     }
 
-    /// Criterion 3: `Ctrl+E` must queue the same handoff `Self::run` drains with a live
+    /// Criterion 3: `Ctrl+O` must queue the same handoff `Self::run` drains with a live
     /// `Tui`, never run one on the spot. `pending_action_editor_handoff` staying `false`
     /// until that key is pressed, and the palette's own text staying untouched, is what
     /// distinguishes "queued for later" from "already handled".
     #[test]
-    fn ctrl_e_queues_the_editor_handoff_rather_than_running_it_inline() {
+    fn ctrl_o_queues_the_editor_handoff_rather_than_running_it_inline() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -10802,12 +10953,12 @@ refresh_all = "z""#,
             app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
                 .expect("type some text");
         }
-        app.handle_key_event(press(KeyCode::Char('e'), KeyModifiers::CONTROL))
-            .expect("press ctrl+e");
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .expect("press ctrl+o");
 
         assert!(
             app.pending_action_editor_handoff,
-            "Ctrl+E must queue the handoff for `run`'s own loop"
+            "Ctrl+O must queue the handoff for `run`'s own loop"
         );
         assert!(
             app.action_palette.is_some(),

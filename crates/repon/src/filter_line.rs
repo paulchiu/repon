@@ -12,7 +12,7 @@ use std::ops::Range;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, widgets::Clear};
 use repon_core::Filter;
 
-use crate::edit_buffer;
+use crate::edit_buffer::{EditBuffer, Motion};
 use crate::glyphs::{BorderScratch, GlyphSet};
 use crate::list_viewport::offset_following_cursor;
 use crate::theme::{Role, Theme};
@@ -49,12 +49,12 @@ impl Trigger {
     }
 }
 
-/// The Filter line's own edit buffer: append-only text, the same shape
-/// [`crate::action_palette::ActionPalette`]'s own query takes. Editing is always at the end:
-/// `Backspace` deletes the last character, `Ctrl+W` the last word, and `Ctrl+U` the whole line
-/// ([keybindings.md](../../../docs/spec/keybindings.md)'s `input` context).
+/// The Filter line's own edit buffer: an [`EditBuffer`], the same shape
+/// [`crate::action_palette::ActionPalette`]'s own query takes, so every edit and every
+/// cursor motion [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names
+/// acts at the caret rather than at the end of the text.
 pub(crate) struct FilterLine {
-    input: String,
+    input: EditBuffer,
     /// The row the completion list's highlight sits on, and the window following it
     /// ([`offset_following_cursor`], the same viewport math the repo list's own cursor
     /// uses). Reset to `(0, 0)` on every edit ([`Self::reset_completion`]): a keystroke can
@@ -85,6 +85,17 @@ fn warn_split<'a>(text: &'a str, warn_ranges: &[Range<usize>]) -> Vec<(&'a str, 
     segments
 }
 
+/// `segment`, which starts at `offset` in the whole typed text, split where `cursor` falls
+/// inside it: the head is painted before the caret's column is read back and the tail after.
+/// A cursor outside the segment leaves the whole of it in the head.
+fn split_at_cursor(segment: &str, cursor: usize, offset: usize) -> (&str, &str) {
+    if (offset..offset + segment.len()).contains(&cursor) {
+        segment.split_at(cursor - offset)
+    } else {
+        (segment, "")
+    }
+}
+
 /// The row's own text while [`FilterLine::input`] is empty, replaced by the prompt character
 /// and typed text on the first keystroke; kept parallel with
 /// [`crate::action_palette::QUERY_PLACEHOLDER`] and
@@ -98,33 +109,40 @@ impl FilterLine {
     /// "refining is the common case").
     pub(crate) fn new(committed: &Filter) -> Self {
         FilterLine {
-            input: committed.as_str().to_string(),
+            input: EditBuffer::from_text(committed.as_str().to_string()),
             highlight: 0,
             completion_offset: 0,
         }
     }
 
     pub(crate) fn type_char(&mut self, c: char) {
-        self.input.push(c);
+        self.input.insert_char(c);
         self.reset_completion();
     }
 
-    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
-    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    /// `Backspace`: deletes the character immediately before the cursor.
     pub(crate) fn delete_previous_char(&mut self) {
-        self.input.pop();
+        self.input.delete_previous_char();
         self.reset_completion();
     }
 
-    /// `Ctrl+W`: deletes one trailing whitespace-delimited word.
+    /// `Ctrl+W`: deletes one whitespace-delimited word ending at the cursor.
     pub(crate) fn delete_previous_word(&mut self) {
-        edit_buffer::delete_previous_word(&mut self.input);
+        self.input.delete_previous_word();
         self.reset_completion();
     }
 
     /// `Ctrl+U`: clears the line, the fastest way back to an unfiltered list while editing.
     pub(crate) fn clear_line(&mut self) {
         self.input.clear();
+        self.reset_completion();
+    }
+
+    /// The arrow keys, `Alt+B`/`Alt+F` and `Ctrl+A`/`Ctrl+E`: moves the caret, and resets the
+    /// completion for whatever term the caret now sits in, since a motion swaps the candidate
+    /// set out from under a standing highlight exactly as an edit does.
+    pub(crate) fn move_cursor(&mut self, motion: Motion) {
+        self.input.move_cursor(motion);
         self.reset_completion();
     }
 
@@ -137,18 +155,15 @@ impl FilterLine {
     /// what keeps this module holding no parsed state of its own to fall out of sync with
     /// `self.input`.
     pub(crate) fn live_filter(&self) -> Filter {
-        Filter::parse(&self.input)
+        Filter::parse(self.input.as_str())
     }
 
-    /// Where the term under the cursor starts in `self.input`. Editing is always at the end
-    /// ([`FilterLine`]'s own doc comment), so "the term under the cursor"
-    /// ([filter.md](../../../docs/spec/filter.md#completion)) is always the *last* term, and
-    /// there is never a cursor position to track separately from `self.input`'s own length.
-    /// [`edit_buffer::last_term_start`] is the one whitespace search the workspace blesses
-    /// (`edit_buffer`'s own doc comment), so this reads through it rather than keeping a
-    /// second copy of the same cut.
+    /// Where the term under the cursor starts in `self.input`, read off the buffer's own
+    /// cursor rather than the end of the text: "the term under the cursor"
+    /// ([filter.md](../../../docs/spec/filter.md#completion)) is the run the caret sits in,
+    /// which is the last term only while the caret is at the end.
     fn term_start(&self) -> usize {
-        edit_buffer::last_term_start(&self.input)
+        self.input.term_start()
     }
 
     /// The current term's own [`Trigger`], and the byte offset in `self.input` where
@@ -163,14 +178,17 @@ impl FilterLine {
     /// case-insensitively, the same as the parser itself
     /// ([filter.md](../../../docs/spec/filter.md#the-grammar)).
     fn trigger(&self) -> (Trigger, usize) {
+        // Everything below reads the text up to the caret alone, so a term is what has been
+        // typed into it so far and never what happens to follow the caret.
+        let typed = self.input.before_cursor();
         let term_start = self.term_start();
-        let term = &self.input[term_start..];
+        let term = self.input.term_under_cursor();
         let body_start = if term.starts_with('-') {
             term_start + 1
         } else {
             term_start
         };
-        let body = &self.input[body_start..];
+        let body = &typed[body_start..];
 
         if body.is_empty() || body == ":" {
             let keys = repon_core::vocabulary()
@@ -231,7 +249,8 @@ impl FilterLine {
     }
 
     /// `Tab`: replaces the term under the cursor (or the value fragment being typed, for a
-    /// comma-joined value) with the highlighted candidate, then resets the highlight for
+    /// comma-joined value) with the highlighted candidate, leaving whatever follows the
+    /// caret alone, then resets the highlight for
     /// whatever the newly written text triggers next. A candidate list emptied out from under
     /// a standing `self.highlight` (this cannot happen today, since every mutation already
     /// resets it, but costs nothing to guard) leaves the line untouched rather than panicking.
@@ -240,8 +259,7 @@ impl FilterLine {
         let Some(candidate) = trigger.candidates().get(self.highlight) else {
             return;
         };
-        self.input.truncate(fragment_start);
-        self.input.push_str(candidate);
+        self.input.replace_before_cursor(fragment_start, candidate);
         self.reset_completion();
     }
 
@@ -252,7 +270,7 @@ impl FilterLine {
     /// `warn` role"). The rightmost column is the fixed advisory slot, `?` in [`Role::Warn`]
     /// when [`repon_core::Filter::unrecognised_ranges`] is non-empty and a plain space
     /// otherwise, so the typed text itself gets one column less than `area`'s own width.
-    /// The caret lands at the end of the typed text (or right after the prompt while empty),
+    /// The caret lands at the buffer's own cursor (or right after the prompt while empty),
     /// clamped so it never advances past the advisory column, however long the typed text.
     /// `area` is expected to be exactly one row tall
     /// ([filter.md](../../../docs/spec/filter.md): "one real row directly above the footer").
@@ -286,13 +304,28 @@ impl FilterLine {
             text_width as usize,
             theme.style_for(Role::Text),
         );
-        for (segment, warn) in warn_split(&self.input, &unrecognised) {
+        // The caret's own column, captured as the paint passes the cursor rather than
+        // measured separately; `None` once the loop ends means the cursor sits at or past
+        // the end of what was painted, which is what `x` itself already names.
+        let mut caret_x = None;
+        let mut offset = 0;
+        for (segment, warn) in warn_split(self.input.as_str(), &unrecognised) {
             if x >= advisory_x {
                 break;
             }
             let style = theme.style_for(if warn { Role::Warn } else { Role::Text });
-            let (next_x, _) = buf.set_stringn(x, area.y, segment, (advisory_x - x) as usize, style);
+            let (head, tail) = split_at_cursor(segment, self.input.cursor(), offset);
+            let (next_x, _) = buf.set_stringn(x, area.y, head, (advisory_x - x) as usize, style);
             x = next_x;
+            if !tail.is_empty() {
+                caret_x = Some(x);
+                if x < advisory_x {
+                    let (next_x, _) =
+                        buf.set_stringn(x, area.y, tail, (advisory_x - x) as usize, style);
+                    x = next_x;
+                }
+            }
+            offset += segment.len();
         }
 
         let (glyph, glyph_role) = if unrecognised.is_empty() {
@@ -302,10 +335,11 @@ impl FilterLine {
         };
         buf.set_stringn(advisory_x, area.y, glyph, 1, theme.style_for(glyph_role));
 
-        // `x` is already where the last painted segment left off, the same cell-width
-        // accounting `set_stringn` used to lay out every glyph, clamped at every step to
-        // `advisory_x`: no separate width measurement can disagree with it.
-        frame.set_cursor_position((x.min(advisory_x), area.y));
+        // `caret_x` (or `x`, where the cursor sits at the end) is already where the paint
+        // itself left off, the same cell-width accounting `set_stringn` used to lay out every
+        // glyph, clamped at every step to `advisory_x`: no separate width measurement can
+        // disagree with it.
+        frame.set_cursor_position((caret_x.unwrap_or(x).min(advisory_x), area.y));
     }
 
     /// The framed completion block's own rect inside `content_area`, or `None` when there is
@@ -815,6 +849,119 @@ mod tests {
         let mut line = typed("-");
         line.accept_highlighted_completion();
         assert_eq!(line.live_filter().as_str(), "-name:");
+    }
+
+    // --- the cursor: where the next keystroke lands, and what the completion reads ---
+
+    /// Completion is offered for the term the caret sits in, not the last one on the line:
+    /// the caret is where every edit lands, so it is what the trigger is read against.
+    #[test]
+    fn the_completion_list_offers_the_term_the_caret_sits_in_rather_than_the_last_one() {
+        let kind_values: Vec<String> = repon_core::vocabulary()
+            .into_iter()
+            .find(|entry| entry.key == "kind")
+            .expect("`kind` is in the vocabulary")
+            .values
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+
+        let mut line = typed("kind: is:dirty");
+        assert!(
+            line.completions() != kind_values,
+            "with the caret at the end the last term is what is completed"
+        );
+        line.move_cursor(Motion::WordLeft);
+        line.move_cursor(Motion::Left);
+        assert_eq!(line.completions(), kind_values);
+    }
+
+    /// Accepting a completion overwrites the term under the caret alone: what follows the
+    /// caret is untouched, and the caret ends after what was written.
+    #[test]
+    fn accepting_a_completion_leaves_the_text_after_the_caret_alone() {
+        let mut line = typed("kind: is:dirty");
+        line.move_cursor(Motion::WordLeft);
+        line.move_cursor(Motion::Left);
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "kind:repo is:dirty");
+        line.type_char('!');
+        assert_eq!(
+            line.live_filter().as_str(),
+            "kind:repo! is:dirty",
+            "the caret follows what was accepted rather than jumping to the end"
+        );
+    }
+
+    /// A motion swaps the candidate list out from under the highlight exactly as an edit
+    /// does, so it resets the highlight for whatever the caret now sits in.
+    #[test]
+    fn moving_the_caret_resets_the_completion_highlight() {
+        let mut line = typed("kind:");
+        line.move_completion_highlight(1);
+        line.move_cursor(Motion::LineStart);
+        line.move_cursor(Motion::LineEnd);
+        line.accept_highlighted_completion();
+        assert_eq!(
+            line.live_filter().as_str(),
+            "kind:repo",
+            "the highlight is back on the first candidate"
+        );
+    }
+
+    #[test]
+    fn typing_and_deleting_act_at_the_caret_rather_than_at_the_end_of_the_line() {
+        let mut line = typed("kind:repo is:dirty");
+        line.move_cursor(Motion::WordLeft);
+        line.type_char('-');
+        assert_eq!(line.live_filter().as_str(), "kind:repo -is:dirty");
+
+        line.delete_previous_char();
+        assert_eq!(line.live_filter().as_str(), "kind:repo is:dirty");
+
+        line.delete_previous_word();
+        assert_eq!(line.live_filter().as_str(), "is:dirty");
+    }
+
+    /// The caret paints where the next keystroke lands, which is the cursor rather than the
+    /// end of the typed text, and it is counted in painted cells: `é` is two bytes and one
+    /// column.
+    #[test]
+    fn the_caret_sits_at_the_cursor_rather_than_after_the_last_character() {
+        let theme = Theme::default();
+        let mut line = typed("café");
+        line.move_cursor(Motion::Left);
+        let (buf, cursor) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(
+            cursor,
+            Position::new(PROMPT_WIDTH + 3, 0),
+            "\"caf\" is three columns after the prompt, whatever `é` costs in bytes"
+        );
+        assert!(
+            row_text(&buf).starts_with("/ café"),
+            "the text after the caret must still be painted: {:?}",
+            row_text(&buf)
+        );
+
+        line.move_cursor(Motion::LineStart);
+        let (_, cursor) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(cursor, Position::new(PROMPT_WIDTH, 0));
+    }
+
+    /// An unrecognised term paints in its own role, and the caret inside one must land at the
+    /// cursor all the same: the warn segment is painted in two pieces around it.
+    #[test]
+    fn the_caret_lands_inside_a_warn_painted_term_at_the_cursor() {
+        let theme = Theme::default();
+        let mut line = typed("nope:x");
+        line.move_cursor(Motion::Left);
+        let (buf, cursor) = draw_with_cursor(&line, &theme, 40);
+        assert_eq!(cursor, Position::new(PROMPT_WIDTH + 5, 0));
+        assert!(
+            row_text(&buf).starts_with("/ nope:x"),
+            "both halves of the split segment must be painted: {:?}",
+            row_text(&buf)
+        );
     }
 
     /// `Ctrl+K`/`Ctrl+J`, `Up`/`Down`: clamped at both ends rather than wrapping, the same

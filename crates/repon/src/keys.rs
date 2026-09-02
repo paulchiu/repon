@@ -89,6 +89,14 @@ pub(crate) enum Action {
     DeletePreviousWord,
     ClearLine,
     OpenInEditor,
+    /// The six motions a field's cursor answers to, all of them acting on
+    /// [`crate::edit_buffer::EditBuffer`]'s own cursor rather than on the text.
+    MoveCursorLeft,
+    MoveCursorRight,
+    MoveCursorWordLeft,
+    MoveCursorWordRight,
+    MoveCursorToLineStart,
+    MoveCursorToLineEnd,
 
     // overlay (Scroll* variants above are reused for j/k/g/G/Ctrl+D/Ctrl+U here too)
     Choose,
@@ -212,6 +220,12 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::DeletePreviousWord => "Delete the previous word",
         Action::ClearLine => "Clear the line",
         Action::OpenInEditor => "Open the field in `$EDITOR`",
+        Action::MoveCursorLeft => "Move the cursor left",
+        Action::MoveCursorRight => "Move the cursor right",
+        Action::MoveCursorWordLeft => "Move the cursor back one word",
+        Action::MoveCursorWordRight => "Move the cursor forward one word",
+        Action::MoveCursorToLineStart => "Move the cursor to the start of the line",
+        Action::MoveCursorToLineEnd => "Move the cursor to the end of the line",
         Action::Choose => "Choose (Set picker only)",
         Action::Close => "Close",
         Action::Search => "Search",
@@ -237,6 +251,11 @@ const NONE: KeyModifiers = KeyModifiers::NONE;
 const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 /// A Ctrl chord arrives as the lowercase letter with CONTROL set, per the same section.
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+/// An Alt chord (macOS Option, Meta elsewhere) arrives the same way, as the lowercase letter
+/// with ALT set. Unlike CONTROL it does not exclude a key from [`printable`], so an Alt chord
+/// is text unless a row of its own claims it first, which is why `input`'s two word motions
+/// are table rows rather than a special case in [`BindingTable::dispatch`].
+const ALT: KeyModifiers = KeyModifiers::ALT;
 
 /// Ctrl+I, Ctrl+M and Ctrl+[, permanently unbindable per
 /// [keybindings.md](../../../../docs/spec/keybindings.md#modifiers-and-matching) and
@@ -563,9 +582,52 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Input, KeyCode::Char('u'), CTRL, Action::ClearLine),
     binding(
         Context::Input,
-        KeyCode::Char('e'),
+        KeyCode::Char('o'),
         CTRL,
         Action::OpenInEditor,
+    ),
+    binding(Context::Input, KeyCode::Left, NONE, Action::MoveCursorLeft),
+    binding(
+        Context::Input,
+        KeyCode::Right,
+        NONE,
+        Action::MoveCursorRight,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::Char('b'),
+        ALT,
+        Action::MoveCursorWordLeft,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::Char('f'),
+        ALT,
+        Action::MoveCursorWordRight,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::Char('a'),
+        CTRL,
+        Action::MoveCursorToLineStart,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::Home,
+        NONE,
+        Action::MoveCursorToLineStart,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::Char('e'),
+        CTRL,
+        Action::MoveCursorToLineEnd,
+    ),
+    binding(
+        Context::Input,
+        KeyCode::End,
+        NONE,
+        Action::MoveCursorToLineEnd,
     ),
     // overlay
     binding(
@@ -704,6 +766,10 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Up => "up".to_string(),
         KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
         KeyCode::PageUp => "pageup".to_string(),
         KeyCode::PageDown => "pagedown".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
@@ -713,6 +779,8 @@ pub(crate) fn chord_label(code: KeyCode, modifiers: KeyModifiers) -> String {
     };
     if modifiers.contains(CTRL) {
         format!("ctrl-{base}")
+    } else if modifiers.contains(ALT) {
+        format!("alt-{base}")
     } else {
         base
     }
@@ -922,6 +990,12 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::DeletePreviousWord => "delete_previous_word",
         Action::ClearLine => "clear_line",
         Action::OpenInEditor => "open_in_editor",
+        Action::MoveCursorLeft => "move_cursor_left",
+        Action::MoveCursorRight => "move_cursor_right",
+        Action::MoveCursorWordLeft => "move_cursor_word_left",
+        Action::MoveCursorWordRight => "move_cursor_word_right",
+        Action::MoveCursorToLineStart => "move_cursor_to_line_start",
+        Action::MoveCursorToLineEnd => "move_cursor_to_line_end",
         Action::Choose => "choose",
         Action::Close => "close",
         Action::Search => "search",
@@ -997,12 +1071,15 @@ fn parse_context_name(name: &str) -> Option<Context> {
 /// names no chord this parser recognises, which a caller reports as config.md's third failure
 /// grade: exit non-zero before the terminal is claimed.
 pub(crate) fn parse_chord(text: &str) -> Option<(KeyCode, KeyModifiers)> {
-    let (ctrl, base) = match text.strip_prefix("ctrl-") {
-        Some(rest) => (true, rest),
-        None => (false, text),
+    let (prefix, base) = match text.strip_prefix("ctrl-") {
+        Some(rest) => (CTRL, rest),
+        None => match text.strip_prefix("alt-") {
+            Some(rest) => (ALT, rest),
+            None => (NONE, text),
+        },
     };
     let code = named_key_code(base)?;
-    let mut modifiers = if ctrl { CTRL } else { NONE };
+    let mut modifiers = prefix;
     if let KeyCode::Char(c) = code
         && c.is_ascii_uppercase()
     {
@@ -1023,6 +1100,10 @@ fn named_key_code(base: &str) -> Option<KeyCode> {
         "backspace" => KeyCode::Backspace,
         "up" => KeyCode::Up,
         "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
         "space" => KeyCode::Char(' '),
@@ -1446,7 +1527,7 @@ mod tests {
         for (code, modifiers) in GLOBAL_PROBE_KEYS {
             let action = dispatch(Context::Input, press(code, modifiers));
             if modifiers.contains(CTRL) {
-                // None of these is one of Input's own five Ctrl chords, and Ctrl is excluded
+                // None of these is one of Input's own Ctrl chords, and Ctrl is excluded
                 // from the printable catch-all, so Input must stay silent on them.
                 assert_eq!(
                     action, None,
@@ -1555,8 +1636,8 @@ mod tests {
     /// while `list` or `detail` has focus, `input`'s printable catch-all claims it as text
     /// rather than leaking the Global action through, and `overlay` and `confirm` bind no
     /// `e` of their own and so answer with silence. The only other `e` in the table is
-    /// `Ctrl+E` (`OpenInEditor`, `input`), a different chord entirely, so this and that row
-    /// never compete for the same keystroke.
+    /// `Ctrl+E` (`MoveCursorToLineEnd`, `input`), a different chord entirely, so this and
+    /// that row never compete for the same keystroke.
     mod e_is_free_across_every_context {
         use super::*;
 
@@ -1643,11 +1724,45 @@ mod tests {
             (press(KeyCode::Backspace, NONE), Action::DeletePreviousChar),
             (press(KeyCode::Char('w'), CTRL), Action::DeletePreviousWord),
             (press(KeyCode::Char('u'), CTRL), Action::ClearLine),
-            (press(KeyCode::Char('e'), CTRL), Action::OpenInEditor),
+            (press(KeyCode::Char('o'), CTRL), Action::OpenInEditor),
         ];
         for (key, expected) in cases {
             assert_eq!(dispatch(Context::Input, key), Some(expected));
         }
+    }
+
+    /// The six motions a text field's cursor answers to, each bound in `input` alone. The
+    /// two `Alt` chords are the reason `lookup` runs before the printable catch-all: without
+    /// a row of their own, `Alt+B` and `Alt+F` are printable characters and would type a
+    /// letter into the field instead.
+    #[test]
+    fn input_moves_the_cursor_by_character_by_word_and_to_either_end_of_the_line() {
+        let cases = [
+            (press(KeyCode::Left, NONE), Action::MoveCursorLeft),
+            (press(KeyCode::Right, NONE), Action::MoveCursorRight),
+            (press(KeyCode::Char('b'), ALT), Action::MoveCursorWordLeft),
+            (press(KeyCode::Char('f'), ALT), Action::MoveCursorWordRight),
+            (
+                press(KeyCode::Char('a'), CTRL),
+                Action::MoveCursorToLineStart,
+            ),
+            (press(KeyCode::Home, NONE), Action::MoveCursorToLineStart),
+            (press(KeyCode::Char('e'), CTRL), Action::MoveCursorToLineEnd),
+            (press(KeyCode::End, NONE), Action::MoveCursorToLineEnd),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(dispatch(Context::Input, key), Some(expected));
+        }
+    }
+
+    /// `Alt+B` and `Alt+F` are the only two Alt chords the table binds, so every other Alt
+    /// combination stays what it was: a printable character typed into the field.
+    #[test]
+    fn an_unbound_alt_chord_is_still_text_in_the_input_context() {
+        assert_eq!(
+            dispatch(Context::Input, press(KeyCode::Char('x'), ALT)),
+            Some(Action::Text('x'))
+        );
     }
 
     // --- confirm captures the whole keyboard except its reserved set ---
@@ -1941,6 +2056,10 @@ mod tests {
             let c = letter.chars().next().expect("Ctrl+ chord names a letter");
             return (KeyCode::Char(c.to_ascii_lowercase()), CTRL);
         }
+        if let Some(letter) = token.strip_prefix("Alt+") {
+            let c = letter.chars().next().expect("Alt+ chord names a letter");
+            return (KeyCode::Char(c.to_ascii_lowercase()), ALT);
+        }
         match token {
             "Esc" => (KeyCode::Esc, NONE),
             "Enter" => (KeyCode::Enter, NONE),
@@ -1952,6 +2071,10 @@ mod tests {
             "Backspace" => (KeyCode::Backspace, NONE),
             "Up" => (KeyCode::Up, NONE),
             "Down" => (KeyCode::Down, NONE),
+            "Left" => (KeyCode::Left, NONE),
+            "Right" => (KeyCode::Right, NONE),
+            "Home" => (KeyCode::Home, NONE),
+            "End" => (KeyCode::End, NONE),
             "PageUp" => (KeyCode::PageUp, NONE),
             "PageDown" => (KeyCode::PageDown, NONE),
             "Space" => (KeyCode::Char(' '), NONE),

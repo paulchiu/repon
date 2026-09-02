@@ -30,7 +30,7 @@ use ratatui::{
     text::Line,
 };
 
-use crate::edit_buffer;
+use crate::edit_buffer::EditBuffer;
 use crate::glyphs::{BorderScratch, GlyphSet, Meaning, bordered_interior};
 use crate::keys::{Action, BindingTable, Context};
 use crate::scroll::scroll_after;
@@ -218,7 +218,10 @@ enum Mode {
 #[derive(Default)]
 pub(crate) struct HelpOverlay {
     scroll: u16,
-    query: String,
+    /// The same buffer every `input`-context field edits through, so the query's `Backspace`
+    /// and `Ctrl+W` are one implementation rather than a second copy. Its cursor stays at the
+    /// end: `overlay` binds no motion, since `Up` and `Down` scroll the list here.
+    query: EditBuffer,
     mode: Mode,
 }
 
@@ -384,7 +387,7 @@ impl HelpOverlay {
 
     /// The query typed so far, empty until the first keystroke of a search.
     pub(crate) fn query(&self) -> &str {
-        &self.query
+        self.query.as_str()
     }
 
     /// Whether `/` has been pressed and `Esc` or `Enter` has not yet left search mode again:
@@ -424,7 +427,7 @@ impl HelpOverlay {
     /// keystroke that narrows or widens the list underneath a standing offset would otherwise
     /// leave the viewport looking at whatever used to be there.
     pub(crate) fn push_query_char(&mut self, c: char) {
-        self.query.push(c);
+        self.query.insert_char(c);
         self.scroll = 0;
     }
 
@@ -432,14 +435,14 @@ impl HelpOverlay {
     /// `Context::Input`/`DeletePreviousChar` row every other text surface reads. Inert on an
     /// empty query, which keeps it from being a second way to leave search mode.
     pub(crate) fn pop_query_char(&mut self) {
-        self.query.pop();
+        self.query.delete_previous_char();
         self.scroll = 0;
     }
 
     /// `Ctrl+W`: deletes one trailing whitespace-delimited word from the query, the same
     /// `Context::Input`/`DeletePreviousWord` row every other text surface reads.
     pub(crate) fn delete_previous_word(&mut self) {
-        edit_buffer::delete_previous_word(&mut self.query);
+        self.query.delete_previous_word();
         self.scroll = 0;
     }
 
@@ -501,7 +504,7 @@ impl HelpOverlay {
             list_height,
         );
 
-        let visible = Self::filtered_lines(table, context, glyphs, &self.query);
+        let visible = Self::filtered_lines(table, context, glyphs, self.query.as_str());
         if visible.is_empty() {
             let mut x = list_area.x;
             paint_run(
@@ -574,7 +577,7 @@ impl HelpOverlay {
 
         if self.shows_query_line() {
             let mut qx = content_area.x;
-            let query_line = format!("/ {}", self.query);
+            let query_line = format!("/ {}", self.query.as_str());
             let query_y = content_area.y + list_height;
             paint_run(
                 buf,

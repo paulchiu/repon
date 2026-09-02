@@ -37,7 +37,7 @@ use repon_core::{ActionSpec, Applicability, Filter, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
-    edit_buffer,
+    edit_buffer::{EditBuffer, Motion},
     glyphs::{BorderScratch, GlyphSet},
     management::{self, Operation},
     theme::{Meaning, Role, Theme},
@@ -329,7 +329,7 @@ pub(crate) enum Decision {
 /// rows.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionPalette {
-    query: String,
+    query: EditBuffer,
     cursor: usize,
     stage: Stage,
     refusal: Option<String>,
@@ -400,7 +400,7 @@ impl ActionPalette {
 
     fn scoped(scope: Scope) -> Self {
         Self {
-            query: String::new(),
+            query: EditBuffer::new(),
             cursor: 0,
             stage: Stage::Choosing,
             refusal: None,
@@ -424,7 +424,7 @@ impl ActionPalette {
     /// that one order: never reordered, per this module's own doc comment on why matching
     /// stays a plain substring test.
     pub(crate) fn matches<'a>(&self, actions: &'a [ActionConfig]) -> Vec<Entry<'a>> {
-        entries(actions, self.scope, &self.query)
+        entries(actions, self.scope, self.query.as_str())
     }
 
     /// The row the cursor currently sits on among the matches, if any match at all.
@@ -445,26 +445,31 @@ impl ActionPalette {
     }
 
     pub(crate) fn type_char(&mut self, c: char, actions: &[ActionConfig]) {
-        self.query.push(c);
+        self.query.insert_char(c);
         self.refusal = None;
         self.clamp_cursor(actions);
     }
 
-    /// `Backspace`: deletes the character immediately before the cursor. `String::pop` removes
-    /// the last `char` (a whole Unicode scalar), never a lone byte of a multi-byte one.
+    /// `Backspace`: deletes the character immediately before the cursor.
     pub(crate) fn delete_previous_char(&mut self, actions: &[ActionConfig]) {
-        self.query.pop();
+        self.query.delete_previous_char();
         self.refusal = None;
         self.clamp_cursor(actions);
     }
 
-    /// `Ctrl+W`: deletes one trailing whitespace-delimited word, the same shape
+    /// `Ctrl+W`: deletes one whitespace-delimited word ending at the cursor, the same shape
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context names for every
     /// text field this table feeds.
     pub(crate) fn delete_previous_word(&mut self, actions: &[ActionConfig]) {
-        edit_buffer::delete_previous_word(&mut self.query);
+        self.query.delete_previous_word();
         self.refusal = None;
         self.clamp_cursor(actions);
+    }
+
+    /// The arrow keys, `Alt+B`/`Alt+F` and `Ctrl+A`/`Ctrl+E`: moves the caret within the
+    /// typed text. The match list is untouched, so nothing here clamps the highlight.
+    pub(crate) fn move_cursor(&mut self, motion: Motion) {
+        self.query.move_cursor(motion);
     }
 
     pub(crate) fn clear_line(&mut self, actions: &[ActionConfig]) {
@@ -473,29 +478,29 @@ impl ActionPalette {
         self.clamp_cursor(actions);
     }
 
-    /// A whole bracketed paste, appended verbatim including any embedded newlines: the one
-    /// way a newline reaches this field, since typing has no key that inserts one (this
-    /// module's own doc comment). Arrives as a single atomic event rather than the
-    /// per-character key presses a terminal without bracketed paste would send, which is what
-    /// keeps a newline in the pasted text from being read as Enter and running the command
-    /// halfway through
+    /// A whole bracketed paste, inserted at the cursor verbatim including any embedded
+    /// newlines: the one way a newline reaches this field, since typing has no key that
+    /// inserts one (this module's own doc comment). Arrives as a single atomic event rather
+    /// than the per-character key presses a terminal without bracketed paste would send,
+    /// which is what keeps a newline in the pasted text from being read as Enter and running
+    /// the command halfway through
     /// ([keybindings.md](../../../docs/spec/keybindings.md#terminal-state)).
     pub(crate) fn paste(&mut self, text: &str, actions: &[ActionConfig]) {
-        self.query.push_str(text);
+        self.query.insert_str(text);
         self.refusal = None;
         self.clamp_cursor(actions);
     }
 
     /// The raw typed text, embedded newlines included: what seeds the `$EDITOR` scratch file
-    /// on `Ctrl+E`.
+    /// on `Ctrl+O`.
     pub(crate) fn text(&self) -> &str {
-        &self.query
+        self.query.as_str()
     }
 
     /// Replaces the typed text wholesale with `$EDITOR`'s own returned content once the
     /// editor exits, embedded newlines included, exactly as a multi-line paste would arrive.
     pub(crate) fn set_text(&mut self, text: String, actions: &[ActionConfig]) {
-        self.query = text;
+        self.query.set_text(text);
         self.refusal = None;
         self.clamp_cursor(actions);
     }
@@ -563,20 +568,20 @@ impl ActionPalette {
                 }
             }
             None => {
-                let steps = ad_hoc_steps(&self.query)?;
+                let steps = ad_hoc_steps(self.query.as_str())?;
                 if steps.is_empty() {
                     return None;
                 }
                 if operable_count == 0 {
                     self.refusal = Some(format!(
                         "\"{}\" targets 0 repos and was not run",
-                        self.query.trim()
+                        self.query.as_str().trim()
                     ));
                     return Some(Decision::Refused);
                 }
                 self.refusal = None;
                 Some(Decision::RunImmediately(to_ad_hoc_action_spec(
-                    &self.query,
+                    self.query.as_str(),
                     steps,
                 )))
             }
@@ -733,15 +738,15 @@ impl ActionPalette {
                         ));
                     }
                 } else if interior.height > 0 {
-                    // The caret sits at the query's own end, "; " plus whatever has been
-                    // typed, not at the end of whichever placeholder text an empty query is
-                    // showing in its place: this is where the next keystroke would land.
-                    // Read back from `set_stringn`'s own return, the same technique
-                    // [`crate::filter_line::FilterLine::draw`] uses, rather than adding a
-                    // separately measured query width to a literal prefix width: a changed
-                    // prefix or a wide character can then never drift the caret from the
-                    // text it follows. `draw_row`'s `Paragraph` is bypassed here rather than
-                    // reused because it never hands back where it stopped painting.
+                    // The caret sits at the query's own cursor, "; " plus whatever has been
+                    // typed ahead of it, not at the end of whichever placeholder text an
+                    // empty query is showing in its place: this is where the next keystroke
+                    // would land. Read back from `set_stringn`'s own return, the same
+                    // technique [`crate::filter_line::FilterLine::draw`] uses, rather than
+                    // adding a separately measured query width to a literal prefix width: a
+                    // changed prefix or a wide character can then never drift the caret from
+                    // the text it follows. `draw_row`'s `Paragraph` is bypassed here rather
+                    // than reused because it never hands back where it stopped painting.
                     let buf: &mut Buffer = frame.buffer_mut();
                     let (x, _) = buf.set_stringn(
                         interior.x,
@@ -750,14 +755,21 @@ impl ActionPalette {
                         row_right.saturating_sub(interior.x) as usize,
                         theme.style_for(Role::Text),
                     );
-                    let (x, _) = buf.set_stringn(
+                    let (caret_x, _) = buf.set_stringn(
                         x,
                         interior.y,
-                        &self.query,
+                        self.query.before_cursor(),
                         row_right.saturating_sub(x) as usize,
                         theme.style_for(Role::Text),
                     );
-                    frame.set_cursor_position(Position::new(x.min(row_right), interior.y));
+                    buf.set_stringn(
+                        caret_x,
+                        interior.y,
+                        self.query.after_cursor(),
+                        row_right.saturating_sub(caret_x) as usize,
+                        theme.style_for(Role::Text),
+                    );
+                    frame.set_cursor_position(Position::new(caret_x.min(row_right), interior.y));
                 }
 
                 let matches = self.matches(actions);
@@ -1675,6 +1687,128 @@ mod tests {
             terminal.backend().cursor_position(),
             Position::new(interior.x + 2 + 3, interior.y),
             "the caret must move to the end of the three typed characters"
+        );
+    }
+
+    /// The cursor's whole point on the drawing side: the caret marks where the next
+    /// keystroke lands, so a caret moved back into the text must paint there and the text
+    /// after it must still be on the row.
+    #[test]
+    fn draw_places_the_caret_at_the_cursor_rather_than_after_the_last_character() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "café".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.move_cursor(Motion::WordLeft);
+        let interior = crate::glyphs::bordered_interior(Rect::new(0, 0, 40, 10));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(3),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the typed query");
+
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2, interior.y),
+            "the caret must sit at the cursor, right after \"; \""
+        );
+        let row: String = (0..interior.width)
+            .map(|offset| {
+                terminal.backend().buffer()[(interior.x + offset, interior.y)]
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            row.starts_with("; café"),
+            "the text after the caret must still be painted: {row:?}"
+        );
+    }
+
+    /// A multi-byte character is one cell wide here, so a caret column counted in bytes
+    /// rather than in painted cells would drift right of where the next keystroke lands.
+    #[test]
+    fn the_caret_column_counts_painted_cells_rather_than_the_bytes_before_the_cursor() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "café".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.move_cursor(Motion::Left);
+        let interior = crate::glyphs::bordered_interior(Rect::new(0, 0, 40, 10));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                palette.draw(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    Run {
+                        actions: &actions,
+                        count: Count::selection(3),
+                        management_lines: &[],
+                    },
+                    &crate::glyphs::FULL,
+                )
+            })
+            .expect("draw the typed query");
+
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(interior.x + 2 + 3, interior.y),
+            "\"caf\" is three cells, however many bytes `é` costs after it"
+        );
+    }
+
+    #[test]
+    fn typing_after_moving_the_cursor_back_inserts_at_the_caret() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "ac".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.move_cursor(Motion::Left);
+        palette.type_char('b', &actions);
+        assert_eq!(palette.text(), "abc");
+    }
+
+    /// Backspace and `Ctrl+W` both cut back from the caret, leaving what follows it.
+    #[test]
+    fn backspace_and_ctrl_w_act_at_the_cursor_rather_than_at_the_end_of_the_query() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "one two".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.move_cursor(Motion::WordLeft);
+        palette.delete_previous_char(&actions);
+        assert_eq!(palette.text(), "onetwo");
+
+        palette.move_cursor(Motion::LineEnd);
+        palette.move_cursor(Motion::LineStart);
+        palette.delete_previous_word(&actions);
+        assert_eq!(
+            palette.text(),
+            "onetwo",
+            "`Ctrl+W` at the start of the line has nothing before the caret to cut"
         );
     }
 
