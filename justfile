@@ -20,6 +20,11 @@ test:
     # and without this second run their suites are written and then executed on nobody's
     # machine but the author's.
     cargo test -p repon-core --locked --features fetch
+    # `repon`'s own built-in `sync` action is eligible only on a build with the `fetch`
+    # feature (0031), so its own crate needs the identical second run: without this, the
+    # `Eligible` half of that decision is untested on anyone's machine but the author's,
+    # the same gap the run above closes for `repon-core`.
+    cargo test -p repon --locked --features fetch --bin repon
 
 # Format code with rustfmt
 fmt:
@@ -32,6 +37,11 @@ fmt-check:
 # Lint with clippy, warnings are errors
 lint:
     cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+    # The run above uses default features, so the `fetch` module is only ever compiled by
+    # `just test`'s own fetch pass, as a test target, where a field the production path
+    # ignores still reads as live. Without this, dead code behind the feature reaches a
+    # user's `cargo install --features fetch` as a warning CI never saw.
+    cargo clippy --workspace --all-targets --locked --no-deps --features fetch -- -D warnings
 
 # Fail on a broken intra-doc link or a malformed doc comment
 docs:

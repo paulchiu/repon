@@ -894,7 +894,14 @@ mod tests {
         );
         assert_eq!(
             names(&entries(&actions, Scope::Everything, "")),
-            vec!["reinstall", "deploy", "ignore", "unignore", "delete"],
+            vec![
+                "reinstall",
+                "deploy",
+                "ignore",
+                "unignore",
+                "delete",
+                "sync"
+            ],
             "an empty query lists everything, config-defined first and the built-ins after"
         );
         assert!(entries(&actions, Scope::Everything, "nothing-named-this").is_empty());
@@ -1410,10 +1417,10 @@ mod tests {
         palette.move_highlight(1, &actions);
         assert_eq!(palette.highlighted(&actions).unwrap().name(), "unignore");
 
-        palette.move_highlight(2, &actions);
+        palette.move_highlight(3, &actions);
         assert_eq!(
             palette.highlighted(&actions).unwrap().name(),
-            "delete",
+            "sync",
             "moving past the last entry must clamp, not wrap back to the first"
         );
     }
@@ -2312,7 +2319,7 @@ mod tests {
 
         let buf = draw_to_buffer(&palette, &[], &Theme::default(), Count::selection(0));
 
-        // Below the three built-ins rather than in place of them: the list is never empty
+        // Below the built-ins rather than in place of them: the list is never empty
         // any more, so the hint that names where an `[[action]]` is declared follows them.
         assert!(
             all_rows(&buf).contains(NO_ACTIONS_CONFIGURED_MESSAGE),

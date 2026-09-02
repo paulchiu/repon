@@ -7,8 +7,10 @@
 use std::{
     io::{Stdout, stdout},
     ops::{Deref, DerefMut},
+    os::fd::{AsRawFd, RawFd},
+    path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -87,9 +89,13 @@ impl Tui {
 
     /// Claims the five pieces of terminal state [keybindings.md](../../../docs/spec/keybindings.md#terminal-state)
     /// fixes: raw mode on, alternate screen on, bracketed paste on, mouse capture off
-    /// (explicit, against an inherited enabled state), focus reporting on.
+    /// (explicit, against an inherited enabled state), focus reporting on. Also diverts fd 2
+    /// to the log file ([`redirect_stderr_to_log`]) for as long as the screen is held: a
+    /// separate concern from the five, since it has no ANSI trace and nothing releases it,
+    /// only [`restore`] putting the real fd back.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
+        redirect_stderr_to_log()?;
         write_enter_sequence(&mut stdout())?;
         self.start();
         Ok(())
@@ -118,11 +124,12 @@ impl Tui {
     /// Hands the terminal to `command` and takes it back: the shared machinery a Launcher
     /// that takes the terminal and the ad hoc command field's `$EDITOR` handoff both stand on
     /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspends and execs in the
-    /// same one"). Restores the five pieces [`Tui::exit`] restores, runs `command` to
-    /// completion with the terminal's own stdio (the default, since this does not touch
-    /// `command`'s stdio handles), then claims them again with [`Tui::enter`] regardless of
-    /// whether the child could even be spawned, so a spawn failure still returns control to
-    /// Repon's own screen rather than stranding the shell.
+    /// same one"). Restores the five pieces [`Tui::exit`] restores, including fd 2's real
+    /// stderr (`exit`'s own redirect is what this crate holds while the screen is up, never
+    /// the child's), runs `command` to completion with the terminal's own stdio (the default,
+    /// since this does not touch `command`'s stdio handles), then claims them again with
+    /// [`Tui::enter`] regardless of whether the child could even be spawned, so a spawn
+    /// failure still returns control to Repon's own screen rather than stranding the shell.
     ///
     /// Panic-safe by construction rather than by a check here: [`crate::errors::init`]'s
     /// panic hook calls the free function [`restore`] unconditionally, which is safe to call
@@ -209,14 +216,98 @@ impl Drop for Tui {
 }
 
 /// Puts the terminal back the way it was found: the mirror image of [`Tui::enter`]'s
-/// five pieces. Safe to call more than once, and safe to call from a panic hook, which is
-/// why it takes nothing.
+/// five pieces, plus fd 2's real stderr. Safe to call more than once, and safe to call from a
+/// panic hook, which is why it takes nothing; `errors::init`'s hook calls this before its own
+/// `eprintln!`, so that report reaches the real terminal rather than the log file.
 pub fn restore() -> std::io::Result<()> {
     // Every step is attempted regardless of an earlier one's outcome. A failed write must
     // not skip disabling raw mode, which is the half the shell inherits.
     let left = write_restore_sequence(&mut stdout());
     let raw = crossterm::terminal::disable_raw_mode();
-    left.and(raw)
+    let stderr = restore_stderr();
+    left.and(raw).and(stderr)
+}
+
+/// The real fd 2, saved by [`redirect_stderr_to_log`] so [`restore_stderr`] can put it back.
+/// `None` while stderr is not redirected. A global rather than `Tui` field because [`restore`]
+/// is a free function the panic hook calls with no `Tui` in hand.
+static SAVED_STDERR: Mutex<Option<RawFd>> = Mutex::new(None);
+
+/// Diverts fd 2 to the log file for as long as the alternate screen is held, so a dependency
+/// thread that writes straight to `std::io::stderr()` (`gix-transport`'s ssh stderr
+/// supervisor is the motivating case, not one of Repon's own call sites) cannot paint over the
+/// frame: it lands in the log instead, kept rather than dropped. A no-op if already redirected,
+/// so a redundant `enter()` never overwrites the saved real fd with the log file's own.
+fn redirect_stderr_to_log() -> std::io::Result<()> {
+    let mut saved = SAVED_STDERR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if saved.is_some() {
+        return Ok(());
+    }
+    *saved = Some(redirect_fd_to_file(
+        libc::STDERR_FILENO,
+        &crate::logging::log_file_path(),
+    )?);
+    Ok(())
+}
+
+/// Puts fd 2 back to whatever [`redirect_stderr_to_log`] saved. Safe to call with nothing
+/// saved (a no-op), the same contract [`restore`] itself already has, since a panic before
+/// `Tui::enter` ever ran must not fail here.
+fn restore_stderr() -> std::io::Result<()> {
+    let mut saved = SAVED_STDERR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(original) = saved.take() else {
+        return Ok(());
+    };
+    restore_fd(libc::STDERR_FILENO, original)
+}
+
+/// Points `target` at `path` (creating the file and its parent directory, appending rather
+/// than truncating), returning a duplicate of what `target` pointed at before, for
+/// [`restore_fd`] to put back later. Generic over the fd number rather than hardcoded to fd 2
+/// so the mechanism itself is unit-testable against an fd this process actually owns, without
+/// touching the real stderr a test's own harness depends on.
+fn redirect_fd_to_file(target: RawFd, path: &Path) -> std::io::Result<RawFd> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // Safety: `target` is a valid, currently-open fd for the duration of this call.
+    let saved = unsafe { libc::dup(target) };
+    if saved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Safety: `file` stays open (and its fd valid) for the duration of this call; `target` is
+    // the same valid fd `dup` just read from above.
+    if unsafe { libc::dup2(file.as_raw_fd(), target) } < 0 {
+        let error = std::io::Error::last_os_error();
+        // Safety: `saved` was just returned by `dup` above and closed nowhere else yet.
+        unsafe { libc::close(saved) };
+        return Err(error);
+    }
+    Ok(saved)
+}
+
+/// Points `target` back at whatever `saved` (from [`redirect_fd_to_file`]) names, then closes
+/// `saved`: the duplicate's job is done once `target` holds its own reference to the same
+/// description again.
+fn restore_fd(target: RawFd, saved: RawFd) -> std::io::Result<()> {
+    // Safety: `target` and `saved` are both valid, currently-open fds for the duration of
+    // this call; `saved` is a duplicate this module made and nothing else has claimed.
+    let result = if unsafe { libc::dup2(saved, target) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // Safety: same fd `dup2` above just read from, closed exactly once here.
+    unsafe { libc::close(saved) };
+    result
 }
 
 /// Waits for the sooner of the next tick, the next frame, or a key, and posts it. Returns
@@ -325,10 +416,80 @@ fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
     use crate::test_support::rust_source_files;
+
+    /// [`redirect_fd_to_file`] and [`restore_fd`] against an fd this test owns outright,
+    /// rather than the real fd 2 a unit test's own harness depends on: opens a scratch file,
+    /// redirects its fd elsewhere, writes through the same `File` value on both sides of the
+    /// redirect (proving the divert operates on the fd number itself, not on any Rust-level
+    /// handle to it), then restores and writes again.
+    #[test]
+    fn redirecting_a_raw_fd_diverts_its_writes_until_restored() {
+        let scratch_dir = tempfile::tempdir().expect("create scratch tempdir");
+        let original_path = scratch_dir.path().join("original.txt");
+        let redirected_path = scratch_dir.path().join("redirected.txt");
+        let mut scratch = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&original_path)
+            .expect("open the scratch file this test redirects");
+        let target = scratch.as_raw_fd();
+
+        writeln!(scratch, "before redirect").expect("write before redirect");
+        let saved = redirect_fd_to_file(target, &redirected_path).expect("redirect the scratch fd");
+        writeln!(scratch, "during redirect").expect("write during redirect");
+        restore_fd(target, saved).expect("restore the scratch fd");
+        writeln!(scratch, "after restore").expect("write after restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&original_path).expect("read the original file"),
+            "before redirect\nafter restore\n",
+            "the fd's own file must see everything but what was written mid-redirect"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&redirected_path).expect("read the redirected file"),
+            "during redirect\n",
+            "the redirect target must see only what was written while it was pointed there"
+        );
+    }
+
+    /// [`redirect_stderr_to_log`]/[`restore_stderr`]'s own no-op contracts: redirecting twice
+    /// without restoring in between must not clobber the saved real fd with the log file's
+    /// own, and restoring with nothing saved must not error. Exercised against
+    /// [`SAVED_STDERR`] directly with a fabricated saved value, never against the real fd 2
+    /// this test process's own harness depends on.
+    #[test]
+    fn redirect_and_restore_stderr_are_no_ops_when_already_in_that_state() {
+        let mut saved = SAVED_STDERR.lock().expect("lock SAVED_STDERR");
+        assert!(
+            saved.is_none(),
+            "test order assumption: nothing else touched fd 2"
+        );
+        *saved = Some(99);
+        drop(saved);
+
+        // A second `enter()`-driven redirect while one is already outstanding must leave the
+        // fabricated saved value untouched rather than overwrite it with a real dup of fd 2.
+        redirect_stderr_to_log().expect("redirect_stderr_to_log is a no-op once already saved");
+        assert_eq!(
+            *SAVED_STDERR.lock().expect("lock SAVED_STDERR"),
+            Some(99),
+            "a redundant redirect must not overwrite what is already saved"
+        );
+
+        // Clears the fabricated value without ever calling libc on the bogus fd 99: restoring
+        // that would corrupt this process's real fd table for every test run after it.
+        *SAVED_STDERR.lock().expect("lock SAVED_STDERR") = None;
+
+        // With nothing saved, restoring must be a no-op rather than an error.
+        restore_stderr().expect("restore_stderr with nothing saved must be a no-op");
+    }
 
     /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
     /// an expectation here comes from crossterm's own encoding rather than a hand-copied
