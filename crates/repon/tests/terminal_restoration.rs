@@ -1273,3 +1273,109 @@ fn classify_pty_read_still_treats_a_non_eio_error_as_a_failure() {
         "a non-EIO error must still classify as a failure"
     );
 }
+
+/// This issue's own central claim: while the alternate screen is held, a write to fd 2 from
+/// any thread, including a dependency's own, must never reach the terminal, and the same
+/// bytes must be recoverable from the log file afterwards. `--write-raw-stderr-after-tui-enter`
+/// writes through `std::io::stderr()` from a spawned thread, the same path `gix-transport`'s
+/// ssh stderr supervisor takes, rather than through any call site of Repon's own, so this is
+/// exactly what a source scan over
+/// `no_warning_path_calls_println_or_eprintln_anywhere_in_this_crates_production_source`
+/// cannot express. `REPON_DATA` points the log at a private tempdir so this test owns the
+/// file it reads back rather than racing every other process's own log writes.
+#[test]
+fn a_write_to_stderr_from_any_thread_never_reaches_the_terminal_but_is_kept_in_the_log() {
+    const MARKER: &str = "STDERR_REDIRECT_MARKER";
+    let data_dir = tempfile::tempdir().expect("create tempdir for REPON_DATA");
+
+    let (status, output) = run_over_pty(
+        &["--write-raw-stderr-after-tui-enter"],
+        &[(
+            "REPON_DATA",
+            data_dir
+                .path()
+                .to_str()
+                .expect("tempdir path must be utf-8"),
+        )],
+    );
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    assert!(
+        output.contains(&enter_alt),
+        "expected the terminal actually claimed, or this test would prove nothing: {output:?}"
+    );
+    assert!(
+        !output.contains(MARKER),
+        "a write to fd 2 while the alternate screen is held must never reach the terminal, \
+         got: {output:?}"
+    );
+
+    let log_path = data_dir
+        .path()
+        .join(concat!(env!("CARGO_PKG_NAME"), ".log"));
+    let log_contents = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", log_path.display()));
+    assert!(
+        log_contents.contains(MARKER),
+        "expected the redirected write recoverable from the log file, got: {log_contents:?}"
+    );
+}
+
+/// The other half of this issue: a `takes_terminal` Launcher's child must be handed the real
+/// stderr, never the redirect meant for Repon's own dependency threads.
+/// `--launcher-marker-after-tui-enter` resolves the same `test` Launcher the stdout handoff
+/// test above uses; here its script writes to its own stderr instead, so this asserts on that
+/// stream specifically rather than on stdout, which `Tui::suspend_for_child` never redirects
+/// at all. `REPON_DATA` points the log at a private tempdir so this test can assert the
+/// marker never lands there either.
+#[test]
+fn a_launcher_handoffs_child_writes_to_the_real_stderr_not_the_redirected_one() {
+    const MARKER: &str = "LAUNCHER_STDERR_MARKER";
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    let data_dir = tempfile::tempdir().expect("create tempdir for REPON_DATA");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        format!(
+            "[[launcher]]\n\
+             name = \"test\"\n\
+             args = [\"sh\", \"-c\", \"printf {MARKER} >&2\"]\n"
+        ),
+    )
+    .expect("write a config.toml declaring the test launcher");
+
+    let (status, output) = run_over_pty(
+        &["--launcher-marker-after-tui-enter"],
+        &[
+            (
+                "REPON_CONFIG",
+                config_dir
+                    .path()
+                    .to_str()
+                    .expect("tempdir path must be utf-8"),
+            ),
+            (
+                "REPON_DATA",
+                data_dir
+                    .path()
+                    .to_str()
+                    .expect("tempdir path must be utf-8"),
+            ),
+        ],
+    );
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+    assert!(
+        output.contains(MARKER),
+        "expected the launcher child's stderr marker on the real terminal, got: {output:?}"
+    );
+
+    let log_path = data_dir
+        .path()
+        .join(concat!(env!("CARGO_PKG_NAME"), ".log"));
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log_contents.contains(MARKER),
+        "a takes_terminal Launcher's own stderr must never be captured by the redirect meant \
+         for this crate's own dependency threads, got: {log_contents:?}"
+    );
+}

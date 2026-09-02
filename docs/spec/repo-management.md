@@ -9,8 +9,9 @@ Management operations change what Repon operates on, or remove a Repo from the m
 | `ignore` | Writes `exclude = true` for the entity's path | A Repo or Worktree not already excluded |
 | `unignore` | Removes `exclude` for the entity's path | A Repo or Worktree currently excluded by a `[[repo]]` entry |
 | `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one | A Repo or Worktree |
+| `sync` | Fast-forwards the branch to its tracked upstream, reusing the periodic fetch's own auto-update rules | A Repo, on a build with the `fetch` cargo feature; whether it is behind, ahead, clean and tracking an upstream right now is read by attempting it, never a gate refusal |
 
-The three names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
+The four names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
 
 `ignore` writes `[[repo]] exclude = true`, never a Set `exclude` glob. `exclude = true` states a fact about one path that Repon knows exactly, and a glob states a class Repon would be guessing at; a glob also changes what exists for every Set sharing that root, where `exclude` leaves the row visible and only stops it being operated on ([config.md](config.md)). Hiding a row from view is the Filter's job ([filter.md](filter.md)), which is transient by design.
 
@@ -21,6 +22,18 @@ The three names are reserved. A config-defined `[[action]]` may not take one, an
 `delete` is refused on a Submodule: its git common dir is `<parent>/.git/modules/<name>` rather than its own, so removing the directory corrupts the parent, whose `.gitmodules` still names it.
 
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
+
+## What `sync` refuses, and why
+
+`sync` is refused on a Submodule: it tracks a pinned commit, not a branch, so there is nothing to fast-forward.
+
+`sync` is refused on a Worktree: the auto-update it reuses acts on a Repo's own branch, and `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly that reason. A Worktree sharing a common dir with a Repo is listed, never operated on, the same rule [config.md](config.md) already states for the periodic fetch's own common-dir filter, and this row says so rather than silently doing nothing.
+
+`sync` is refused on every row, whatever its Kind, on a build with no `fetch` cargo feature: the fast-forward mechanism it reuses does not exist to call on a build like that, the same "accepted and inert" fact [config.md](config.md)'s `fetch.enabled` warning already names for the periodic fetch. The reason names the same install command that warning does, `cargo install --git https://github.com/paulchiu/repon --locked --features fetch repon` ([releasing.md](releasing.md)), rather than inventing a second way to say it.
+
+A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
+
+What the auto-update's own five rules find not eligible right now, not clean, no upstream, not behind or not fast-forward, is a different fact from a refusal above, and is never one: eligibility there can change between the gate and the run, so it is read only by attempting the fast-forward, and every Repo `sync` is eligible for by Kind is attempted and reports its own outcome afterwards, the same "report ineligible cases rather than fix them" rule [config.md](config.md)'s auto-update already keeps.
 
 ## What `delete` does to a Worktree
 
@@ -93,8 +106,10 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | `delete` removed a Worktree cleanly and there was no entry | `Did` | worktree removed, no `[[repo]]` entry of its own |
 | `delete` fell back to a directory removal and an entry of its own | `Did` | directory removed, its parent Repo was unreadable, `[[repo]]` entry removed |
 | `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
+| `sync` fast-forwarded the branch | `Did` | fast-forwarded to its upstream |
 | `unignore` on a row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
-| the gate already refused it | `Refused` | refused, then the reason "What `delete` refuses" gives |
+| `sync` found the Repo not eligible right now | `Refused` | not eligible to sync, then the reason the auto-update's own five rules give |
+| the gate already refused it | `Refused` | refused, then the reason its own "What it refuses" section gives |
 | the tree would not remove, or the file would not write | `CouldNotAct` | failed, then what went wrong |
 
 The receipt does not replace the gate. A refusal is still named and counted before the gesture is accepted, which is where a user can still change their mind; the receipt is what says afterwards which row got which answer. The log line and the one-line Notice carrying the counts stay too, and the receipt's own words are the log line's own words, read from one place so the two cannot drift.

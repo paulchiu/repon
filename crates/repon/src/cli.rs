@@ -90,6 +90,15 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub unspawnable_launcher_after_tui_enter: bool,
 
+    /// Claims the terminal, then writes to fd 2 from a spawned thread through
+    /// `std::io::stderr()`, the same path a dependency's own thread takes rather than one of
+    /// this crate's call sites, then exits. Debug-only: exists so a test can observe that a
+    /// write to fd 2 from any thread cannot reach the terminal while the alternate screen is
+    /// held, rather than trusting a description of it, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub write_raw_stderr_after_tui_enter: bool,
+
     /// Resolves the config path, prints it, sets `REPON_CONFIG` to the given value, resolves
     /// again and prints that too, then exits, claiming no terminal at all. Debug-only: exists
     /// so a test can observe that a path resolved from a flag or the environment is fixed for
