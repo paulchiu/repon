@@ -148,7 +148,7 @@ Every value carries one of the five states from [0001](../adr/0001-per-cell-prov
 The detail pane always reports provenance per cell, which is the escape hatch from the gutter's row-level summary. It shows:
 
 - The entity's identity and path.
-- One line per value, with its provenance spelled out in words and its age, for example "fresh 9s ago".
+- One line per value, with its provenance spelled out in words and its age, for example "refreshed 9s ago", the reading's own age rather than a property of the value. A Refresh settles a row's Known cells together, so when they all agree this is printed once, as its own line, rather than once per cell; a cell whose age genuinely differs from its neighbours keeps its own.
 - Recent commits.
 - The labelled per-step output of the last Action, each step separately readable, surviving the run.
 
