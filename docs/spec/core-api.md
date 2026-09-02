@@ -182,7 +182,7 @@ impl Core {
     pub fn refresh_all(&self) -> Generation;
     pub fn probe_now(&self, key: &EntityKey) -> EntityState;
     pub fn snapshot(&self) -> Snapshot;
-    pub fn settle(&self, within: Duration) -> Snapshot;
+    pub fn try_settle(&self, within: Duration) -> Result<Snapshot, Snapshot>;
     pub fn dismiss(&self, key: &EntityKey);
     pub fn pause(&self);
     pub fn resume(&self);
@@ -197,14 +197,15 @@ They group into four concerns.
 | --- | --- | --- |
 | Lifecycle | `start`, `pause`, `resume`, `Drop` | Spawn the threads and Generation 1, stop them for a suspension, cancel what is in flight and join them at the end |
 | Refreshing | `refresh`, `refresh_all`, `probe_now`, `dismiss` | Start a Generation over an order the caller computed or over everything discovery finds, re-probe one entity synchronously, drop a Vanished row |
-| Reading | `snapshot`, `settle` | Clone the table now, or block until it settles |
+| Reading | `snapshot`, `try_settle` | Clone the table now, or block until it settles |
 | Counting | `count` | Match a `SetSpec` with no probing and no provenance |
 
 - `refresh` takes an already-ordered list of keys and attaches no meaning to an empty one. [refresh.md](refresh.md) dispatches phase C cursor row first, then the visible rows, then the rest in discovery order; the caller computes that order, which costs the core nothing because the order was already 'by position, not by predicted cost'.
 - `refresh_all` is the same Generation with its order resolved after that Generation's own discovery rather than by the caller. It exists for the Set switch, whose consumer has just discarded the old Set's rows and has no key to name; nothing is lost to it, because it has no cursor or viewport yet either. Launch and `repon status` need it no more, since `start`'s own walk is that `Core`'s Generation 1. Every other trigger has a cursor and a viewport, and takes `refresh`.
 - `probe_now` is the Launcher return: [refresh.md](refresh.md) requires the handed-off entity to be re-probed first and synchronously before a normal Generation starts.
 - `pause` and `resume` exist because all background work stops while the terminal interface is suspended. The core is not told why.
-- `settle` is the machine-readable consumer's whole loop: it blocks until nothing is in flight or the deadline passes, then returns.
+- `try_settle` is the machine-readable consumer's whole loop: it blocks until nothing is in flight or the deadline passes, then returns. The two outcomes are separate arms rather than one return value, because they are separate facts. `Ok` is a table that settled; `Err` is the wait giving up, carrying the same snapshot so a consumer that means to degrade still has something to degrade with. A single return value made an expiry indistinguishable from an answer, and a half-populated table read as a settled one is a wrong answer rather than a late one: it surfaces as a defect several steps downstream with nothing left naming the wait. `repon status` takes the `Err` arm deliberately, because the Generation deadline's own sweep has by then converted anything still outstanding to `Unknown::TimedOut`, which is what its exit code reads.
+- `settle` is the same wait with no deadline to pass and no expiry to handle: it waits on `liveness::BACKSTOP` and panics naming the wait if that expires. It is gated behind `test-util` and off a published build, because a wait a caller cannot bound is only ever honest inside a test, where every deadline it used to take was a number guessed against whichever machine its author had. A wait whose *number* is the claim ("nothing arrives within 200ms") is a different wait and takes `try_settle`.
 - `count` is a free function taking a `SetSpec` and returning a match count, with no probing and no provenance, because `repon sets` in [config.md](config.md) prints a count for every declared Set rather than for the active one. This is what makes `repon sets` a real second consumer rather than a special case.
 
 ## Generations and supersession
@@ -215,7 +216,7 @@ The check lives in the core and nowhere else. That is the whole reason the core 
 
 ## Threads and lifecycle
 
-`Core::start` rather than `Core::new`, because it spawns. It spawns the first discovery too, so it returns against an empty table and the terminal is claimed and a first frame drawn while the walk runs; that walk is Generation 1 and dispatches over what it found, and `settle` waits for it like it waits for any other Generation, so the machine-readable consumer is unaffected. Every Generation's own discovery runs on the same footing: `refresh` and `refresh_all` reserve the Generation number on the calling thread and run the walk and the fan-out on one of their own, so no keystroke and no focus event holds the render loop for the length of a walk. Reserving on the calling thread is what keeps the Generation numbers in gesture order; the bodies then queue on that order, so an older Generation can never insert its in-flight entries behind a newer one's and cancel them. Probes go on rayon's global pool, as the existing fan-out already does, one task per entity with gix's per-repository thread limit at 1, which [refresh.md](refresh.md) fixes and marks not configurable. The two second metadata poll and the thirty second Generation deadline share one dedicated thread, since a 1.79 millisecond sweep every two seconds does not earn a pool. `Drop` cancels whatever is in flight, then joins them.
+`Core::start` rather than `Core::new`, because it spawns. It spawns the first discovery too, so it returns against an empty table and the terminal is claimed and a first frame drawn while the walk runs; that walk is Generation 1 and dispatches over what it found, and `try_settle` waits for it like it waits for any other Generation, so the machine-readable consumer is unaffected. Every Generation's own discovery runs on the same footing: `refresh` and `refresh_all` reserve the Generation number on the calling thread and run the walk and the fan-out on one of their own, so no keystroke and no focus event holds the render loop for the length of a walk. Reserving on the calling thread is what keeps the Generation numbers in gesture order; the bodies then queue on that order, so an older Generation can never insert its in-flight entries behind a newer one's and cancel them. Probes go on rayon's global pool, as the existing fan-out already does, one task per entity with gix's per-repository thread limit at 1, which [refresh.md](refresh.md) fixes and marks not configurable. The two second metadata poll and the thirty second Generation deadline share one dedicated thread, since a 1.79 millisecond sweep every two seconds does not earn a pool. `Drop` cancels whatever is in flight, then joins them.
 
 `gix::Repository` is `Send` and `Clone` but not `Sync`, because it holds a `RefCell` free-list of buffers; `gix::ThreadSafeRepository` is `Send`, `Sync` and `Clone`. So one `Repository` per task, never shared across them.
 
@@ -272,7 +273,7 @@ The document carries a `schema` integer at its root, and the settled-state set a
 
 The version-bump discipline: bump `SCHEMA` whenever `Settled` or `Unknown` gains or loses a variant. `crates/repon-core/src/wire.rs`'s own test pins today's variant counts against an exhaustive match with no wildcard arm, so a variant added to either enum without being classified there fails to compile, and updating that classification is where the bump happens.
 
-The machine-readable consumer emits one settled document rather than a stream: `settle`, then serialise. `gh --json` buffers one array and `cargo --message-format=json` streams a line per completed unit, and streaming here would mean polling and diffing the snapshot, which is a second supersession implementation. The cost is stated plainly: a one-shot run waits out the full 4.4 second probe before printing anything, and a population an order of magnitude larger would want streaming and the diff machinery that comes with it.
+The machine-readable consumer emits one settled document rather than a stream: `try_settle`, then serialise. `gh --json` buffers one array and `cargo --message-format=json` streams a line per completed unit, and streaming here would mean polling and diffing the snapshot, which is a second supersession implementation. The cost is stated plainly: a one-shot run waits out the full 4.4 second probe before printing anything, and a population an order of magnitude larger would want streaming and the diff machinery that comes with it.
 
 Exit codes follow two measured precedents. Google's `repo status` and `vcstool status` both return zero for a dirty tree and reserve nonzero for a probe that failed. So nonzero means the tool could not get an answer, never that the news is bad.
 

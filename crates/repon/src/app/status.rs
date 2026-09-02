@@ -15,7 +15,7 @@ use repon_core::{Cell, Core, EntityState, Settled, SettledDocument, Snapshot, Un
 use super::reload::{self, ActiveSet};
 use crate::config::Config;
 
-/// Slack added to [`reload::GENERATION_DEADLINE`] for this path's own `settle` call, so it
+/// Slack added to [`reload::GENERATION_DEADLINE`] for this path's own `try_settle` call, so it
 /// always outlasts the dedicated thread's own sweep rather than racing it: without slack, a
 /// probe stuck right at the sweep's own deadline could still read outstanding here even
 /// though the sweep is about to convert it to `Unknown::TimedOut` on its own.
@@ -67,7 +67,13 @@ fn settle_document(
         &active_set,
         flag_no_fetch,
     ));
-    let snapshot = core.settle(reload::GENERATION_DEADLINE + SETTLE_DEADLINE_SLACK);
+    // Either arm prints: an expiry here is not itself the verdict, because the dedicated
+    // thread's own sweep has already converted anything still outstanding at that point to
+    // `Unknown::TimedOut`, which is what `any_probe_failed` reads and reports.
+    let snapshot = match core.try_settle(reload::GENERATION_DEADLINE + SETTLE_DEADLINE_SLACK) {
+        Ok(settled) => settled,
+        Err(unsettled) => unsettled,
+    };
 
     let any_failed = any_probe_failed(&snapshot);
     Ok((SettledDocument::new(snapshot), any_failed))
@@ -272,7 +278,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let snapshot = core.settle(Duration::from_secs(5));
+        let snapshot = core.settle();
 
         assert_eq!(snapshot.entities.len(), 1, "expected exactly the one repo");
         let entity = &snapshot.entities[0];
@@ -345,7 +351,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let snapshot = core.settle(Duration::from_secs(5));
+        let snapshot = core.settle();
 
         assert!(
             any_probe_failed(&snapshot),

@@ -9,13 +9,16 @@
 //! First, the number is a backstop, not a budget. [`BACKSTOP`] is sized for "genuinely
 //! stuck", never for "how long should this take": every wait in this workspace completes in
 //! milliseconds on a healthy machine and never approaches it, so a generous value costs a
-//! passing run nothing and only pays out when something is really wedged. There is no knob
-//! to raise it: a machine on which a millisecond-scale wait needs more than thirty seconds
-//! is broken rather than slow, and a knob nothing sets is a remedy nobody has tried.
+//! passing run nothing and only pays out when something is really wedged. It is sized for
+//! the most contended machine this suite runs on rather than for the machine it was written
+//! on, because those are the two candidates and only one of them defeats a wait that is
+//! working. There is still no knob: a per-call-site number is a number guessed against
+//! whichever machine its author had.
 //!
 //! Second, expiry is reported where it happens. [`wait_for`] panics naming the property
 //! that never held, so a wait that gives up cannot be mistaken for the assertion three
-//! steps downstream of it.
+//! steps downstream of it. [`expired`] is that report, shared with `Core::settle` so the
+//! two waits a test can make read the same when they give up.
 //!
 //! ## A fixture that has to outlive the wait watching it
 //!
@@ -42,14 +45,14 @@
 //!   five seconds. The short `recv_timeout` calls that poll for the next chunk of pty
 //!   output are intervals, not deadlines, and are left alone.
 //! - **`Core::settle` awaiting a Generation the caller already dispatched** (most of its
-//!   call sites, 82 of them): at risk, and not fixed here. `Core::settle` (`core.rs:826`)
-//!   discards the `WaitTimeoutResult` its own `wait_timeout_while` returns, so an expiry is
-//!   indistinguishable from a settle and comes back as an unsettled snapshot the caller
-//!   then reports as a wrong value several steps downstream, with nothing naming the wait.
-//!   That is this ticket's defect exactly, at forty-four call sites bounded at 500ms.
-//!   Routing them through this module is not enough on its own: the fix is a `settle` that
-//!   says whether it settled, which is a change to a published `Core` method rather than to
-//!   a test helper, so it is recorded here and left for its own ticket.
+//!   call sites): was at risk, and is the one entry here that has since been fixed. It
+//!   discarded the `WaitTimeoutResult` its own `wait_timeout_while` returned, so an expiry
+//!   was indistinguishable from a settle and came back as an unsettled snapshot the caller
+//!   reported as a wrong value several steps downstream, with nothing naming the wait.
+//!   `Core::settle` now takes no deadline at all: it waits on [`BACKSTOP`] and panics
+//!   through [`expired`], so there is no number left at a call site to guess and no expiry
+//!   left to mistake for an answer. `Core::try_settle` is where a deadline that is itself
+//!   the claim goes, and it hands back an expiry rather than panicking on one.
 //! - **`Core::settle` awaiting an Action's completion Generation**: at risk, and *not* on
 //!   the deadline. `run_action`'s completion clears `action_running` before it dispatches
 //!   that Generation, so a settle called in the window between the two finds the gate at
@@ -57,11 +60,13 @@
 //!   race rather than removing it; the caller has to wait on what it actually needs, which
 //!   is what `run_failing_action_on` in `app.rs` now does.
 //! - **Deliberately short settles proving a negative** (`app.rs`'s 200ms focus gate,
-//!   `core.rs`'s 50ms empty-order settle, and the 500ms pair either side of a Launcher
-//!   handoff): not raised here, on purpose. Their number is the claim, not a backstop,
-//!   so raising it would delete the thing they check. They are still weakened by load, in
-//!   that a probe too slow to land inside the window makes them pass without discriminating;
-//!   that is a different defect from this ticket's and is left recorded, not fixed.
+//!   `core.rs`'s 50ms empty-order settle, and the 500ms bound on a Launcher handoff
+//!   returning promptly): not raised, on purpose. Their number is the claim, not a
+//!   backstop, so raising it would delete the thing they check. Each goes through
+//!   `Core::try_settle` and says out loud what it makes of an expiry, since for them an
+//!   expiry is a reading rather than a failure. They are still weakened by load, in that a
+//!   probe too slow to land inside the window makes them pass without discriminating; that
+//!   is a different defect and is left recorded, not fixed.
 //! - **Fixed sleeps standing in for a bound** (`app.rs`'s 100ms "nothing ran", `core.rs`'s
 //!   1.8s held-step check, `executor.rs`'s 600ms slow-drain): safety claims, not liveness
 //!   ones, and no deadline can prove them. Load makes them weaker, never flakier.
@@ -78,20 +83,24 @@ use std::time::{Duration, Instant};
 
 /// The deadline every wait a test makes goes through.
 ///
-/// Thirty seconds because nothing here benefits from failing fast: a correct run reaches
-/// its condition in milliseconds, and the only event this number decides is how long a
-/// wedged suite runs before it reports.
+/// Two minutes because nothing here benefits from failing fast: a correct run reaches its
+/// condition in milliseconds, and the only event this number decides is how long a wedged
+/// suite runs before it reports. Thirty seconds stood here first and was defeated nine
+/// times in one day by CI runners executing the whole workspace's tests across every core
+/// they have, which is a slow machine rather than a wedged one. Raising it costs a healthy
+/// run nothing, because [`wait_for`] returns on its next poll whatever the ceiling is.
 #[cfg(any(test, feature = "test-util"))]
-pub const BACKSTOP: Duration = Duration::from_secs(30);
+pub const BACKSTOP: Duration = Duration::from_secs(120);
 
 /// How long a test's fixture sleeps when the point of it is to still be running once
 /// [`BACKSTOP`] expires.
 ///
 /// Ten times the backstop, so the margin is a factor rather than a coincidence: a fixture
 /// that ended on its own before the wait watching it gave up would make its test pass
-/// without discriminating anything.
+/// without discriminating anything. The cost of the factor is paid only by a run that
+/// already failed, which leaves such a fixture sleeping out the rest of this length.
 #[cfg(any(test, feature = "test-util"))]
-pub const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
+pub const FIXTURE_LIFETIME: Duration = Duration::from_secs(1200);
 
 // The relationship the two constants above only mean anything together, checked where it
 // cannot be forgotten rather than left to a reader comparing two literals.
@@ -141,16 +150,25 @@ fn wait_within(
             return;
         }
         if start.elapsed() >= deadline {
-            let context = on_timeout();
-            panic!(
-                "gave up after {deadline:?} waiting for {property}{}{context}\nA wait that \
-                 expires is never evidence about the property itself; this one is sized for \
-                 a wedged process, not for a slow one.",
-                if context.is_empty() { "" } else { ": " }
-            );
+            expired(deadline, property, &on_timeout());
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The panic an expired wait reports, wherever the wait itself lives.
+///
+/// Shared with `Core::settle`, which blocks on a Condvar rather than polling and so cannot
+/// go through [`wait_within`]: the two are one wait as far as a reader of a failing run is
+/// concerned, and a second wording would make them read as two unrelated defects. `context`
+/// is whatever the wait can add about the state it gave up in, or empty.
+pub(crate) fn expired(deadline: Duration, property: &str, context: &str) -> ! {
+    panic!(
+        "gave up after {deadline:?} waiting for {property}{}{context}\nA wait that expires \
+         is never evidence about the property itself; this one is sized for a wedged \
+         process, not for a slow one.",
+        if context.is_empty() { "" } else { ": " }
+    );
 }
 
 #[cfg(test)]
@@ -159,6 +177,10 @@ mod tests {
 
     use super::*;
 
+    /// The claim that lets [`BACKSTOP`] be sized for the worst machine rather than the
+    /// best: the ceiling costs a healthy wait nothing, because the condition is read before
+    /// the clock ever is. Run through `wait_for` against the real backstop, so raising that
+    /// number can never change the poll count asserted here.
     #[test]
     fn wait_for_returns_as_soon_as_the_condition_holds() {
         let polls = AtomicUsize::new(0);

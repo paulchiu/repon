@@ -54,6 +54,8 @@ use crate::executor;
 use crate::filter::{Applicability, Filter, Partition};
 use crate::git;
 use crate::landing;
+#[cfg(any(test, feature = "test-util"))]
+use crate::liveness;
 use crate::patch_equivalence;
 use crate::poll;
 use crate::snapshot::Snapshot;
@@ -402,7 +404,7 @@ enum ClockControl {
 ///
 /// Construction is `start`, never a plain constructor, because it spawns; `Drop`
 /// joins every thread it spawned. The public entry points are exactly `start`,
-/// `refresh`, `probe_now`, `snapshot`, `settle`, `dismiss`, `pause`, `resume`,
+/// `refresh`, `probe_now`, `snapshot`, `try_settle`, `dismiss`, `pause`, `resume`,
 /// `discovery_warning` and `run_action` (see its own doc comment).
 pub struct Core {
     table: Arc<RwLock<Table>>,
@@ -602,7 +604,7 @@ impl Core {
     /// walk (refresh.md's "The first frame"). That walk is refresh.md's "Startup"
     /// Generation as well, dispatched over what it found, so a consumer probes its rows
     /// by starting a `Core` and never by asking for a second walk of the same tree.
-    /// [`Self::settle`] waits for it the way it waits for any other Generation.
+    /// [`Self::try_settle`] waits for it the way it waits for any other Generation.
     pub fn start(spec: CoreSpec) -> Core {
         Self::start_watched(spec).core
     }
@@ -997,15 +999,66 @@ impl Core {
         }
     }
 
-    /// Blocks until nothing is in flight or `within` elapses, then returns a
-    /// snapshot. The machine-readable consumer's whole loop.
-    pub fn settle(&self, within: Duration) -> Snapshot {
+    /// Blocks until nothing is in flight or `within` elapses, then returns a snapshot.
+    /// The machine-readable consumer's whole loop.
+    ///
+    /// `Ok` is a table that actually settled. `Err` is the wait giving up, carrying the
+    /// snapshot as it stood at that moment so a caller that means to degrade still has
+    /// something to degrade with. The two are separate arms rather than one return value
+    /// because they are separate facts: a half-populated table read as a settled one is a
+    /// wrong answer, not a late one, and it reads as a defect several steps downstream with
+    /// nothing left naming the wait.
+    pub fn try_settle(&self, within: Duration) -> Result<Snapshot, Snapshot> {
         let (lock, cvar) = &*self.settle_gate;
         let guard = lock.lock().unwrap();
-        let _ = cvar
+        let (guard, timeout) = cvar
             .wait_timeout_while(guard, within, |counts| !counts.is_settled())
             .unwrap();
-        self.snapshot()
+        // Released before the snapshot below, which takes the table lock: holding both at
+        // once is a lock order nothing else in this file takes.
+        drop(guard);
+        let snapshot = self.snapshot();
+        if timeout.timed_out() {
+            Err(snapshot)
+        } else {
+            Ok(snapshot)
+        }
+    }
+
+    /// Blocks until nothing is in flight, panicking once [`liveness::BACKSTOP`] expires.
+    /// For a test.
+    ///
+    /// Takes no deadline, unlike [`Self::try_settle`], because every deadline this ever
+    /// took was a number guessed against the machine its author had: the wait is on a
+    /// liveness property ("the Generation I just dispatched lands"), which carries no
+    /// wall-clock bound of its own, so the only honest bound is the shared backstop.
+    /// A wait whose *number* is the claim ("nothing arrives within 200ms") is a different
+    /// wait and belongs on [`Self::try_settle`], which reports an expiry rather than
+    /// panicking on one.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn settle(&self) -> Snapshot {
+        self.settle_within(liveness::BACKSTOP)
+    }
+
+    /// [`Self::settle`] against an explicit deadline, so this crate's own tests can
+    /// exercise the expiry path without waiting out a real backstop. The same seam
+    /// `liveness::wait_within` gives its module.
+    #[cfg(any(test, feature = "test-util"))]
+    fn settle_within(&self, deadline: Duration) -> Snapshot {
+        self.try_settle(deadline).unwrap_or_else(|_| {
+            // Read out and released before the panic below: unwinding out of a held guard
+            // poisons the gate, and every later `lock().unwrap()` on it, `Drop`'s included,
+            // then panics on the way out and turns a named report into an abort.
+            let (probes, dispatches) = {
+                let counts = self.settle_gate.0.lock().unwrap();
+                (counts.probes, counts.dispatches)
+            };
+            liveness::expired(
+                deadline,
+                "everything this Core has in flight to land",
+                &format!("{probes} probe(s) and {dispatches} dispatch(es) still outstanding"),
+            )
+        })
     }
 
     /// What deleting `key`'s working tree destroys, read fresh right now
@@ -1215,7 +1268,7 @@ impl Core {
 
     /// `true` while any refresh-shaped dispatch this `Core` started still owes the table
     /// work: a Generation reserved and not yet raised the probes it dispatches, or probes
-    /// raised and not yet landed, cancelled or timed out. The same gate [`Core::settle`]
+    /// raised and not yet landed, cancelled or timed out. The same gate [`Core::try_settle`]
     /// blocks on, read here without blocking, so a consumer can report a Refresh's own
     /// progress on screen while it runs rather than waiting for it to finish
     /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)).
@@ -3516,11 +3569,11 @@ fn begin_probes(entity: &mut EntityState) {
     }
 }
 
-/// What [`Core::settle`] waits on, and the one lock every count it waits on lives
+/// What [`Core::try_settle`] waits on, and the one lock every count it waits on lives
 /// under, so a settle can never observe one of them without the other.
 type SettleGate = (Mutex<SettleCounts>, Condvar);
 
-/// The two outstanding counts [`Core::settle`] blocks on.
+/// The two outstanding counts [`Core::try_settle`] blocks on.
 ///
 /// `dispatches` exists because a Generation reserves its number on the calling
 /// thread and does everything else on one of its own: between those two moments
@@ -4740,7 +4793,7 @@ mod tests {
     /// finished with. [`BACKSTOP`] rather than a budget, and the gate is read afterwards so
     /// an expired wait fails here by name instead of downstream as a wrong value.
     fn settle_launch(core: &Core) -> Snapshot {
-        let launched = core.settle(BACKSTOP);
+        let launched = core.settle();
         assert_eq!(
             core.settle_gate_count_for_test(),
             0,
@@ -4871,7 +4924,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let entity = &settled.entities[0];
         match entity.branch.settled() {
@@ -4953,7 +5006,7 @@ mod tests {
         assert_eq!(keys.len(), ENTITY_COUNT, "expected every repo discovered");
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
 
         for entity in &settled.entities {
             assert!(
@@ -5303,7 +5356,7 @@ mod tests {
         );
 
         core.refresh(&three_tier_order);
-        core.settle(Duration::from_secs(5));
+        core.settle();
 
         assert_eq!(
             core.dispatch_log_for_test(),
@@ -5331,7 +5384,7 @@ mod tests {
             .expect("discovery should have cached a handle");
 
         core.refresh(std::slice::from_ref(&key));
-        core.settle(Duration::from_millis(500));
+        core.settle();
 
         let after = core
             .cached_repo_handle_for_test(&key)
@@ -5354,7 +5407,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("repo"));
 
         let core = Core::start_discovered(spec(vec![root]));
-        core.settle(Duration::from_secs(5));
+        core.settle();
         assert!(
             !core.refresh_running(),
             "sanity: nothing outstanding once startup has settled"
@@ -5373,7 +5426,7 @@ mod tests {
              returns, so this must already read true"
         );
 
-        core.settle(Duration::from_secs(5));
+        core.settle();
         assert!(
             !core.refresh_running(),
             "settle blocks until nothing is outstanding, so this must read false once it \
@@ -5434,7 +5487,87 @@ mod tests {
             Vec::new(),
             "an empty order must dispatch no probe"
         );
-        let settled = core.settle(Duration::from_millis(50));
+        // The number is the claim here, not a backstop: an order naming nobody raises no
+        // probe, so the gate is already at zero and this must come back settled at once
+        // rather than eventually.
+        let settled = core
+            .try_settle(Duration::from_millis(50))
+            .expect("an empty order raises no probe, so the settle gate is already at zero");
+        assert!(!settled.entities[0].branch.is_in_flight());
+    }
+
+    /// One entity left owing a probe that nothing will ever complete: no tick is sent, so
+    /// the deadline sweep that would otherwise time the cell out never runs, and the settle
+    /// gate stays above zero for as long as anyone waits on it.
+    ///
+    /// Returns the live `Core` and the tick sender, which the caller must hold: dropping it
+    /// stops the dedicated thread's own select arm, and a `Core` whose thread has gone is a
+    /// different fixture from the one these waits mean to test.
+    fn one_probe_owed_that_never_lands(
+        dir: &tempfile::TempDir,
+    ) -> (Core, crossbeam_channel::Sender<Instant>) {
+        let root = root_of(dir);
+        init_repo_with_a_commit(&root.join("repo"));
+        let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+        let core = Core::start_for_test(spec(vec![root]), Duration::from_secs(3600), tick_rx)
+            .discovered()
+            .core;
+        let key = settle_launch(&core).entities[0].key.clone();
+        core.begin_untracked_probe_for_test(&key);
+        (core, tick_tx)
+    }
+
+    /// The defect this pair exists for: a settle that gives up used to be indistinguishable
+    /// from one that succeeded, so the table it handed back was read as an answer and the
+    /// run failed several steps downstream with nothing left naming the wait.
+    ///
+    /// [`Core::settle`]'s half is to report at the wait, the way `liveness::wait_for` does.
+    /// Driven through `settle_within` rather than `settle` so the expiry path is exercised
+    /// without waiting out a real backstop.
+    #[test]
+    #[should_panic(expected = "waiting for everything this Core has in flight to land")]
+    fn a_settle_that_expires_reports_at_the_wait_rather_than_returning_the_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (core, _tick_tx) = one_probe_owed_that_never_lands(&dir);
+
+        core.settle_within(Duration::from_millis(20));
+    }
+
+    /// [`Core::try_settle`]'s half of the same claim, for the callers that mean to degrade
+    /// rather than fail: the expiry comes back as `Err`, so the unsettled table can only be
+    /// reached by a caller that has already acknowledged the wait gave up.
+    #[test]
+    fn try_settle_hands_an_expiry_back_as_an_error_carrying_the_table_it_gave_up_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (core, _tick_tx) = one_probe_owed_that_never_lands(&dir);
+
+        let unsettled = core
+            .try_settle(Duration::from_millis(20))
+            .expect_err("a probe nothing will ever complete cannot settle");
+
+        assert!(
+            unsettled.entities[0].branch.is_in_flight(),
+            "the Err arm must still carry the table as it stood, so a caller that degrades \
+             deliberately has something to degrade with"
+        );
+    }
+
+    /// The other arm, so the two are told apart by what actually happened rather than by
+    /// `Err` being the only reachable answer.
+    #[test]
+    fn try_settle_hands_a_generation_that_really_landed_back_as_ok() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        init_repo_with_a_commit(&root.join("repo"));
+
+        let (core, launched) = started_and_settled(spec(vec![root]));
+        let key = launched.entities[0].key.clone();
+        core.refresh(std::slice::from_ref(&key));
+
+        let settled = core
+            .try_settle(BACKSTOP)
+            .expect("a dispatched Generation must land inside the backstop");
+
         assert!(!settled.entities[0].branch.is_in_flight());
     }
 
@@ -5522,7 +5655,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
 
         assert!(
             matches!(
@@ -5931,7 +6064,7 @@ mod tests {
             },
         );
         assert_eq!(
-            core.settle(Duration::from_secs(5)).generation,
+            core.settle().generation,
             before.generation.successor(),
             "completion must start exactly one Generation: not zero (no refresh at all) and \
              not two (a double refresh)"
@@ -6693,7 +6826,7 @@ mod tests {
         let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
-        let before = core.settle(Duration::from_millis(500));
+        let before = core.settle();
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
@@ -6706,7 +6839,7 @@ mod tests {
         fs::remove_dir_all(&repo).expect("remove the repo from disk");
 
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         assert_eq!(
             after.entities.len(),
@@ -6745,7 +6878,7 @@ mod tests {
 
         fs::remove_dir_all(&repo).expect("remove the repo from disk");
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         let entity = &after.entities[0];
         assert_eq!(entity.presence, crate::entity::Presence::Vanished);
@@ -6839,7 +6972,7 @@ mod tests {
             .key
             .clone();
         core.refresh(std::slice::from_ref(&submodule_key));
-        let before = core.settle(Duration::from_millis(500));
+        let before = core.settle();
         let submodule_before = before
             .entities
             .iter()
@@ -6862,7 +6995,7 @@ mod tests {
         fs::write(parent.join(".gitmodules"), "").expect("clear .gitmodules");
 
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         let submodule_after = after
             .entities
@@ -6918,7 +7051,7 @@ mod tests {
         let core = Core::start_discovered(spec(vec![root.clone()]));
         let original_key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&original_key));
-        let before = core.settle(Duration::from_millis(500));
+        let before = core.settle();
         let branch_name = match before.entities[0].branch.settled() {
             Some(Settled::Known {
                 value: Head::Branch { name, .. },
@@ -6932,7 +7065,7 @@ mod tests {
         fs::rename(&original_path, &moved_path).expect("move the repo on disk");
 
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         assert_eq!(
             after.entities.len(),
@@ -6970,7 +7103,7 @@ mod tests {
 
         fs::remove_dir_all(&repo).expect("remove the repo from disk");
         core.refresh(&[]);
-        let vanished = core.settle(Duration::from_millis(500));
+        let vanished = core.settle();
         assert_eq!(
             vanished.entities[0].presence,
             crate::entity::Presence::Vanished,
@@ -6979,7 +7112,7 @@ mod tests {
 
         init_repo_with_a_commit(&repo);
         core.refresh(&[]);
-        let recreated = core.settle(Duration::from_millis(500));
+        let recreated = core.settle();
 
         let entity = recreated
             .entities
@@ -7009,7 +7142,7 @@ mod tests {
 
         init_repo_with_a_commit(&root.join("second"));
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         assert_eq!(
             after.entities.len(),
@@ -7027,7 +7160,7 @@ mod tests {
             .key
             .clone();
         core.refresh(std::slice::from_ref(&new_key));
-        let probed = core.settle(Duration::from_millis(500));
+        let probed = core.settle();
         let new_entity = probed
             .entities
             .iter()
@@ -7092,7 +7225,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("second"));
 
         core.refresh(&[]);
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         assert!(
             !after
@@ -7188,7 +7321,7 @@ mod tests {
         )
         .discovered();
         started.core.refresh(&[]);
-        started.core.settle(Duration::from_millis(500));
+        started.core.settle();
         assert!(
             started.core.discovery_manual_for_test(),
             "the zero-length abandon deadline must have already taken this Core manual"
@@ -7203,7 +7336,7 @@ mod tests {
 
         init_repo_with_a_commit(&fresh_root.join("second"));
         fresh_core.refresh(&[]);
-        let after = fresh_core.settle(Duration::from_millis(500));
+        let after = fresh_core.settle();
 
         assert_eq!(
             after.entities.len(),
@@ -7276,7 +7409,7 @@ mod tests {
         assert!(before.entities[0].branch.is_in_flight());
 
         tick_tx.send(Instant::now()).expect("send one tick");
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         assert!(matches!(
             after.entities[0].branch.settled(),
@@ -7365,7 +7498,7 @@ mod tests {
             .clone();
 
         core.refresh(&[key_a.clone(), key_b.clone()]);
-        let landed = core.settle(Duration::from_secs(2));
+        let landed = core.settle();
         let entity_of = |snapshot: &Snapshot, key: &EntityKey| {
             snapshot
                 .entities
@@ -7587,7 +7720,7 @@ mod tests {
         let core = Core::start_discovered(short_lived);
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
-        core.settle(Duration::from_secs(2));
+        core.settle();
 
         let aged = core.snapshot();
         match aged.entities[0].dirty.settled() {
@@ -7616,7 +7749,7 @@ mod tests {
         let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
-        core.settle(Duration::from_secs(2));
+        core.settle();
 
         let fresh = core.snapshot();
         match fresh.entities[0].dirty.settled() {
@@ -7720,7 +7853,7 @@ mod tests {
         assert!(!cancel.load(Ordering::Acquire));
 
         core.pause();
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         assert!(
             cancel.load(Ordering::Acquire),
@@ -7878,7 +8011,7 @@ mod tests {
         // [`BACKSTOP`] rather than a budget: what follows reads the cell the new
         // Generation's own probe writes, which is a liveness property with no wall-clock
         // bound of its own.
-        let after_refresh = core.settle(BACKSTOP);
+        let after_refresh = core.settle();
 
         let a_after_gen2 = after_refresh
             .entities
@@ -8041,7 +8174,7 @@ mod tests {
         );
 
         tick_tx.send(Instant::now()).expect("send one tick");
-        let after_sweep = core.settle(Duration::from_millis(500));
+        let after_sweep = core.settle();
 
         let a_after = after_sweep
             .entities
@@ -8132,7 +8265,7 @@ mod tests {
         core.begin_untracked_probe_for_test(&worktree_key);
 
         tick_tx.send(Instant::now()).expect("send one tick");
-        let after_sweep = core.settle(Duration::from_millis(500));
+        let after_sweep = core.settle();
 
         let worktree_after = after_sweep
             .entities
@@ -8198,7 +8331,7 @@ mod tests {
         // sweep this tick triggers has a real Cell to time out on this very entity.
         core.begin_untracked_probe_for_test(&key);
         tick_tx.send(Instant::now()).expect("send one tick");
-        let after = core.settle(Duration::from_millis(500));
+        let after = core.settle();
 
         let entity = after
             .entities
@@ -8472,7 +8605,7 @@ mod tests {
             .collect();
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let worktree_entity = settled
             .entities
@@ -8566,7 +8699,7 @@ mod tests {
             .collect();
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let worktree_entity = settled
             .entities
@@ -8631,7 +8764,7 @@ mod tests {
             .collect();
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let worktree_entity = settled
             .entities
@@ -8726,7 +8859,7 @@ mod tests {
 
         let before = loose_object_count(&parent);
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let after = loose_object_count(&parent);
 
         let worktree_entity = settled
@@ -8820,7 +8953,7 @@ mod tests {
             .collect();
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let worktree_entity = settled
             .entities
@@ -8922,7 +9055,7 @@ mod tests {
             .clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
         let submodule_entity = settled
             .entities
             .iter()
@@ -9016,7 +9149,7 @@ mod tests {
             .clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
         let submodule = settled
             .entities
             .iter()
@@ -9085,7 +9218,7 @@ mod tests {
 
         // First Generation, dispatched while hidden: `dispatch` must skip it outright.
         core.refresh(std::slice::from_ref(&key));
-        let while_hidden = core.settle(Duration::from_secs(5));
+        let while_hidden = core.settle();
         let hidden_entity = while_hidden
             .entities
             .iter()
@@ -9103,7 +9236,7 @@ mod tests {
         // key, since nothing about the key or the `Core` itself changed in between.
         core.set_show_submodules(true);
         core.refresh(std::slice::from_ref(&key));
-        let while_shown = core.settle(Duration::from_secs(5));
+        let while_shown = core.settle();
         let shown_entity = while_shown
             .entities
             .iter()
@@ -9191,7 +9324,7 @@ mod tests {
         // Generation's own dispatch is what proves the mark survives real probing, not
         // merely discovery's own construction-time diagnostics write.
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
         let parent_entity = settled
             .entities
             .iter()
@@ -9404,7 +9537,7 @@ mod tests {
             "`refresh_all` must be the Generation immediately after the one already on the \
              table"
         );
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
 
         let mut named: Vec<String> = settled
             .entities
@@ -9484,7 +9617,7 @@ mod tests {
         );
 
         core.wait_dispatched_for_test();
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
 
         assert!(
             settled
@@ -9852,7 +9985,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         match entity.default_branch.settled() {
@@ -9923,7 +10056,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
@@ -9962,7 +10095,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
@@ -9996,7 +10129,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         assert_eq!(entity.diagnostics.default_branch_rung, Some(4));
@@ -10019,7 +10152,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         assert!(matches!(
@@ -10068,7 +10201,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         match entity.default_branch.settled() {
@@ -10122,7 +10255,7 @@ mod tests {
         let key = core.snapshot().entities[0].key.clone();
 
         core.refresh(std::slice::from_ref(&key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
         let entity = &settled.entities[0];
 
         assert!(!entity.diagnostics.default_branch_rung_two_stale);
@@ -10335,7 +10468,7 @@ mod tests {
         );
 
         core.refresh(&keys);
-        core.settle(Duration::from_millis(500));
+        core.settle();
 
         assert_eq!(
             core.default_branch_chain_reads_for_test(),
@@ -10348,7 +10481,7 @@ mod tests {
         // `Core` would answer this refresh for free and read 0, which is the
         // persistence ADR 0006 refuses.
         core.refresh(&keys);
-        core.settle(Duration::from_millis(500));
+        core.settle();
         assert_eq!(
             core.default_branch_chain_reads_for_test(),
             2,
@@ -10490,7 +10623,7 @@ mod tests {
         );
 
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let worktree_states: Vec<_> = settled
             .entities
@@ -10524,7 +10657,7 @@ mod tests {
         // A second Generation pays for the same two scans again: a cache hoisted
         // onto `Core` would answer this refresh for free and read 0.
         core.refresh(&keys);
-        core.settle(Duration::from_millis(500));
+        core.settle();
         assert_eq!(
             core.patch_identity_reads_for_test(),
             2,
@@ -10671,7 +10804,7 @@ mod tests {
         let order = vec![parent_key, shallow_key.clone(), deep_key.clone()];
 
         core.refresh(&order);
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let state_of = |key: &EntityKey| {
             settled
@@ -10940,7 +11073,7 @@ mod tests {
             .clone();
 
         core.refresh(std::slice::from_ref(&worktree_key));
-        let settled = core.settle(Duration::from_millis(500));
+        let settled = core.settle();
 
         let state = settled
             .entities
@@ -11017,7 +11150,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_millis(500))
+        core.settle()
     }
 
     fn sync_of<'a>(
@@ -11892,7 +12025,7 @@ mod tests {
         fn discover_repo(root: &Path) -> (Core, EntityKey) {
             let core = Core::start_discovered(spec(vec![root.to_path_buf()]));
             let key = core
-                .settle(Duration::from_secs(10))
+                .settle()
                 .entities
                 .into_iter()
                 .find(|entity| entity.kind == Kind::Repo)
@@ -12081,7 +12214,7 @@ mod tests {
             let key = core.snapshot().entities[0].key.clone();
 
             core.refresh(std::slice::from_ref(&key));
-            let settled = core.settle(Duration::from_millis(500));
+            let settled = core.settle();
             assert_eq!(
                 default_branch_name(&settled.entities[0]),
                 Some("origin/main".to_string()),
@@ -12090,7 +12223,7 @@ mod tests {
             );
 
             core.rederive_default_branches(std::slice::from_ref(&key));
-            let settled = core.settle(Duration::from_millis(2000));
+            let settled = core.settle();
             assert_eq!(
                 default_branch_name(&settled.entities[0]),
                 Some("origin/trunk".to_string()),
@@ -12141,7 +12274,7 @@ mod tests {
                 .clone();
 
             core.refresh(&[selected_key.clone(), outside_key.clone()]);
-            let settled = core.settle(Duration::from_millis(500));
+            let settled = core.settle();
             let outside_before = format!(
                 "{:?}",
                 settled
@@ -12152,7 +12285,7 @@ mod tests {
             );
 
             core.rederive_default_branches(std::slice::from_ref(&selected_key));
-            let settled = core.settle(Duration::from_millis(2000));
+            let settled = core.settle();
 
             let selected_after = settled
                 .entities
@@ -12203,7 +12336,7 @@ mod tests {
         init_repo_with_a_commit(&repo);
 
         let core = Core::start_discovered(spec(vec![root]));
-        let snapshot = core.settle(Duration::from_secs(10));
+        let snapshot = core.settle();
         let key = snapshot.entities[0].key.clone();
         let generation_before = snapshot.generation;
         assert!(
@@ -12252,7 +12385,7 @@ mod tests {
             }],
         ));
         assert!(
-            core.settle(Duration::from_secs(10)).entities[0].excluded,
+            core.settle().entities[0].excluded,
             "the starting override excludes it"
         );
 
@@ -12277,14 +12410,9 @@ mod tests {
         crate::test_support::git(&repo, &["branch", "trunk"]);
 
         let core = Core::start_discovered(spec(vec![root]));
-        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+        let key = core.settle().entities[0].key.clone();
         core.refresh(std::slice::from_ref(&key));
-        let before = format!(
-            "{:?}",
-            core.settle(Duration::from_secs(10)).entities[0]
-                .default_branch
-                .settled()
-        );
+        let before = format!("{:?}", core.settle().entities[0].default_branch.settled());
 
         core.set_exclusions(&[RepoOverride {
             path: repo.clone(),
@@ -12292,7 +12420,7 @@ mod tests {
             excluded: true,
         }]);
         core.refresh(&[key]);
-        core.settle(Duration::from_secs(10));
+        core.settle();
 
         let after = core.snapshot();
         assert!(after.entities[0].excluded, "exclude took effect");
@@ -12318,7 +12446,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("repo-b"));
 
         let core = Core::start_discovered(spec(vec![root]));
-        let entities = core.settle(Duration::from_secs(10)).entities;
+        let entities = core.settle().entities;
         let named = entities
             .iter()
             .find(|entity| &*entity.name == "repo-a")
@@ -12375,7 +12503,7 @@ mod tests {
         init_repo_with_a_commit(&root.join("repo-a"));
 
         let core = Core::start_discovered(spec(vec![root]));
-        let entities = core.settle(Duration::from_secs(10)).entities;
+        let entities = core.settle().entities;
         let stranger = EntityKey::new(Arc::from(std::path::Path::new("/nowhere/at/all")));
 
         core.record_own_work(
@@ -12418,7 +12546,7 @@ mod tests {
         // same repository while the line below reads it: two concurrent gix statuses over one
         // working tree is a race in the harness, not in `delete_risk`.
         let key = core
-            .settle(Duration::from_secs(10))
+            .settle()
             .entities
             .into_iter()
             .find(|entity| entity.kind == Kind::Repo)
@@ -12468,7 +12596,7 @@ mod tests {
             }
 
             let core = Core::start_discovered(spec(vec![root]));
-            let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+            let key = core.settle().entities[0].key.clone();
 
             let risk = core.delete_risk(&key).expect("read the risk");
 
@@ -12497,7 +12625,7 @@ mod tests {
         crate::test_support::git(&repo, &["add", "staged.txt"]);
 
         let core = Core::start_discovered(spec(vec![root]));
-        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+        let key = core.settle().entities[0].key.clone();
 
         let opened = git::open_thread_safe(repo.as_path())
             .expect("open the repo")
@@ -12536,7 +12664,7 @@ mod tests {
         crate::test_support::git(&repo, &["checkout", "."]);
 
         let core = Core::start_discovered(spec(vec![root]));
-        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+        let key = core.settle().entities[0].key.clone();
 
         let risk = core.delete_risk(&key).expect("read the risk");
 
@@ -12570,7 +12698,7 @@ mod tests {
 
         // Bounded by `inside` alone, so the Worktree is not a row in this Core's own table.
         let core = Core::start_discovered(spec(vec![inside]));
-        let snapshot = core.settle(Duration::from_secs(10));
+        let snapshot = core.settle();
         assert!(
             snapshot
                 .entities
@@ -12608,7 +12736,7 @@ mod tests {
         crate::test_support::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
 
         let core = Core::start_discovered(spec(vec![root]));
-        let key = core.settle(Duration::from_secs(10)).entities[0].key.clone();
+        let key = core.settle().entities[0].key.clone();
 
         let risk = core.delete_risk(&key).expect("read the risk");
 
@@ -12651,7 +12779,7 @@ mod tests {
 
         let core = Core::start_discovered(spec(vec![root]));
         let key = core
-            .settle(Duration::from_secs(10))
+            .settle()
             .entities
             .into_iter()
             .find(|entity| entity.kind == Kind::Worktree)
@@ -12682,7 +12810,7 @@ mod tests {
         fs::create_dir_all(&not_a_repo).expect("create it");
 
         let core = Core::start_discovered(spec(vec![root]));
-        core.settle(Duration::from_secs(10));
+        core.settle();
         let key = EntityKey::new(Arc::from(not_a_repo.as_path()));
 
         assert!(core.worktree_admin_dir(&key).is_err());
@@ -12721,7 +12849,7 @@ mod tests {
 
         let core = Core::start_discovered(spec(vec![root]));
         let key = core
-            .settle(Duration::from_secs(10))
+            .settle()
             .entities
             .into_iter()
             .find(|entity| entity.kind == Kind::Repo)

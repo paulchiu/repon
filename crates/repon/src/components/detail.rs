@@ -1467,7 +1467,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
 
         let lines = content_lines(&settled.entities[0], WIDE, full_glyphs());
         let branch_line = line_labelled(&lines, "branch");
@@ -1722,7 +1722,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let settled = core.settle(Duration::from_secs(5));
+        let settled = core.settle();
         let submodule = settled
             .entities
             .iter()
