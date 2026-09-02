@@ -2995,6 +2995,15 @@ mod tests {
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
     /// pattern `repon-core`'s own tests use rather than a git-backend trait.
+    /// Writes a committer into the repository's own config. The `-c` arguments the fixtures
+    /// below pass reach the `git` CLI and nothing else, so a fast-forward Repon performs
+    /// through gix finds no identity to stamp its reflog entry with and fails, on any machine
+    /// whose global config carries none. CI is exactly that machine.
+    fn set_test_identity(path: &std::path::Path) {
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+    }
+
     pub(crate) fn init_repo(path: &std::path::Path) {
         std::fs::create_dir_all(path).expect("create repo dir");
         let status = std::process::Command::new("git")
@@ -3004,6 +3013,7 @@ mod tests {
             .status()
             .expect("run git init");
         assert!(status.success());
+        set_test_identity(path);
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(path)
@@ -3039,6 +3049,8 @@ mod tests {
             .status()
             .expect("run git clone");
         assert!(status.success());
+        // A clone inherits none of the source's local config, identity included.
+        set_test_identity(dest);
     }
 
     /// Writes `name` with `contents` in `dir` and commits it there, real bytes on disk a
