@@ -1,11 +1,16 @@
-//! The three built-in management operations: `ignore`, `unignore` and `delete`.
+//! The four built-in management operations: `ignore`, `unignore`, `delete` and `sync`.
 //!
-//! [repo-management.md](../../../docs/spec/repo-management.md) is the specification and
-//! [0028](../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) the reasoning.
-//! They are built-in entries in the Action palette rather than a third palette, and they fan
-//! out over the Selection sharing the Action confirm gate's shape (a count, with ineligible
-//! entities subtracted and named) and none of the pty machinery in
-//! [actions.md](../../../docs/spec/actions.md), because no child process runs.
+//! [repo-management.md](../../../docs/spec/repo-management.md) is the specification,
+//! [0028](../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) the reasoning for
+//! the first three, and
+//! [0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md) the
+//! reasoning for `sync`'s own feature gate. They are built-in entries in the Action palette
+//! rather than a third palette, and they fan out over the Selection sharing the Action
+//! confirm gate's shape (a count, with ineligible entities subtracted and named) and none of
+//! the pty machinery in [actions.md](../../../docs/spec/actions.md), because no child process
+//! runs. `sync` fans out no mutation of its own either: it reuses
+//! [`repon_core::Core::attempt_auto_update`], the identical fast-forward the periodic fetch's
+//! own auto-update already runs.
 //!
 //! What a run leaves behind, per repo-management.md's "Receipts": an
 //! [`repon_core::ActionReceipt`] whose single Step is the act Repon performed itself, carrying
@@ -24,11 +29,11 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, eyre};
-use repon_core::{DeleteRisk, EntityKey, EntityState, Kind, OwnWork};
+use repon_core::{AutoUpdateAttempt, DeleteRisk, EntityKey, EntityState, Kind, OwnWork};
 
 use crate::config::repo_entry::{self, Edit};
 
-/// One of the three built-in entries in the Action palette, in the order
+/// One of the four built-in entries in the Action palette, in the order
 /// [repo-management.md](../../../docs/spec/repo-management.md)'s own operations table lists
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,13 +41,18 @@ pub(crate) enum Operation {
     Ignore,
     Unignore,
     Delete,
+    Sync,
 }
 
 /// Every built-in operation, which is also the list `m` filters the palette down to and the
 /// set of names a config-defined `[[action]]` may not take
 /// ([`crate::config::document`]'s own load-time check reads this).
-pub(crate) const OPERATIONS: [Operation; 3] =
-    [Operation::Ignore, Operation::Unignore, Operation::Delete];
+pub(crate) const OPERATIONS: [Operation; 4] = [
+    Operation::Ignore,
+    Operation::Unignore,
+    Operation::Delete,
+    Operation::Sync,
+];
 
 impl Operation {
     /// The name the palette lists it under, and the reserved name a config-defined
@@ -52,6 +62,7 @@ impl Operation {
             Operation::Ignore => "ignore",
             Operation::Unignore => "unignore",
             Operation::Delete => "delete",
+            Operation::Sync => "sync",
         }
     }
 
@@ -62,6 +73,7 @@ impl Operation {
             Operation::Ignore => "Stop operating on the selected entities",
             Operation::Unignore => "Operate on the selected entities again",
             Operation::Delete => "Remove the selected working trees, permanently",
+            Operation::Sync => "Fast-forward the selected Repos to their tracked upstream",
         }
     }
 
@@ -74,9 +86,17 @@ impl Operation {
 
     /// Whether `entity` is operated on, or the reason it is not, per
     /// [repo-management.md](../../../docs/spec/repo-management.md)'s "eligible" column. Every
-    /// pairing of the three operations with the three Kinds is named here rather than falling
-    /// through a catch-all, so a fourth Kind fails to compile instead of quietly becoming
+    /// pairing of the four operations with the three Kinds is named here rather than falling
+    /// through a catch-all, so a fifth Kind fails to compile instead of quietly becoming
     /// eligible for a destructive operation.
+    ///
+    /// `sync` on a build with no `fetch` cargo feature is refused before its Kind is even
+    /// read, whatever Kind the row is: the mechanism it would call does not exist on a build
+    /// like that
+    /// ([0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
+    /// What the auto-update's own five rules find ineligible right now (dirty, no upstream,
+    /// not behind, not fast-forward) is a different fact, read only by attempting it, so it
+    /// is never a gate refusal here; [`run`]'s own `sync_one` is where that surfaces.
     pub(crate) fn eligibility(self, entity: &EntityState) -> Eligibility {
         match (self, entity.kind) {
             (Operation::Ignore, Kind::Repo | Kind::Worktree) => {
@@ -99,6 +119,16 @@ impl Operation {
             (Operation::Delete, Kind::Repo | Kind::Worktree) => Eligibility::Eligible,
             (Operation::Delete, Kind::Submodule) => {
                 Eligibility::Refused(Refusal::SubmoduleCannotBeDeleted)
+            }
+            (Operation::Sync, _) if !repon_core::FETCH_AVAILABLE => {
+                Eligibility::Refused(Refusal::FetchNotBuilt)
+            }
+            (Operation::Sync, Kind::Repo) => Eligibility::Eligible,
+            (Operation::Sync, Kind::Worktree) => {
+                Eligibility::Refused(Refusal::WorktreeSyncsThroughItsRepo)
+            }
+            (Operation::Sync, Kind::Submodule) => {
+                Eligibility::Refused(Refusal::SubmoduleCannotSync)
             }
         }
     }
@@ -129,6 +159,18 @@ pub(crate) enum Refusal {
     AlreadyIgnored,
     /// `unignore` on an entity no `[[repo]]` entry excludes.
     NotIgnored,
+    /// `sync` on a Worktree: the auto-update it reuses acts on a Repo's own branch, and
+    /// `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly
+    /// that reason, so a Worktree sharing a common dir with a Repo is refused rather than
+    /// silently doing nothing.
+    WorktreeSyncsThroughItsRepo,
+    /// `sync` on a Submodule: it tracks a pinned commit, not a branch, so there is nothing
+    /// to fast-forward.
+    SubmoduleCannotSync,
+    /// `sync` on a build with no `fetch` cargo feature: the fast-forward mechanism it
+    /// reuses does not exist to call
+    /// ([0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
+    FetchNotBuilt,
 }
 
 impl Refusal {
@@ -143,6 +185,19 @@ impl Refusal {
             }
             Refusal::AlreadyIgnored => "already ignored",
             Refusal::NotIgnored => "not ignored",
+            Refusal::WorktreeSyncsThroughItsRepo => {
+                "sync acts on a Repo's own branch; a Worktree shares it and is not itself \
+                 the target"
+            }
+            Refusal::SubmoduleCannotSync => {
+                "a Submodule tracks a pinned commit, not a branch, so there is nothing to \
+                 fast-forward"
+            }
+            Refusal::FetchNotBuilt => {
+                "this build has no fetch mechanism; install with `cargo install --git \
+                 https://github.com/paulchiu/repon --locked --features fetch repon` to turn \
+                 it on"
+            }
         }
     }
 }
@@ -315,7 +370,8 @@ fn target_line(operation: Operation, target: &Target) -> String {
                     target.name
                 )
             }
-            (Operation::Delete, None) | (Operation::Ignore | Operation::Unignore, _) => {
+            (Operation::Delete, None)
+            | (Operation::Ignore | Operation::Unignore | Operation::Sync, _) => {
                 target.name.to_string()
             }
         },
@@ -384,12 +440,45 @@ pub(crate) enum Outcome {
     /// than a clean `git worktree remove`. `config_entry_removed` says whether an entry of
     /// its own went with it.
     DirectoryRemoved { config_entry_removed: bool },
+    /// `sync` fast-forwarded the Repo's branch to its upstream.
+    Synced,
+    /// `sync` attempted the Repo and the auto-update's own five rules found it not eligible
+    /// right now: eligibility can change between the gate and the run, so this is read only
+    /// by attempting it, never a gate refusal
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `sync` refuses,
+    /// and why").
+    NotEligibleToSync(SyncIneligibility),
     /// The gate already named this one and counted it; it is carried through so the report
     /// after the run names it too.
     Refused(Refusal),
     /// The operation was attempted and did not finish: a working tree that would not remove,
     /// or a config file that would not write.
     Failed(String),
+}
+
+/// Which of the fast-forward-only auto-update's own five rules found a Repo not eligible for
+/// `sync` right now, reused unchanged from [`repon_core::AutoUpdateAttempt`] rather than a
+/// second vocabulary for the identical four reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncIneligibility {
+    NotClean,
+    NoUpstream,
+    NotBehind,
+    NotFastForward,
+}
+
+impl SyncIneligibility {
+    /// The reason the receipt and the log line give, in the auto-update's own terms.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            SyncIneligibility::NotClean => "the working tree or index carries a change of its own",
+            SyncIneligibility::NoUpstream => "no branch, no remote, or no upstream configured",
+            SyncIneligibility::NotBehind => "already level with its upstream",
+            SyncIneligibility::NotFastForward => {
+                "the local branch has a commit its upstream does not"
+            }
+        }
+    }
 }
 
 /// One outcome as the receipt records it: which grade of work Repon did, and its own words
@@ -431,6 +520,11 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
         Outcome::ExcludedByAnInheritedEntry => OwnWork::Refused(Arc::from(
             "still ignored: the `[[repo]]` entry excluding it names another path",
         )),
+        Outcome::Synced => OwnWork::Did(Arc::from("fast-forwarded to its upstream")),
+        Outcome::NotEligibleToSync(reason) => OwnWork::Refused(Arc::from(format!(
+            "not eligible to sync, {}",
+            reason.reason()
+        ))),
         Outcome::Refused(refusal) => {
             OwnWork::Refused(Arc::from(format!("refused, {}", refusal.reason())))
         }
@@ -485,11 +579,13 @@ impl Report {
         let mut done = 0usize;
         let mut refused = 0usize;
         let mut unchanged = 0usize;
+        let mut not_eligible = 0usize;
         let mut failed = 0usize;
         for record in &self.records {
             match record.outcome {
                 Outcome::Ignored
                 | Outcome::Unignored
+                | Outcome::Synced
                 | Outcome::Deleted {
                     config_entry_removed: true,
                 }
@@ -509,6 +605,7 @@ impl Report {
                     config_entry_removed: false,
                 } => done += 1,
                 Outcome::ExcludedByAnInheritedEntry => unchanged += 1,
+                Outcome::NotEligibleToSync(_) => not_eligible += 1,
                 Outcome::Refused(_) => refused += 1,
                 Outcome::Failed(_) => failed += 1,
             }
@@ -519,6 +616,9 @@ impl Report {
         }
         if unchanged > 0 {
             parts.push(format!("{unchanged} still ignored by another entry"));
+        }
+        if not_eligible > 0 {
+            parts.push(format!("{not_eligible} not eligible to sync"));
         }
         if failed > 0 {
             parts.push(format!("{failed} failed"));
@@ -533,8 +633,9 @@ impl Report {
 /// `config_file` is passed in rather than resolved here, so a test drives this against a
 /// temp directory of its own making and never against the process-wide path
 /// [`crate::config::config_file`] fixes.
-/// Runs `plan` against `config_file`. `worktree_admin_dir` and `linked_worktree_paths` are
-/// [`repon_core::Core::worktree_admin_dir`] and [`repon_core::Core::linked_worktree_paths`]
+/// Runs `plan` against `config_file`. `worktree_admin_dir`, `linked_worktree_paths` and
+/// `attempt_sync` are [`repon_core::Core::worktree_admin_dir`],
+/// [`repon_core::Core::linked_worktree_paths`] and [`repon_core::Core::attempt_auto_update`]
 /// at the one call site; taken as parameters, the same way [`Plan::with_risk`] takes `read`,
 /// so this module never needs a `Core` to be tested.
 pub(crate) fn run(
@@ -542,6 +643,7 @@ pub(crate) fn run(
     config_file: &Path,
     worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
+    attempt_sync: impl Fn(&EntityKey) -> AutoUpdateAttempt,
 ) -> Report {
     let records = plan
         .targets
@@ -556,6 +658,7 @@ pub(crate) fn run(
                     config_file,
                     &worktree_admin_dir,
                     &linked_worktree_paths,
+                    &attempt_sync,
                 )
                 .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
             };
@@ -579,6 +682,7 @@ fn run_one(
     config_file: &Path,
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
+    attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
 ) -> Result<Outcome> {
     match operation {
         Operation::Ignore => {
@@ -598,6 +702,24 @@ fn run_one(
             worktree_admin_dir,
             linked_worktree_paths,
         ),
+        Operation::Sync => Ok(sync_one(target, attempt_sync)),
+    }
+}
+
+/// `sync` on one row: `attempt_sync` is called only for the Repos [`Operation::eligibility`]
+/// already found eligible by Kind, and its own answer is reported rather than fixed, per
+/// [repo-management.md](../../../docs/spec/repo-management.md)'s "What `sync` refuses, and
+/// why": an ineligible-right-now Repo is not a failure, so it never reaches [`Outcome::Failed`].
+fn sync_one(target: &Target, attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt) -> Outcome {
+    match attempt_sync(&target.key) {
+        AutoUpdateAttempt::Updated => Outcome::Synced,
+        AutoUpdateAttempt::NotClean => Outcome::NotEligibleToSync(SyncIneligibility::NotClean),
+        AutoUpdateAttempt::NoUpstream => Outcome::NotEligibleToSync(SyncIneligibility::NoUpstream),
+        AutoUpdateAttempt::NotBehind => Outcome::NotEligibleToSync(SyncIneligibility::NotBehind),
+        AutoUpdateAttempt::NotFastForward => {
+            Outcome::NotEligibleToSync(SyncIneligibility::NotFastForward)
+        }
+        AutoUpdateAttempt::Failed(error) => Outcome::Failed(error),
     }
 }
 
@@ -733,13 +855,20 @@ mod tests {
         )
     }
 
-    /// [`run`] with no Worktree of its own to remove: every test that is not itself about
-    /// the Worktree-removal cascade wires trivial closures here rather than repeating them.
+    /// [`run`] with no Worktree of its own to remove and no `sync` attempt to make: every
+    /// test that is not itself about the Worktree-removal cascade or `sync` wires trivial
+    /// closures here rather than repeating them.
     fn run_plain(plan: &Plan, config_file: &Path) -> Report {
-        run(plan, config_file, |_| None, |_| Vec::new())
+        run(
+            plan,
+            config_file,
+            |_| None,
+            |_| Vec::new(),
+            |_| panic!("run_plain does not exercise sync"),
+        )
     }
 
-    /// The three names, and their order, come from repo-management.md's own operations table
+    /// The four names, and their order, come from repo-management.md's own operations table
     /// read at test time, never restated here: the reserved-name check in
     /// [`crate::config::document`] and the palette's own built-in list are both this array,
     /// so a name that drifted from the specification would take both with it silently.
@@ -891,6 +1020,7 @@ mod tests {
             &config_file,
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
         );
 
         assert!(!tree.exists(), "the Worktree's own directory is gone");
@@ -925,6 +1055,7 @@ mod tests {
             &config_file,
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
         );
 
         assert!(
@@ -955,6 +1086,7 @@ mod tests {
             &config_file,
             |_| None,
             |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
         );
 
         assert!(!tree.exists(), "the Worktree's own directory is still gone");
@@ -988,6 +1120,7 @@ mod tests {
             &config_file,
             |_| None,
             |_| siblings.to_vec(),
+            |_| panic!("this test does not exercise sync"),
         );
 
         assert!(!repo.exists(), "the Repo's own working tree is gone");
@@ -1229,6 +1362,189 @@ mod tests {
         assert_eq!(
             Operation::Ignore.eligibility(&submodule),
             Eligibility::Refused(Refusal::SubmoduleHasNoEntryOfItsOwn)
+        );
+    }
+
+    // =====================================================================================
+    // `sync`'s own eligibility: a Repo is eligible by Kind on a build with the `fetch`
+    // feature and refused with a reason otherwise; a Worktree and a Submodule are always
+    // refused with a reason of their own, whatever the build. Every assertion below holds
+    // in both feature configurations at once, the same "prove it both ways" shape
+    // `config::document`'s own `fetch_enabled_warns_exactly_when_this_build_carries_no_fetch_mechanism`
+    // test already uses, so this suite is meaningful whichever way `just test` compiles it.
+    // =====================================================================================
+
+    /// A Repo is eligible for `sync` exactly when this build carries the `fetch` mechanism,
+    /// and refused with a reason naming that otherwise: never silently ineligible.
+    #[test]
+    fn sync_is_eligible_on_a_repo_exactly_when_fetch_is_available() {
+        let repo = entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo);
+
+        let eligibility = Operation::Sync.eligibility(&repo);
+
+        if repon_core::FETCH_AVAILABLE {
+            assert_eq!(eligibility, Eligibility::Eligible);
+        } else {
+            assert_eq!(
+                eligibility,
+                Eligibility::Refused(Refusal::FetchNotBuilt),
+                "a build with no fetch mechanism must refuse with a reason, not run"
+            );
+        }
+    }
+
+    /// A Worktree is refused with its own reason, never silently ineligible, whatever the
+    /// build carries: `repos_eligible_for_auto_update_attempt` is Repo-only, so a Worktree
+    /// sharing a common dir must say so rather than doing nothing.
+    #[test]
+    fn sync_is_refused_on_a_worktree_and_named_and_counted() {
+        let worktree = entity(Path::new("/tmp/x/tree"), "tree", Kind::Worktree);
+
+        let eligibility = Operation::Sync.eligibility(&worktree);
+
+        if repon_core::FETCH_AVAILABLE {
+            assert_eq!(
+                eligibility,
+                Eligibility::Refused(Refusal::WorktreeSyncsThroughItsRepo)
+            );
+        } else {
+            assert_eq!(eligibility, Eligibility::Refused(Refusal::FetchNotBuilt));
+        }
+
+        let entities = vec![worktree];
+        let plan = plan(Operation::Sync, &entities);
+        assert_eq!(
+            plan.eligible_count(),
+            0,
+            "a Worktree is never eligible for sync"
+        );
+        assert_eq!(plan.refused_count(), 1, "and the refusal is counted");
+    }
+
+    /// A Submodule is refused with its own reason: it tracks a pinned commit, not a branch.
+    #[test]
+    fn sync_is_refused_on_a_submodule() {
+        let submodule = entity(Path::new("/tmp/x/sub"), "sub", Kind::Submodule);
+
+        let eligibility = Operation::Sync.eligibility(&submodule);
+
+        if repon_core::FETCH_AVAILABLE {
+            assert_eq!(
+                eligibility,
+                Eligibility::Refused(Refusal::SubmoduleCannotSync)
+            );
+        } else {
+            assert_eq!(eligibility, Eligibility::Refused(Refusal::FetchNotBuilt));
+        }
+    }
+
+    /// A build with no `fetch` cargo feature names the same install command
+    /// [config.md](../../../docs/spec/config.md)'s own `fetch.enabled` warning does, read
+    /// from [releasing.md](../../../docs/spec/releasing.md) at test time rather than
+    /// restated, so the two messages cannot silently say two different things.
+    #[test]
+    fn fetch_not_built_names_releasings_own_fetch_install_command() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let releasing = std::fs::read_to_string(manifest_dir.join("../../docs/spec/releasing.md"))
+            .expect("read docs/spec/releasing.md");
+        let command = releasing
+            .lines()
+            .find(|line| line.starts_with("cargo install") && line.contains("--features fetch"))
+            .expect("releasing.md must carry a fetch-enabled `cargo install` line")
+            .trim();
+
+        assert!(
+            Refusal::FetchNotBuilt.reason().contains(command),
+            "the reason must name releasing.md's own fetch-enabled install command verbatim, \
+             got {:?}",
+            Refusal::FetchNotBuilt.reason()
+        );
+    }
+
+    // =====================================================================================
+    // `sync`'s own run: every `AutoUpdateAttempt` the injected closure returns becomes the
+    // matching `Outcome`, proven independently of the `fetch` cargo feature since the
+    // closure stands in for `Core::attempt_auto_update` here, the same way `with_risk`'s
+    // own `read` stands in for `Core::delete_risk`.
+    // =====================================================================================
+
+    fn run_with_sync(plan: &Plan, attempt: AutoUpdateAttempt) -> Report {
+        run(
+            plan,
+            Path::new("/tmp/unused-config.toml"),
+            |_| None,
+            |_| Vec::new(),
+            move |_| attempt.clone(),
+        )
+    }
+
+    #[test]
+    fn sync_updated_becomes_synced() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        // Forced eligible regardless of this build's own `fetch` feature: `run`'s own
+        // dispatch reads `target.eligibility`, not `Operation::eligibility` again, so this
+        // is the one seam that lets the outcome mapping be tested on every build.
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run_with_sync(&built, AutoUpdateAttempt::Updated);
+
+        assert_eq!(report.records[0].outcome, Outcome::Synced);
+        assert!(
+            report.summary().contains("1 done"),
+            "got {:?}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn every_auto_update_ineligible_reason_reaches_the_report_as_a_reason() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let cases = [
+            (AutoUpdateAttempt::NotClean, SyncIneligibility::NotClean),
+            (AutoUpdateAttempt::NoUpstream, SyncIneligibility::NoUpstream),
+            (AutoUpdateAttempt::NotBehind, SyncIneligibility::NotBehind),
+            (
+                AutoUpdateAttempt::NotFastForward,
+                SyncIneligibility::NotFastForward,
+            ),
+        ];
+
+        for (attempt, expected) in cases {
+            let mut built = plan(Operation::Sync, &entities);
+            built.targets[0].eligibility = Eligibility::Eligible;
+
+            let report = run_with_sync(&built, attempt.clone());
+
+            assert_eq!(
+                report.records[0].outcome,
+                Outcome::NotEligibleToSync(expected),
+                "attempt {attempt:?} must surface as a reason, never silently"
+            );
+            assert!(
+                own_work(&report.records[0].outcome)
+                    .said()
+                    .contains(expected.reason()),
+                "the receipt's own words must carry the reason"
+            );
+            assert!(
+                report.summary().contains("1 not eligible to sync"),
+                "got {:?}",
+                report.summary()
+            );
+        }
+    }
+
+    #[test]
+    fn sync_failed_becomes_a_failure_never_an_ineligible_reason() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run_with_sync(&built, AutoUpdateAttempt::Failed("git said no".to_string()));
+
+        assert!(
+            matches!(&report.records[0].outcome, Outcome::Failed(message) if message == "git said no")
         );
     }
 

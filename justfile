@@ -20,6 +20,11 @@ test:
     # and without this second run their suites are written and then executed on nobody's
     # machine but the author's.
     cargo test -p repon-core --locked --features fetch
+    # `repon`'s own built-in `sync` action is eligible only on a build with the `fetch`
+    # feature (0031), so its own crate needs the identical second run: without this, the
+    # `Eligible` half of that decision is untested on anyone's machine but the author's,
+    # the same gap the run above closes for `repon-core`.
+    cargo test -p repon --locked --features fetch --bin repon
 
 # Format code with rustfmt
 fmt:
