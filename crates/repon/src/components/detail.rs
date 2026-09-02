@@ -18,8 +18,6 @@
 //! takes no role and no child colour but a default style, `docs/spec/actions.md`'s own rule
 //! for it.
 
-use std::time::Duration;
-
 use ansi_to_tui::IntoText;
 use ratatui::{
     Frame,
@@ -39,6 +37,7 @@ use super::list::{
     worktree_state_word, write_cell_runs,
 };
 use crate::{
+    elapsed::format_seconds_elapsed,
     glyphs::{BorderScratch, FULL_SPINNER_INTERVAL, GlyphSet},
     keys::Action,
     scroll::scroll_after,
@@ -447,18 +446,6 @@ fn action_run_lines(
     lines
 }
 
-/// A step's own elapsed time: one decimal place under a minute, minutes and seconds beyond
-/// it. `docs/spec/actions.md`'s "the pane carries per-step elapsed time", what makes a
-/// stuck step visible in the absence of a timeout.
-fn format_step_elapsed(elapsed: Duration) -> String {
-    let whole_secs = elapsed.as_secs();
-    if whole_secs < 60 {
-        format!("{:.1}s", elapsed.as_secs_f64())
-    } else {
-        format!("{}m{:02}s", whole_secs / 60, whole_secs % 60)
-    }
-}
-
 /// A finished step's own outcome word, or, for a step Repon performed itself, Repon's own
 /// sentence about it. Exhaustive over [`StepOutcome`]'s closed five, the same discipline
 /// [`sync_word`] and [`stopped_word`] hold over their own closed sets, so a sixth variant
@@ -511,7 +498,11 @@ fn child_step_line(index: usize, step: &StepResult) -> ContentLine {
             step_outcome_meaning(&step.outcome).role(),
         ),
         (
-            format!("   {}   {}", step.label, format_step_elapsed(step.elapsed)),
+            format!(
+                "   {}   {}",
+                step.label,
+                format_seconds_elapsed(step.elapsed)
+            ),
             Role::Dim,
         ),
     ])
@@ -530,7 +521,7 @@ fn own_work_line(step: &StepResult) -> ContentLine {
             step_outcome_meaning(&step.outcome).role(),
         ),
         (
-            format!("   {}", format_step_elapsed(step.elapsed)),
+            format!("   {}", format_seconds_elapsed(step.elapsed)),
             Role::Dim,
         ),
     ])
@@ -557,7 +548,7 @@ fn running_step_line(
         ),
         ("running".to_string(), Meaning::LoadingSpinner.role()),
         (
-            format!("   {}   {}", running.label, format_step_elapsed(elapsed)),
+            format!("   {}   {}", running.label, format_seconds_elapsed(elapsed)),
             Role::Dim,
         ),
     ])

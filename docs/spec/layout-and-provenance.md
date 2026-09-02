@@ -58,7 +58,7 @@ Rank 4 is the **sort**: `sort dirty ↓`, the sorted column's own header text an
 One warning outstanding and unacknowledged, a run in flight, so every item is live:
 
 ```
-158  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12000ms
+156  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12.0s
 152  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) ...
 118  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches ...
  97  [1] work 403 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 ...
@@ -68,7 +68,7 @@ One warning outstanding and unacknowledged, a run in flight, so every item is li
   3  [1]
 ```
 
-Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted four columns by the reserved indicator: 97, 91, 57, 36, 25, 21, and the same 3-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
+Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted four columns by the reserved indicator: 95, 91, 57, 36, 25, 21, and the same 3-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
 
 One warning outstanding and unacknowledged, a Refresh in progress, nothing from the header live:
 
