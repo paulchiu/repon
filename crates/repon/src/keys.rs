@@ -574,7 +574,9 @@ const BINDINGS: &[Binding] = &[
         NONE,
         Action::ScrollDown,
     ),
+    binding(Context::Overlay, KeyCode::Down, NONE, Action::ScrollDown),
     binding(Context::Overlay, KeyCode::Char('k'), NONE, Action::ScrollUp),
+    binding(Context::Overlay, KeyCode::Up, NONE, Action::ScrollUp),
     binding(Context::Overlay, KeyCode::Char('g'), NONE, Action::Top),
     binding(Context::Overlay, KeyCode::Char('G'), SHIFT, Action::Bottom),
     binding(

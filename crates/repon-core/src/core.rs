@@ -285,6 +285,23 @@ pub struct AutoUpdateSpec {
     pub enabled: bool,
 }
 
+/// The most recent periodic-fetch cycle's own failures, read fresh through
+/// [`Core::fetch_failures`] the same way [`Core::discovery_warning`] and
+/// [`Core::vanished_count`] are: never latched, so a cycle where every fetch
+/// succeeds leaves this empty rather than carrying a stale failure forward from an
+/// earlier one. Per-repository independence is unaffected: one entry here is one
+/// repository `run_fetch_cycle` could not reach, never a reason another repository's
+/// own fetch was skipped.
+///
+/// Carries the path and the underlying `FetchError`'s own text, for
+/// a consumer's log; a consumer's own screen-facing warning is expected to surface
+/// only `failed.len()`, the precedent `warnings.rs`'s `OnRefreshFailed` already sets
+/// for never putting remote-supplied text on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchFailures {
+    pub failed: Vec<(PathBuf, String)>,
+}
+
 /// One [`Core::attempt_auto_update`] result on a single Repo: the fast-forward-only
 /// auto-update's own five eligibility rules
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
@@ -545,6 +562,12 @@ pub struct Core {
     /// writes to it, so a lookup here always misses, the same "inert" shape
     /// [`FetchSpec`] already takes.
     network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
+    /// The most recently completed periodic-fetch cycle's own failures, replaced
+    /// wholesale by [`run_fetch_cycle`] every time it runs. Read through
+    /// [`Core::fetch_failures`]. Always present, even without the `fetch` cargo
+    /// feature, the same "inert" shape `network_default_branch` above already
+    /// takes: without it nothing ever writes here, so a read always finds it empty.
+    fetch_failures: Arc<Mutex<FetchFailures>>,
     /// Orders every spawned dispatch body this `Core` starts; see
     /// [`DispatchTurnstile`].
     turnstile: Arc<DispatchTurnstile>,
@@ -1417,6 +1440,16 @@ impl Core {
     /// at any point in the run with no reload involved.
     pub fn discovery_warning(&self) -> Option<String> {
         self.discovery_warning.lock().unwrap().clone()
+    }
+
+    /// The most recently completed periodic-fetch cycle's own failures, or an
+    /// empty [`FetchFailures`] once every fetch in that cycle succeeded, or the
+    /// cycle has never run. The UI's shared warning slot polls this every frame,
+    /// the same way it polls [`Self::discovery_warning`] and
+    /// [`Self::vanished_count`], since a later cycle can replace this at any point
+    /// in the run with no reload involved.
+    pub fn fetch_failures(&self) -> FetchFailures {
+        self.fetch_failures.lock().unwrap().clone()
     }
 
     /// Sets the live show-submodules preference a Generation's dispatch reads from this
@@ -2649,6 +2682,7 @@ fn start_internal(
     let dispatch_log = Arc::new(Mutex::new(Vec::new()));
     let phase_c_gates = Arc::new(Mutex::new(HashMap::new()));
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
+    let fetch_failures = Arc::new(Mutex::new(FetchFailures::default()));
     let turnstile = Arc::new(DispatchTurnstile::default());
 
     let fetch_refresh_handles = RefreshHandles {
@@ -2677,6 +2711,7 @@ fn start_internal(
         ticks: fetch_ticks,
         refresh: fetch_refresh_handles.clone(),
         cycle_count: Arc::clone(&fetch_cycle_count),
+        failures: Arc::clone(&fetch_failures),
         auto_update_enabled,
     };
 
@@ -2715,6 +2750,7 @@ fn start_internal(
         let settle_gate = Arc::clone(&settle_gate);
         let fetch_refresh_handles = fetch_refresh_handles.clone();
         let fetch_cycle_count = Arc::clone(&fetch_cycle_count);
+        let fetch_failures = Arc::clone(&fetch_failures);
         let discovery_gate = discovery_gate.clone();
         move || {
             let turn = fetch_refresh_handles.turnstile.take(startup_ticket);
@@ -2775,6 +2811,7 @@ fn start_internal(
                         fetch_concurrency,
                         &fetch_refresh_handles,
                         &fetch_cycle_count,
+                        &fetch_failures,
                         auto_update_enabled,
                     );
                 });
@@ -2809,6 +2846,7 @@ fn start_internal(
             #[cfg(feature = "fetch")]
             fetch_cycle_count,
             network_default_branch,
+            fetch_failures,
             turnstile,
             discovery_gate,
         },
@@ -2856,6 +2894,7 @@ struct FetchSchedule {
     ticks: Receiver<Instant>,
     refresh: RefreshHandles,
     cycle_count: Arc<AtomicUsize>,
+    failures: Arc<Mutex<FetchFailures>>,
     /// `CoreSpec::auto_update`'s own `enabled` flag, read once at `start` like every
     /// other field on [`FetchSchedule`]: the fast-forward-only update carries no
     /// interval of its own, so there is no separate tick to gate it on, only this.
@@ -2934,6 +2973,7 @@ fn spawn_clock_thread(
                             fetch.concurrency,
                             &fetch.refresh,
                             &fetch.cycle_count,
+                            &fetch.failures,
                             fetch.auto_update_enabled,
                         );
                     }
@@ -2976,37 +3016,51 @@ fn run_fetch_cycle(
     concurrency: usize,
     refresh: &RefreshHandles,
     cycle_count: &Arc<AtomicUsize>,
+    failures: &Arc<Mutex<FetchFailures>>,
     auto_update_enabled: bool,
 ) {
     cycle_count.fetch_add(1, Ordering::Release);
 
     let common_dirs = distinct_fetchable_common_dirs(table);
+    let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
     crate::fetch::run_bounded(common_dirs, concurrency.max(1), |common_dir| {
         let cancel = AtomicBool::new(false);
         // Every repository's own fetch result is independent: one credential
         // failure or one unreachable remote must never stop the rest of the
         // cycle from running, so a per-repository error is swallowed here
-        // rather than aborting the whole cycle.
-        if let Ok(outcome) = crate::fetch::fetch_and_prune(&common_dir, &cancel) {
-            // The handshake this fetch already paid for is what
-            // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
-            // "The network" means by "arrives inside a round trip already being
-            // paid for": landed here, before `refresh.dispatch` below re-runs
-            // the local chain, so the local answer always computes first and
-            // this only ever supersedes it. `Unborn` and a missing answer both
-            // leave any earlier session answer for this common dir untouched,
-            // since neither is itself a fact worth overwriting one with.
-            if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
-                outcome.advertised_default_branch
-            {
-                refresh
-                    .network_default_branch
+        // rather than aborting the whole cycle. It is still counted below,
+        // which is the count this cycle's own [`FetchFailures`] carries.
+        match crate::fetch::fetch_and_prune(&common_dir, &cancel) {
+            Ok(outcome) => {
+                // The handshake this fetch already paid for is what
+                // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+                // "The network" means by "arrives inside a round trip already being
+                // paid for": landed here, before `refresh.dispatch` below re-runs
+                // the local chain, so the local answer always computes first and
+                // this only ever supersedes it. `Unborn` and a missing answer both
+                // leave any earlier session answer for this common dir untouched,
+                // since neither is itself a fact worth overwriting one with.
+                if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
+                    outcome.advertised_default_branch
+                {
+                    refresh
+                        .network_default_branch
+                        .lock()
+                        .unwrap()
+                        .insert(common_dir.clone(), Arc::from(name));
+                }
+            }
+            Err(error) => {
+                failed
                     .lock()
                     .unwrap()
-                    .insert(common_dir.clone(), Arc::from(name));
+                    .push((common_dir.clone(), error.to_string()));
             }
         }
     });
+    *failures.lock().unwrap() = FetchFailures {
+        failed: failed.into_inner().unwrap(),
+    };
 
     // The fast-forward-only auto-update rides this cycle rather than a timer of its
     // own, per `docs/spec/config.md`'s "Refresh, fetch and auto-update": it can only
@@ -3040,6 +3094,7 @@ fn run_fetch_cycle(
     _concurrency: usize,
     _refresh: &RefreshHandles,
     _cycle_count: &Arc<AtomicUsize>,
+    _failures: &Arc<Mutex<FetchFailures>>,
     _auto_update_enabled: bool,
 ) {
 }
@@ -11412,6 +11467,104 @@ mod tests {
             wait_for("a tick on the fetch channel to run a second cycle", || {
                 core.fetch_cycle_count_for_test() >= 2
             });
+        }
+
+        /// Points `repo`'s `origin` at a path nothing lives at, breaking `fetch_and_prune`
+        /// alone: discovery has already found `repo` as a real Repo before this runs, so
+        /// only the fetch itself fails, never the walk. A local path rather than a loopback
+        /// address, so this never touches even the machine's own network stack, the same
+        /// standing constraint every fixture in this module already holds to.
+        fn break_remote(repo: &Path) {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["remote", "set-url", "origin", "/nonexistent-remote-282"])
+                .status()
+                .expect("run git remote set-url");
+            assert!(status.success());
+        }
+
+        /// Criterion: a cycle where every fetch succeeds reports no failures.
+        #[test]
+        fn a_cycle_in_which_every_fetch_succeeds_reports_no_failures() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            )
+            .discovered();
+            let core = started.core;
+
+            wait_for("the periodic fetch to run its first cycle", || {
+                core.fetch_cycle_count_for_test() >= 1
+            });
+
+            assert!(
+                core.fetch_failures().failed.is_empty(),
+                "a cycle where every fetch succeeds must report no failures, got: {:?}",
+                core.fetch_failures().failed
+            );
+        }
+
+        /// A cycle in which one repository cannot be fetched counts that one failure, and
+        /// the per-repository independence at the fetch loop's own swallow is unchanged,
+        /// proven here by the sibling repository still fetching.
+        #[test]
+        fn a_repository_that_cannot_be_fetched_is_counted_while_its_sibling_still_fetches() {
+            let good_remote = seeded_remote();
+            let bad_remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let good = root_path.join("good");
+            let bad = root_path.join("bad");
+            clone_into(good_remote.path(), &good);
+            clone_into(bad_remote.path(), &bad);
+            break_remote(&bad);
+
+            crate::test_support::push_new_commit(good_remote.path(), "second.txt", "second\n");
+            let good_remote_tip = rev_parse(good_remote.path(), "refs/heads/main");
+
+            let fetch_ticks: Receiver<Instant> = crossbeam_channel::never();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_ticks,
+            )
+            .discovered();
+            let core = started.core;
+
+            wait_for(
+                "the cycle to run and count the one repository it could not fetch",
+                || core.fetch_failures().failed.len() == 1,
+            );
+
+            let failures = core.fetch_failures();
+            assert_eq!(
+                failures.failed.len(),
+                1,
+                "exactly one repository failed, so exactly one failure must be counted, \
+                 got: {:?}",
+                failures.failed
+            );
+            assert!(
+                failures.failed[0].0.to_string_lossy().contains("bad"),
+                "the counted failure must name the repository that actually failed, \
+                 got: {:?}",
+                failures.failed
+            );
+
+            wait_for(
+                "the sibling repository to still fetch despite the other one failing",
+                || rev_parse(&good, "refs/remotes/origin/main") == good_remote_tip,
+            );
         }
 
         /// [`crate::test_support::push_new_commit`], but onto `branch` rather than

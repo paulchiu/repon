@@ -1,6 +1,7 @@
 //! The one shared warning population [config.md](../../../../docs/spec/config.md) amends
 //! [theming.md](../../../../docs/spec/theming.md) into: theme warnings, config warnings, a
-//! failed `on_refresh` hook, an abandoned discovery and vanished entities fold into one
+//! failed `on_refresh` hook, a periodic fetch cycle that failed on some repositories, an
+//! abandoned discovery and vanished entities fold into one
 //! [`Warning`] list. This module is
 //! an item source for [`crate::status_row`], not a renderer: [`slot_line`] computes the
 //! single most severe warning's own text, the same text the status row shows as its rank-2
@@ -15,11 +16,12 @@
 //! removed it, since a reply to a keystroke is not a standing condition and this module never
 //! clears one on its own; [`crate::notice`] is where that reply now lives instead. Vanished
 //! entities are an abandoned discovery's mirror: an abandoned walk means rows may be missing,
-//! and a Vanished row means one is present that no longer exists. Vanished and the failed
-//! `on_refresh` hook are the two sources never latched: [`WarningSources`] is built fresh
-//! every frame from the live snapshot, so each condition clears itself the instant the last
-//! Vanished row is dismissed or rediscovered, or a later run replaces the failed receipts,
-//! with nothing to reset by hand.
+//! and a Vanished row means one is present that no longer exists. Vanished, the failed
+//! `on_refresh` hook and the periodic fetch's own failure count are the three sources never
+//! latched: [`WarningSources`] is built fresh every frame from the live snapshot, so each
+//! condition clears itself the instant the last Vanished row is dismissed or rediscovered, a
+//! later run replaces the failed receipts, or a later cycle replaces the failure count, with
+//! nothing to reset by hand.
 //!
 //! A half-applied theme or config must not silently look fully applied: that is the same
 //! class of quiet lie per-cell provenance exists to prevent
@@ -49,6 +51,10 @@ pub(crate) enum Warning {
         action: String,
         entities: usize,
     },
+    /// How many repositories the periodic fetch's most recently completed cycle could not
+    /// fetch. Never the underlying error text: it is arbitrary bytes from a remote, the same
+    /// reason [`Warning::OnRefreshFailed`] never carries a step's own captured output.
+    FetchFailed(usize),
     DiscoveryAbandoned(String),
     /// How many Entities are currently Vanished
     /// rows present that no longer
@@ -61,9 +67,11 @@ impl Warning {
     /// Higher ranks are more severe. Ranked by how much of what is already on screen the
     /// condition puts in doubt: a Vanished row and an abandoned walk are ranked together at
     /// the top, one meaning rows on screen no longer exist and the other meaning rows are
-    /// missing from it, a failed `on_refresh` hook means something the user asked Repon to
-    /// run did not finish, a config warning means some of this session's own behaviour
-    /// silently fell back to a default, and a theme warning is cosmetic only.
+    /// missing from it, a periodic fetch that failed on some repositories means their sync
+    /// data may be silently stale with no per-row mark to say so, a failed `on_refresh` hook
+    /// means something the user asked Repon to run did not finish, a config warning means
+    /// some of this session's own behaviour silently fell back to a default, and a theme
+    /// warning is cosmetic only.
     /// [theming.md](../../../../docs/spec/theming.md)'s "Warnings and Notices" states the
     /// population in this same order, least severe first, which this module's own
     /// `rank_matches_theming_mds_own_severity_order` test pins this match against rather than
@@ -77,8 +85,9 @@ impl Warning {
                 action: _,
                 entities: _,
             } => 3,
-            Warning::DiscoveryAbandoned(_) => 4,
-            Warning::Vanished(_) => 5,
+            Warning::FetchFailed(_) => 4,
+            Warning::DiscoveryAbandoned(_) => 5,
+            Warning::Vanished(_) => 6,
         }
     }
 }
@@ -90,6 +99,9 @@ impl std::fmt::Display for Warning {
             Warning::Config(warning) => write!(f, "{warning}"),
             Warning::OnRefreshFailed { action, entities } => {
                 write!(f, "on_refresh `{action}` failed a step on {entities} rows")
+            }
+            Warning::FetchFailed(count) => {
+                write!(f, "periodic fetch failed on {count} repositories")
             }
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
             Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
@@ -111,6 +123,12 @@ pub(crate) struct WarningSources {
     /// the condition clears itself the moment a later run replaces those receipts, the same
     /// unlatched shape `vanished` below takes.
     pub(crate) on_refresh_failed: Option<(String, usize)>,
+    /// How many repositories the periodic fetch's most recently completed cycle could not
+    /// fetch, read fresh from [`repon_core::Core::fetch_failures`] every time this struct is
+    /// built rather than latched, the same unlatched shape `vanished` below takes: a later
+    /// cycle where every fetch succeeds clears the condition with nothing to reset by hand.
+    /// Zero contributes no warning.
+    pub(crate) fetch_failed: usize,
     pub(crate) discovery_abandoned: Option<String>,
     /// How many Entities are Vanished right now, read fresh from the live snapshot every
     /// time this struct is built rather than latched, which is what lets the condition clear
@@ -127,6 +145,7 @@ impl WarningSources {
             theme,
             config,
             on_refresh_failed,
+            fetch_failed,
             discovery_abandoned,
             vanished,
         } = self;
@@ -134,6 +153,9 @@ impl WarningSources {
         warnings.extend(config.into_iter().map(Warning::Config));
         if let Some((action, entities)) = on_refresh_failed.filter(|(_, entities)| *entities > 0) {
             warnings.push(Warning::OnRefreshFailed { action, entities });
+        }
+        if fetch_failed > 0 {
+            warnings.push(Warning::FetchFailed(fetch_failed));
         }
         warnings.extend(
             discovery_abandoned
@@ -280,6 +302,10 @@ mod tests {
         }
     }
 
+    fn fetch_failed(count: usize) -> Warning {
+        Warning::FetchFailed(count)
+    }
+
     // --- WarningSources: the compile-time forcing function ---
 
     #[test]
@@ -290,6 +316,7 @@ mod tests {
             }],
             config: vec![document::Warning::SetNamedAll],
             on_refresh_failed: Some(("sync".to_string(), 3)),
+            fetch_failed: 4,
             discovery_abandoned: Some("discovery: stopped at 5 directories".to_string()),
             vanished: 2,
         };
@@ -302,6 +329,7 @@ mod tests {
                 theme_unknown_key("x"),
                 config_set_named_all(),
                 on_refresh_failed(3),
+                fetch_failed(4),
                 discovery_abandoned(5),
                 vanished(2),
             ]
@@ -316,6 +344,8 @@ mod tests {
             // A declared hook whose last run failed on nothing is the zero this asserts
             // contributes no warning, exactly as a zero Vanished count does.
             on_refresh_failed: Some(("sync".to_string(), 0)),
+            // A cycle where every fetch succeeded is the same zero, contributing nothing.
+            fetch_failed: 0,
             discovery_abandoned: None,
             vanished: 0,
         };
@@ -720,8 +750,8 @@ mod tests {
         let clauses: Vec<&str> = clauses_text.split(", ").collect();
         assert_eq!(
             clauses.len(),
-            5,
-            "expected theming.md to name exactly the five standing conditions `Warning` has \
+            6,
+            "expected theming.md to name exactly the six standing conditions `Warning` has \
              variants for, got: {clauses:?}"
         );
 
@@ -732,6 +762,8 @@ mod tests {
                     theme_unknown_key("x").rank()
                 } else if clause.contains("on_refresh") {
                     on_refresh_failed(1).rank()
+                } else if clause.contains("periodic fetch") {
+                    fetch_failed(1).rank()
                 } else if clause.contains("config") {
                     config_set_named_all().rank()
                 } else if clause.contains("discovery") {

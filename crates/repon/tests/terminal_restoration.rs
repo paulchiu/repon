@@ -3,6 +3,10 @@
 //! pseudo-terminal and reading back what it wrote. A `TestBackend` cannot exercise a real
 //! `termios` call or a real panic unwind, and no crate on the dependency allowlist opens a
 //! pty, so this reaches four POSIX functions directly via `extern "C"`.
+//!
+//! The same real-binary-over-a-real-pty setup is also the only sanctioned way to time the
+//! first frame against the wall clock rather than against a `TestBackend`'s own instant
+//! draws; [`process_start_to_first_draw_is_within_budget`] is that measurement.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
@@ -13,7 +17,7 @@ use std::os::raw::{c_char, c_int, c_ulong};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use repon_core::liveness::{BACKSTOP, wait_for_or};
 
@@ -1271,6 +1275,166 @@ fn classify_pty_read_still_treats_a_non_eio_error_as_a_failure() {
     assert!(
         matches!(classify_pty_read(result), Err(DrainEnd::Err(_))),
         "a non-EIO error must still classify as a failure"
+    );
+}
+
+/// How long `docs/spec/refresh.md`'s "The first frame" holds process start to first drawn
+/// frame to. Pinned to that prose by [`first_draw_budget_matches_the_refresh_spec`] below,
+/// so neither this number nor the sentence can change without the other going red.
+const FIRST_DRAW_BUDGET_MS: u64 = 50;
+
+/// The exact bytes `tui.rs`'s `write_enter_sequence` writes before the event thread starts:
+/// alternate screen, bracketed paste, mouse capture off, focus reporting, cursor hidden, in
+/// that order. Encoded from crossterm's own commands, the same way [`ansi`] does for one at a
+/// time, rather than copied, so this cannot drift from what a future crossterm version
+/// writes. Everything the master reports past this many bytes is the first `terminal.draw`,
+/// the only other write before the render tick starts producing periodic ones.
+fn enter_sequence_len() -> usize {
+    ansi(crossterm::terminal::EnterAlternateScreen).len()
+        + ansi(crossterm::event::EnableBracketedPaste).len()
+        + ansi(crossterm::event::DisableMouseCapture).len()
+        + ansi(crossterm::event::EnableFocusChange).len()
+        + ansi(crossterm::cursor::Hide).len()
+}
+
+/// Reads `master` until the cumulative bytes read cross `threshold`, then sends the duration
+/// from `started` to that moment on the returned channel. Runs on its own thread so the
+/// caller can bound the wait with [`BACKSTOP`] through a channel receive rather than blocking
+/// directly on a `read` a wedged child would never satisfy.
+fn spawn_threshold_reader(
+    mut master: File,
+    threshold: usize,
+    started: Instant,
+) -> (std::thread::JoinHandle<()>, mpsc::Receiver<Duration>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut total = 0usize;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if total > threshold {
+                        let _ = tx.send(started.elapsed());
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (handle, rx)
+}
+
+/// Spawns `repon` over a real pty with an isolated `REPON_CONFIG` and `REPON_DATA`, and
+/// reports how long it took, from just before `spawn`, for the master to report bytes past
+/// [`enter_sequence_len`]: the point in the output where the first `terminal.draw` starts
+/// landing. Kills the child the moment that is known rather than waiting for a natural exit,
+/// since the point of this call is the timing, not the run.
+fn measure_first_draw_latency() -> Duration {
+    let (master, slave_path) = open_pty();
+    let config_dir = tempfile::tempdir().expect("create tempdir for REPON_CONFIG");
+    let data_dir = tempfile::tempdir().expect("create tempdir for REPON_DATA");
+
+    let started = Instant::now();
+    let mut child = spawn_attached_to_pty_with(
+        &slave_path,
+        &[],
+        &[
+            (
+                "REPON_CONFIG",
+                config_dir
+                    .path()
+                    .to_str()
+                    .expect("tempdir path must be utf-8"),
+            ),
+            (
+                "REPON_DATA",
+                data_dir
+                    .path()
+                    .to_str()
+                    .expect("tempdir path must be utf-8"),
+            ),
+        ],
+    );
+
+    let (reader, rx) = spawn_threshold_reader(master, enter_sequence_len(), started);
+    let elapsed = rx.recv_timeout(BACKSTOP).unwrap_or_else(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("repon never wrote past its own enter sequence within the liveness backstop");
+    });
+    let _ = reader.join();
+    let _ = child.kill();
+    let _ = child.wait();
+    elapsed
+}
+
+/// refresh.md's "The first frame": the wall clock from just before this test spawns the real
+/// `repon` binary to the first bytes past its own enter sequence reaching the pty, which is
+/// where the very first `terminal.draw` starts landing (`app.rs`'s render tick, driven by the
+/// event thread `Tui::start` spawns, fires within the same iteration `Tui::enter` returns
+/// into, so a real terminal cannot resolve the enter sequence and the first draw apart at
+/// millisecond scale). A static read of the startup path found no blocking work anywhere on
+/// that route, so this measures the real binary rather than trusting that reading.
+///
+/// One spawn is discarded as a warm-up before the five that are measured, and the minimum of
+/// those five is taken rather than an average. Measured directly against this repository's
+/// own release and debug builds: a binary and its shared libraries pay a one-time page-in
+/// cost of roughly 570-1030ms the first time anything on the machine touches them after a
+/// build, and roughly 4-10ms on every run after, on this development machine. That cost is a
+/// fact about the filesystem's page cache, identical with and without the `fetch` feature and
+/// regardless of debug or release, not a fact about this process's own startup path; scoping
+/// this test to the warm case is what keeps it a check on Repon's own code rather than a check
+/// on whichever machine happens to run it. Scheduling noise on a loaded machine only ever adds
+/// delay on top of a run's real cost, never removes it, so the smallest of several warm runs
+/// is the tightest honest estimate of that cost.
+#[test]
+fn process_start_to_first_draw_is_within_budget() {
+    measure_first_draw_latency(); // warm-up: pages in the binary and its shared libraries
+
+    let samples: Vec<Duration> = (0..5).map(|_| measure_first_draw_latency()).collect();
+    let fastest = samples
+        .iter()
+        .min()
+        .copied()
+        .expect("five samples were just collected above");
+
+    let budget = Duration::from_millis(FIRST_DRAW_BUDGET_MS);
+    assert!(
+        fastest <= budget,
+        "fastest of {} warm runs took {fastest:?} to reach the first draw, over the \
+         {budget:?} budget refresh.md's \"The first frame\" holds it to; all samples: \
+         {samples:?}",
+        samples.len(),
+    );
+}
+
+/// `docs/spec/refresh.md`'s "The first frame" commits to this exact figure in its own prose;
+/// parsed back out of the document and compared against [`FIRST_DRAW_BUDGET_MS`] rather than
+/// restated, so an edit to either the sentence or the constant that leaves the other behind
+/// fails here instead of drifting apart silently.
+#[test]
+fn first_draw_budget_matches_the_refresh_spec() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let spec_path = manifest_dir.join("../../docs/spec/refresh.md");
+    let spec = std::fs::read_to_string(&spec_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", spec_path.display()));
+
+    const MARKER: &str = "rows with names on screen within ";
+    let after = spec
+        .split_once(MARKER)
+        .unwrap_or_else(|| panic!("refresh.md no longer says {MARKER:?}"))
+        .1;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let documented_ms: u64 = digits
+        .parse()
+        .unwrap_or_else(|_| panic!("could not parse a millisecond figure after {MARKER:?}"));
+
+    assert_eq!(
+        documented_ms, FIRST_DRAW_BUDGET_MS,
+        "refresh.md's first-draw budget ({documented_ms}ms) and this test's own \
+         FIRST_DRAW_BUDGET_MS ({FIRST_DRAW_BUDGET_MS}ms) have drifted apart"
     );
 }
 
