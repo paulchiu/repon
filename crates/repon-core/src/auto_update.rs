@@ -46,9 +46,10 @@ pub(crate) enum Ineligible {
     NotFastForward,
 }
 
-/// One [`attempt`] outcome. `run_fetch_cycle` deliberately discards it (`let _ =`):
-/// per this module's own doc comment, nothing here writes a report of its own, so the
-/// fields below are read only by this module's own tests, not by production code.
+/// One [`attempt`] outcome. `run_fetch_cycle` deliberately discards it (`let _ =`), since
+/// nothing there writes a report of its own; `Core::attempt_auto_update` is the one
+/// production reader, matching every variant but `Updated`'s own `from`/`to` fields, which
+/// stay read only by this module's own tests.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum Outcome {

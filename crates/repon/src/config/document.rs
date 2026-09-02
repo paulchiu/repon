@@ -588,7 +588,7 @@ fn duplicate_message(what: &str, value: &str) -> String {
     format!("duplicate {what} `{value}`")
 }
 
-/// The three built-in management operations' names are reserved
+/// The built-in management operations' names are reserved
 /// ([repo-management.md](../../../../docs/spec/repo-management.md)): a config-defined
 /// `[[action]]` taking one fails the load rather than one shadowing the other, and it fails
 /// with the message a second `[[action]]` of the same name already produces, since a name
@@ -1522,7 +1522,7 @@ mod tests {
     #[test]
     fn on_refresh_naming_a_declared_action_does_not_warn() {
         let loaded = parse_ok(
-            "on_refresh = \"sync\"\n\n[[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+            "on_refresh = \"hook\"\n\n[[action]]\nname = \"hook\"\nsteps = [{ args = [\"true\"] }]\n",
         );
 
         assert!(
@@ -1557,10 +1557,10 @@ mod tests {
     #[test]
     fn a_set_on_refresh_key_parses() {
         let loaded = parse_ok(
-            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"sync\"\n\n\
-             [[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"hook\"\n\n\
+             [[action]]\nname = \"hook\"\nsteps = [{ args = [\"true\"] }]\n",
         );
-        assert_eq!(loaded.document.sets[0].on_refresh.as_deref(), Some("sync"));
+        assert_eq!(loaded.document.sets[0].on_refresh.as_deref(), Some("hook"));
     }
 
     #[test]
@@ -1622,8 +1622,8 @@ mod tests {
     #[test]
     fn a_set_on_refresh_naming_a_declared_action_does_not_warn() {
         let loaded = parse_ok(
-            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"sync\"\n\n\
-             [[action]]\nname = \"sync\"\nsteps = [{ args = [\"true\"] }]\n",
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\non_refresh = \"hook\"\n\n\
+             [[action]]\nname = \"hook\"\nsteps = [{ args = [\"true\"] }]\n",
         );
         assert!(
             !loaded

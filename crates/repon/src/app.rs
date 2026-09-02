@@ -1982,6 +1982,7 @@ impl App {
             &self.config_file,
             |key| self.core.worktree_admin_dir(key).ok(),
             |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
+            |key| self.core.attempt_auto_update(key),
         );
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
@@ -5562,9 +5563,11 @@ mod tests {
     }
 
     /// The same "computed, not stubbed" claim for what a `delete` run needs to remove a
-    /// Worktree the way `git worktree remove` does: [`repon_core::Core::worktree_admin_dir`]
-    /// and [`repon_core::Core::linked_worktree_paths`] at the one call site, not a literal
-    /// this crate could hand [`crate::management::run`] instead.
+    /// Worktree the way `git worktree remove` does, and what a `sync` run needs to attempt
+    /// the fast-forward: [`repon_core::Core::worktree_admin_dir`],
+    /// [`repon_core::Core::linked_worktree_paths`] and
+    /// [`repon_core::Core::attempt_auto_update`] at the one call site, not a literal this
+    /// crate could hand [`crate::management::run`] instead.
     #[test]
     fn the_delete_run_reads_its_worktree_removal_from_the_core_rather_than_a_literal() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -5586,6 +5589,10 @@ mod tests {
         assert!(
             source.contains("self.core.linked_worktree_paths(key)"),
             "the run must read a Repo's linked Worktree paths off the Core"
+        );
+        assert!(
+            source.contains("self.core.attempt_auto_update(key)"),
+            "the run must attempt `sync` through the Core rather than a literal"
         );
     }
 
