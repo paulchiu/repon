@@ -128,11 +128,17 @@ fn shipped_defaults() -> Vec<Launcher> {
 }
 
 impl Launcher {
-    fn from_config(config: &LauncherConfig) -> Self {
+    /// `shipped` is the shipped default this entry names, when it names one. An entry
+    /// declaring neither `args` nor `from_env` keeps that default's own source, which is what
+    /// makes a bare `[[launcher]] name = "shell"` a statement about order alone; with no
+    /// shipped default behind it, the same entry resolves to an empty argv as before.
+    fn from_config(config: &LauncherConfig, shipped: Option<&Launcher>) -> Self {
         let source = match (&config.args, &config.from_env) {
             (Some(args), _) => Source::Args(args.clone()),
             (None, Some(name)) => Source::FromEnv(name.clone()),
-            (None, None) => Source::Args(Vec::new()),
+            (None, None) => shipped
+                .map(|launcher| launcher.source.clone())
+                .unwrap_or_else(|| Source::Args(Vec::new())),
         };
         Self {
             name: config.name.get_ref().clone(),
@@ -144,29 +150,27 @@ impl Launcher {
     }
 }
 
-/// Merges the four shipped defaults with `document`'s declared `[[launcher]]` entries, in
-/// file order:
-/// [config.md](../../../../docs/spec/config.md#launchers): "Declaring a `[[launcher]]` with a
-/// shipped name replaces it in place; `disabled = true` drops it." An entry whose name is not
-/// one of the four shipped defaults is appended, unless it is itself `disabled`, in which
-/// case declaring it does nothing.
+/// Merges the four shipped defaults with `document`'s declared `[[launcher]]` entries, per
+/// [config.md](../../../../docs/spec/config.md#launchers): the file is the order, so the
+/// declared entries come first in file order and the shipped defaults the file never names
+/// follow, keeping their own relative order. A `disabled` entry contributes nothing: it drops
+/// the shipped default it names, and does nothing at all under a name that ships with none.
 pub fn resolve(document: &Document) -> Vec<Launcher> {
-    let mut result = shipped_defaults();
+    let mut unnamed = shipped_defaults();
+    let mut result = Vec::with_capacity(unnamed.len() + document.launchers.len());
     for declared in &document.launchers {
         let name = declared.name.get_ref().as_str();
-        match result.iter().position(|launcher| launcher.name == name) {
-            Some(position) if declared.disabled => {
-                result.remove(position);
-            }
-            Some(position) => {
-                result[position] = Launcher::from_config(declared);
-            }
-            None if !declared.disabled => {
-                result.push(Launcher::from_config(declared));
-            }
-            None => {}
+        // Taken out either way, so a shipped default a `disabled` entry names is dropped and
+        // one a live entry names cannot also reappear in the tail.
+        let shipped = unnamed
+            .iter()
+            .position(|launcher| launcher.name == name)
+            .map(|position| unnamed.remove(position));
+        if !declared.disabled {
+            result.push(Launcher::from_config(declared, shipped.as_ref()));
         }
     }
+    result.extend(unnamed);
     result
 }
 
@@ -310,37 +314,86 @@ mod tests {
         assert_eq!(resolved, shipped_defaults());
     }
 
-    // Criterion 1, replacement: a declared entry of a shipped name replaces it in place
-    // rather than appending a duplicate.
+    // Criterion 1, replacement: a declared entry of a shipped name replaces that default
+    // rather than appending a duplicate, and takes the file's position for it.
     #[test]
-    fn a_shipped_launcher_is_replaced_in_place_by_a_declared_entry_of_the_same_name() {
+    fn a_declared_entry_of_a_shipped_name_replaces_that_default_and_takes_its_file_position() {
         let mut document = Document::default();
         document.launchers.push(launcher_config(
-            "lazygit",
-            Some(vec!["custom-lazygit", "--flag"]),
+            "tuicr",
+            Some(vec!["custom-tuicr", "--flag"]),
             None,
             false,
         ));
 
         let resolved = resolve(&document);
 
-        assert_eq!(
-            resolved.len(),
-            4,
-            "replacing a shipped name must not add a fifth entry"
-        );
         let names: Vec<&str> = resolved
             .iter()
             .map(|launcher| launcher.name.as_str())
             .collect();
         assert_eq!(
             names,
-            vec!["lazygit", "tuicr", "editor", "shell"],
-            "the replacement keeps the shipped position"
+            vec!["tuicr", "lazygit", "editor", "shell"],
+            "the declared entry leads, and the shipped defaults it did not name follow in \
+             their own order"
         );
         assert_eq!(
             resolved[0].source,
-            Source::Args(vec!["custom-lazygit".to_string(), "--flag".to_string()])
+            Source::Args(vec!["custom-tuicr".to_string(), "--flag".to_string()])
+        );
+    }
+
+    // The file is the order: declared entries fill the palette in the order they are
+    // written, whether or not they name a shipped default.
+    #[test]
+    fn declared_entries_lead_in_file_order_and_the_unmentioned_shipped_defaults_follow() {
+        let mut document = Document::default();
+        document
+            .launchers
+            .push(launcher_config("scratch", Some(vec!["true"]), None, false));
+        document
+            .launchers
+            .push(launcher_config("editor", Some(vec!["nvim"]), None, false));
+
+        let resolved = resolve(&document);
+
+        let names: Vec<&str> = resolved
+            .iter()
+            .map(|launcher| launcher.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["scratch", "editor", "lazygit", "tuicr", "shell"],
+            "the two declared entries lead in file order, then lazygit, tuicr and shell keep \
+             their shipped relative order"
+        );
+    }
+
+    // A `[[launcher]]` naming a shipped default and declaring neither `args` nor `from_env`
+    // is a pure reordering statement: it says where the default goes and nothing else.
+    #[test]
+    fn declaring_a_shipped_name_with_no_argv_keys_only_moves_it_and_keeps_the_shipped_default() {
+        let mut document = Document::default();
+        document
+            .launchers
+            .push(launcher_config("shell", None, None, false));
+
+        let resolved = resolve(&document);
+
+        let names: Vec<&str> = resolved
+            .iter()
+            .map(|launcher| launcher.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["shell", "lazygit", "tuicr", "editor"]);
+        let shipped_shell = shipped_defaults()
+            .into_iter()
+            .find(|launcher| launcher.name == "shell")
+            .expect("a shell ships as a default");
+        assert_eq!(
+            resolved[0], shipped_shell,
+            "a bare entry must resolve to the shipped default itself, argv included, rather \
+             than to an empty argv that fails to spawn"
         );
     }
 
@@ -373,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_entry_with_a_new_name_is_appended_rather_than_replacing_anything() {
+    fn a_declared_entry_with_a_new_name_joins_the_list_rather_than_replacing_anything() {
         let mut document = Document::default();
         document
             .launchers
@@ -381,8 +434,12 @@ mod tests {
 
         let resolved = resolve(&document);
 
-        assert_eq!(resolved.len(), 5);
-        assert_eq!(resolved.last().unwrap().name, "scratch");
+        assert_eq!(
+            resolved.len(),
+            5,
+            "a new name must displace no shipped default"
+        );
+        assert_eq!(resolved.first().unwrap().name, "scratch");
     }
 
     #[test]
