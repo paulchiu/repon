@@ -1,4 +1,4 @@
-//! The one document `Core::settle` feeds standard output: a schema integer at its root plus
+//! The one document `Core::try_settle` feeds standard output: a schema integer at its root plus
 //! the settled [`Snapshot`] itself, behind the `serde` feature and off by default.
 //!
 //! See `docs/spec/core-api.md`'s "The wire format" and
@@ -17,7 +17,7 @@ use crate::snapshot::Snapshot;
 pub(crate) const SCHEMA: u32 = 1;
 
 /// The whole settled table, tagged with the schema version that closes
-/// [`crate::Settled`] and [`crate::Unknown`]'s variant sets. `settle`, then serialise this
+/// [`crate::Settled`] and [`crate::Unknown`]'s variant sets. `try_settle`, then serialise this
 /// once: `docs/spec/core-api.md`'s "The machine-readable consumer emits one settled document
 /// rather than a stream".
 ///

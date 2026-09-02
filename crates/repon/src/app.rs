@@ -6790,7 +6790,7 @@ mod tests {
     fn vanish(app: &App, repo: &std::path::Path) {
         std::fs::remove_dir_all(repo).expect("remove the repo from disk");
         app.core.refresh(&[]);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
     }
 
     /// `d`'s successful case: the cursor sits on a Vanished row, so the row leaves the table
@@ -6808,7 +6808,7 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         vanish(&app, &repo_a);
 
         let snapshot = app.core.snapshot();
@@ -6940,7 +6940,7 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         vanish(&app, &repo);
 
         assert!(
@@ -8284,14 +8284,14 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         checkout_new_branch(&repo_a, "after-refresh-all-a");
         checkout_new_branch(&repo_b, "after-refresh-all-b");
 
         app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
             .expect("handle RefreshAll");
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let snapshot = app.core.snapshot();
         assert_eq!(
@@ -8324,7 +8324,7 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let original_snapshot = app.core.snapshot();
         let repo_b_original_branch = branch_name(entity_for(&original_snapshot, &repo_b))
@@ -8337,7 +8337,7 @@ mod tests {
 
         app.handle_key_event(press(KeyCode::Char('R'), KeyModifiers::SHIFT))
             .expect("handle RefreshSelection");
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let snapshot = app.core.snapshot();
         assert_eq!(
@@ -8443,7 +8443,7 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let original_snapshot = app.core.snapshot();
         let repo_a_original_branch = branch_name(entity_for(&original_snapshot, &repo_a))
@@ -8464,7 +8464,7 @@ mod tests {
 
         app.handle_key_event(press(KeyCode::Char('b'), KeyModifiers::NONE))
             .expect("handle RederiveDefaultBranches");
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let snapshot = app.core.snapshot();
         assert_eq!(
@@ -8510,13 +8510,13 @@ mod tests {
         );
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         checkout_new_branch(&repo_a, "after-focus-gained-a");
         checkout_new_branch(&repo_b, "after-focus-gained-b");
 
         app.on_focus_gained();
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let snapshot = app.core.snapshot();
         assert_eq!(
@@ -8544,19 +8544,24 @@ mod tests {
         app.document.refresh.on_focus = false;
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
 
         let original_branch = branch_name(entity_for(&app.core.snapshot(), &repo))
             .expect("repo has a settled branch before the disabled focus event");
         checkout_new_branch(&repo, "after-disabled-focus-gained");
 
         app.on_focus_gained();
-        app.core.settle(Duration::from_millis(200));
+        // The number is the claim, not a backstop: a window wide enough for a Generation
+        // this event should never have started to land in, and no wider. An expiry is a
+        // reading rather than a failure (it means something was outstanding for the whole
+        // window), so it is folded into the report below instead of panicking.
+        let settled_inside_the_window = app.core.try_settle(Duration::from_millis(200)).is_ok();
 
         assert_eq!(
             branch_name(entity_for(&app.core.snapshot(), &repo)).as_deref(),
             Some(original_branch.as_str()),
-            "refresh.on_focus = false must gate the trigger outright, not merely delay it"
+            "refresh.on_focus = false must gate the trigger outright, not merely delay it; \
+             the settle gate reached zero inside the window: {settled_inside_the_window}"
         );
     }
 
@@ -8579,7 +8584,7 @@ mod tests {
         let mut app = test_app(&root);
         let keys = entity_keys(&app.core.snapshot());
         app.core.refresh(&keys);
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         let generation_before = app.core.snapshot().generation;
 
         // `Event::FocusGained` never arrives in this test, the same as a terminal or
@@ -8831,7 +8836,7 @@ mod tests {
         app.on_focus_gained();
 
         assert!(app.action_run.is_none() && !app.core.action_running());
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         assert!(
             !hook_ran_in(&repo),
             "a Generation nobody asked for must never fire the hook"
@@ -8853,7 +8858,7 @@ mod tests {
         app.on_resume();
 
         assert!(app.action_run.is_none() && !app.core.action_running());
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         assert!(
             !hook_ran_in(&repo),
             "returning from suspension is not a Refresh the user asked for"
@@ -8881,7 +8886,7 @@ mod tests {
         app.core.refresh(&entity_keys(&app.core.snapshot()));
 
         assert!(app.action_run.is_none() && !app.core.action_running());
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         assert!(
             !hook_ran_in(&repo),
             "a Generation started off the key path must run no Action at all, which is what \
@@ -8921,7 +8926,7 @@ mod tests {
             .expect("handle RefreshAll");
 
         wait_for("the slow Action to finish", || !app.core.action_running());
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         assert!(
             !hook_ran_in(&repo),
             "the hook yields while a fan-out is in flight, and never queues itself behind it"
@@ -9099,7 +9104,7 @@ mod tests {
             .expect("handle RefreshAll");
 
         assert!(app.action_run.is_none() && !app.core.action_running());
-        app.core.settle(Duration::from_secs(5));
+        app.core.settle();
         assert_ne!(
             app.core.snapshot().generation,
             generation_before,
@@ -9431,26 +9436,31 @@ refresh_all = "z""#,
 
         // `begin_untracked_probe_for_test` marks this entry in flight without spawning
         // anything to complete it, so nothing but a real cancellation can ever release the
-        // one pending `settle` count it registers.
+        // one pending settle-gate count it registers.
         let cancel = app.core.begin_untracked_probe_for_test(&key);
         assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
 
         app.around_entity_handoff(&key, || {});
 
-        // Pausing (which cancels it) has to happen for `settle` to ever return short of its
+        // Pausing (which cancels it) has to happen for `try_settle` to ever return short of its
         // own timeout: nothing else in this sequence releases that one leaked count, since
         // `refresh`'s own per-key redispatch (`on_resume`, called right after) flips the same
         // cancel flag too but never touches the settle gate, so that half of this assertion
         // alone would still pass even with `pause` removed. The elapsed time is what actually
         // distinguishes the two: a build that skips `pause` leaves this count stuck, and
-        // `settle` only ever returns here by running out its own 500ms timeout.
+        // `try_settle` only ever returns here by running out its own 500ms timeout.
         let started = std::time::Instant::now();
-        app.core.settle(Duration::from_millis(500));
+        let settled = app.core.try_settle(Duration::from_millis(500)).is_ok();
         let elapsed = started.elapsed();
 
         assert!(
             cancel.load(std::sync::atomic::Ordering::Acquire),
             "the handoff must pause the core, which cancels whatever was already in flight"
+        );
+        assert!(
+            settled,
+            "the settle gate must actually reach zero here rather than the wait running out \
+             its own timeout, which is the whole distinction this test draws"
         );
         assert!(
             elapsed < Duration::from_millis(400),
@@ -9705,7 +9715,7 @@ refresh_all = "z""#,
         // The postcondition every caller actually reads, waited on directly rather than
         // through a proxy: a row whose cells hold nothing yet folds to InFlight ahead of the
         // receipt's own failure, so "the fan-out finished" is not yet "this row reads
-        // Failed". `Core::settle` cannot stand in for it either, at any deadline, because
+        // Failed". `Core::settle` cannot stand in for it either, at any bound, because
         // `run_action`'s completion clears `action_running` before it dispatches the
         // Generation that raises the settle gate, so a settle called in that window finds
         // the gate at zero and returns at once. Once a row does read Failed it stays that

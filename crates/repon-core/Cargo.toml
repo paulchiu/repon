@@ -66,4 +66,12 @@ rayon = "1.12.0"
 serde = { version = "1.0.229", optional = true, features = ["derive", "rc"] }
 
 [dev-dependencies]
+# This crate on itself, purely to turn `test-util` on for its own test targets. An
+# integration test under `tests/` links against the library built *without* `cfg(test)`,
+# so `liveness` and `Core::settle` are invisible to it unless something in the graph asks
+# for the feature. `repon`'s own dev-dependency already did that for `cargo test
+# --workspace`, and only for that: `cargo test -p repon-core`, which `just test` runs on
+# its own for the `fetch` feature, resolves without `repon` and saw neither. Stripped on
+# publish, like every path-only dev-dependency.
+repon-core = { path = ".", features = ["test-util"] }
 tempfile = "3.27.0"

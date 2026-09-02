@@ -1576,7 +1576,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_secs(5))
+        core.settle()
     }
 
     /// Inits a real disposable git repository at `path` on a named branch with no commit
@@ -1657,7 +1657,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_secs(5))
+        core.settle()
     }
 
     /// A real, settled `Snapshot` off one Repo checked out one commit behind its own default
@@ -1766,7 +1766,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_secs(5))
+        core.settle()
     }
 
     /// One meaning phrase's role, read from theming.md's own "map from meaning to role" table
@@ -3343,7 +3343,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_secs(5))
+        core.settle()
     }
 
     /// `draw_row` reads [`sync_cell_runs`], not [`sync_glyph`], and the two join their runs
@@ -4209,7 +4209,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let snapshot = core.settle(Duration::from_secs(5));
+        let snapshot = core.settle();
 
         let (row, entity) = find_entity_row(&snapshot, "vendor/lib");
         assert!(matches!(entity.kind, Kind::Submodule));
@@ -4285,7 +4285,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        (core.settle(Duration::from_secs(5)), submodule_short_id)
+        (core.settle(), submodule_short_id)
     }
 
     /// A `List` that has been handed a config reading `show_submodules = true`, the same
@@ -4577,7 +4577,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let snapshot = core.settle(Duration::from_secs(5));
+        let snapshot = core.settle();
 
         // The row must exist at all: this lookup panicking is the "no row at all" failure
         // mode criterion 3 forbids.
@@ -4915,7 +4915,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        let snapshot = core.settle(Duration::from_secs(5));
+        let snapshot = core.settle();
 
         (
             snapshot,
@@ -5215,7 +5215,7 @@ mod tests {
             .map(|entity| entity.key.clone())
             .collect();
         core.refresh(&keys);
-        core.settle(Duration::from_secs(5))
+        core.settle()
     }
 
     /// Criterion 2: the branch cell's abbreviation is a fixed nine characters, independent of

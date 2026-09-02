@@ -24,7 +24,7 @@ use crate::{
 /// ([core.rs](https://github.com/paulchiu/repon/blob/main/crates/repon-core/src/core.rs)'s
 /// own doc comment fixes it at thirty seconds); this is that same figure, named here rather
 /// than left as a bare literal at the one call site that needs it. `pub(crate)` so
-/// [`super::status`]'s own `settle` deadline can build on the same number rather than
+/// [`super::status`]'s own `try_settle` deadline can build on the same number rather than
 /// carrying a second, independent thirty.
 pub(crate) const GENERATION_DEADLINE: Duration = Duration::from_secs(30);
 

@@ -3272,6 +3272,7 @@ dependencies = [
  "globset",
  "libc",
  "rayon",
+ "repon-core",
  "serde",
  "tempfile",
 ]

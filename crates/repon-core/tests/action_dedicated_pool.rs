@@ -29,9 +29,9 @@
 //! isolated on its own pool never touches the global pool's workers at all, so the
 //! probe settles in a handful of milliseconds, nowhere near either bound.
 //! `core.settle`'s own bound below is a backstop against a hang, not the assertion
-//! under test: it exists only so a wrong implementation fails this test in seconds
-//! rather than tying up a CI runner, and the steps' own poll cap exists so a failing
-//! run's child processes still exit on their own rather than lingering indefinitely.
+//! under test: it exists only so a wrong implementation reports rather than tying up a
+//! CI runner, and the steps' own poll cap exists so a failing run's child processes
+//! still exit on their own rather than lingering indefinitely.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -118,9 +118,9 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
 
     let core = Core::start(spec(vec![root.clone()]));
     // `Core::start` returns before its own discovery has finished, so the table is
-    // empty until it lands; `settle` is what waits for it. Ten seconds is the same
-    // loose backstop against a hang the settle below carries, not a margin.
-    let snapshot = core.settle(Duration::from_secs(10));
+    // empty until it lands; `settle` is what waits for it, on the workspace's shared
+    // backstop rather than a number of this test's own.
+    let snapshot = core.settle();
     let key_of = |path: &Path| {
         snapshot
             .entities
@@ -161,12 +161,11 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
     // Dispatched immediately after, on the global pool, exactly like every other
     // probe. If the fan-out above ever lands on that same pool, both of its threads
     // are busy polling for `signal`, which does not exist yet, and this has nowhere
-    // to run until one of them gives up on its own 60 second cap. Ten seconds is a
-    // deliberately loose backstop against that hang, not a margin against the
-    // blocked steps' own timing: a correct implementation settles in milliseconds,
-    // nowhere near it.
+    // to run until one of them gives up on its own 60 second cap. `settle` is a
+    // backstop against that hang, not a margin against the blocked steps' own
+    // timing: a correct implementation settles in milliseconds, nowhere near it.
     core.refresh(std::slice::from_ref(&probed_key));
-    let settled = core.settle(Duration::from_secs(10));
+    let settled = core.settle();
 
     let probe_settled = settled
         .entities
