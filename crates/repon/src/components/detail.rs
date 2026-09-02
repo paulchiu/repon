@@ -290,6 +290,19 @@ fn styled_content_lines(
         recent_commits,
     } = entity;
 
+    // A Refresh settles this row's Cells together, so their ages overwhelmingly agree; see
+    // `row_freshness_agreement`'s own doc comment for why printing that agreement once here
+    // replaces each of the six lines below repeating it.
+    let row_freshness = row_freshness_agreement(&[
+        known_age_annotation(branch.settled()),
+        known_age_annotation(sync.settled()),
+        known_age_annotation(base.settled()),
+        known_age_annotation(dirty.settled()),
+        known_age_annotation(state.settled()),
+        known_age_annotation(default_branch.settled()),
+    ]);
+    let collapsed = row_freshness.is_some();
+
     let mut lines: Vec<ContentLine> = Vec::new();
     lines.push(ContentLine::Styled(vec![
         (name.to_string(), name_cell_meaning(*kind).role()),
@@ -300,38 +313,59 @@ fn styled_content_lines(
 
     lines.push(ContentLine::Styled(labelled(
         "branch          ",
-        describe_cell_spans(branch.settled(), head_word, |_| Meaning::FreshValue),
+        own_age_unless_collapsed(
+            describe_cell_spans(branch.settled(), head_word, |_| Meaning::FreshValue),
+            collapsed,
+        ),
     )));
     lines.push(ContentLine::Styled(labelled(
         "sync            ",
-        describe_cell_spans(sync.settled(), sync_word, sync_meaning),
+        own_age_unless_collapsed(
+            describe_cell_spans(sync.settled(), sync_word, sync_meaning),
+            collapsed,
+        ),
     )));
     lines.push(ContentLine::Styled(labelled(
         "base            ",
-        describe_cell_spans(base.settled(), base_word, base_meaning),
+        own_age_unless_collapsed(
+            describe_cell_spans(base.settled(), base_word, base_meaning),
+            collapsed,
+        ),
     )));
     lines.push(ContentLine::Styled(labelled(
         "dirty           ",
-        describe_cell_spans(dirty.settled(), dirty_word, dirty_meaning),
+        own_age_unless_collapsed(
+            describe_cell_spans(dirty.settled(), dirty_word, dirty_meaning),
+            collapsed,
+        ),
     )));
     lines.push(ContentLine::Styled(labelled(
         "state           ",
-        describe_cell_spans(
-            state.settled(),
-            |value| worktree_state_word(value).to_string(),
-            state_meaning,
+        own_age_unless_collapsed(
+            describe_cell_spans(
+                state.settled(),
+                |value| worktree_state_word(value).to_string(),
+                state_meaning,
+            ),
+            collapsed,
         ),
     )));
     lines.push(ContentLine::Styled(labelled(
         "default branch  ",
-        describe_cell_spans(default_branch.settled(), default_branch_word, |_| {
-            Meaning::FreshValue
-        }),
+        own_age_unless_collapsed(
+            describe_cell_spans(default_branch.settled(), default_branch_word, |_| {
+                Meaning::FreshValue
+            }),
+            collapsed,
+        ),
     )));
     for diagnostic_line in default_branch_diagnostics_lines(diagnostics) {
         lines.push(ContentLine::Styled(plain(format!(
             "                {diagnostic_line}"
         ))));
+    }
+    if let Some(freshness) = row_freshness {
+        lines.push(ContentLine::Styled(vec![(freshness, Meaning::Age.role())]));
     }
 
     if let Some(reason) = row_level_failure(diagnostics, last_action) {
@@ -763,14 +797,14 @@ fn sync_meaning(value: &SyncState) -> Meaning {
     }
 }
 
-/// One Cell's whole provenance, spelled out in words, plus its age for a Known value: "fresh
-/// 9s ago", "stale 3m ago", "unknown: timed out", or a Failed cell's own probe message, which
-/// already reads as words (`ProbeError`'s `Display`). Exhaustive over `Option<&Settled<T>>`
-/// with no wildcard arm, the same discipline `list.rs`'s `render_cell` holds, so a `Settled`
-/// shape added later fails to compile here instead of falling through some default reading.
-/// [`styled_content_lines`] now reads [`describe_cell_spans`] directly; this stays as the
-/// plain-text oracle this module's own words-only tests check the formatting against,
-/// independent of colour.
+/// One Cell's whole provenance, spelled out in words, plus its age for a Known value:
+/// "refreshed 9s ago", "stale 3m ago", "unknown: timed out", or a Failed cell's own probe
+/// message, which already reads as words (`ProbeError`'s `Display`). Exhaustive over
+/// `Option<&Settled<T>>` with no wildcard arm, the same discipline `list.rs`'s `render_cell`
+/// holds, so a `Settled` shape added later fails to compile here instead of falling through
+/// some default reading. [`styled_content_lines`] now reads [`describe_cell_spans`] directly;
+/// this stays as the plain-text oracle this module's own words-only tests check the
+/// formatting against, independent of colour.
 #[allow(dead_code)] // read only from `#[cfg(test)]` call sites
 fn describe_cell<T>(
     settled: Option<&Settled<T>>,
@@ -785,23 +819,23 @@ fn describe_cell<T>(
 /// [`describe_cell`]'s styled counterpart: the value takes `meaning_for_value`'s own role and
 /// the freshness annotation (or the Unknown, Failed, NotApplicable and Loading words) takes
 /// the role theming.md's map already gives that state, matching `list.rs`'s `cell_role`
-/// rather than inventing a second answer for the same `Settled` shape.
+/// rather than inventing a second answer for the same `Settled` shape. Always carries its own
+/// annotation: [`styled_content_lines`] is the one caller that drops it, via
+/// `own_age_unless_collapsed`, once [`row_freshness_agreement`] says the whole row already
+/// said it once.
 fn describe_cell_spans<T>(
     settled: Option<&Settled<T>>,
     format_value: impl FnOnce(&T) -> String,
     meaning_for_value: impl FnOnce(&T) -> Meaning,
 ) -> StyledLine {
     match settled {
-        Some(Settled::Known { value, at, stale }) => {
-            let word = if *stale { "stale" } else { "fresh" };
-            vec![
-                (format_value(value), meaning_for_value(value).role()),
-                (
-                    format!("   {word} {}", format_age(*at)),
-                    Meaning::Age.role(),
-                ),
-            ]
-        }
+        Some(Settled::Known { value, at, stale }) => vec![
+            (format_value(value), meaning_for_value(value).role()),
+            (
+                format!("   {}", age_annotation(*at, *stale)),
+                Meaning::Age.role(),
+            ),
+        ],
         Some(Settled::Unknown(reason)) => vec![(
             format!("unknown: {}", describe_unknown(*reason)),
             Meaning::StaleOrUnknownGutterMark.role(),
@@ -812,6 +846,64 @@ fn describe_cell_spans<T>(
         Some(Settled::NotApplicable) => vec![("not applicable".to_string(), Role::Text)],
         None => vec![("loading".to_string(), Meaning::LoadingSpinner.role())],
     }
+}
+
+/// A Known cell's freshness in words: the reading word, "refreshed" once settled or "stale"
+/// once past the age threshold, describes when Repon last looked rather than the value itself,
+/// followed by [`format_age`]'s own elapsed text. Shared by [`describe_cell_spans`]'s per-cell
+/// annotation and [`row_freshness_agreement`]'s collapsed line so the two can never read
+/// differently for the same fact.
+fn age_annotation(at: Timestamp, stale: bool) -> String {
+    let word = if stale { "stale" } else { "refreshed" };
+    format!("{word} {}", format_age(at))
+}
+
+/// A Cell's own [`age_annotation`] when it is `Known`, or `None` for every other `Settled`
+/// shape: `Unknown`, `Failed`, `NotApplicable` and a still-loading cell carry no age and so
+/// never enter [`row_freshness_agreement`]'s test, per this ticket's own scope.
+fn known_age_annotation<T>(settled: Option<&Settled<T>>) -> Option<String> {
+    match settled {
+        Some(Settled::Known {
+            value: _,
+            at,
+            stale,
+        }) => Some(age_annotation(*at, *stale)),
+        _ => None,
+    }
+}
+
+/// The one freshness fact this row's Known cells share, or `None` when fewer than two of them
+/// are Known or any two disagree. A Refresh settles a row's cells together, so on the
+/// overwhelmingly common path every Known cell's annotation agrees to the second; printing
+/// that agreement four times over spends the pane's widest columns on a constant and buries
+/// the one case, a genuine disagreement, this per-cell annotation exists to show. Comparing
+/// the already-formatted text rather than the raw `Timestamp` is deliberate: two cells a
+/// Refresh settles microseconds apart still read the same age, and a `stale` cell reads a
+/// different word from a fresh neighbour even at the same instant, so either kind of real
+/// difference already fails this comparison without a separate flag for it. A lone Known cell
+/// has nothing to repeat, so it keeps its own inline annotation rather than moving to a line
+/// that would say the same thing once anyway.
+fn row_freshness_agreement(known_annotations: &[Option<String>]) -> Option<String> {
+    let mut known = known_annotations.iter().flatten();
+    let first = known.next()?;
+    let mut agreeing = 1;
+    for other in known {
+        if other != first {
+            return None;
+        }
+        agreeing += 1;
+    }
+    (agreeing >= 2).then(|| first.clone())
+}
+
+/// Drops [`describe_cell_spans`]'s own age annotation once [`row_freshness_agreement`] has
+/// already printed the row's shared fact as its own line: a `Known` cell's spans are its value
+/// followed by that annotation, so the value alone is every span but the last.
+fn own_age_unless_collapsed(mut spans: StyledLine, collapsed: bool) -> StyledLine {
+    if collapsed {
+        spans.truncate(1);
+    }
+    spans
 }
 
 /// The two closed [`Unknown`] reasons, distinguished by name even though both share the
@@ -967,8 +1059,8 @@ mod tests {
     use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
     use repon_core::{
-        CaptureElision, Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec, StepOutcome,
-        StepResult, liveness::wait_for,
+        CaptureElision, Cell, Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec,
+        StepOutcome, StepResult, liveness::wait_for,
     };
 
     use super::*;
@@ -1098,7 +1190,7 @@ mod tests {
     // --- describe_cell: provenance in words, plus age computed from the settled timestamp ---
 
     #[test]
-    fn a_known_fresh_value_reads_its_word_and_age_in_words() {
+    fn a_known_refreshed_value_reads_its_word_and_age_in_words() {
         let settled = Settled::Known {
             value: 5u32,
             at: Timestamp::now(),
@@ -1107,7 +1199,7 @@ mod tests {
 
         let text = describe_cell(Some(&settled), |value| value.to_string());
 
-        assert!(text.starts_with("5   fresh"), "got {text:?}");
+        assert!(text.starts_with("5   refreshed"), "got {text:?}");
         assert!(
             text.contains("ago") || text.contains("just now"),
             "got {text:?}"
@@ -1115,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn a_known_stale_value_reads_stale_rather_than_fresh() {
+    fn a_known_stale_value_reads_stale_rather_than_refreshed() {
         let settled = Settled::Known {
             value: 5u32,
             at: Timestamp::now(),
@@ -1125,7 +1217,7 @@ mod tests {
         let text = describe_cell(Some(&settled), |value| value.to_string());
 
         assert!(text.contains("stale"), "got {text:?}");
-        assert!(!text.contains("fresh"), "got {text:?}");
+        assert!(!text.contains("refreshed"), "got {text:?}");
     }
 
     #[test]
@@ -1492,6 +1584,108 @@ mod tests {
         }
     }
 
+    // --- row_freshness_agreement: one freshness fact printed once, or each cell's own ---
+
+    /// A `Known` cell settled at an explicit instant, so two cells can be given the same `at`
+    /// (or a deliberately different one) without racing separate `Timestamp::now()` calls
+    /// against each other.
+    fn settled_known_at<T>(value: T, at: Timestamp, stale: bool) -> Cell<T> {
+        Cell::already_settled(Settled::Known { value, at, stale })
+    }
+
+    #[test]
+    fn a_rows_agreeing_known_cells_print_their_shared_freshness_once_and_drop_it_per_cell() {
+        let at = Timestamp::now();
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), at, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, at, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), at, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), at, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        for label in ["branch", "sync", "dirty", "default branch"] {
+            let line = line_labelled(&lines, label);
+            assert!(!line.contains("refreshed"), "got {line:?}");
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("refreshed"))
+                .count(),
+            1,
+            "expected exactly one collapsed freshness line, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_rows_disagreeing_known_cells_keep_their_own_freshness_and_print_no_shared_line() {
+        let now = Timestamp::now();
+        let two_hours_ago =
+            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(7_200));
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, two_hours_ago, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let branch_line = line_labelled(&lines, "branch");
+        let sync_line = line_labelled(&lines, "sync");
+        assert!(
+            branch_line.contains("refreshed") && branch_line.contains("just now"),
+            "got {branch_line:?}"
+        );
+        assert!(
+            sync_line.contains("refreshed") && sync_line.contains("2h ago"),
+            "got {sync_line:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("refreshed ")),
+            "a genuine disagreement must never collapse into one shared line, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_cell_amid_fresh_neighbours_at_the_same_instant_still_keeps_its_own_line() {
+        let at = Timestamp::now();
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), at, true);
+        row.sync = settled_known_at(SyncState::NoUpstream, at, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let branch_line = line_labelled(&lines, "branch");
+        let sync_line = line_labelled(&lines, "sync");
+        assert!(branch_line.contains("stale"), "got {branch_line:?}");
+        assert!(sync_line.contains("refreshed"), "got {sync_line:?}");
+        assert!(
+            !lines.iter().any(|line| line.starts_with("refreshed ")),
+            "a stale cell beside a fresh one at the same instant must never collapse into one \
+             shared line, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_known_cell_keeps_its_own_inline_freshness_rather_than_a_pointless_shared_line() {
+        let mut row = entity("a");
+        row.dirty = settled_known_at(DirtyCounts::default(), Timestamp::now(), false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let dirty_line = line_labelled(&lines, "dirty");
+        assert!(dirty_line.contains("refreshed"), "got {dirty_line:?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("refreshed"))
+                .count(),
+            1,
+            "one Known cell has nothing to repeat, so it should not also get a standalone \
+             line, got {lines:?}"
+        );
+    }
+
     /// The wiring half of criterion 3: `default_branch_diagnostics_lines` above proves the
     /// words are right, but nothing yet proves `content_lines` actually calls it. Without this,
     /// a diagnostics fact computed correctly could still sit unread and never reach the pane.
@@ -1650,7 +1844,11 @@ mod tests {
     }
 
     /// The defining behaviour of criterion 2: every one of the six per-Cell lines reads its
-    /// own cell's value and its own cell's age, never a neighbour's. `base` (`Cell<u32>`) and
+    /// own cell's value, never a neighbour's. The submodule's own branch, sync, dirty and
+    /// default branch settle in the same refresh and so share one age, which
+    /// `row_freshness_agreement` collapses onto its own line rather than repeating per cell;
+    /// this test checks that collapsed line exists once, rather than the age inside each
+    /// per-cell line, for that reason. `base` (`Cell<u32>`) and
     /// `dirty` (`Cell<DirtyCounts>`) now carry distinct types, so a wiring bug that read one
     /// from the other could not compile; this test still proves it at the value level rather
     /// than resting on that alone, since a future change could narrow both back to the same
@@ -1730,20 +1928,21 @@ mod tests {
         let default_branch_line = line_labelled(&lines, "default branch");
 
         assert!(
-            branch_line.contains("feature-distinct-branch") && branch_line.contains("fresh"),
+            branch_line.contains("feature-distinct-branch") && !branch_line.contains("refreshed"),
             "got {branch_line:?}"
         );
         assert!(
-            default_branch_line.contains("origin/main") && default_branch_line.contains("fresh"),
+            default_branch_line.contains("origin/main")
+                && !default_branch_line.contains("refreshed"),
             "got {default_branch_line:?}"
         );
         assert!(
-            sync_line.contains("no upstream configured") && sync_line.contains("fresh"),
+            sync_line.contains("no upstream configured") && !sync_line.contains("refreshed"),
             "the submodule's own branch has a remote but no upstream configured for it, got \
              {sync_line:?}"
         );
         assert!(
-            dirty_line.contains("clean") && dirty_line.contains("fresh"),
+            dirty_line.contains("clean") && !dirty_line.contains("refreshed"),
             "the submodule's own working tree is freshly committed and clean, got \
              {dirty_line:?}"
         );
@@ -1754,6 +1953,11 @@ mod tests {
         assert!(
             state_line.ends_with("unknown: no default branch found"),
             "got {state_line:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("refreshed")
+                && (line.contains("ago") || line.contains("just now"))),
+            "expected the four agreeing Known cells' shared age on its own line, got {lines:?}"
         );
 
         // Defence in depth beyond the type-level guard `DirtyCounts` now gives `dirty` over
@@ -1784,7 +1988,7 @@ mod tests {
 
         assert_eq!(spans[0], ("5".to_string(), Meaning::Dirty.role()));
         assert_eq!(spans[1].1, Meaning::Age.role());
-        assert!(spans[1].0.contains("fresh"), "got {spans:?}");
+        assert!(spans[1].0.contains("refreshed"), "got {spans:?}");
     }
 
     #[test]
