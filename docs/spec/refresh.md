@@ -10,7 +10,7 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 
 | trigger | what it does |
 | --- | --- |
-| Startup | Generation 1 over everything, with an empty prior state. `Core::start` starts it itself: it returns before its own discovery has landed, and that same walk resolves the Generation's order and dispatches it, so a launch walks the tree once and a consumer names no keys. |
+| Startup | Generation 1 over everything the startup Set covers, with an empty prior state. That Set is the one the last session was viewing unless `--set` or `REPON_SET` names another ([config.md](config.md#sets)'s Selection order). `Core::start` starts it itself: it returns before its own discovery has landed, and that same walk resolves the Generation's order and dispatches it, so a launch walks the tree once and a consumer names no keys. |
 | The refresh key | A new generation over everything, on any chord dispatching `Action::RefreshAll` (`r` and `F5` by default), settled in [keybindings.md](keybindings.md). |
 | Refreshing the Selection | A new generation over the Selection only, on any chord dispatching `Action::RefreshSelection` (`R` by default). A separate explicit gesture, not the default, because after acting on three Repos you want those three re-read now rather than a four second sweep. |
 | Returning from a Launcher | The entity that was handed off is re-probed first and synchronously, then a normal generation starts. |
