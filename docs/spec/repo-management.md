@@ -81,6 +81,12 @@ A Worktree row's own gate line discloses the same first two facts about its own 
 
 `ignore` and `unignore` use the ordinary Action confirm gate with no additional lines, since neither destroys anything.
 
+## Once accepted
+
+`y` closes the gate immediately and replaces it with a Notice naming the operation and how many rows it covers, before any of the work below starts. `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and the gate is the worst frame to leave standing through that: it still reads as a question, so a user watching it sit unchanged has no way to tell a dropped keypress from one already running. That Notice is replaced by the summary once the run finishes, the counts "Receipts" below reads its words from.
+
+This is still the one call [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) already describes: `run_management` starts no Generation and reaches no intermediate state a keypress could observe beyond the two Notices, so nothing here changes when `before_sync` and `after_sync` fire or how a Selection resolves.
+
 ## Writing config
 
 Every write is a read, a modify and a write of `config.toml` on disk. There is no lock and no watcher, so the last writer wins against an editor open on the same file; that is the exposure a user already has between two editors.

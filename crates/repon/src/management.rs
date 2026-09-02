@@ -347,6 +347,15 @@ fn drop_worktrees_covered_by_their_own_selected_parent(targets: &mut Vec<Target>
 /// trash, which the gate says in as many words").
 pub(crate) const NO_UNDO: &str = "there is no undo and no trash";
 
+/// The Notice `App::run_management` raises the instant the confirm gate is accepted, replacing
+/// the gate itself before any of the operation's blocking work starts: [`Report::summary`]
+/// replaces it once that work finishes. Named after `eligible_count`, the same row count the
+/// gate's own [`headline`] showed, since the gate and the run must agree on how many rows this
+/// is about.
+pub(crate) fn running_notice(operation: Operation, eligible: usize) -> String {
+    format!("{}: running on {eligible} repos", operation.name())
+}
+
 fn headline(operation: Operation, eligible: usize, refused: usize) -> String {
     let name = operation.name();
     if refused == 0 {
