@@ -83,9 +83,11 @@ A Worktree row's own gate line discloses the same first two facts about its own 
 
 ## Once accepted
 
-`y` closes the gate immediately and replaces it with a Notice naming the operation and how many rows it covers, before any of the work below starts. `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and the gate is the worst frame to leave standing through that: it still reads as a question, so a user watching it sit unchanged has no way to tell a dropped keypress from one already running. That Notice is replaced by the summary once the run finishes, the counts "Receipts" below reads its words from.
+`y` closes the gate immediately and replaces it with a Notice naming the operation and how many rows it covers, before any of the work below starts. `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and the gate is the worst frame to leave standing through that: it still reads as a question, so a user watching it sit unchanged has no way to tell a dropped keypress from one already running.
 
-This is still the one call [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) already describes: `run_management` starts no Generation and reaches no intermediate state a keypress could observe beyond the two Notices, so nothing here changes when `before_sync` and `after_sync` fire or how a Selection resolves.
+That first Notice is followed by one per row, in the Selection's own order: each names the row and its position among the whole run (`delete: manage-pr-1358 (3/12)`), painted before that row's own work starts. A screen that stopped moving the moment the gate closed would be nearly as uninformative as the gate itself, since a multi-row run gives no other sign of whether it is on the first row or the last, and a single large row has nothing else to show while it works. The last row's own Notice is replaced by the summary once the run finishes, the counts "Receipts" below reads its words from.
+
+This is still the one call [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) already describes: `run_management` starts no Generation and reaches no intermediate state a keypress could observe beyond these Notices, so nothing here changes when `before_sync` and `after_sync` fire or how a Selection resolves.
 
 ## Writing config
 

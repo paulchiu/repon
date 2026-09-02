@@ -1574,7 +1574,7 @@ impl App {
     /// `AcceptCompletion` (`Tab`) stays inert here permanently, not merely until this ticket:
     /// keybindings.md scopes `Tab`'s completion-accept to the Filter line alone, and this
     /// palette has no completion list of its own.
-    fn handle_action_palette_key(&mut self, key: KeyEvent, tui: Option<&mut Tui>) {
+    fn handle_action_palette_key(&mut self, key: KeyEvent, mut tui: Option<&mut Tui>) {
         let Some(palette) = &self.action_palette else {
             return;
         };
@@ -1596,10 +1596,12 @@ impl App {
                     }
                     if let Some(operation) = management {
                         // `tui` paints the gate coming down before `run_management`'s own
-                        // blocking work starts; a test with none still gets the gate closed
-                        // and the running Notice set, just no live terminal to draw them to.
+                        // blocking work starts, and repaints before every row after that; a
+                        // test with none still gets the gate closed and each Notice set, just
+                        // no live terminal to draw them to. `as_deref_mut` reborrows rather
+                        // than consuming `tui`, since this hook runs more than once.
                         self.run_management(operation, |app| {
-                            let Some(tui) = tui else {
+                            let Some(tui) = tui.as_deref_mut() else {
                                 return;
                             };
                             if let Err(err) = app.render(tui) {
@@ -2131,12 +2133,18 @@ impl App {
     /// [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)
     /// fixes for `on_refresh`.
     ///
-    /// `paint` runs once the gate is down and the running Notice is up, but before any of the
-    /// blocking work below: a live `Tui` draw from [`Self::handle_events`] in production, a
-    /// no-op everywhere else. `delete`'s own worktree walk and hooks can take seconds, and the
-    /// confirm gate is the worst frame to leave standing through that, since it still reads as
-    /// a question a user might answer twice.
-    fn run_management(&mut self, operation: management::Operation, paint: impl FnOnce(&mut Self)) {
+    /// `paint` runs once the gate is down and the running Notice is up, before any of the
+    /// blocking work below, and again before each row's own work starts: a live `Tui` draw
+    /// from [`Self::handle_events`] in production, a no-op everywhere else. `delete`'s own
+    /// worktree walk and hooks can take seconds per row, and the confirm gate is the worst
+    /// frame to leave standing through that, since it still reads as a question a user might
+    /// answer twice; a screen that never moves again once the gate closes is barely better,
+    /// which is why the loop below repaints between rows rather than once at the start alone.
+    fn run_management(
+        &mut self,
+        operation: management::Operation,
+        mut paint: impl FnMut(&mut Self),
+    ) {
         // scan: management_write_reload begin -- criterion 8: everything between this pair is
         // what a management write does after the gate is accepted, and the test over this
         // region asserts it reaches config through `reload_config` and touches no in-memory
@@ -2162,20 +2170,36 @@ impl App {
         let after_sync_hook = self
             .after_sync_action()
             .map(crate::action_palette::to_action_spec);
-        let run_sync_hook = |hook: &Option<repon_core::ActionSpec>, key: &EntityKey| {
-            let action = hook.as_ref()?;
-            let receipt = self.core.run_action_for_entity_blocking(action, key)?;
-            Some(management::hook_outcome_from_receipt(&receipt))
-        };
-        let report = management::run(
-            &plan,
-            &self.config_file,
-            |key| self.core.worktree_admin_dir(key).ok(),
-            |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
-            |key| self.core.attempt_auto_update(key),
-            |key| run_sync_hook(&before_sync_hook, key),
-            |key| run_sync_hook(&after_sync_hook, key),
-        );
+        // Each row gets its own Notice, naming it and its position, before that row's own
+        // work starts: over several rows this makes the run legible rather than a frozen
+        // count, and for one large row it is the only thing on screen while it runs.
+        let total = plan.targets.len();
+        let mut records = Vec::with_capacity(total);
+        for (index, target) in plan.targets.iter().enumerate() {
+            self.set_notice(management::row_notice(
+                operation,
+                &target.name,
+                index + 1,
+                total,
+            ));
+            paint(self);
+            let run_sync_hook = |hook: &Option<repon_core::ActionSpec>, key: &EntityKey| {
+                let action = hook.as_ref()?;
+                let receipt = self.core.run_action_for_entity_blocking(action, key)?;
+                Some(management::hook_outcome_from_receipt(&receipt))
+            };
+            records.push(management::run_one_record(
+                &plan,
+                target,
+                &self.config_file,
+                |key| self.core.worktree_admin_dir(key).ok(),
+                |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
+                |key| self.core.attempt_auto_update(key),
+                |key| run_sync_hook(&before_sync_hook, key),
+                |key| run_sync_hook(&after_sync_hook, key),
+            ));
+        }
+        let report = management::Report { operation, records };
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
         }
@@ -5504,10 +5528,11 @@ mod tests {
     }
 
     /// `run_management`'s own paint hook, the seam a live `Tui` (in `App::run`) or nothing
-    /// (every other caller) is handed through: it must run once the gate is already down and
-    /// the running Notice already up, and it must run before `management::run` does anything
-    /// to disk. A hook that fires late, or fires against a gate still open, fails this the
-    /// same way a real terminal left showing the stale gate for the whole run would.
+    /// (every other caller) is handed through: the first call must land once the gate is
+    /// already down and the running Notice already up, before `management::run_one_record`
+    /// does anything to disk, and a later call must land once that row's own Notice is up. A
+    /// hook that fires late, or fires against a gate still open, fails this the same way a
+    /// real terminal left showing the stale gate for the whole run would.
     #[test]
     fn the_gate_closes_and_a_running_notice_is_set_before_the_blocking_delete_starts() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5522,28 +5547,81 @@ mod tests {
             "the fixture must open the gate before the hook can be asked to close it"
         );
 
-        let mut painted = false;
+        let mut notices_seen = Vec::new();
         app.run_management(management::Operation::Delete, |app| {
-            painted = true;
             assert!(
                 app.action_palette.is_none(),
-                "the gate must already be closed by the time the frame paints"
-            );
-            assert_eq!(
-                app.notice(),
-                Some("delete: running on 1 repos"),
-                "the screen must already say what is about to run"
+                "the gate must already be closed by the time a frame paints"
             );
             assert!(
                 repo.exists(),
-                "the paint must happen before the blocking delete, not after it"
+                "every paint before the row's own work must see the tree still there"
             );
+            notices_seen.push(app.notice().map(str::to_string));
         });
 
-        assert!(painted, "run_management must call its own paint hook");
+        assert_eq!(
+            notices_seen.first().cloned().flatten().as_deref(),
+            Some("delete: running on 1 repos"),
+            "the first paint must already say what is about to run, got {notices_seen:?}"
+        );
+        assert!(
+            notices_seen
+                .iter()
+                .any(|notice| notice.as_deref() == Some("delete: repo-a (1/1)")),
+            "a later paint must name the row and its position before that row's own work \
+             starts, got {notices_seen:?}"
+        );
         assert!(
             !repo.exists(),
             "the run still deletes the tree once painted"
+        );
+    }
+
+    /// Over several rows, not just one: every target gets its own paint before its own work
+    /// starts, naming it and its position among the whole run, in the plan's own order, so a
+    /// multi-row run reads as progress rather than a frozen count
+    /// (issue #336: "over N rows the user cannot tell whether it is on the first or the
+    /// last").
+    #[test]
+    fn run_management_paints_once_per_row_naming_each_ones_position_in_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in ["repo-a", "repo-b", "repo-c"] {
+            init_repo(&root.join(name));
+        }
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let entities = app.core.snapshot().entities;
+        assert_eq!(
+            entities.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+        let ordered_keys: Vec<_> = entities.iter().map(|entity| entity.key.clone()).collect();
+        app.management_plan = Some(management::Plan::new(
+            management::Operation::Ignore,
+            &entities,
+            &ordered_keys,
+        ));
+
+        let mut notices_seen = Vec::new();
+        app.run_management(management::Operation::Ignore, |app| {
+            notices_seen.push(app.notice().map(str::to_string));
+        });
+
+        let mut expected = vec![Some("ignore: running on 3 repos".to_string())];
+        expected.extend(entities.iter().enumerate().map(|(index, entity)| {
+            Some(management::row_notice(
+                management::Operation::Ignore,
+                &entity.name,
+                index + 1,
+                3,
+            ))
+        }));
+        assert_eq!(
+            notices_seen, expected,
+            "each row must paint its own Notice, in order, before that row's own work starts"
         );
     }
 
@@ -6067,7 +6145,7 @@ mod tests {
     /// the fast-forward: [`repon_core::Core::worktree_admin_dir`],
     /// [`repon_core::Core::linked_worktree_paths`] and
     /// [`repon_core::Core::attempt_auto_update`] at the one call site, not a literal this
-    /// crate could hand [`crate::management::run`] instead.
+    /// crate could hand [`crate::management::run_one_record`] instead.
     #[test]
     fn the_delete_run_reads_its_worktree_removal_from_the_core_rather_than_a_literal() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -6075,7 +6153,7 @@ mod tests {
 
         let call_sites: Vec<&str> = source
             .lines()
-            .filter(|line| line.contains("management::run("))
+            .filter(|line| line.contains("management::run_one_record("))
             .collect();
         assert_eq!(
             call_sites.len(),

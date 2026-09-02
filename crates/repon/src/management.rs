@@ -356,6 +356,21 @@ pub(crate) fn running_notice(operation: Operation, eligible: usize) -> String {
     format!("{}: running on {eligible} repos", operation.name())
 }
 
+/// The Notice `App::run_management` paints before each row's own work starts, replacing
+/// [`running_notice`] as the run goes: the operation, the row's own name, and its position
+/// among every row this run visits in order. A refused row is still visited and still
+/// counts towards `total`, since the run reports it too rather than skipping straight past
+/// it; only an eligible row's own work can stall, but naming a refused row here as it is
+/// reached keeps the position honest over the whole Selection the gate showed.
+pub(crate) fn row_notice(
+    operation: Operation,
+    name: &str,
+    position: usize,
+    total: usize,
+) -> String {
+    format!("{}: {name} ({position}/{total})", operation.name())
+}
+
 fn headline(operation: Operation, eligible: usize, refused: usize) -> String {
     let name = operation.name();
     if refused == 0 {
@@ -718,20 +733,63 @@ impl Report {
     }
 }
 
+/// Runs `plan`'s operation against one `target` alone, timing the act and turning its
+/// outcome into a `Record`. Exposed separately from [`run`] so a caller that wants to act
+/// between rows, a live paint naming each one as it starts, can drive the Selection's own
+/// loop itself rather than losing control to `run` for the whole thing at once; `run` itself
+/// is this called once per target, in order, with nothing between calls.
+///
+/// `worktree_admin_dir`, `linked_worktree_paths` and `attempt_sync` are
+/// [`repon_core::Core::worktree_admin_dir`], [`repon_core::Core::linked_worktree_paths`] and
+/// [`repon_core::Core::attempt_auto_update`] at the one call site; taken as parameters, the
+/// same way [`Plan::with_risk`] takes `read`, so this module never needs a `Core` to be
+/// tested. `run_before_sync_hook` and `run_after_sync_hook` are consulted for
+/// `Operation::Sync` alone, `None` meaning the Set active for this run names no hook at all
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_one_record(
+    plan: &Plan,
+    target: &Target,
+    config_file: &Path,
+    worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
+    linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
+    attempt_sync: impl Fn(&EntityKey) -> AutoUpdateAttempt,
+    run_before_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
+    run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
+) -> Record {
+    let started = Instant::now();
+    let outcome = match target.eligibility {
+        Eligibility::Refused(refusal) => Outcome::Refused(refusal),
+        Eligibility::Eligible => run_one(
+            plan.operation,
+            target,
+            config_file,
+            &worktree_admin_dir,
+            &linked_worktree_paths,
+            &attempt_sync,
+            &run_before_sync_hook,
+            &run_after_sync_hook,
+        )
+        .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
+    };
+    Record {
+        key: target.key.clone(),
+        name: Arc::clone(&target.name),
+        outcome,
+        elapsed: started.elapsed(),
+    }
+}
+
 /// Runs `plan` against `config_file`, in the Selection's own order, and reports what happened
 /// to every row including the ones the gate already refused.
 ///
 /// `config_file` is passed in rather than resolved here, so a test drives this against a
 /// temp directory of its own making and never against the process-wide path
-/// [`crate::config::config_file`] fixes.
-/// Runs `plan` against `config_file`. `worktree_admin_dir`, `linked_worktree_paths` and
-/// `attempt_sync` are [`repon_core::Core::worktree_admin_dir`],
-/// [`repon_core::Core::linked_worktree_paths`] and [`repon_core::Core::attempt_auto_update`]
-/// at the one call site; taken as parameters, the same way [`Plan::with_risk`] takes `read`,
-/// so this module never needs a `Core` to be tested. `run_before_sync_hook` and
-/// `run_after_sync_hook` are consulted for `Operation::Sync` alone, `None` meaning the Set
-/// active for this run names no hook at all
-/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
+/// [`crate::config::config_file`] fixes. Every row is [`run_one_record`], called once per
+/// target with nothing of this function's own between calls; a caller that needs to act
+/// between rows drives `run_one_record` itself instead.
+#[allow(dead_code)] // exercised by this module's own tests; production drives run_one_record
+// itself, to repaint between rows
 pub(crate) fn run(
     plan: &Plan,
     config_file: &Path,
@@ -745,27 +803,16 @@ pub(crate) fn run(
         .targets
         .iter()
         .map(|target| {
-            let started = Instant::now();
-            let outcome = match target.eligibility {
-                Eligibility::Refused(refusal) => Outcome::Refused(refusal),
-                Eligibility::Eligible => run_one(
-                    plan.operation,
-                    target,
-                    config_file,
-                    &worktree_admin_dir,
-                    &linked_worktree_paths,
-                    &attempt_sync,
-                    &run_before_sync_hook,
-                    &run_after_sync_hook,
-                )
-                .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
-            };
-            Record {
-                key: target.key.clone(),
-                name: Arc::clone(&target.name),
-                outcome,
-                elapsed: started.elapsed(),
-            }
+            run_one_record(
+                plan,
+                target,
+                config_file,
+                &worktree_admin_dir,
+                &linked_worktree_paths,
+                &attempt_sync,
+                &run_before_sync_hook,
+                &run_after_sync_hook,
+            )
         })
         .collect();
     Report {
@@ -1021,6 +1068,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the compiled built-ins must be exactly the specification's own operations, in \
              its own order"
+        );
+    }
+
+    /// The per-row Notice `App::run_management` paints before each row's own work starts:
+    /// the operation, the row's own name, and its position among every row this run visits,
+    /// refused rows counted too since the run still visits them in order.
+    #[test]
+    fn row_notice_names_the_operation_the_row_and_its_position() {
+        assert_eq!(
+            row_notice(Operation::Delete, "manage-pr-1358", 3, 12),
+            "delete: manage-pr-1358 (3/12)"
         );
     }
 
