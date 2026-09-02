@@ -1,6 +1,6 @@
-//! `state.toml`: the Selection and the committed Filter, persisted per scope so a quit and
-//! relaunch restores each while every git value is recomputed from scratch
-//! ([config.md](../../../docs/spec/config.md#state),
+//! `state.toml`: the Selection, the committed Filter and the table's own `RowOrder`,
+//! persisted per scope so a quit and relaunch restores each while every git value is
+//! recomputed from scratch ([config.md](../../../docs/spec/config.md#state),
 //! [0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). This module
 //! owns the file's shape and its scope key; [`crate::app::App::restore_session_state`] and
 //! [`crate::app::App::persist_state`] are the only callers.
@@ -10,18 +10,27 @@ use std::{collections::BTreeMap, fs, path::Path};
 use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
+use crate::sort::RowOrder;
+
 const STATE_FILE: &str = "state.toml";
 
-/// One scope's whole session state: the Selection as a list of display names, and the
-/// committed Filter as its own expression string. Nothing computed from git is ever a field
-/// here, because session state is user input and can only be absent, never stale
-/// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+/// One scope's whole session state: the Selection as a list of display names, the committed
+/// Filter as its own expression string, and the table's `RowOrder`. Nothing computed from
+/// git is ever a field here, because session state is user input and can only be absent,
+/// never stale ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+/// `sort` is `None` for a scope nothing has ever chosen an order for, which
+/// [`crate::app::App::restore_session_state`] reads as [`RowOrder::cold_start`] rather than
+/// [`RowOrder::Natural`]
+/// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+/// amendment).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScopeState {
     #[serde(default)]
     pub(crate) selection: Vec<String>,
     #[serde(default)]
     pub(crate) filter: String,
+    #[serde(default)]
+    pub(crate) sort: Option<RowOrder>,
 }
 
 /// The whole file: a map of scope key to its own [`ScopeState`], so two Sets, or two working
@@ -100,6 +109,7 @@ mod tests {
             ScopeState {
                 selection: vec!["repo-a".to_string(), "repo-b".to_string()],
                 filter: "kind:worktree".to_string(),
+                sort: None,
             },
         );
 
@@ -111,17 +121,18 @@ mod tests {
             ScopeState {
                 selection: vec!["repo-a".to_string(), "repo-b".to_string()],
                 filter: "kind:worktree".to_string(),
+                sort: None,
             }
         );
     }
 
     /// Criterion 2's own risk: a round trip of one field proves nothing about what else the
-    /// file carries. This asserts the whole written file's content is exactly the two fields
-    /// a scope owns, so a later field added to the struct (a branch name, a commit id) would
-    /// fail this the moment it serialised, not only when some other test happened to read it
-    /// back.
+    /// file carries. This asserts the whole written file's content is exactly the three
+    /// fields a scope owns, so a later field added to the struct (a branch name, a commit
+    /// id) would fail this the moment it serialised, not only when some other test happened
+    /// to read it back.
     #[test]
-    fn the_written_file_holds_only_selection_and_filter_nothing_else() {
+    fn the_written_file_holds_only_selection_filter_and_sort_nothing_else() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut file = StateFile::default();
         file.set_scope(
@@ -129,6 +140,7 @@ mod tests {
             ScopeState {
                 selection: vec!["repo-a".to_string()],
                 filter: "is:dirty".to_string(),
+                sort: Some(RowOrder::cold_start()),
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -144,9 +156,71 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["filter", "selection"],
-            "a scope must hold exactly `selection` and `filter`, nothing git computed: {text:?}"
+            vec!["filter", "selection", "sort"],
+            "a scope must hold exactly `selection`, `filter` and `sort`, nothing git \
+             computed: {text:?}"
         );
+    }
+
+    /// The two `RowOrder` shapes both round-trip: the struct variant carrying a column and a
+    /// direction, and the unit variant with neither, so an explicit `Natural` choice
+    /// survives a restart rather than reading back as nothing stored
+    /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+    /// amendment).
+    #[test]
+    fn a_recorded_sort_round_trips_through_state_toml() {
+        use crate::sort::{Direction, SortColumn};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut file = StateFile::default();
+        file.set_scope(
+            "sorted".to_string(),
+            ScopeState {
+                selection: vec![],
+                filter: String::new(),
+                sort: Some(RowOrder::By {
+                    column: SortColumn::Dirty,
+                    direction: Direction::Descending,
+                }),
+            },
+        );
+        file.set_scope(
+            "natural".to_string(),
+            ScopeState {
+                selection: vec![],
+                filter: String::new(),
+                sort: Some(RowOrder::Natural),
+            },
+        );
+        save(dir.path(), &file).expect("save state.toml");
+
+        let reloaded = load(dir.path());
+        assert_eq!(
+            reloaded.scope("sorted").sort,
+            Some(RowOrder::By {
+                column: SortColumn::Dirty,
+                direction: Direction::Descending,
+            })
+        );
+        assert_eq!(reloaded.scope("natural").sort, Some(RowOrder::Natural));
+    }
+
+    /// A scope with no `sort` key at all, exactly what an older build's own `state.toml`
+    /// looks like, loads with `sort: None` rather than failing the whole scope, `selection`
+    /// and `filter` restoring untouched beside it.
+    #[test]
+    fn a_scope_with_no_sort_key_loads_sort_as_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(STATE_FILE),
+            "[work]\nselection = [\"repo-a\"]\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write a pre-sort state.toml");
+
+        let scope = load(dir.path()).scope("work");
+        assert_eq!(scope.sort, None);
+        assert_eq!(scope.selection, vec!["repo-a"]);
+        assert_eq!(scope.filter, "is:dirty");
     }
 
     /// Two Sets never read each other's state: writing `work`'s scope must leave `personal`'s
@@ -160,6 +234,7 @@ mod tests {
             ScopeState {
                 selection: vec!["repo-a".to_string()],
                 filter: "kind:worktree".to_string(),
+                sort: None,
             },
         );
         file.set_scope(
@@ -167,6 +242,7 @@ mod tests {
             ScopeState {
                 selection: vec!["dotfiles".to_string()],
                 filter: String::new(),
+                sort: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -245,6 +321,7 @@ mod tests {
             ScopeState {
                 selection: vec!["repo-a".to_string()],
                 filter: "is:dirty".to_string(),
+                sort: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");

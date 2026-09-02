@@ -4,19 +4,23 @@
 //! Nothing here draws and nothing here reads a key. [`RowOrder::choose`] is the whole rule
 //! the sort menu applies, and [`order_candidates`] is the one comparator
 //! [`crate::components::list::visible_row_order`] sorts with, so both can be exercised
-//! without a frame. Session state, never config
-//! ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)).
+//! without a frame. Session state, persisted to `state.toml` beside the Selection and the
+//! Filter ([`crate::state::ScopeState`]) rather than read from config
+//! ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+//! amendment).
 
 use std::cmp::Reverse;
 
 use repon_core::{Cell, EntityState, Head, Settled, SyncState, WorktreeState};
+use serde::{Deserialize, Serialize};
 
 use crate::components::list::head_text;
 use crate::glyphs::GlyphSet;
 use crate::keys::Action;
 
 /// One column the table can be ordered by, in the order the header draws them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum SortColumn {
     Name,
     Branch,
@@ -81,7 +85,8 @@ impl SortColumn {
 /// Which way a sorted column reads. Kept beside [`SortColumn`] rather than folded into it,
 /// since a column and the direction it is read in are two different questions: which column
 /// is active never changes what ascending means for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Direction {
     Ascending,
     Descending,
@@ -107,10 +112,14 @@ impl Direction {
 }
 
 /// The order the table lists rows in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum RowOrder {
-    /// Discovery order, each Repo followed by its own children: what a session opens on, what
-    /// `0` restores, and the one order no header carries an arrow for.
+    /// Discovery order, each Repo followed by its own children: what `0` restores and the
+    /// one order no header carries an arrow for. No longer what a session opens on with
+    /// nothing persisted; see [`Self::cold_start`]
+    /// ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+    /// amendment).
     #[default]
     Natural,
     By {
@@ -120,6 +129,21 @@ pub(crate) enum RowOrder {
 }
 
 impl RowOrder {
+    /// The order a scope with nothing stored opens on: name ascending, not `Natural`
+    /// ([`crate::app::App::restore_session_state`]). Covers both a first run with no
+    /// `state.toml` at all and an older build's file that never recorded a sort
+    /// ([ADR 0030](../../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
+    /// amendment: the status quo discovery order is an arbitrary, machine-dependent order
+    /// rather than a neutral absence of one). `Natural` stays reachable through `0`, and a
+    /// `Natural` explicitly chosen still round-trips through `state.toml` like any other
+    /// order.
+    pub(crate) const fn cold_start() -> Self {
+        RowOrder::By {
+            column: SortColumn::Name,
+            direction: Direction::Ascending,
+        }
+    }
+
     /// The order after the sort menu picks `column`: the active column reverses in place, and
     /// any other column opens at its own natural direction rather than carrying the previous
     /// column's over.
@@ -418,13 +442,31 @@ mod tests {
     }
 
     #[test]
-    fn a_session_opens_on_the_natural_order_and_no_header_carries_an_arrow() {
-        let order = RowOrder::default();
-        assert_eq!(order, RowOrder::Natural);
+    fn the_natural_order_carries_no_label_and_no_header_arrow() {
+        let order = RowOrder::Natural;
+        assert_eq!(
+            RowOrder::default(),
+            order,
+            "the type's own neutral element is Natural"
+        );
         assert_eq!(order.label(full()), None);
         for column in SortColumn::ALL {
             assert_eq!(order.arrow_for(column, full()), None, "{column:?}");
         }
+    }
+
+    /// [`RowOrder::cold_start`], not [`RowOrder::default`], is what a session with nothing
+    /// persisted opens on: name ascending, since the ADR 0030 amendment makes the natural
+    /// discovery order a deliberate choice rather than the absence of one.
+    #[test]
+    fn cold_start_is_name_ascending_not_natural() {
+        assert_eq!(
+            RowOrder::cold_start(),
+            RowOrder::By {
+                column: SortColumn::Name,
+                direction: Direction::Ascending,
+            }
+        );
     }
 
     #[test]
