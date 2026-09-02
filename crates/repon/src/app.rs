@@ -20,7 +20,7 @@ use crate::{
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
-    filter_line::{self, FilterLine},
+    filter_line::FilterLine,
     footer,
     glyphs::{BorderScratch, GlyphSet},
     header::HeaderContent,
@@ -370,9 +370,11 @@ pub struct App {
     bindings: BindingTable,
     /// The Set `self.core` is currently running over, tracked so `Action::ReloadConfig` and
     /// `Action::SwitchToSet` can tell whether it changed. Resolved at startup by
-    /// [`reload::resolve_startup_set`] (`--set`/`-s`, then `REPON_SET`, then the first
-    /// declared Set), and only ever moved afterwards by a reload's own fallback rule or by a
-    /// `1`-to-`9` Set switch.
+    /// [`reload::resolve_startup_set`] (`--set`/`-s`, then `REPON_SET`, then the Set
+    /// `state.toml` remembers, then the first declared Set), and only ever moved afterwards
+    /// by a reload's own fallback rule or by a `1`-to-`9` Set switch. Written back to
+    /// `state.toml` on quit ([`Self::persist_state`]), so a switch made mid-session is what
+    /// the next launch reopens.
     active_set: ActiveSet,
     /// The whole parsed document from the last load, kept so `Action::SwitchToSet` can look
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
@@ -509,10 +511,16 @@ impl App {
         );
 
         let env_set = std::env::var("REPON_SET").ok();
+        // `state.toml` is read again by `restore_session_state` below, once the Set this
+        // resolves has fixed the scope key that read is keyed on.
+        let remembered_set = state::load(&config.data_dir)
+            .active_set()
+            .map(str::to_string);
         let active_set_config = reload::resolve_startup_set(
             &config.document.sets,
             flag_set.as_deref(),
             env_set.as_deref(),
+            remembered_set.as_deref(),
         )?;
         let active_set = ActiveSet::from_config(active_set_config);
 
@@ -654,7 +662,9 @@ impl App {
 
     /// Writes this scope's whole session state to `state.toml`, leaving every other scope's
     /// own entry untouched: the checked rows by name, the committed Filter's own expression,
-    /// and the table's `RowOrder`, nothing `self.core` computed from git
+    /// and the table's `RowOrder`, plus the Set being viewed at the top level, which is what
+    /// [`reload::resolve_startup_set`] reopens the next run in. Nothing `self.core` computed
+    /// from git is written
     /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Called
     /// on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the same
     /// grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session is
@@ -669,6 +679,12 @@ impl App {
         };
         let mut file = state::load(&self.data_dir);
         file.set_scope(self.scope_key(), scope_state);
+        // A zero-config run has no Set to remember, and writing the implicit `all` would
+        // replace a configured run's own remembered Set with a name its config file most
+        // likely never declares.
+        if !self.zero_config {
+            file.set_active_set(self.active_set.name.clone());
+        }
         if let Err(err) = state::save(&self.data_dir, &file) {
             tracing::error!("could not write state.toml: {err:#}");
         }
@@ -2789,23 +2805,11 @@ impl App {
         if let Some(line) = &self.filter_line {
             line.draw(frame, filter_area, &self.theme);
             // Overlays the bottom of the list area, anchored to the Filter line and growing
-            // upward, capped at `COMPLETION_MAX_ROWS`
-            // ([filter.md](../../../docs/spec/filter.md#screen-placement)); `content_area`
-            // itself was already sized above with no regard to this, which is what "never
-            // resizes the list" means here.
-            let completions = line.completions();
-            let overlay_height = completions
-                .len()
-                .min(filter_line::COMPLETION_MAX_ROWS)
-                .min(content_area.height as usize) as u16;
-            if overlay_height > 0 {
-                let overlay_area = Rect {
-                    x: content_area.x,
-                    y: content_area.y + content_area.height - overlay_height,
-                    width: content_area.width,
-                    height: overlay_height,
-                };
-                line.draw_completions(frame, overlay_area, &self.theme);
+            // upward ([filter.md](../../../docs/spec/filter.md#screen-placement));
+            // `content_area` itself was already sized above with no regard to this, which is
+            // what "never resizes the list" means here.
+            if let Some(overlay_area) = line.completion_area(content_area) {
+                line.draw_completions(frame, overlay_area, &self.theme, self.glyphs);
             }
         }
         footer::draw(
@@ -11696,12 +11700,13 @@ refresh_all = "z""#,
         );
     }
 
-    /// The overlay paints directly onto `content_area`'s own bottom rows, immediately above
-    /// the Filter line, capped at eight regardless of how many keys there are to offer
+    /// The overlay paints onto `content_area`'s own bottom rows as a framed block whose
+    /// bottom border sits immediately above the Filter line, its interior capped at eight
+    /// rows regardless of how many keys there are to offer
     /// ([filter.md](../../../docs/spec/filter.md#screen-placement)): thirteen keys is well
-    /// past the cap, so the ninth key up from the Filter line must not appear at all.
+    /// past the cap, so the ninth key must not appear at all.
     #[test]
-    fn the_overlay_caps_at_eight_rows_anchored_directly_above_the_filter_line() {
+    fn the_overlay_caps_at_eight_interior_rows_framed_directly_above_the_filter_line() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -11721,11 +11726,19 @@ refresh_all = "z""#,
                 .to_string()
         };
 
-        // Row layout, bottom up: footer (last row), the Filter line (one above it), then the
-        // overlay's own eight rows in vocabulary order (the highlight defaults to row 0,
-        // "name:", the topmost of the eight), then whatever the list itself draws.
+        // Row layout, bottom up: footer (last row), the Filter line (one above it), the
+        // block's own bottom border, its eight interior rows in vocabulary order (the
+        // highlight defaults to row 0, "name:", the topmost of the eight), its top border,
+        // then whatever the list itself draws.
         let footer_row = app.frame_size.height - 1;
         let filter_row = footer_row - 1;
+        let interior_text = |y: u16| -> String {
+            (1..buf.area.width - 1)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
         let keys = repon_core::vocabulary();
         assert_eq!(
             keys.len(),
@@ -11733,21 +11746,27 @@ refresh_all = "z""#,
             "fixture sanity: more keys than the eight-row cap"
         );
 
+        let first_interior_row = filter_row - 9;
         for (index, entry) in keys.iter().take(8).enumerate() {
-            let depth = 8 - index as u16;
             let marker = if index == 0 { "> " } else { "  " };
             assert_eq!(
-                row_text(filter_row - depth),
+                interior_text(first_interior_row + index as u16),
                 format!("{marker}{}:", entry.key),
-                "row {depth} above the Filter line"
+                "interior row {index} of the completion block"
             );
         }
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            Rect::new(0, filter_row - 10, buf.area.width, 10),
+            crate::glyphs::FULL.border,
+            "",
+            "the completion list's frame",
+        );
         let ninth_key = &keys[8].key;
-        let row_past_the_cap = row_text(filter_row - 9);
         assert!(
-            !row_past_the_cap.contains(ninth_key),
-            "the cap is eight rows; the ninth key ({ninth_key}) must not reach the screen, \
-             got {row_past_the_cap:?}"
+            (0..filter_row).all(|y| !row_text(y).contains(ninth_key)),
+            "the cap is eight interior rows; the ninth key ({ninth_key}) must not reach the \
+             screen"
         );
     }
 
@@ -11851,12 +11870,12 @@ refresh_all = "z""#,
         );
     }
 
-    /// Criterion 2: the written file holds only the Selection's names and the Filter's own
-    /// string, nothing `self.core` computed from git, checked against the whole file's
-    /// content rather than a round trip that would pass just as happily if a git-derived
-    /// field were also written.
+    /// Criterion 2: the written file holds only the Set being viewed, the Selection's names
+    /// and the Filter's own string, nothing `self.core` computed from git, checked against
+    /// the whole file's content rather than a round trip that would pass just as happily if
+    /// a git-derived field were also written.
     #[test]
-    fn persisting_writes_only_the_selection_names_the_filter_string_and_the_sort() {
+    fn persisting_writes_only_the_active_set_the_selection_names_the_filter_string_and_the_sort() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -11877,10 +11896,72 @@ refresh_all = "z""#,
             std::fs::read_to_string(state_dir.path().join("state.toml")).expect("read state.toml");
         assert_eq!(
             text.trim(),
-            "[test]\nselection = [\"repo-a\"]\nfilter = \"kind:worktree\"\n\n\
+            "active_set = \"test\"\n\n[test]\nselection = [\"repo-a\"]\n\
+             filter = \"kind:worktree\"\n\n\
              [test.sort.by]\ncolumn = \"dirty\"\ndirection = \"descending\"",
-            "expected exactly the Selection's names, the Filter string and the sort, nothing \
-             else: {text:?}"
+            "expected exactly the Set being viewed, the Selection's names, the Filter string \
+             and the sort, nothing else: {text:?}"
+        );
+    }
+
+    /// The Set being viewed comes back with the Selection and the Filter that were persisted
+    /// beside it: quitting on `personal` and relaunching resolves `personal`, not the first
+    /// declared Set the same document would otherwise have opened.
+    #[test]
+    fn the_set_last_viewed_is_the_one_a_relaunch_resolves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.active_set.name = "personal".to_string();
+        app.data_dir = state_dir.path().to_path_buf();
+        app.persist_state();
+
+        let declared = vec![
+            set_config("work", &root),
+            set_config("personal", &root),
+            set_config("archive", &root),
+        ];
+        let remembered = state::load(state_dir.path())
+            .active_set()
+            .map(str::to_string);
+        let chosen = reload::resolve_startup_set(&declared, None, None, remembered.as_deref())
+            .expect("personal is declared");
+
+        assert_eq!(
+            chosen.name.get_ref(),
+            "personal",
+            "expected the Set the last session quit on rather than the first declared one"
+        );
+    }
+
+    /// A zero-config run keys its scope by working directory and has no Set to remember, so
+    /// it must leave a configured run's own remembered Set alone rather than overwriting it
+    /// with the implicit `all` that names nothing in that user's config file.
+    #[test]
+    fn a_zero_config_run_leaves_a_configured_runs_remembered_set_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut configured = test_app(&root);
+        configured.active_set.name = "personal".to_string();
+        configured.data_dir = state_dir.path().to_path_buf();
+        configured.persist_state();
+
+        let mut zero_config = test_app(&root);
+        zero_config.zero_config = true;
+        zero_config.cwd = root.clone();
+        zero_config.data_dir = state_dir.path().to_path_buf();
+        zero_config.persist_state();
+
+        assert_eq!(
+            state::load(state_dir.path()).active_set(),
+            Some("personal"),
+            "a run with no Set to remember must not clear the one a configured run left"
         );
     }
 

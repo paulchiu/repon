@@ -1,6 +1,6 @@
-//! `state.toml`: the Selection, the committed Filter and the table's own `RowOrder`,
-//! persisted per scope so a quit and relaunch restores each while every git value is
-//! recomputed from scratch ([config.md](../../../docs/spec/config.md#state),
+//! `state.toml`: the Set being viewed, plus the Selection, the committed Filter and the
+//! table's own `RowOrder` persisted per scope, so a quit and relaunch restores each while
+//! every git value is recomputed from scratch ([config.md](../../../docs/spec/config.md#state),
 //! [0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). This module
 //! owns the file's shape and its scope key; [`crate::app::App::restore_session_state`] and
 //! [`crate::app::App::persist_state`] are the only callers.
@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::sort::RowOrder;
 
 const STATE_FILE: &str = "state.toml";
+
+/// The one top-level key the file reserves for itself, spelled here as well as in
+/// [`StateFile`]'s own field because [`StateFile::set_scope`] compares a scope key against it.
+const ACTIVE_SET_KEY: &str = "active_set";
 
 /// One scope's whole session state: the Selection as a list of display names, the committed
 /// Filter as its own expression string, and the table's `RowOrder`. Nothing computed from
@@ -33,10 +37,16 @@ pub(crate) struct ScopeState {
     pub(crate) sort: Option<RowOrder>,
 }
 
-/// The whole file: a map of scope key to its own [`ScopeState`], so two Sets, or two working
-/// directories both running with no config, never restore each other's Selection or Filter.
+/// The whole file: the Set last viewed, then a map of scope key to its own [`ScopeState`],
+/// so two Sets, or two working directories both running with no config, never restore each
+/// other's Selection or Filter. `active_set` sits at the top level rather than in a scope
+/// because it is what chooses the scope, and is absent for a run that had no Set to remember
+/// (a zero-config one) or for a file written before it was recorded. It is therefore a
+/// reserved key ([`ACTIVE_SET_KEY`]), and a Set carrying that name keeps no scope of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_set: Option<String>,
     #[serde(flatten)]
     scopes: BTreeMap<String, ScopeState>,
 }
@@ -47,8 +57,26 @@ impl StateFile {
         self.scopes.get(key).cloned().unwrap_or_default()
     }
 
-    /// Replaces `key`'s own state wholesale, leaving every other scope's entry untouched.
+    /// The Set the last session was viewing, or `None` when nothing has ever recorded one.
+    /// [`crate::app::reload::resolve_startup_set`] reads it as a rung below `REPON_SET`, and
+    /// a name no longer declared falls through there rather than failing.
+    pub(crate) fn active_set(&self) -> Option<&str> {
+        self.active_set.as_deref()
+    }
+
+    /// Records the Set being viewed, replacing whatever the last session left.
+    pub(crate) fn set_active_set(&mut self, name: String) {
+        self.active_set = Some(name);
+    }
+
+    /// Replaces `key`'s own state wholesale, leaving every other scope's entry untouched. A
+    /// scope named after [`ACTIVE_SET_KEY`] is dropped rather than written: two entries under
+    /// one key is not TOML, so writing it would cost every other scope in the file its own
+    /// state on the next load, where dropping it costs one Set its Selection and no more.
     pub(crate) fn set_scope(&mut self, key: String, state: ScopeState) {
+        if key == ACTIVE_SET_KEY {
+            return;
+        }
         self.scopes.insert(key, state);
     }
 }
@@ -221,6 +249,80 @@ mod tests {
         assert_eq!(scope.sort, None);
         assert_eq!(scope.selection, vec!["repo-a"]);
         assert_eq!(scope.filter, "is:dirty");
+    }
+
+    /// The Set being viewed is session state like the Selection beside it, and it is the one
+    /// piece that cannot live in a scope, because it is what chooses the scope. It round
+    /// trips at the top level with every scope's own entry untouched.
+    #[test]
+    fn the_active_set_round_trips_beside_the_scopes_it_chooses_between() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut file = StateFile::default();
+        file.set_scope(
+            "work".to_string(),
+            ScopeState {
+                selection: vec!["repo-a".to_string()],
+                filter: "is:dirty".to_string(),
+                sort: None,
+            },
+        );
+        file.set_active_set("work".to_string());
+        save(dir.path(), &file).expect("save state.toml");
+
+        let reloaded = load(dir.path());
+        assert_eq!(reloaded.active_set(), Some("work"));
+        assert_eq!(reloaded.scope("work").selection, vec!["repo-a"]);
+        assert_eq!(reloaded.scope("work").filter, "is:dirty");
+    }
+
+    /// A Set carrying the reserved key's own name keeps no scope, and every other scope in
+    /// the file survives it: writing both a remembered Set and a scope table under the one
+    /// key would not be TOML at all, and the whole file would read back empty next launch.
+    #[test]
+    fn a_scope_named_after_the_reserved_key_never_displaces_the_remembered_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut file = StateFile::default();
+        file.set_scope(
+            ACTIVE_SET_KEY.to_string(),
+            ScopeState {
+                selection: vec!["repo-a".to_string()],
+                ..ScopeState::default()
+            },
+        );
+        file.set_scope(
+            "work".to_string(),
+            ScopeState {
+                selection: vec!["repo-b".to_string()],
+                ..ScopeState::default()
+            },
+        );
+        file.set_active_set(ACTIVE_SET_KEY.to_string());
+        save(dir.path(), &file).expect("save state.toml");
+
+        let reloaded = load(dir.path());
+        assert_eq!(reloaded.active_set(), Some(ACTIVE_SET_KEY));
+        assert_eq!(
+            reloaded.scope("work").selection,
+            vec!["repo-b"],
+            "every other scope must survive a Set named after the reserved key"
+        );
+    }
+
+    /// A file an older build wrote, and one a run with no Set to remember wrote, are the same
+    /// shape: every scope still loads and the remembered Set is simply absent, never a
+    /// failure that would take the whole file down with it.
+    #[test]
+    fn a_file_with_no_remembered_active_set_loads_every_scope_with_none_remembered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(STATE_FILE),
+            "[work]\nselection = [\"repo-a\"]\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write a state.toml with no remembered Set");
+
+        let file = load(dir.path());
+        assert_eq!(file.active_set(), None);
+        assert_eq!(file.scope("work").selection, vec!["repo-a"]);
     }
 
     /// Two Sets never read each other's state: writing `work`'s scope must leave `personal`'s
