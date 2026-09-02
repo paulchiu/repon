@@ -1,7 +1,8 @@
-//! The `[[repo]]` entries Repon writes, read-modify-written on the file on disk.
+//! The config entries Repon writes, read-modify-written on the file on disk.
 //!
-//! [0028](../../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) bounds what may
-//! be written to `[[repo]]` and nothing else, and
+//! [0028](../../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md), as amended,
+//! bounds what may be written to the `[[repo]]` entries and the `[[set]]` `include` and
+//! `exclude` arrays, and nothing else, and
 //! [repo-management.md](../../../../docs/spec/repo-management.md)'s "Writing config" fixes the
 //! mechanism: every write reads the file, edits the parsed text and writes it back, so a
 //! concurrent hand edit loses only the keys both writers touched. Nothing here ever
@@ -18,15 +19,23 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::document::expand_home;
 
-/// The array of tables this module is bounded to. Named once so no call site below can
-/// reach a different one by typo.
+/// The array of tables this module's `[[repo]]` writes are bounded to. Named once so no call
+/// site below can reach a different one by typo.
 const REPO: &str = "repo";
+
+/// The other array of tables this module writes, for the two arrays of paths a Set may bound
+/// itself with.
+const SET: &str = "set";
 
 /// The one key an entry Repon appends carries besides `path`, and the one key `unignore`
 /// removes.
 const EXCLUDE: &str = "exclude";
 
 const PATH: &str = "path";
+
+/// The `[[set]]` arrays that may name a path, so a path `delete` destroyed stops being named
+/// by either of them.
+const SET_PATH_ARRAYS: [&str; 2] = ["include", EXCLUDE];
 
 /// What a management operation asks of one `[[repo]]` entry, per
 /// [repo-management.md](../../../../docs/spec/repo-management.md)'s operations table.
@@ -38,7 +47,8 @@ pub(crate) enum Edit {
     /// `unignore`: the `exclude` key alone, leaving whatever else the table carries. An
     /// entry left with nothing but `path` goes with it.
     Unexclude,
-    /// `delete`: the whole entry, once the working tree is gone.
+    /// `delete`: the whole entry, once the working tree is gone, and the path with it from
+    /// every `[[set]]` array that named it.
     Remove,
 }
 
@@ -58,14 +68,24 @@ pub(crate) fn today() -> String {
     now.split('T').next().unwrap_or(&now).to_string()
 }
 
-/// Reads `config_file`, applies `edit` to the `[[repo]]` entry naming `path`, and writes the
-/// result back. A missing file is read as the empty document it already behaves as
-/// ([`super::document::load`]'s own "a missing file is not an error"), so a first `ignore`
-/// with no config at all still writes one.
-///
-/// Returns whether the file's text changed, so a caller can tell an edit that did something
-/// from one that found nothing to do.
-pub(crate) fn write(config_file: &Path, path: &Path, edit: Edit) -> Result<bool> {
+/// What one write did, which is two facts rather than one: a `delete` may edit a `[[set]]`
+/// array for an entity that never had a `[[repo]]` entry at all, so "the file changed" and
+/// "the entity's own entry went" are no longer the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Written {
+    /// Whether the file's text changed, so a caller can tell an edit that did something from
+    /// one that found nothing to do.
+    pub(crate) changed: bool,
+    /// Whether a `[[repo]]` entry of the entity's own was there and went, which is the fact
+    /// `delete`'s receipt names ([repo-management.md](../../../../docs/spec/repo-management.md)'s
+    /// "Receipts").
+    pub(crate) removed_repo_entry: bool,
+}
+
+/// Reads `config_file`, applies `edit` for `path`, and writes the result back. A missing file
+/// is read as the empty document it already behaves as ([`super::document::load`]'s own "a
+/// missing file is not an error"), so a first `ignore` with no config at all still writes one.
+pub(crate) fn write(config_file: &Path, path: &Path, edit: Edit) -> Result<Written> {
     let before = match fs::read_to_string(config_file) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -73,9 +93,18 @@ pub(crate) fn write(config_file: &Path, path: &Path, edit: Edit) -> Result<bool>
             return Err(err).wrap_err_with(|| format!("could not read {}", config_file.display()));
         }
     };
+    // Read before the edit, since afterwards the entry is gone either way. `apply` reports
+    // the malformed-document failure for both of us, so a parse that fails here is left to it.
+    let removed_repo_entry = edit == Edit::Remove
+        && before
+            .parse::<DocumentMut>()
+            .is_ok_and(|document| find_entry(&document, path).is_some());
     let after = apply(&before, path, edit, &today())?;
     if after == before {
-        return Ok(false);
+        return Ok(Written {
+            changed: false,
+            removed_repo_entry,
+        });
     }
     if let Some(parent) = config_file.parent() {
         fs::create_dir_all(parent)
@@ -83,11 +112,15 @@ pub(crate) fn write(config_file: &Path, path: &Path, edit: Edit) -> Result<bool>
     }
     fs::write(config_file, &after)
         .wrap_err_with(|| format!("could not write {}", config_file.display()))?;
-    Ok(true)
+    Ok(Written {
+        changed: true,
+        removed_repo_entry,
+    })
 }
 
-/// `text` with `edit` applied to the `[[repo]]` entry naming `path`, and nothing else
-/// touched.
+/// `text` with `edit` applied to the entries naming `path`, and nothing else touched: the
+/// `[[repo]]` entry for every edit, and, for [`Edit::Remove`] alone, the `[[set]]` arrays
+/// naming it as well ([`remove_from_set_path_arrays`]).
 ///
 /// Matching is by expanded path rather than by the written string, so an entry the user wrote
 /// as `~/dev/noisy` is found by the absolute path Repon knows the entity by. An appended
@@ -118,15 +151,49 @@ pub(crate) fn apply(text: &str, path: &Path, edit: Edit, today: &str) -> Result<
                 entries.remove(index);
             }
         }
-        (Edit::Remove, Some(index)) => {
-            let Some(entries) = entries_mut(&mut document) else {
-                unreachable!("an index was found, so the array of tables is there");
-            };
-            entries.remove(index);
+        (Edit::Remove, index) => {
+            if let Some(index) = index {
+                let Some(entries) = entries_mut(&mut document) else {
+                    unreachable!("an index was found, so the array of tables is there");
+                };
+                entries.remove(index);
+            }
+            remove_from_set_path_arrays(&mut document, path);
         }
-        (Edit::Unexclude | Edit::Remove, None) => {}
+        (Edit::Unexclude, None) => {}
     }
     Ok(document.to_string())
+}
+
+/// Removes `path` from every `[[set]]` `include` and `exclude` array that names it, and
+/// removes an array its last named path leaves empty.
+///
+/// A glob that merely would have matched `path` is left alone: it states a class rather than
+/// this one entity, so dropping it would change what the Set means for every other row it
+/// covers ([repo-management.md](../../../../docs/spec/repo-management.md)'s "Writing
+/// config"). An emptied array goes rather than being left as `[]`, on the same reasoning
+/// [`carries_only_a_path`] removes an entry with nothing left to say: an empty `include`
+/// reads as "nothing" and means "everything" to discovery, which is a worse thing to leave
+/// behind than the key's absence.
+fn remove_from_set_path_arrays(document: &mut DocumentMut, path: &Path) {
+    let Some(sets) = document.get_mut(SET).and_then(Item::as_array_of_tables_mut) else {
+        return;
+    };
+    for set in sets.iter_mut() {
+        for key in SET_PATH_ARRAYS {
+            let Some(paths) = set.get_mut(key).and_then(Item::as_array_mut) else {
+                continue;
+            };
+            paths.retain(|named| {
+                !named
+                    .as_str()
+                    .is_some_and(|declared| declared_path_matches(declared, path))
+            });
+            if paths.is_empty() {
+                set.remove(key);
+            }
+        }
+    }
 }
 
 /// The index of the `[[repo]]` entry whose `path` expands to `path`, if any. A duplicate
@@ -144,7 +211,14 @@ fn entry_path_matches(entry: &Table, path: &Path) -> bool {
     entry
         .get(PATH)
         .and_then(Item::as_str)
-        .is_some_and(|declared| expand_home(declared) == path)
+        .is_some_and(|declared| declared_path_matches(declared, path))
+}
+
+/// Whether the string a config entry wrote names `path`. One definition for both the
+/// `[[repo]]` `path` key and a `[[set]]` array's own entries, so the two can never disagree
+/// about which written form names the entity Repon knows by an absolute path.
+fn declared_path_matches(declared: &str, path: &Path) -> bool {
+    expand_home(declared) == path
 }
 
 fn entries_mut(document: &mut DocumentMut) -> Option<&mut toml_edit::ArrayOfTables> {
@@ -304,9 +378,9 @@ mod tests {
         );
     }
 
-    /// Criterion 1, sharpened: the write is bounded to `[[repo]]`, so nothing the user
-    /// hand-wrote is reformatted. Every line of the fixture that is not part of the one
-    /// entry being edited comes back byte for byte.
+    /// Criterion 1, sharpened: an `ignore` reaches the one `[[repo]]` entry it names and
+    /// nothing else, so nothing the user hand-wrote is reformatted. Every line of the
+    /// fixture that is not part of that entry comes back byte for byte.
     #[test]
     fn a_write_reformats_nothing_outside_the_repo_entry_it_edits() {
         let before = commented_fixture();
@@ -513,6 +587,117 @@ mod tests {
         );
     }
 
+    /// `delete`'s other half: the path it destroyed stops being named by the `[[set]]`
+    /// arrays that listed it too, in every Set that listed it, rather than only in the
+    /// `[[repo]]` entry it happened to have.
+    #[test]
+    fn removing_an_entry_also_removes_the_path_from_every_set_include_array_naming_it() {
+        let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
+                      include = [\"~/dev/gone\", \"~/dev/kept\"]\n\n\
+                      [[set]]\nname = \"two\"\nroots = [\"~/dev\"]\n\
+                      include = [\"~/dev/other\", \"~/dev/gone\"]\n";
+
+        let after = apply(before, &path("~/dev/gone"), Edit::Remove, "2026-09-01")
+            .expect("the document parses");
+
+        assert!(
+            !after.contains("gone"),
+            "no Set may go on naming a path `delete` destroyed: {after:?}"
+        );
+        assert!(
+            after.contains("\"~/dev/kept\"") && after.contains("\"~/dev/other\""),
+            "every other path a Set names is left alone: {after:?}"
+        );
+    }
+
+    /// The same for a Set's `exclude` array, which names paths on the identical terms its
+    /// `include` does.
+    #[test]
+    fn removing_an_entry_also_removes_the_path_from_a_set_exclude_array_naming_it() {
+        let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
+                      exclude = [\"~/dev/gone\", \"**/node_modules/**\"]\n";
+
+        let after = apply(before, &path("~/dev/gone"), Edit::Remove, "2026-09-01")
+            .expect("the document parses");
+
+        assert!(
+            !after.contains("gone") && after.contains("\"**/node_modules/**\""),
+            "the path goes and the glob beside it stays: {after:?}"
+        );
+    }
+
+    /// A path Repon knows exactly is removed; a glob that merely would have matched it is
+    /// not. The glob states a class, so dropping it would change what the Set means for
+    /// every other row it covers.
+    #[test]
+    fn removing_an_entry_leaves_a_set_glob_that_would_have_matched_the_deleted_path_alone() {
+        let before = commented_fixture();
+
+        let after = apply(
+            &before,
+            &path("~/dev/acme/checkout"),
+            Edit::Remove,
+            "2026-09-01",
+        )
+        .expect("the fixture parses");
+
+        assert_eq!(
+            after, before,
+            "a glob that would have matched the deleted path is not a name for it"
+        );
+    }
+
+    /// A Set array whose last named path was the deleted one goes with it, rather than being
+    /// left as an empty array: an empty `include` reads as "nothing" and means "everything"
+    /// to discovery, so the key that says nothing is removed the same way a `[[repo]]` entry
+    /// left with nothing but `path` is.
+    #[test]
+    fn a_set_array_left_empty_by_a_removal_goes_with_the_last_path_in_it() {
+        let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
+                      include = [\"~/dev/gone\"]\nexclude = [\"~/dev/gone\"]\n";
+
+        let after = apply(before, &path("~/dev/gone"), Edit::Remove, "2026-09-01")
+            .expect("the document parses");
+
+        assert_eq!(after, "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n");
+    }
+
+    /// A Set names its paths the way a `[[repo]]` entry does, so the absolute path the
+    /// entity is known by finds the `~`-relative string the user wrote.
+    #[test]
+    fn a_set_path_written_relative_to_home_is_found_by_the_absolute_path_it_expands_to() {
+        let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
+                      include = [\"~/dev/gone\", \"~/dev/kept\"]\n";
+
+        let after = apply(
+            before,
+            &expand_home("~/dev/gone"),
+            Edit::Remove,
+            "2026-09-01",
+        )
+        .expect("the document parses");
+
+        assert!(!after.contains("gone"), "got {after:?}");
+    }
+
+    /// `ignore` and `unignore` state a fact about one `[[repo]]` entry and never about a
+    /// Set: only the removal `delete` performs reaches a `[[set]]` array at all.
+    #[test]
+    fn ignore_and_unignore_leave_every_set_array_untouched() {
+        let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
+                      include = [\"~/dev/noisy\"]\n";
+
+        for edit in [Edit::Exclude, Edit::Unexclude] {
+            let after = apply(before, &path("~/dev/noisy"), edit, "2026-09-01")
+                .expect("the document parses");
+
+            assert!(
+                after.contains("include = [\"~/dev/noisy\"]"),
+                "{edit:?} must leave the Set naming it alone: {after:?}"
+            );
+        }
+    }
+
     /// `Edit::Remove` on a path with no `[[repo]]` entry at all leaves the file alone, which
     /// is the ordinary case for `delete` on a Repo the user never configured.
     #[test]
@@ -542,9 +727,9 @@ mod tests {
         )
         .expect("write the config file");
 
-        let changed = write(&file, &path("~/dev/noisy"), Edit::Exclude).expect("the write runs");
+        let written = write(&file, &path("~/dev/noisy"), Edit::Exclude).expect("the write runs");
 
-        assert!(changed);
+        assert!(written.changed);
         let after = std::fs::read_to_string(&file).expect("read it back");
         assert!(
             after.contains("something_repon_has_never_heard_of = 3")
@@ -561,9 +746,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let file = dir.path().join("nested").join("config.toml");
 
-        let changed = write(&file, &path("~/dev/noisy"), Edit::Exclude).expect("the write runs");
+        let written = write(&file, &path("~/dev/noisy"), Edit::Exclude).expect("the write runs");
 
-        assert!(changed);
+        assert!(written.changed);
         let after = std::fs::read_to_string(&file).expect("read it back");
         assert!(after.contains("[[repo]]"), "got {after:?}");
     }
