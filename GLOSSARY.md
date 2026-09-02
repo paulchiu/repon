@@ -103,7 +103,7 @@ The Step outcome of a Step Repon performed itself, carrying Repon's own words ra
 The Step an Action receipt is executing right now: its label and when it started, present on the receipt only until that Step finishes. Distinct from a Step result, which a Step earns only once it is done; the pane shows a spinner rather than a Step outcome for this one.
 
 **Management operation**:
-One of the three built-in entries in the Action palette that change what Repon operates on, or remove a Repo from the machine: `ignore`, `unignore` and `delete`. Built in rather than configured, so the three names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all.
+One of the four built-in entries in the Action palette that change what Repon operates on, remove a Repo from the machine, or fast-forward one to its upstream: `ignore`, `unignore`, `delete` and `sync`. Built in rather than configured, so the four names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all.
 _Avoid_: Management palette (there is one palette; `m` is a filter over it)
 
 **Delete risk**:
@@ -169,6 +169,9 @@ The auto-update's own bounding data as the core receives it: whether it runs at 
 
 **Fetch available**:
 Whether the build in hand carries the periodic fetch's own mechanism rather than only the bounding data on Core spec. False on a default build, where Fetch spec's `enabled` is accepted and inert, which a consumer is expected to say out loud rather than leave silent.
+
+**Auto update attempt**:
+One on-demand result of the fast-forward-only auto-update against a single Repo, read fresh rather than from a Cell: fast-forwarded, or one of its own four ineligible reasons, or a git read or write that failed partway through. The core's own on-demand entry point for a consumer to call by hand, reusing the identical rules the periodic fetch's own auto-update already runs rather than a second implementation of them.
 
 ## Provenance
 

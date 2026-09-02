@@ -43,6 +43,11 @@ directories = "6.0.0"
 etcetera = "0.11.0"
 globset = "0.4.20"
 humantime-serde = "1.1.1"
+# dup(2)/dup2(2) for redirecting fd 2 to the log file while the alternate screen is held
+# (`tui.rs`'s `redirect_stderr_to_log`), already in the dependency tree transitively via
+# backtrace/color-eyre and cpufeatures/sha1, and already a direct dependency of `repon-core`
+# for the same reason (its own `Cargo.toml` comment on this line).
+libc = "0.2.189"
 ratatui = "0.30"
 # `serde` turns on the settled document's wire format (ADR 0015): `repon status` is the
 # one caller that needs it. `repon-core`'s own `fetch` feature is deliberately never

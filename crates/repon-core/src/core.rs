@@ -302,6 +302,33 @@ pub struct FetchFailures {
     pub failed: Vec<(PathBuf, String)>,
 }
 
+/// One [`Core::attempt_auto_update`] result on a single Repo: the fast-forward-only
+/// auto-update's own five eligibility rules
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// eligibility rule), flattened into one return type so the built-in `sync` action
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md))
+/// can report every ineligible reason to the user rather than a bare "did nothing".
+///
+/// Always present, regardless of the `fetch` cargo feature, the same way [`AutoUpdateSpec`]
+/// is: plain data describing an outcome, not the mutating mechanism. Without the feature,
+/// [`Core::attempt_auto_update`] is never reached at all, because `sync`'s own eligibility
+/// already refuses every row first, so this needs no "not built" case of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoUpdateAttempt {
+    /// The working tree or index carried a change of its own.
+    NotClean,
+    /// No branch, no remote, or a branch with no upstream configured.
+    NoUpstream,
+    /// Already level with its upstream: nothing to move.
+    NotBehind,
+    /// The local branch has a commit its upstream does not, so no fast-forward exists.
+    NotFastForward,
+    /// The branch fast-forwarded to its upstream.
+    Updated,
+    /// A git read or write failed partway through.
+    Failed(String),
+}
+
 /// Everything `Core::start` needs, handed as plain data. The core reads no file, no
 /// path and no environment variable: this is the whole crossing, per
 /// `docs/spec/core-api.md`'s "What crosses from config".
@@ -1031,6 +1058,47 @@ impl Core {
     pub fn linked_worktree_paths(&self, key: &EntityKey) -> Result<Vec<PathBuf>, git::ProbeError> {
         let repo = git::open_thread_safe(key.path())?.to_thread_local();
         git::linked_worktree_paths(&repo)
+    }
+
+    /// Attempts the fast-forward-only auto-update on `key`'s own Repo, on demand: exactly
+    /// [`crate::auto_update::attempt`]'s own five rules and its own fast-forward, reused
+    /// rather than a second implementation for the built-in `sync` action to call by hand
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)).
+    /// Read fresh right now, the same tense [`Self::delete_risk`] reads in: eligibility can
+    /// change between the gate and the run, so this is never answered from a Cell.
+    ///
+    /// Without the `fetch` cargo feature this is never reached: `sync`'s own eligibility
+    /// check refuses every row before a run gets here, since the mechanism does not exist
+    /// to call.
+    #[cfg(feature = "fetch")]
+    pub fn attempt_auto_update(&self, key: &EntityKey) -> AutoUpdateAttempt {
+        match crate::auto_update::attempt(key.path()) {
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotClean) => {
+                AutoUpdateAttempt::NotClean
+            }
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NoUpstream) => {
+                AutoUpdateAttempt::NoUpstream
+            }
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotBehind) => {
+                AutoUpdateAttempt::NotBehind
+            }
+            crate::auto_update::Outcome::Ineligible(
+                crate::auto_update::Ineligible::NotFastForward,
+            ) => AutoUpdateAttempt::NotFastForward,
+            crate::auto_update::Outcome::Updated { .. } => AutoUpdateAttempt::Updated,
+            crate::auto_update::Outcome::Failed(error) => AutoUpdateAttempt::Failed(error),
+        }
+    }
+
+    /// Without the `fetch` cargo feature, the auto-update mechanism this delegates to on a
+    /// build that has it does not exist to call: `sync`'s own eligibility refuses every row
+    /// on a build like this one before a run ever reaches here.
+    #[cfg(not(feature = "fetch"))]
+    pub fn attempt_auto_update(&self, _key: &EntityKey) -> AutoUpdateAttempt {
+        unreachable!(
+            "sync's own eligibility refuses every row before this is reached without the \
+             `fetch` cargo feature"
+        )
     }
 
     /// Drops one entity from the table, cancelling any probe in flight against it.
@@ -11702,6 +11770,145 @@ mod tests {
                 "the eligible branch to fast-forward on the immediate cycle alone, with no \
                  fetch tick and no auto-update tick of its own",
                 || rev_parse(&parent, "refs/heads/main") == remote_tip,
+            );
+        }
+    }
+
+    /// [`Core::attempt_auto_update`] must answer exactly what
+    /// [`crate::auto_update::attempt`] would for the same Repo, since it delegates to that
+    /// function rather than reimplementing its own copy of the eligibility rules: the
+    /// built-in `sync` action's own "reuses `auto_update`'s existing rules rather than a
+    /// second implementation"
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md))
+    /// is proven here, at the one seam a reimplementation could actually diverge from the
+    /// rules it is supposed to reuse. Every fixture is a bare repo this test creates plus a
+    /// real `git clone` of it, the same standing constraint `fetch_scheduler` above follows.
+    #[cfg(feature = "fetch")]
+    mod attempt_auto_update {
+        use super::*;
+
+        fn seeded_remote() -> tempfile::TempDir {
+            let remote = tempfile::tempdir().expect("temp dir");
+            crate::test_support::init_bare(remote.path());
+            crate::test_support::push_new_commit(remote.path(), "README.md", "seed\n");
+            remote
+        }
+
+        fn clone_into(remote: &Path, dest: &Path) {
+            let status = Command::new("git")
+                .arg("clone")
+                .arg(remote)
+                .arg(dest)
+                .status()
+                .expect("run git clone");
+            assert!(status.success());
+            crate::test_support::set_identity(dest);
+        }
+
+        /// Discovers `root`'s one Repo and hands back the live `Core` alongside its key,
+        /// the same `Core::start_discovered` plus `settle` shape [`delete_risk`]'s own tests
+        /// already use: this method reads the repository fresh, not a Cell, so discovery's
+        /// own read-only probes running first are never a race with it.
+        fn discover_repo(root: &Path) -> (Core, EntityKey) {
+            let core = Core::start_discovered(spec(vec![root.to_path_buf()]));
+            let key = core
+                .settle(Duration::from_secs(10))
+                .entities
+                .into_iter()
+                .find(|entity| entity.kind == Kind::Repo)
+                .expect("the Repo row is discovered")
+                .key;
+            (core, key)
+        }
+
+        /// The eligible condition: clean, behind, not ahead, tracking an upstream. Proves
+        /// the wrapper both classifies and actually moves the branch, not only the former.
+        #[test]
+        fn an_eligible_repo_fast_forwards_through_the_wrapper_too() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo = root_path.join("repo");
+            clone_into(remote.path(), &repo);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            crate::test_support::git(&repo, &["fetch", "origin"]);
+
+            let (core, key) = discover_repo(&root_path);
+
+            assert_eq!(core.attempt_auto_update(&key), AutoUpdateAttempt::Updated);
+            assert!(
+                repo.join("second.txt").exists(),
+                "the fast-forward must reach the working tree through the wrapper too"
+            );
+        }
+
+        /// Condition 1: a dirty working tree.
+        #[test]
+        fn a_dirty_repo_is_reported_not_clean_through_the_wrapper_too() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo = root_path.join("repo");
+            clone_into(remote.path(), &repo);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            crate::test_support::git(&repo, &["fetch", "origin"]);
+            fs::write(repo.join("stray.txt"), "uncommitted\n").expect("write a stray file");
+
+            let (core, key) = discover_repo(&root_path);
+
+            assert_eq!(core.attempt_auto_update(&key), AutoUpdateAttempt::NotClean);
+        }
+
+        /// Condition 2: already level with the upstream.
+        #[test]
+        fn an_up_to_date_repo_is_reported_not_behind_through_the_wrapper_too() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo = root_path.join("repo");
+            clone_into(remote.path(), &repo);
+            crate::test_support::git(&repo, &["fetch", "origin"]);
+
+            let (core, key) = discover_repo(&root_path);
+
+            assert_eq!(core.attempt_auto_update(&key), AutoUpdateAttempt::NotBehind);
+        }
+
+        /// Condition 3: a local commit the upstream does not have.
+        #[test]
+        fn an_unpublished_local_commit_is_reported_not_fast_forward_through_the_wrapper_too() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo = root_path.join("repo");
+            clone_into(remote.path(), &repo);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            crate::test_support::git(&repo, &["fetch", "origin"]);
+            crate::test_support::commit_file(&repo, "local-only.txt", "never pushed\n");
+
+            let (core, key) = discover_repo(&root_path);
+
+            assert_eq!(
+                core.attempt_auto_update(&key),
+                AutoUpdateAttempt::NotFastForward
+            );
+        }
+
+        /// Condition 4: no upstream configured at all.
+        #[test]
+        fn a_branch_with_no_upstream_is_reported_through_the_wrapper_too() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let repo = root_path.join("repo");
+            clone_into(remote.path(), &repo);
+            crate::test_support::git(&repo, &["checkout", "-b", "untracked-branch"]);
+
+            let (core, key) = discover_repo(&root_path);
+
+            assert_eq!(
+                core.attempt_auto_update(&key),
+                AutoUpdateAttempt::NoUpstream
             );
         }
     }
