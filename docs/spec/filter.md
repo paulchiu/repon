@@ -102,6 +102,8 @@ A warning-sign icon was measured and refused. `⚠` (U+26A0) is present in 1 of 
 
 A completion list appears when the term under the cursor has completions and vanishes when it does not. It is **not dismissible**, which is what leaves Esc's unwind stack untouched.
 
+The term under the cursor is the whitespace-delimited run the caret sits in, read up to the caret and no further: with the caret at the end of the line, which is where it starts and where refining leaves it, that is the last term, and a caret moved back into the line completes what is typed ahead of it rather than what follows. Accepting a completion overwrites that same span, so whatever sits after the caret survives untouched.
+
 The trigger, after stripping any leading `-`:
 
 | the term under the cursor | the list offers |
@@ -120,6 +122,8 @@ Keys, in the `input` context ([keybindings.md](keybindings.md)):
 | `Tab` | Accept the highlighted completion |
 | `Ctrl+J`, `Ctrl+K`, `Down`, `Up` | Move the highlight |
 | `Enter` | **Always** commit the Filter, never accept a completion |
+
+Moving the caret re-reads the trigger against wherever it landed, and clears the highlight the same way an edit does: the candidate list a motion arrives at is a different list, so a highlight carried into it would point at a row nobody chose.
 
 Enter never accepts, because a key whose effect depends on a widget the user is not looking at is a key whose effect they cannot predict; and because the list narrows live, so you can see the answer before you finish typing, and Enter must always mean "done". This widens keybindings.md's `Ctrl+J`/`Ctrl+K` from "palettes only" to the whole `input` context.
 

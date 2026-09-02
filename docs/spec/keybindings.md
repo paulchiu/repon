@@ -16,7 +16,7 @@ Seven named contexts. `global` is live in `list` and `detail` only, and is suspe
 | `confirm` | The yes/no gate before an Action fans out |
 | `sort` | The sort menu, open over the table and waiting on one column key |
 
-An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, the cursor keys and the five Ctrl chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
+An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, Home, End, the cursor keys and the Ctrl and Alt chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
 `sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every visible row. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those five letters keep every meaning they already have.
 
@@ -91,7 +91,13 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Backspace` | Delete the previous character |
 | `Ctrl+W` | Delete the previous word |
 | `Ctrl+U` | Clear the line |
-| `Ctrl+E` | Open the field in `$EDITOR` |
+| `Ctrl+O` | Open the field in `$EDITOR` |
+| `Left` | Move the cursor left |
+| `Right` | Move the cursor right |
+| `Alt+B` | Move the cursor back one word |
+| `Alt+F` | Move the cursor forward one word |
+| `Ctrl+A`, `Home` | Move the cursor to the start of the line |
+| `Ctrl+E`, `End` | Move the cursor to the end of the line |
 
 ### overlay
 
@@ -162,7 +168,7 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 
 `m` for management is free rather than fought over: it is unbound in Repon today, and `Ctrl+M` is already reserved as permanently unbindable because terminals deliver it as `Enter`, which does not reach the unmodified key. It opens the same palette `;` opens rather than a third one, so it adds a filter and not a surface, and [0008](../adr/0008-two-palettes-not-one.md)'s boundary is unmoved: management fans out over the Selection and can do damage, which puts it on the Action palette's side of the split.
 
-`e` for editing `config.toml` is free the same way: unbound in Global, List, Detail, Overlay and Confirm, and the table's only other `e` is `Ctrl+E` (`OpenInEditor`, the ad hoc command field's own `input`-context chord), which does not collide because it is a different chord and a mnemonically consistent one at that.
+`e` for editing `config.toml` is free the same way: unbound in Global, List, Detail, Overlay and Confirm, and the table's only other `e` is `Ctrl+E` (`MoveCursorToLineEnd`, `input`'s own readline chord), which does not collide because it is a different chord.
 
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
@@ -184,6 +190,8 @@ crossterm reports an uppercase character with the SHIFT modifier set, so `R`, `G
 
 Shift+Tab is the one further exception: crossterm reports it as its own `KeyCode::BackTab`, with no SHIFT modifier set, rather than as `Tab` with SHIFT the way an uppercase letter arrives. It is matched as `BackTab` against NONE, and the table above writes it `Shift+Tab` for readability rather than `BackTab`, which is crossterm's own name and not this map's spelling for anything else.
 
+Alt chords (macOS Option, Meta elsewhere) arrive the same way Ctrl chords do, as the lowercase char with ALT set, and `input`'s two word motions are the only two the map binds. Unlike CONTROL, ALT does not take a character out of the printable set, so an Alt chord is text unless a row claims it first: `Alt+B` and `Alt+F` are word motions and every other Alt combination still types its letter. A `[keys]` value names one with the `alt-` prefix, as `ctrl-` names a Ctrl chord.
+
 ## Esc
 
 Esc never quits, at any depth. It unwinds exactly one level per press. If an Action is fanning out, Esc cancels it. Otherwise, innermost first: cancel a range, then close the detail pane, then clear a committed Filter. That last step is why clearing a Filter has no key of its own.
@@ -204,13 +212,13 @@ When the Selection is empty, an Action and a Launcher both act on the cursor row
 
 ## The ad hoc command field
 
-The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+E` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
+The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+O` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
 
 What such a command does when it runs, how its lines gate, and what its output looks like are settled in [actions.md](actions.md), which makes it argv split with `shell-words` rather than a shell string, because [0007](../adr/0007-launchers-are-argv-vectors.md) puts the shell behind an explicit flag and an ad hoc command has no config entry in which to show one. This spec fixes only the keys that reach it.
 
 ## Editing config.toml
 
-`e` opens the resolved config file (`repon config`'s own first line) in `$EDITOR`, through the same handoff machinery the ad hoc command field's own `Ctrl+E` uses (`editor::edit`), and reloads through the identical path `Ctrl+R` runs once the editor returns. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) bans Repon rewriting `config.toml` programmatically; handing the file to the user's own editor and writing back exactly what it returned is not that, the same way `git commit` hands a message file to `$EDITOR` without git composing the message.
+`e` opens the resolved config file (`repon config`'s own first line) in `$EDITOR`, through the same handoff machinery the ad hoc command field's own `Ctrl+O` uses (`editor::edit`), and reloads through the identical path `Ctrl+R` runs once the editor returns. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) bans Repon rewriting `config.toml` programmatically; handing the file to the user's own editor and writing back exactly what it returned is not that, the same way `git commit` hands a message file to `$EDITOR` without git composing the message.
 
 If the file does not exist yet, which is the zero-config default, the editor opens on the annotated example `repon config --example` prints, so the first edit starts from something readable rather than an empty buffer, and the edited text is written to the resolved path (creating its directory if needed) rather than discarded.
 
@@ -265,7 +273,7 @@ The sort context's footer is 73 columns at full width. Its column hints are give
  10  esc cancel
 ```
 
-The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-e editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-o editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
 
 `o` itself is not in the list or detail footer. Both are already at their documented full widths with no room for a ninth hint, and `o` is a `global` binding, so the help overlay already lists it in its `global` section wherever it is open from. The column keys are taught by the menu's own footer at the one moment they mean anything.
 
