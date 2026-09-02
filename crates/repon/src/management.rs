@@ -628,6 +628,26 @@ impl Report {
             .collect()
     }
 
+    /// The rows whose working tree this run removed, for the caller to drop from the table
+    /// itself ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete`
+    /// leaves behind"). Repon caused these absences, so they never become Vanished, which
+    /// asks the user to acknowledge one it did not cause. A refused or failed row is not
+    /// here: its working tree is, or may still be, on disk.
+    pub(crate) fn removed_keys(&self) -> Vec<EntityKey> {
+        self.records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.outcome,
+                    Outcome::Deleted { .. }
+                        | Outcome::WorktreeRemoved { .. }
+                        | Outcome::DirectoryRemoved { .. }
+                )
+            })
+            .map(|record| record.key.clone())
+            .collect()
+    }
+
     /// The one-line summary a Notice carries: the counts, never a silent success.
     pub(crate) fn summary(&self) -> String {
         let mut done = 0usize;
@@ -762,7 +782,7 @@ fn run_one(
             Ok(Outcome::Ignored)
         }
         Operation::Unignore => {
-            if repo_entry::write(config_file, target.key.path(), Edit::Unexclude)? {
+            if repo_entry::write(config_file, target.key.path(), Edit::Unexclude)?.changed {
                 Ok(Outcome::Unignored)
             } else {
                 Ok(Outcome::ExcludedByAnInheritedEntry)
@@ -839,7 +859,7 @@ fn delete_one(
             }
             remove_working_tree(target.key.path())?;
             let config_entry_removed =
-                repo_entry::write(config_file, target.key.path(), Edit::Remove)?;
+                repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
             Ok(Outcome::Deleted {
                 config_entry_removed,
             })
@@ -859,7 +879,7 @@ fn delete_one(
                 let _ = fs::remove_dir_all(admin_dir);
             }
             let config_entry_removed =
-                repo_entry::write(config_file, target.key.path(), Edit::Remove)?;
+                repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
             Ok(if admin_dir.is_some() {
                 Outcome::WorktreeRemoved {
                     config_entry_removed,
@@ -1093,6 +1113,43 @@ mod tests {
             report.summary().contains("1 refused"),
             "the summary must count the refusal rather than announce a clean run, got {:?}",
             report.summary()
+        );
+    }
+
+    /// A row a Set names but no `[[repo]]` entry does: the path leaves the Set's own array,
+    /// and the receipt still says there was no entry of its own, since dropping a path from
+    /// a Set is not an entry going with the working tree.
+    #[test]
+    fn deleting_a_repo_named_only_by_a_set_says_there_was_no_entry_of_its_own() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create a fixture directory");
+        std::fs::write(
+            &config_file,
+            format!(
+                "[[set]]\nname = \"one\"\nroots = [\"{root}\"]\ninclude = [\"{repo}\", \
+                 \"**/kept/**\"]\n",
+                root = dir.path().display(),
+                repo = repo.display(),
+            ),
+        )
+        .expect("write config.toml");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+
+        let report = run_plain(&plan(Operation::Delete, &entities), &config_file);
+
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::Deleted {
+                config_entry_removed: false
+            },
+            "the Set naming it is not a `[[repo]]` entry of its own"
+        );
+        let written = std::fs::read_to_string(&config_file).expect("read config.toml back");
+        assert!(
+            !written.contains(&repo.display().to_string()) && written.contains("**/kept/**"),
+            "the Set stops naming the deleted path and keeps its glob: {written:?}"
         );
     }
 
