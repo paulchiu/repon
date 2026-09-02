@@ -79,6 +79,13 @@ pub(crate) enum AdvertisedDefaultBranch {
 /// handshake this fetch already paid for.
 #[derive(Debug)]
 pub(crate) struct FetchOutcome {
+    /// Read by this module's tests, never by the fetch cycle: a prune's effect reaches
+    /// the table through the refresh that follows, not through this count. `expect`
+    /// rather than `allow` so this goes red if a caller ever does read it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the prune count is a test observation only")
+    )]
     pub(crate) pruned: usize,
     pub(crate) advertised_default_branch: Option<AdvertisedDefaultBranch>,
 }

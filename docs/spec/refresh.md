@@ -165,6 +165,8 @@ It stays a fetch rather than an `ls-remote` probe, because [default-branch.md](d
 
 A finished fetch starts a normal generation, so the new behind counts arrive through the same path as everything else.
 
+A user-triggered counterpart exists too: the built-in `sync` action in the Action palette ([repo-management.md](repo-management.md)) runs the identical fast-forward-only auto-update on demand over the Selection, rather than waiting for this cycle's own timer. It shares this mechanism's own `fetch` cargo feature gate, since the fast-forward it calls lives behind the same boundary, but not `fetch.enabled` or `auto_update.enabled`: those two govern what Repon decides to do unbidden, where `sync` is what the user asked for, behind the Action confirm gate ([0002](../adr/0002-repon-owns-the-outer-loop-only.md), [0031](../adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
+
 ## Configuration
 
 | key | default | meaning |
