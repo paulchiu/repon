@@ -34,11 +34,17 @@ impl Selection {
         self.selected.len()
     }
 
-    /// Not read outside tests until an Action or Launcher needs to branch on whether it is
-    /// acting on the cursor row alone.
-    #[allow(dead_code)]
+    /// Whether nothing is checked, which is the case an Action and a management operation
+    /// answer differently: see [`Self::targets`].
     pub(crate) fn is_empty(&self) -> bool {
         self.selected.is_empty()
+    }
+
+    /// The checked rows alone, with no default of any kind. [`Self::targets`]'s other half,
+    /// read by the caller that has its own answer for an empty Selection
+    /// ([`crate::app::App::action_targets`]).
+    pub(crate) fn checked(&self) -> Vec<EntityKey> {
+        self.selected.iter().cloned().collect()
     }
 
     pub(crate) fn contains(&self, key: &EntityKey) -> bool {
@@ -97,10 +103,14 @@ impl Selection {
         self.range_anchor = None;
     }
 
-    /// The rows an Action or Launcher acts on: the checked rows, or, when none are checked,
-    /// the cursor row alone. An empty Selection is never widened to every visible row, which
-    /// is what keeps clearing a Filter unable to change an operation's blast radius between
-    /// keystrokes: this reads only the checked set, never anything visibility-shaped.
+    /// The rows a Launcher, a management operation and a Selection-scoped Refresh act on:
+    /// the checked rows, or, when none are checked, the cursor row alone. This is the
+    /// cursor-row fallback itself, and it is never widened to every visible row: `delete`
+    /// with nothing checked would otherwise put the whole visible list behind one confirm.
+    /// So this reads only the checked set, never anything visibility-shaped. An Action is
+    /// the one caller with a different answer for the empty case, resolved in
+    /// [`crate::app::App::action_targets`] rather than here
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-selection)).
     ///
     pub(crate) fn targets(&self, cursor: &EntityKey) -> Vec<EntityKey> {
         if self.selected.is_empty() {
@@ -246,6 +256,20 @@ mod tests {
         selection.toggle(checked.clone());
 
         assert_eq!(selection.targets(&cursor), vec![checked]);
+    }
+
+    /// [`Selection::checked`] is the half with no default at all: the caller that reads it
+    /// ([`crate::app::App::action_targets`]) has its own answer for the empty case, and a
+    /// cursor row leaking in here would give it two.
+    #[test]
+    fn checked_reports_the_checked_rows_alone_and_defaults_an_empty_selection_onto_nothing() {
+        let mut selection = Selection::new();
+        assert!(selection.checked().is_empty());
+
+        let checked = key("checked-row");
+        selection.toggle(checked.clone());
+
+        assert_eq!(selection.checked(), vec![checked]);
     }
 
     #[test]

@@ -80,7 +80,7 @@ Two consequences worth stating rather than discovering:
 
 A Filter **flattens**. A matching row is shown on its own, and a non-matching parent is never dragged in as context.
 
-This keeps one identity the rest of the design leans on: the visible rows, the matching rows, the header's match count and the set `a` selects are all the same set. [keybindings.md](keybindings.md) makes `a` select every visible row and refuses to let an Action act on visible rows, on the grounds that clearing a Filter would otherwise silently widen an Action's reach; a context parent would be a row `a` sweeps into an Action the user never matched.
+This keeps one identity the rest of the design leans on: the visible rows, the matching rows, the header's match count and the set `a` selects are all the same set. [keybindings.md](keybindings.md) makes `a` select every visible row, and makes an Action with an empty Selection fan out over every visible row, so both gestures read the same set this identity fixes; a context parent would be a row `a` sweeps in, and a row an unchecked Action reaches, that the user never matched.
 
 The cost, stated plainly: while a Filter is active the indent and the `└` marker vanish, and a Worktree's display name is not parent-qualified, so a filtered Worktree row does not say which Repo it belongs to and the detail pane is the only discriminator. That is the same cost [head.md](head.md) already accepts for a detached row's `branch` cell.
 
