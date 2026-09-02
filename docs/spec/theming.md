@@ -38,7 +38,7 @@ This map lives in code and here. A theme file cannot reach into it, so Gone and 
 
 ### Surfaces the nine roles cover
 
-Stated explicitly so a tenth role is added deliberately rather than discovered. The status bar is `dim` text above a `border`, with the theme warning indicator in `warn` and a Notice in plain `text`, which makes it the brightest thing on the row through contrast that already exists rather than through a tenth role. The detail pane's labels are `dim` and its values take whichever role their meaning already has, which is the point of naming roles for meaning. The help overlay's keys are `accent` and its descriptions are `dim`, and the footer takes the same pair ([keybindings.md](keybindings.md)).
+Stated explicitly so a tenth role is added deliberately rather than discovered. The status bar is `dim` text above a `border`, with the theme warning indicator in `warn` and a Notice in plain `text`, which makes it the brightest thing on the row through contrast that already exists rather than through a tenth role. The detail pane's labels are `dim` and its values take whichever role their meaning already has, which is the point of naming roles for meaning. The help overlay's keys are `accent` and its descriptions are `dim`, and the footer takes the same pair ([keybindings.md](keybindings.md)). The Filter's completion list frames itself in `border` rather than `border_focused`, because the Filter line it is anchored to is what holds focus and not the list ([filter.md](filter.md#screen-placement)).
 
 ### The cursor row
 
