@@ -120,6 +120,14 @@ fn last_line(text: &str) -> &str {
 /// on screen whatever the Selection's length.
 pub(crate) const CONFIRM_HINT: &str = "y run  n cancel";
 
+/// `label` folded onto one line: every embedded newline becomes `"; "`, so a multi-line ad
+/// hoc command still reads as the lines it was, rather than being cut to its first line or
+/// splitting [`ActionPalette::refusal`] across rows it does not own
+/// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+fn one_line(label: &str) -> String {
+    label.replace('\n', "; ")
+}
+
 /// The line [`fit_confirm_rows`] puts in place of the per-Repo lines it could not fit, so a
 /// gate that does not fit says how many rows it is not showing rather than dropping them
 /// silently ([repo-management.md](../../../docs/spec/repo-management.md): "A refusal is
@@ -611,7 +619,7 @@ impl ActionPalette {
                 if operable_count == 0 {
                     self.refusal = Some(format!(
                         "\"{}\" targets 0 repos and was not run",
-                        action.name.get_ref()
+                        one_line(action.name.get_ref())
                     ));
                     return Some(Decision::Refused);
                 }
@@ -632,7 +640,7 @@ impl ActionPalette {
                 if operable_count == 0 {
                     self.refusal = Some(format!(
                         "\"{}\" targets 0 repos and was not run",
-                        self.query.as_str().trim()
+                        one_line(self.query.as_str().trim())
                     ));
                     return Some(Decision::Refused);
                 }
@@ -867,14 +875,22 @@ impl ActionPalette {
                     self.draw_query(frame, interior, theme, query_rows);
                 }
 
+                // A refusal takes the row right below the query, where the eye already is
+                // the instant Enter produces it, and reserves that row from the list beneath
+                // so the two can never share it. The footer keeps its own last row regardless
+                // ([repo-management.md](../../../docs/spec/repo-management.md)'s "A refusal
+                // is reported ... never silent" is the same standard this palette's own
+                // refusal now meets).
+                let refusal_rows: u16 = if self.refusal.is_some() { 1 } else { 0 };
+                let list_top = query_rows + refusal_rows;
                 let matches = self.matches(actions);
                 let rows_below_query =
-                    interior.height.saturating_sub(query_rows).saturating_sub(1) as usize;
+                    interior.height.saturating_sub(list_top).saturating_sub(1) as usize;
                 if matches.is_empty() {
                     draw_row(
                         frame,
                         interior,
-                        query_rows,
+                        list_top,
                         NO_MATCHES_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
@@ -897,7 +913,7 @@ impl ActionPalette {
                             Entry::Builtin(_) => theme.style_for(Role::Accent),
                             Entry::Configured(_) => Style::new(),
                         };
-                        let y_row = query_rows + row as u16;
+                        let y_row = list_top + row as u16;
                         draw_row(frame, interior, y_row, &line, style);
                         // Painted after the row's own text, over the row's full interior
                         // width, the same patch-not-replace order `components/list.rs` uses
@@ -924,19 +940,16 @@ impl ActionPalette {
                     draw_row(
                         frame,
                         interior,
-                        query_rows + matches.len() as u16,
+                        list_top + matches.len() as u16,
                         NO_ACTIONS_CONFIGURED_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
                 }
-                // One row above the footer, which owns the last row outright: a refusal is
-                // read once and the keys are taught every frame, so the keys are what must
-                // never be pushed off screen.
                 if let Some(refusal) = &self.refusal {
                     draw_row(
                         frame,
                         interior,
-                        interior.height.saturating_sub(2),
+                        query_rows,
                         refusal,
                         theme.style_for(Role::Danger),
                     );
@@ -1376,6 +1389,32 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_ad_hoc_command_targeting_zero_repos_refuses_on_a_single_line() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "ls".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.insert_newline(&actions);
+        for c in "wc".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let decision = palette.choose(&actions, 0);
+
+        assert!(matches!(decision, Some(Decision::Refused)));
+        let refusal = palette.refusal().expect("a refusal message");
+        assert!(
+            !refusal.contains('\n'),
+            "the refusal must be exactly one line whatever was typed, got {refusal:?}"
+        );
+        assert!(
+            refusal.contains("ls") && refusal.contains("wc"),
+            "both typed lines must still be identifiable in the refusal, got {refusal:?}"
+        );
+    }
+
+    #[test]
     fn paste_appends_the_whole_text_verbatim_including_embedded_newlines() {
         let actions: Vec<ActionConfig> = Vec::new();
         let mut palette = ActionPalette::new();
@@ -1590,6 +1629,43 @@ mod tests {
         assert!(
             last_interior_row.contains("esc cancel"),
             "expected the way out on the same row: {last_interior_row:?}"
+        );
+    }
+
+    /// A refusal lands where the user is already looking, right below whatever the query
+    /// took, rather than sharing the last interior row with the footer's own key hints.
+    #[test]
+    fn draw_places_the_refusal_directly_below_the_query_leaving_the_footer_row_untouched() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "ls".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.insert_newline(&actions);
+        for c in "wc".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.choose(&actions, 0);
+
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 60, 10);
+        let interior = crate::glyphs::bordered_interior(Rect::new(0, 0, 60, 10));
+        let query_rows = 2; // "ls" and "wc" on separate lines
+
+        let refusal_row = row_text(&buf, interior.y + query_rows, 60);
+        assert!(
+            refusal_row.contains("targets 0 repos"),
+            "expected the refusal on the row right below the two-line query: {refusal_row:?}"
+        );
+
+        let footer_row = row_text(&buf, interior.y + interior.height - 1, 60);
+        assert!(
+            footer_row.contains("alt-enter newline"),
+            "the refusal must not have pushed the footer's own hints off its row: \
+             {footer_row:?}"
+        );
+        assert!(
+            !footer_row.contains("targets 0 repos"),
+            "the refusal must not land on the footer row: {footer_row:?}"
         );
     }
 

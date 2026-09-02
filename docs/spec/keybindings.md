@@ -221,6 +221,8 @@ The Action palette can take a command typed at the moment rather than one named 
 
 Rendering a multi-line command means the query row is no longer one row. The palette grows it one row per line and shrinks its own candidate list to match, capped at 8 rows however long the command is, so a runaway paste can take at most eight rows of the frame rather than all of it. Past the cap the query scrolls rather than growing, keeping the cursor's own line on screen. The cap is further clipped by the frame itself: the query never takes the row the footer owns, nor the last row the candidate list has left.
 
+A command Enter finds targets zero repos refuses on exactly one row, right below the query, whatever the query looked like: every embedded newline becomes `"; "` rather than reaching the screen as a literal line break, since [actions.md](actions.md#the-selection-and-the-gate)'s "A count of zero does not run and says so" is a promise about one line, not about however many the typed command happened to span. It lands beside the query rather than beside the footer, since that is where Enter was just pressed and where the answer is expected.
+
 What such a command does when it runs, how its lines gate, and what its output looks like are settled in [actions.md](actions.md), which makes it argv split with `shell-words` rather than a shell string, because [0007](../adr/0007-launchers-are-argv-vectors.md) puts the shell behind an explicit flag and an ad hoc command has no config entry in which to show one. This spec fixes only the keys that reach it.
 
 ## Editing config.toml
