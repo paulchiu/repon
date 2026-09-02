@@ -233,6 +233,42 @@ fn filter_items(table: &BindingTable) -> Vec<Item> {
     ]
 }
 
+/// The Action palette's own footer
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): the four keys the
+/// palette answers while it is choosing, `esc cancel` pinned as the way out. The newline
+/// hint is given up first, by rule 2's own reasoning: `ctrl-o editor` reaches the same
+/// multi-line command by a route that works on a terminal that sends no meta at all, so the
+/// hint with a fallback drops before the one without.
+///
+/// Drawn by [`draw_action_palette`] into the palette's own last interior row rather than the
+/// frame's last row, since the palette takes the whole frame in place of the list, the status
+/// row and the footer alike.
+fn action_palette_items(table: &BindingTable) -> Vec<Item> {
+    let item = |(hint, built), priority| Item {
+        hint,
+        priority,
+        built,
+    };
+    vec![
+        item(
+            hint_item(table, Context::Input, Action::Apply, "run"),
+            Priority::Drop(3),
+        ),
+        item(
+            hint_item(table, Context::Input, Action::InsertNewline, "newline"),
+            Priority::Drop(1),
+        ),
+        item(
+            hint_item(table, Context::Input, Action::OpenInEditor, "editor"),
+            Priority::Drop(2),
+        ),
+        item(
+            hint_item(table, Context::Input, Action::Cancel, "cancel"),
+            Priority::Pinned,
+        ),
+    ]
+}
+
 /// The sort menu's own footer
 /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): the six column keys
 /// in the order the table draws the columns, then the way back to the natural order and the
@@ -374,6 +410,13 @@ pub(crate) fn render(table: &BindingTable, context: Context, width: u16) -> Stri
     footer_line(table, context, width).to_string()
 }
 
+/// [`render`]'s counterpart for the Action palette, which owns a footer of its own rather
+/// than the one `Context::Input` renders for the Filter line.
+#[allow(dead_code)] // read only from `#[cfg(test)]` call sites, exactly as `render` is
+pub(crate) fn render_action_palette(table: &BindingTable, width: u16) -> String {
+    drop_unbuilt_then_budget(action_palette_items(table), width).to_string()
+}
+
 /// Writes `text` at `(*x, y)` in `style` and advances `*x` by its own byte length: sound
 /// only because every footer item is ASCII (the same invariant [`budget`]'s own
 /// `debug_assert!` already leans on), so a byte count is always a display-column count.
@@ -399,7 +442,25 @@ pub(crate) fn draw(
     table: &BindingTable,
     theme: &Theme,
 ) {
-    let line = footer_line(table, context, area.width);
+    paint_line(frame, area, &footer_line(table, context, area.width), theme);
+}
+
+/// [`draw`]'s counterpart for the Action palette, painted into whichever row the palette
+/// hands over ([`action_palette_items`]): its own last interior row, not the frame's last.
+pub(crate) fn draw_action_palette(
+    frame: &mut Frame,
+    area: Rect,
+    table: &BindingTable,
+    theme: &Theme,
+) {
+    let line = drop_unbuilt_then_budget(action_palette_items(table), area.width);
+    paint_line(frame, area, &line, theme);
+}
+
+/// One already-selected [`FooterLine`] painted span by span into `area`'s single row, each
+/// hint's key in `accent` and its label in `dim`: the one painting path both callers above
+/// share, so neither can grow a second set of roles.
+fn paint_line(frame: &mut Frame, area: Rect, line: &FooterLine, theme: &Theme) {
     let buf = frame.buffer_mut();
     let mut x = area.x;
     let mut first = true;
@@ -721,6 +782,57 @@ mod tests {
                 row.expected,
                 "sort footer mismatch at width {}",
                 row.width
+            );
+        }
+    }
+
+    #[test]
+    fn action_palette_footer_matches_the_documented_degradation_table_at_every_named_width() {
+        let spec = read_spec();
+        let rows = parse_degradation_table(
+            &spec,
+            "The Action palette's own footer is 55 columns at full width",
+        );
+        assert!(!rows.is_empty(), "expected at least one documented width");
+        let table = default_table();
+        for row in rows {
+            assert_eq!(
+                budget(&action_palette_items(&table), row.width as usize).to_string(),
+                row.expected,
+                "Action palette footer mismatch at width {}",
+                row.width
+            );
+        }
+    }
+
+    /// The newline hint is the first of the four to go, because `ctrl-o editor` is a second
+    /// route to the same multi-line command: a user who has lost the one still has the
+    /// other, which is the fallback rule 2 orders the whole ladder by. Proven across every
+    /// width rather than at the one the documented table names, so the two hints cannot
+    /// swap ranks at some width no row happens to cover.
+    #[test]
+    fn the_action_palette_footer_gives_up_the_newline_hint_before_the_editor_hint() {
+        let table = default_table();
+        for width in 0..=60u16 {
+            let rendered = render_action_palette(&table, width);
+            assert!(
+                !rendered.contains("newline") || rendered.contains("editor"),
+                "width {width} kept the newline hint after dropping the editor hint: \
+                 {rendered:?}"
+            );
+        }
+    }
+
+    /// The palette is unusable without a way out, so `esc cancel` is the one hint that
+    /// survives every width its footer renders anything at all in.
+    #[test]
+    fn the_action_palette_footers_way_out_is_the_last_hint_to_go() {
+        let table = default_table();
+        for width in 10..=60u16 {
+            let rendered = render_action_palette(&table, width);
+            assert!(
+                rendered.contains("esc cancel"),
+                "width {width} drew {rendered:?} with no way out of the palette"
             );
         }
     }

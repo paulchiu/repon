@@ -1390,6 +1390,7 @@ impl App {
                 | Action::DeletePreviousWord
                 | Action::ClearLine
                 | Action::OpenInEditor
+                | Action::InsertNewline
                 | Action::MoveCursorLeft
                 | Action::MoveCursorRight
                 | Action::MoveCursorWordLeft
@@ -1636,6 +1637,11 @@ impl App {
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_action(),
+            Some(Action::InsertNewline) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.insert_newline(&self.document.actions);
+                }
+            }
             Some(Action::OpenInEditor) => self.pending_action_editor_handoff = true,
             Some(Action::AcceptCompletion) => {}
             None => {}
@@ -1758,7 +1764,10 @@ impl App {
                     line.move_cursor(cursor_motion(action));
                 }
             }
-            Some(Action::OpenInEditor) => {}
+            // Both inert here, permanently: the Filter line is one line by definition
+            // ([filter.md](../../../docs/spec/filter.md)), so it has no newline to insert,
+            // and keybindings.md scopes `Ctrl+O` to the ad hoc command field.
+            Some(Action::OpenInEditor | Action::InsertNewline) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or Text, \
@@ -1822,7 +1831,10 @@ impl App {
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_launcher(),
-            Some(Action::AcceptCompletion | Action::OpenInEditor) => {}
+            // All three inert here: this palette has no completion list, and its query is a
+            // one-line name to match rather than a command to write, so neither the editor
+            // handoff nor the newline has anything to act on.
+            Some(Action::AcceptCompletion | Action::OpenInEditor | Action::InsertNewline) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or \
@@ -2773,6 +2785,7 @@ impl App {
                     actions: &self.document.actions,
                     count: action_palette_count.unwrap_or_else(|| Count::selection(0)),
                     management_lines: &management_lines,
+                    bindings: &self.bindings,
                 },
                 self.glyphs,
             );
@@ -5055,6 +5068,90 @@ mod tests {
         );
     }
 
+    /// `Enter` runs the ad hoc command, so the newline is a chord on it: pressed in the
+    /// Action palette it must extend what was typed rather than run half of it
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+    #[test]
+    fn alt_enter_types_a_newline_into_the_action_palette_rather_than_running_the_command() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("press ;");
+        for c in "echo one".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the first line");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::ALT))
+            .expect("press alt+enter");
+        for c in "echo two".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the second line");
+        }
+
+        let palette = app
+            .action_palette
+            .as_ref()
+            .expect("the palette must still be open, not closed by a run");
+        assert_eq!(palette.text(), "echo one\necho two");
+    }
+
+    /// One `input` table serves four surfaces, so the newline row reaches the Filter line
+    /// and the Launcher palette too. Neither is a multi-line field, so the chord does
+    /// nothing there rather than falling through to the handler's own `unreachable!`.
+    #[test]
+    fn the_newline_chord_is_inert_in_the_filter_line_and_the_launcher_palette() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the Filter line");
+        for c in "ab".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type into the Filter line");
+        }
+        let before = format!(
+            "{:?}",
+            app.filter_line
+                .as_ref()
+                .expect("the Filter line is open")
+                .live_filter()
+        );
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::ALT))
+            .expect("alt+enter must not panic in the Filter line");
+        let after = format!(
+            "{:?}",
+            app.filter_line
+                .as_ref()
+                .expect("the Filter line must still be open")
+                .live_filter()
+        );
+        assert_eq!(before, after, "the Filter line stays one line");
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close the Filter line");
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the Launcher palette");
+        for c in "gi".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type into the Launcher palette");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::ALT))
+            .expect("alt+enter must not panic in the Launcher palette");
+        assert_eq!(
+            app.launcher_palette
+                .as_ref()
+                .expect("the Launcher palette must still be open")
+                .text(),
+            "gi",
+            "the Launcher palette's query stays one line"
+        );
+    }
+
     /// Every action `dispatch(Context::Input, _)` can return is named arm by arm in every
     /// handler that dispatches through that context, so an action joining the input
     /// vocabulary is a red test rather than a runtime `unreachable!` on the key press. The
@@ -5246,6 +5343,7 @@ mod tests {
                         actions: &app.document.actions,
                         count: Count::selection(1),
                         management_lines: &[],
+                        bindings: &app.bindings,
                     },
                     app.glyphs,
                 )

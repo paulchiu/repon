@@ -89,6 +89,9 @@ pub(crate) enum Action {
     DeletePreviousWord,
     ClearLine,
     OpenInEditor,
+    /// `Alt+Enter`: a literal newline in the ad hoc command field, the one `input` surface
+    /// that holds more than one line.
+    InsertNewline,
     /// The six motions a field's cursor answers to, all of them acting on
     /// [`crate::edit_buffer::EditBuffer`]'s own cursor rather than on the text.
     MoveCursorLeft,
@@ -220,6 +223,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::DeletePreviousWord => "Delete the previous word",
         Action::ClearLine => "Clear the line",
         Action::OpenInEditor => "Open the field in `$EDITOR`",
+        Action::InsertNewline => "Insert a newline (the ad hoc command field only)",
         Action::MoveCursorLeft => "Move the cursor left",
         Action::MoveCursorRight => "Move the cursor right",
         Action::MoveCursorWordLeft => "Move the cursor back one word",
@@ -252,9 +256,10 @@ const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 /// A Ctrl chord arrives as the lowercase letter with CONTROL set, per the same section.
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 /// An Alt chord (macOS Option, Meta elsewhere) arrives the same way, as the lowercase letter
-/// with ALT set. Unlike CONTROL it does not exclude a key from [`printable`], so an Alt chord
-/// is text unless a row of its own claims it first, which is why `input`'s two word motions
-/// are table rows rather than a special case in [`BindingTable::dispatch`].
+/// with ALT set. Unlike CONTROL it does not exclude a letter from [`printable`], so an Alt
+/// letter is text unless a row of its own claims it first, which is why `input`'s two word
+/// motions are table rows rather than a special case in [`BindingTable::dispatch`].
+/// `Alt+Enter` is not a letter, so it has no printable meaning to take.
 const ALT: KeyModifiers = KeyModifiers::ALT;
 
 /// Ctrl+I, Ctrl+M and Ctrl+[, permanently unbindable per
@@ -556,6 +561,7 @@ const BINDINGS: &[Binding] = &[
     ),
     // input (the printable-character catch-all is `dispatch`'s fallback, not a row here)
     binding(Context::Input, KeyCode::Enter, NONE, Action::Apply),
+    binding(Context::Input, KeyCode::Enter, ALT, Action::InsertNewline),
     binding(Context::Input, KeyCode::Esc, NONE, Action::Cancel),
     binding(Context::Input, KeyCode::Up, NONE, Action::PreviousEntry),
     binding(
@@ -990,6 +996,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::DeletePreviousWord => "delete_previous_word",
         Action::ClearLine => "clear_line",
         Action::OpenInEditor => "open_in_editor",
+        Action::InsertNewline => "insert_newline",
         Action::MoveCursorLeft => "move_cursor_left",
         Action::MoveCursorRight => "move_cursor_right",
         Action::MoveCursorWordLeft => "move_cursor_word_left",
@@ -1755,8 +1762,24 @@ mod tests {
         }
     }
 
-    /// `Alt+B` and `Alt+F` are the only two Alt chords the table binds, so every other Alt
-    /// combination stays what it was: a printable character typed into the field.
+    /// `Enter` runs the ad hoc command, so the newline it cannot type is a chord on it
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+    /// The two chords must stay separate: one row claiming both would turn the key pressed
+    /// to extend a command into the key that runs it half-written.
+    #[test]
+    fn alt_enter_inserts_a_newline_while_plain_enter_still_applies() {
+        assert_eq!(
+            dispatch(Context::Input, press(KeyCode::Enter, ALT)),
+            Some(Action::InsertNewline)
+        );
+        assert_eq!(
+            dispatch(Context::Input, press(KeyCode::Enter, NONE)),
+            Some(Action::Apply)
+        );
+    }
+
+    /// The letter Alt chords the table binds are `Alt+B` and `Alt+F` alone, so every other
+    /// Alt letter stays what it was: a printable character typed into the field.
     #[test]
     fn an_unbound_alt_chord_is_still_text_in_the_input_context() {
         assert_eq!(
@@ -2056,8 +2079,14 @@ mod tests {
             let c = letter.chars().next().expect("Ctrl+ chord names a letter");
             return (KeyCode::Char(c.to_ascii_lowercase()), CTRL);
         }
-        if let Some(letter) = token.strip_prefix("Alt+") {
-            let c = letter.chars().next().expect("Alt+ chord names a letter");
+        if let Some(rest) = token.strip_prefix("Alt+") {
+            // `Alt+Enter` names a key the branches below already know; `Alt+B` names a
+            // letter the spec capitalises and crossterm delivers in lowercase.
+            if rest.chars().count() > 1 {
+                let (code, _) = spec_key_to_chord(rest);
+                return (code, ALT);
+            }
+            let c = rest.chars().next().expect("Alt+ chord names a letter");
             return (KeyCode::Char(c.to_ascii_lowercase()), ALT);
         }
         match token {
