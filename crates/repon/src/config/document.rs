@@ -2121,6 +2121,8 @@ mod tests {
             show_submodules: _,
             notice_timeout: _,
             on_refresh: _,
+            before_sync: _,
+            after_sync: _,
             refresh: _,
             fetch: _,
             auto_update: _,
@@ -2138,6 +2140,8 @@ mod tests {
                 "show_submodules",
                 "notice_timeout",
                 "on_refresh",
+                "before_sync",
+                "after_sync",
             ],
             &[
                 "[refresh]",
@@ -2187,8 +2191,18 @@ mod tests {
             include: _,
             exclude: _,
             on_refresh: _,
+            before_sync: _,
+            after_sync: _,
         } = toml::from_str::<SetConfig>("name = \"x\"\nroots = []\n").expect("minimal SetConfig");
-        &["name", "roots", "include", "exclude", "on_refresh"]
+        &[
+            "name",
+            "roots",
+            "include",
+            "exclude",
+            "on_refresh",
+            "before_sync",
+            "after_sync",
+        ]
     }
 
     fn repo_config_field_names() -> &'static [&'static str] {

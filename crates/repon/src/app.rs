@@ -3056,7 +3056,6 @@ mod tests {
     /// A real `git -C dir <args>`, asserting it succeeded: the `after_sync` fixture's own
     /// plumbing, kept beside [`init_repo`] rather than reused from `repon-core`'s own test
     /// support, which this crate cannot see.
-    #[cfg(feature = "fetch")]
     fn run_git(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
