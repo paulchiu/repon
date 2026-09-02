@@ -93,6 +93,13 @@ macro_rules! glyph_set {
             /// `capture_elision` below are.
             pub sort_ascending: char,
             pub sort_descending: char,
+            /// The scrollbar a scrollable pane draws down its own right border: the track
+            /// over the whole interior and the thumb over the part of it on screen. Outside
+            /// the row interior on the same terms the sort arrow above is, and the track
+            /// deliberately repeats the frame's vertical run so an unscrolled pane's border
+            /// is unchanged where the thumb is not.
+            pub scrollbar_track: char,
+            pub scrollbar_thumb: char,
             pub border: Border,
             pub capture_elision: &'static str,
         }
@@ -147,6 +154,7 @@ macro_rules! glyph_set {
                     self.row_interior().into_iter().map(|(_, c)| c).collect();
                 glyphs.extend(self.border.chars());
                 glyphs.extend([self.sort_ascending, self.sort_descending]);
+                glyphs.extend([self.scrollbar_track, self.scrollbar_thumb]);
                 glyphs.extend(self.capture_elision.chars());
                 glyphs
             }
@@ -237,6 +245,11 @@ pub const FULL: GlyphSet = GlyphSet {
     // against a column label rather than decoded as a value inside a row.
     sort_ascending: '\u{2191}',
     sort_descending: '\u{2193}',
+    // The track is this table's own vertical rule, so the bar only ever adds the thumb to a
+    // border that is otherwise drawn exactly as it was before; the thumb is the solid block
+    // that reads as a filled length of that rule rather than as a character in it.
+    scrollbar_track: '│',
+    scrollbar_thumb: '█',
     border: Border {
         top_left: '╭',
         top_right: '╮',
@@ -284,6 +297,11 @@ pub const ASCII: GlyphSet = GlyphSet {
     // glyph in a label's place.
     sort_ascending: '^',
     sort_descending: 'v',
+    // The same pairing the full table makes: the track is this table's own vertical rule, and
+    // `#` is the densest of the 95 printable ASCII characters, none of which this table has
+    // already claimed for anything else.
+    scrollbar_track: '|',
+    scrollbar_thumb: '#',
     border: Border {
         top_left: '+',
         top_right: '+',
@@ -1014,6 +1032,60 @@ mod tests {
             assert_eq!(
                 &drawn, cell,
                 "the {label} table's sort arrows disagree with theming.md's sort arrow row"
+            );
+        }
+    }
+
+    /// Reads `docs/spec/theming.md`'s own "scrollbar" row at test time and compares both
+    /// cells against both tables, the same way the panel border and sort arrow rows above
+    /// are compared, so a scrollable pane's own two characters can never drift from the
+    /// design of record. The ascii cell contains a literal `|`, so the cells are read as the
+    /// row's backtick-delimited spans rather than by splitting the row on its own pipes.
+    #[test]
+    fn both_tables_scrollbar_characters_match_theming_mds_own_scrollbar_row() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read the theming specification");
+        let row = spec
+            .lines()
+            .find(|line| line.trim_start().starts_with("| scrollbar"))
+            .expect("theming.md's \"The two sets\" table names a `scrollbar` row");
+        let cells: Vec<String> = row
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|cell| cell.replace(' ', ""))
+            .collect();
+        let [full_cell, ascii_cell] = cells.as_slice() else {
+            panic!("expected exactly two code spans in theming.md's scrollbar row: {row:?}");
+        };
+
+        for (label, cell, table) in [("full", full_cell, &FULL), ("ascii", ascii_cell, &ASCII)] {
+            let drawn: String = [table.scrollbar_track, table.scrollbar_thumb]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                &drawn, cell,
+                "the {label} table's scrollbar characters disagree with theming.md's \
+                 scrollbar row"
+            );
+        }
+    }
+
+    /// The scrollbar is drawn over the frame it sits in, so its track is deliberately the
+    /// frame's own vertical rule in both tables: a pane's border is unchanged everywhere the
+    /// thumb is not. The thumb is the one character that has to differ from it, or the bar
+    /// would report nothing at all.
+    #[test]
+    fn the_scrollbar_track_repeats_the_frames_vertical_rule_in_both_tables() {
+        for (label, table) in [("full", &FULL), ("ascii", &ASCII)] {
+            assert_eq!(
+                table.scrollbar_track, table.border.vertical,
+                "the {label} table's scrollbar track must be the vertical rule it is drawn over"
+            );
+            assert_ne!(
+                table.scrollbar_thumb, table.scrollbar_track,
+                "the {label} table's scrollbar thumb is indistinguishable from its track"
             );
         }
     }

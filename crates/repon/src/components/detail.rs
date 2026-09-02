@@ -21,7 +21,13 @@
 use std::time::Duration;
 
 use ansi_to_tui::IntoText;
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::Rect,
+    style::Style,
+    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget},
+};
 use repon_core::{
     ActionReceipt, CaptureElision, DefaultBranch, DefaultBranchStopped, Diagnostics, DirtyCounts,
     EntityState, Head, InProgressOperation, Kind, OwnWork, RunningStep, Settled, StepOutcome,
@@ -100,13 +106,17 @@ impl Detail {
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
+        let lines = styled_content_lines(entity, interior.width, glyphs);
         let buf = frame.buffer_mut();
-        draw_lines(
+        draw_lines(buf, interior, &lines, self.scroll, theme);
+        draw_scrollbar(
             buf,
+            area,
             interior,
-            &styled_content_lines(entity, interior.width, glyphs),
+            lines.len(),
             self.scroll,
-            theme,
+            glyphs,
+            theme.style_for(role),
         );
     }
 }
@@ -199,6 +209,47 @@ fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[ContentLine], scroll: u16, 
         };
         write_cell_runs(buf, area, area.x, area.y + row as u16, area.width, &runs);
     }
+}
+
+/// Draws the pane's own scrollbar over its right border, or nothing at all when every line
+/// already fits the interior: a pane showing all it has looks exactly as it did before this
+/// existed. `style` is the border's own resolved style, so the bar reads as part of the frame
+/// it is painted over and carries the same focus colour, and its two characters come from the
+/// live glyph table for the reason the frame's own do.
+///
+/// [`ScrollbarState`]'s `content_length` is given the number of scroll positions rather than
+/// the line count: ratatui sizes and places the thumb against `content_length - 1 + viewport`,
+/// so the line count would leave the thumb short of the bottom on a pane scrolled to its last
+/// line, which is the one reading this bar exists to make certain.
+fn draw_scrollbar(
+    buf: &mut Buffer,
+    area: Rect,
+    interior: Rect,
+    content_len: usize,
+    scroll: u16,
+    glyphs: &'static GlyphSet,
+    style: Style,
+) {
+    let viewport = interior.height as usize;
+    if viewport == 0 || area.width < BORDER_WIDTH || content_len <= viewport {
+        return;
+    }
+
+    let mut track = [0u8; 4];
+    let mut thumb = [0u8; 4];
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .track_symbol(Some(glyphs.scrollbar_track.encode_utf8(&mut track)))
+        .thumb_symbol(glyphs.scrollbar_thumb.encode_utf8(&mut thumb))
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(style)
+        .thumb_style(style);
+    let mut state = ScrollbarState::new(content_len - viewport + 1).position(scroll as usize);
+    bar.render(
+        Rect::new(area.right() - 1, interior.y, 1, interior.height),
+        buf,
+        &mut state,
+    );
 }
 
 /// Every line the pane shows, in order: identity and path, one line per Cell's provenance in
@@ -2095,9 +2146,11 @@ mod tests {
     fn draw_frames_the_pane_with_the_active_glyph_tables_own_border() {
         use ratatui::{Terminal, backend::TestBackend};
 
+        // Tall enough that this fixture's own content fits: the assertion below reads the
+        // whole right border, which a scrollable pane draws its own scrollbar over.
         for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
             let detail = Detail::default();
-            let backend = TestBackend::new(40, 10);
+            let backend = TestBackend::new(40, 30);
             let mut terminal = Terminal::new(backend).expect("create test terminal");
 
             terminal
@@ -2118,13 +2171,13 @@ mod tests {
             // reads the top and the bottom separately.
             crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
                 terminal.backend().buffer(),
-                Rect::new(0, 0, 40, 10),
+                Rect::new(0, 0, 40, 30),
                 glyphs.border,
                 " a ",
                 "the detail pane's frame",
             );
             let bottom_row: String = (0..40)
-                .map(|x| terminal.backend().buffer()[(x, 9)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 29)].symbol())
                 .collect();
             let expected_tail = format!(
                 "{}{}",
@@ -2135,6 +2188,198 @@ mod tests {
                 bottom_row.ends_with(&expected_tail),
                 "expected the close hint right-aligned against the bottom-right corner, got \
                  {bottom_row:?}"
+            );
+        }
+    }
+
+    // --- the scrollbar: whether the pane scrolls, where in the content it is, how much is left ---
+
+    /// The pane's own right border between its two corners, top to bottom: the cells the
+    /// scrollbar is drawn over, and the only cells it may touch.
+    fn right_border_interior(buf: &Buffer, area: Rect) -> String {
+        ((area.y + 1)..(area.bottom() - 1))
+            .map(|y| buf[(area.right() - 1, y)].symbol())
+            .collect()
+    }
+
+    /// An Entity whose recent commits are the only thing making the pane long: one line each,
+    /// and nothing else the pane shows changes with their number.
+    fn entity_with_commits(count: usize) -> EntityState {
+        let mut entity = entity("a");
+        entity.recent_commits = (0..count)
+            .map(|index| RecentCommit {
+                short_id: Arc::from(format!("{index:07}")),
+                summary: Arc::from("a commit summary"),
+            })
+            .collect();
+        entity
+    }
+
+    /// Draws `entity` into a `width` by `height` pane at `scroll`, and returns the buffer's
+    /// own right border between the corners.
+    fn drawn_scrollbar(
+        entity: &EntityState,
+        glyphs: &'static GlyphSet,
+        theme: &Theme,
+        focused: bool,
+        scroll: u16,
+        width: u16,
+        height: u16,
+    ) -> (String, ratatui::buffer::Buffer) {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let area = Rect::new(0, 0, width, height);
+        let detail = Detail { scroll };
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| detail.draw(frame, frame.area(), entity, glyphs, focused, theme))
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer().clone();
+        (right_border_interior(&buf, area), buf)
+    }
+
+    /// A pane showing everything it has is drawn exactly as it was before the bar existed:
+    /// the frame's own vertical rule, all the way down, and no thumb anywhere.
+    #[test]
+    fn draw_leaves_the_right_border_bare_when_the_content_fits_the_pane() {
+        let glyphs = full_glyphs();
+        let (bar, _) = drawn_scrollbar(&entity("a"), glyphs, &theme::DEFAULT, true, 0, 40, 40);
+
+        assert_eq!(
+            bar,
+            glyphs
+                .border
+                .vertical
+                .to_string()
+                .repeat(bar.chars().count()),
+            "expected an unscrollable pane's right border untouched, got {bar:?}"
+        );
+    }
+
+    /// The pane at its first line reports it: the thumb sits against the top of the track,
+    /// and the rest of the track is still bare border.
+    #[test]
+    fn draw_marks_the_top_of_the_right_border_when_a_scrollable_pane_shows_its_first_line() {
+        let glyphs = full_glyphs();
+        let (bar, _) = drawn_scrollbar(
+            &entity_with_commits(30),
+            glyphs,
+            &theme::DEFAULT,
+            true,
+            0,
+            40,
+            10,
+        );
+
+        assert!(
+            bar.starts_with(glyphs.scrollbar_thumb),
+            "expected the thumb against the top of the track, got {bar:?}"
+        );
+        assert!(
+            bar.ends_with(glyphs.scrollbar_track),
+            "expected track below the thumb at the first line, got {bar:?}"
+        );
+    }
+
+    /// The reading the pane could not give before: a pane showing its last line is told apart
+    /// from one showing its first, because the thumb reaches the bottom of the track. The
+    /// corners and the bottom border's own close hint are outside the bar's own cells.
+    #[test]
+    fn draw_marks_the_bottom_of_the_right_border_when_a_scrollable_pane_shows_its_last_line() {
+        let glyphs = full_glyphs();
+        let entity = entity_with_commits(30);
+        let mut detail = Detail::default();
+        detail.apply(Action::Bottom, Detail::content_len(&entity, 40, glyphs), 8);
+
+        let (bar, buf) = drawn_scrollbar(
+            &entity,
+            glyphs,
+            &theme::DEFAULT,
+            true,
+            detail.scroll,
+            40,
+            10,
+        );
+
+        assert!(
+            bar.ends_with(glyphs.scrollbar_thumb),
+            "expected the thumb against the bottom of the track at the last line, got {bar:?}"
+        );
+        assert!(
+            bar.starts_with(glyphs.scrollbar_track),
+            "expected track above the thumb at the last line, got {bar:?}"
+        );
+        assert_eq!(
+            buf[(39, 0)].symbol(),
+            glyphs.border.top_right.to_string(),
+            "the bar must not reach the pane's own top-right corner"
+        );
+        assert_eq!(
+            buf[(39, 9)].symbol(),
+            glyphs.border.bottom_right.to_string(),
+            "the bar must not reach the pane's own bottom-right corner"
+        );
+    }
+
+    /// The bar degrades with the frame it is drawn over: both characters come from the
+    /// active table, so `glyphs = "ascii"` leaves nothing on the border that `TERM=linux`
+    /// cannot draw. Both tables in the one test, so a hardcoded copy of either satisfies
+    /// neither.
+    #[test]
+    fn draw_takes_the_scrollbars_characters_from_the_active_glyph_table() {
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let (bar, _) = drawn_scrollbar(
+                &entity_with_commits(30),
+                glyphs,
+                &theme::DEFAULT,
+                true,
+                0,
+                40,
+                10,
+            );
+
+            assert!(
+                bar.contains(glyphs.scrollbar_thumb),
+                "expected the active table's own thumb on the border, got {bar:?}"
+            );
+            assert!(
+                bar.contains(glyphs.scrollbar_track),
+                "expected the active table's own track on the border, got {bar:?}"
+            );
+        }
+    }
+
+    /// The bar takes the border's own role rather than one of its own, so it carries the
+    /// pane's focus the same way the frame around it does. Colours with no compiled role
+    /// reuse them, so passing the wrong one through cannot pass by coincidence.
+    #[test]
+    fn draw_paints_the_scrollbar_in_the_role_of_the_border_it_sits_in() {
+        let live_theme = Theme {
+            border: ratatui::style::Color::Rgb(1, 2, 3),
+            border_focused: ratatui::style::Color::Rgb(9, 8, 7),
+            ..theme::DEFAULT
+        };
+        let glyphs = full_glyphs();
+
+        for (focused, expected) in [
+            (true, ratatui::style::Color::Rgb(9, 8, 7)),
+            (false, ratatui::style::Color::Rgb(1, 2, 3)),
+        ] {
+            let (_, buf) = drawn_scrollbar(
+                &entity_with_commits(30),
+                glyphs,
+                &live_theme,
+                focused,
+                0,
+                40,
+                10,
+            );
+
+            assert_eq!(
+                buf[(39, 1)].fg,
+                expected,
+                "expected the thumb painted in the same role as the border, focused: {focused}"
             );
         }
     }
