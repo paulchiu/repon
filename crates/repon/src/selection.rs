@@ -51,6 +51,16 @@ impl Selection {
         self.selected.contains(key)
     }
 
+    /// Drops `key` from the checked set, called at every seam that removes a row from the
+    /// table ([`crate::app::App::dismiss_vanished_at_cursor`] and the management report's
+    /// own removed keys) so a Selection can never outlive the row it names. Without this a
+    /// stale key keeps [`Self::is_empty`] false, which stops the empty-Selection widening
+    /// [`crate::app::App::action_targets`] relies on and leaves [`Self::count`] overstating
+    /// what is actually checked.
+    pub(crate) fn remove(&mut self, key: &EntityKey) {
+        self.selected.remove(key);
+    }
+
     /// Toggles one row's membership, independent of every other row: selecting a Worktree
     /// never selects its Repo, and the reverse.
     pub(crate) fn toggle(&mut self, key: EntityKey) {
@@ -208,6 +218,30 @@ mod tests {
         selection.toggle(repo.clone());
         assert!(!selection.contains(&repo));
         assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn removing_the_one_checked_row_empties_the_selection() {
+        let mut selection = Selection::new();
+        let repo = key("repo");
+        selection.toggle(repo.clone());
+
+        selection.remove(&repo);
+
+        assert!(selection.is_empty());
+        assert_eq!(selection.count(), 0);
+    }
+
+    #[test]
+    fn removing_a_row_that_was_never_checked_does_nothing() {
+        let mut selection = Selection::new();
+        let checked = key("checked-row");
+        selection.toggle(checked.clone());
+
+        selection.remove(&key("never-checked"));
+
+        assert!(selection.contains(&checked));
+        assert_eq!(selection.count(), 1);
     }
 
     #[test]
