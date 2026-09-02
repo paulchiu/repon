@@ -101,8 +101,8 @@ out of their own key handler, so it does nothing for either.
 
 | key | action |
 | --- | --- |
-| `j` | Scroll down |
-| `k` | Scroll up |
+| `j`, `Down` | Scroll down |
+| `k`, `Up` | Scroll up |
 | `g` | Top |
 | `G` | Bottom |
 | `Ctrl+D` | Half page down |

@@ -10522,6 +10522,34 @@ refresh_all = "z""#,
         );
     }
 
+    /// `Down` must reach the same `ScrollDown` action `j` does, not fall through as an unbound
+    /// key: this is what #283 adds to `Context::Overlay`.
+    #[test]
+    fn down_moves_the_pickers_own_cursor_the_same_as_j() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+        let list_cursor_before = app.cursor;
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the picker's cursor down");
+
+        assert_eq!(
+            app.cursor, list_cursor_before,
+            "Down while the picker is open must never move the list's own cursor"
+        );
+        assert_eq!(
+            app.set_picker.as_ref().map(SetPicker::cursor),
+            Some(1),
+            "Down must move the picker's own cursor onto the second declared Set"
+        );
+    }
+
     /// The other half of the same risk: consulting `self.focus` (which falls back to
     /// `Global`) instead of `Context::Overlay` would let `q` quit the application mid-picker.
     /// `Action::Quit` never sets a field directly; it sends `Message::Quit` on the channel,
