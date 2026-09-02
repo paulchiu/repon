@@ -10,7 +10,8 @@ use ratatui::{
     widgets::Clear,
 };
 use repon_core::{
-    ActionReceipt, Core, EntityKey, EntityState, Filter, Kind, Presence, Snapshot, StepOutcome,
+    ActionReceipt, Core, EntityKey, EntityState, FetchFailures, Filter, Kind, Presence, Snapshot,
+    StepOutcome,
 };
 use tracing::debug;
 
@@ -332,6 +333,12 @@ pub struct App {
     /// only when `self.core` itself is rebuilt on a reload, since a fresh `Core` starts with
     /// no discovery warning of its own.
     discovery_warning_logged: bool,
+    /// The last periodic-fetch cycle's own failures already logged to `repon.log`, compared
+    /// by value against `self.core.fetch_failures()` each frame: a cycle whose failures
+    /// exactly repeat this is not re-logged, since nothing new happened to report. Reset to
+    /// empty only when `self.core` itself is rebuilt on a reload, the same lifecycle
+    /// `discovery_warning_logged` takes.
+    fetch_failures_logged: FetchFailures,
     /// The last size `Tui` reported, so the help overlay's own scroll clamp
     /// ([`HelpOverlay::apply`]) knows its viewport height without `Tui` reaching back in.
     frame_size: Size,
@@ -547,6 +554,7 @@ impl App {
             theme_warnings,
             config_warnings,
             discovery_warning_logged: false,
+            fetch_failures_logged: FetchFailures::default(),
             frame_size: Size::default(),
             message_tx,
             message_rx,
@@ -668,10 +676,12 @@ impl App {
     /// involved; the first time it does, this also logs it to `repon.log`
     /// ([`warnings::log_discovery_warning_once`]), the discovery half of "every warning is
     /// reported twice" (the theme and config halves already log at the point their own load
-    /// raises them). The Vanished count and the `on_refresh` hook's own failures are read
-    /// fresh from `snapshot` the same way, with nothing latched: each condition clears itself
-    /// the moment the count returns to zero. A live Notice is never folded
-    /// in here: it is not a standing condition of the session, and
+    /// raises them). `self.core`'s own periodic-fetch failure count is read fresh the same
+    /// way, and its individual failures logged once per distinct set
+    /// ([`log_fetch_failures_once`]), the fetch half of the same rule. The Vanished count and
+    /// the `on_refresh` hook's own failures are read fresh from `snapshot` the same way, with
+    /// nothing latched: each condition clears itself the moment the count returns to zero. A
+    /// live Notice is never folded in here: it is not a standing condition of the session, and
     /// [theming.md](../../../docs/spec/theming.md) keeps the two apart.
     fn current_warnings(&mut self, snapshot: &Snapshot) -> Vec<Warning> {
         let discovery_abandoned = self.core.discovery_warning();
@@ -679,12 +689,15 @@ impl App {
             discovery_abandoned.as_ref(),
             &mut self.discovery_warning_logged,
         );
+        let fetch_failures = self.core.fetch_failures();
+        log_fetch_failures_once(&fetch_failures, &mut self.fetch_failures_logged);
         let vanished = self.core.vanished_count();
         let on_refresh_failed = self.on_refresh_failures(snapshot);
         WarningSources {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             on_refresh_failed,
+            fetch_failed: fetch_failures.failed.len(),
             discovery_abandoned,
             vanished,
         }
@@ -2916,6 +2929,22 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
         .collect()
 }
 
+/// Logs `failures`'s own entries to `repon.log` once per distinct set of them, mirroring
+/// [`warnings::log_discovery_warning_once`]: the periodic fetch's own half of "every warning
+/// is reported twice". A cycle whose failures exactly repeat the last logged set is not
+/// re-logged, since nothing new happened to report; the path and the underlying
+/// `FetchError`'s own text both reach the log, unlike the Warning's own screen text, since
+/// neither is drawn here.
+fn log_fetch_failures_once(failures: &FetchFailures, already_logged: &mut FetchFailures) {
+    if failures == already_logged {
+        return;
+    }
+    for (path, message) in &failures.failed {
+        tracing::warn!(path = %path.display(), "periodic fetch failed: {message}");
+    }
+    *already_logged = failures.clone();
+}
+
 /// The status row's whole content, exactly one of two shapes and never a mix
 /// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md#the-status-row)):
 /// a live Notice takes the row whole, alone, or with no Notice live
@@ -3152,6 +3181,7 @@ mod tests {
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
             discovery_warning_logged: false,
+            fetch_failures_logged: FetchFailures::default(),
             frame_size: Size::default(),
             message_tx,
             message_rx,
@@ -8677,6 +8707,115 @@ mod tests {
         );
     }
 
+    /// `current_warnings` reads `self.core.fetch_failures()` on every call: with the
+    /// periodic fetch off (as every `test_app` core has it), that count is always zero, so
+    /// this is a sanity check on the wiring rather than on the periodic fetch itself, which
+    /// `repon-core`'s own `fetch_scheduler` tests cover with a real cycle.
+    #[test]
+    fn no_periodic_fetch_failures_means_current_warnings_never_raises_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        let warnings = app.current_warnings(&app.core.snapshot());
+
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::FetchFailed(_))),
+            "no periodic-fetch cycle has ever run, so no such condition stands, got: {warnings:?}"
+        );
+    }
+
+    // --- `log_fetch_failures_once`: the fetch half of "every warning is reported twice",
+    // mirroring `warnings::log_discovery_warning_once`'s own coverage. ---
+
+    #[test]
+    fn fetch_failures_are_logged_to_the_file_writer_with_their_paths() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![
+                (
+                    PathBuf::from("/repos/a"),
+                    "failed to connect to remote: x".to_string(),
+                ),
+                (
+                    PathBuf::from("/repos/b"),
+                    "failed to open git repository: y".to_string(),
+                ),
+            ],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&failures, &mut already_logged);
+        });
+
+        assert!(
+            logs.contains("/repos/a") && logs.contains("failed to connect to remote: x"),
+            "expected the first failure's path and message logged, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("/repos/b") && logs.contains("failed to open git repository: y"),
+            "expected the second failure's path and message logged, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_fetch_failures_are_logged_exactly_once_even_when_checked_every_tick() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+        };
+
+        let logs = capture_tracing(|| {
+            for _ in 0..5 {
+                log_fetch_failures_once(&failures, &mut already_logged);
+            }
+        });
+
+        assert_eq!(
+            logs.matches("/repos/a").count(),
+            1,
+            "expected exactly one log line despite five checks against the same still-set \
+             failures, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn no_fetch_failures_logs_nothing() {
+        let mut already_logged = FetchFailures::default();
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&FetchFailures::default(), &mut already_logged);
+        });
+
+        assert!(logs.is_empty(), "expected no log line, got: {logs:?}");
+    }
+
+    /// A later cycle with a different failure set is logged again, since a new set is new
+    /// information, not a repeat of what already reached the log.
+    #[test]
+    fn a_later_distinct_fetch_failure_set_is_logged_again() {
+        let mut already_logged = FetchFailures::default();
+        let first = FetchFailures {
+            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+        };
+        let second = FetchFailures {
+            failed: vec![(PathBuf::from("/repos/b"), "failed: y".to_string())],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&first, &mut already_logged);
+            log_fetch_failures_once(&second, &mut already_logged);
+        });
+
+        assert!(
+            logs.contains("/repos/a") && logs.contains("/repos/b"),
+            "expected both distinct failure sets logged, got: {logs:?}"
+        );
+    }
+
     /// The load warning is the whole of what a typo costs: pressing `r` afterwards still
     /// refreshes, runs nothing and does not panic. `App` deliberately raises no Notice of its
     /// own here, since `r` is pressed many times a session and the condition was already
@@ -10614,6 +10753,34 @@ refresh_all = "z""#,
             app.set_picker.as_ref().map(SetPicker::cursor),
             Some(1),
             "j must move the picker's own cursor onto the second declared Set"
+        );
+    }
+
+    /// `Down` must reach the same `ScrollDown` action `j` does, not fall through as an unbound
+    /// key: this is what #283 adds to `Context::Overlay`.
+    #[test]
+    fn down_moves_the_pickers_own_cursor_the_same_as_j() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+        let list_cursor_before = app.cursor;
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the picker's cursor down");
+
+        assert_eq!(
+            app.cursor, list_cursor_before,
+            "Down while the picker is open must never move the list's own cursor"
+        );
+        assert_eq!(
+            app.set_picker.as_ref().map(SetPicker::cursor),
+            Some(1),
+            "Down must move the picker's own cursor onto the second declared Set"
         );
     }
 

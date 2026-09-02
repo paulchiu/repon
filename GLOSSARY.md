@@ -158,6 +158,9 @@ An optional background cycle, off by default, that fetches every remote with pru
 **Fetch spec**:
 The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Present only when the core is built with its `fetch` cargo feature, the mutating path's own isolation boundary. Not a FetchConfig, which names the consumer's parsed TOML shape rather than the core's.
 
+**Fetch failures**:
+The most recently completed periodic fetch cycle's own count of repositories it could not fetch, read fresh rather than latched: a cycle where every fetch succeeds carries none. Never the underlying error text, since that text is arbitrary bytes from a remote; the individual failures, with their paths, reach the log instead. One repository's own failure never stops another's, the per-repository independence the periodic fetch already holds to.
+
 **The fast-forward-only auto-update**:
 An optional mutation that rides the periodic fetch cycle rather than carrying a timer of its own, off by default. It acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, never fixed, by leaving its true Cells to say so on the next Generation. It never rebases, merges, commits or resets: moving the branch a fast-forward's own way (a ref update and the working-tree writes a tree diff between the two commits names) is the whole mechanism.
 

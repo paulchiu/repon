@@ -2035,6 +2035,328 @@ mod tests {
         assert!(loaded.warnings.is_empty(), "got: {:?}", loaded.warnings);
     }
 
+    /// Which part of the template one of its own lines belongs to, coarse enough for
+    /// [`section_declares_key`]: everything above the first header is the bare top-level
+    /// keys, and every other line belongs to whichever header last preceded it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TemplateSection {
+        TopLevel,
+        Refresh,
+        Fetch,
+        AutoUpdate,
+        Set,
+        Repo,
+        Launcher,
+        Action,
+        ActionSteps,
+    }
+
+    /// Tags every line of `template` with the section it falls under, by the last
+    /// `[section]` or `[[array]]` header seen. A struct's own scalar fields are declared
+    /// only inside its own section header's own array-of-tables, so `[[action.steps]]`
+    /// switches away from `Action` (a step's fields are not an action's), and a fresh
+    /// `[[action]]` switches back.
+    fn sectioned_lines(template: &str) -> Vec<(TemplateSection, &str)> {
+        let mut section = TemplateSection::TopLevel;
+        template
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with("[[action.steps]]") {
+                    section = TemplateSection::ActionSteps;
+                } else if trimmed.starts_with("[[set]]") {
+                    section = TemplateSection::Set;
+                } else if trimmed.starts_with("[[repo]]") {
+                    section = TemplateSection::Repo;
+                } else if trimmed.starts_with("[[launcher]]") {
+                    section = TemplateSection::Launcher;
+                } else if trimmed.starts_with("[[action]]") {
+                    section = TemplateSection::Action;
+                } else if trimmed.starts_with("[refresh]") {
+                    section = TemplateSection::Refresh;
+                } else if trimmed.starts_with("[fetch]") {
+                    section = TemplateSection::Fetch;
+                } else if trimmed.starts_with("[auto_update]") {
+                    section = TemplateSection::AutoUpdate;
+                }
+                (section, line)
+            })
+            .collect()
+    }
+
+    /// Whether `line` declares `key`, live or commented out: a leading `#` is stripped
+    /// first, so `# poll_interval = "2s"` and `poll_interval = "2s"` both count, and a
+    /// prose comment that never reaches an `=` (`# The pipe is why...`) never falsely
+    /// matches a key that happens to prefix one of its words.
+    fn line_declares_key(line: &str, key: &str) -> bool {
+        let line = line.trim();
+        let line = line.strip_prefix('#').map(str::trim).unwrap_or(line);
+        line.strip_prefix(key)
+            .map(|rest| rest.trim_start().starts_with('='))
+            .unwrap_or(false)
+    }
+
+    /// Whether `key` is declared anywhere inside `section`, live or commented out.
+    fn section_declares_key(
+        lines: &[(TemplateSection, &str)],
+        section: TemplateSection,
+        key: &str,
+    ) -> bool {
+        lines
+            .iter()
+            .filter(|(line_section, _)| *line_section == section)
+            .any(|(_, line)| line_declares_key(line, key))
+    }
+
+    /// Every key name [`Document`] itself declares, split into the bare scalars (checked
+    /// as a `key = value` line) and the tables and arrays of tables (checked as a header).
+    /// An exhaustive destructure with no `..` tail: a field added to `Document` fails this
+    /// to compile until it is named here too, rather than the check below silently never
+    /// seeing it (the hand-enumeration failure this ticket was asked to watch for).
+    fn document_field_names() -> (&'static [&'static str], &'static [&'static str]) {
+        let Document {
+            theme: _,
+            glyphs: _,
+            show_worktrees: _,
+            show_submodules: _,
+            notice_timeout: _,
+            on_refresh: _,
+            refresh: _,
+            fetch: _,
+            auto_update: _,
+            sets: _,
+            repos: _,
+            launchers: _,
+            actions: _,
+            keys: _,
+        } = Document::default();
+        (
+            &[
+                "theme",
+                "glyphs",
+                "show_worktrees",
+                "show_submodules",
+                "notice_timeout",
+                "on_refresh",
+            ],
+            &[
+                "[refresh]",
+                "[fetch]",
+                "[auto_update]",
+                "[keys",
+                "[[set]]",
+                "[[repo]]",
+                "[[launcher]]",
+                "[[action]]",
+            ],
+        )
+    }
+
+    /// The same exhaustive-destructure guard as [`document_field_names`], one per nested
+    /// or repeated table. A required field (`SetConfig::name`, `RepoConfig::path`,
+    /// `LauncherConfig::name`, `ActionConfig::{name,steps}`, `StepConfig::args`) still
+    /// needs a value to destructure, so each parses the smallest document that can carry
+    /// it rather than restating its shape as a struct literal a second time.
+    fn refresh_config_field_names() -> &'static [&'static str] {
+        let RefreshConfig {
+            poll_interval: _,
+            status_stale_after: _,
+            on_focus: _,
+        } = RefreshConfig::default();
+        &["poll_interval", "status_stale_after", "on_focus"]
+    }
+
+    fn fetch_config_field_names() -> &'static [&'static str] {
+        let FetchConfig {
+            enabled: _,
+            interval: _,
+            concurrency: _,
+        } = FetchConfig::default();
+        &["enabled", "interval", "concurrency"]
+    }
+
+    fn auto_update_config_field_names() -> &'static [&'static str] {
+        let AutoUpdateConfig { enabled: _ } = AutoUpdateConfig::default();
+        &["enabled"]
+    }
+
+    fn set_config_field_names() -> &'static [&'static str] {
+        let SetConfig {
+            name: _,
+            roots: _,
+            include: _,
+            exclude: _,
+            on_refresh: _,
+        } = toml::from_str::<SetConfig>("name = \"x\"\nroots = []\n").expect("minimal SetConfig");
+        &["name", "roots", "include", "exclude", "on_refresh"]
+    }
+
+    fn repo_config_field_names() -> &'static [&'static str] {
+        let RepoConfig {
+            path: _,
+            default_branch: _,
+            exclude: _,
+        } = toml::from_str::<RepoConfig>("path = \"x\"\n").expect("minimal RepoConfig");
+        &["path", "default_branch", "exclude"]
+    }
+
+    fn launcher_config_field_names() -> &'static [&'static str] {
+        let LauncherConfig {
+            name: _,
+            args: _,
+            from_env: _,
+            shell: _,
+            takes_terminal: _,
+            env: _,
+            disabled: _,
+        } = toml::from_str::<LauncherConfig>("name = \"x\"\n").expect("minimal LauncherConfig");
+        &[
+            "name",
+            "args",
+            "from_env",
+            "shell",
+            "takes_terminal",
+            "env",
+            "disabled",
+        ]
+    }
+
+    /// `steps` is excluded here: it is `[[action.steps]]`, an array-of-tables header
+    /// rather than a `key = value` line, so the exhaustiveness test below checks it as a
+    /// header the same way it checks `Document`'s own array-of-tables fields.
+    fn action_config_field_names() -> &'static [&'static str] {
+        let ActionConfig {
+            name: _,
+            description: _,
+            steps: _,
+            confirm: _,
+            concurrency: _,
+            when: _,
+        } = toml::from_str::<ActionConfig>("name = \"x\"\nsteps = []\n")
+            .expect("minimal ActionConfig");
+        &["name", "description", "confirm", "concurrency", "when"]
+    }
+
+    fn step_config_field_names() -> &'static [&'static str] {
+        let StepConfig {
+            args: _,
+            shell: _,
+            env: _,
+        } = toml::from_str::<StepConfig>("args = []\n").expect("minimal StepConfig");
+        &["args", "shell", "env"]
+    }
+
+    /// Done when: "Every key in the schema appears in the template, proven by a test that
+    /// fails when a field is added to a struct and not to the file." Each `*_field_names`
+    /// helper above is pinned to its struct by an exhaustive destructure, so a field added
+    /// there and never named here fails this file to compile; this test is what then
+    /// checks the file actually shows it, commented out or live, rather than trusting the
+    /// list of currently-omitted keys this ticket opened with.
+    #[test]
+    fn every_schema_field_appears_somewhere_in_the_shipped_template() {
+        let template = annotated_example();
+        let lines = sectioned_lines(template);
+
+        let (top_level, headers) = document_field_names();
+        let mut missing = Vec::new();
+        for key in top_level {
+            if !section_declares_key(&lines, TemplateSection::TopLevel, key) {
+                missing.push(format!("Document.{key}"));
+            }
+        }
+        for header in headers {
+            if !template.contains(header) {
+                missing.push(format!("Document.{header}"));
+            }
+        }
+
+        let sections: &[(&str, TemplateSection, &[&str])] = &[
+            (
+                "RefreshConfig",
+                TemplateSection::Refresh,
+                refresh_config_field_names(),
+            ),
+            (
+                "FetchConfig",
+                TemplateSection::Fetch,
+                fetch_config_field_names(),
+            ),
+            (
+                "AutoUpdateConfig",
+                TemplateSection::AutoUpdate,
+                auto_update_config_field_names(),
+            ),
+            ("SetConfig", TemplateSection::Set, set_config_field_names()),
+            (
+                "RepoConfig",
+                TemplateSection::Repo,
+                repo_config_field_names(),
+            ),
+            (
+                "LauncherConfig",
+                TemplateSection::Launcher,
+                launcher_config_field_names(),
+            ),
+            (
+                "ActionConfig",
+                TemplateSection::Action,
+                action_config_field_names(),
+            ),
+            (
+                "StepConfig",
+                TemplateSection::ActionSteps,
+                step_config_field_names(),
+            ),
+        ];
+        for (struct_name, section, fields) in sections {
+            for key in *fields {
+                if !section_declares_key(&lines, *section, key) {
+                    missing.push(format!("{struct_name}.{key}"));
+                }
+            }
+        }
+        // `ActionConfig::steps` is its own array-of-tables header, checked separately from
+        // `action_config_field_names`'s scalar keys.
+        if !template.contains("[[action.steps]]") {
+            missing.push("ActionConfig.steps".to_string());
+        }
+
+        assert!(
+            missing.is_empty(),
+            "example.toml omits these schema fields entirely: {missing:?}"
+        );
+    }
+
+    /// Every commented-out `key = value` line in `template`, uncommented in place: a
+    /// standalone comment whose text never reaches an `=` (prose) is left alone, so only a
+    /// line shaped like a default demonstration is affected. This is what "uncommenting
+    /// the entire template" (config.md's "An annotated example") means for the checks
+    /// below.
+    fn uncomment_defaults(template: &str) -> String {
+        template
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed.strip_prefix('#') else {
+                    return line.to_string();
+                };
+                let candidate = rest.trim_start();
+                let key_end = candidate
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                    .unwrap_or(candidate.len());
+                let is_key_value =
+                    key_end > 0 && candidate[key_end..].trim_start().starts_with('=');
+                if is_key_value {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    format!("{indent}{candidate}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // `repon config --example` prints this exact text; parsing it here, rather than a
     // hand-typed copy, is what proves the printed example and the real schema cannot drift
     // apart. No unknown key means every line the spec shows is a key this schema knows.
@@ -2106,9 +2428,30 @@ mod tests {
     // only: deleting it falls back to the same value through the deep merge. Comparing
     // against each type's own `Default::default()`, the single source of truth, rather than a
     // value copied by hand, is what would catch the example drifting from a changed default.
+    //
+    // Most of those values are now shown commented out rather than live (the template's own
+    // "full surface" this ticket asked for), so this parses `uncomment_defaults`'s output
+    // rather than the shipped text directly: a comment is invisible to the parser, and a
+    // commented default with nothing pinning it to the real one is exactly the drift this
+    // test exists to catch. No unknown-key warning is what proves every uncommented key is
+    // one the schema actually knows, the same filter `the_annotated_example_parses_against_
+    // the_real_schema` already applies above: the shipped `[[repo]]` paths and `[[set]]`
+    // globs are demonstration values, real only on the machine `config.md` was written on,
+    // so `RepoPathMatchesNothing` and `SetGlobMatchesNothing` are expected here and are not
+    // this test's concern.
     #[test]
     fn every_default_valued_field_the_example_shows_could_be_deleted() {
-        let loaded = parse_ok(annotated_example());
+        let uncommented = uncomment_defaults(annotated_example());
+        let loaded = parse_ok(&uncommented);
+        let unknown: Vec<&Warning> = loaded
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, Warning::UnknownKey(_)))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "uncommenting the whole template must raise no unknown-key warning, got: {unknown:?}"
+        );
         let document = &loaded.document;
 
         assert_eq!(document.theme, Document::default().theme);
@@ -2118,6 +2461,7 @@ mod tests {
             document.show_submodules,
             Document::default().show_submodules
         );
+        assert_eq!(document.notice_timeout, Document::default().notice_timeout);
         assert_eq!(
             document.refresh.poll_interval,
             RefreshConfig::default().poll_interval
@@ -2133,15 +2477,34 @@ mod tests {
             FetchConfig::default().concurrency
         );
 
-        // The negative control: the example deliberately turns these two on to show what an
-        // active fetch and auto-update look like, so they must NOT equal the compiled
-        // default, or the assertions above would be vacuously true regardless of what they
-        // compared.
+        let editor = document
+            .launchers
+            .iter()
+            .find(|launcher| launcher.name.get_ref() == "editor")
+            .expect("the example's editor launcher");
+        assert_eq!(editor.env, BTreeMap::new());
+        assert!(!editor.disabled);
+
+        let reinstall = document
+            .actions
+            .iter()
+            .find(|action| action.name.get_ref() == "reinstall")
+            .expect("the example's reinstall action");
+        assert_eq!(reinstall.confirm, default_action_confirm());
+        let rm_step = reinstall.steps.first().expect("reinstall's first step");
+        assert!(!rm_step.shell);
+        assert_eq!(rm_step.env, BTreeMap::new());
+
+        // The negative control: the example deliberately turns these on, or away from
+        // their default, to show what an active fetch, auto-update and scoped Action look
+        // like, so they must NOT equal the compiled default, or the assertions above
+        // would be vacuously true regardless of what they compared.
         assert_ne!(document.fetch.enabled, FetchConfig::default().enabled);
         assert_ne!(
             document.auto_update.enabled,
             AutoUpdateConfig::default().enabled
         );
+        assert!(reinstall.when.is_some());
     }
 
     /// The same extraction `annotated_example()` used to do at compile time, run here at
