@@ -2138,6 +2138,7 @@ impl App {
             .record_own_work(operation.name(), &report.own_work_records());
         for key in report.removed_keys() {
             self.core.dismiss(&key);
+            self.selection.remove(&key);
         }
         self.reload_config();
         // scan: management_write_reload end
@@ -2404,6 +2405,7 @@ impl App {
             return;
         }
         self.core.dismiss(&key);
+        self.selection.remove(&key);
         self.set_cursor(self.cursor);
     }
 
@@ -6844,6 +6846,78 @@ mod tests {
             app.notice(),
             None,
             "a successful dismissal must not raise a Notice (#171's own constraint)"
+        );
+    }
+
+    /// A Selection holding only a key that has since left the table (dismissed here by `d`
+    /// once the row went Vanished) must read as empty: the checked row is gone, not "still
+    /// checked but unreachable". An Action over it then reaches every remaining visible row,
+    /// the same as never having checked anything at all.
+    #[test]
+    fn dismissing_the_one_checked_row_empties_the_selection_and_an_action_reaches_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle();
+        let repo_a_index = app
+            .visible_keys()
+            .iter()
+            .position(|key| key.path() == repo_a)
+            .expect("repo-a must be visible");
+        app.set_cursor(repo_a_index);
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("check repo-a");
+        assert!(
+            app.selection
+                .contains(&EntityKey::new(std::sync::Arc::from(repo_a.as_path()))),
+            "the fixture must actually check repo-a before dismissing it"
+        );
+
+        vanish(&app, &repo_a);
+        let vanished_index = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .position(|entity| entity.presence == Presence::Vanished)
+            .expect("expected repo-a's row to have vanished");
+        app.set_cursor(vanished_index);
+        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
+            .expect("dismiss the vanished, checked row");
+
+        assert!(
+            app.selection.is_empty(),
+            "the checked row left the table, so the Selection holding only its key must \
+             read as empty rather than as a non-empty Selection resolving to nothing"
+        );
+        assert_eq!(
+            app.selection.count(),
+            0,
+            "the list's own bottom-right counter must not overstate what is checked once \
+             the checked row is gone"
+        );
+
+        app.document.actions.push(action_config(
+            "reinstall",
+            false,
+            std::path::Path::new("marker"),
+        ));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false runs the highlighted entry immediately");
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+        assert!(
+            repo_b.join("marker").exists(),
+            "an empty Selection must reach every remaining visible row, not zero rows"
         );
     }
 
