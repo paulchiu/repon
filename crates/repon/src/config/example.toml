@@ -12,6 +12,10 @@ show_submodules = false
 # background sweep.
 on_refresh = "tidy"
 
+# The same shape either side of the built-in sync. Both default to nothing.
+# before_sync = "tidy"
+# after_sync = "tidy"
+
 [refresh]
 poll_interval = "2s"       # "0s" turns the sweep off
 status_stale_after = "5m"
@@ -39,6 +43,9 @@ roots = ["~/dev"]
 include = ["**/acme/**"]
 exclude = ["**/archive/**", "**/node_modules/**"]
 on_refresh = "tidy"
+# A Set's own hook wins over the top-level one for the rows in this Set.
+after_sync = "tidy"
+# before_sync = "tidy"
 
 # origin/HEAD on this one still says master; pin it.
 [[repo]]

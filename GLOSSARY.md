@@ -103,7 +103,7 @@ The Step outcome of a Step Repon performed itself, carrying Repon's own words ra
 The Step an Action receipt is executing right now: its label and when it started, present on the receipt only until that Step finishes. Distinct from a Step result, which a Step earns only once it is done; the pane shows a spinner rather than a Step outcome for this one.
 
 **Management operation**:
-One of the four built-in entries in the Action palette that change what Repon operates on, remove a Repo from the machine, or fast-forward one to its upstream: `ignore`, `unignore`, `delete` and `sync`. Built in rather than configured, so the four names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all.
+One of the four built-in entries in the Action palette that change what Repon operates on, remove a Repo from the machine, or fast-forward one to its upstream: `ignore`, `unignore`, `delete` and `sync`. Built in rather than configured, so the four names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all beyond `sync`'s own optional `before_sync` and `after_sync` hooks.
 _Avoid_: Management palette (there is one palette; `m` is a filter over it)
 
 **Delete risk**:

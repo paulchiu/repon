@@ -1978,6 +1978,18 @@ impl App {
     /// table is a closed list and names no management trigger, so starting one here would be
     /// a ninth trigger that document does not have; `r` is what settles those rows Vanished
     /// today.
+    ///
+    /// `before_sync` and `after_sync` are resolved here too, fresh from `self.document` and
+    /// `self.active_set.name`, and run through
+    /// [`repon_core::Core::run_action_for_entity_blocking`], blocking this call until each
+    /// row's own hook finishes: `sync`'s own outcome per row depends on whether its pre-hook
+    /// passed, which an asynchronous fan-out could not answer before this function returns
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync",
+    /// [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)).
+    /// This whole call is reached from `y` over the confirm gate alone, so a hook fires from
+    /// that keystroke and never from a Generation, the same restriction
+    /// [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)
+    /// fixes for `on_refresh`.
     fn run_management(&mut self, operation: management::Operation) {
         // scan: management_write_reload begin -- criterion 8: everything between this pair is
         // what a management write does after the gate is accepted, and the test over this
@@ -1995,12 +2007,25 @@ impl App {
             );
             return;
         }
+        let before_sync_hook = self
+            .before_sync_action()
+            .map(crate::action_palette::to_action_spec);
+        let after_sync_hook = self
+            .after_sync_action()
+            .map(crate::action_palette::to_action_spec);
+        let run_sync_hook = |hook: &Option<repon_core::ActionSpec>, key: &EntityKey| {
+            let action = hook.as_ref()?;
+            let receipt = self.core.run_action_for_entity_blocking(action, key)?;
+            Some(management::hook_outcome_from_receipt(&receipt))
+        };
         let report = management::run(
             &plan,
             &self.config_file,
             |key| self.core.worktree_admin_dir(key).ok(),
             |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
             |key| self.core.attempt_auto_update(key),
+            |key| run_sync_hook(&before_sync_hook, key),
+            |key| run_sync_hook(&after_sync_hook, key),
         );
         for record in &report.records {
             tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
@@ -2067,6 +2092,33 @@ impl App {
     fn on_refresh_action(&self) -> Option<&config::document::ActionConfig> {
         let name =
             config::document::resolve_on_refresh_name(&self.document, &self.active_set.name)?;
+        self.document
+            .actions
+            .iter()
+            .find(|action| action.name.get_ref() == name)
+    }
+
+    /// The `[[action]]` `before_sync` names for the Set currently active, the identical
+    /// resolution [`Self::on_refresh_action`] gives a different field
+    /// ([`config::document::resolve_before_sync_name`],
+    /// [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)).
+    /// `None` when the resolved name is unset or names an Action nothing declares, which
+    /// [`config::document::Warning::BeforeSyncNamesNoAction`] or
+    /// [`config::document::Warning::SetBeforeSyncNamesNoAction`] already said at load.
+    fn before_sync_action(&self) -> Option<&config::document::ActionConfig> {
+        let name =
+            config::document::resolve_before_sync_name(&self.document, &self.active_set.name)?;
+        self.document
+            .actions
+            .iter()
+            .find(|action| action.name.get_ref() == name)
+    }
+
+    /// The `[[action]]` `after_sync` names for the Set currently active, the identical
+    /// resolution [`Self::on_refresh_action`] gives a different field.
+    fn after_sync_action(&self) -> Option<&config::document::ActionConfig> {
+        let name =
+            config::document::resolve_after_sync_name(&self.document, &self.active_set.name)?;
         self.document
             .actions
             .iter()
@@ -2977,6 +3029,15 @@ mod tests {
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
     /// pattern `repon-core`'s own tests use rather than a git-backend trait.
+    /// Writes a committer into the repository's own config. The `-c` arguments the fixtures
+    /// below pass reach the `git` CLI and nothing else, so a fast-forward Repon performs
+    /// through gix finds no identity to stamp its reflog entry with and fails, on any machine
+    /// whose global config carries none. CI is exactly that machine.
+    fn set_test_identity(path: &std::path::Path) {
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+    }
+
     pub(crate) fn init_repo(path: &std::path::Path) {
         std::fs::create_dir_all(path).expect("create repo dir");
         let status = std::process::Command::new("git")
@@ -2986,6 +3047,7 @@ mod tests {
             .status()
             .expect("run git init");
         assert!(status.success());
+        set_test_identity(path);
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(path)
@@ -2994,6 +3056,54 @@ mod tests {
             .status()
             .expect("run git commit");
         assert!(status.success());
+    }
+
+    /// A real `git -C dir <args>`, asserting it succeeded: the `after_sync` fixture's own
+    /// plumbing, kept beside [`init_repo`] rather than reused from `repon-core`'s own test
+    /// support, which this crate cannot see.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A real `git clone` of `source` into `dest`, tracking `source` as `origin` the way
+    /// `sync`'s own fast-forward needs.
+    #[cfg(feature = "fetch")]
+    fn clone_repo(source: &std::path::Path, dest: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(source)
+            .arg(dest)
+            .status()
+            .expect("run git clone");
+        assert!(status.success());
+        // A clone inherits none of the source's local config, identity included.
+        set_test_identity(dest);
+    }
+
+    /// Writes `name` with `contents` in `dir` and commits it there, real bytes on disk a
+    /// clone's own `git fetch` can see move.
+    #[cfg(feature = "fetch")]
+    fn commit_a_file(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("write the fixture file");
+        run_git(dir, &["add", name]);
+        run_git(
+            dir,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "add a file",
+            ],
+        );
     }
 
     /// Adds a real linked Worktree at `worktree`, on a new branch, off `parent`'s own repo.
@@ -3101,6 +3211,8 @@ mod tests {
                     include: None,
                     exclude: None,
                     on_refresh: None,
+                    before_sync: None,
+                    after_sync: None,
                 });
                 document
             },
@@ -4236,6 +4348,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         });
 
         let logs = capture_tracing(|| {
@@ -5628,6 +5742,42 @@ mod tests {
         assert!(
             source.contains("self.core.attempt_auto_update(key)"),
             "the run must attempt `sync` through the Core rather than a literal"
+        );
+    }
+
+    /// The absence half of [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)'s
+    /// restriction for the sync hooks: the only production call to
+    /// [`repon_core::Core::run_action_for_entity_blocking`] sits inside `run_management`'s
+    /// own `management_write_reload` region, reached from `y` over the confirm gate alone,
+    /// never from a Generation or a timer. Scanned across every workspace crate's `src` for
+    /// the count, the same shape `the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else`
+    /// already takes for `on_refresh`.
+    #[test]
+    fn the_sync_hooks_fire_from_run_action_for_entity_blocking_inside_run_management_alone() {
+        // The leading `.` is what tells a call site (`self.core.run_action_for_entity_blocking(`)
+        // apart from the method's own `pub fn run_action_for_entity_blocking(` definition in
+        // repon-core, which this same substring would otherwise also match.
+        let calls =
+            crate::test_support::production_lines_containing(".run_action_for_entity_blocking(");
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one production call to run_action_for_entity_blocking, a count \
+             that moved means a hook call site was added or duplicated, at: {calls:?}"
+        );
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
+        let region = crate::test_support::source_region(&source, "management_write_reload")
+            .expect("run_management's own scan markers are still in place");
+        assert!(
+            region.contains(".run_action_for_entity_blocking("),
+            "the one call site must sit inside run_management's own marked region"
+        );
+        assert!(
+            region.contains(".before_sync_action()") && region.contains(".after_sync_action()"),
+            "both hooks must be resolved inside the same region the confirm gate reaches, \
+             got: {region}"
         );
     }
 
@@ -8228,6 +8378,85 @@ mod tests {
         repo.join(HOOK_MARKER).exists()
     }
 
+    /// Declares `before_sync = <name>` and the `[[action]]` it names, whose one step touches
+    /// `marker` in each row `sync` runs it against
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
+    #[cfg(feature = "fetch")]
+    fn declare_before_sync_hook(app: &mut App, name: &str, marker: &str) {
+        app.document
+            .actions
+            .push(hook_action_config(name, &["touch", marker]));
+        app.document.before_sync = Some(name.to_string());
+    }
+
+    /// [`declare_before_sync_hook`]'s sibling for `after_sync`.
+    #[cfg(feature = "fetch")]
+    fn declare_after_sync_hook(app: &mut App, name: &str, marker: &str) {
+        app.document
+            .actions
+            .push(hook_action_config(name, &["touch", marker]));
+        app.document.after_sync = Some(name.to_string());
+    }
+
+    /// End to end, through the real key path: `y` over `sync`'s own confirm gate runs the
+    /// declared `before_sync` Action against the real Repo, through
+    /// [`repon_core::Core::run_action_for_entity_blocking`], before `sync` itself is
+    /// attempted. The Repo has no remote, so `sync` itself reports `NotEligibleToSync`
+    /// afterwards; the marker file is the proof the hook ran for real rather than only in
+    /// [`crate::management`]'s own injected-closure tests.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn before_sync_runs_the_named_action_against_the_real_repo_before_sync_is_attempted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let marker = "before-sync-ran";
+
+        let mut app = test_app(&root);
+        declare_before_sync_hook(&mut app, "pre-hook", marker);
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert!(
+            repo.join(marker).exists(),
+            "the before_sync hook must have run against the real Repo by the time y returns, \
+             since run_management blocks on it"
+        );
+    }
+
+    /// The sibling proof for `after_sync`: a Repo that is genuinely behind its own upstream
+    /// gets fast-forwarded, and the declared `after_sync` Action runs against it once that
+    /// fast-forward actually happened.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn after_sync_runs_the_named_action_against_the_real_repo_once_it_fast_forwards() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        // `upstream` sits outside `root`, the sole directory discovery walks: nested inside
+        // it, discovery would find it as a second Repo of its own, and the confirm gate's
+        // cursor row could land on it instead of the one this test means to sync.
+        let upstream = canonical_dir.join("upstream");
+        init_repo(&upstream);
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let repo = root.join("repo-a");
+        clone_repo(&upstream, &repo);
+        commit_a_file(&upstream, "b.txt", "b");
+        run_git(&repo, &["fetch", "origin"]);
+        let marker = "after-sync-ran";
+
+        let mut app = test_app(&root);
+        declare_after_sync_hook(&mut app, "post-hook", marker);
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert!(
+            repo.join(marker).exists(),
+            "the after_sync hook must have run against the real Repo once sync fast-forwarded it"
+        );
+    }
+
     /// The first "Done when": `on_refresh = "sync"` runs that Action once after a Refresh
     /// started by `r`, over every row that Refresh covers. The entry declares
     /// `confirm = true`, so a build that put the hook behind the Action confirm gate would
@@ -8723,6 +8952,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: Some("hook-b".to_string()),
+            before_sync: None,
+            after_sync: None,
         });
 
         app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
@@ -10472,6 +10703,8 @@ refresh_all = "z""#,
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         }
     }
 

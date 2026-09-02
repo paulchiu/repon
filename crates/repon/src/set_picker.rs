@@ -222,6 +222,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         }
     }
 
