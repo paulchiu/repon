@@ -1033,6 +1033,7 @@ impl App {
                     self.focus,
                     self.glyphs,
                     overlay.query(),
+                    frame_area,
                 );
                 overlay.apply(action, content_len, viewport_height);
             };
@@ -3830,7 +3831,9 @@ mod tests {
         app.frame_size = Size::new(100, 15);
         app.help = Some(HelpOverlay::default());
 
-        let content_len = HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, "");
+        let frame_area = Rect::new(0, 0, app.frame_size.width, app.frame_size.height);
+        let content_len =
+            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, "", frame_area);
         for _ in 0..content_len {
             app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
                 .expect("scroll down past the end of the content");
@@ -4306,9 +4309,16 @@ mod tests {
             "",
             "expected the query cleared by the first Esc"
         );
+        let frame_area = Rect::new(0, 0, app.frame_size.width, app.frame_size.height);
         assert_eq!(
-            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, overlay.query()),
-            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, ""),
+            HelpOverlay::visible_len(
+                &app.bindings,
+                app.focus,
+                app.glyphs,
+                overlay.query(),
+                frame_area
+            ),
+            HelpOverlay::visible_len(&app.bindings, app.focus, app.glyphs, "", frame_area),
             "expected the content unfiltered again after the first Esc"
         );
 
