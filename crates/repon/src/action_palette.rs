@@ -56,10 +56,14 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
 
 /// The query row's own text while `self.query` is empty, replaced by the prompt character
-/// and typed text on the first keystroke; kept parallel with
-/// [`crate::launcher_palette::QUERY_PLACEHOLDER`] and [`crate::filter_line::QUERY_PLACEHOLDER`],
-/// each the prompt character, a verb, then what it acts on.
-pub(crate) const QUERY_PLACEHOLDER: &str = "; filter actions";
+/// and typed text on the first keystroke; opens in the prompt character, a verb, then what
+/// it acts on that [`crate::launcher_palette::QUERY_PLACEHOLDER`] and
+/// [`crate::filter_line::QUERY_PLACEHOLDER`] share, then names the second job neither of
+/// those two has: the field also takes an ad hoc command to run
+/// ([actions.md](../../../docs/spec/actions.md)), which nothing else on screen advertises.
+/// The verb is "select" rather than those two's "filter" because narrowing the list is the
+/// means here, not the end: what the row is for is landing on one Action.
+pub(crate) const QUERY_PLACEHOLDER: &str = "; select action or type a command";
 
 /// `; ` plus the space after it: the caret's own column while [`ActionPalette::query`] is
 /// empty, since nothing has been painted yet to measure a cursor position off. Once there is
@@ -2340,8 +2344,19 @@ mod tests {
         theme: &Theme,
         count: Count,
     ) -> ratatui::buffer::Buffer {
+        draw_to_buffer_sized(palette, actions, theme, count, 40, 10)
+    }
+
+    fn draw_to_buffer_sized(
+        palette: &ActionPalette,
+        actions: &[ActionConfig],
+        theme: &Theme,
+        count: Count,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(40, 10);
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| {
@@ -2398,7 +2413,7 @@ mod tests {
             row_text(&typed, 1, 40)
         );
         assert!(
-            !row_text(&typed, 1, 40).contains("filter actions"),
+            !row_text(&typed, 1, 40).contains("select action or type a command"),
             "the placeholder must not linger once there is typed text: {:?}",
             row_text(&typed, 1, 40)
         );
@@ -2419,6 +2434,51 @@ mod tests {
             row_text(&cleared, 1, 40).contains(QUERY_PLACEHOLDER),
             "the placeholder must return once the query is emptied again: {:?}",
             row_text(&cleared, 1, 40)
+        );
+    }
+
+    /// The query row does two jobs: it lands on one of the declared `[[action]]` entries and
+    /// it accepts an ad hoc command to run ([actions.md](../../../docs/spec/actions.md)). A
+    /// placeholder naming only the first leaves the second invisible to anyone who has not
+    /// found it another way.
+    #[test]
+    fn the_query_placeholder_names_both_choosing_an_action_and_typing_a_command() {
+        assert!(
+            QUERY_PLACEHOLDER.contains("select action"),
+            "the placeholder must name choosing an Action, in the verb-then-object shape its \
+             two siblings share: {QUERY_PLACEHOLDER:?}"
+        );
+        assert!(
+            QUERY_PLACEHOLDER.contains("command"),
+            "the placeholder must also name the ad hoc command the field accepts: \
+             {QUERY_PLACEHOLDER:?}"
+        );
+    }
+
+    /// 88 columns is the narrow screen [keybindings.md](../../../docs/spec/keybindings.md)
+    /// budgets every ladder against, and the Action palette is drawn over the whole frame,
+    /// so a placeholder longer than that frame's interior would read clipped there. Asserted
+    /// on the paint rather than on a measured length, since the paint is what a user sees.
+    #[test]
+    fn the_query_placeholder_reads_whole_at_the_narrow_screen_width() {
+        const NARROW_SCREEN_WIDTH: u16 = 88;
+
+        let actions = vec![action("reinstall", true)];
+        let palette = ActionPalette::new();
+        let buf = draw_to_buffer_sized(
+            &palette,
+            &actions,
+            &Theme::default(),
+            Count::selection(3),
+            NARROW_SCREEN_WIDTH,
+            10,
+        );
+
+        assert!(
+            row_text(&buf, 1, NARROW_SCREEN_WIDTH).contains(QUERY_PLACEHOLDER),
+            "expected the whole placeholder on the query row at {NARROW_SCREEN_WIDTH} \
+             columns: {:?}",
+            row_text(&buf, 1, NARROW_SCREEN_WIDTH)
         );
     }
 
