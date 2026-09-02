@@ -77,6 +77,11 @@ fn main() -> color_eyre::Result<()> {
     }
 
     #[cfg(debug_assertions)]
+    if args.write_raw_stderr_after_tui_enter {
+        return write_raw_stderr_after_tui_enter();
+    }
+
+    #[cfg(debug_assertions)]
     if let Some(new_value) = &args.reprint_config_path_after_env_change {
         return reprint_config_path_after_env_change(new_value);
     }
@@ -224,6 +229,27 @@ fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
         env: Default::default(),
     };
     launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
+    Ok(())
+}
+
+/// Claims the terminal, then writes a marker to fd 2 from a spawned thread via
+/// `std::io::stderr()`, the same path a dependency's own thread takes (`gix-transport`'s ssh
+/// stderr supervisor, this ticket's own motivating case) rather than any call site of this
+/// crate's own, then exits cleanly. A test attached to a real pty can then confirm the marker
+/// never reaches the terminal while `Tui::enter`'s redirect is in effect, and is recoverable
+/// from the log file instead.
+#[cfg(debug_assertions)]
+fn write_raw_stderr_after_tui_enter() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    std::thread::spawn(|| {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "STDERR_REDIRECT_MARKER");
+    })
+    .join()
+    .expect("the stderr-writing thread must not panic");
+    tui.exit()?;
     Ok(())
 }
 

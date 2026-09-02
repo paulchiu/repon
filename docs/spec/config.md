@@ -73,7 +73,7 @@ The six keys from [refresh.md](refresh.md), with their nesting and the duration 
 
 Every duration in the file is a humantime string via `humantime-serde`: `"2s"`, `"5m"`, `"1h 30m"`. The disabled poll is `"0s"`, not `0`. Measured, humantime-serde rejects a bare TOML integer with `invalid type: integer 2, expected a duration`, which amends [refresh.md](refresh.md)'s table, where the disabling value was written as `0`. One representation for every duration, and both authoring mistakes (a missing unit, a bare integer) fail with a line number rather than being read as some other unit.
 
-`[auto_update]` has one key, `enabled = false`. It rides the fetch cycle rather than carrying its own interval or concurrency, because it can only act on what a fetch just learned, and a second timer would drift out of phase with the only thing that feeds it. It is fast-forward only, and acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, not fixed.
+`[auto_update]` has one key, `enabled = false`. It rides the fetch cycle rather than carrying its own interval or concurrency, because it can only act on what a fetch just learned, and a second timer would drift out of phase with the only thing that feeds it. It is fast-forward only, and acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, not fixed. The built-in `sync` action ([repo-management.md](repo-management.md)) reuses this same eligibility rule and the same fast-forward on demand, independent of both `[auto_update].enabled` and `fetch.enabled`, since it is a gesture the user asked for rather than something this section's own automatic cycle decided unbidden.
 
 ## Sets
 
@@ -250,7 +250,7 @@ show_submodules = false
 
 # One declared action runs after a refresh you asked for: `r` and `R`, never the
 # background sweep.
-on_refresh = "sync"
+on_refresh = "tidy"
 
 [refresh]
 poll_interval = "2s"       # "0s" turns the sweep off
@@ -271,14 +271,14 @@ name = "dev"
 roots = ["~/dev", "~/dev-misc"]
 
 # One client, minus the graveyard. Globs are case-sensitive. Its own on_refresh
-# names sync explicitly, so a later edit to the top-level default cannot retarget
+# names tidy explicitly, so a later edit to the top-level default cannot retarget
 # this Set's refresh key by accident.
 [[set]]
 name = "work"
 roots = ["~/dev"]
 include = ["**/acme/**"]
 exclude = ["**/archive/**", "**/node_modules/**"]
-on_refresh = "sync"
+on_refresh = "tidy"
 
 # origin/HEAD on this one still says master; pin it.
 [[repo]]
@@ -330,12 +330,12 @@ args = ["rm", "-rf", "node_modules"]
 args = ["pnpm", "install"]
 
 [[action]]
-name = "sync"
+name = "tidy"
 description = "Whatever each Repo needs once its state is fresh"
 concurrency = 4
 
 [[action.steps]]
-args = ["sync-repo"]
+args = ["tidy-repo"]
 
 # Only what changes. Everything else keeps the default map.
 [keys.global]
