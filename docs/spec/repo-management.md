@@ -8,7 +8,7 @@ Management operations change what Repon operates on, or remove a Repo from the m
 | --- | --- | --- |
 | `ignore` | Writes `exclude = true` for the entity's path | A Repo or Worktree not already excluded |
 | `unignore` | Removes `exclude` for the entity's path | A Repo or Worktree currently excluded by a `[[repo]]` entry |
-| `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one | A Repo or Worktree |
+| `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one and its path from every `[[set]]` array that names it, then drops its row | A Repo or Worktree |
 | `sync` | Fast-forwards the branch to its tracked upstream, reusing the periodic fetch's own auto-update rules | A Repo, on a build with the `fetch` cargo feature; whether it is behind, ahead, clean and tracking an upstream right now is read by attempting it, never a gate refusal |
 
 The four names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
@@ -53,6 +53,16 @@ A Worktree whose parent Repo cannot be opened, gone or otherwise unreadable, fal
 
 Deleting a Repo takes its linked Worktrees with it. Each one's own working directory sits outside the Repo's own and is not touched by removing that alone, so `delete` removes every linked Worktree's directory too, in the same run. A Worktree already in the same Selection as its parent Repo is not named or run as its own row: the Repo's own `delete` already destroys it, and naming it twice would report one removal as two.
 
+## What `delete` leaves behind
+
+Nothing in the list. A row whose working tree `delete` removed leaves the table in the frame the operation reports, without a refresh and without `d`.
+
+It is dropped rather than left to become Vanished. [core-api.md](core-api.md) gives `Vanished` to an entity a Generation found gone and says it leaves only when it is dismissed, which is the right rule for a disappearance behind Repon's back and the wrong one for a disappearance Repon caused: the user would be asked to acknowledge an absence they just asked for. Repon knows which it is, so `delete` dismisses the rows its own report names as removed, and `Vanished` keeps its meaning for the rest.
+
+Only the rows the report names as removed leave. A refused row still has a working tree, and so may a failed one, so both stay listed with the receipt saying why.
+
+A removed row's own receipt goes with it, since a receipt says what happened to a row a user can still look at. What that row got is still said twice: in the one-line Notice's counts and in the log line "Receipts" below reads its words from.
+
 ## The confirm gate
 
 `delete` names, per Repo, what accepting will destroy:
@@ -75,7 +85,7 @@ A Worktree row's own gate line discloses the same first two facts about its own 
 
 Every write is a read, a modify and a write of `config.toml` on disk. There is no lock and no watcher, so the last writer wins against an editor open on the same file; that is the exposure a user already has between two editors.
 
-Only `[[repo]]` tables are written. Nothing the user hand-wrote is rewritten or reformatted, and a comment anywhere in the file survives a write. Removing a `[[repo]]` table removes the comment attached above it, which is a comment written about the entry being removed.
+Only `[[repo]]` tables and the `include` and `exclude` arrays of a `[[set]]` are written. Nothing the user hand-wrote is rewritten or reformatted, and a comment anywhere in the file survives a write. Removing a `[[repo]]` table removes the comment attached above it, which is a comment written about the entry being removed.
 
 An entry Repon appends carries a comment saying so, on the line above it:
 
@@ -87,6 +97,8 @@ exclude = true
 ```
 
 An entry that already exists is modified in place rather than appended a second time, and keeps whatever other keys it carries: `unignore` on an entry holding `default_branch` removes the `exclude` key alone and leaves the table. An entry left with no keys but `path` is removed entirely, and an empty `[[repo]]` array of tables is removed with it, so a file that had none before an `ignore` and an `unignore` is byte-for-byte what it started as.
+
+`delete` reaches further than the `[[repo]]` entry it removes: the path it destroyed goes from every `[[set]]` `include` and `exclude` array naming it too, matched by the same resolved path a `[[repo]]` `path` is matched by, so an array that wrote it relative to home is found by the absolute path the row was known by. A glob that merely would have matched that path is left alone, since it also covers rows the deletion did not touch. An array whose last named path goes this way is removed with it rather than left as `[]`, which reads as "nothing" and means "everything"; that widens the Set, which [config.md](config.md)'s Sets section states as the trade. `ignore` and `unignore` never touch a `[[set]]` array at all.
 
 After a successful write, Repon runs the same path `Action::ReloadConfig` runs. Nothing mutates the in-memory document directly, so config reaches the running app one way and a write cannot produce a state the file alone would not reproduce.
 
