@@ -28,15 +28,27 @@ use std::time::Duration;
 use crate::degrade::{self, Priority};
 use crate::elapsed::format_elapsed;
 
+/// Why Worktree rows are off when [`HeaderContent::worktrees_note`] is `Some`: config.toml's
+/// own `show_worktrees` ([config.md](../../../../docs/spec/config.md)'s "the stake on
+/// `show_worktrees`"), or this session's own `t` toggle overriding it
+/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "The worktrees toggle").
+/// [`trailing_items`] picks its wording from this so a toggle-off session never reads as if
+/// config.toml said so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreesHiddenBy {
+    Preference,
+    Toggle,
+}
+
 /// One value for each of the header's five items, already computed by whatever owns that
 /// piece of state. `None` means the item has nothing to report this frame: no run in flight
-/// (`run_progress`, `elapsed`), no Filter committed (`filter_match_count`), or
-/// `show_worktrees` already true (`worktrees_note`). `entity_count` alone is never absent.
+/// (`run_progress`, `elapsed`), no Filter committed (`filter_match_count`), or Worktree rows
+/// already shown (`worktrees_note`). `entity_count` alone is never absent.
 pub(crate) struct HeaderContent {
     pub(crate) entity_count: usize,
     pub(crate) run_progress: Option<(usize, usize)>,
     pub(crate) filter_match_count: Option<usize>,
-    pub(crate) worktrees_note: Option<usize>,
+    pub(crate) worktrees_note: Option<(usize, WorktreesHiddenBy)>,
     pub(crate) elapsed: Option<Duration>,
 }
 
@@ -63,9 +75,13 @@ pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<Strin
             priority: Priority::Drop(3),
         });
     }
-    if let Some(count) = content.worktrees_note {
+    if let Some((count, reason)) = content.worktrees_note {
+        let reason = match reason {
+            WorktreesHiddenBy::Preference => "preference off",
+            WorktreesHiddenBy::Toggle => "toggled off",
+        };
         items.push(degrade::Item {
-            content: format!("worktrees: {count} (preference off)"),
+            content: format!("worktrees: {count} ({reason})"),
             priority: Priority::Drop(2),
         });
     }
@@ -113,7 +129,7 @@ mod tests {
             entity_count: 403,
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
-            worktrees_note: Some(161),
+            worktrees_note: Some((161, WorktreesHiddenBy::Preference)),
             elapsed: Some(Duration::from_millis(12000)),
         }
     }
@@ -160,6 +176,28 @@ mod tests {
                 rendered.chars().count()
             );
         }
+    }
+
+    // --- criterion: the worktrees note's wording names which of the two actually hid them ---
+
+    #[test]
+    fn the_worktrees_note_reads_toggled_off_rather_than_preference_off_when_the_toggle_is_why() {
+        let content = HeaderContent {
+            entity_count: 403,
+            run_progress: None,
+            filter_match_count: None,
+            worktrees_note: Some((161, WorktreesHiddenBy::Toggle)),
+            elapsed: None,
+        };
+        let rendered = render(&content, 200);
+        assert!(
+            rendered.contains("worktrees: 161 (toggled off)"),
+            "the toggle, not config.toml, hid these rows: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("preference off"),
+            "must never claim config.toml said so when the toggle is why: {rendered:?}"
+        );
     }
 
     // --- criterion: the ascii ellipsis is reserved inside the budget, not appended after ---

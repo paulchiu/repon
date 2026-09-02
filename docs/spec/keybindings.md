@@ -18,7 +18,7 @@ Seven named contexts. `global` is live in `list` and `detail` only, and is suspe
 
 An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, Home, End, the cursor keys and the Ctrl and Alt chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
-`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every visible row. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those five letters keep every meaning they already have.
+`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every visible row, `t` toggles Worktree rows for the session. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those six letters keep every meaning they already have.
 
 ## The default map
 
@@ -38,6 +38,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `R` | Refresh the Selection |
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
+| `t` | Toggle Worktree rows for the session |
 | `s`, `Tab` | Open the Set picker |
 | `o` | Open the sort menu |
 | `1` to `9` | Switch to the Nth declared Set |
@@ -171,6 +172,8 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 
 `e` for editing `config.toml` is free the same way: unbound in Global, List, Detail, Overlay and Confirm, and the table's only other `e` is `Ctrl+E` (`MoveCursorToLineEnd`, `input`'s own readline chord), which does not collide because it is a different chord.
 
+`t` for the worktrees toggle is free on the same terms: unbound in Global, List, Detail, Input, Overlay and Confirm, so no context-specific binding is left to shadow it while `list` or `detail` has focus. Its one other appearance in the whole table is `sort`'s own `t` (`Sort by state`), a context `global` never falls back into and that never falls back into `global` either ([The contexts](#the-contexts)), so the two cannot collide at dispatch. It is also the one column key `sort` binds that carried no meaning outside the menu before this ticket; giving it one here means every column letter now reads the same way in or out of the menu, the way `b`, `s`, `n`, `d` and `a` already did.
+
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
 `space` toggles and `v` anchors a range. `v` is lazygit's. `space` is not: lazygit's `Universal.Select` is a per-context action key and lazygit has no point-toggle multi-select at all. The real precedents for space are k9s, ranger, nnn, yazi, gitui, lf and htop.
@@ -210,6 +213,8 @@ The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothin
 Selection is per row, so a Worktree is selected independently of its Repo and selecting a Repo does not select its Worktrees. The Repo row and its Worktree rows have different working directories, so a Launcher on one and a Launcher on the other are different acts. `j` and `k` step over every visible row without regard to depth.
 
 When the Selection is empty, an Action fans out over every visible row, and a Launcher acts on the cursor row. An Action is the gesture that reaches N Repos, and the palette has already read its own count out in its border title before anything is typed, so a run with nothing checked reaches the rows that count named rather than the one row under the cursor. It is bounded by visibility rather than by the population: clearing a Filter does widen the next run's reach, and the border title and the confirm gate are what say so, both counting from the same resolution the fan-out itself takes. `a` still checks every visible row, which is what fixes a reach against a later Filter change rather than letting it move with one.
+
+The checked set itself is never bounded by visibility this way: a row checked once and later hidden, by a narrower Filter or by [the worktrees toggle](#the-worktrees-toggle), stays checked and still counts toward the next Action or Launcher's targets, and the palette's own border-title count still names it. A Selection made deliberately must not change what it reaches because of what the screen happens to be drawing at the moment the gesture fires.
 
 The management operations, `delete`, `ignore`, `unignore` and `sync`, keep the cursor row when the Selection is empty. They share the Action confirm gate, but `delete` with nothing checked would put the whole visible list behind a single confirm, and that is not a trade worth making for consistency. GLOSSARY.md's "never empty at the point of acting" holds on both sides: with nothing visible an Action has a count of zero, which does not run and says so.
 
@@ -360,6 +365,14 @@ Switching answers. `1` to `9`, and the picker's own `Enter`, raise a Notice nami
 `w` does two things with one press: it opens the expanded warning list, and opening it acknowledges every condition currently outstanding, which is what returns the status row to its indicator. The footer and the help overlay advertise the first, since that is what the user is reaching for; [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the second. It is not a dismissal and no key dismisses a warning: a standing condition leaves the row by ceasing to be true.
 
 An unbound printable key is ignored in silence and never beeps, because a split escape sequence can leak a literal character through the parser and a beep would then fire on the terminal's own noise.
+
+## The worktrees toggle
+
+`t` flips whether Worktree rows are drawn, for this session alone: it overrides [config.md](config.md)'s `show_worktrees` without writing to `config.toml`, and the override stands until the app exits or a reload (`Ctrl+R`, or `e`'s own reload on return) re-reads the file, at which point the file's current value decides again exactly as if the toggle had never fired.
+
+The toggle changes what is drawn and what the cursor can reach, nothing more: discovery, probing and what a Set matches are untouched, since the Worktrees are still there and still refreshed, merely undrawn. Hiding the row the cursor sits on re-clamps the cursor onto the table the same way a dismissal does (`d`, above). The Selection is left exactly alone: a checked Worktree row the toggle just hid stays checked, the same as one a narrowing Filter already hides ([The Selection](#the-selection)'s own "must not change" rule), so it still counts toward the next Action or Launcher's targets and the palette's own border-title count still names it; nothing is silently dropped from a Selection a keystroke did not touch.
+
+The header's own `worktrees: N (preference off)` note ([config.md](config.md)'s "the stake on `show_worktrees`") changes its wording to name whichever of the two is actually why Worktrees are off: `(preference off)` when `show_worktrees` in the file is what hides them, `(toggled off)` once `t` has fired this session, so the note never credits the file with a session-only override or the reverse.
 
 ## Open
 

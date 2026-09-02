@@ -42,6 +42,9 @@ pub(crate) enum Action {
     RefreshSelection,
     RederiveDefaultBranches,
     ExpandWarning,
+    /// `t`: flips the session's own show-Worktrees state, leaving `show_worktrees` in
+    /// config.toml untouched until the next reload.
+    ToggleWorktrees,
     OpenSetPicker,
     OpenSortMenu,
     /// `1` to `9`: which Set to switch to.
@@ -183,6 +186,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::RefreshSelection => "Refresh the Selection",
         Action::RederiveDefaultBranches => "Re-derive default branches over the Selection",
         Action::ExpandWarning => "Expand the warning slot",
+        Action::ToggleWorktrees => "Toggle Worktree rows for the session",
         Action::OpenSetPicker => "Open the Set picker",
         Action::OpenSortMenu => "Open the sort menu",
         Action::SwitchToSet(_) => "Switch to the Nth declared Set",
@@ -392,6 +396,15 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char('w'),
         NONE,
         Action::ExpandWarning,
+    ),
+    // `t` is free in `global`: it names no other Global, List or Detail binding, and its
+    // one other appearance in the whole table is `Context::Sort`'s own `t` (`SortByState`),
+    // a suspended context this fallback never reaches (keybindings.md's "The contexts").
+    binding(
+        Context::Global,
+        KeyCode::Char('t'),
+        NONE,
+        Action::ToggleWorktrees,
     ),
     binding(
         Context::Global,
@@ -959,6 +972,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::RefreshSelection => "refresh_selection",
         Action::RederiveDefaultBranches => "rederive_default_branches",
         Action::ExpandWarning => "expand_warning",
+        Action::ToggleWorktrees => "toggle_worktrees",
         Action::OpenSetPicker => "open_set_picker",
         Action::OpenSortMenu => "open_sort_menu",
         Action::SwitchToSet(_) => return None,

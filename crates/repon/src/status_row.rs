@@ -248,7 +248,7 @@ mod tests {
             entity_count: 403,
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
-            worktrees_note: Some(161),
+            worktrees_note: Some((161, header::WorktreesHiddenBy::Preference)),
             elapsed: Some(Duration::from_millis(12000)),
         }
     }

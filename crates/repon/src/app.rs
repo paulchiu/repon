@@ -24,7 +24,7 @@ use crate::{
     filter_line::FilterLine,
     footer,
     glyphs::{BorderScratch, GlyphSet},
-    header::HeaderContent,
+    header::{self, HeaderContent},
     help::HelpOverlay,
     keys::{self, Action, BindingTable, Context},
     launcher::{self, Launcher},
@@ -399,6 +399,13 @@ pub struct App {
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
     /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
     document: Document,
+    /// This session's own override of `document.show_worktrees`, set by `Action::ToggleWorktrees`
+    /// (`t`) and read through [`Self::effective_show_worktrees`] everywhere the config field
+    /// used to be read directly. `None` until the toggle first fires, so the config file keeps
+    /// deciding the starting state; `apply_reloaded_config` resets this to `None` too, so a
+    /// reload always hands the keyboard back to whatever the file currently says
+    /// ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees toggle").
+    worktrees_toggle: Option<bool>,
     /// Where `state.toml` lives, fixed for the process the same way [`config::data_dir`]
     /// itself is; kept as a field rather than re-read from that `OnceLock` on every call so
     /// a test can point it at a tempdir ([`Self::persist_state`],
@@ -595,6 +602,7 @@ impl App {
             bindings,
             active_set,
             document: config.document,
+            worktrees_toggle: None,
             data_dir: config.data_dir,
             config_dir: config::config_dir(),
             config_file: config::config_file(),
@@ -759,21 +767,31 @@ impl App {
         warnings: &'a [Warning],
     ) -> StatusRowContent<'a> {
         let filter = self.active_filter();
+        let worktrees_shown = self.effective_show_worktrees();
         let visible = crate::components::list::visible_row_order(
             &snapshot.entities,
-            self.document.show_worktrees,
+            worktrees_shown,
             self.document.show_submodules,
             &filter,
             self.row_order,
         );
         let filter_match_count = filter.is_active().then_some(visible.len());
-        let worktrees_override =
-            !self.document.show_worktrees && filter.requests_kind(Kind::Worktree);
+        let worktrees_override = !worktrees_shown && filter.requests_kind(Kind::Worktree);
         let worktrees_note = worktrees_override.then(|| {
-            visible
+            let count = visible
                 .iter()
                 .filter(|&&index| matches!(snapshot.entities[index].kind, Kind::Worktree))
-                .count()
+                .count();
+            // Worktrees are hidden either because config.toml's own `show_worktrees` says so,
+            // or because this session's own `t` toggle overrode it; the toggle is why exactly
+            // when it has fired at all, whatever value it currently holds, since firing it at
+            // least once means the file's own value is no longer what decided this frame.
+            let reason = if self.worktrees_toggle.is_some() {
+                header::WorktreesHiddenBy::Toggle
+            } else {
+                header::WorktreesHiddenBy::Preference
+            };
+            (count, reason)
         });
         let (run_progress, elapsed) = match (self.action_running(), &self.action_run) {
             (true, Some(run)) => (
@@ -1288,6 +1306,10 @@ impl App {
                     self.acknowledged_warnings = warnings;
                     self.warning_overlay_open = true;
                 }
+                None
+            }
+            Some(Action::ToggleWorktrees) => {
+                self.toggle_worktrees();
                 None
             }
             Some(Action::SwitchToSet(nth)) => {
@@ -2352,6 +2374,28 @@ impl App {
         Some((name, failures))
     }
 
+    /// Whether Worktree rows are drawn this frame: `self.worktrees_toggle` once
+    /// `Action::ToggleWorktrees` has fired this session, else `self.document.show_worktrees`,
+    /// the config file's own value. Every reader that used to name
+    /// `self.document.show_worktrees` directly reads this instead, so the toggle overrides the
+    /// config file for the rest of the session without ever mutating it.
+    fn effective_show_worktrees(&self) -> bool {
+        self.worktrees_toggle
+            .unwrap_or(self.document.show_worktrees)
+    }
+
+    /// `Action::ToggleWorktrees`'s (`t`) whole effect: flips [`Self::effective_show_worktrees`]
+    /// for the rest of the session and re-clamps the cursor onto the table the visibility
+    /// change may have just shrunk ([`Self::set_cursor`]), the identical re-clamp a dismissal
+    /// gives. The Selection is deliberately left untouched: a checked Worktree row the toggle
+    /// just hid stays checked, exactly as one a narrowing Filter already hides does
+    /// ([`Selection::targets`]'s own "must not change" criterion), so the next Action or
+    /// Launcher still reaches it and the palette's own border-title count still names it.
+    fn toggle_worktrees(&mut self) {
+        self.worktrees_toggle = Some(!self.effective_show_worktrees());
+        self.set_cursor(self.cursor);
+    }
+
     /// The Filter currently narrowing the list: the edit buffer's own live parse while
     /// `self.filter_line` is open, since a Filter applies live on every keystroke
     /// ([filter.md](../../../docs/spec/filter.md)), or the committed one otherwise.
@@ -2365,7 +2409,7 @@ impl App {
     /// Every currently shown Entity's key, in the same order
     /// [`crate::components::list::List`] draws
     /// ([`crate::components::list::visible_row_order`]): this crate's whole "visible list",
-    /// narrowed by the show-worktrees and show-submodules preferences and by
+    /// narrowed by [`Self::effective_show_worktrees`], the show-submodules preference and
     /// [`Self::active_filter`], and what `select_all_visible`, `extend_range` and the cursor
     /// bounds all read.
     fn visible_keys(&self) -> Vec<EntityKey> {
@@ -2373,7 +2417,7 @@ impl App {
         let filter = self.active_filter();
         crate::components::list::visible_row_order(
             &snapshot.entities,
-            self.document.show_worktrees,
+            self.effective_show_worktrees(),
             self.document.show_submodules,
             &filter,
             self.row_order,
@@ -2488,7 +2532,7 @@ impl App {
         let filter = self.active_filter();
         crate::components::list::visible_row_order(
             &snapshot.entities,
-            self.document.show_worktrees,
+            self.effective_show_worktrees(),
             self.document.show_submodules,
             &filter,
             self.row_order,
@@ -2875,6 +2919,11 @@ impl App {
         self.list.set_cursor(self.cursor);
         self.list.set_offset(self.list_offset);
         self.list.set_theme(self.theme);
+        // The toggle (`Action::ToggleWorktrees`) is session state, not something a config
+        // handshake carries, so it is handed to `self.list` fresh every frame the same way
+        // `filter` above is rather than through `register_config_handler`.
+        self.list
+            .set_show_worktrees(self.effective_show_worktrees());
         // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
         // `self.list` the same per-frame way as the cursor and the Filter above.
         self.list.set_selection(self.selection.clone());
@@ -3387,6 +3436,7 @@ mod tests {
                 });
                 document
             },
+            worktrees_toggle: None,
             // `zero_config: false` means `scope_key` reads `active_set.name` alone, so an
             // empty, never-created `data_dir`/`cwd` are harmless placeholders here, the same
             // shape `themes_dir` above already takes; a test exercising `persist_state` or
@@ -3738,7 +3788,7 @@ mod tests {
                 entity_count: 403,
                 run_progress: Some((7, 12)),
                 filter_match_count: Some(12),
-                worktrees_note: Some(161),
+                worktrees_note: Some((161, header::WorktreesHiddenBy::Preference)),
                 elapsed: Some(Duration::from_millis(12000)),
             },
             warnings,
@@ -12084,6 +12134,157 @@ refresh_all = "z""#,
         assert!(
             !text.contains("preference off"),
             "a Filter that never names kind:worktree overrides nothing: {text:?}"
+        );
+    }
+
+    // --- the worktrees toggle (`t`): a session override, cursor re-clamp, the Selection
+    // left alone, and the header naming the toggle rather than the file ---
+
+    #[test]
+    fn pressing_t_hides_worktree_rows_for_the_session_without_touching_config_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "the Repo and its Worktree, both drawn"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "the toggle just hid the Worktree row for this session"
+        );
+        assert!(
+            app.document.show_worktrees,
+            "the toggle must never write to the config document itself"
+        );
+    }
+
+    #[test]
+    fn pressing_t_twice_returns_to_the_configured_starting_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t once");
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t twice");
+
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "a second press must flip back to the Worktree row being drawn"
+        );
+    }
+
+    /// The scope's own rule: hiding the row the cursor sits on must land it somewhere valid,
+    /// the same re-clamp a dismissal gives, rather than leaving it pointed at a row that is
+    /// no longer in [`App::visible_keys`].
+    #[test]
+    fn toggling_worktrees_off_re_clamps_a_cursor_sitting_on_the_row_it_just_hid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+        // The Worktree sorts after its Repo in the natural grouped order; land the cursor on it.
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        let worktree_key = app.cursor_key().expect("a cursor row exists");
+        assert_eq!(
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .find(|entity| entity.key == worktree_key)
+                .map(|entity| entity.kind),
+            Some(Kind::Worktree),
+            "the cursor must start on the Worktree row for this test to prove anything"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        let visible = app.visible_keys();
+        assert!(
+            app.cursor < visible.len(),
+            "the cursor must be re-clamped onto the table the toggle just shrank, got cursor \
+             {} over {} visible rows",
+            app.cursor,
+            visible.len()
+        );
+    }
+
+    /// The Scope's other explicit decision: a checked row the toggle just hid is left
+    /// checked, exactly as one a narrowing Filter already hides is
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "The Selection"), rather than
+    /// silently dropped from a Selection no keystroke of the user's own touched.
+    #[test]
+    fn toggling_worktrees_off_leaves_a_checked_worktree_row_selected_and_still_reachable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        let worktree_key = app.cursor_key().expect("a cursor row exists");
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("dispatch space to check the Worktree row");
+        assert!(app.selection.contains(&worktree_key));
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        assert!(
+            !app.visible_keys().contains(&worktree_key),
+            "the Worktree row must actually be hidden for this test to prove anything"
+        );
+        assert!(
+            app.selection.contains(&worktree_key),
+            "a checked row the toggle hides must stay checked, never silently dropped"
+        );
+        assert_eq!(
+            app.action_targets(),
+            vec![worktree_key],
+            "the hidden but checked row must still be what an Action or Launcher reaches"
+        );
+    }
+
+    #[test]
+    fn the_header_says_toggled_off_rather_than_preference_off_once_t_has_fired() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        let text = status_row_text_with_active_filter(&mut app, "kind:worktree", 200);
+
+        assert!(
+            text.contains("worktrees: 1 (toggled off)"),
+            "the toggle, not config.toml, is why Worktrees are off: {text:?}"
+        );
+        assert!(
+            !text.contains("preference off"),
+            "must never credit config.toml with a session-only toggle: {text:?}"
         );
     }
 

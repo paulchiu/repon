@@ -58,6 +58,8 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 
 The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter, `kind:worktree` in [filter.md](filter.md), beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
 
+[keybindings.md](keybindings.md#the-worktrees-toggle)'s `t` overrides `show_worktrees` the same way for the rest of the session, with no write to the file: while that override is why Worktrees are off, the same header note reads `worktrees: N (toggled off)` instead, so it never credits the file with a session-only gesture. Reload replaces the override with whatever the file currently says, the same as every other key below.
+
 ## Refresh, fetch and auto-update
 
 The six keys from [refresh.md](refresh.md), with their nesting and the duration representation settled:
@@ -243,6 +245,8 @@ Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). Ther
 `theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`'s `exclude`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. `[[repo]]` is split, and only `exclude` is on that list: `exclude` decides only whether an operation may reach a row that is discovered and listed either way, so it needs nothing rebuilt, where `default_branch` is a probe input and reaches the session it was written in only through a restart. [repo-management.md](repo-management.md)'s "Writing config" carries the reasoning. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in a Notice, and the status row's first item then carries the fallback's name for as long as it is active. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
 
 Paths that came from a flag or the environment are fixed for the process, since re-resolving them mid-session would move the file just edited.
+
+A reload also clears [keybindings.md](keybindings.md#the-worktrees-toggle)'s own `t` override, so `show_worktrees`'s freshly re-applied value decides again as though the toggle had never fired this session.
 
 ## An annotated example
 
