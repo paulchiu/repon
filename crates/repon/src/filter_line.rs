@@ -13,6 +13,7 @@ use ratatui::{Frame, buffer::Buffer, layout::Rect, widgets::Clear};
 use repon_core::Filter;
 
 use crate::edit_buffer;
+use crate::glyphs::{BorderScratch, GlyphSet};
 use crate::list_viewport::offset_following_cursor;
 use crate::theme::{Role, Theme};
 
@@ -23,7 +24,8 @@ const PROMPT_WIDTH: u16 = 2;
 
 /// The completion overlay's own cap, whatever the terminal's height
 /// ([filter.md](../../../docs/spec/filter.md#screen-placement): "capped at 8 rows and
-/// scrolling ... beyond that").
+/// scrolling ... beyond that"). It counts interior rows, so the framed block itself is this
+/// plus its two border rows.
 pub(crate) const COMPLETION_MAX_ROWS: usize = 8;
 
 /// What the term under the cursor offers, per
@@ -306,32 +308,76 @@ impl FilterLine {
         frame.set_cursor_position((x.min(advisory_x), area.y));
     }
 
-    /// Draws the completion overlay into `area`, one candidate per row, the highlighted one
-    /// marked `> ` the way [`crate::action_palette::ActionPalette`] and
-    /// [`crate::set_picker::SetPicker`] already mark theirs. `area`'s own height is the
-    /// caller's job: [filter.md](../../../docs/spec/filter.md#screen-placement) has it grow
-    /// upward from the Filter line, capped at [`COMPLETION_MAX_ROWS`], and this draws
-    /// whatever height it is handed starting from `self.completion_offset`'s own window.
-    pub(crate) fn draw_completions(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    /// The framed completion block's own rect inside `content_area`, or `None` when there is
+    /// nothing to offer or no room to frame it.
+    /// [filter.md](../../../docs/spec/filter.md#screen-placement) anchors it to the Filter
+    /// line and grows it upward, capped at [`COMPLETION_MAX_ROWS`] interior rows, so the
+    /// block is that count plus its two border rows and it never resizes the list beneath it.
+    pub(crate) fn completion_area(&self, content_area: Rect) -> Option<Rect> {
+        let rows = self.completions().len().min(COMPLETION_MAX_ROWS) as u16;
+        if rows == 0 {
+            return None;
+        }
+        let height = rows.saturating_add(2).min(content_area.height);
+        // Below three rows the frame would have no interior at all, which is a bare box over
+        // the table rather than a completion list.
+        if height < 3 {
+            return None;
+        }
+        Some(Rect {
+            x: content_area.x,
+            y: content_area.bottom() - height,
+            width: content_area.width,
+            height,
+        })
+    }
+
+    /// Draws the completion overlay into `area`, one candidate per interior row, the
+    /// highlighted one marked `> ` the way [`crate::action_palette::ActionPalette`] and
+    /// [`crate::set_picker::SetPicker`] already mark theirs. `area` is the whole framed
+    /// block, [`Self::completion_area`]'s own rect, and this draws as many candidates as its
+    /// interior holds starting from `self.completion_offset`'s own window.
+    ///
+    /// The rows sit inside the house-style frame every other floating surface draws, its
+    /// characters taken from `glyphs` rather than ratatui's default set, in
+    /// [`Role::Border`]: the Filter line this list is anchored to is what holds focus, not
+    /// the list.
+    pub(crate) fn draw_completions(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        glyphs: &'static GlyphSet,
+    ) {
         let candidates = self.completions();
         // Clears whatever the list already painted here first: `set_stringn` below only ever
         // writes as many cells as the candidate text itself is long, so without this a short
         // candidate would leave the tail of the list's own border or row peeking out past it.
         frame.render_widget(Clear, area);
+
+        let mut scratch = BorderScratch::new();
+        let block = glyphs
+            .bordered_block(&mut scratch)
+            .border_style(theme.style_for(Role::Border));
+        let interior = block.inner(area);
+        frame.render_widget(block, area);
+
         let buf: &mut Buffer = frame.buffer_mut();
         for (row, candidate) in candidates
             .iter()
             .enumerate()
             .skip(self.completion_offset)
-            .take(area.height as usize)
+            .take(interior.height as usize)
         {
             let marker = if row == self.highlight { "> " } else { "  " };
             let line = format!("{marker}{candidate}");
+            // Clamped to the interior, not the buffer: a value like `no-default-branch` is
+            // wider than a narrow interior and must not paint over the frame's right border.
             buf.set_stringn(
-                area.x,
-                area.y + (row - self.completion_offset) as u16,
+                interior.x,
+                interior.y + (row - self.completion_offset) as u16,
                 &line,
-                area.width as usize,
+                interior.width as usize,
                 theme.style_for(Role::Text),
             );
         }
@@ -343,6 +389,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
 
     use super::*;
+    use crate::glyphs::GlyphSet;
 
     fn committed(text: &str) -> Filter {
         Filter::parse(text)
@@ -814,29 +861,175 @@ mod tests {
         );
     }
 
-    #[test]
-    fn draw_completions_marks_only_the_highlighted_row() {
-        let theme = Theme::default();
-        let mut line = typed("kind:");
-        line.move_completion_highlight(1);
-
-        let backend = TestBackend::new(40, 3);
+    /// The `TestBackend` area the completion draws below run against, and the buffer they
+    /// read back: `draw_completions` frames itself inside whatever rect it is handed, so a
+    /// test asserting a row's own text has to know where the interior starts.
+    fn draw_completions_to_buffer(
+        line: &FilterLine,
+        area: Rect,
+        glyphs: &'static GlyphSet,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| line.draw_completions(frame, frame.area(), &theme))
+            .draw(|frame| line.draw_completions(frame, frame.area(), &Theme::default(), glyphs))
             .expect("draw the frame");
-        let buf = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
 
-        let row = |y: u16| -> String {
-            (0..buf.area.width)
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        };
-        assert_eq!(row(0), "  repo");
-        assert_eq!(row(1), "> worktree");
-        assert_eq!(row(2), "  submodule");
+    /// Row `row` of the interior inside a frame drawn over the whole of `area`, trailing
+    /// blanks trimmed, so a test names the candidate rather than the padding after it.
+    fn interior_row_text(buf: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        ((area.x + 1)..(area.right() - 1))
+            .map(|x| buf[(x, area.y + 1 + row)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    // --- The frame's own characters come from the glyph table, not ratatui's default ---
+
+    /// theming.md's "panel border" row: the completion list frames itself with the active
+    /// table's own characters, the set the list and detail panes already draw, and degrades
+    /// with them under `glyphs = "ascii"`. Both tables in the one test, so a hardcoded
+    /// rounded set would satisfy neither.
+    #[test]
+    fn draw_completions_frames_the_list_with_the_active_glyph_tables_own_border() {
+        for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
+            let line = typed("kind:");
+            let area = Rect::new(0, 0, 40, 5);
+            let buf = draw_completions_to_buffer(&line, area, glyphs);
+
+            crate::test_support::assert_frame_drawn_with(
+                &buf,
+                area,
+                glyphs.border,
+                "",
+                "the completion list's frame",
+            );
+        }
+    }
+
+    /// The completion list is not the focused surface; the Filter line it is anchored to is.
+    #[test]
+    fn draw_completions_paints_its_frame_in_the_unfocused_border_role() {
+        let theme = Theme::default();
+        let line = typed("kind:");
+        let area = Rect::new(0, 0, 40, 5);
+        let buf = draw_completions_to_buffer(&line, area, &crate::glyphs::FULL);
+
+        assert_eq!(
+            buf[(area.x, area.y)].fg,
+            theme.border,
+            "the frame must take the unfocused border role, not border_focused"
+        );
+    }
+
+    /// A candidate is drawn one cell in from the frame rather than flush against the border
+    /// characters, the same inset the Set picker's own rows sit at.
+    #[test]
+    fn draw_completions_insets_its_rows_one_cell_from_the_frame() {
+        let mut line = typed("kind:");
+        line.move_completion_highlight(1);
+        let area = Rect::new(0, 0, 40, 5);
+        let buf = draw_completions_to_buffer(&line, area, &crate::glyphs::FULL);
+
+        assert_eq!(interior_row_text(&buf, area, 0), "  repo");
+        assert_eq!(interior_row_text(&buf, area, 1), "> worktree");
+        assert_eq!(interior_row_text(&buf, area, 2), "  submodule");
+    }
+
+    /// A candidate wider than the interior stops at it rather than painting down the frame's
+    /// own right border, the clamp a Set name already gets in the picker. Asserted over the
+    /// whole frame, not the one cell beside the text: an overrun writes the border's column.
+    #[test]
+    fn a_candidate_wider_than_the_interior_never_paints_over_the_frames_right_border() {
+        let line = typed("unknown:");
+        let area = Rect::new(0, 0, 12, 4);
+        let widest = line
+            .completions()
+            .iter()
+            .map(|candidate| candidate.chars().count() + 2)
+            .max()
+            .expect("`unknown:` offers its own values");
+        assert!(
+            widest > (area.width - 2) as usize,
+            "a candidate has to be wider than the interior for this to test anything"
+        );
+
+        let buf = draw_completions_to_buffer(&line, area, &crate::glyphs::FULL);
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            area,
+            crate::glyphs::FULL.border,
+            "",
+            "the completion list's frame beside an over-long candidate",
+        );
+    }
+
+    // --- Where the framed block lands, filter.md#screen-placement ---
+
+    /// filter.md#screen-placement: the cap counts interior rows, so the block itself is the
+    /// cap plus its two border rows, still anchored to the bottom of the list area and still
+    /// its full width.
+    #[test]
+    fn the_completion_overlay_is_the_row_cap_plus_its_two_border_rows() {
+        let line = typed("");
+        assert!(
+            line.completions().len() > COMPLETION_MAX_ROWS,
+            "this needs more candidates than the cap to mean anything"
+        );
+        let content = Rect::new(3, 2, 40, 20);
+        let overlay = line
+            .completion_area(content)
+            .expect("an empty term offers every key");
+
+        assert_eq!(overlay.height as usize, COMPLETION_MAX_ROWS + 2);
+        assert_eq!(overlay.y, content.bottom() - overlay.height);
+        assert_eq!(overlay.x, content.x);
+        assert_eq!(overlay.width, content.width);
+    }
+
+    /// A list shorter than the cap frames only the rows it has, so three values never pay for
+    /// eight rows of empty interior.
+    #[test]
+    fn a_completion_list_shorter_than_the_cap_frames_only_the_rows_it_has() {
+        let line = typed("kind:");
+        assert_eq!(line.completions().len(), 3);
+        let overlay = line
+            .completion_area(Rect::new(0, 0, 40, 20))
+            .expect("`kind:` offers its own three values");
+
+        assert_eq!(overlay.height, 5);
+    }
+
+    /// The list vanishes when the term under the cursor has no completions, so there is no
+    /// bare frame left standing over the table.
+    #[test]
+    fn there_is_no_completion_overlay_when_the_term_offers_nothing() {
+        let line = typed("brackets");
+        assert!(line.completions().is_empty());
+        assert!(line.completion_area(Rect::new(0, 0, 40, 20)).is_none());
+    }
+
+    /// A list area with no room for a border and an interior draws nothing at all rather than
+    /// a frame with no rows inside it.
+    #[test]
+    fn a_list_area_too_short_for_an_interior_draws_no_completion_overlay() {
+        let line = typed("kind:");
+        assert!(line.completion_area(Rect::new(0, 0, 40, 2)).is_none());
+    }
+
+    #[test]
+    fn draw_completions_marks_only_the_highlighted_row() {
+        let mut line = typed("kind:");
+        line.move_completion_highlight(1);
+        let area = Rect::new(0, 0, 40, 5);
+        let buf = draw_completions_to_buffer(&line, area, &crate::glyphs::FULL);
+
+        assert_eq!(interior_row_text(&buf, area, 0), "  repo");
+        assert_eq!(interior_row_text(&buf, area, 1), "> worktree");
+        assert_eq!(interior_row_text(&buf, area, 2), "  submodule");
     }
 
     /// [filter.md](../../../docs/spec/filter.md#screen-placement): "capped at 8 rows and
@@ -857,22 +1050,10 @@ mod tests {
         }
         // The highlight now sits on the ninth key (index 8), one past an unmoved [0, 8)
         // window, which must have scrolled by exactly one row to keep it in view.
-        let theme = Theme::default();
-        let backend = TestBackend::new(40, COMPLETION_MAX_ROWS as u16);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
-        terminal
-            .draw(|frame| line.draw_completions(frame, frame.area(), &theme))
-            .expect("draw the frame");
-        let buf = terminal.backend().buffer().clone();
-        let last_row: String = (0..buf.area.width)
-            .map(|x| {
-                buf[(x, (COMPLETION_MAX_ROWS - 1) as u16)]
-                    .symbol()
-                    .to_string()
-            })
-            .collect();
+        let area = Rect::new(0, 0, 40, COMPLETION_MAX_ROWS as u16 + 2);
+        let buf = draw_completions_to_buffer(&line, area, &crate::glyphs::FULL);
         assert_eq!(
-            last_row.trim_end(),
+            interior_row_text(&buf, area, COMPLETION_MAX_ROWS as u16 - 1),
             format!("> {}", keys[8]),
             "the window must have scrolled down by one row to keep the ninth key visible"
         );

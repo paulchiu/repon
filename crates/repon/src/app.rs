@@ -20,7 +20,7 @@ use crate::{
     components::{Component, detail::Detail, list::List},
     config::{self, Config, Document},
     editor,
-    filter_line::{self, FilterLine},
+    filter_line::FilterLine,
     footer,
     glyphs::{BorderScratch, GlyphSet},
     header::HeaderContent,
@@ -2768,23 +2768,11 @@ impl App {
         if let Some(line) = &self.filter_line {
             line.draw(frame, filter_area, &self.theme);
             // Overlays the bottom of the list area, anchored to the Filter line and growing
-            // upward, capped at `COMPLETION_MAX_ROWS`
-            // ([filter.md](../../../docs/spec/filter.md#screen-placement)); `content_area`
-            // itself was already sized above with no regard to this, which is what "never
-            // resizes the list" means here.
-            let completions = line.completions();
-            let overlay_height = completions
-                .len()
-                .min(filter_line::COMPLETION_MAX_ROWS)
-                .min(content_area.height as usize) as u16;
-            if overlay_height > 0 {
-                let overlay_area = Rect {
-                    x: content_area.x,
-                    y: content_area.y + content_area.height - overlay_height,
-                    width: content_area.width,
-                    height: overlay_height,
-                };
-                line.draw_completions(frame, overlay_area, &self.theme);
+            // upward ([filter.md](../../../docs/spec/filter.md#screen-placement));
+            // `content_area` itself was already sized above with no regard to this, which is
+            // what "never resizes the list" means here.
+            if let Some(overlay_area) = line.completion_area(content_area) {
+                line.draw_completions(frame, overlay_area, &self.theme, self.glyphs);
             }
         }
         footer::draw(
@@ -11422,12 +11410,13 @@ refresh_all = "z""#,
         );
     }
 
-    /// The overlay paints directly onto `content_area`'s own bottom rows, immediately above
-    /// the Filter line, capped at eight regardless of how many keys there are to offer
+    /// The overlay paints onto `content_area`'s own bottom rows as a framed block whose
+    /// bottom border sits immediately above the Filter line, its interior capped at eight
+    /// rows regardless of how many keys there are to offer
     /// ([filter.md](../../../docs/spec/filter.md#screen-placement)): thirteen keys is well
-    /// past the cap, so the ninth key up from the Filter line must not appear at all.
+    /// past the cap, so the ninth key must not appear at all.
     #[test]
-    fn the_overlay_caps_at_eight_rows_anchored_directly_above_the_filter_line() {
+    fn the_overlay_caps_at_eight_interior_rows_framed_directly_above_the_filter_line() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -11447,11 +11436,19 @@ refresh_all = "z""#,
                 .to_string()
         };
 
-        // Row layout, bottom up: footer (last row), the Filter line (one above it), then the
-        // overlay's own eight rows in vocabulary order (the highlight defaults to row 0,
-        // "name:", the topmost of the eight), then whatever the list itself draws.
+        // Row layout, bottom up: footer (last row), the Filter line (one above it), the
+        // block's own bottom border, its eight interior rows in vocabulary order (the
+        // highlight defaults to row 0, "name:", the topmost of the eight), its top border,
+        // then whatever the list itself draws.
         let footer_row = app.frame_size.height - 1;
         let filter_row = footer_row - 1;
+        let interior_text = |y: u16| -> String {
+            (1..buf.area.width - 1)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
         let keys = repon_core::vocabulary();
         assert_eq!(
             keys.len(),
@@ -11459,21 +11456,27 @@ refresh_all = "z""#,
             "fixture sanity: more keys than the eight-row cap"
         );
 
+        let first_interior_row = filter_row - 9;
         for (index, entry) in keys.iter().take(8).enumerate() {
-            let depth = 8 - index as u16;
             let marker = if index == 0 { "> " } else { "  " };
             assert_eq!(
-                row_text(filter_row - depth),
+                interior_text(first_interior_row + index as u16),
                 format!("{marker}{}:", entry.key),
-                "row {depth} above the Filter line"
+                "interior row {index} of the completion block"
             );
         }
+        crate::test_support::assert_frame_drawn_with(
+            &buf,
+            Rect::new(0, filter_row - 10, buf.area.width, 10),
+            crate::glyphs::FULL.border,
+            "",
+            "the completion list's frame",
+        );
         let ninth_key = &keys[8].key;
-        let row_past_the_cap = row_text(filter_row - 9);
         assert!(
-            !row_past_the_cap.contains(ninth_key),
-            "the cap is eight rows; the ninth key ({ninth_key}) must not reach the screen, \
-             got {row_past_the_cap:?}"
+            (0..filter_row).all(|y| !row_text(y).contains(ninth_key)),
+            "the cap is eight interior rows; the ninth key ({ninth_key}) must not reach the \
+             screen"
         );
     }
 
