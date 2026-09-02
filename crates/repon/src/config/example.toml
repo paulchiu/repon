@@ -6,6 +6,8 @@ glyphs = "full"
 show_worktrees = true
 show_submodules = false
 
+# notice_timeout = "3s"      # "0s" turns the timer off, not Notices
+
 # One declared action runs after a refresh you asked for: `r` and `R`, never the
 # background sweep.
 on_refresh = "tidy"
@@ -60,6 +62,8 @@ args = ["tuicr"]
 [[launcher]]
 name = "editor"
 from_env = "EDITOR"
+# env = {}                  # merged over the guaranteed set
+# disabled = false          # drops a shipped default
 
 # The pipe is why this one opts into the shell.
 [[launcher]]
@@ -80,9 +84,13 @@ takes_terminal = false
 name = "reinstall"
 description = "Reinstall dependencies from scratch"
 concurrency = 4
+when = "kind:repo"          # skip Worktrees and Submodules: they share node_modules with the Repo
+# confirm = true            # ask before fanning out
 
 [[action.steps]]
 args = ["rm", "-rf", "node_modules"]
+# shell = false              # runs through $SHELL -c
+# env = {}                   # merged over the guaranteed environment contract
 
 [[action.steps]]
 args = ["pnpm", "install"]
