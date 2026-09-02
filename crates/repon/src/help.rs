@@ -828,8 +828,8 @@ mod tests {
     /// Pinned to [theming.md](../../../../docs/spec/theming.md)'s own "The two sets" table,
     /// read at test time rather than restated: every meaning that table names must appear in
     /// the legend with exactly its own wording, and the legend must name nothing the table
-    /// does not. `panel border`, `capture elision` and the header's own `sort arrow` are the
-    /// table's rows outside the row interior ([`crate::glyphs`]'s own module doc: they are
+    /// does not. `panel border`, `capture elision`, the header's own `sort arrow` and a
+    /// scrollable pane's own `scrollbar` are the table's rows outside the row interior ([`crate::glyphs`]'s own module doc: they are
     /// declared outside the `glyph_set!` macro and carry no `Meaning`), excluded here on the
     /// same terms.
     #[test]
@@ -867,7 +867,10 @@ mod tests {
             .filter(|meaning| {
                 !matches!(
                     meaning.as_str(),
-                    "panel border" | "capture elision" | "sort arrow (ascending, descending)"
+                    "panel border"
+                        | "capture elision"
+                        | "sort arrow (ascending, descending)"
+                        | "scrollbar (track, thumb)"
                 )
             })
             .collect();

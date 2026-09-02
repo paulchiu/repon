@@ -155,9 +155,12 @@ One switch, two vetted sets, no way to mix them:
 | truncated name | `$` | `$` |
 | sort arrow (ascending, descending) | `↑↓` | `^v` |
 | panel border | `╭╮╰╯─│` | `+ + + + - |` |
+| scrollbar (track, thumb) | `│█` | `| #` |
 | capture elision | `···` | `...` |
 
-The sort arrow is the one row of that table outside the row interior, alongside the panel border and the capture elision, so it is exempt from the disjointness obligation below and the help overlay's own legend does not carry it. Under `full` it is deliberately the same `↑` and `↓` the ahead and behind counts already use: a header arrow sits against a column label rather than inside a row, and reading it as a count would mean reading the header as a row. Under `ascii` the pair is `^` and `v`, since `>` and `<` are already ahead and behind there. [layout-and-provenance.md](layout-and-provenance.md#the-order-the-user-chooses) fixes where it is drawn.
+The sort arrow and the scrollbar are outside the row interior, alongside the panel border and the capture elision, so both are exempt from the disjointness obligation below and the help overlay's own legend carries neither. The sort arrow under `full` is deliberately the same `↑` and `↓` the ahead and behind counts already use: a header arrow sits against a column label rather than inside a row, and reading it as a count would mean reading the header as a row. Under `ascii` the pair is `^` and `v`, since `>` and `<` are already ahead and behind there. [layout-and-provenance.md](layout-and-provenance.md#the-order-the-user-chooses) fixes where it is drawn.
+
+The scrollbar's track is the panel border's own vertical rule in both sets, because the bar is drawn over that border: the frame is unchanged everywhere the thumb is not, and the thumb is the only character the border was not already carrying. The bar takes no role of its own either, but the `border` or `border_focused` the pane it belongs to is already drawn in, so it carries focus the way the frame around it does and stays inside the nine roles. [layout-and-provenance.md](layout-and-provenance.md#the-detail-pane) fixes which pane draws one and when.
 
 The same screen, [head.md](head.md)'s, under each setting. Every line is exactly 94 columns, none of these rows checked, so the Selection's own marker column sits blank throughout.
 

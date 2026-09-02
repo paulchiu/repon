@@ -1927,18 +1927,36 @@ impl App {
         let Some(cursor_key) = self.cursor_key() else {
             return Some(Count::selection(0));
         };
-        let targets = self.selection.targets(&cursor_key);
         Some(match palette.highlighted(&self.document.actions) {
             // A built-in subtracts its own ineligible rows rather than the excluded ones
             // `operable_count` subtracts: `unignore`'s eligible set is exactly the
             // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
-            // operations table), which the Action gate's own subtraction would zero.
+            // operations table), which the Action gate's own subtraction would zero. It
+            // reads the cursor-row fallback too, where a configured entry and an ad hoc
+            // command both read `action_targets`.
             Some(Entry::Builtin(operation)) => Count::selection(
-                self.management_plan_for(operation, &targets)
+                self.management_plan_for(operation, &self.selection.targets(&cursor_key))
                     .eligible_count(),
             ),
-            Some(Entry::Configured(_)) | None => self.narrowed_count(palette, &targets),
+            Some(Entry::Configured(_)) | None => {
+                self.narrowed_count(palette, &self.action_targets())
+            }
         })
+    }
+
+    /// The rows an Action fans out over: the checked rows, or every visible row when the
+    /// Selection is empty ([actions.md](../../../docs/spec/actions.md)'s "The Selection and
+    /// the gate"). A second resolution beside [`Selection::targets`] rather than a widening
+    /// of it, because the management operations keep the cursor-row fallback that seam
+    /// gives them. Bounded by visibility, so a row a Filter hides is never reached, and the
+    /// border title and the confirm gate both count from here so neither can name a number
+    /// the run would not act on.
+    fn action_targets(&self) -> Vec<EntityKey> {
+        if self.selection.is_empty() {
+            self.visible_keys()
+        } else {
+            self.selection.checked()
+        }
     }
 
     /// [`Self::action_palette_count`]'s configured half: the operable count, narrowed by the
@@ -1971,15 +1989,17 @@ impl App {
     }
 
     /// `Action::Apply` (`Enter`) inside the Action palette: computes the operable count from
-    /// `self.selection.targets(cursor)` through [`repon_core::Core::operable_count`], the
-    /// identical computation [`Self::start_action`]'s own confirm dialog reads, then hands it
-    /// to [`ActionPalette::choose`]. A missing cursor (an empty table) leaves the palette
-    /// untouched, the same as choosing with no match at all.
+    /// [`Self::action_targets`] through [`repon_core::Core::operable_count`], the identical
+    /// computation [`Self::action_palette_count`]'s own border title and confirm dialog
+    /// read, then hands it to [`ActionPalette::choose`]. A built-in reads
+    /// [`Selection::targets`] instead, the cursor-row fallback it keeps. A missing cursor
+    /// (an empty table) leaves the palette untouched, the same as choosing with no match at
+    /// all.
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
         };
-        let targets = self.selection.targets(&cursor_key);
+        let management_targets = self.selection.targets(&cursor_key);
         let chosen_builtin = self.action_palette.as_ref().and_then(|palette| {
             match palette.highlighted(&self.document.actions) {
                 Some(Entry::Builtin(operation)) => Some(operation),
@@ -1990,14 +2010,14 @@ impl App {
         // walks its refs. A plan with nothing eligible reads nothing, since `with_risk` only
         // fills the rows the run would act on.
         let plan = chosen_builtin.map(|operation| {
-            self.management_plan_for(operation, &targets)
+            self.management_plan_for(operation, &management_targets)
                 .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
         });
         // Read for a config-defined Action and an ad hoc command alone: those two are
         // refused at a count of zero, where a built-in enters its own gate instead and names
         // and counts each ineligible row there
         // ([repo-management.md](../../../docs/spec/repo-management.md)).
-        let operable_count = self.core.operable_count(&targets);
+        let operable_count = self.core.operable_count(&self.action_targets());
         let Some(palette) = &mut self.action_palette else {
             return;
         };
@@ -2115,18 +2135,19 @@ impl App {
         self.set_notice(report.summary());
     }
 
-    /// Runs `spec` over the current Selection's targets ([`crate::selection::Selection::targets`]),
-    /// the seam every Action-running path in this file uses so a run started from the
-    /// confirm gate and one started by a `confirm = false` entry can never diverge in what
-    /// they act on. `Core::run_action`'s own `bool` (whether a second fan-out was rejected
-    /// because one is already live) gates whether `self.action_run` replaces the run already
-    /// in flight; surfacing that rejection to the user is issue #69's own scope, blocked by
-    /// this one.
+    /// Runs `spec` over [`Self::action_targets`], the seam every Action-running path in this
+    /// file uses so a run started from the confirm gate and one started by a
+    /// `confirm = false` entry can never diverge in what they act on, nor from the count the
+    /// palette already showed. Nothing to act on runs nothing, the same answer a count of
+    /// zero already gives. `Core::run_action`'s own `bool` (whether a second fan-out was
+    /// rejected because one is already live) gates whether `self.action_run` replaces the
+    /// run already in flight; surfacing that rejection to the user is issue #69's own scope,
+    /// blocked by this one.
     fn start_action(&mut self, spec: repon_core::ActionSpec) {
-        let Some(cursor_key) = self.cursor_key() else {
+        let targets = self.action_targets();
+        if targets.is_empty() {
             return;
-        };
-        let targets = self.selection.targets(&cursor_key);
+        }
         self.start_action_over(spec, targets);
     }
 
@@ -9573,6 +9594,11 @@ refresh_all = "z""#,
     /// `repon-core`'s `snapshot.rs`.
     fn run_failing_action_on(app: &mut App, index: usize) {
         app.set_cursor(index);
+        // Checked rather than left to the cursor: an Action with an empty Selection fans out
+        // over every visible row, which would fail every row rather than the one named here.
+        // Cleared again below so the caller's next gesture starts from an empty Selection.
+        let row = app.cursor_key().expect("the visible row the fixture names");
+        app.selection.toggle(row);
         app.document.actions.push(failing_action_config("break"));
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
@@ -9590,6 +9616,7 @@ refresh_all = "z""#,
             &format!("row {index} to read Failed once its failing Action has finished"),
             || !app.core.action_running() && app.visible_failed().get(index) == Some(&true),
         );
+        app.selection.clear();
     }
 
     // Criterion 1: two distinct keys, no shared entry point. `!` (OpenLauncher) must never
@@ -10520,6 +10547,253 @@ refresh_all = "z""#,
             "the confirm = false Action to have run without a gate",
             || marker.exists(),
         );
+    }
+
+    // =====================================================================================
+    // An Action with an empty Selection fans out over every visible row, where the four
+    // management operations keep the cursor-row fallback
+    // ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    // =====================================================================================
+
+    /// One visible row's own display name, which is what the management gate lists.
+    fn row_name(key: &EntityKey) -> String {
+        key.path()
+            .file_name()
+            .expect("a discovered row has a directory name")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The rule proven at the child rather than at the count: two repos, nothing checked,
+    /// and both must carry the file the step touched. A build resolving an Action through
+    /// the cursor-row fallback leaves whichever repo is not the cursor row untouched.
+    #[test]
+    fn an_action_with_an_empty_selection_fans_out_over_every_visible_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            false,
+            std::path::Path::new("marker"),
+        ));
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false runs the highlighted entry immediately");
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+        assert!(
+            repo_a.join("marker").exists(),
+            "the cursor row is reached either way"
+        );
+        assert!(
+            repo_b.join("marker").exists(),
+            "an empty Selection must reach every visible row, not the cursor row alone"
+        );
+    }
+
+    /// The identical rule for a command typed at the moment, which shares
+    /// [`App::start_action`]'s own seam with a configured entry and must not diverge from it.
+    #[test]
+    fn an_ad_hoc_command_with_an_empty_selection_fans_out_over_every_visible_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command(&mut app, "touch marker");
+
+        assert!(
+            repo_a.join("marker").exists(),
+            "the cursor row is reached either way"
+        );
+        assert!(
+            repo_b.join("marker").exists(),
+            "an ad hoc command is widened by the same rule a configured entry is"
+        );
+    }
+
+    /// Bounded by visibility rather than by the population: a committed Filter hiding a row
+    /// keeps an unchecked Action off it, the same way `a` has never swept a hidden row in.
+    #[test]
+    fn an_empty_selections_action_reaches_the_rows_a_committed_filter_shows_and_no_others() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let alpha = root.join("alpha");
+        let beta_one = root.join("beta-one");
+        let beta_two = root.join("beta-two");
+        for repo in [&alpha, &beta_one, &beta_two] {
+            init_repo(repo);
+        }
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            false,
+            std::path::Path::new("marker"),
+        ));
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+        for c in "beta".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(app.visible_keys().len(), 2, "the Filter narrows to the two");
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false runs the highlighted entry immediately");
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+        assert!(beta_one.join("marker").exists());
+        assert!(beta_two.join("marker").exists());
+        assert!(
+            !alpha.join("marker").exists(),
+            "a row the Filter hides is not visible, so the widening never reaches it"
+        );
+    }
+
+    /// The other half of the same rule, unchanged: once a row is checked the Selection is
+    /// what the Action acts on, and the rows around it are never swept in.
+    #[test]
+    fn an_action_with_one_checked_row_still_acts_on_that_row_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in ["repo-a", "repo-b", "repo-c"] {
+            init_repo(&root.join(name));
+        }
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            false,
+            std::path::Path::new("marker"),
+        ));
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("check the cursor row");
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false runs the highlighted entry immediately");
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+        assert!(visible[0].path().join("marker").exists());
+        for other in &visible[1..] {
+            assert!(
+                !other.path().join("marker").exists(),
+                "a checked Selection is the whole of what an Action acts on"
+            );
+        }
+    }
+
+    /// The count the palette's border title reads before anything is typed, taken from the
+    /// same resolution the run itself takes so the two can never name different numbers.
+    #[test]
+    fn the_action_palettes_border_title_counts_every_visible_row_when_the_selection_is_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        assert_eq!(
+            app.action_palette_count().map(|count| count.operable),
+            Some(2),
+            "with nothing checked the border title counts every visible row"
+        );
+    }
+
+    /// And the confirm gate's own question, which reads the identical count: the border
+    /// title and the question can never disagree about what a run will reach.
+    #[test]
+    fn the_confirm_gate_asks_about_every_visible_row_when_the_selection_is_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+        assert!(
+            frame.contains("run \"reinstall\" on 2 repos?"),
+            "the gate asks about every visible row, got:\n{frame}"
+        );
+    }
+
+    /// The deliberate exception, pinned so a later change cannot widen the destructive path
+    /// by accident: each of the four management operations with nothing checked still gates
+    /// the cursor row alone and never names the other visible row. `delete` over every
+    /// visible row behind a single confirm is the trade this refuses.
+    #[test]
+    fn every_management_operation_with_an_empty_selection_still_gates_the_cursor_row_alone() {
+        for operation in crate::management::OPERATIONS {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().canonicalize().expect("canonicalize temp dir");
+            init_repo(&root.join("repo-a"));
+            init_repo(&root.join("repo-b"));
+            let mut app = test_app(&root);
+            let visible = app.visible_keys();
+            assert_eq!(visible.len(), 2, "the fixture must discover both repos");
+            let cursor_name = row_name(&visible[0]);
+            let other_name = row_name(&visible[1]);
+
+            open_the_management_gate(&mut app, operation);
+
+            let gate = app
+                .management_plan
+                .as_ref()
+                .expect("a built-in always opens its own gate")
+                .confirm_lines()
+                .join("\n");
+            assert!(
+                gate.contains(&cursor_name),
+                "{} must gate the cursor row, got:\n{gate}",
+                operation.name()
+            );
+            assert!(
+                !gate.contains(&other_name),
+                "{} keeps the cursor-row fallback and must never widen to every visible \
+                 row, got:\n{gate}",
+                operation.name()
+            );
+        }
     }
 
     // =====================================================================================
