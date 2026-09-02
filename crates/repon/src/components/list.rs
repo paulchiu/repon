@@ -228,9 +228,12 @@ pub struct List {
     /// the predecessor's recorded defect
     /// (`docs/spec/refresh.md`'s "What the gutter and the cells show").
     started_at: Instant,
-    /// The show-worktrees preference read at the last config handshake: `true`, matching
-    /// `Document::default`, until one arrives. An active Filter's own `kind:worktree` term
-    /// beats this ([`kind_is_visible`]'s own doc comment,
+    /// Whether Worktree rows are drawn this frame: config.toml's own `show_worktrees` unless
+    /// `Action::ToggleWorktrees` (`t`) has overridden it for the session, handed in every
+    /// frame by [`Self::set_show_worktrees`] the same way [`Self::set_filter`] is, since the
+    /// toggle is session state and not something a config handshake carries. `true`, matching
+    /// `Document::default`, until the first frame arrives. An active Filter's own
+    /// `kind:worktree` term beats this ([`kind_is_visible`]'s own doc comment,
     /// [config.md](../../../../docs/spec/config.md)'s "the stake on `show_worktrees`").
     show_worktrees: bool,
     /// The show-submodules preference read at the last config handshake: `false`, matching
@@ -513,6 +516,14 @@ impl List {
     /// [`Self::set_filter`] is: the sort menu can change it between two keystrokes.
     pub(crate) fn set_row_order(&mut self, order: RowOrder) {
         self.row_order = order;
+    }
+
+    /// Hands this draw the effective show-worktrees state for the frame
+    /// (`crate::app::App::effective_show_worktrees`), read fresh every frame the same way
+    /// [`Self::set_filter`] is: `Action::ToggleWorktrees` (`t`) can override config.toml's own
+    /// value for the rest of the session.
+    pub(crate) fn set_show_worktrees(&mut self, show_worktrees: bool) {
+        self.show_worktrees = show_worktrees;
     }
 }
 

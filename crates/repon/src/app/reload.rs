@@ -238,6 +238,11 @@ impl App {
         // Stored after `reload_active_set` reads it by reference: `Action::SwitchToSet`
         // reads this copy afterwards to look up the Nth declared Set.
         self.document = new_config.document;
+        // A reload always hands the keyboard back to whatever the file currently says: the
+        // freshly-loaded `show_worktrees` above is what `Self::effective_show_worktrees` falls
+        // back to once this is cleared, exactly per keybindings.md's "the toggle overrides it
+        // until the app exits or config is reloaded".
+        self.worktrees_toggle = None;
         // Live, no rebuild: safe to call even when `reload_active_set` just rebuilt `self.core`
         // outright, since the fresh `Core` already started with this same reading from
         // `core_spec`.
@@ -542,6 +547,37 @@ mod tests {
             app.list_offset, 2,
             "the standing cursor (5) is now past the narrowed table's own end (5 rows); the \
              offset must clamp to the largest window that still describes real rows: [2, 5)"
+        );
+    }
+
+    /// `Action::ToggleWorktrees` (`t`) is session state, not something a reload should carry
+    /// forward: [keybindings.md](../../../../docs/spec/keybindings.md)'s "The worktrees
+    /// toggle" promises the override stands only "until the app exits or config is reloaded".
+    #[test]
+    fn a_reload_clears_the_worktrees_toggle_back_to_whatever_the_file_currently_says() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert!(
+            app.effective_show_worktrees(),
+            "Document::default's own starting value"
+        );
+
+        app.toggle_worktrees();
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle just turned Worktrees off for the session"
+        );
+
+        let mut document = Document::default();
+        document.sets.push(matching_set_config(&root));
+        app.apply_reloaded_config(config_with_document(document));
+
+        assert!(
+            app.effective_show_worktrees(),
+            "a reload must clear the session override and fall back to the freshly-loaded \
+             `show_worktrees = true` again"
         );
     }
 
