@@ -1078,6 +1078,31 @@ impl Core {
         )
     }
 
+    /// Runs `action`'s own steps against one Entity, on the calling thread, blocking until
+    /// they finish rather than handing the run off the way [`Core::run_action`]'s async
+    /// fan-out does. A pre or post hook wrapping a built-in ([0032](https://github.com/paulchiu/repon/blob/main/docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md))
+    /// needs the outcome before the built-in can proceed or report, which nothing running
+    /// off this thread can give in time. Reuses `run_action_for_entity`, the identical
+    /// per-step execution `run_action`'s fan-out gives every entity, so a hook and a
+    /// configured `[[action]]` never diverge in what a step means; writes nothing to the
+    /// table and touches none of `run_action`'s own state (`action_running`, `action_control`),
+    /// since a hook is a distinct concern from the one fan-out the palette tracks.
+    ///
+    /// `None` when `key` names no Entity this table currently knows.
+    pub fn run_action_for_entity_blocking(
+        &self,
+        action: &ActionSpec,
+        key: &EntityKey,
+    ) -> Option<ActionReceipt> {
+        let entity = {
+            let table = self.table.read().unwrap();
+            let idx = *table.index.get(key)?;
+            table.entities[idx].clone()
+        };
+        let control = executor::RunControl::new();
+        Some(run_action_for_entity(&entity, action, &control, &|_| {}))
+    }
+
     /// Drops one entity from the table, cancelling any probe in flight against it.
     pub fn dismiss(&self, key: &EntityKey) {
         let mut table = self.table.write().unwrap();
@@ -6012,6 +6037,61 @@ mod tests {
             actually_ran,
             "operable_count must report exactly how many rows run_action actually ran a \
              step against, not merely how many keys resolved"
+        );
+    }
+
+    /// [`Core::run_action_for_entity_blocking`]'s own reason to exist: it returns the
+    /// finished receipt on the calling thread rather than handing the run off, so a caller
+    /// needs no `wait_for` at all to see the step's own effect, unlike every `run_action`
+    /// test above.
+    #[test]
+    fn run_action_for_entity_blocking_returns_the_finished_receipt_on_the_calling_thread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+        let marker = repo.join("hook-ran");
+
+        let core = Core::start_discovered(spec_with_overrides(vec![root], Vec::new()));
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == repo)
+            .expect("the repo is discovered")
+            .key
+            .clone();
+
+        let receipt = core
+            .run_action_for_entity_blocking(
+                &action("hook", vec![step(&["touch", "hook-ran"])]),
+                &key,
+            )
+            .expect("the entity is known");
+
+        assert!(
+            marker.exists(),
+            "the step must have already run by the time this call returns"
+        );
+        assert_eq!(receipt.steps.len(), 1);
+        assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+    }
+
+    /// `None` rather than a receipt for a key the table does not know: the same fallback
+    /// every other key-addressed `Core` entry point gives one, and the caller's own signal
+    /// for "no hook to consult" when a hook names a row `sync`'s own eligibility has already
+    /// dropped.
+    #[test]
+    fn run_action_for_entity_blocking_answers_none_for_an_unknown_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let core = Core::start_discovered(spec_with_overrides(vec![root.clone()], Vec::new()));
+
+        let unknown = EntityKey::new(Arc::from(root.join("never-discovered").as_path()));
+
+        assert!(
+            core.run_action_for_entity_blocking(&action("hook", vec![step(&["true"])]), &unknown)
+                .is_none()
         );
     }
 

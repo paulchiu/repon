@@ -7,10 +7,15 @@
 //! reasoning for `sync`'s own feature gate. They are built-in entries in the Action palette
 //! rather than a third palette, and they fan out over the Selection sharing the Action
 //! confirm gate's shape (a count, with ineligible entities subtracted and named) and none of
-//! the pty machinery in [actions.md](../../../docs/spec/actions.md), because no child process
-//! runs. `sync` fans out no mutation of its own either: it reuses
-//! [`repon_core::Core::attempt_auto_update`], the identical fast-forward the periodic fetch's
-//! own auto-update already runs.
+//! the pty machinery in [actions.md](../../../docs/spec/actions.md) for the operation itself,
+//! because no child process runs for it. `sync` fans out no mutation of its own either: it
+//! reuses [`repon_core::Core::attempt_auto_update`], the identical fast-forward the periodic
+//! fetch's own auto-update already runs. `sync` alone may still spawn a child process, through
+//! the `before_sync` and `after_sync` hooks a Set may declare around it
+//! ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync",
+//! [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)),
+//! run through [`repon_core::Core::run_action_for_entity_blocking`] rather than the async
+//! fan-out `on_refresh` and the palette share.
 //!
 //! What a run leaves behind, per repo-management.md's "Receipts": an
 //! [`repon_core::ActionReceipt`] whose single Step is the act Repon performed itself, carrying
@@ -454,6 +459,49 @@ pub(crate) enum Outcome {
     /// The operation was attempted and did not finish: a working tree that would not remove,
     /// or a config file that would not write.
     Failed(String),
+    /// `before_sync` named a hook and one of its steps failed, so `sync` was never attempted
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
+    BeforeSyncHookFailed(String),
+    /// `sync` fast-forwarded the Repo, but `after_sync` named a hook and one of its steps
+    /// failed. The fast-forward already happened and is never undone.
+    SyncedAfterHookFailed(String),
+}
+
+/// What running a resolved `before_sync` or `after_sync` hook against one Repo found, once
+/// its steps have finished: `None` when the Set active for the run names no hook at all, so
+/// `sync_one` never has to distinguish "no hook" from "a hook that passed" itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookOutcome {
+    Passed,
+    Failed(String),
+}
+
+/// [`HookOutcome`] from a hook's own [`repon_core::ActionReceipt`]: the first step that
+/// failed, in the step's own words, or [`HookOutcome::Passed`] when every step ran clean.
+/// [`repon_core::StepOutcome::is_failure`] is the identical classification the fold and the
+/// `action:` Filter term already share, so a hook and a configured `[[action]]` never
+/// disagree about what counts as failing.
+pub(crate) fn hook_outcome_from_receipt(receipt: &repon_core::ActionReceipt) -> HookOutcome {
+    match receipt.steps.iter().find(|step| step.outcome.is_failure()) {
+        Some(step) => HookOutcome::Failed(describe_step_failure(step)),
+        None => HookOutcome::Passed,
+    }
+}
+
+/// One failed [`repon_core::StepResult`] in a sentence: its own label, then what it exited
+/// with or, for a step Repon performed itself, its own words.
+fn describe_step_failure(step: &repon_core::StepResult) -> String {
+    match &step.outcome {
+        repon_core::StepOutcome::Failed(code) => format!("`{}` exited {code}", step.label),
+        repon_core::StepOutcome::OwnWork(own_work) => {
+            format!("`{}` {}", step.label, own_work.said())
+        }
+        repon_core::StepOutcome::Ok
+        | repon_core::StepOutcome::NotRun
+        | repon_core::StepOutcome::Cancelled => {
+            format!("`{}` did not run to a failing exit", step.label)
+        }
+    }
 }
 
 /// Which of the fast-forward-only auto-update's own five rules found a Repo not eligible for
@@ -529,6 +577,12 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
             OwnWork::Refused(Arc::from(format!("refused, {}", refusal.reason())))
         }
         Outcome::Failed(error) => OwnWork::CouldNotAct(Arc::from(format!("failed, {error}"))),
+        Outcome::BeforeSyncHookFailed(error) => OwnWork::CouldNotAct(Arc::from(format!(
+            "before_sync hook failed, sync was not attempted: {error}"
+        ))),
+        Outcome::SyncedAfterHookFailed(error) => OwnWork::Did(Arc::from(format!(
+            "fast-forwarded to its upstream; after_sync hook failed: {error}"
+        ))),
     }
 }
 
@@ -581,11 +635,16 @@ impl Report {
         let mut unchanged = 0usize;
         let mut not_eligible = 0usize;
         let mut failed = 0usize;
+        let mut after_hook_failed = 0usize;
         for record in &self.records {
+            if matches!(record.outcome, Outcome::SyncedAfterHookFailed(_)) {
+                after_hook_failed += 1;
+            }
             match record.outcome {
                 Outcome::Ignored
                 | Outcome::Unignored
                 | Outcome::Synced
+                | Outcome::SyncedAfterHookFailed(_)
                 | Outcome::Deleted {
                     config_entry_removed: true,
                 }
@@ -607,7 +666,7 @@ impl Report {
                 Outcome::ExcludedByAnInheritedEntry => unchanged += 1,
                 Outcome::NotEligibleToSync(_) => not_eligible += 1,
                 Outcome::Refused(_) => refused += 1,
-                Outcome::Failed(_) => failed += 1,
+                Outcome::Failed(_) | Outcome::BeforeSyncHookFailed(_) => failed += 1,
             }
         }
         let mut parts = vec![format!("{done} done")];
@@ -623,6 +682,9 @@ impl Report {
         if failed > 0 {
             parts.push(format!("{failed} failed"));
         }
+        if after_hook_failed > 0 {
+            parts.push(format!("{after_hook_failed} after_sync hook failed"));
+        }
         format!("{}: {}", self.operation.name(), parts.join(", "))
     }
 }
@@ -637,13 +699,18 @@ impl Report {
 /// `attempt_sync` are [`repon_core::Core::worktree_admin_dir`],
 /// [`repon_core::Core::linked_worktree_paths`] and [`repon_core::Core::attempt_auto_update`]
 /// at the one call site; taken as parameters, the same way [`Plan::with_risk`] takes `read`,
-/// so this module never needs a `Core` to be tested.
+/// so this module never needs a `Core` to be tested. `run_before_sync_hook` and
+/// `run_after_sync_hook` are consulted for `Operation::Sync` alone, `None` meaning the Set
+/// active for this run names no hook at all
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
 pub(crate) fn run(
     plan: &Plan,
     config_file: &Path,
     worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
     attempt_sync: impl Fn(&EntityKey) -> AutoUpdateAttempt,
+    run_before_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
+    run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
 ) -> Report {
     let records = plan
         .targets
@@ -659,6 +726,8 @@ pub(crate) fn run(
                     &worktree_admin_dir,
                     &linked_worktree_paths,
                     &attempt_sync,
+                    &run_before_sync_hook,
+                    &run_after_sync_hook,
                 )
                 .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
             };
@@ -676,6 +745,7 @@ pub(crate) fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one(
     operation: Operation,
     target: &Target,
@@ -683,6 +753,8 @@ fn run_one(
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
     attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
+    run_before_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
+    run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
 ) -> Result<Outcome> {
     match operation {
         Operation::Ignore => {
@@ -702,7 +774,12 @@ fn run_one(
             worktree_admin_dir,
             linked_worktree_paths,
         ),
-        Operation::Sync => Ok(sync_one(target, attempt_sync)),
+        Operation::Sync => Ok(sync_one(
+            target,
+            attempt_sync,
+            run_before_sync_hook,
+            run_after_sync_hook,
+        )),
     }
 }
 
@@ -710,8 +787,22 @@ fn run_one(
 /// already found eligible by Kind, and its own answer is reported rather than fixed, per
 /// [repo-management.md](../../../docs/spec/repo-management.md)'s "What `sync` refuses, and
 /// why": an ineligible-right-now Repo is not a failure, so it never reaches [`Outcome::Failed`].
-fn sync_one(target: &Target, attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt) -> Outcome {
-    match attempt_sync(&target.key) {
+///
+/// `run_before_sync_hook` runs, and is checked, before `attempt_sync` is ever called: a
+/// failing pre-hook means the fast-forward is never attempted for this row at all.
+/// `run_after_sync_hook` runs only once `attempt_sync` reports [`AutoUpdateAttempt::Updated`],
+/// and its own failure never undoes that fast-forward, which already happened
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
+fn sync_one(
+    target: &Target,
+    attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
+    run_before_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
+    run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
+) -> Outcome {
+    if let Some(HookOutcome::Failed(error)) = run_before_sync_hook(&target.key) {
+        return Outcome::BeforeSyncHookFailed(error);
+    }
+    let outcome = match attempt_sync(&target.key) {
         AutoUpdateAttempt::Updated => Outcome::Synced,
         AutoUpdateAttempt::NotClean => Outcome::NotEligibleToSync(SyncIneligibility::NotClean),
         AutoUpdateAttempt::NoUpstream => Outcome::NotEligibleToSync(SyncIneligibility::NoUpstream),
@@ -720,7 +811,13 @@ fn sync_one(target: &Target, attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAtt
             Outcome::NotEligibleToSync(SyncIneligibility::NotFastForward)
         }
         AutoUpdateAttempt::Failed(error) => Outcome::Failed(error),
+    };
+    if matches!(outcome, Outcome::Synced)
+        && let Some(HookOutcome::Failed(error)) = run_after_sync_hook(&target.key)
+    {
+        return Outcome::SyncedAfterHookFailed(error);
     }
+    outcome
 }
 
 /// `delete` on one row: a Repo takes its linked Worktrees' own directories with it, a
@@ -865,6 +962,8 @@ mod tests {
             |_| None,
             |_| Vec::new(),
             |_| panic!("run_plain does not exercise sync"),
+            |_| panic!("run_plain declares no before_sync hook"),
+            |_| panic!("run_plain declares no after_sync hook"),
         )
     }
 
@@ -1021,6 +1120,8 @@ mod tests {
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
         );
 
         assert!(!tree.exists(), "the Worktree's own directory is gone");
@@ -1056,6 +1157,8 @@ mod tests {
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
         );
 
         assert!(
@@ -1087,6 +1190,8 @@ mod tests {
             |_| None,
             |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
         );
 
         assert!(!tree.exists(), "the Worktree's own directory is still gone");
@@ -1121,6 +1226,8 @@ mod tests {
             |_| None,
             |_| siblings.to_vec(),
             |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
         );
 
         assert!(!repo.exists(), "the Repo's own working tree is gone");
@@ -1475,6 +1582,27 @@ mod tests {
             |_| None,
             |_| Vec::new(),
             move |_| attempt.clone(),
+            |_| None,
+            |_| None,
+        )
+    }
+
+    /// [`run_with_sync`] plus a `before_sync` and an `after_sync` hook of the caller's own
+    /// choosing, for the hook-specific tests below.
+    fn run_with_sync_and_hooks(
+        plan: &Plan,
+        attempt: AutoUpdateAttempt,
+        before_sync: Option<HookOutcome>,
+        after_sync: Option<HookOutcome>,
+    ) -> Report {
+        run(
+            plan,
+            Path::new("/tmp/unused-config.toml"),
+            |_| None,
+            |_| Vec::new(),
+            move |_| attempt.clone(),
+            move |_| before_sync.clone(),
+            move |_| after_sync.clone(),
         )
     }
 
@@ -1545,6 +1673,174 @@ mod tests {
 
         assert!(
             matches!(&report.records[0].outcome, Outcome::Failed(message) if message == "git said no")
+        );
+    }
+
+    // =====================================================================================
+    // Hooks around sync (docs/spec/repo-management.md's "Hooks around sync"): a pre hook
+    // that fails stops sync from being attempted at all; a post hook that fails never undoes
+    // a fast-forward that already happened.
+    // =====================================================================================
+
+    /// A pre hook that fails must stop `sync` before it is ever attempted: `attempt_sync`
+    /// itself panics if called, so this only passes if `sync_one` never reaches it.
+    #[test]
+    fn a_failing_before_sync_hook_stops_sync_from_being_attempted() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run(
+            &built,
+            Path::new("/tmp/unused-config.toml"),
+            |_| None,
+            |_| Vec::new(),
+            |_| panic!("a failing pre-hook must stop sync before attempt_sync is ever called"),
+            |_| Some(HookOutcome::Failed("exit 1".to_string())),
+            |_| panic!("a before_sync failure must never reach the after_sync hook either"),
+        );
+
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::BeforeSyncHookFailed("exit 1".to_string())
+        );
+        assert!(
+            matches!(
+                own_work(&report.records[0].outcome),
+                OwnWork::CouldNotAct(_)
+            ),
+            "sync never ran, so this row could not act rather than merely being refused"
+        );
+    }
+
+    /// A passing pre hook lets `sync` proceed exactly as it would with none declared.
+    #[test]
+    fn a_passing_before_sync_hook_still_lets_sync_run() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run_with_sync_and_hooks(
+            &built,
+            AutoUpdateAttempt::Updated,
+            Some(HookOutcome::Passed),
+            None,
+        );
+
+        assert_eq!(report.records[0].outcome, Outcome::Synced);
+    }
+
+    /// A post hook that fails never undoes the fast-forward: the row still reports the
+    /// branch moved, with the hook's own failure carried alongside it rather than replacing
+    /// it, so "sync happened" is never lost.
+    #[test]
+    fn a_failing_after_sync_hook_never_undoes_the_fast_forward_it_already_did() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run_with_sync_and_hooks(
+            &built,
+            AutoUpdateAttempt::Updated,
+            None,
+            Some(HookOutcome::Failed("exit 1".to_string())),
+        );
+
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::SyncedAfterHookFailed("exit 1".to_string())
+        );
+        assert!(
+            matches!(own_work(&report.records[0].outcome), OwnWork::Did(message) if message.contains("fast-forwarded")),
+            "the fast-forward already happened and must still read as done, got {:?}",
+            own_work(&report.records[0].outcome)
+        );
+        assert!(
+            report.summary().contains("1 after_sync hook failed"),
+            "the summary must flag the hook failure rather than folding it silently into \
+             'done', got {:?}",
+            report.summary()
+        );
+    }
+
+    /// The after_sync hook is never even consulted when `sync` did not actually fast-forward
+    /// the branch: nothing happened for it to run after.
+    #[test]
+    fn after_sync_hook_is_not_consulted_when_sync_did_not_fast_forward() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run(
+            &built,
+            Path::new("/tmp/unused-config.toml"),
+            |_| None,
+            |_| Vec::new(),
+            |_| AutoUpdateAttempt::NotBehind,
+            |_| None,
+            |_| panic!("after_sync must never be consulted when sync did not fast-forward"),
+        );
+
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::NotEligibleToSync(SyncIneligibility::NotBehind)
+        );
+    }
+
+    /// A passing after_sync hook reports the plain `Synced` outcome, with no trace that a
+    /// hook ran at all: only a hook's own failure is worth a distinct outcome.
+    #[test]
+    fn a_passing_after_sync_hook_leaves_the_outcome_as_plain_synced() {
+        let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
+        let mut built = plan(Operation::Sync, &entities);
+        built.targets[0].eligibility = Eligibility::Eligible;
+
+        let report = run_with_sync_and_hooks(
+            &built,
+            AutoUpdateAttempt::Updated,
+            None,
+            Some(HookOutcome::Passed),
+        );
+
+        assert_eq!(report.records[0].outcome, Outcome::Synced);
+    }
+
+    /// [`hook_outcome_from_receipt`]'s own job: a receipt with a failing step becomes
+    /// `Failed` naming that step, and a receipt whose steps all ran clean becomes `Passed`.
+    #[test]
+    fn hook_outcome_from_receipt_reads_the_first_failing_step() {
+        use repon_core::{ActionReceipt, StepOutcome, StepResult};
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let passing = ActionReceipt {
+            label: StdArc::from("hook"),
+            steps: StdArc::from(vec![StepResult {
+                label: StdArc::from("true"),
+                outcome: StepOutcome::Ok,
+                output: StdArc::from(&b""[..]),
+                elapsed: Duration::ZERO,
+                elision: None,
+            }]),
+            skip: None,
+            finished_at: repon_core::Timestamp::now(),
+            running: None,
+        };
+        assert_eq!(hook_outcome_from_receipt(&passing), HookOutcome::Passed);
+
+        let failing = ActionReceipt {
+            steps: StdArc::from(vec![StepResult {
+                label: StdArc::from("false"),
+                outcome: StepOutcome::Failed(1),
+                output: StdArc::from(&b""[..]),
+                elapsed: Duration::ZERO,
+                elision: None,
+            }]),
+            ..passing
+        };
+        assert_eq!(
+            hook_outcome_from_receipt(&failing),
+            HookOutcome::Failed("`false` exited 1".to_string())
         );
     }
 
@@ -1680,6 +1976,12 @@ mod tests {
             (Outcome::ExcludedByAnInheritedEntry, "Refused"),
             (Outcome::Refused(Refusal::AlreadyIgnored), "Refused"),
             (Outcome::Failed("boom".to_string()), "CouldNotAct"),
+            (Outcome::Synced, "Did"),
+            (
+                Outcome::BeforeSyncHookFailed("boom".to_string()),
+                "CouldNotAct",
+            ),
+            (Outcome::SyncedAfterHookFailed("boom".to_string()), "Did"),
         ];
 
         for (outcome, grade) in cases {
@@ -1841,11 +2143,11 @@ mod tests {
         }
 
         assert_eq!(
-            matches_checked, 6,
-            "the six matches over a Step outcome this workspace holds are `is_failure`, \
-             `is_refusal`, `OwnWork::said`, `step_outcome_word`, `step_outcome_meaning` and \
-             `finished_step_line`; a different count means the scan has stopped finding them, \
-             or a seventh landed and belongs on this list"
+            matches_checked, 7,
+            "the seven matches over a Step outcome this workspace holds are `is_failure`, \
+             `is_refusal`, `OwnWork::said`, `step_outcome_word`, `step_outcome_meaning`, \
+             `finished_step_line` and `describe_step_failure`; a different count means the \
+             scan has stopped finding them, or an eighth landed and belongs on this list"
         );
         assert!(
             offending.is_empty(),

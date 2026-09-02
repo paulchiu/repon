@@ -84,10 +84,14 @@ Every duration in the file is a humantime string via `humantime-serde`: `"2s"`, 
 | `include` | array of globs, optional | Default everything |
 | `exclude` | array of globs, optional | |
 | `on_refresh` | string, optional | Names one declared `[[action]]` to run after a Refresh the user asked for while this Set is active, ahead of the top-level `on_refresh` key ([actions.md](actions.md)'s "The refresh hook", [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)) |
+| `before_sync` | string, optional | Names one declared `[[action]]` to run before `sync` acts on a row while this Set is active, ahead of the top-level `before_sync` key; a failing step stops `sync` from running at all for that row ([repo-management.md](repo-management.md)'s "Hooks around sync", [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)) |
+| `after_sync` | string, optional | Names one declared `[[action]]` to run after `sync` fast-forwards a row while this Set is active, ahead of the top-level `after_sync` key; a failing step never undoes the fast-forward |
 
 A Set bounds the work. An entity excluded by a Set is never discovered and never probed, which is what separates it from a Filter: a Filter narrows what is visible, a Set narrows what exists.
 
 `on_refresh` is resolved at the moment the hook fires, never at load: the active Set's own `on_refresh`, then the top-level key, then no hook. The same shape as [default-branch.md](default-branch.md)'s rungs and `[[repo]]`'s "a Worktree named directly by its own path beats the entry it inherits". Resolving at fire time rather than caching the value at startup or at a Set switch is the point: the active Set changes at runtime under `s` and `1` to `9`, and `Ctrl+R` re-reads the file, so a hook latched once would keep firing the Set the process launched with after the user switched away from it. There is no way for a Set to opt out of a top-level hook it does not want; that bound is stated rather than closed with a sentinel, in [actions.md](actions.md)'s "The refresh hook".
+
+`before_sync` and `after_sync` resolve exactly the same way, over their own two fields rather than `on_refresh`'s one: the active Set's own value, then the top-level key, then no hook, resolved fresh every time `sync`'s confirm gate is accepted rather than cached. [repo-management.md](repo-management.md)'s "Hooks around sync" and [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) carry what the two hooks do and why they fire from that keystroke alone.
 
 `roots` is required on every Set and there is no top-level fallback. Five Sets over the same roots is five honest lines, and a Set you can read in isolation is worth the repetition, since what varies between them is the globs.
 
@@ -226,6 +230,7 @@ Checked at load, each a warning rather than an exit:
 - A `[[set]]` glob matching nothing.
 - A `[[set]]` named `all`.
 - `on_refresh` naming an Action no `[[action]]` declares, so the hook can never fire. The warning names the value.
+- `before_sync` or `after_sync` naming an Action no `[[action]]` declares, so `sync` runs with that hook unfired. The warning names the value.
 
 ## Reload
 

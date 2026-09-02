@@ -1,6 +1,6 @@
 # Repo management
 
-Management operations change what Repon operates on, or remove a Repo from the machine. They are built-in entries in the Action palette, not a third palette: [0008](../adr/0008-two-palettes-not-one.md) splits the palettes by reach, one Repo against N Repos unattended, and management is on the N-Repos side of that boundary. They share the Action confirm gate, the Selection count and the ineligible-entity subtraction with config-defined Actions, and share none of the pty machinery in [actions.md](actions.md), because no child process runs. The reasoning is in [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md).
+Management operations change what Repon operates on, or remove a Repo from the machine. They are built-in entries in the Action palette, not a third palette: [0008](../adr/0008-two-palettes-not-one.md) splits the palettes by reach, one Repo against N Repos unattended, and management is on the N-Repos side of that boundary. They share the Action confirm gate, the Selection count and the ineligible-entity subtraction with config-defined Actions, and share none of the pty machinery in [actions.md](actions.md) for the operation itself, because no child process runs for it. The reasoning is in [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md). `sync` is the one exception, and only through the `before_sync` and `after_sync` hooks a Set may declare around it, "Hooks around sync" below.
 
 ## The operations
 
@@ -34,6 +34,16 @@ A refusal is reported and counted in the confirm gate, never silent, the same wa
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
 
 What the auto-update's own five rules find not eligible right now, not clean, no upstream, not behind or not fast-forward, is a different fact from a refusal above, and is never one: eligibility there can change between the gate and the run, so it is read only by attempting the fast-forward, and every Repo `sync` is eligible for by Kind is attempted and reports its own outcome afterwards, the same "report ineligible cases rather than fix them" rule [config.md](config.md)'s auto-update already keeps.
+
+## Hooks around sync
+
+A Set may name `before_sync` and `after_sync`, an `[[action]]` each to run around `sync` acting on one of its own rows, in the identical `Option<String>` shape and fire-time resolution [config.md](config.md)'s `on_refresh` already uses: the active Set's own value first, then the top-level key of the same name, then no hook, re-resolved fresh every time `sync`'s confirm gate is accepted rather than cached. [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) is the reasoning for firing them from that keystroke, never from a Generation.
+
+A row's own `before_sync` hook runs first, and its own steps must all succeed for `sync` to be attempted at all: a failing step means the fast-forward is never attempted for that row, reported as `BeforeSyncHookFailed` rather than silence or a crash. `after_sync` runs only once `sync` has actually fast-forwarded the row, and its own failure never undoes that fast-forward, which already happened by the time the hook runs: the row still reports `SyncedAfterHookFailed`, carrying both facts, the branch moved and the hook did not finish clean, rather than losing either one.
+
+Both hooks run against one row at a time, blocking `sync`'s own confirm-gate handler until that row's hook finishes, rather than through the asynchronous Action fan-out `on_refresh` and the palette share: `sync`'s own outcome for a row depends on whether its `before_sync` passed, which nothing running off the calling thread could answer before the built-in has to report. The steps themselves, the executor, the PTY and the environment contract are unchanged; only how the run is awaited differs.
+
+A `before_sync` or `after_sync` naming an Action no `[[action]]` declares is a load warning on the same path `on_refresh`'s does, never a crash: `sync` proceeds unhooked for the field that failed to resolve.
 
 ## What `delete` does to a Worktree
 
@@ -107,9 +117,11 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | `delete` fell back to a directory removal and an entry of its own | `Did` | directory removed, its parent Repo was unreadable, `[[repo]]` entry removed |
 | `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
 | `sync` fast-forwarded the branch | `Did` | fast-forwarded to its upstream |
+| `sync` fast-forwarded the branch but `after_sync` failed | `Did` | fast-forwarded to its upstream; after_sync hook failed, then what went wrong |
 | `unignore` on a row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
 | `sync` found the Repo not eligible right now | `Refused` | not eligible to sync, then the reason the auto-update's own five rules give |
 | the gate already refused it | `Refused` | refused, then the reason its own "What it refuses" section gives |
 | the tree would not remove, or the file would not write | `CouldNotAct` | failed, then what went wrong |
+| `before_sync` failed, so `sync` was never attempted | `CouldNotAct` | before_sync hook failed, sync was not attempted, then what went wrong |
 
 The receipt does not replace the gate. A refusal is still named and counted before the gesture is accepted, which is where a user can still change their mind; the receipt is what says afterwards which row got which answer. The log line and the one-line Notice carrying the counts stay too, and the receipt's own words are the log line's own words, read from one place so the two cannot drift.

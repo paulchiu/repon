@@ -422,6 +422,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         }
     }
 
@@ -569,6 +571,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         });
 
         app.reload_active_set(&document);
@@ -661,6 +665,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         });
 
         let logs = capture_tracing(|| app.reload_active_set(&document));
@@ -693,6 +699,8 @@ mod tests {
             include: None,
             exclude: None,
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
         }
     }
 
@@ -820,6 +828,8 @@ mod tests {
                 include: None,
                 exclude: None,
                 on_refresh: None,
+                before_sync: None,
+                after_sync: None,
             },
         ];
 
@@ -885,6 +895,8 @@ mod tests {
                 include: None,
                 exclude: None,
                 on_refresh: None,
+                before_sync: None,
+                after_sync: None,
             },
         ];
 
@@ -989,6 +1001,8 @@ mod tests {
                 include: None,
                 exclude: None,
                 on_refresh: None,
+                before_sync: None,
+                after_sync: None,
             },
         ];
 
@@ -1038,6 +1052,8 @@ mod tests {
                 include: None,
                 exclude: None,
                 on_refresh: None,
+                before_sync: None,
+                after_sync: None,
             },
         ];
         let keys: Vec<_> = app

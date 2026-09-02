@@ -95,6 +95,24 @@ pub struct SetConfig {
     /// distinguishable warnings.
     #[serde(default)]
     pub on_refresh: Option<String>,
+    /// Names one declared `[[action]]` to run before `sync` acts on a row while this Set is
+    /// active, read ahead of the top-level `before_sync` key, the identical resolution
+    /// `on_refresh` above already uses
+    /// ([repo-management.md](../../../../docs/spec/repo-management.md)'s "Hooks around
+    /// sync",
+    /// [0032](../../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)).
+    /// A row whose hook fails never reaches `sync` at all. A name no `[[action]]` declares is
+    /// [`Warning::SetBeforeSyncNamesNoAction`] at load rather than an exit, naming this Set so
+    /// a typo shared by two Sets still produces two distinguishable warnings.
+    #[serde(default)]
+    pub before_sync: Option<String>,
+    /// Names one declared `[[action]]` to run after `sync` fast-forwards a row while this Set
+    /// is active, read ahead of the top-level `after_sync` key. A row's hook failing here
+    /// never undoes the fast-forward it already performed. A name no `[[action]]` declares is
+    /// [`Warning::SetAfterSyncNamesNoAction`] at load rather than an exit, for the same reason
+    /// `before_sync`'s does.
+    #[serde(default)]
+    pub after_sync: Option<String>,
 }
 
 /// A `[[repo]]` entry: rung 1 of [default-branch.md](../../../../docs/spec/default-branch.md)'s
@@ -236,6 +254,16 @@ pub struct Document {
     /// `[[action]]` declares is [`Warning::OnRefreshNamesNoAction`] at load rather than an
     /// exit, so a typo costs the hook and nothing else.
     pub on_refresh: Option<String>,
+    /// The `[[action]]` a Set declaring no `before_sync` of its own falls through to, run
+    /// before `sync` acts on a row
+    /// ([repo-management.md](../../../../docs/spec/repo-management.md)'s "Hooks around
+    /// sync"). A name no `[[action]]` declares is [`Warning::BeforeSyncNamesNoAction`] at
+    /// load rather than an exit.
+    pub before_sync: Option<String>,
+    /// The `[[action]]` a Set declaring no `after_sync` of its own falls through to, run
+    /// after `sync` fast-forwards a row. A name no `[[action]]` declares is
+    /// [`Warning::AfterSyncNamesNoAction`] at load rather than an exit.
+    pub after_sync: Option<String>,
     pub refresh: RefreshConfig,
     pub fetch: FetchConfig,
     pub auto_update: AutoUpdateConfig,
@@ -264,6 +292,8 @@ impl Default for Document {
             show_submodules: false,
             notice_timeout: Duration::from_secs(3),
             on_refresh: None,
+            before_sync: None,
+            after_sync: None,
             refresh: RefreshConfig::default(),
             fetch: FetchConfig::default(),
             auto_update: AutoUpdateConfig::default(),
@@ -299,6 +329,20 @@ pub enum Warning {
     /// the same bad value produce two distinguishable warnings rather than one that could
     /// belong to either.
     SetOnRefreshNamesNoAction { set: String, name: String },
+    /// `before_sync` naming an Action no `[[action]]` declares, so `sync` never runs a
+    /// pre-hook and proceeds unhooked rather than never running at all.
+    BeforeSyncNamesNoAction { name: String },
+    /// A `[[set]].before_sync` naming an Action no `[[action]]` declares, so `sync` runs
+    /// unhooked while that Set is active. Carries the Set's own name for the same reason
+    /// [`Warning::SetOnRefreshNamesNoAction`] does.
+    SetBeforeSyncNamesNoAction { set: String, name: String },
+    /// `after_sync` naming an Action no `[[action]]` declares, so a fast-forward runs with
+    /// no post-hook rather than never running at all.
+    AfterSyncNamesNoAction { name: String },
+    /// A `[[set]].after_sync` naming an Action no `[[action]]` declares, so a fast-forward
+    /// runs unhooked while that Set is active. Carries the Set's own name for the same
+    /// reason [`Warning::SetOnRefreshNamesNoAction`] does.
+    SetAfterSyncNamesNoAction { set: String, name: String },
 }
 
 impl std::fmt::Display for Warning {
@@ -337,6 +381,26 @@ impl std::fmt::Display for Warning {
                 f,
                 "set `{set}`'s on_refresh names `{name}`, which no [[action]] declares, so \
                  nothing runs after a refresh while `{set}` is active"
+            ),
+            Warning::BeforeSyncNamesNoAction { name } => write!(
+                f,
+                "before_sync names `{name}`, which no [[action]] declares, so sync runs with \
+                 no pre-hook"
+            ),
+            Warning::SetBeforeSyncNamesNoAction { set, name } => write!(
+                f,
+                "set `{set}`'s before_sync names `{name}`, which no [[action]] declares, so \
+                 sync runs with no pre-hook while `{set}` is active"
+            ),
+            Warning::AfterSyncNamesNoAction { name } => write!(
+                f,
+                "after_sync names `{name}`, which no [[action]] declares, so sync runs with \
+                 no post-hook"
+            ),
+            Warning::SetAfterSyncNamesNoAction { set, name } => write!(
+                f,
+                "set `{set}`'s after_sync names `{name}`, which no [[action]] declares, so \
+                 sync runs with no post-hook while `{set}` is active"
             ),
         }
     }
@@ -499,6 +563,8 @@ fn implicit_all_set(root: PathBuf) -> SetConfig {
         include: None,
         exclude: None,
         on_refresh: None,
+        before_sync: None,
+        after_sync: None,
     }
 }
 
@@ -650,23 +716,75 @@ fn duplicate<'a, T>(
     None
 }
 
-/// [config.md](../../../../docs/spec/config.md)'s "Sets" resolution chain for `on_refresh`,
-/// amending [0029](../../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md):
-/// the Set named `active_set_name`'s own `on_refresh` first, then the top-level key, then no
-/// hook. A pure function of `document` and the active Set's own name rather than something
-/// resolved once and cached, since the active Set changes at runtime under `s` and `1` to `9`
-/// and a hook latched at startup would keep firing the Set the process launched with; the app
-/// crate calls this fresh every time a Refresh fires ([`crate::app::App::on_refresh_action`]).
-pub(crate) fn resolve_on_refresh_name<'a>(
+/// The one resolution chain every hook field in this file shares: the Set named
+/// `active_set_name`'s own field first, then the top-level key, then no hook. A pure
+/// function of `document` and the active Set's own name rather than something resolved once
+/// and cached, since the active Set changes at runtime under `s` and `1` to `9` and a hook
+/// latched at startup would keep firing the Set the process launched with.
+/// [`resolve_on_refresh_name`], [`resolve_before_sync_name`] and [`resolve_after_sync_name`]
+/// are this same chain over three different fields, so the rule cannot drift between them.
+fn resolve_hook_name<'a>(
     document: &'a Document,
     active_set_name: &str,
+    set_field: impl Fn(&'a SetConfig) -> Option<&'a str>,
+    document_field: Option<&'a str>,
 ) -> Option<&'a str> {
     document
         .sets
         .iter()
         .find(|set| set.name.get_ref() == active_set_name)
-        .and_then(|set| set.on_refresh.as_deref())
-        .or(document.on_refresh.as_deref())
+        .and_then(set_field)
+        .or(document_field)
+}
+
+/// [config.md](../../../../docs/spec/config.md)'s "Sets" resolution chain for `on_refresh`,
+/// amending [0029](../../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md).
+/// The app crate calls this fresh every time a Refresh fires
+/// ([`crate::app::App::on_refresh_action`]).
+pub(crate) fn resolve_on_refresh_name<'a>(
+    document: &'a Document,
+    active_set_name: &str,
+) -> Option<&'a str> {
+    resolve_hook_name(
+        document,
+        active_set_name,
+        |set| set.on_refresh.as_deref(),
+        document.on_refresh.as_deref(),
+    )
+}
+
+/// [repo-management.md](../../../../docs/spec/repo-management.md)'s "Hooks around sync"
+/// resolution chain for `before_sync`, the identical rule `resolve_on_refresh_name` uses over
+/// a different field
+/// ([0032](../../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)).
+/// The app crate calls this fresh every time `sync`'s confirm gate is accepted
+/// ([`crate::app::App::before_sync_action`]).
+pub(crate) fn resolve_before_sync_name<'a>(
+    document: &'a Document,
+    active_set_name: &str,
+) -> Option<&'a str> {
+    resolve_hook_name(
+        document,
+        active_set_name,
+        |set| set.before_sync.as_deref(),
+        document.before_sync.as_deref(),
+    )
+}
+
+/// [repo-management.md](../../../../docs/spec/repo-management.md)'s "Hooks around sync"
+/// resolution chain for `after_sync`, the identical rule `resolve_on_refresh_name` uses over a
+/// different field. The app crate calls this fresh every time `sync`'s confirm gate is
+/// accepted ([`crate::app::App::after_sync_action`]).
+pub(crate) fn resolve_after_sync_name<'a>(
+    document: &'a Document,
+    active_set_name: &str,
+) -> Option<&'a str> {
+    resolve_hook_name(
+        document,
+        active_set_name,
+        |set| set.after_sync.as_deref(),
+        document.after_sync.as_deref(),
+    )
 }
 
 /// The checks [config.md](../../../../docs/spec/config.md#cross-key-validity) runs at
@@ -693,6 +811,24 @@ fn cross_key_warnings(document: &Document) -> Vec<Warning> {
         warnings.push(Warning::OnRefreshNamesNoAction { name: name.clone() });
     }
 
+    if let Some(name) = document.before_sync.as_ref().filter(|name| {
+        !document
+            .actions
+            .iter()
+            .any(|action| action.name.get_ref() == *name)
+    }) {
+        warnings.push(Warning::BeforeSyncNamesNoAction { name: name.clone() });
+    }
+
+    if let Some(name) = document.after_sync.as_ref().filter(|name| {
+        !document
+            .actions
+            .iter()
+            .any(|action| action.name.get_ref() == *name)
+    }) {
+        warnings.push(Warning::AfterSyncNamesNoAction { name: name.clone() });
+    }
+
     for set in &document.sets {
         let name = set.name.get_ref();
         if name == "all" {
@@ -707,6 +843,28 @@ fn cross_key_warnings(document: &Document) -> Vec<Warning> {
             warnings.push(Warning::SetOnRefreshNamesNoAction {
                 set: name.clone(),
                 name: on_refresh.clone(),
+            });
+        }
+        if let Some(before_sync) = set.before_sync.as_ref().filter(|before_sync| {
+            !document
+                .actions
+                .iter()
+                .any(|action| action.name.get_ref().as_str() == before_sync.as_str())
+        }) {
+            warnings.push(Warning::SetBeforeSyncNamesNoAction {
+                set: name.clone(),
+                name: before_sync.clone(),
+            });
+        }
+        if let Some(after_sync) = set.after_sync.as_ref().filter(|after_sync| {
+            !document
+                .actions
+                .iter()
+                .any(|action| action.name.get_ref().as_str() == after_sync.as_str())
+        }) {
+            warnings.push(Warning::SetAfterSyncNamesNoAction {
+                set: name.clone(),
+                name: after_sync.clone(),
             });
         }
         for glob in set.include.iter().chain(&set.exclude).flatten() {
@@ -1632,6 +1790,155 @@ mod tests {
                 .any(|warning| matches!(warning, Warning::SetOnRefreshNamesNoAction { .. })),
             "got: {:?}",
             loaded.warnings
+        );
+    }
+
+    // `before_sync` and `after_sync`: the identical shape and resolution `on_refresh` already
+    // has, over two fields instead of one (docs/spec/repo-management.md's "Hooks around
+    // sync").
+
+    #[test]
+    fn before_sync_naming_an_undeclared_action_warns_rather_than_failing_the_load() {
+        let loaded = parse_ok("before_sync = \"tidy\"\n");
+
+        assert!(
+            loaded.warnings.contains(&Warning::BeforeSyncNamesNoAction {
+                name: "tidy".to_string(),
+            }),
+            "got: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(loaded.document.before_sync.as_deref(), Some("tidy"));
+    }
+
+    #[test]
+    fn after_sync_naming_an_undeclared_action_warns_rather_than_failing_the_load() {
+        let loaded = parse_ok("after_sync = \"tidy\"\n");
+
+        assert!(
+            loaded.warnings.contains(&Warning::AfterSyncNamesNoAction {
+                name: "tidy".to_string(),
+            }),
+            "got: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(loaded.document.after_sync.as_deref(), Some("tidy"));
+    }
+
+    #[test]
+    fn before_sync_and_after_sync_naming_a_declared_action_do_not_warn() {
+        let loaded = parse_ok(
+            "before_sync = \"hook\"\nafter_sync = \"hook\"\n\n\
+             [[action]]\nname = \"hook\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+        assert!(
+            !loaded.warnings.iter().any(|warning| matches!(
+                warning,
+                Warning::BeforeSyncNamesNoAction { .. } | Warning::AfterSyncNamesNoAction { .. }
+            )),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    /// Left out entirely, the zero-config shape: no warning about an Action nobody named.
+    #[test]
+    fn absent_before_sync_and_after_sync_keys_warn_about_nothing_and_default_to_none() {
+        let loaded = parse_ok("theme = \"default\"\n");
+
+        assert_eq!(loaded.document.before_sync, None);
+        assert_eq!(loaded.document.after_sync, None);
+        assert!(
+            !loaded.warnings.iter().any(|warning| matches!(
+                warning,
+                Warning::BeforeSyncNamesNoAction { .. } | Warning::AfterSyncNamesNoAction { .. }
+            )),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn a_set_before_sync_and_after_sync_key_parse() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\n\
+             before_sync = \"pre\"\nafter_sync = \"post\"\n\n\
+             [[action]]\nname = \"pre\"\nsteps = [{ args = [\"true\"] }]\n\n\
+             [[action]]\nname = \"post\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+        assert_eq!(loaded.document.sets[0].before_sync.as_deref(), Some("pre"));
+        assert_eq!(loaded.document.sets[0].after_sync.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn a_set_before_sync_naming_no_declared_action_warns_and_names_the_set() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\nbefore_sync = \"nothing-declares-this\"\n",
+        );
+        assert!(
+            loaded
+                .warnings
+                .contains(&Warning::SetBeforeSyncNamesNoAction {
+                    set: "work".to_string(),
+                    name: "nothing-declares-this".to_string(),
+                }),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn a_set_after_sync_naming_no_declared_action_warns_and_names_the_set() {
+        let loaded = parse_ok(
+            "[[set]]\nname = \"work\"\nroots = [\"~/dev\"]\nafter_sync = \"nothing-declares-this\"\n",
+        );
+        assert!(
+            loaded
+                .warnings
+                .contains(&Warning::SetAfterSyncNamesNoAction {
+                    set: "work".to_string(),
+                    name: "nothing-declares-this".to_string(),
+                }),
+            "got: {:?}",
+            loaded.warnings
+        );
+    }
+
+    // The chain over all three rungs from one document, for both fields, the identical proof
+    // `on_refresh_resolves_over_all_three_rungs_from_one_document` below already gives that
+    // key.
+    #[test]
+    fn before_sync_and_after_sync_resolve_over_all_three_rungs_from_one_document() {
+        let loaded = parse_ok(
+            "before_sync = \"top-level-pre\"\nafter_sync = \"top-level-post\"\n\n\
+             [[set]]\nname = \"own-hooks\"\nroots = [\"~/dev\"]\n\
+             before_sync = \"set-pre\"\nafter_sync = \"set-post\"\n\n\
+             [[set]]\nname = \"falls-through\"\nroots = [\"~/dev\"]\n\n\
+             [[action]]\nname = \"set-pre\"\nsteps = [{ args = [\"true\"] }]\n\n\
+             [[action]]\nname = \"set-post\"\nsteps = [{ args = [\"true\"] }]\n\n\
+             [[action]]\nname = \"top-level-pre\"\nsteps = [{ args = [\"true\"] }]\n\n\
+             [[action]]\nname = \"top-level-post\"\nsteps = [{ args = [\"true\"] }]\n",
+        );
+
+        assert_eq!(
+            resolve_before_sync_name(&loaded.document, "own-hooks"),
+            Some("set-pre"),
+            "a Set with its own before_sync must resolve to it, ahead of the top-level key"
+        );
+        assert_eq!(
+            resolve_after_sync_name(&loaded.document, "own-hooks"),
+            Some("set-post"),
+            "a Set with its own after_sync must resolve to it, ahead of the top-level key"
+        );
+        assert_eq!(
+            resolve_before_sync_name(&loaded.document, "falls-through"),
+            Some("top-level-pre"),
+            "a Set with no before_sync of its own must fall through to the top-level key"
+        );
+        assert_eq!(
+            resolve_after_sync_name(&loaded.document, "falls-through"),
+            Some("top-level-post"),
+            "a Set with no after_sync of its own must fall through to the top-level key"
         );
     }
 
