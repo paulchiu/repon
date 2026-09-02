@@ -107,9 +107,13 @@ impl<T> FoldableCell for Cell<T> {
 /// space. Otherwise the row shows its least settled Cell, widened by two
 /// entity-level derivations that are not Cells at all: an unparseable
 /// `.gitmodules` and a failed last Action both drive the row to `Failed` even
-/// when every Cell reads fine. The default branch's rung and its disagreement
-/// stay out, being metadata about how a value was obtained rather than a value
-/// that can itself fail.
+/// when every Cell reads fine. Before any of that, though, `last_action.running` being
+/// `Some` also reads `InFlight`, outranking a `Failed` Cell and the same receipt's own
+/// past failures: `Core::run_action` writes it once per step while a run is on this row
+/// right now (`docs/spec/actions.md`'s "The run on screen"), so a row being retried is
+/// in-flight rather than still reporting the failure it is retrying. The default branch's
+/// rung and its disagreement stay out, being metadata about how a value was obtained
+/// rather than a value that can itself fail.
 pub fn summary(entity: &EntityState) -> RowSummary {
     // Exhaustive: a Cell or derivation source added to EntityState or Diagnostics
     // later must be named here or the pattern fails to compile, so it cannot be
@@ -152,7 +156,13 @@ pub fn summary(entity: &EntityState) -> RowSummary {
     // reached yet and a row whose first probe is already running therefore fold
     // identically.
     let holds_no_values = cells.iter().all(|cell| !cell.holds_a_value());
-    if holds_no_values {
+    // A running Action step outranks everything below it, a failed Cell and the same
+    // receipt's own past failures included: a row being retried right now is in-flight, and
+    // reporting the old failure while the retry runs is the wrong answer.
+    let action_running = last_action
+        .as_ref()
+        .is_some_and(|receipt| receipt.running.is_some());
+    if holds_no_values || action_running {
         return RowSummary::InFlight;
     }
 
@@ -770,6 +780,77 @@ mod tests {
         );
 
         assert_eq!(summary(&entity), RowSummary::Failed);
+    }
+
+    /// The defect this ticket fixes: `EntityState::last_action.running` is what
+    /// `Core::run_action` writes once per step while a run is on this row right now
+    /// (`docs/spec/actions.md`'s "The run on screen"), and the fold must widen to
+    /// `InFlight` for it, not merely name it to skip it.
+    #[test]
+    fn a_row_with_a_running_action_step_reads_in_flight() {
+        let mut entity = fresh_entity("repo");
+        entity.last_action = Some(ActionReceipt {
+            label: Arc::from("action"),
+            steps: Arc::from(Vec::new()),
+            skip: None,
+            finished_at: Timestamp::now(),
+            running: Some(crate::entity::RunningStep {
+                label: Arc::from("pnpm install"),
+                started_at: Timestamp::now(),
+            }),
+        });
+
+        assert_eq!(summary(&entity), RowSummary::InFlight);
+    }
+
+    /// Settles the issue's own open question: a running Action outranks a failed one, because a
+    /// row retrying a previously failed step is in-flight right now, and reporting the old
+    /// failure while the retry runs is the wrong answer.
+    #[test]
+    fn a_running_action_step_outranks_the_same_receipts_own_failed_steps() {
+        let mut entity = fresh_entity("repo");
+        entity.last_action = Some(ActionReceipt {
+            label: Arc::from("action"),
+            steps: Arc::from(vec![StepResult {
+                label: Arc::from("step 0"),
+                outcome: StepOutcome::Failed(1),
+                output: Arc::from(&b""[..]),
+                elapsed: std::time::Duration::from_millis(1),
+                elision: None,
+            }]),
+            skip: None,
+            finished_at: Timestamp::now(),
+            running: Some(crate::entity::RunningStep {
+                label: Arc::from("step 1"),
+                started_at: Timestamp::now(),
+            }),
+        });
+
+        assert_eq!(summary(&entity), RowSummary::InFlight);
+    }
+
+    /// A running Action outranks a genuinely failed Cell too, not only its own receipt's past
+    /// steps: while a row is being retried right now, that is the fact worth showing over a
+    /// probe failure from before the retry started.
+    #[test]
+    fn a_running_action_step_outranks_a_failed_cell() {
+        let mut entity = fresh_entity("repo");
+        entity.dirty.settle(
+            Generation::new(2),
+            Settled::Failed(crate::git::ProbeError::Read(Arc::from("boom"))),
+        );
+        entity.last_action = Some(ActionReceipt {
+            label: Arc::from("action"),
+            steps: Arc::from(Vec::new()),
+            skip: None,
+            finished_at: Timestamp::now(),
+            running: Some(crate::entity::RunningStep {
+                label: Arc::from("step 0"),
+                started_at: Timestamp::now(),
+            }),
+        });
+
+        assert_eq!(summary(&entity), RowSummary::InFlight);
     }
 
     #[test]
