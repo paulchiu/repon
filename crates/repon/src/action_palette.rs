@@ -17,13 +17,15 @@
 //! [`ad_hoc_steps`], which reads the typed text itself as the command to run
 //! ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
 //! one step, split into argv with shell-words, and the lines gate exactly as config steps
-//! do"). There is no key that inserts a literal newline into that text: Shift+Enter and
-//! Ctrl+Enter do not exist without the kitty keyboard protocol, which this crate does not
+//! do"). `Enter` runs that command, so the key that inserts a literal newline into it is a
+//! chord on `Enter`: `Alt+Enter` ([`ActionPalette::insert_newline`]). The two obvious keys
+//! are not available, which is why the chord looks like an odd choice and is not: Shift+Enter
+//! and Ctrl+Enter do not exist without the kitty keyboard protocol, which this crate does not
 //! opt into, and Ctrl+J is the newline byte itself, indistinguishable from Enter on every
-//! terminal this crate targets. A multi-line command reaches this field only through a whole
-//! paste ([`ActionPalette::paste`]) or a round trip through `$EDITOR`
-//! ([`ActionPalette::text`], [`ActionPalette::set_text`]), never through per-character typing
-//! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+//! terminal this crate targets. A newline still reaches this field the other two ways as
+//! well, through a whole paste ([`ActionPalette::paste`]) or a round trip through `$EDITOR`
+//! ([`ActionPalette::text`], [`ActionPalette::set_text`]), and all three mean the same thing
+//! to a step ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
 
 use ratatui::{
     Frame,
@@ -38,7 +40,9 @@ use repon_core::{ActionSpec, Applicability, Filter, Step};
 use crate::{
     config::document::{ActionConfig, StepConfig},
     edit_buffer::{EditBuffer, Motion},
+    footer,
     glyphs::{BorderScratch, GlyphSet},
+    keys::BindingTable,
     management::{self, Operation},
     theme::{Meaning, Role, Theme},
 };
@@ -70,6 +74,46 @@ pub(crate) const QUERY_PLACEHOLDER: &str = "; select action or type a command";
 /// typed text [`ActionPalette::draw`] reads the caret's column back from what it painted
 /// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
 const PROMPT_WIDTH: u16 = 2;
+
+/// The most interior rows the typed query is ever given, however many lines it holds
+/// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field): "capped at
+/// 8 rows"). Past it the query scrolls to keep the cursor's own line on screen rather than
+/// growing further, so a runaway paste can take at most eight rows of the frame instead of
+/// all of it. The same number [`crate::filter_line::COMPLETION_MAX_ROWS`] caps the completion
+/// overlay at, for the same reason: a field that can grow must not be able to grow without
+/// bound.
+pub(crate) const QUERY_MAX_ROWS: usize = 8;
+
+/// How many interior rows the query takes when it holds `lines` lines inside an interior
+/// `interior_height` rows tall: one row per line, capped at [`QUERY_MAX_ROWS`] and clipped
+/// again to leave the footer its own row and the candidate list at least one, never below
+/// one row.
+fn query_height(lines: usize, interior_height: u16) -> u16 {
+    let room = interior_height.saturating_sub(2).max(1);
+    (lines.clamp(1, QUERY_MAX_ROWS) as u16).min(room)
+}
+
+/// Which query line the top row shows: the window of `height` lines that keeps
+/// `cursor_line` in view, anchored at the buffer's own first line until the cursor moves
+/// past the bottom of it.
+fn first_visible_line(cursor_line: usize, height: u16) -> usize {
+    cursor_line.saturating_sub(height.saturating_sub(1) as usize)
+}
+
+/// Which line of the buffer the cursor sits on, counting from zero, given everything before
+/// it.
+fn cursor_line(before_cursor: &str) -> usize {
+    before_cursor.matches('\n').count()
+}
+
+/// `text`'s own last line: the run after its final newline, or the whole of it when there is
+/// none. Read over [`EditBuffer::before_cursor`] that is the caret's own column text.
+fn last_line(text: &str) -> &str {
+    match text.rfind('\n') {
+        Some(index) => &text[index + 1..],
+        None => text,
+    }
+}
 
 /// The last interior row of [`Stage::Confirming`], always drawn: the gate's own answer
 /// vocabulary, which [repo-management.md](../../../docs/spec/repo-management.md) requires be
@@ -344,6 +388,10 @@ pub(crate) struct Run<'a> {
     pub(crate) actions: &'a [ActionConfig],
     pub(crate) count: Count,
     pub(crate) management_lines: &'a [String],
+    /// The live binding table the palette's own footer hints are read off, never a literal
+    /// chord string ([0016](../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)),
+    /// so a `[keys]` rebind reaches this footer the same frame it reaches the list's.
+    pub(crate) bindings: &'a BindingTable,
 }
 
 /// What the border title counts this frame: how many rows a choice made right now would run
@@ -489,6 +537,15 @@ impl ActionPalette {
         self.query.insert_str(text);
         self.refusal = None;
         self.clamp_cursor(actions);
+    }
+
+    /// `Alt+Enter`: a literal newline at the cursor, so a second command can be written
+    /// without leaving the field. Text like any other character, which is why it goes in
+    /// through [`Self::type_char`] rather than around it: the match list narrows on it (a
+    /// name with a newline in it matches nothing, which is exactly what an ad hoc command
+    /// wants) and the highlight is clamped by the same call.
+    pub(crate) fn insert_newline(&mut self, actions: &[ActionConfig]) {
+        self.type_char('\n', actions);
     }
 
     /// The raw typed text, embedded newlines included: what seeds the `$EDITOR` scratch file
@@ -660,10 +717,71 @@ impl ActionPalette {
         }
     }
 
+    /// The typed query, one interior row per line and at most `capped_rows` of them: the
+    /// buffer's own first line carries the `; ` prompt and every continuation line is
+    /// indented under it, and the window scrolls so the caret's own line is always one of
+    /// the rows painted.
+    ///
+    /// The caret's column is read back from `set_stringn`'s own return, the same technique
+    /// [`crate::filter_line::FilterLine::draw`] uses, rather than added up from a separately
+    /// measured text width: a changed prompt or a wide character can then never drift the
+    /// caret from the text it follows. [`draw_row`]'s `Paragraph` is bypassed for the same
+    /// reason, since it never hands back where it stopped painting.
+    fn draw_query(&self, frame: &mut Frame, interior: Rect, theme: &Theme, capped_rows: u16) {
+        let row_right = interior.x + interior.width;
+        let style = theme.style_for(Role::Text);
+        let caret_line = cursor_line(self.query.before_cursor());
+        let first = first_visible_line(caret_line, capped_rows);
+        let column_before = last_line(self.query.before_cursor());
+        let column_after = self.query.after_cursor().split('\n').next().unwrap_or("");
+        let mut caret = None;
+        for (index, line) in self
+            .query
+            .as_str()
+            .split('\n')
+            .enumerate()
+            .skip(first)
+            .take(capped_rows as usize)
+        {
+            let y = interior.y + (index - first) as u16;
+            let buf: &mut Buffer = frame.buffer_mut();
+            let prompt = if index == 0 { "; " } else { "  " };
+            let (x, _) = buf.set_stringn(
+                interior.x,
+                y,
+                prompt,
+                row_right.saturating_sub(interior.x) as usize,
+                style,
+            );
+            if index == caret_line {
+                let (caret_x, _) = buf.set_stringn(
+                    x,
+                    y,
+                    column_before,
+                    row_right.saturating_sub(x) as usize,
+                    style,
+                );
+                buf.set_stringn(
+                    caret_x,
+                    y,
+                    column_after,
+                    row_right.saturating_sub(caret_x) as usize,
+                    style,
+                );
+                caret = Some(Position::new(caret_x.min(row_right), y));
+            } else {
+                buf.set_stringn(x, y, line, row_right.saturating_sub(x) as usize, style);
+            }
+        }
+        if let Some(position) = caret {
+            frame.set_cursor_position(position);
+        }
+    }
+
     /// Takes the whole frame in place of everything else. [`Stage::Choosing`]'s first
-    /// interior row is always the typed query, below it the match list or whichever
-    /// empty-state message applies; [`Stage::Confirming`] shows actions.md's confirm sentence
-    /// instead.
+    /// interior rows are the typed query, one per line, then the match list or whichever
+    /// empty-state message applies, and the palette's own footer on the last row;
+    /// [`Stage::Confirming`] shows actions.md's confirm sentence instead.
     pub(crate) fn draw(
         &self,
         frame: &mut Frame,
@@ -676,6 +794,7 @@ impl ActionPalette {
             actions,
             count,
             management_lines,
+            bindings,
         } = run;
         let run_count = count.run_count();
         let mut scratch = BorderScratch::new();
@@ -718,6 +837,13 @@ impl ActionPalette {
                 }
             }
             Stage::Choosing => {
+                // The query is as many rows as it has lines, capped, and the list below it
+                // takes what is left once the footer has its own last row: growing one and
+                // shrinking the other is what keeps a pasted twenty-line command from
+                // painting over the candidates
+                // ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+                let query_rows =
+                    query_height(self.query.as_str().split('\n').count(), interior.height);
                 let row_right = interior.x + interior.width;
                 if self.query.is_empty() {
                     draw_row(
@@ -738,47 +864,17 @@ impl ActionPalette {
                         ));
                     }
                 } else if interior.height > 0 {
-                    // The caret sits at the query's own cursor, "; " plus whatever has been
-                    // typed ahead of it, not at the end of whichever placeholder text an
-                    // empty query is showing in its place: this is where the next keystroke
-                    // would land. Read back from `set_stringn`'s own return, the same
-                    // technique [`crate::filter_line::FilterLine::draw`] uses, rather than
-                    // adding a separately measured query width to a literal prefix width: a
-                    // changed prefix or a wide character can then never drift the caret from
-                    // the text it follows. `draw_row`'s `Paragraph` is bypassed here rather
-                    // than reused because it never hands back where it stopped painting.
-                    let buf: &mut Buffer = frame.buffer_mut();
-                    let (x, _) = buf.set_stringn(
-                        interior.x,
-                        interior.y,
-                        "; ",
-                        row_right.saturating_sub(interior.x) as usize,
-                        theme.style_for(Role::Text),
-                    );
-                    let (caret_x, _) = buf.set_stringn(
-                        x,
-                        interior.y,
-                        self.query.before_cursor(),
-                        row_right.saturating_sub(x) as usize,
-                        theme.style_for(Role::Text),
-                    );
-                    buf.set_stringn(
-                        caret_x,
-                        interior.y,
-                        self.query.after_cursor(),
-                        row_right.saturating_sub(caret_x) as usize,
-                        theme.style_for(Role::Text),
-                    );
-                    frame.set_cursor_position(Position::new(caret_x.min(row_right), interior.y));
+                    self.draw_query(frame, interior, theme, query_rows);
                 }
 
                 let matches = self.matches(actions);
-                let rows_below_query = interior.height.saturating_sub(1) as usize;
+                let rows_below_query =
+                    interior.height.saturating_sub(query_rows).saturating_sub(1) as usize;
                 if matches.is_empty() {
                     draw_row(
                         frame,
                         interior,
-                        1,
+                        query_rows,
                         NO_MATCHES_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
@@ -801,7 +897,7 @@ impl ActionPalette {
                             Entry::Builtin(_) => theme.style_for(Role::Accent),
                             Entry::Configured(_) => Style::new(),
                         };
-                        let y_row = 1 + row as u16;
+                        let y_row = query_rows + row as u16;
                         draw_row(frame, interior, y_row, &line, style);
                         // Painted after the row's own text, over the row's full interior
                         // width, the same patch-not-replace order `components/list.rs` uses
@@ -828,18 +924,34 @@ impl ActionPalette {
                     draw_row(
                         frame,
                         interior,
-                        1 + matches.len() as u16,
+                        query_rows + matches.len() as u16,
                         NO_ACTIONS_CONFIGURED_MESSAGE,
                         theme.style_for(Role::Dim),
                     );
                 }
+                // One row above the footer, which owns the last row outright: a refusal is
+                // read once and the keys are taught every frame, so the keys are what must
+                // never be pushed off screen.
                 if let Some(refusal) = &self.refusal {
                     draw_row(
                         frame,
                         interior,
-                        interior.height.saturating_sub(1),
+                        interior.height.saturating_sub(2),
                         refusal,
                         theme.style_for(Role::Danger),
+                    );
+                }
+                if interior.height > 0 {
+                    footer::draw_action_palette(
+                        frame,
+                        Rect::new(
+                            interior.x,
+                            interior.y + interior.height - 1,
+                            interior.width,
+                            1,
+                        ),
+                        bindings,
+                        theme,
                     );
                 }
             }
@@ -849,7 +961,14 @@ impl ActionPalette {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
+
+    /// The compiled default table, which is all any test here needs: none of them exercises
+    /// a rebind, only the footer the palette derives from whatever table it is handed.
+    static BINDINGS_FOR_TESTS: LazyLock<BindingTable> =
+        LazyLock::new(BindingTable::compiled_default);
 
     fn action(name: &str, confirm: bool) -> ActionConfig {
         ActionConfig {
@@ -1040,6 +1159,7 @@ mod tests {
                         actions: &actions,
                         count: narrowed(8, 1, 3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1279,21 +1399,197 @@ mod tests {
         assert_eq!(palette.text(), "edited\ntext");
     }
 
-    /// A future reader who sees this module's own newline-key absence and thinks it looks
-    /// like an oversight needs the reason sitting right here beside the widget, not only in
+    /// A future reader who sees the newline bound to a chord rather than to either of the
+    /// two obvious keys needs the reason sitting right here beside the widget, not only in
     /// keybindings.md.
     #[test]
-    fn the_absence_of_an_inline_newline_key_and_its_reason_are_recorded_beside_the_widget() {
+    fn the_newline_chord_and_the_two_it_was_chosen_over_are_recorded_beside_the_widget() {
         let source = crate::test_support::production_source_at(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/action_palette.rs"),
         );
         assert!(
+            source.contains("Alt+Enter"),
+            "expected the module doc to name the chord that inserts a newline"
+        );
+        assert!(
             source.contains("kitty keyboard protocol"),
-            "expected the module doc to record why there is no inline-newline key"
+            "expected the module doc to record why Shift+Enter and Ctrl+Enter were not used"
         );
         assert!(
             source.contains("Ctrl+J is the newline byte itself"),
             "expected the module doc to name Ctrl+J as the obvious, unusable control chord"
+        );
+    }
+
+    // --- the newline key and the multi-line field it makes reachable ---
+
+    /// The newline goes in at the cursor like any other character, not onto the end of the
+    /// text, which is the whole point of the field owning an [`EditBuffer`]: a command whose
+    /// second line was written first can still be split where it belongs.
+    #[test]
+    fn the_newline_key_inserts_a_newline_at_the_cursor_rather_than_at_the_end() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "ab".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.move_cursor(Motion::Left);
+
+        palette.insert_newline(&actions);
+
+        assert_eq!(palette.text(), "a\nb");
+        assert_eq!(
+            palette.query.after_cursor(),
+            "b",
+            "the cursor must follow the newline it inserted, not jump to the end"
+        );
+    }
+
+    /// A newline typed with the chord means exactly what a pasted one means
+    /// ([actions.md](../../../docs/spec/actions.md)): each non-empty line is one step's own
+    /// command string, argv-split, and never implicitly `shell = true`.
+    #[test]
+    fn a_typed_newline_makes_the_second_line_a_step_of_its_own_with_no_implicit_shell() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "echo one".chars() {
+            palette.type_char(c, &actions);
+        }
+        palette.insert_newline(&actions);
+        for c in "echo two".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        match palette.choose(&actions, 5) {
+            Some(Decision::RunImmediately(spec)) => {
+                assert_eq!(spec.steps.len(), 2, "each line is one step");
+                assert_eq!(
+                    spec.steps[0].argv,
+                    vec!["echo".to_string(), "one".to_string()]
+                );
+                assert_eq!(
+                    spec.steps[1].argv,
+                    vec!["echo".to_string(), "two".to_string()]
+                );
+                assert!(
+                    spec.steps.iter().all(|step| !step.shell),
+                    "a newline must not turn the typed command into a shell string"
+                );
+            }
+            other => panic!("expected an ad hoc RunImmediately decision, got {other:?}"),
+        }
+    }
+
+    /// The cap lives in two places, this constant and the sentence in the spec. The test
+    /// reads the spec rather than restating the number, so the two cannot drift apart.
+    #[test]
+    fn the_query_row_cap_is_the_number_keybindings_md_documents() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read the keybinding spec");
+        let sentence = format!("capped at {QUERY_MAX_ROWS} rows");
+        assert!(
+            spec.contains(&sentence),
+            "keybindings.md no longer documents the query row cap as {sentence:?}"
+        );
+    }
+
+    /// The query row is no longer one row: each line takes one, and the candidate list
+    /// underneath starts that much lower rather than being drawn over.
+    #[test]
+    fn a_multi_line_query_grows_the_query_rows_and_starts_the_candidate_list_below_them() {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let theme = Theme::default();
+        let mut palette = ActionPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let one_line = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
+        assert!(
+            row_text(&one_line, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "a one-line query leaves the interior's second row to the list: {:?}",
+            row_text(&one_line, 2, 40)
+        );
+
+        palette.insert_newline(&actions);
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+        let two_lines = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
+
+        assert!(
+            row_text(&two_lines, 2, 40).contains("zzq"),
+            "the second query line must own the row the list used to start on: {:?}",
+            row_text(&two_lines, 2, 40)
+        );
+        assert!(
+            row_text(&two_lines, 3, 40).contains(NO_MATCHES_MESSAGE),
+            "the list must start one row lower, not be painted over: {:?}",
+            row_text(&two_lines, 3, 40)
+        );
+    }
+
+    /// A runaway paste must not take the frame: past the cap the query stops growing and
+    /// scrolls instead, so the candidate list keeps the rows below it whatever was pasted.
+    #[test]
+    fn a_query_past_the_cap_stops_growing_and_leaves_the_candidate_list_its_rows() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        type_lines(&mut palette, &actions, 20);
+
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 40, 20);
+
+        assert!(
+            row_text(&buf, 1 + QUERY_MAX_ROWS as u16, 40).contains(NO_MATCHES_MESSAGE),
+            "the list must begin exactly {QUERY_MAX_ROWS} rows below the query's own first \
+             row: {:?}",
+            row_text(&buf, 1 + QUERY_MAX_ROWS as u16, 40)
+        );
+    }
+
+    /// Scrolling rather than growing is only usable if the caret's own line is one of the
+    /// rows on screen: the window follows the cursor to either end of a long command.
+    #[test]
+    fn a_query_past_the_cap_scrolls_to_keep_the_cursors_own_line_on_screen() {
+        let actions = vec![action("reinstall", true)];
+        let theme = Theme::default();
+        let mut palette = ActionPalette::new();
+        type_lines(&mut palette, &actions, 20);
+
+        let at_end = draw_sized(&palette, &actions, &theme, 40, 20);
+        assert!(
+            row_text(&at_end, QUERY_MAX_ROWS as u16, 40).contains("line19"),
+            "the cursor's own last line must be the bottom query row: {:?}",
+            row_text(&at_end, QUERY_MAX_ROWS as u16, 40)
+        );
+
+        palette.move_cursor(Motion::LineStart);
+        let at_start = draw_sized(&palette, &actions, &theme, 40, 20);
+        assert!(
+            row_text(&at_start, 1, 40).contains("line0"),
+            "moving the cursor back to the first line must scroll it into view: {:?}",
+            row_text(&at_start, 1, 40)
+        );
+    }
+
+    /// The palette teaches its own keys on its own last interior row, the newline chord
+    /// among them: nothing else on screen names a key while the palette has the frame.
+    #[test]
+    fn the_palette_draws_its_own_footer_naming_the_newline_key_on_its_last_interior_row() {
+        let actions = vec![action("reinstall", true)];
+        let palette = ActionPalette::new();
+
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 60, 10);
+
+        let last_interior_row = row_text(&buf, 8, 60);
+        assert!(
+            last_interior_row.contains("alt-enter newline"),
+            "expected the newline hint on the palette's own footer row: {last_interior_row:?}"
+        );
+        assert!(
+            last_interior_row.contains("esc cancel"),
+            "expected the way out on the same row: {last_interior_row:?}"
         );
     }
 
@@ -1514,6 +1810,7 @@ mod tests {
                             actions: &actions,
                             count: Count::selection(3),
                             management_lines: &[],
+                            bindings: &BINDINGS_FOR_TESTS,
                         },
                         glyphs,
                     );
@@ -1559,6 +1856,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -1593,6 +1891,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(2),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -1650,6 +1949,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1678,6 +1978,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1716,6 +2017,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1765,6 +2067,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(3),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1835,6 +2138,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(12),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )
@@ -1875,6 +2179,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(2),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -1932,6 +2237,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(12),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -1974,6 +2280,7 @@ mod tests {
                         actions: &actions,
                         count: narrowed(8, 3, 1),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -2063,6 +2370,7 @@ mod tests {
                         actions: &[],
                         count: Count::selection(25),
                         management_lines: &lines,
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -2156,6 +2464,7 @@ mod tests {
                         actions: &[],
                         count: Count::selection(1),
                         management_lines: &lines,
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -2213,6 +2522,7 @@ mod tests {
                         actions: &actions,
                         count: Count::selection(2),
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 );
@@ -2347,6 +2657,33 @@ mod tests {
         draw_to_buffer_sized(palette, actions, theme, count, 40, 10)
     }
 
+    /// The palette drawn into a frame of the caller's own size, for the claims the 40x10
+    /// frame above is too small to make: the whole footer needs 55 columns, and the query's
+    /// own row cap needs more rows than a ten-row frame can give it.
+    fn draw_sized(
+        palette: &ActionPalette,
+        actions: &[ActionConfig],
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        draw_to_buffer_sized(palette, actions, theme, Count::selection(3), width, height)
+    }
+
+    /// Types `count` lines reading `line0`, `line1` and so on into `palette`, each separated
+    /// by the newline key rather than by a paste, so what is on screen came through the same
+    /// path a user's own keystrokes take.
+    fn type_lines(palette: &mut ActionPalette, actions: &[ActionConfig], count: usize) {
+        for index in 0..count {
+            if index > 0 {
+                palette.insert_newline(actions);
+            }
+            for c in format!("line{index}").chars() {
+                palette.type_char(c, actions);
+            }
+        }
+    }
+
     fn draw_to_buffer_sized(
         palette: &ActionPalette,
         actions: &[ActionConfig],
@@ -2368,6 +2705,7 @@ mod tests {
                         actions,
                         count,
                         management_lines: &[],
+                        bindings: &BINDINGS_FOR_TESTS,
                     },
                     &crate::glyphs::FULL,
                 )

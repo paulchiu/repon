@@ -84,6 +84,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | --- | --- |
 | any printable character | Text |
 | `Enter` | Apply the Filter, or run the highlighted entry. In the Filter line it **always** commits and never accepts a completion ([filter.md](filter.md)) |
+| `Alt+Enter` | Insert a newline (the ad hoc command field only) |
 | `Esc` | Cancel |
 | `Up`, `Ctrl+K` | Previous entry |
 | `Down`, `Ctrl+J` | Next entry |
@@ -190,7 +191,7 @@ crossterm reports an uppercase character with the SHIFT modifier set, so `R`, `G
 
 Shift+Tab is the one further exception: crossterm reports it as its own `KeyCode::BackTab`, with no SHIFT modifier set, rather than as `Tab` with SHIFT the way an uppercase letter arrives. It is matched as `BackTab` against NONE, and the table above writes it `Shift+Tab` for readability rather than `BackTab`, which is crossterm's own name and not this map's spelling for anything else.
 
-Alt chords (macOS Option, Meta elsewhere) arrive the same way Ctrl chords do, as the lowercase char with ALT set, and `input`'s two word motions are the only two the map binds. Unlike CONTROL, ALT does not take a character out of the printable set, so an Alt chord is text unless a row claims it first: `Alt+B` and `Alt+F` are word motions and every other Alt combination still types its letter. A `[keys]` value names one with the `alt-` prefix, as `ctrl-` names a Ctrl chord.
+Alt chords (macOS Option, Meta elsewhere) arrive the same way Ctrl chords do, as the lowercase char with ALT set, and `input` binds three of them: the two word motions and `Alt+Enter`. Unlike CONTROL, ALT does not take a character out of the printable set, so an Alt letter is text unless a row claims it first: `Alt+B` and `Alt+F` are word motions and every other Alt letter still types itself. `Alt+Enter` is not a letter, so it takes nothing printable away; it arrives as `KeyCode::Enter` with ALT set, which is a different chord from the bare `Enter` above it and never shadows it. A `[keys]` value names one with the `alt-` prefix, as `ctrl-` names a Ctrl chord.
 
 ## Esc
 
@@ -214,7 +215,11 @@ The management operations, `delete`, `ignore`, `unignore` and `sync`, keep the c
 
 ## The ad hoc command field
 
-The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it and `Ctrl+O` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state. There is no inline newline key: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, and Ctrl+J is the newline byte itself.
+The Action palette can take a command typed at the moment rather than one named in config. It accepts more than one line, so more than one command can run without typing each separately. Enter runs it, `Alt+Enter` inserts a newline at the cursor, and `Ctrl+O` opens it in `$EDITOR`, which is the same answer git already gives for a multi-line field, and which costs nothing because [0007](../adr/0007-launchers-are-argv-vectors.md)'s suspend-and-exec machinery already restores all five pieces of terminal state.
+
+`Alt+Enter` is the chord because the two obvious keys are not available: Shift+Enter and Ctrl+Enter do not exist without the kitty keyboard protocol, which this crate does not opt into, and Ctrl+J is the newline byte itself, indistinguishable from Enter on every terminal this crate targets. Alt is the modifier `input` already spends on `Alt+B` and `Alt+F`, and `Alt+Enter` is free in every context. Its one cost is a terminal that does not send meta at all, where Option+Enter arrives as a bare Enter and runs the command instead: `Ctrl+O` is the route that works everywhere, which is why the footer teaches it and keeps teaching it after the newline hint has gone.
+
+Rendering a multi-line command means the query row is no longer one row. The palette grows it one row per line and shrinks its own candidate list to match, capped at 8 rows however long the command is, so a runaway paste can take at most eight rows of the frame rather than all of it. Past the cap the query scrolls rather than growing, keeping the cursor's own line on screen. The cap is further clipped by the frame itself: the query never takes the row the footer owns, nor the last row the candidate list has left.
 
 What such a command does when it runs, how its lines gate, and what its output looks like are settled in [actions.md](actions.md), which makes it argv split with `shell-words` rather than a shell string, because [0007](../adr/0007-launchers-are-argv-vectors.md) puts the shell behind an explicit flag and an ad hoc command has no config entry in which to show one. This spec fixes only the keys that reach it.
 
@@ -275,13 +280,23 @@ The sort context's footer is 73 columns at full width. Its column hints are give
  10  esc cancel
 ```
 
-The other three are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), `enter run  ctrl-o editor  esc cancel` at 36 for a palette, and `y run  n cancel` at 15 for the confirm gate.
+The Action palette's own footer is 55 columns at full width, drawn on the palette's own last interior row rather than the frame's, since the palette takes the whole frame. `esc cancel` is pinned. Above it the drop order is discoverability cost read the same way rule 2 reads it: `alt-enter newline` goes first, because `ctrl-o editor` reaches the same multi-line command by a route that works on every terminal, then `ctrl-o editor`, then `enter run`. It degrades like this:
+
+```
+ 55  enter run  alt-enter newline  ctrl-o editor  esc cancel
+ 40  enter run  ctrl-o editor  esc cancel ...
+ 25  enter run  esc cancel ...
+ 14  esc cancel ...
+ 10  esc cancel
+```
+
+The other two are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), and `y run  n cancel` at 15 for the confirm gate.
 
 `o` itself is not in the list or detail footer. Both are already at their documented full widths with no room for a ninth hint, and `o` is a `global` binding, so the help overlay already lists it in its `global` section wherever it is open from. The column keys are taught by the menu's own footer at the one moment they mean anything.
 
 ## The help overlay
 
-Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`, then a legend naming what the `sync`, `base`, `dirty` and `state` glyphs mean ([layout-and-provenance.md](layout-and-provenance.md)). `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their footer already carries the three bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
+Generated from the same table, and carrying only Built bindings, exactly as the footer does. It shows the current context's bindings first, then `global`, then a legend naming what the `sync`, `base`, `dirty` and `state` glyphs mean ([layout-and-provenance.md](layout-and-provenance.md)). `?` opens it from every context except `input`, where every printable character has to be typeable. The input contexts earn that exemption because their own footer already carries the bindings a user would go looking for, and the rest are the arrow-key and readline reflexes they already have. This is the one place lazygit is not followed: its `?` carries a disabled reason that filters it out of the footer in popup contexts, so the escape hatch vanishes where a user is most lost.
 
 ### The help overlay is searchable, as a mode inside `overlay` rather than a switch to `input`
 
