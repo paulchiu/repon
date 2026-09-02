@@ -165,6 +165,8 @@ It stays a fetch rather than an `ls-remote` probe, because [default-branch.md](d
 
 A finished fetch starts a normal generation, so the new behind counts arrive through the same path as everything else.
 
+One repository's own fetch failure never stops the cycle: the rest still fetch. The cycle counts how many failed and surfaces the count as a Warning ([theming.md](theming.md)'s "Warnings and Notices"), never the underlying error text, since that text is arbitrary bytes from a remote. Each individual failure, with its path, still reaches `repon.log`.
+
 ## Configuration
 
 | key | default | meaning |

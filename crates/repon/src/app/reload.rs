@@ -350,6 +350,9 @@ impl App {
             // The new `Core` starts with no discovery warning of its own, so a warning the
             // old one already logged must not suppress logging a fresh one from this one.
             self.discovery_warning_logged = false;
+            // Same reasoning: the new `Core` starts with no periodic-fetch failures of its
+            // own, so the old one's already-logged set must not suppress a fresh one.
+            self.fetch_failures_logged = repon_core::FetchFailures::default();
         }
         // Only the branch above can change the visible row count (an unchanged bounds
         // rebuilds nothing), but calling this unconditionally costs nothing and keeps this

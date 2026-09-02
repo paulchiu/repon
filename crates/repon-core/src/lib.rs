@@ -92,6 +92,7 @@ mod wire;
 pub const FETCH_AVAILABLE: bool = cfg!(feature = "fetch");
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
+pub use core::FetchFailures;
 pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
