@@ -104,14 +104,14 @@ const FIRST_ENTITY_ROW: u16 = HEADER_ROW + 1;
 const CHILD_ROW_MARKER_WIDTH: u16 = 1;
 /// Columns of indent before a child row's own marker, so the row reads as nested under its
 /// parent.
-const CHILD_ROW_INDENT_WIDTH: u16 = 4;
+const CHILD_ROW_INDENT_WIDTH: u16 = 2;
 /// The single-space gap between a child row's marker and its own name text, the same gap
 /// width every other column boundary uses.
 const CHILD_ROW_GAP_WIDTH: u16 = GAP;
 /// Every column the name field spends on a child row before its own name text starts: the
 /// indent, the marker and the gap. `child_name_budget_matches_the_adrs_own_arithmetic` reads
-/// ADR 0020's own "28 minus 6 = 22 ... 40 minus 6 = 34" sentence at test time and checks this
-/// figure against it, rather than restating "6" as a second literal the ADR's own number
+/// ADR 0020's own "28 minus 4 = 24 ... 40 minus 4 = 36" sentence at test time and checks this
+/// figure against it, rather than restating "4" as a second literal the ADR's own number
 /// could drift from.
 const CHILD_ROW_PREFIX_WIDTH: u16 =
     CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
@@ -2496,11 +2496,11 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
-        // Indent (4) + marker (1) + gap (1) = 6 columns before the child's own name text
+        // Indent (2) + marker (1) + gap (1) = 4 columns before the child's own name text
         // starts, per `CHILD_ROW_PREFIX_WIDTH`; on a 140-column frame the name column is at
-        // its 40-column cap, so the child's own budget is 40 minus 6 = 34.
-        let expected = format!("{}{}", "b".repeat(33), glyphs.truncated);
-        assert_eq!(cell_text(buf, 11, entity_row_y(1), 34), expected);
+        // its 40-column cap, so the child's own budget is 40 minus 4 = 36.
+        let expected = format!("{}{}", "b".repeat(35), glyphs.truncated);
+        assert_eq!(cell_text(buf, 9, entity_row_y(1), 36), expected);
     }
 
     /// `branch` carries the same mark `name` does once a value overflows it: a branch cut
@@ -4409,8 +4409,8 @@ mod tests {
             "the top-level Repo row's name must start flush at the name column's own start"
         );
         assert_eq!(
-            cell_text(buf, name_x(buf), worktree_y, 4),
-            "    ",
+            cell_text(buf, name_x(buf), worktree_y, 2),
+            "  ",
             "a child row's own indent must leave the name column's own start blank"
         );
         let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
@@ -4429,6 +4429,31 @@ mod tests {
             ),
             "feature-worktree",
             "expected the child's own name text right after the marker and its gap"
+        );
+    }
+
+    /// A child row's indent is two columns, not four: enough to read as nested under its
+    /// parent without pushing every child name that much further into the name column.
+    #[test]
+    fn a_child_rows_indent_is_two_columns_before_its_marker() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (worktree_row, _) = find_entity_row(&snapshot, "feature-worktree");
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let worktree_y = entity_row_y(worktree_row);
+
+        assert_eq!(
+            cell_text(buf, name_x(buf), worktree_y, 2),
+            "  ",
+            "a child row's indent must leave exactly two columns blank before its marker"
+        );
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, name_x(buf) + 2, worktree_y, 1),
+            glyphs.child_row.to_string(),
+            "the marker must sit two columns in, not four"
         );
     }
 
