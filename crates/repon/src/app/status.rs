@@ -55,8 +55,11 @@ fn settle_document(
     flag_no_fetch: bool,
 ) -> Result<(SettledDocument, bool)> {
     let env_set = std::env::var("REPON_SET").ok();
+    // No remembered Set here, unlike the TUI's own startup: this subcommand is a scripted,
+    // one-shot read, and what it covers must not turn on which Set an interactive session
+    // happened to quit on.
     let active_set_config =
-        reload::resolve_startup_set(&config.document.sets, flag_set, env_set.as_deref())?;
+        reload::resolve_startup_set(&config.document.sets, flag_set, env_set.as_deref(), None)?;
     let active_set = ActiveSet::from_config(active_set_config);
 
     let core = Core::start(reload::core_spec(

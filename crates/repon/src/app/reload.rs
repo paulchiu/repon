@@ -55,9 +55,10 @@ impl ActiveSet {
 
 /// Resolves the Set active at startup, per
 /// [config.md](../../../../docs/spec/config.md#sets)'s "Selection order": `--set`/`-s`, then
-/// `REPON_SET`, then the first declared Set, which is already the implicit `all` Set when
-/// the file declared none (`document::load` leaves it there as `sets[0]`, so this function
-/// never special-cases "no Sets declared" itself).
+/// `REPON_SET`, then `remembered`, the Set the last session was viewing
+/// ([`crate::state::StateFile::active_set`]), then the first declared Set, which is already
+/// the implicit `all` Set when the file declared none (`document::load` leaves it there as
+/// `sets[0]`, so this function never special-cases "no Sets declared" itself).
 ///
 /// A name at either of the first two rungs that matches no declared Set is never substituted
 /// with another one: a Set bounds the work rather than merely how it looks
@@ -66,10 +67,15 @@ impl ActiveSet {
 /// constructs a `Tui`, the same shape [`document::load`] and [`keys::merge`] already give
 /// their own startup grades. Each message names its own source and value and points at
 /// `repon sets`, which needs no terminal and is not scoped by the selection that just failed.
+///
+/// `remembered` is the one rung that falls through instead: nobody named it this run, so a
+/// Set deleted from the config file since the last session is the same situation as one that
+/// vanishes under a reload, which degrades to the first declared Set rather than refusing.
 pub(crate) fn resolve_startup_set<'a>(
     sets: &'a [document::SetConfig],
     flag: Option<&str>,
     env: Option<&str>,
+    remembered: Option<&str>,
 ) -> Result<&'a document::SetConfig> {
     if let Some(name) = flag {
         return sets
@@ -82,6 +88,11 @@ pub(crate) fn resolve_startup_set<'a>(
             .iter()
             .find(|set| set.name.get_ref() == name)
             .ok_or_else(|| eyre!("REPON_SET `{name}` names no declared Set; see `repon sets`"));
+    }
+    if let Some(set) =
+        remembered.and_then(|name| sets.iter().find(|set| set.name.get_ref() == name))
+    {
+        return Ok(set);
     }
     Ok(sets
         .first()
@@ -691,7 +702,7 @@ mod tests {
     }
 
     // =====================================================================================
-    // Criterion 1: `resolve_startup_set`'s own four rungs, each proven independently of the
+    // Criterion 1: `resolve_startup_set`'s own five rungs, each proven independently of the
     // rung below it, per config.md's "Selection order".
     // =====================================================================================
 
@@ -712,7 +723,8 @@ mod tests {
     #[test]
     fn the_flag_beats_a_real_environment_value_and_the_first_declared_set() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, Some("gamma"), Some("beta")).expect("gamma exists");
+        let chosen =
+            resolve_startup_set(&sets, Some("gamma"), Some("beta"), None).expect("gamma exists");
         assert_eq!(chosen.name.get_ref(), "gamma");
     }
 
@@ -722,21 +734,65 @@ mod tests {
     #[test]
     fn the_environment_variable_beats_the_first_declared_set_when_no_flag_is_given() {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let chosen = resolve_startup_set(&sets, None, Some("beta")).expect("beta exists");
+        let chosen = resolve_startup_set(&sets, None, Some("beta"), None).expect("beta exists");
         assert_eq!(chosen.name.get_ref(), "beta");
     }
 
-    /// Rung 3: with neither a flag nor an environment value, the first declared Set wins,
+    /// Rung 3: the Set the last session was viewing beats the first declared Set, so a user
+    /// who tabbed away from the first Set and quit comes back to the one they left, with the
+    /// two rungs above it both empty.
+    #[test]
+    fn the_remembered_set_beats_the_first_declared_set_when_no_flag_and_no_environment_value_is_given()
+     {
+        let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
+        let chosen =
+            resolve_startup_set(&sets, None, None, Some("gamma")).expect("gamma is declared");
+        assert_eq!(chosen.name.get_ref(), "gamma");
+    }
+
+    /// The flag still wins over a remembered Set that would otherwise have resolved, so a
+    /// scripted `repon --set` is unaffected by whatever the last interactive session left.
+    #[test]
+    fn the_flag_beats_the_remembered_set() {
+        let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
+        let chosen = resolve_startup_set(&sets, Some("beta"), None, Some("gamma"))
+            .expect("beta is declared");
+        assert_eq!(chosen.name.get_ref(), "beta");
+    }
+
+    /// `REPON_SET` still wins over a remembered Set that would otherwise have resolved, with
+    /// no flag present to have taken precedence over either.
+    #[test]
+    fn the_environment_variable_beats_the_remembered_set() {
+        let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
+        let chosen = resolve_startup_set(&sets, None, Some("beta"), Some("gamma"))
+            .expect("beta is declared");
+        assert_eq!(chosen.name.get_ref(), "beta");
+    }
+
+    /// A remembered Set the file no longer declares falls through to the first declared Set
+    /// rather than exiting the way an unmatched flag or `REPON_SET` does: nobody asked for it
+    /// this run, so there is no name to refuse.
+    #[test]
+    fn a_remembered_set_that_is_no_longer_declared_falls_through_to_the_first_declared_set() {
+        let sets = vec![named_set("alpha"), named_set("beta")];
+        let chosen = resolve_startup_set(&sets, None, None, Some("deleted-since"))
+            .expect("a vanished remembered Set is not an error");
+        assert_eq!(chosen.name.get_ref(), "alpha");
+    }
+
+    /// Rung 4: with neither a flag nor an environment value, the first declared Set wins,
     /// proven against a document declaring more than one so "first" is a real claim about
     /// order rather than the only option available.
     #[test]
     fn the_first_declared_set_wins_with_no_flag_and_no_environment_value() {
         let sets = vec![named_set("alpha"), named_set("beta"), named_set("gamma")];
-        let chosen = resolve_startup_set(&sets, None, None).expect("a Set is always declared here");
+        let chosen =
+            resolve_startup_set(&sets, None, None, None).expect("a Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "alpha");
     }
 
-    /// Rung 4: with no Set declared at all, `document::load` is what leaves the implicit
+    /// Rung 5: with no Set declared at all, `document::load` is what leaves the implicit
     /// `all` Set as `sets[0]` ([`document::tests::a_missing_file_resolves_to_the_implicit_all_set`]
     /// proves that construction); this proves `resolve_startup_set` falls all the way
     /// through to it rather than panicking or defaulting to something else when the flag and
@@ -745,7 +801,7 @@ mod tests {
     fn the_implicit_set_wins_when_none_is_declared_and_neither_flag_nor_environment_is_given() {
         let loaded = document::load(Path::new("/does/not/exist/anywhere/repon-config.toml"))
             .expect("a missing file is not an error");
-        let chosen = resolve_startup_set(&loaded.document.sets, None, None)
+        let chosen = resolve_startup_set(&loaded.document.sets, None, None, None)
             .expect("the implicit `all` Set is always declared here");
         assert_eq!(chosen.name.get_ref(), "all");
     }
@@ -757,7 +813,7 @@ mod tests {
     fn an_unmatched_flag_is_an_error_naming_the_flag_and_value_and_never_falls_through_to_a_real_environment_value()
      {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let err = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"))
+        let err = resolve_startup_set(&sets, Some("nonexistent"), Some("beta"), None)
             .expect_err("an unmatched --set must be an error, not a fallback");
         let message = err.to_string();
         assert!(
@@ -779,7 +835,7 @@ mod tests {
     #[test]
     fn an_unmatched_environment_variable_is_an_error_naming_the_variable_and_value() {
         let sets = vec![named_set("alpha"), named_set("beta")];
-        let err = resolve_startup_set(&sets, None, Some("nonexistent"))
+        let err = resolve_startup_set(&sets, None, Some("nonexistent"), None)
             .expect_err("an unmatched REPON_SET must be an error");
         let message = err.to_string();
         assert!(

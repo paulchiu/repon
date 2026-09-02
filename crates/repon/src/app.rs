@@ -370,9 +370,11 @@ pub struct App {
     bindings: BindingTable,
     /// The Set `self.core` is currently running over, tracked so `Action::ReloadConfig` and
     /// `Action::SwitchToSet` can tell whether it changed. Resolved at startup by
-    /// [`reload::resolve_startup_set`] (`--set`/`-s`, then `REPON_SET`, then the first
-    /// declared Set), and only ever moved afterwards by a reload's own fallback rule or by a
-    /// `1`-to-`9` Set switch.
+    /// [`reload::resolve_startup_set`] (`--set`/`-s`, then `REPON_SET`, then the Set
+    /// `state.toml` remembers, then the first declared Set), and only ever moved afterwards
+    /// by a reload's own fallback rule or by a `1`-to-`9` Set switch. Written back to
+    /// `state.toml` on quit ([`Self::persist_state`]), so a switch made mid-session is what
+    /// the next launch reopens.
     active_set: ActiveSet,
     /// The whole parsed document from the last load, kept so `Action::SwitchToSet` can look
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
@@ -509,10 +511,16 @@ impl App {
         );
 
         let env_set = std::env::var("REPON_SET").ok();
+        // `state.toml` is read again by `restore_session_state` below, once the Set this
+        // resolves has fixed the scope key that read is keyed on.
+        let remembered_set = state::load(&config.data_dir)
+            .active_set()
+            .map(str::to_string);
         let active_set_config = reload::resolve_startup_set(
             &config.document.sets,
             flag_set.as_deref(),
             env_set.as_deref(),
+            remembered_set.as_deref(),
         )?;
         let active_set = ActiveSet::from_config(active_set_config);
 
@@ -654,7 +662,9 @@ impl App {
 
     /// Writes this scope's whole session state to `state.toml`, leaving every other scope's
     /// own entry untouched: the checked rows by name, the committed Filter's own expression,
-    /// and the table's `RowOrder`, nothing `self.core` computed from git
+    /// and the table's `RowOrder`, plus the Set being viewed at the top level, which is what
+    /// [`reload::resolve_startup_set`] reopens the next run in. Nothing `self.core` computed
+    /// from git is written
     /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Called
     /// on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the same
     /// grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session is
@@ -669,6 +679,12 @@ impl App {
         };
         let mut file = state::load(&self.data_dir);
         file.set_scope(self.scope_key(), scope_state);
+        // A zero-config run has no Set to remember, and writing the implicit `all` would
+        // replace a configured run's own remembered Set with a name its config file most
+        // likely never declares.
+        if !self.zero_config {
+            file.set_active_set(self.active_set.name.clone());
+        }
         if let Err(err) = state::save(&self.data_dir, &file) {
             tracing::error!("could not write state.toml: {err:#}");
         }
@@ -11577,12 +11593,12 @@ refresh_all = "z""#,
         );
     }
 
-    /// Criterion 2: the written file holds only the Selection's names and the Filter's own
-    /// string, nothing `self.core` computed from git, checked against the whole file's
-    /// content rather than a round trip that would pass just as happily if a git-derived
-    /// field were also written.
+    /// Criterion 2: the written file holds only the Set being viewed, the Selection's names
+    /// and the Filter's own string, nothing `self.core` computed from git, checked against
+    /// the whole file's content rather than a round trip that would pass just as happily if
+    /// a git-derived field were also written.
     #[test]
-    fn persisting_writes_only_the_selection_names_the_filter_string_and_the_sort() {
+    fn persisting_writes_only_the_active_set_the_selection_names_the_filter_string_and_the_sort() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -11603,10 +11619,72 @@ refresh_all = "z""#,
             std::fs::read_to_string(state_dir.path().join("state.toml")).expect("read state.toml");
         assert_eq!(
             text.trim(),
-            "[test]\nselection = [\"repo-a\"]\nfilter = \"kind:worktree\"\n\n\
+            "active_set = \"test\"\n\n[test]\nselection = [\"repo-a\"]\n\
+             filter = \"kind:worktree\"\n\n\
              [test.sort.by]\ncolumn = \"dirty\"\ndirection = \"descending\"",
-            "expected exactly the Selection's names, the Filter string and the sort, nothing \
-             else: {text:?}"
+            "expected exactly the Set being viewed, the Selection's names, the Filter string \
+             and the sort, nothing else: {text:?}"
+        );
+    }
+
+    /// The Set being viewed comes back with the Selection and the Filter that were persisted
+    /// beside it: quitting on `personal` and relaunching resolves `personal`, not the first
+    /// declared Set the same document would otherwise have opened.
+    #[test]
+    fn the_set_last_viewed_is_the_one_a_relaunch_resolves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.active_set.name = "personal".to_string();
+        app.data_dir = state_dir.path().to_path_buf();
+        app.persist_state();
+
+        let declared = vec![
+            set_config("work", &root),
+            set_config("personal", &root),
+            set_config("archive", &root),
+        ];
+        let remembered = state::load(state_dir.path())
+            .active_set()
+            .map(str::to_string);
+        let chosen = reload::resolve_startup_set(&declared, None, None, remembered.as_deref())
+            .expect("personal is declared");
+
+        assert_eq!(
+            chosen.name.get_ref(),
+            "personal",
+            "expected the Set the last session quit on rather than the first declared one"
+        );
+    }
+
+    /// A zero-config run keys its scope by working directory and has no Set to remember, so
+    /// it must leave a configured run's own remembered Set alone rather than overwriting it
+    /// with the implicit `all` that names nothing in that user's config file.
+    #[test]
+    fn a_zero_config_run_leaves_a_configured_runs_remembered_set_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut configured = test_app(&root);
+        configured.active_set.name = "personal".to_string();
+        configured.data_dir = state_dir.path().to_path_buf();
+        configured.persist_state();
+
+        let mut zero_config = test_app(&root);
+        zero_config.zero_config = true;
+        zero_config.cwd = root.clone();
+        zero_config.data_dir = state_dir.path().to_path_buf();
+        zero_config.persist_state();
+
+        assert_eq!(
+            state::load(state_dir.path()).active_set(),
+            Some("personal"),
+            "a run with no Set to remember must not clear the one a configured run left"
         );
     }
 
