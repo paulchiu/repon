@@ -22,7 +22,7 @@ A nonzero step stands as a Warning, and that is a fifth standing condition rathe
 
 `on_refresh` naming an Action nothing declares is a load warning on the existing path, not an exit and not silence. Every other value in the file is still usable, so refusing to start would be out of proportion; and a hook that quietly never fires is the exact defect [0023](0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) rules out for a keybinding, a thing configured, accepted and inert with nothing said.
 
-[0028](0028-repon-writes-the-repo-entries-it-owns.md)'s bound stands untouched. `[[repo]]` is still the only table Repon writes, and `on_refresh` is hand-written like everything else in the file.
+[0028](0028-repon-writes-the-repo-entries-it-owns.md)'s bound stands untouched by this decision. That bound has since widened, in its own "Amended by #304", to the paths a `[[set]]`'s arrays name; `on_refresh` sits outside it either way, and is hand-written like everything else in the file.
 
 ## Consequences
 

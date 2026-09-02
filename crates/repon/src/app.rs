@@ -1971,13 +1971,12 @@ impl App {
     /// `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and
     /// still needs a rebuilt `Core`; Repon never writes it.
     ///
-    /// One thing the write does not reach, recorded here rather than worked around, because
-    /// closing it means changing a document this implements rather than owns. A deleted
-    /// Repo's row: no Generation starts here, so a row whose directory this just removed
-    /// keeps its last known values until the next one. `docs/spec/refresh.md`'s Triggers
-    /// table is a closed list and names no management trigger, so starting one here would be
-    /// a ninth trigger that document does not have; `r` is what settles those rows Vanished
-    /// today.
+    /// A row `delete` removed leaves the table here, through
+    /// [`repon_core::Core::dismiss`] over the report's own removed rows, rather than waiting
+    /// for a Generation to find it gone and mark it Vanished
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind"). No Generation starts here either way: `docs/spec/refresh.md`'s Triggers
+    /// table is a closed list naming no management trigger, and dismissing needs none.
     ///
     /// `before_sync` and `after_sync` are resolved here too, fresh from `self.document` and
     /// `self.active_set.name`, and run through
@@ -2032,8 +2031,14 @@ impl App {
         }
         self.core
             .record_own_work(operation.name(), &report.own_work_records());
+        for key in report.removed_keys() {
+            self.core.dismiss(&key);
+        }
         self.reload_config();
         // scan: management_write_reload end
+        // The rows just dropped shortened the table under a standing cursor, the same
+        // re-clamp [`Self::dismiss_vanished_at_cursor`] does after its own removal.
+        self.set_cursor(self.cursor);
         self.set_notice(report.summary());
     }
 
@@ -5428,6 +5433,95 @@ mod tests {
         assert_eq!(app.notice(), Some("delete: 1 done"));
     }
 
+    /// A row `delete` removed leaves the list in the same frame, with no refresh pressed and
+    /// no `d`: Repon caused the absence, so `Vanished`, which asks the user to acknowledge
+    /// one it did not cause, never applies to it
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_row_delete_removed_leaves_the_list_in_the_same_frame_with_no_refresh_and_no_dismissal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        init_repo(&root.join("repo-b"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        assert_eq!(
+            app.core.snapshot().entities.len(),
+            2,
+            "both rows are listed"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        let names: Vec<String> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["repo-b".to_string()],
+            "the deleted row is gone and the untouched one stays"
+        );
+        assert!(
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .all(|entity| entity.presence == Presence::Present),
+            "a row Repon deleted must never be left Vanished for the user to dismiss"
+        );
+    }
+
+    /// The other half: only the rows `delete` actually removed leave. A row the gate refused
+    /// still has a working tree on disk, so it stays listed with the receipt saying why.
+    #[test]
+    fn a_row_delete_refused_stays_in_the_list_beside_the_ones_it_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        write_gitmodules(&repo, "lib", "vendor/lib");
+        std::fs::create_dir_all(repo.join("vendor").join("lib")).expect("create submodule dir");
+        init_repo(&root.join("repo-b"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.document.show_submodules = true;
+        app.core.set_show_submodules(true);
+        for name in ["repo-b", "vendor/lib"] {
+            let key = app
+                .core
+                .snapshot()
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} is discovered"))
+                .key
+                .clone();
+            app.selection.toggle(key);
+        }
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        let mut names: Vec<String> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["repo-a".to_string(), "vendor/lib".to_string()],
+            "the refused row keeps its place, and so does the row nothing acted on"
+        );
+    }
+
     /// The Done-when itself, end to end and on screen: an `ignore` leaves a receipt the
     /// detail pane shows, naming the row by what Repon did to it. Nothing short of a rendered
     /// frame proves it, since a receipt written to the table that the pane never draws closes
@@ -5462,7 +5556,11 @@ mod tests {
     /// The other half of the Done-when: a row the gate refused gets a receipt of its own
     /// saying why, and no row carries an outcome that means something a child process did.
     /// Read off the table rather than the frame, because "no exit code anywhere" is a claim
-    /// about the receipt rather than about what fits on screen.
+    /// about the receipt rather than about what fits on screen. The row `delete` removed is
+    /// not read here at all: it left the table when the operation reported, and its receipt
+    /// went with it
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
     #[test]
     fn a_refused_row_leaves_a_receipt_saying_why_and_no_row_carries_a_child_processs_outcome() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5481,60 +5579,42 @@ mod tests {
         press_through_the_management_gate(&mut app, management::Operation::Delete);
 
         let entities = app.core.snapshot().entities;
-        let words = |name: &str| -> String {
-            let entity = entities
-                .iter()
-                .find(|entity| &*entity.name == name)
-                .unwrap_or_else(|| panic!("{name} is still a row"));
-            let receipt = entity
-                .last_action
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name} carries a receipt"));
-            assert!(
-                !receipt.not_applicable(),
-                "{name} was operated on, so it is not the excluded row Not applicable names"
-            );
-            assert_eq!(
-                &*receipt.label, "delete",
-                "{name}'s receipt names the operation"
-            );
-            receipt
-                .steps
-                .iter()
-                .map(|step| match &step.outcome {
-                    repon_core::StepOutcome::OwnWork(work) => work.said().to_string(),
-                    other => panic!("{name} carries a child process's outcome: {other:?}"),
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
+        assert!(
+            entities.iter().all(|entity| &*entity.name != "repo-a"),
+            "the row whose working tree went leaves the table, and its receipt with it"
+        );
+        let receipt = entities
+            .iter()
+            .find(|entity| &*entity.name == "vendor/lib")
+            .expect("the refused row is still listed")
+            .last_action
+            .clone()
+            .expect("the refused row carries a receipt");
+        assert!(
+            !receipt.not_applicable(),
+            "the run named it, so it is not the excluded row Not applicable names"
+        );
+        assert_eq!(&*receipt.label, "delete", "the receipt names the operation");
 
-        assert_eq!(
-            words("repo-a"),
-            "working tree removed, no `[[repo]]` entry of its own"
+        let words = receipt
+            .steps
+            .iter()
+            .map(|step| match &step.outcome {
+                repon_core::StepOutcome::OwnWork(work) => work.said().to_string(),
+                other => panic!("a management row carries a child process's outcome: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("refused, a Submodule's git dir lives in its parent"),
+            "the refused row says why, got {words:?}"
         );
         assert!(
-            words("vendor/lib").contains("refused, a Submodule's git dir lives in its parent"),
-            "the refused row says why, got {:?}",
-            words("vendor/lib")
-        );
-        let receipt_of = |name: &str| {
-            entities
-                .iter()
-                .find(|entity| &*entity.name == name)
-                .and_then(|entity| entity.last_action.clone())
-                .unwrap_or_else(|| panic!("{name} carries a receipt"))
-        };
-        assert!(
-            !receipt_of("repo-a").refused(),
-            "the Repo that was acted on did not refuse"
+            receipt.refused(),
+            "and reads as a refusal rather than a failure"
         );
         assert!(
-            receipt_of("vendor/lib").refused(),
-            "and the row the gate refused reads as a refusal rather than a failure"
-        );
-        assert!(
-            !receipt_of("vendor/lib").failed(),
+            !receipt.failed(),
             "a refusal never widens the row summary fold"
         );
     }
