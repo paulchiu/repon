@@ -298,14 +298,18 @@ pub struct App {
     /// stage: a Launcher hands off immediately.
     launcher_palette: Option<LauncherPalette>,
     /// `Some` between [`Self::choose_highlighted_launcher`] queuing a chosen Launcher and
-    /// [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, since
-    /// `handle_key_event` itself never holds one. Taken (never merely read) the moment it is
-    /// handed to [`Self::run_launcher_handoff`], so a handoff runs at most once per choice.
+    /// [`Self::run`]'s own loop draining it with a live [`Tui`] in hand:
+    /// [`Self::handle_key_event_with_tui`] forwards the `Tui` it may be holding to
+    /// [`Self::run_management`]'s own paint alone, so every other press, a chosen Launcher
+    /// included, still queues rather than drawing inline. Taken (never merely read) the
+    /// moment it is handed to [`Self::run_launcher_handoff`], so a handoff runs at most once
+    /// per choice.
     pending_launcher_handoff: Option<(EntityKey, Launcher)>,
     /// `true` between `Action::OpenInEditor` (`Ctrl+O`) firing inside the Action palette's
     /// ad hoc field and [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, the
     /// same reason `pending_launcher_handoff` is a flag rather than an immediate call:
-    /// `handle_key_event` never holds one. Cleared the moment it is handed to
+    /// `handle_key_event_with_tui` never hands its own `Tui`, when it is holding one, anywhere
+    /// but that one paint. Cleared the moment it is handed to
     /// [`Self::run_action_editor_handoff`], so a handoff runs at most once per press.
     pending_action_editor_handoff: bool,
     /// `true` between `Action::EditConfig` (`e`) firing and [`Self::run`]'s own loop draining
@@ -874,12 +878,14 @@ impl App {
         self.list.init(size)?;
 
         loop {
-            self.handle_events(&tui)?;
+            self.handle_events(&mut tui)?;
             self.handle_messages(&mut tui)?;
-            // `handle_key_event` never holds a `Tui`, so choosing a Launcher only queues the
-            // choice; this is the one point in the loop that drains it with a live `Tui` in
-            // hand, the same reason `should_suspend` below is a flag `handle_key_event` sets
-            // and only `run` itself acts on.
+            // Choosing a Launcher only queues the choice rather than running it inline, since
+            // `handle_key_event_with_tui`'s own `Tui` is on loan for the one press
+            // (`Self::run_management`'s paint) that actually needs it; this is the one point
+            // in the loop that drains the queued choice with a live `Tui` in hand, the same
+            // reason `should_suspend` below is a flag `handle_key_event_with_tui` sets and
+            // only `run` itself acts on.
             if let Some((entity_key, launcher)) = self.pending_launcher_handoff.take() {
                 self.run_launcher_handoff(&mut tui, &entity_key, &launcher);
             }
@@ -915,7 +921,7 @@ impl App {
         tui.exit()
     }
 
-    fn handle_events(&mut self, tui: &Tui) -> Result<()> {
+    fn handle_events(&mut self, tui: &mut Tui) -> Result<()> {
         let Some(event) = tui.next_event() else {
             // The event thread has gone; there is nothing left to drive the loop.
             self.should_quit = true;
@@ -927,7 +933,12 @@ impl App {
             Event::Resize(columns, rows) => {
                 self.message_tx.send(Message::Resize(columns, rows))?;
             }
-            Event::Key(key) => self.handle_key_event(key)?,
+            // The one key press that can start blocking work of its own
+            // (`Self::run_management`, over `y` on a built-in's confirm gate) needs a live
+            // `Tui` in hand to paint its own gate-down frame before that work starts, so this
+            // is the one event handed a mutable one rather than [`Self::handle_key_event`]'s
+            // own `None`.
+            Event::Key(key) => self.handle_key_event_with_tui(key, Some(tui))?,
             Event::Paste(ref text) => self.handle_paste_event(text),
             Event::FocusGained => self.on_focus_gained(),
             Event::Error => self
@@ -939,6 +950,16 @@ impl App {
             self.message_tx.send(message)?;
         }
         Ok(())
+    }
+
+    /// Every test's own entry point: [`Self::handle_key_event_with_tui`] with no live terminal
+    /// to hand a management run for painting its own gate-down frame, which the confirm
+    /// gate's `y` alone ever asks for. [`Self::handle_events`] is production's one caller of
+    /// the `tui`-carrying method directly, since it is the one place a live `Tui` exists to
+    /// pass.
+    #[cfg(test)]
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        self.handle_key_event_with_tui(key, None)
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
@@ -981,7 +1002,7 @@ impl App {
     /// always `List` or `Detail` ([`Self::focus`]'s own doc comment), through
     /// `dispatch(List | Detail, key)` ([`keys::BindingTable::dispatch`] never consults those
     /// three contexts for either).
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_key_event_with_tui(&mut self, key: KeyEvent, tui: Option<&mut Tui>) -> Result<()> {
         // A Notice takes the status row from the warning slot, so one that outlives the press
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
@@ -1075,7 +1096,7 @@ impl App {
         }
 
         if self.action_palette.is_some() {
-            self.handle_action_palette_key(key);
+            self.handle_action_palette_key(key, tui);
             return Ok(());
         }
 
@@ -1123,8 +1144,9 @@ impl App {
                 }
                 None
             }
-            // `handle_key_event` never holds a `Tui`, so this only queues the handoff; `run`
-            // drains `pending_config_editor_handoff` with one in hand, the same shape
+            // `handle_key_event_with_tui`'s own `Tui`, when it is holding one, never reaches
+            // this arm, so this only queues the handoff; `run` drains
+            // `pending_config_editor_handoff` with one in hand, the same shape
             // `pending_action_editor_handoff` and `pending_launcher_handoff` already take.
             // Gated the same way `Ctrl+R` is: the handoff ends in the identical
             // `reload_config` call, which can rebuild `self.core` outright and must never
@@ -1552,7 +1574,7 @@ impl App {
     /// `AcceptCompletion` (`Tab`) stays inert here permanently, not merely until this ticket:
     /// keybindings.md scopes `Tab`'s completion-accept to the Filter line alone, and this
     /// palette has no completion list of its own.
-    fn handle_action_palette_key(&mut self, key: KeyEvent) {
+    fn handle_action_palette_key(&mut self, key: KeyEvent, tui: Option<&mut Tui>) {
         let Some(palette) = &self.action_palette else {
             return;
         };
@@ -1573,7 +1595,20 @@ impl App {
                         self.start_action(spec);
                     }
                     if let Some(operation) = management {
-                        self.run_management(operation);
+                        // `tui` paints the gate coming down before `run_management`'s own
+                        // blocking work starts; a test with none still gets the gate closed
+                        // and the running Notice set, just no live terminal to draw them to.
+                        self.run_management(operation, |app| {
+                            let Some(tui) = tui else {
+                                return;
+                            };
+                            if let Err(err) = app.render(tui) {
+                                tracing::error!(
+                                    "could not paint the frame before `{}` began: {err}",
+                                    operation.name()
+                                );
+                            }
+                        });
                     }
                     self.close_action_palette();
                 }
@@ -1853,8 +1888,9 @@ impl App {
     /// Closes the palette and queues the choice in `self.pending_launcher_handoff` for
     /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
     /// ([`Self::run_launcher_handoff`] is what actually calls
-    /// [`Self::around_entity_handoff`]): `handle_key_event` itself never holds one, the same
-    /// reason `Action::Suspend` only sets `self.should_suspend` here and leaves the real
+    /// [`Self::around_entity_handoff`]): the `Tui` `handle_key_event_with_tui` may be holding
+    /// never reaches this method, the same reason `Action::Suspend` only sets
+    /// `self.should_suspend` here and leaves the real
     /// `tui.suspend()` call to `Self::run`. A missing cursor (an empty table) or an empty
     /// match list leaves the palette open and untouched, the same as
     /// [`Self::choose_highlighted_action`] does for a query matching nothing.
@@ -2094,7 +2130,13 @@ impl App {
     /// that keystroke and never from a Generation, the same restriction
     /// [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)
     /// fixes for `on_refresh`.
-    fn run_management(&mut self, operation: management::Operation) {
+    ///
+    /// `paint` runs once the gate is down and the running Notice is up, but before any of the
+    /// blocking work below: a live `Tui` draw from [`Self::handle_events`] in production, a
+    /// no-op everywhere else. `delete`'s own worktree walk and hooks can take seconds, and the
+    /// confirm gate is the worst frame to leave standing through that, since it still reads as
+    /// a question a user might answer twice.
+    fn run_management(&mut self, operation: management::Operation, paint: impl FnOnce(&mut Self)) {
         // scan: management_write_reload begin -- criterion 8: everything between this pair is
         // what a management write does after the gate is accepted, and the test over this
         // region asserts it reaches config through `reload_config` and touches no in-memory
@@ -2111,6 +2153,9 @@ impl App {
             );
             return;
         }
+        self.action_palette = None;
+        self.set_notice(management::running_notice(operation, plan.eligible_count()));
+        paint(self);
         let before_sync_hook = self
             .before_sync_action()
             .map(crate::action_palette::to_action_spec);
@@ -5454,6 +5499,50 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// `run_management`'s own paint hook, the seam a live `Tui` (in `App::run`) or nothing
+    /// (every other caller) is handed through: it must run once the gate is already down and
+    /// the running Notice already up, and it must run before `management::run` does anything
+    /// to disk. A hook that fires late, or fires against a gate still open, fails this the
+    /// same way a real terminal left showing the stale gate for the whole run would.
+    #[test]
+    fn the_gate_closes_and_a_running_notice_is_set_before_the_blocking_delete_starts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app(&root);
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        assert!(
+            app.action_palette.is_some(),
+            "the fixture must open the gate before the hook can be asked to close it"
+        );
+
+        let mut painted = false;
+        app.run_management(management::Operation::Delete, |app| {
+            painted = true;
+            assert!(
+                app.action_palette.is_none(),
+                "the gate must already be closed by the time the frame paints"
+            );
+            assert_eq!(
+                app.notice(),
+                Some("delete: running on 1 repos"),
+                "the screen must already say what is about to run"
+            );
+            assert!(
+                repo.exists(),
+                "the paint must happen before the blocking delete, not after it"
+            );
+        });
+
+        assert!(painted, "run_management must call its own paint hook");
+        assert!(
+            !repo.exists(),
+            "the run still deletes the tree once painted"
+        );
     }
 
     /// The whole gesture, end to end through the real key path: `m`, `Enter`, `y`, and then a
