@@ -2596,20 +2596,55 @@ mod tests {
         &before[block_start..]
     }
 
-    /// Refresh, fetch, auto_update and sync name four different things (GLOSSARY.md,
-    /// docs/spec/config.md's "Refresh, fetch and auto-update"), so the comment above the
-    /// block that declares three of them must not let a future edit split them apart
-    /// without naming the fourth, the built-in sync action, that sits beside them.
+    /// The block's own prose, with any line carrying the spec URL removed, so a term
+    /// check can't be satisfied by the link's anchor text instead of the explanation.
+    fn strip_link_lines(block: &str) -> String {
+        block
+            .lines()
+            .filter(|line| !line.contains("http"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The comment above [refresh] must keep naming all four of refresh, fetch,
+    /// auto_update and sync so a future edit cannot drop one silently.
     #[test]
     fn the_refresh_fetch_and_auto_update_block_is_preceded_by_a_comment_naming_all_four_terms() {
-        let block = comment_block_immediately_above(annotated_example(), "[refresh]");
+        let prose = strip_link_lines(comment_block_immediately_above(
+            annotated_example(),
+            "[refresh]",
+        ));
 
         for term in ["refresh", "fetch", "auto_update", "sync"] {
             assert!(
-                block.contains(term),
-                "the comment above [refresh] does not mention `{term}`: {block}"
+                prose.contains(term),
+                "the comment above [refresh] does not mention `{term}` outside its link: {prose}"
             );
         }
+    }
+
+    /// `sync` names two different things here (GLOSSARY.md's Cell and the built-in
+    /// Management action), so naming the bare word once is not enough: the comment must
+    /// name both senses, not just the one a stray edit happens to leave behind.
+    #[test]
+    fn the_comment_distinguishes_the_sync_action_from_the_sync_cell() {
+        let prose = strip_link_lines(comment_block_immediately_above(
+            annotated_example(),
+            "[refresh]",
+        ));
+
+        assert!(
+            prose.matches("sync").count() >= 2,
+            "the comment names `sync` only once, not both its senses: {prose}"
+        );
+        assert!(
+            prose.contains("action"),
+            "the comment does not name the sync action: {prose}"
+        );
+        assert!(
+            prose.contains("Cell"),
+            "the comment does not name the sync Cell as a separate thing: {prose}"
+        );
     }
 
     /// The comment's link must survive a heading rename: if "## Refresh, fetch and
