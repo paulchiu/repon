@@ -51,6 +51,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 | `glyphs` | `"full"` or `"ascii"` | `"ascii"` on `TERM=linux`, `"full"` otherwise | The vetted glyph set; describes the terminal, not taste |
 | `show_worktrees` | bool | `true` | Whether Worktrees are rows |
 | `show_submodules` | bool | `false` | Whether Submodules are rows, probed and polled ([0009](../adr/0009-worktree-state-model.md) hides them). It narrows the view rather than bounding the work, since they are always discovered ([discovery.md](discovery.md)) |
+| `advance_on_toggle` | bool | `false` | Whether `space` moves the cursor to the next row after toggling this one's Selection ([keybindings.md](keybindings.md)'s `space` paragraph). Governs `space` alone; `v`'s range anchor, `a` and `A` are untouched. On the last row there is nothing to advance to, so the cursor stays put: nothing else in the list wraps |
 | `notice_timeout` | humantime string | `"3s"` | How long a Notice stays on the status row ([theming.md](theming.md)). `"0s"` turns the timer off, not Notices: the next keypress or a replacement still clears one. There is no key that disables Notices, since a refusal nobody is told about is the defect [0023](../adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) exists to remove |
 | `on_refresh` | string | unset | Names one declared `[[action]]` to run after a Refresh the user asked for, `r` and `R` alone ([actions.md](actions.md)'s "The refresh hook", [0029](../adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)). A bare scalar rather than a table, since it is about the whole program and names one thing. It fires unattended on that keypress with no confirm gate, whatever the named Action's own `confirm` says, so an Action that destroys anything does not belong in it |
 
@@ -242,7 +243,7 @@ Checked at load, each a warning rather than an exit:
 
 Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). There is no file watcher. Because that keystroke can change the keyboard itself, the footer and the help overlay are derived from the binding table rather than written as strings; [keybindings.md](keybindings.md) carries the rule. `e` reloads the same way, after handing the resolved config file to `$EDITOR` and writing back whatever it returns; [keybindings.md](keybindings.md#editing-configtoml) owns that handoff.
 
-`theme`, `glyphs`, the two `show_` keys, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`'s `exclude`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. `[[repo]]` is split, and only `exclude` is on that list: `exclude` decides only whether an operation may reach a row that is discovered and listed either way, so it needs nothing rebuilt, where `default_branch` is a probe input and reaches the session it was written in only through a restart. [repo-management.md](repo-management.md)'s "Writing config" carries the reasoning. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in a Notice, and the status row's first item then carries the fallback's name for as long as it is active. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
+`theme`, `glyphs`, the two `show_` keys, `advance_on_toggle`, `notice_timeout`, `[[launcher]]`, `[[action]]`, `[[repo]]`'s `exclude`, `[refresh]`, `[fetch]` and `[auto_update]` re-apply immediately. `[[repo]]` is split, and only `exclude` is on that list: `exclude` decides only whether an operation may reach a row that is discovered and listed either way, so it needs nothing rebuilt, where `default_branch` is a probe input and reaches the session it was written in only through a restart. [repo-management.md](repo-management.md)'s "Writing config" carries the reasoning. A change to any Set's `roots` or globs discards discovery and starts a fresh Generation, so the rows go Loading and refill. If the active Set no longer exists after a reload, Repon falls back to the first declared Set and says so in a Notice, and the status row's first item then carries the fallback's name for as long as it is active. This is deliberately not the startup grade above: the terminal is already claimed, the user is at the keyboard and is told, and the alternative is tearing down work in flight ([0025](../adr/0025-a-name-that-bounds-the-work-is-never-substituted.md)).
 
 Paths that came from a flag or the environment are fixed for the process, since re-resolving them mid-session would move the file just edited.
 
@@ -260,6 +261,8 @@ glyphs = "full"
 # Worktrees are rows too; Submodules stay hidden.
 show_worktrees = true
 show_submodules = false
+
+# advance_on_toggle = false  # true also moves the cursor down after space checks a row
 
 # notice_timeout = "3s"      # "0s" turns the timer off, not Notices
 

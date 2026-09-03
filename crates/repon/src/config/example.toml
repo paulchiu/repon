@@ -6,6 +6,8 @@ glyphs = "full"
 show_worktrees = true
 show_submodules = false
 
+# advance_on_toggle = false  # true also moves the cursor down after space checks a row
+
 # notice_timeout = "3s"      # "0s" turns the timer off, not Notices
 
 # One declared action runs after a refresh you asked for: `r` and `R`, never the
