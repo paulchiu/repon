@@ -1760,6 +1760,12 @@ mod tests {
             row_text(&at_end, QUERY_MAX_ROWS as u16, 40)
         );
 
+        // `LineStart` only reaches the current line's own start (issue #318), so walking back
+        // to line0 crosses one newline per step, the same as a user holding the chord down.
+        for _ in 1..20 {
+            palette.move_cursor(Motion::LineStart);
+            palette.move_cursor(Motion::Left);
+        }
         palette.move_cursor(Motion::LineStart);
         let at_start = draw_sized(&palette, &actions, &theme, 40, 20);
         assert!(

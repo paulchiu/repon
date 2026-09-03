@@ -153,8 +153,8 @@ impl EditBuffer {
             }
             Motion::WordLeft => self.word_start_before_cursor(),
             Motion::WordRight => self.word_end_after_cursor(),
-            Motion::LineStart => 0,
-            Motion::LineEnd => self.text.len(),
+            Motion::LineStart => self.line_start_before_cursor(),
+            Motion::LineEnd => self.line_end_after_cursor(),
         };
     }
 
@@ -181,6 +181,23 @@ impl EditBuffer {
     pub(crate) fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
         self.text.replace_range(start..self.cursor, replacement);
         self.cursor = start + replacement.len();
+    }
+
+    /// Where [`Motion::LineStart`] lands: the byte right after the nearest newline before the
+    /// cursor, or `0` when there is none. `\n` is one byte, so that position is already on a
+    /// character boundary whatever precedes or follows it.
+    fn line_start_before_cursor(&self) -> usize {
+        self.before_cursor()
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    /// Where [`Motion::LineEnd`] lands: the nearest newline at or after the cursor, or the
+    /// buffer's own end when there is none.
+    fn line_end_after_cursor(&self) -> usize {
+        self.after_cursor()
+            .find('\n')
+            .map_or(self.text.len(), |index| self.cursor + index)
     }
 
     /// Where the word before the cursor starts, whitespace between the two skipped first:
@@ -408,14 +425,64 @@ mod tests {
         assert!(buffer.as_str().is_char_boundary(buffer.cursor()));
     }
 
+    /// A single line is the buffer's own two ends, so the ad hoc command field's only
+    /// multi-line case is the one this suite has to add, not the one it has to change.
     #[test]
-    fn the_line_start_and_line_end_motions_land_on_the_buffers_own_two_ends() {
+    fn on_a_single_line_buffer_line_start_and_line_end_still_land_on_its_own_two_ends() {
         let mut buffer = buffer("café\u{2003}naïve");
         buffer.move_cursor(Motion::LineStart);
         assert_eq!(buffer.cursor(), 0);
         assert_eq!(buffer.after_cursor(), "café\u{2003}naïve");
         buffer.move_cursor(Motion::LineEnd);
         assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    /// The case #308's multi-line field made possible: a cursor on a middle line lands after
+    /// that line's own preceding newline and before its own following one, not at either end
+    /// of the whole buffer.
+    #[test]
+    fn on_a_multi_line_buffer_line_start_and_line_end_land_on_the_current_lines_own_two_ends() {
+        let mut buffer = buffer("alpha\nbeta café\nnaïve gamma");
+        for _ in 0.." naïve gamma".chars().count() {
+            buffer.move_cursor(Motion::Left);
+        }
+        assert_eq!(buffer.before_cursor(), "alpha\nbeta café");
+
+        buffer.move_cursor(Motion::LineStart);
+        assert_eq!(buffer.before_cursor(), "alpha\n");
+        assert!(buffer.as_str().is_char_boundary(buffer.cursor()));
+
+        buffer.move_cursor(Motion::LineEnd);
+        assert_eq!(buffer.before_cursor(), "alpha\nbeta café");
+        assert!(buffer.as_str().is_char_boundary(buffer.cursor()));
+    }
+
+    /// The last line has no following newline to land before, so `LineEnd` falls back to the
+    /// buffer's own end exactly as it does on a single-line buffer.
+    #[test]
+    fn line_end_on_the_last_line_falls_back_to_the_buffers_own_end() {
+        let mut buffer = buffer("alpha\nbeta\ngamma");
+        for _ in 0.."ma".len() {
+            buffer.move_cursor(Motion::Left);
+        }
+        assert_eq!(buffer.before_cursor(), "alpha\nbeta\ngam");
+
+        buffer.move_cursor(Motion::LineEnd);
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    /// The first line has no preceding newline to land after, so `LineStart` falls back to
+    /// the buffer's own start exactly as it does on a single-line buffer.
+    #[test]
+    fn line_start_on_the_first_line_falls_back_to_the_buffers_own_start() {
+        let mut buffer = buffer("alpha\nbeta\ngamma");
+        for _ in 0.."pha\nbeta\ngamma".len() {
+            buffer.move_cursor(Motion::Left);
+        }
+        assert_eq!(buffer.before_cursor(), "al");
+
+        buffer.move_cursor(Motion::LineStart);
+        assert_eq!(buffer.cursor(), 0);
     }
 
     #[test]
