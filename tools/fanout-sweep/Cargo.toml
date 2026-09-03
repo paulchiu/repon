@@ -18,4 +18,8 @@ gix = { version = "0.87.1", default-features = false, features = [
     "status",
     "dirwalk",
 ] }
+# `getrusage(2)` for the peak-RSS column the `landing` sweep reports: an object cache is a
+# time-against-memory trade, so a run that prints only wall clock cannot support the
+# decision. Same version repon-core pins.
+libc = "0.2.189"
 rayon = "1.12.0"

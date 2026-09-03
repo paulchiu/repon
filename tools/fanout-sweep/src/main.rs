@@ -20,6 +20,7 @@
 //!   hand or reusing across several `real`-style runs without rebuilding it.
 
 mod corpus;
+mod landing;
 mod probe;
 mod rng;
 mod stats;
@@ -38,6 +39,9 @@ struct Config {
     pool_width: usize,
     thread_limit: Option<usize>,
     contend: usize,
+    /// gix's decoded-object cache size in bytes for every handle this cell opens, or
+    /// `None` to leave it off, which is what production does today.
+    cache_limit: Option<usize>,
 }
 
 impl std::fmt::Display for Config {
@@ -48,8 +52,11 @@ impl std::fmt::Display for Config {
         };
         write!(
             f,
-            "width={} thread_limit={} contend={}",
-            self.pool_width, limit, self.contend
+            "width={} thread_limit={} contend={} cache={}",
+            self.pool_width,
+            limit,
+            self.contend,
+            describe_cache(self.cache_limit)
         )
     }
 }
@@ -98,7 +105,7 @@ fn run_once(paths: &[PathBuf], config: Config) -> (Duration, Vec<Duration>) {
     let durations: Vec<Duration> = pool.install(|| {
         paths
             .par_iter()
-            .map(|path| probe::probe_entity_task(path, config.thread_limit))
+            .map(|path| probe::probe_entity_task(path, config.thread_limit, config.cache_limit))
             .collect()
     });
     let wall = start.elapsed();
@@ -131,10 +138,11 @@ fn run_config(
 
 fn print_header() {
     println!(
-        "{:<8} {:<12} {:<8} | {:>10} {:>10} {:>10} | {:>9} {:>9} {:>9} {:>9}",
+        "{:<8} {:<12} {:<8} {:<8} | {:>10} {:>10} {:>10} | {:>9} {:>9} {:>9} {:>9}",
         "width",
         "thread_lim",
         "contend",
+        "cache",
         "wall_med",
         "wall_min",
         "wall_max",
@@ -151,10 +159,11 @@ fn print_row(config: Config, wall: &stats::WallStats, entity: &stats::EntityStat
         None => "none".to_string(),
     };
     println!(
-        "{:<8} {:<12} {:<8} | {:>10?} {:>10?} {:>10?} | {:>9?} {:>9?} {:>9?} {:>9?}",
+        "{:<8} {:<12} {:<8} {:<8} | {:>10?} {:>10?} {:>10?} | {:>9?} {:>9?} {:>9?} {:>9?}",
         config.pool_width,
         limit,
         config.contend,
+        describe_cache(config.cache_limit),
         wall.median,
         wall.min,
         wall.max,
@@ -167,7 +176,7 @@ fn print_row(config: Config, wall: &stats::WallStats, entity: &stats::EntityStat
 
 fn write_csv(out: &Path, rows: &[(Config, stats::WallStats, stats::EntityStats)]) {
     let mut body = String::from(
-        "pool_width,thread_limit,contend,repeats,wall_median_ms,wall_min_ms,wall_max_ms,entity_samples,entity_p50_ms,entity_p90_ms,entity_max_ms,entity_min_ms,entity_mean_ms\n",
+        "pool_width,thread_limit,contend,cache_limit,repeats,wall_median_ms,wall_min_ms,wall_max_ms,entity_samples,entity_p50_ms,entity_p90_ms,entity_max_ms,entity_min_ms,entity_mean_ms\n",
     );
     for (config, wall, entity) in rows {
         let limit = match config.thread_limit {
@@ -175,10 +184,11 @@ fn write_csv(out: &Path, rows: &[(Config, stats::WallStats, stats::EntityStats)]
             None => "none".to_string(),
         };
         body.push_str(&format!(
-            "{},{},{},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+            "{},{},{},{},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
             config.pool_width,
             limit,
             config.contend,
+            config.cache_limit.unwrap_or(0),
             wall.runs,
             wall.median.as_secs_f64() * 1000.0,
             wall.min.as_secs_f64() * 1000.0,
@@ -192,6 +202,32 @@ fn write_csv(out: &Path, rows: &[(Config, stats::WallStats, stats::EntityStats)]
         ));
     }
     std::fs::write(out, body).unwrap_or_else(|error| panic!("write {}: {error}", out.display()));
+}
+
+/// Renders a cache limit the way the grid's own column wants it: `off` for the
+/// production default, otherwise a mebibyte figure, since every cap swept is a whole
+/// number of them.
+fn describe_cache(cache_limit: Option<usize>) -> String {
+    match cache_limit {
+        None => "off".to_string(),
+        Some(bytes) => format!("{}m", bytes / (1024 * 1024)),
+    }
+}
+
+/// Parses the cache axis: `off` (or `0`) leaves gix's object cache unset, the production
+/// default; anything else is a mebibyte count, since a byte-exact cap is not a thing this
+/// sweep can resolve and naming one would imply a precision the measurement does not have.
+fn parse_cache_limits(s: &str) -> Vec<Option<usize>> {
+    s.split(',')
+        .map(|p| {
+            let p = p.trim().trim_end_matches(['m', 'M']);
+            if p.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            let mib: usize = p.parse().expect("integer mebibyte cache limit or 'off'");
+            (mib > 0).then(|| mib * 1024 * 1024)
+        })
+        .collect()
 }
 
 fn parse_widths(s: &str) -> Vec<usize> {
@@ -216,6 +252,7 @@ fn parse_thread_limits(s: &str) -> Vec<Option<usize>> {
 struct SweepArgs {
     widths: Vec<usize>,
     thread_limits: Vec<Option<usize>>,
+    cache_limits: Vec<Option<usize>>,
     repeats: usize,
     contend: Vec<usize>,
     out: Option<PathBuf>,
@@ -224,6 +261,7 @@ struct SweepArgs {
 fn parse_sweep_args(args: &[String]) -> SweepArgs {
     let mut widths = vec![1, 2, 4, 8, 12, 18, 36];
     let mut thread_limits = vec![Some(1), Some(2), Some(4), None];
+    let mut cache_limits = vec![None];
     let mut repeats = 3;
     let mut contend = vec![0];
     let mut out = None;
@@ -236,6 +274,10 @@ fn parse_sweep_args(args: &[String]) -> SweepArgs {
             }
             "--thread-limits" => {
                 thread_limits = parse_thread_limits(&args[i + 1]);
+                i += 2;
+            }
+            "--cache-limits" => {
+                cache_limits = parse_cache_limits(&args[i + 1]);
                 i += 2;
             }
             "--repeats" => {
@@ -256,6 +298,7 @@ fn parse_sweep_args(args: &[String]) -> SweepArgs {
     SweepArgs {
         widths,
         thread_limits,
+        cache_limits,
         repeats,
         contend,
         out,
@@ -268,14 +311,17 @@ fn run_sweep(paths: &[PathBuf], args: &SweepArgs) {
     for &contend in &args.contend {
         for &pool_width in &args.widths {
             for &thread_limit in &args.thread_limits {
-                let config = Config {
-                    pool_width,
-                    thread_limit,
-                    contend,
-                };
-                let (wall, entity) = run_config(paths, config, args.repeats);
-                print_row(config, &wall, &entity);
-                rows.push((config, wall, entity));
+                for &cache_limit in &args.cache_limits {
+                    let config = Config {
+                        pool_width,
+                        thread_limit,
+                        contend,
+                        cache_limit,
+                    };
+                    let (wall, entity) = run_config(paths, config, args.repeats);
+                    print_row(config, &wall, &entity);
+                    rows.push((config, wall, entity));
+                }
             }
         }
     }
@@ -346,10 +392,105 @@ fn find_git_repos(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether `path`'s repository carries a commit-graph, read through its own `.git`
+/// (which is a file, not a directory, for a linked worktree or a submodule checkout).
+fn has_commit_graph(path: &Path) -> bool {
+    let Ok(repo) = gix::open(path) else {
+        return false;
+    };
+    let info = repo.common_dir().join("objects").join("info");
+    info.join("commit-graph").exists() || info.join("commit-graphs").is_dir()
+}
+
+fn median_depth(eligible: &[landing::Eligible]) -> usize {
+    let mut depths: Vec<usize> = eligible.iter().map(|e| e.depth).collect();
+    depths.sort_unstable();
+    depths.get(depths.len() / 2).copied().unwrap_or(0)
+}
+
+/// Peak resident set size for this process so far, in bytes. `ru_maxrss` is a high-water
+/// mark that never falls, so it is read once per cell and reported as a delta against the
+/// cell before it; that makes it meaningful only for a grid run in increasing-cache order,
+/// which [`run_landing_sweep`] is.
+fn peak_rss_bytes() -> u64 {
+    // SAFETY: `getrusage` writes into a fully owned, zeroed `rusage` and reads nothing
+    // else; the only failure mode is a negative return, which leaves the zeroes in place.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return 0;
+        }
+        // macOS reports bytes, Linux kibibytes.
+        if cfg!(target_os = "macos") {
+            usage.ru_maxrss as u64
+        } else {
+            (usage.ru_maxrss as u64) * 1024
+        }
+    }
+}
+
+/// One pass of the patch-equivalence phase over `eligible` at `config`, on a dedicated
+/// pool, mirroring [`run_once`]'s own shape for the cheap phases.
+fn run_landing_once(eligible: &[landing::Eligible], config: Config) -> (Duration, Vec<Duration>) {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.pool_width)
+        .build()
+        .expect("build the landing sweep's own pool");
+    let start = Instant::now();
+    let durations: Vec<Duration> = pool.install(|| {
+        eligible
+            .par_iter()
+            .map(|entity| landing::landing_task(entity, config.cache_limit))
+            .collect()
+    });
+    (start.elapsed(), durations)
+}
+
+/// Sweeps the patch-equivalence phase over the cache axis (and pool width, held at the
+/// sweep's own widths), reporting wall clock, per-entity percentiles and the peak-RSS
+/// high-water mark each cell left behind.
+fn run_landing_sweep(eligible: &[landing::Eligible], args: &SweepArgs) {
+    println!(
+        "{:<8} {:<8} | {:>10} {:>10} {:>10} | {:>9} {:>9} {:>9} | {:>10}",
+        "width", "cache", "wall_med", "wall_min", "wall_max", "p50", "p90", "max", "peak_rss"
+    );
+    for &pool_width in &args.widths {
+        for &cache_limit in &args.cache_limits {
+            let config = Config {
+                pool_width,
+                thread_limit: Some(1),
+                contend: 0,
+                cache_limit,
+            };
+            let mut walls = Vec::with_capacity(args.repeats);
+            let mut all = Vec::new();
+            for _ in 0..args.repeats {
+                let (wall, durations) = run_landing_once(eligible, config);
+                walls.push(wall);
+                all.extend(durations);
+            }
+            let wall = stats::wall_stats(walls);
+            let entity = stats::entity_stats(all);
+            println!(
+                "{:<8} {:<8} | {:>10?} {:>10?} {:>10?} | {:>9?} {:>9?} {:>9?} | {:>9}M",
+                pool_width,
+                describe_cache(cache_limit),
+                wall.median,
+                wall.min,
+                wall.max,
+                entity.p50,
+                entity.p90,
+                entity.max,
+                peak_rss_bytes() / (1024 * 1024)
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first() else {
-        eprintln!("usage: fanout-sweep <synthetic|real|generate> [args]");
+        eprintln!("usage: fanout-sweep <synthetic|real|generate|landing> [args]");
         std::process::exit(2);
     };
     let rest = &args[1..];
@@ -526,6 +667,94 @@ fn main() {
                  phases this sweep times on the no-remote path (see probe.rs)"
             );
             run_sweep(&paths, &sweep_args);
+        }
+        "landing" => {
+            let mut roots: Vec<PathBuf> = Vec::new();
+            let mut limit = usize::MAX;
+            let mut max_depth = 6usize;
+            let mut sweep_args_raw = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--roots" => {
+                        roots = rest[i + 1].split(',').map(PathBuf::from).collect();
+                        i += 2;
+                    }
+                    "--limit" => {
+                        limit = rest[i + 1].parse().expect("integer limit");
+                        i += 2;
+                    }
+                    "--max-depth" => {
+                        max_depth = rest[i + 1].parse().expect("integer depth");
+                        i += 2;
+                    }
+                    other => {
+                        sweep_args_raw.push(other.to_string());
+                        sweep_args_raw.push(rest[i + 1].clone());
+                        i += 2;
+                    }
+                }
+            }
+            assert!(
+                !roots.is_empty(),
+                "landing needs at least one --roots entry"
+            );
+            for root in &roots {
+                assert!(
+                    !root
+                        .components()
+                        .any(|c| is_forbidden_dir_name(c.as_os_str())),
+                    "refusing a --roots entry that names or contains `mrx`: {}",
+                    root.display()
+                );
+                assert!(
+                    root.is_dir(),
+                    "--roots entry is not a readable directory: {}",
+                    root.display()
+                );
+            }
+            let sweep_args = parse_sweep_args(&sweep_args_raw);
+            let mut paths = Vec::new();
+            for root in &roots {
+                find_git_repos(root, max_depth, &mut paths);
+            }
+            paths.truncate(limit);
+            println!("{} repository boundaries found", paths.len());
+
+            let mut eligible: Vec<landing::Eligible> =
+                paths.iter().filter_map(|p| landing::classify(p)).collect();
+            for entity in &mut eligible {
+                entity.depth = landing::measure_depth(entity);
+            }
+            let total_depth: usize = eligible.iter().map(|e| e.depth).sum();
+            println!(
+                "{} of them reach patch equivalence (HEAD diverged from its own default \
+                 branch, which is what `landing::probe` answers Outstanding for); their \
+                 default-branch scans walk {total_depth} commits in total, a median of {}",
+                eligible.len(),
+                median_depth(&eligible)
+            );
+            assert!(
+                !eligible.is_empty(),
+                "no repository under these roots reaches patch equivalence, so there is \
+                 nothing for this sweep to time"
+            );
+            // Commit-graph presence is reported because `merge_base` consults it before
+            // ever decoding a commit object (gix's `commit_graph_if_enabled`), so a repo
+            // that has one pays none of the redundant decode an object cache would serve.
+            let with_graph = eligible
+                .iter()
+                .filter(|e| has_commit_graph(&e.path))
+                .count();
+
+            println!(
+                "{with_graph} of those resolve to a common dir carrying a commit-graph, \
+                 whose merge-base walks are served from it rather than from decoded commit \
+                 objects (far fewer distinct files than entities: the eligible population \
+                 is mostly linked worktrees sharing a handful of common dirs). Tree diffs \
+                 are not served by it either way, which is the work the object cache acts on"
+            );
+            run_landing_sweep(&eligible, &sweep_args);
         }
         other => {
             eprintln!("unknown subcommand: {other}");
