@@ -53,11 +53,11 @@ fn plan(entities: usize, seed: u64) -> Vec<EntityPlan> {
 
     let mut plans = Vec::with_capacity(entities);
     let push_tier = |plans: &mut Vec<EntityPlan>,
-                          rng: &mut Rng,
-                          count: usize,
-                          prefix: &str,
-                          file_range: (usize, usize),
-                          commit_range: (usize, usize)| {
+                     rng: &mut Rng,
+                     count: usize,
+                     prefix: &str,
+                     file_range: (usize, usize),
+                     commit_range: (usize, usize)| {
         for i in 0..count {
             let dirty = rng.chance(0.04);
             plans.push(EntityPlan {
@@ -93,14 +93,7 @@ fn plan(entities: usize, seed: u64) -> Vec<EntityPlan> {
         (150, 801),
         (3, 15),
     );
-    push_tier(
-        &mut plans,
-        &mut rng,
-        small_count,
-        "small",
-        (5, 151),
-        (1, 8),
-    );
+    push_tier(&mut plans, &mut rng, small_count, "small", (5, 151), (1, 8));
     plans
 }
 
@@ -110,11 +103,20 @@ fn git(path: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["-c", "user.email=fanout-sweep@example.com", "-c", "user.name=fanout-sweep"])
+        .args([
+            "-c",
+            "user.email=fanout-sweep@example.com",
+            "-c",
+            "user.name=fanout-sweep",
+        ])
         .args(args)
         .status()
         .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
-    assert!(status.success(), "git {args:?} failed in {}", path.display());
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        path.display()
+    );
 }
 
 /// Spreads `count` files under `root` in a shallow tree rather than one flat directory,
@@ -132,7 +134,8 @@ fn write_files(root: &Path, count: usize, rng: &mut Rng) {
         } else {
             let group = dir_index / FILES_PER_DIR;
             let leaf = dir_index % FILES_PER_DIR;
-            root.join(format!("d{group:03}")).join(format!("d{leaf:03}"))
+            root.join(format!("d{group:03}"))
+                .join(format!("d{leaf:03}"))
         };
         std::fs::create_dir_all(&dir).expect("create working-tree directory");
         for i in 0..this_dir_count {
@@ -191,8 +194,7 @@ fn build_repo(root: &Path, plan: &EntityPlan, rng: &mut Rng) {
         // Modified: rewrite an existing tracked file without committing it.
         touch_a_few_files(root, plan.file_count, rng);
         // Untracked: a new file `git add` never saw.
-        std::fs::write(root.join("untracked.txt"), "never staged\n")
-            .expect("write untracked file");
+        std::fs::write(root.join("untracked.txt"), "never staged\n").expect("write untracked file");
         // Deleted: remove a tracked file from the working tree only.
         let victim = root.join("f000000.txt");
         if victim.exists() {

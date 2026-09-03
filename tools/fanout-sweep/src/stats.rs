@@ -16,7 +16,10 @@ pub struct EntityStats {
 /// configuration, so a config run three times reports on 3x the samples rather than
 /// throwing two thirds of them away.
 pub fn entity_stats(mut durations: Vec<Duration>) -> EntityStats {
-    assert!(!durations.is_empty(), "no per-entity durations to summarise");
+    assert!(
+        !durations.is_empty(),
+        "no per-entity durations to summarise"
+    );
     durations.sort_unstable();
     let n = durations.len();
     let percentile = |p: f64| durations[((n - 1) as f64 * p).round() as usize];

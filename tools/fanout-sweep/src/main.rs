@@ -46,7 +46,11 @@ impl std::fmt::Display for Config {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         };
-        write!(f, "width={} thread_limit={} contend={}", self.pool_width, limit, self.contend)
+        write!(
+            f,
+            "width={} thread_limit={} contend={}",
+            self.pool_width, limit, self.contend
+        )
     }
 }
 
@@ -54,7 +58,10 @@ impl std::fmt::Display for Config {
 /// concurrent Action or fetch pool's own workers competing for the same cores: those pools
 /// are dedicated and do not share rayon's global pool, but they still take real cores away
 /// from whichever pool the probe fan-out itself runs on.
-fn spawn_contention(count: usize, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
+fn spawn_contention(
+    count: usize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<()>> {
     (0..count)
         .map(|_| {
             let stop = std::sync::Arc::clone(&stop);
@@ -107,7 +114,11 @@ fn run_once(paths: &[PathBuf], config: Config) -> (Duration, Vec<Duration>) {
 /// Runs `config` `repeats` times, pooling every repeat's per-entity durations for the
 /// percentile report and keeping each repeat's own wall clock for the variance report,
 /// per the standing rule that a single run is not evidence.
-fn run_config(paths: &[PathBuf], config: Config, repeats: usize) -> (stats::WallStats, stats::EntityStats) {
+fn run_config(
+    paths: &[PathBuf],
+    config: Config,
+    repeats: usize,
+) -> (stats::WallStats, stats::EntityStats) {
     let mut walls = Vec::with_capacity(repeats);
     let mut all_durations = Vec::new();
     for _ in 0..repeats {
@@ -121,7 +132,16 @@ fn run_config(paths: &[PathBuf], config: Config, repeats: usize) -> (stats::Wall
 fn print_header() {
     println!(
         "{:<8} {:<12} {:<8} | {:>10} {:>10} {:>10} | {:>9} {:>9} {:>9} {:>9}",
-        "width", "thread_lim", "contend", "wall_med", "wall_min", "wall_max", "p50", "p90", "max", "min"
+        "width",
+        "thread_lim",
+        "contend",
+        "wall_med",
+        "wall_min",
+        "wall_max",
+        "p50",
+        "p90",
+        "max",
+        "min"
     );
 }
 
@@ -132,7 +152,16 @@ fn print_row(config: Config, wall: &stats::WallStats, entity: &stats::EntityStat
     };
     println!(
         "{:<8} {:<12} {:<8} | {:>10?} {:>10?} {:>10?} | {:>9?} {:>9?} {:>9?} {:>9?}",
-        config.pool_width, limit, config.contend, wall.median, wall.min, wall.max, entity.p50, entity.p90, entity.max, entity.min
+        config.pool_width,
+        limit,
+        config.contend,
+        wall.median,
+        wall.min,
+        wall.max,
+        entity.p50,
+        entity.p90,
+        entity.max,
+        entity.min
     );
 }
 
@@ -166,7 +195,9 @@ fn write_csv(out: &Path, rows: &[(Config, stats::WallStats, stats::EntityStats)]
 }
 
 fn parse_widths(s: &str) -> Vec<usize> {
-    s.split(',').map(|p| p.trim().parse().expect("integer pool width")).collect()
+    s.split(',')
+        .map(|p| p.trim().parse().expect("integer pool width"))
+        .collect()
 }
 
 fn parse_thread_limits(s: &str) -> Vec<Option<usize>> {
@@ -222,7 +253,13 @@ fn parse_sweep_args(args: &[String]) -> SweepArgs {
             other => panic!("unrecognised sweep argument: {other}"),
         }
     }
-    SweepArgs { widths, thread_limits, repeats, contend, out }
+    SweepArgs {
+        widths,
+        thread_limits,
+        repeats,
+        contend,
+        out,
+    }
 }
 
 fn run_sweep(paths: &[PathBuf], args: &SweepArgs) {
@@ -231,7 +268,11 @@ fn run_sweep(paths: &[PathBuf], args: &SweepArgs) {
     for &contend in &args.contend {
         for &pool_width in &args.widths {
             for &thread_limit in &args.thread_limits {
-                let config = Config { pool_width, thread_limit, contend };
+                let config = Config {
+                    pool_width,
+                    thread_limit,
+                    contend,
+                };
                 let (wall, entity) = run_config(paths, config, args.repeats);
                 print_row(config, &wall, &entity);
                 rows.push((config, wall, entity));
@@ -419,7 +460,9 @@ fn main() {
             assert!(!roots.is_empty(), "real needs at least one --roots entry");
             for root in &roots {
                 assert!(
-                    !root.components().any(|c| is_forbidden_dir_name(c.as_os_str())),
+                    !root
+                        .components()
+                        .any(|c| is_forbidden_dir_name(c.as_os_str())),
                     "refusing a --roots entry that names or contains `mrx`: {}",
                     root.display()
                 );
@@ -451,7 +494,11 @@ fn main() {
                 );
             }
             paths.truncate(limit);
-            println!("found {} repositories under {} root(s)", paths.len(), roots.len());
+            println!(
+                "found {} repositories under {} root(s)",
+                paths.len(),
+                roots.len()
+            );
             // Tracked-file count only, read from each repo's own index rather than a
             // full status walk: enough to compare the real population's shape against
             // `synthetic`'s own reported "files total" figure without paying for a
@@ -465,6 +512,19 @@ fn main() {
                 .map(|index| index.entries().len())
                 .sum();
             println!("{total_tracked} tracked files total across the real population");
+            // Printed because the sweep does not measure these repositories the way
+            // production would: `probe`'s module doc explains that phases A and B are
+            // always timed on the "no remote" path, so this count is the size of that
+            // omission for this population, on the run's own output.
+            let with_remote = paths
+                .iter()
+                .filter_map(|path| gix::open(path).ok())
+                .filter(|repo| !repo.remote_names().is_empty())
+                .count();
+            println!(
+                "{with_remote} of them carry a remote, whose sync and default-branch \
+                 phases this sweep times on the no-remote path (see probe.rs)"
+            );
             run_sweep(&paths, &sweep_args);
         }
         other => {

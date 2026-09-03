@@ -23,10 +23,20 @@
 //! entity"), so a corpus of plain repos never exercises it in production either, and
 //! omitting it here is not a narrowing. The real population the `real` subcommand walks
 //! does include linked worktrees, whose own per-entity task does run that phase; this
-//! harness times neither them nor it. A repository with a live remote also costs more in
-//! the sync and default-branch phases than the "no remote" path timed here, since
-//! resolving a remote-tracking `HEAD` and walking ahead/behind against a live upstream
-//! both cost more than the early return this corpus always takes; `in_progress_operation`
+//! harness times neither them nor it.
+//!
+//! Phases A and B are timed on the "no remote" path for *every* entity, including the
+//! `real` subcommand's, which is where that stops being a faithful reproduction: most of
+//! the repositories on a real machine do carry a remote, and for those production walks
+//! ahead/behind against a live upstream and climbs the default-branch chain instead of
+//! returning early. The `real` subcommand prints how many of the repositories it found
+//! carry one, so the size of the omission is on the run's own output rather than left to
+//! be guessed. What that costs the numbers: the real corpus's absolute per-entity times
+//! are a lower bound for its remote-bearing entities, so they do not stand in for what a
+//! real refresh takes. What it does not cost: the comparison *across* pool widths within
+//! that corpus, which every cell pays the same omission on. Mirroring the remote path
+//! would mean duplicating the whole default-branch chain here, which is the trade the
+//! module doc's first paragraph already declines. `in_progress_operation`
 //! (part of production's phase A) is likewise not reproduced, since it stats the git
 //! dir's own marker files rather than anything corpus size could make expensive, and ADR
 //! 0019 already measured it at 6.55ms across 403 entities, negligible next to phase C's
@@ -75,15 +85,21 @@ fn probe_sync(repo: &gix::Repository) {
     let _ = repo.remote_names();
 }
 
-/// Phase B's second half, default branch resolution, mirroring
-/// `default_branch::ChainFacts::resolve`'s own early return once `chosen_remote` finds
-/// no remote: see the module doc.
+/// Phase B's second half, default branch resolution, mirroring both gix calls
+/// `default_branch::ChainFacts::resolve` makes before its early return: `has_any_remote`
+/// and `chosen_remote`, which it issues unconditionally rather than only when a remote
+/// exists. See the module doc for why this corpus always takes that return.
 fn probe_default_branch(repo: &gix::Repository) {
     let _ = repo.remote_names();
+    let _ = repo.remote_default_name(gix::remote::Direction::Fetch);
 }
 
 /// Phase B's second rev-walk, `base`, mirroring `base::probe`'s own `has_any_remote`
-/// early return: see the module doc.
+/// early return: see the module doc. Called on every task here, which makes the timed
+/// unit a *first* generation's: production's `probes_base` gate stops re-probing a
+/// no-remote Repo once `base` has settled to `NotApplicable`, so a steady-state
+/// generation skips this call. Timing the first generation is the wider of the two, and
+/// the difference is one `remote_names` read against a status walk.
 fn probe_base(repo: &gix::Repository) {
     let _ = repo.remote_names();
 }
@@ -96,9 +112,8 @@ fn probe_base(repo: &gix::Repository) {
 /// the same unit `dispatch_probes`'s own `rayon::spawn` closure commits one pool slot to
 /// (see the module doc for the one phase, worktree state, this does not include).
 pub fn probe_entity_task(path: &Path, thread_limit: Option<usize>) -> Duration {
-    let repo = gix::open(path).unwrap_or_else(|error| {
-        panic!("open corpus repository {}: {error}", path.display())
-    });
+    let repo = gix::open(path)
+        .unwrap_or_else(|error| panic!("open corpus repository {}: {error}", path.display()));
     let cancel = Arc::new(AtomicBool::new(false));
 
     let start = Instant::now();
