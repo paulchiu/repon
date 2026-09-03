@@ -59,7 +59,7 @@ That yields `theme`, `glyphs`, `show_worktrees` and `show_submodules` bare; `[re
 
 The stake on `show_worktrees` is measured: `~/dev` holds 148 Repos and 161 Worktrees, so the key is the difference between a 148-row list and a 309-row one. A Worktrees-only Filter, `kind:worktree` in [filter.md](filter.md), beats `show_worktrees = false`, and says so: turning it on while the preference is off shows the Worktrees and puts `worktrees: 161 (preference off)` in the header beside the match count [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) already requires. An explicit gesture beating a stored preference is the same rule 0006 applies to flags beating stored state, and the alternative is an empty list that reads as a broken config.
 
-[keybindings.md](keybindings.md#the-worktrees-toggle)'s `t` overrides `show_worktrees` the same way for the rest of the session, with no write to the file: while that override is why Worktrees are off, the same header note reads `worktrees: N (toggled off)` instead, so it never credits the file with a session-only gesture. Reload replaces the override with whatever the file currently says, the same as every other key below.
+[keybindings.md](keybindings.md#the-worktrees-toggle)'s `t` overrides `show_worktrees` the same way, with no write to `config.toml`: while that override is why Worktrees are off, the same header note reads `worktrees: N (toggled off)` instead, so it never credits the file with a gesture that is not its own. The override is remembered per scope below, so it survives a quit and relaunch over the same scope; a restart is not what it takes to clear it. A restored override is still an override, never the file's own preference, so it keeps reading `(toggled off)` on the relaunch that restores it, the same as it did the session it was set. Reload replaces the override with whatever the file currently says, the same as every other key below; that is what actually clears it, and the save that follows records the override's absence, so a later restart in turn defers to the file.
 
 ## Refresh, fetch and auto-update
 
@@ -204,11 +204,11 @@ The anchors are measured. Boundary-stop discovery costs 0.19s over `~/dev` (309 
 
 ## State
 
-`state.toml` lives in the data directory, never in the config directory. It is a map of scope to state, where the scope is the active Set's name, or the absolute working directory when running zero-config, so two contexts cannot restore each other's Selection. Each scope holds `selection` (a list of names), `filter` (a string) and `sort` (the chosen column and direction, or `Natural`, absent for a scope nothing has ever sorted).
+`state.toml` lives in the data directory, never in the config directory. It is a map of scope to state, where the scope is the active Set's name, or the absolute working directory when running zero-config, so two contexts cannot restore each other's Selection. Each scope holds `selection` (a list of names), `filter` (a string), `sort` (the chosen column and direction, or `Natural`, absent for a scope nothing has ever sorted) and `show_worktrees` (the worktrees toggle, [keybindings.md](keybindings.md#the-worktrees-toggle)'s `t`, absent for a scope nothing has ever toggled Worktrees in).
 
 One key sits above the scopes rather than inside one: `active_set`, the Set the last session was viewing, which is what Selection order's third rung reads. It cannot live in a scope, because it is what chooses the scope, so `active_set` is reserved at the top level of the file and a Set carrying that name keeps no scope of its own: one key holding both a remembered Set and a scope table is not TOML, and the file would read back empty for every other scope in it. A zero-config run keys its scope by working directory and has no Set to remember, so it writes nothing there and leaves whatever a configured run last recorded.
 
-Any parse failure or unreadable file is treated as absent with no warning, because deleting it is a supported reset ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Selection restores by name and unknown names drop silently, and a remembered `active_set` no longer declared drops the same way. A restored Filter announces its match count. A scope with no `sort` recorded, whether the file predates the field or was never written, opens sorted by name ascending rather than the natural grouped order ([0030](../adr/0030-the-table-has-an-order-the-user-chooses.md)'s amendment).
+Any parse failure or unreadable file is treated as absent with no warning, because deleting it is a supported reset ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)). Selection restores by name and unknown names drop silently, and a remembered `active_set` no longer declared drops the same way. A restored Filter announces its match count. A scope with no `sort` recorded, whether the file predates the field or was never written, opens sorted by name ascending rather than the natural grouped order ([0030](../adr/0030-the-table-has-an-order-the-user-chooses.md)'s amendment). A scope with no `show_worktrees` recorded, the same two ways, leaves `config.toml`'s own `show_worktrees` deciding, exactly as if `t` had never fired in this scope.
 
 Across all 403 boundary-stopped entities in the two measured roots, zero names collide, so name-keying is unambiguous there. It is not unambiguous in general, which is why the scope key exists.
 
@@ -247,7 +247,7 @@ Everything reloads in place on `Ctrl+R` ([keybindings.md](keybindings.md)). Ther
 
 Paths that came from a flag or the environment are fixed for the process, since re-resolving them mid-session would move the file just edited.
 
-A reload also clears [keybindings.md](keybindings.md#the-worktrees-toggle)'s own `t` override, so `show_worktrees`'s freshly re-applied value decides again as though the toggle had never fired this session.
+A reload also clears [keybindings.md](keybindings.md#the-worktrees-toggle)'s own `t` override, so `show_worktrees`'s freshly re-applied value decides again as though the toggle had never fired, whether it fired this session or was restored from a session before it.
 
 ## An annotated example
 
