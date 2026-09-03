@@ -215,19 +215,45 @@ fn line_display_width(line: &HelpLine, key_width: usize) -> usize {
     }
 }
 
+/// The widest key or glyph column any line in `lines` needs, 0 for a column with no such line
+/// (a slice of nothing but headings and blanks). Shared by [`ColumnMetrics::compute`] to size a
+/// column's own key/glyph gutter from that column's own lines alone, rather than the whole
+/// table.
+fn max_key_width(lines: &[HelpLine]) -> usize {
+    lines
+        .iter()
+        .map(|line| match line {
+            HelpLine::Binding { keys, .. } => keys.chars().count(),
+            HelpLine::Legend { glyph, .. } => glyph.chars().count(),
+            HelpLine::Heading(_) | HelpLine::Blank => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// `lines`' own rendered width at `key_width`: the widest [`line_display_width`] among them, 0
+/// for an empty column.
+fn column_width(lines: &[HelpLine], key_width: usize) -> u16 {
+    lines
+        .iter()
+        .map(|line| line_display_width(line, key_width) as u16)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The overlay's column geometry for one frame width, computed once so [`HelpOverlay::draw`]'s
 /// render loop and [`HelpOverlay::visible_len`]'s own row count can never disagree about what
-/// is on screen. `key_width`, the one fixed key/glyph column figure keybindings.md's own "The
-/// help overlay's own chrome" already fixes, applies across both columns rather than being
-/// computed per column: simpler, and it
-/// keeps the two columns' own key gutters lined up with each other as well as within
-/// themselves. `two_columns` and `column_offset` both come from the widest line the whole
-/// unfiltered content ([`HelpOverlay::lines`]) actually renders, twice over plus one
-/// [`COLUMN_GUTTER`] between them, not a round number picked by hand; reading from the
-/// unfiltered content rather than whatever a query currently narrows to is what keeps the
-/// column count from toggling mid-search the same way `key_width` already does not shift.
+/// is on screen. The key/glyph gutter is one fixed width *per column*, not one figure shared
+/// across both: [`HelpOverlay::split_into_columns`] decides which sections land in which column
+/// first, from the whole unfiltered content ([`HelpOverlay::built_sections`] with an empty
+/// query), and each column is then measured only against its own lines
+/// ([`max_key_width`], [`column_width`]). `two_columns` holds once the two columns' own widths
+/// plus [`COLUMN_GUTTER`] fit `content_width`; reading from the unfiltered split rather than
+/// whatever a query currently narrows to is what keeps a column's own gutter, and the column
+/// count itself, from shifting mid-search.
 struct ColumnMetrics {
-    key_width: usize,
+    left_key_width: usize,
+    right_key_width: usize,
     two_columns: bool,
     /// How far right of the left column's own origin the right one starts, when
     /// `two_columns` holds. Unused otherwise.
@@ -235,23 +261,36 @@ struct ColumnMetrics {
 }
 
 impl ColumnMetrics {
+    /// `left` and `right`, already split, into `(left_key_width, right_key_width, left_width,
+    /// right_width)`: the shared arithmetic [`Self::compute`] and the test module's own
+    /// `two_column_threshold` both need, so the test pins the exact threshold without a
+    /// second copy of this sum drifting from the real one.
+    fn column_metrics(left: &[HelpLine], right: &[HelpLine]) -> (usize, usize, u16, u16) {
+        let left_key_width = max_key_width(left);
+        let right_key_width = max_key_width(right);
+        let left_width = column_width(left, left_key_width);
+        let right_width = column_width(right, right_key_width);
+        (left_key_width, right_key_width, left_width, right_width)
+    }
+
     fn compute(
         table: &BindingTable,
         context: Context,
         glyphs: &GlyphSet,
         content_width: u16,
     ) -> ColumnMetrics {
-        let key_width = HelpOverlay::key_width(table, context, glyphs);
-        let widest = HelpOverlay::lines(table, context, glyphs)
-            .iter()
-            .map(|line| line_display_width(line, key_width) as u16)
-            .max()
-            .unwrap_or(0);
-        let two_column_min_width = widest.saturating_mul(2).saturating_add(COLUMN_GUTTER);
+        let unfiltered = HelpOverlay::built_sections(table, context, glyphs, "");
+        let (left, right) = HelpOverlay::split_into_columns(unfiltered);
+        let (left_key_width, right_key_width, left_width, right_width) =
+            Self::column_metrics(&left, &right);
+        let two_column_min_width = left_width
+            .saturating_add(COLUMN_GUTTER)
+            .saturating_add(right_width);
         ColumnMetrics {
-            key_width,
+            left_key_width,
+            right_key_width,
             two_columns: content_width >= two_column_min_width,
-            column_offset: widest.saturating_add(COLUMN_GUTTER),
+            column_offset: left_width.saturating_add(COLUMN_GUTTER),
         }
     }
 }
@@ -267,7 +306,7 @@ enum Mode {
     Searching,
 }
 
-/// The overlay's own scroll position, mode and query: [`HelpOverlay::lines`] derives
+/// The overlay's own scroll position, mode and query: [`HelpOverlay::built_sections`] derives
 /// everything else fresh from the binding table and the live glyph set on every call, which
 /// is what lets a config reload or a `glyphs` switch change what this screen shows with no
 /// code change here. Dropped and rebuilt with [`Self::default`] on every open
@@ -346,7 +385,7 @@ impl HelpOverlay {
     /// entirely rather than standing over nothing: `context`'s own bindings
     /// ([`BindingTable::describe_own`]), the `global` bindings live alongside it
     /// ([`BindingTable::describe_global`]), and one legend row per row-interior [`Meaning`]
-    /// ([`Self::legend_rows`]). The one source [`Self::lines`], `Self::filtered_lines` (both
+    /// ([`Self::legend_rows`]). The one source `Self::lines`, `Self::filtered_lines` (both
     /// assembled flat, one column) and [`Self::draw`] (assembled into one or two columns,
     /// [`Self::split_into_columns`]) all build from, so the shapes can never disagree about
     /// which sections and rows exist.
@@ -400,7 +439,10 @@ impl HelpOverlay {
     }
 
     /// The overlay's full content with no query typed, assembled into one column
-    /// ([`Self::assemble_sections`] over [`Self::built_sections`]).
+    /// ([`Self::assemble_sections`] over [`Self::built_sections`]). Test-only: production
+    /// measures column widths from [`Self::built_sections`] split into two, never from this
+    /// flat one-column shape.
+    #[cfg(test)]
     fn lines(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> Vec<HelpLine> {
         Self::assemble_sections(Self::built_sections(table, context, glyphs, ""))
     }
@@ -604,23 +646,6 @@ impl HelpOverlay {
         self.scroll = scroll_after(self.scroll, action, content_len, viewport_height);
     }
 
-    /// The key/glyph column's fixed width across the whole unfiltered content
-    /// ([`Self::lines`]), so it never shifts as a query narrows what is on screen or a scroll
-    /// brings a longer or shorter key into view. Shared by [`Self::draw_line`]'s own padding
-    /// and [`ColumnMetrics::compute`], which needs the same figure to measure a rendered
-    /// line's own width.
-    fn key_width(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> usize {
-        Self::lines(table, context, glyphs)
-            .iter()
-            .map(|line| match line {
-                HelpLine::Binding { keys, .. } => keys.chars().count(),
-                HelpLine::Legend { glyph, .. } => glyph.chars().count(),
-                HelpLine::Heading(_) | HelpLine::Blank => 0,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
     /// Paints one `line` at `(x, y)`: a binding's or legend's own key/glyph column padded to
     /// `key_width` in `accent`, two spaces, then the description or meaning in `dim`
     /// ([theming.md](../../../../docs/spec/theming.md)); a heading in bold `accent`; a blank
@@ -747,7 +772,15 @@ impl HelpOverlay {
                 }
                 let y = list_area.y + row as u16;
                 if let Some(line) = left.get(index) {
-                    Self::draw_line(buf, list_area.x, y, end, line, metrics.key_width, theme);
+                    Self::draw_line(
+                        buf,
+                        list_area.x,
+                        y,
+                        end,
+                        line,
+                        metrics.left_key_width,
+                        theme,
+                    );
                 }
                 if let Some(line) = right.get(index) {
                     Self::draw_line(
@@ -756,7 +789,7 @@ impl HelpOverlay {
                         y,
                         end,
                         line,
-                        metrics.key_width,
+                        metrics.right_key_width,
                         theme,
                     );
                 }
@@ -2048,12 +2081,15 @@ mod tests {
     }
 
     /// [`ColumnMetrics::compute`]'s own two-column threshold for `context`'s content: the
-    /// content_width right at which `two_columns` first turns on. Derived from
-    /// `column_offset` (which does not depend on `content_width`) rather than hard-coded, so
-    /// this stays correct if `context`'s own bindings or descriptions ever change length.
+    /// content_width right at which `two_columns` first turns on, from the same split and
+    /// per-column widths ([`ColumnMetrics::column_metrics`]) `compute` itself uses, rather
+    /// than hard-coded, so this stays correct if `context`'s own bindings or descriptions
+    /// ever change length.
     fn two_column_threshold(table: &BindingTable, context: Context, glyphs: &GlyphSet) -> u16 {
-        let metrics = ColumnMetrics::compute(table, context, glyphs, u16::MAX);
-        metrics.column_offset * 2 - COLUMN_GUTTER
+        let unfiltered = HelpOverlay::built_sections(table, context, glyphs, "");
+        let (left, right) = HelpOverlay::split_into_columns(unfiltered);
+        let (_, _, left_width, right_width) = ColumnMetrics::column_metrics(&left, &right);
+        left_width + COLUMN_GUTTER + right_width
     }
 
     #[test]
@@ -2180,6 +2216,33 @@ mod tests {
         assert!(
             at.two_columns,
             "expected two columns right at the threshold ({threshold})"
+        );
+    }
+
+    /// The concrete regression this ticket fixes: at a real 161-column terminal, the default
+    /// List content, full glyphs, must reach two columns. Before this fix the threshold doubled
+    /// the single widest line across the whole table (172, unreachable at any width a real
+    /// terminal is likely to run) instead of sizing each column against its own content.
+    #[test]
+    fn a_real_161_column_terminal_lays_out_the_default_list_content_in_two_columns() {
+        let table = default_table();
+        let context = Context::List;
+        let glyphs = full_glyphs();
+        let frame = Rect::new(0, 0, 161, 40);
+
+        let content_width = HelpLayout::compute(frame).content_area(frame).width;
+        let metrics = ColumnMetrics::compute(&table, context, glyphs, content_width);
+        assert!(
+            metrics.two_columns,
+            "expected a 161-column terminal ({content_width} content columns) to reach two \
+             columns for List's own content"
+        );
+
+        let sections = HelpOverlay::built_sections(&table, context, glyphs, "");
+        let (left, right) = HelpOverlay::laid_out(sections, &metrics);
+        assert!(
+            !left.is_empty() && !right.is_empty(),
+            "expected both columns to hold content, got left={left:?} right={right:?}"
         );
     }
 
