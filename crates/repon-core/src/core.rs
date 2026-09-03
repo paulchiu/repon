@@ -1113,6 +1113,21 @@ impl Core {
         git::linked_worktree_paths(&repo)
     }
 
+    /// `delete`'s phase 1: the ignored directories inside the working tree at `path`, read
+    /// fresh right now
+    /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+    /// "Deleting a working tree"). `path` rather than an [`EntityKey`] because a Repo
+    /// `delete` runs this once for its own working tree and once more for each linked
+    /// Worktree [`Self::linked_worktree_paths`] names, and only the first of those has a Set
+    /// row of its own.
+    pub fn ignored_directories_for_deletion(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<PathBuf>, git::ProbeError> {
+        let repo = git::open_thread_safe(path)?.to_thread_local();
+        git::ignored_directories_for_deletion(&repo)
+    }
+
     /// Attempts the fast-forward-only auto-update on `key`'s own Repo, on demand: exactly
     /// [`crate::auto_update::attempt`]'s own five rules and its own fast-forward, reused
     /// rather than a second implementation for the built-in `sync` action to call by hand

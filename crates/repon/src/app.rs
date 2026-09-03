@@ -2247,6 +2247,11 @@ impl App {
                 &self.config_file,
                 |key| self.core.worktree_admin_dir(key).ok(),
                 |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
+                |path| {
+                    self.core
+                        .ignored_directories_for_deletion(path)
+                        .unwrap_or_default()
+                },
                 |key| self.core.attempt_auto_update(key),
                 |key| run_sync_hook(&before_sync_hook, key),
                 |key| run_sync_hook(&after_sync_hook, key),
@@ -6242,9 +6247,10 @@ mod tests {
     }
 
     /// The same "computed, not stubbed" claim for what a `delete` run needs to remove a
-    /// Worktree the way `git worktree remove` does, and what a `sync` run needs to attempt
-    /// the fast-forward: [`repon_core::Core::worktree_admin_dir`],
-    /// [`repon_core::Core::linked_worktree_paths`] and
+    /// Worktree the way `git worktree remove` does, what it needs for `delete`'s own ignored-
+    /// directories phase 1, and what a `sync` run needs to attempt the fast-forward:
+    /// [`repon_core::Core::worktree_admin_dir`], [`repon_core::Core::linked_worktree_paths`],
+    /// [`repon_core::Core::ignored_directories_for_deletion`] and
     /// [`repon_core::Core::attempt_auto_update`] at the one call site, not a literal this
     /// crate could hand [`crate::management::run_one_record`] instead.
     #[test]
@@ -6268,6 +6274,10 @@ mod tests {
         assert!(
             source.contains("self.core.linked_worktree_paths(key)"),
             "the run must read a Repo's linked Worktree paths off the Core"
+        );
+        assert!(
+            source.contains(".ignored_directories_for_deletion(path)"),
+            "the run must enumerate a working tree's ignored directories off the Core"
         );
         assert!(
             source.contains("self.core.attempt_auto_update(key)"),

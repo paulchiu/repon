@@ -3248,6 +3248,7 @@ dependencies = [
  "humantime-serde",
  "libc",
  "ratatui",
+ "rayon",
  "repon-core",
  "serde",
  "serde_ignored",

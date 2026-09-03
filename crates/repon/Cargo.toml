@@ -49,6 +49,10 @@ humantime-serde = "1.1.1"
 # for the same reason (its own `Cargo.toml` comment on this line).
 libc = "0.2.189"
 ratatui = "0.30"
+# `delete`'s phase 2, a bounded worker pool draining the ignored directories phase 1 found
+# independently of one another: already a direct dependency of `repon-core` for the probe
+# fan-out, pinned to the same version here since the two never need to agree beyond that.
+rayon = "1.12.0"
 # `serde` turns on the settled document's wire format (ADR 0015): `repon status` is the
 # one caller that needs it. `repon-core`'s own `fetch` feature is deliberately never
 # requested by default here: it gates the periodic fetch's blocking network client, HTTP

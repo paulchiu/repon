@@ -23,6 +23,22 @@ The four names are reserved. A config-defined `[[action]]` may not take one, and
 
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
 
+## Deleting a working tree
+
+`delete` removes a working tree in three phases, run once per tree: the Repo's own if the row is a Repo, each linked Worktree's own that cascading takes with it (see "What `delete` does to a Worktree" below), or the one Worktree's own if the row is a Worktree.
+
+1. **Enumerate.** gix's own directory walk lists the tree's ignored directories, collapsed to their own root rather than one entry per file inside: a `node_modules` or `target` is one entry, and the walk never descends into the thing it is about to hand phase 2 wholesale. It stops at the same boundary that makes it cheap: only the tracked-and-untracked part of the tree, the small part on a typical checkout, is walked file by file.
+2. **Delete independently.** A bounded worker pool, a small fixed count rather than one read off the machine's own core count, drains what phase 1 found, each directory removed on its own without waiting for the others.
+3. **Remove what is left.** The same whole-tree removal `delete` has always run, unchanged, now acting on a tree most of whose bulk phase 2 already cleared.
+
+This replaces the rename-then-delete strategy an earlier design considered and dropped ([#342](https://github.com/paulchiu/repon/issues/342)): that strategy bought speed with a trash directory pinned to one volume and an orphan sweep after a crash, neither of which this shape needs.
+
+**Phase 2 is safe because it deletes a strict subset of what phase 3 deletes anyway.** Phase 3 still removes the whole tree; nothing phase 2 destroys is destroyed a moment early that phase 3 would not have destroyed a moment later regardless. Only the order of what is already going changes, never what is at risk.
+
+**Phase 2 takes only what phase 1 found inside the tree phase 3 is about to remove**, never a path from config, an environment variable or the working directory, the same rule every `delete` fixture already keeps. Phase 3's own guards, refusing a relative path and refusing a directory with no `.git` in it, run exactly as before and are weakened by neither phase 1 nor phase 2: neither ever touches `.git`, and neither runs after phase 3 has.
+
+**A crash between phases is recoverable.** Phase 2 failing partway through, or the process dying between phase 2 and phase 3, leaves a working tree still registered with git and still on disk, with some or all of its ignored content already gone. Re-running `delete` finds less for phase 1 to enumerate and finishes the same removal phase 3 would have anyway; nothing dangles in the meantime, unlike rename-then-delete's own failure mode of a full checkout on disk with nothing pointing at it.
+
 ## What `sync` refuses, and why
 
 `sync` is refused on a Submodule: it tracks a pinned commit, not a branch, so there is nothing to fast-forward.
