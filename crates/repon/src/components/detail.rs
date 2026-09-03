@@ -961,7 +961,13 @@ fn freshness_row(cells: &[CellFreshness; 6]) -> Option<FreshnessRow> {
     let breakdown = known
         .iter()
         .filter(|cell| cell.age.as_deref() != Some(majority_age))
-        .map(|cell| format!("{}, {}", cell.label, cell.age.as_deref().unwrap()))
+        .map(|cell| {
+            format!(
+                "{}, {}",
+                cell.label,
+                cell.age.as_deref().expect("filtered to Known above")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     Some(FreshnessRow::Refreshed(breakdown))
