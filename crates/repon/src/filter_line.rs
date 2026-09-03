@@ -174,7 +174,8 @@ impl FilterLine {
     ///
     /// [filter.md](../../../docs/spec/filter.md#completion)'s trigger table, verbatim: empty
     /// (or a bare `-`) offers every key, a bare `:` (or `-:`) offers every key, a known key up
-    /// to or past its `:` offers that key's own values, anything else offers nothing. Matched
+    /// to or past its `:` offers that key's own values, a colon-less prefix of one or more
+    /// keys offers those keys' own entries, anything else offers nothing. Matched
     /// case-insensitively, the same as the parser itself
     /// ([filter.md](../../../docs/spec/filter.md#the-grammar)).
     fn trigger(&self) -> (Trigger, usize) {
@@ -199,7 +200,17 @@ impl FilterLine {
         }
 
         let Some(colon) = body.find(':') else {
-            return (Trigger::None, body_start);
+            let body_lower = body.to_ascii_lowercase();
+            let keys: Vec<String> = repon_core::vocabulary()
+                .into_iter()
+                .filter(|entry| entry.key.starts_with(body_lower.as_str()))
+                .map(|entry| format!("{}:", entry.key))
+                .collect();
+            return if keys.is_empty() {
+                (Trigger::None, body_start)
+            } else {
+                (Trigger::Keys(keys), body_start)
+            };
         };
         let key_text = &body[..colon];
         let Some(entry) = repon_core::vocabulary()
@@ -798,15 +809,48 @@ mod tests {
         assert_eq!(typed("kind:wor").completions(), kind_values);
     }
 
-    /// Row 4: anything else offers nothing, including a key's own text with no colon reached
-    /// yet (a bare word never triggers, `docs/spec/filter.md#completion`'s own note) and a
-    /// colon whose key half is not recognised.
+    /// Row 4: a colon whose key half is not recognised offers nothing, and neither does a
+    /// colon-less prefix that no key starts with; [`FilterLine::completion_area`] stays
+    /// `None` for it too, so the overlay is hidden rather than drawn empty.
     #[test]
-    fn anything_else_offers_nothing() {
-        assert!(typed("kin").completions().is_empty());
-        assert!(typed("kind").completions().is_empty());
-        assert!(typed("somerepo").completions().is_empty());
+    fn a_prefix_matching_no_key_offers_nothing() {
+        let somerepo = typed("somerepo");
+        assert!(somerepo.completions().is_empty());
+        assert!(somerepo.completion_area(Rect::new(0, 0, 40, 20)).is_none());
         assert!(typed("kimd:repo").completions().is_empty());
+    }
+
+    /// A colon-less prefix shared by two keys offers both of them, in vocabulary order.
+    #[test]
+    fn a_prefix_shared_by_two_keys_offers_both_of_them() {
+        assert_eq!(typed("s").completions(), vec!["state:", "sync:"]);
+    }
+
+    /// Typing more of a shared prefix narrows to the one remaining key.
+    #[test]
+    fn typing_more_of_a_shared_prefix_narrows_to_the_one_remaining_key() {
+        assert_eq!(typed("st").completions(), vec!["state:"]);
+        assert_eq!(typed("sy").completions(), vec!["sync:"]);
+    }
+
+    /// A fully typed key with no colon yet still offers its own entry, since it is a prefix
+    /// of itself.
+    #[test]
+    fn a_fully_typed_key_with_no_colon_yet_still_offers_its_own_entry() {
+        assert_eq!(typed("kind").completions(), vec!["kind:"]);
+    }
+
+    /// A key prefix matches case-insensitively, like the colon-qualified row above it.
+    #[test]
+    fn a_key_prefix_matches_case_insensitively() {
+        assert_eq!(typed("S").completions(), typed("s").completions());
+    }
+
+    /// A leading negation does not change what the prefix offers, mirroring
+    /// [`a_bare_colon_offers_every_key`]'s `-:`/`:` pair.
+    #[test]
+    fn a_negated_key_prefix_offers_the_same_entries_as_the_bare_prefix() {
+        assert_eq!(typed("-s").completions(), typed("s").completions());
     }
 
     /// The free-text keys (`name`, `branch`, `path`) reach the "known key" row too, but their
