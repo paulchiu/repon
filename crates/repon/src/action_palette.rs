@@ -32,6 +32,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
     style::Style,
+    text::Line,
     widgets::Paragraph,
 };
 
@@ -39,6 +40,7 @@ use repon_core::{ActionSpec, Applicability, Filter, Step};
 
 use crate::{
     config::document::{ActionConfig, StepConfig},
+    degrade::{self, Priority},
     edit_buffer::{EditBuffer, Motion},
     footer,
     glyphs::{BorderScratch, GlyphSet},
@@ -74,6 +76,48 @@ pub(crate) const QUERY_PLACEHOLDER: &str = "; select action or type a command";
 /// typed text [`ActionPalette::draw`] reads the caret's column back from what it painted
 /// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
 const PROMPT_WIDTH: u16 = 2;
+
+/// The ad hoc field's own bottom-border hint, in three priority tiers rather than one
+/// string, so a narrow frame drops a clause instead of clipping mid-word
+/// ([actions.md](../../../docs/spec/actions.md): the ad hoc field is never implicitly
+/// `shell = true`, so `$VAR` and `$(cmd)` reach argv as literal characters). The mechanism
+/// clause drops first: once "no shell" is on screen a shell-literate reader can guess *why*,
+/// but not the fix, so `sh -c '...'` outlives it. "no shell" itself never drops once
+/// anything is shown at all.
+const NO_SHELL_CORE: &str = "no shell";
+const NO_SHELL_MECHANISM: &str = ": $VAR and $(cmd) are literal";
+const NO_SHELL_FIX: &str = "; use sh -c '...'";
+
+/// [`NO_SHELL_CORE`], [`NO_SHELL_MECHANISM`] and [`NO_SHELL_FIX`] budgeted with
+/// [`degrade::budget`] against `frame_width`, then wrapped in the leading/trailing space
+/// [`ActionPalette::border_title`] and [`crate::help::BORDER_TITLE`] already pad every
+/// title with. Empty once even [`NO_SHELL_CORE`] alone cannot fit, which
+/// [`ActionPalette::draw`] reads as "draw no bottom title" rather than a half-drawn one.
+fn no_shell_hint(frame_width: u16) -> String {
+    let items = [
+        degrade::Item {
+            content: NO_SHELL_CORE,
+            priority: Priority::Pinned,
+        },
+        degrade::Item {
+            content: NO_SHELL_MECHANISM,
+            priority: Priority::Drop(1),
+        },
+        degrade::Item {
+            content: NO_SHELL_FIX,
+            priority: Priority::Drop(2),
+        },
+    ];
+    // The border's own two corner glyphs plus the one padding space on each side every
+    // title in this crate already carries.
+    let budget = (frame_width as usize).saturating_sub(4);
+    let line = degrade::budget(&items, budget, "", "");
+    if line.items.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", line.render("", ""))
+    }
+}
 
 /// The most interior rows the typed query is ever given, however many lines it holds
 /// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field): "capped at
@@ -806,10 +850,18 @@ impl ActionPalette {
         } = run;
         let run_count = count.run_count();
         let mut scratch = BorderScratch::new();
-        let block = glyphs
+        let mut block = glyphs
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
             .title(Self::border_title(&count));
+        // Only while the ad hoc field itself can be typed into: the confirm gate types
+        // nothing, so it has nothing here to warn about.
+        if matches!(self.stage, Stage::Choosing) {
+            let hint = no_shell_hint(area.width);
+            if !hint.is_empty() {
+                block = block.title_bottom(Line::from(hint));
+            }
+        }
         let interior = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1185,6 +1237,111 @@ mod tests {
         assert!(
             top.contains(&expected),
             "the drawn border must carry the whole reading {expected:?}, got: {top:?}"
+        );
+    }
+
+    // --- the ad hoc field's own "no shell" hint ---
+
+    /// [keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)'s own
+    /// backtick-quoted copy of the sentence, read at test time rather than retyped here, so
+    /// a wording edit to either the doc or the constants cannot silently drift from the
+    /// other.
+    #[test]
+    fn the_no_shell_hint_matches_keybindings_mds_own_quoted_sentence() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
+            .expect("read docs/spec/keybindings.md");
+        let quoted = spec
+            .split("it draws: `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("keybindings.md still carries the quoted no-shell sentence");
+        let built = format!("{NO_SHELL_CORE}{NO_SHELL_MECHANISM}{NO_SHELL_FIX}");
+        assert_eq!(
+            built, quoted,
+            "the module's three constants must join into keybindings.md's own quoted sentence"
+        );
+    }
+
+    /// Wide enough that all three tiers fit.
+    #[test]
+    fn the_no_shell_hint_reads_the_whole_sentence_when_the_frame_is_wide_enough() {
+        let expected = format!("{NO_SHELL_CORE}{NO_SHELL_MECHANISM}{NO_SHELL_FIX}");
+        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            bottom.contains(&expected),
+            "expected the whole no-shell sentence on the bottom border at 70 columns: \
+             {bottom:?}"
+        );
+    }
+
+    /// The mechanism clause is the first of the three tiers to give way: a frame too narrow
+    /// for the whole sentence still teaches "no shell" and the escape hatch, dropping only
+    /// the explanation of why, by the same discoverability-cost reasoning
+    /// [keybindings.md](../../../docs/spec/keybindings.md#the-footer) applies to the footer.
+    #[test]
+    fn the_no_shell_hint_drops_the_mechanism_clause_before_the_escape_hatch() {
+        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 40, 6);
+        let bottom = row_text(&buf, 5, 40);
+        assert!(
+            bottom.contains(NO_SHELL_CORE) && bottom.contains("sh -c"),
+            "expected \"no shell\" and the escape hatch to survive at 40 columns: {bottom:?}"
+        );
+        assert!(
+            !bottom.contains("literal"),
+            "expected the mechanism clause dropped before the escape hatch at 40 columns: \
+             {bottom:?}"
+        );
+    }
+
+    /// "no shell" is the one tier that never drops once anything is drawn at all: a frame
+    /// too narrow even for the escape hatch still names the fact, never a half-drawn clause.
+    #[test]
+    fn the_no_shell_hint_keeps_the_bare_words_once_the_escape_hatch_no_longer_fits() {
+        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 20, 6);
+        let bottom = row_text(&buf, 5, 20);
+        assert!(
+            bottom.contains(NO_SHELL_CORE),
+            "expected the bare \"no shell\" words to survive at 20 columns: {bottom:?}"
+        );
+        assert!(
+            !bottom.contains("sh -c"),
+            "expected the escape hatch dropped before \"no shell\" itself at 20 columns: \
+             {bottom:?}"
+        );
+    }
+
+    /// Below the width even "no shell" alone needs, nothing is drawn: the hint disappears
+    /// as a whole rather than clipping to a fragment ratatui's own title truncation would
+    /// otherwise cut mid-word.
+    #[test]
+    fn the_no_shell_hint_disappears_whole_rather_than_clipping_when_nothing_fits() {
+        assert_eq!(
+            no_shell_hint(6),
+            "",
+            "6 columns must be too narrow for any tier"
+        );
+        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 6, 6);
+        let bottom = row_text(&buf, 5, 6);
+        assert!(
+            !bottom.contains("no"),
+            "expected no fragment of the hint at 6 columns: {bottom:?}"
+        );
+    }
+
+    /// The confirm gate types nothing, so it has nothing for this hint to warn about: it is
+    /// drawn only while [`Stage::Choosing`] is what the field shows.
+    #[test]
+    fn the_no_shell_hint_is_absent_while_the_confirm_gate_is_showing() {
+        let mut palette = ActionPalette::new();
+        let actions = vec![action("reinstall", true)];
+        palette.choose(&actions, 3);
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(NO_SHELL_CORE),
+            "expected no \"no shell\" hint while confirming: {bottom:?}"
         );
     }
 
@@ -1866,6 +2023,11 @@ mod tests {
     /// own characters, the set the list and detail panes already draw, and degrades with
     /// them under `glyphs = "ascii"`. Both tables in the one test, so a second hardcoded
     /// rounded set would satisfy neither.
+    ///
+    /// Reads [`crate::test_support::assert_bordered_frame_and_top_title_drawn_with`] rather
+    /// than [`crate::test_support::assert_frame_drawn_with`], since the bottom border no
+    /// longer draws as a plain run once the no-shell hint is on it
+    /// ([`the_no_shell_hint_reads_the_whole_sentence_when_the_frame_is_wide_enough`]).
     #[test]
     fn draw_frames_the_palette_with_the_active_glyph_tables_own_border() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -1893,7 +2055,7 @@ mod tests {
                 })
                 .expect("draw the frame");
 
-            crate::test_support::assert_frame_drawn_with(
+            crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
                 terminal.backend().buffer(),
                 Rect::new(0, 0, 40, 10),
                 glyphs.border,
