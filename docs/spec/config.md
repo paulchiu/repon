@@ -355,6 +355,7 @@ when = "kind:repo"          # skip Worktrees and Submodules: they share node_mod
 [[action.steps]]
 args = ["rm", "-rf", "node_modules"]
 # shell = false              # runs through $SHELL -c
+                              # without it, $VAR and $(cmd) above stay literal, not expanded
 # env = {}                   # merged over the guaranteed environment contract
 
 [[action.steps]]

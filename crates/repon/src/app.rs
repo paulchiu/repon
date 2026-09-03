@@ -4098,7 +4098,9 @@ mod tests {
 
             app.action_palette = Some(ActionPalette::new());
             let buf = render_app_frame(&mut app, width, height);
-            crate::test_support::assert_frame_drawn_with(
+            // Not `assert_frame_drawn_with`: the ad hoc field's own bottom border carries
+            // the "no shell" hint rather than a plain run.
+            crate::test_support::assert_bordered_frame_and_top_title_drawn_with(
                 &buf,
                 whole_frame,
                 glyphs.border,
