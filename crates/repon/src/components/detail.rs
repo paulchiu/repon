@@ -833,7 +833,11 @@ fn describe_cell_spans<T>(
     meaning_for_value: impl FnOnce(&T) -> Meaning,
 ) -> StyledLine {
     match settled {
-        Some(Settled::Known { value, .. }) => {
+        Some(Settled::Known {
+            value,
+            at: _,
+            stale: _,
+        }) => {
             vec![(format_value(value), meaning_for_value(value).role())]
         }
         Some(Settled::Unknown(reason)) => vec![(
@@ -892,7 +896,11 @@ fn cell_freshness<T>(
     CellFreshness {
         label,
         age: match settled {
-            Some(Settled::Known { at, stale, .. }) => Some(freshness_text(*at, *stale)),
+            Some(Settled::Known {
+                value: _,
+                at,
+                stale,
+            }) => Some(freshness_text(*at, *stale)),
             _ => None,
         },
         in_flight,
