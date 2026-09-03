@@ -1690,10 +1690,8 @@ mod tests {
     #[test]
     fn a_rows_disagreeing_known_cells_print_one_refreshed_line_with_one_label_and_age_per_line() {
         let now = Timestamp::now();
-        let two_seconds_ago =
-            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
-        let five_seconds_ago =
-            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let two_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
+        let five_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
         let mut row = entity("a");
         row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
         row.base = settled_known_at(0u32, now, false);
@@ -1839,7 +1837,10 @@ mod tests {
         let lines = content_lines(&row, WIDE, full_glyphs());
 
         let freshness_line = line_labelled(&lines, "refreshed");
-        assert!(freshness_line.contains("just now"), "got {freshness_line:?}");
+        assert!(
+            freshness_line.contains("just now"),
+            "got {freshness_line:?}"
+        );
         assert_eq!(
             lines
                 .iter()
