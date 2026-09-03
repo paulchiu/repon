@@ -349,14 +349,25 @@ fn styled_content_lines(
         ))));
     }
     if let Some(freshness) = freshness {
-        let (label, value, role) = match freshness {
-            FreshnessRow::Loading(value) => ("loading", value, Meaning::LoadingSpinner.role()),
-            FreshnessRow::Refreshed(value) => ("refreshed", value, Meaning::Age.role()),
+        let (label, values, role) = match freshness {
+            FreshnessRow::Loading(value) => {
+                ("loading", vec![value], Meaning::LoadingSpinner.role())
+            }
+            FreshnessRow::Refreshed(values) => ("refreshed", values, Meaning::Age.role()),
         };
-        lines.push(ContentLine::Styled(labelled(
-            &format!("{label:<16}"),
-            vec![(value, role)],
-        )));
+        // One `ContentLine` per breakdown entry so `draw_lines` paints each on its own screen
+        // row; only the first carries the label, later entries indent under it.
+        for (index, value) in values.into_iter().enumerate() {
+            let label_text = if index == 0 {
+                format!("{label:<16}")
+            } else {
+                " ".repeat(16)
+            };
+            lines.push(ContentLine::Styled(labelled(
+                &label_text,
+                vec![(value, role)],
+            )));
+        }
     }
 
     if let Some(reason) = row_level_failure(diagnostics, last_action) {
@@ -914,10 +925,13 @@ enum FreshnessRow {
     /// those cells' own labels, outranking a stale or disagreeing age the way a Cell's own
     /// `is_in_flight` already outranks its settled state elsewhere.
     Loading(String),
-    /// Every currently-in-flight cell is quiet: the value is the shared age when every Known
-    /// cell agrees, or a `label, age` breakdown, one line per cell that disagrees with the
-    /// majority, when they do not.
-    Refreshed(String),
+    /// Every currently-in-flight cell is quiet: one line, the shared age, when every Known
+    /// cell agrees, or one `label, age` line per cell that disagrees with the majority, when
+    /// they do not. Each `String` is its own screen row, never a value with `\n` inside it:
+    /// [`draw_lines`] paints one `ContentLine` per row and neither it nor ratatui's own
+    /// `Buffer::set_stringn` splits on an embedded newline, so a caller collapsing this back
+    /// into one row would silently squash every entry after the first onto the row above it.
+    Refreshed(Vec<String>),
 }
 
 /// Folds the six cells' own freshness facts into the one row [`docs/spec/layout-and-provenance.md`'s
@@ -926,7 +940,9 @@ enum FreshnessRow {
 /// agrees to the second; comparing the already-formatted text rather than the raw `Timestamp`
 /// is deliberate, since a `stale` cell reads different text from a fresh neighbour even at the
 /// same instant, and either kind of real difference already fails this comparison without a
-/// separate flag for it.
+/// separate flag for it. The majority must be strict (more than half of the Known cells): short
+/// of that, no group can claim to be the baseline the rest disagree with, so every cell's own
+/// reading is named rather than picking whichever group the tally reaches first.
 fn freshness_row(cells: &[CellFreshness; 6]) -> Option<FreshnessRow> {
     let in_flight_labels: Vec<&str> = cells
         .iter()
@@ -948,19 +964,21 @@ fn freshness_row(cells: &[CellFreshness; 6]) -> Option<FreshnessRow> {
     }
     let majority_count = tally.iter().map(|(_, count)| *count).max()?;
     if majority_count == known.len() {
-        return Some(FreshnessRow::Refreshed(
+        return Some(FreshnessRow::Refreshed(vec![
             known[0].age.clone().expect("filtered to Known above"),
-        ));
+        ]));
     }
 
-    let majority_age = tally
-        .iter()
-        .find(|(_, count)| *count == majority_count)
-        .expect("the tallied max came from this same tally")
-        .0;
+    let majority_age = (majority_count * 2 > known.len()).then(|| {
+        tally
+            .iter()
+            .find(|(_, count)| *count == majority_count)
+            .expect("the tallied max came from this same tally")
+            .0
+    });
     let breakdown = known
         .iter()
-        .filter(|cell| cell.age.as_deref() != Some(majority_age))
+        .filter(|cell| majority_age.is_none() || cell.age.as_deref() != majority_age)
         .map(|cell| {
             format!(
                 "{}, {}",
@@ -968,8 +986,7 @@ fn freshness_row(cells: &[CellFreshness; 6]) -> Option<FreshnessRow> {
                 cell.age.as_deref().expect("filtered to Known above")
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
     Some(FreshnessRow::Refreshed(breakdown))
 }
 
@@ -1716,10 +1733,19 @@ mod tests {
 
         let lines = content_lines(&row, WIDE, full_glyphs());
 
-        let freshness_line = line_labelled(&lines, "refreshed");
+        let freshness_index = lines
+            .iter()
+            .position(|line| line.starts_with("refreshed"))
+            .expect("expected a refreshed line");
         assert_eq!(
-            freshness_line, "refreshed       sync, 2s ago\ndirty, 5s ago",
-            "got {freshness_line:?}"
+            lines[freshness_index], "refreshed       sync, 2s ago",
+            "got {lines:?}"
+        );
+        assert_eq!(
+            lines[freshness_index + 1],
+            "                dirty, 5s ago",
+            "expected the second breakdown entry on its own line, indented under the label, \
+             got {lines:?}"
         );
         assert_eq!(
             lines
@@ -1727,8 +1753,100 @@ mod tests {
                 .filter(|line| line.starts_with("refreshed"))
                 .count(),
             1,
-            "expected exactly one refreshed line, got {lines:?}"
+            "expected exactly one line to start with the refreshed label, got {lines:?}"
         );
+    }
+
+    /// `content_lines` flattens every `ContentLine` to plain text, so a breakdown squashed
+    /// into one `ContentLine` with an embedded `\n` reads identically to one split across
+    /// several `ContentLine`s there. Drawing through the real `Buffer` is the only way to
+    /// tell them apart: `Buffer::set_stringn` treats `\n` as a control character and drops
+    /// it, so a squashed breakdown paints both entries onto one screen row with no
+    /// separator between them instead of two rows.
+    #[test]
+    fn a_disagreement_breakdown_draws_each_label_age_line_as_its_own_screen_row() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let now = Timestamp::now();
+        let two_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
+        let five_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
+        row.base = settled_known_at(0u32, now, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), now, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, two_seconds_ago, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), five_seconds_ago, false);
+
+        let glyphs = full_glyphs();
+        let detail = Detail::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                detail.draw(frame, frame.area(), &row, glyphs, true, &theme::DEFAULT);
+            })
+            .expect("draw the frame");
+
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (1..buf.area.height.saturating_sub(1))
+            .map(|y| {
+                (1..buf.area.width.saturating_sub(1))
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        let refreshed_row = rows
+            .iter()
+            .position(|line| line.starts_with("refreshed"))
+            .unwrap_or_else(|| panic!("no refreshed row drawn, got {rows:?}"));
+        assert!(
+            rows[refreshed_row].contains("sync, 2s ago") && !rows[refreshed_row].contains("dirty"),
+            "expected only the first breakdown entry on the refreshed row, got {:?}",
+            rows[refreshed_row]
+        );
+        assert!(
+            rows[refreshed_row + 1].contains("dirty, 5s ago")
+                && !rows[refreshed_row + 1].contains("refreshed"),
+            "expected the second breakdown entry on its own row below, got {:?}",
+            rows[refreshed_row + 1]
+        );
+    }
+
+    /// With no group ahead of the rest, `freshness_row` used to report whichever group its
+    /// tally happened to reach first as "the majority" and hide those cells from the
+    /// breakdown entirely, so half a genuine 3-3 split vanished instead of reading as a
+    /// disagreement. Short of a strict majority, every cell's own reading is named.
+    #[test]
+    fn a_three_three_split_names_every_cell_rather_than_hide_half_behind_an_arbitrary_majority() {
+        let group_a = Timestamp::now();
+        let group_b = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(1));
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), group_a, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, group_a, false);
+        row.base = settled_known_at(0u32, group_a, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), group_b, false);
+        row.state = settled_known_at(WorktreeState::Active, group_b, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), group_b, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+        let freshness_index = lines
+            .iter()
+            .position(|line| line.starts_with("refreshed"))
+            .expect("expected a refreshed line");
+        let breakdown = &lines[freshness_index..freshness_index + 6];
+
+        for label in ["branch", "sync", "base", "dirty", "state", "default branch"] {
+            assert!(
+                breakdown.iter().any(|line| line.contains(label)),
+                "expected {label} named in a 3-3 split with no majority, got {breakdown:?}"
+            );
+        }
     }
 
     #[test]
