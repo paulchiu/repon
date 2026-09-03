@@ -733,19 +733,34 @@ impl Report {
     }
 }
 
+/// The Notice a management run raises for itself when `Action::Unwind` stopped it between
+/// rows rather than letting it reach its own end: [`Report::summary`]'s own counts, prefixed
+/// with how many of the whole Selection the run actually reached, so the truncation is
+/// explicit rather than a summary that quietly undercounts what a full run would have shown.
+/// `total` is the run's own starting size, from before the cancellation, never
+/// `report.records.len()` again.
+pub(crate) fn cancelled_summary(report: &Report, total: usize) -> String {
+    format!(
+        "{}, cancelled after {}/{total}",
+        report.summary(),
+        report.records.len()
+    )
+}
+
 /// Runs `plan`'s operation against one `target` alone, timing the act and turning its
 /// outcome into a `Record`. Exposed separately from [`run`] so a caller that wants to act
-/// between rows, a live paint naming each one as it starts, can drive the Selection's own
-/// loop itself rather than losing control to `run` for the whole thing at once; `run` itself
-/// is this called once per target, in order, with nothing between calls.
+/// between rows, publishing each one's own position as it starts and checking for a
+/// cancellation ahead of the next, can drive the Selection's own loop itself rather than
+/// losing control to `run` for the whole thing at once; `run` itself is this called once per
+/// target, in order, with nothing between calls.
 ///
 /// `worktree_admin_dir`, `linked_worktree_paths`, `ignored_directories_for_deletion` and
-/// `attempt_sync` are [`repon_core::Core::worktree_admin_dir`],
-/// [`repon_core::Core::linked_worktree_paths`],
-/// [`repon_core::Core::ignored_directories_for_deletion`] and
-/// [`repon_core::Core::attempt_auto_update`] at the one call site; taken as parameters, the
-/// same way [`Plan::with_risk`] takes `read`, so this module never needs a `Core` to be
-/// tested. `run_before_sync_hook` and `run_after_sync_hook` are consulted for
+/// `attempt_sync` are [`repon_core::ManagementHandle::worktree_admin_dir`],
+/// [`repon_core::ManagementHandle::linked_worktree_paths`],
+/// [`repon_core::ManagementHandle::ignored_directories_for_deletion`] and
+/// [`repon_core::ManagementHandle::attempt_auto_update`] at the one call site; taken as
+/// parameters, the same way [`Plan::with_risk`] takes `read`, so this module never needs a
+/// `Core` to be tested. `run_before_sync_hook` and `run_after_sync_hook` are consulted for
 /// `Operation::Sync` alone, `None` meaning the Set active for this run names no hook at all
 /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
 #[allow(clippy::too_many_arguments)]

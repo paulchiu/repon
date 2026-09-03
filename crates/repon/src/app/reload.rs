@@ -311,7 +311,7 @@ impl App {
     /// declared or past whatever the pressed digit named.
     ///
     /// Checked first, ahead of either of those two reasons: `1` to `9` is one of the four
-    /// bindings inert while an Action is fanning out
+    /// bindings inert while an Action is fanning out or a management run is outstanding
     /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
     /// confirming"), and a Set switch discards discovery and starts a fresh Generation, which
     /// must never race a fan-out's own completion Generation. This is the same action
@@ -319,7 +319,7 @@ impl App {
     /// digit reads differently from refused because a run is live, which is what proves the
     /// reason is computed here rather than fixed for `SwitchToSet` as a whole.
     pub(crate) fn switch_to_set(&mut self, nth: u8) {
-        if self.action_running() {
+        if self.any_run_outstanding() {
             self.set_notice(action_running_notice("Set switch"));
             return;
         }

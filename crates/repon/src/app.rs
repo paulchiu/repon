@@ -1,4 +1,8 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use color_eyre::eyre::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -135,6 +139,30 @@ impl UnwindLevel for CancelActionOnUnwind<'_> {
     }
 }
 
+/// Cancelling a management run in flight sits beside [`CancelActionOnUnwind`] at the unwind
+/// stack's same innermost level
+/// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)):
+/// the two are mutually exclusive, since starting either is refused while the other is
+/// outstanding ([`App::management_running`]'s own doc comment), so trying both on every Esc
+/// costs nothing on whichever press finds neither live. Unlike an Action fan-out, this never
+/// signals mid-row: it raises a flag the background thread checks before its next row
+/// starts, so a `delete` already removing one working tree always finishes it.
+struct CancelManagementOnUnwind<'a> {
+    run: Option<&'a ManagementRun>,
+}
+
+impl UnwindLevel for CancelManagementOnUnwind<'_> {
+    fn unwind(&mut self) -> bool {
+        match self.run {
+            Some(run) => {
+                run.cancel.store(true, Ordering::Release);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Closing the detail pane is the unwind stack's second level
 /// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)'s fixed order: an in-flight
 /// fan-out, then a range anchor, then the detail pane, then a committed Filter), live only
@@ -210,6 +238,41 @@ impl ActionRun {
             })
             .count()
     }
+}
+
+/// One row's own position in a management run still in flight: its name and where it sits
+/// among every row the run visits, the two facts [`management::row_notice`] turns into the
+/// live Notice [`App::draw_frame`] reads fresh every frame. `total` is fixed at the run's own
+/// start rather than read off `records.len()` later, so a run Esc cancels between rows still
+/// reports the whole Selection's own size against however many rows it actually reached.
+struct RowProgress {
+    name: Arc<str>,
+    position: usize,
+    total: usize,
+}
+
+/// What the background thread [`App::run_management`] starts sends back once every row (or
+/// the rows before an Esc cancellation) has run: the [`management::Report`] itself, and
+/// whether a cancellation cut the run short, which decides which of
+/// [`management::Report::summary`] or [`management::cancelled_summary`]
+/// [`App::poll_management_run`] raises once it applies the report.
+struct ManagementRunOutcome {
+    report: management::Report,
+    cancelled: bool,
+}
+
+/// State for one management run moved off the calling thread
+/// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)):
+/// the operation, for the row Notice's own wording; the shared position
+/// [`App::draw_frame`] reads every frame it is `Some`; the flag `Action::Unwind` raises to
+/// stop the loop before its next row starts, never mid-row; and the channel the finished
+/// [`ManagementRunOutcome`] arrives on, drained by [`App::poll_management_run`] on every
+/// [`Message::Tick`].
+struct ManagementRun {
+    operation: management::Operation,
+    progress: Arc<Mutex<RowProgress>>,
+    cancel: Arc<AtomicBool>,
+    outcome: mpsc::Receiver<ManagementRunOutcome>,
 }
 
 /// One dispatch the refresh key made: `Action::RefreshAll` (`r`, `F5`) or
@@ -290,6 +353,13 @@ pub struct App {
     /// tree and refs ([`repon_core::Core::delete_risk`]); the rows it names are the rows the
     /// run then acts on, so the count on screen and the run cannot disagree.
     management_plan: Option<Plan>,
+    /// `Some` from the instant `y` accepts [`Self::management_plan`] until the background
+    /// thread it starts sends back a finished [`ManagementRunOutcome`]
+    /// ([`Self::run_management`], [`Self::poll_management_run`]). While this is `Some`, a
+    /// second run is refused the same way [`Self::action_running`] already refuses one
+    /// ([`Self::management_running`]), and `Action::Unwind`'s own innermost level raises
+    /// `cancel` rather than running a second confirm gate.
+    management_run: Option<ManagementRun>,
     /// `Some` while the Launcher palette has focus, opened by `Action::OpenLauncher` (`!`)
     /// and closed by `Action::Cancel` (`Esc`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `input` context, the same one
@@ -298,19 +368,16 @@ pub struct App {
     /// stage: a Launcher hands off immediately.
     launcher_palette: Option<LauncherPalette>,
     /// `Some` between [`Self::choose_highlighted_launcher`] queuing a chosen Launcher and
-    /// [`Self::run`]'s own loop draining it with a live [`Tui`] in hand:
-    /// [`Self::handle_key_event_with_tui`] forwards the `Tui` it may be holding to
-    /// [`Self::run_management`]'s own paint alone, so every other press, a chosen Launcher
-    /// included, still queues rather than drawing inline. Taken (never merely read) the
-    /// moment it is handed to [`Self::run_launcher_handoff`], so a handoff runs at most once
-    /// per choice.
+    /// [`Self::run`]'s own loop draining it with a live [`Tui`] in hand: [`Self::handle_key_event`]
+    /// never holds one of its own at all, so every press, a chosen Launcher included, queues
+    /// rather than drawing inline. Taken (never merely read) the moment it is handed to
+    /// [`Self::run_launcher_handoff`], so a handoff runs at most once per choice.
     pending_launcher_handoff: Option<(EntityKey, Launcher)>,
     /// `true` between `Action::OpenInEditor` (`Ctrl+O`) firing inside the Action palette's
     /// ad hoc field and [`Self::run`]'s own loop draining it with a live [`Tui`] in hand, the
-    /// same reason `pending_launcher_handoff` is a flag rather than an immediate call:
-    /// `handle_key_event_with_tui` never hands its own `Tui`, when it is holding one, anywhere
-    /// but that one paint. Cleared the moment it is handed to
-    /// [`Self::run_action_editor_handoff`], so a handoff runs at most once per press.
+    /// same reason `pending_launcher_handoff` is a flag rather than an immediate call.
+    /// Cleared the moment it is handed to [`Self::run_action_editor_handoff`], so a handoff
+    /// runs at most once per press.
     pending_action_editor_handoff: bool,
     /// `true` between `Action::EditConfig` (`e`) firing and [`Self::run`]'s own loop draining
     /// it with a live [`Tui`] in hand, the identical reason `pending_action_editor_handoff` is
@@ -619,6 +686,7 @@ impl App {
             no_fetch: flag_no_fetch,
             quit_confirm: false,
             action_run: None,
+            management_run: None,
             refresh_run: None,
             row_order: RowOrder::default(),
             sort_menu_open: false,
@@ -914,11 +982,10 @@ impl App {
             self.handle_events(&mut tui)?;
             self.handle_messages(&mut tui)?;
             // Choosing a Launcher only queues the choice rather than running it inline, since
-            // `handle_key_event_with_tui`'s own `Tui` is on loan for the one press
-            // (`Self::run_management`'s paint) that actually needs it; this is the one point
+            // `handle_key_event` never holds a live `Tui` of its own; this is the one point
             // in the loop that drains the queued choice with a live `Tui` in hand, the same
-            // reason `should_suspend` below is a flag `handle_key_event_with_tui` sets and
-            // only `run` itself acts on.
+            // reason `should_suspend` below is a flag `handle_key_event` sets and only `run`
+            // itself acts on.
             if let Some((entity_key, launcher)) = self.pending_launcher_handoff.take() {
                 self.run_launcher_handoff(&mut tui, &entity_key, &launcher);
             }
@@ -966,12 +1033,7 @@ impl App {
             Event::Resize(columns, rows) => {
                 self.message_tx.send(Message::Resize(columns, rows))?;
             }
-            // The one key press that can start blocking work of its own
-            // (`Self::run_management`, over `y` on a built-in's confirm gate) needs a live
-            // `Tui` in hand to paint its own gate-down frame before that work starts, so this
-            // is the one event handed a mutable one rather than [`Self::handle_key_event`]'s
-            // own `None`.
-            Event::Key(key) => self.handle_key_event_with_tui(key, Some(tui))?,
+            Event::Key(key) => self.handle_key_event(key)?,
             Event::Paste(ref text) => self.handle_paste_event(text),
             Event::FocusGained => self.on_focus_gained(),
             Event::Error => self
@@ -983,16 +1045,6 @@ impl App {
             self.message_tx.send(message)?;
         }
         Ok(())
-    }
-
-    /// Every test's own entry point: [`Self::handle_key_event_with_tui`] with no live terminal
-    /// to hand a management run for painting its own gate-down frame, which the confirm
-    /// gate's `y` alone ever asks for. [`Self::handle_events`] is production's one caller of
-    /// the `tui`-carrying method directly, since it is the one place a live `Tui` exists to
-    /// pass.
-    #[cfg(test)]
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
-        self.handle_key_event_with_tui(key, None)
     }
 
     /// Routes the key through `self.bindings`, the live table a config reload replaces:
@@ -1035,7 +1087,7 @@ impl App {
     /// always `List` or `Detail` ([`Self::focus`]'s own doc comment), through
     /// `dispatch(List | Detail, key)` ([`keys::BindingTable::dispatch`] never consults those
     /// three contexts for either).
-    fn handle_key_event_with_tui(&mut self, key: KeyEvent, tui: Option<&mut Tui>) -> Result<()> {
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         // A Notice takes the status row from the warning slot, so one that outlives the press
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
@@ -1130,7 +1182,7 @@ impl App {
         }
 
         if self.action_palette.is_some() {
-            self.handle_action_palette_key(key, tui);
+            self.handle_action_palette_key(key);
             return Ok(());
         }
 
@@ -1160,33 +1212,32 @@ impl App {
         // ends up living, and a marker that moves or is renamed fails the test loudly rather
         // than reading as "nothing found".
         let message = match self.bindings.dispatch(self.focus, key) {
-            // Gated behind a confirm dialog while a fan-out is in flight, because quitting
-            // orphans the children (keybindings.md's "Quitting, suspending, confirming");
-            // `Action::Suspend` just below is never gated the same way, since suspending
-            // is reversible where quitting is not.
-            Some(Action::Quit) if !self.action_running() => Some(Message::Quit),
+            // Gated behind a confirm dialog while a fan-out or a management run is in
+            // flight, because quitting orphans the children (keybindings.md's "Quitting,
+            // suspending, confirming"); `Action::Suspend` just below is never gated the same
+            // way, since suspending is reversible where quitting is not.
+            Some(Action::Quit) if !self.any_run_outstanding() => Some(Message::Quit),
             Some(Action::Quit) => {
                 self.quit_confirm = true;
                 None
             }
             Some(Action::Suspend) => Some(Message::Suspend),
             Some(Action::ReloadConfig) => {
-                if self.action_running() {
+                if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Reload config"));
                 } else {
                     self.reload_config();
                 }
                 None
             }
-            // `handle_key_event_with_tui`'s own `Tui`, when it is holding one, never reaches
-            // this arm, so this only queues the handoff; `run` drains
-            // `pending_config_editor_handoff` with one in hand, the same shape
-            // `pending_action_editor_handoff` and `pending_launcher_handoff` already take.
-            // Gated the same way `Ctrl+R` is: the handoff ends in the identical
-            // `reload_config` call, which can rebuild `self.core` outright and must never
-            // race a fan-out's own completion Generation.
+            // `handle_key_event` never holds a live `Tui` of its own, so this only queues
+            // the handoff; `run` drains `pending_config_editor_handoff` with one in hand,
+            // the same shape `pending_action_editor_handoff` and `pending_launcher_handoff`
+            // already take. Gated the same way `Ctrl+R` is: the handoff ends in the
+            // identical `reload_config` call, which can rebuild `self.core` outright and
+            // must never race a fan-out's own completion Generation.
             Some(Action::EditConfig) => {
-                if self.action_running() {
+                if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Edit config"));
                 } else {
                     self.pending_config_editor_handoff = true;
@@ -1296,6 +1347,9 @@ impl App {
             }
             Some(Action::Unwind) => {
                 let mut cancel_action = CancelActionOnUnwind { core: &self.core };
+                let mut cancel_management = CancelManagementOnUnwind {
+                    run: self.management_run.as_ref(),
+                };
                 let mut close_pane = ClosePaneOnUnwind {
                     pane: &mut self.pane,
                     focus: &mut self.focus,
@@ -1305,6 +1359,7 @@ impl App {
                 };
                 unwind::unwind_one(&mut [
                     &mut cancel_action,
+                    &mut cancel_management,
                     &mut self.selection,
                     &mut close_pane,
                     &mut clear_filter,
@@ -1336,7 +1391,7 @@ impl App {
                 None
             }
             Some(Action::OpenSetPicker) => {
-                if self.action_running() {
+                if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Set picker"));
                 } else {
                     self.set_picker = Some(SetPicker::new());
@@ -1352,7 +1407,7 @@ impl App {
                 None
             }
             Some(Action::OpenActionPalette) => {
-                if self.action_running() {
+                if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Action palette"));
                 } else {
                     self.action_palette = Some(ActionPalette::new());
@@ -1420,7 +1475,7 @@ impl App {
             // ([repo-management.md](../../../docs/spec/repo-management.md)'s "Keys"). Gated
             // while a fan-out is in flight for the same reason `;` is: it is the same palette.
             Some(Action::OpenManagementPalette) => {
-                if self.action_running() {
+                if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Action palette"));
                 } else {
                     self.action_palette = Some(ActionPalette::management());
@@ -1616,7 +1671,7 @@ impl App {
     /// `AcceptCompletion` (`Tab`) stays inert here permanently, not merely until this ticket:
     /// keybindings.md scopes `Tab`'s completion-accept to the Filter line alone, and this
     /// palette has no completion list of its own.
-    fn handle_action_palette_key(&mut self, key: KeyEvent, mut tui: Option<&mut Tui>) {
+    fn handle_action_palette_key(&mut self, key: KeyEvent) {
         let Some(palette) = &self.action_palette else {
             return;
         };
@@ -1637,22 +1692,7 @@ impl App {
                         self.start_action(spec);
                     }
                     if let Some(operation) = management {
-                        // `tui` paints the gate coming down before `run_management`'s own
-                        // blocking work starts, and repaints before every row after that; a
-                        // test with none still gets the gate closed and each Notice set, just
-                        // no live terminal to draw them to. `as_deref_mut` reborrows rather
-                        // than consuming `tui`, since this hook runs more than once.
-                        self.run_management(operation, |app| {
-                            let Some(tui) = tui.as_deref_mut() else {
-                                return;
-                            };
-                            if let Err(err) = app.render(tui) {
-                                tracing::error!(
-                                    "could not paint the frame before `{}` began: {err}",
-                                    operation.name()
-                                );
-                            }
-                        });
+                        self.run_management(operation);
                     }
                     self.close_action_palette();
                 }
@@ -1943,10 +1983,9 @@ impl App {
     /// Closes the palette and queues the choice in `self.pending_launcher_handoff` for
     /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
     /// ([`Self::run_launcher_handoff`] is what actually calls
-    /// [`Self::around_entity_handoff`]): the `Tui` `handle_key_event_with_tui` may be holding
-    /// never reaches this method, the same reason `Action::Suspend` only sets
-    /// `self.should_suspend` here and leaves the real
-    /// `tui.suspend()` call to `Self::run`. A missing cursor (an empty table) or an empty
+    /// [`Self::around_entity_handoff`]): `handle_key_event` never holds one of its own, the
+    /// same reason `Action::Suspend` only sets `self.should_suspend` here and leaves the
+    /// real `tui.suspend()` call to `Self::run`. A missing cursor (an empty table) or an empty
     /// match list leaves the palette open and untouched, the same as
     /// [`Self::choose_highlighted_action`] does for a query matching nothing.
     fn choose_highlighted_launcher(&mut self) {
@@ -2141,68 +2180,37 @@ impl App {
         self.management_plan = None;
     }
 
-    /// `y` over a built-in's confirm gate: runs [`Self::management_plan`] against the config
-    /// file, leaves a receipt per row, announces what it did and reloads.
+    /// `y` over a built-in's confirm gate: starts [`Self::management_plan`] running against
+    /// the config file on a background thread and returns at once, rather than blocking the
+    /// caller for `delete`'s own worktree walk
+    /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)).
+    /// [`Self::apply_management_report`] is where the receipt, the drop and the reload this
+    /// used to run inline still happen, once [`Self::poll_management_run`] finds the
+    /// background thread's own report waiting.
     ///
-    /// The receipt is [`repon_core::Core::record_own_work`]'s, one per Selection row including
-    /// the ones the gate already refused, so the detail pane names per Repo what was done or
-    /// why it was refused (`docs/spec/repo-management.md`'s "Receipts"). It does not replace
-    /// the gate, which still names and counts every refusal beforehand, and its words are
-    /// [`crate::management::own_work`]'s, the same ones the log lines above it carry.
-    ///
-    /// The plan is the one the gate was built from, so the rows named on screen are the rows
-    /// acted on. `operation` is checked against it rather than trusted: the two come from the
+    /// `operation` is checked against the plan rather than trusted: the two come from the
     /// palette and from this struct, and a mismatch means a gate outlived its own plan.
+    /// Refuses to start a second run while [`Self::management_running`] is already true, the
+    /// identical refusal `Core::run_action` already gives a second fan-out.
     ///
-    /// The reload is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs
-    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config"), so
-    /// config reaches the running app one way and a write cannot produce a state the file
-    /// alone would not reproduce. Nothing here touches `self.document`.
-    ///
-    /// An `ignore` takes effect in this same frame: the reload re-applies `exclude` live
-    /// through [`repon_core::Core::set_exclusions`], so the row it named is subtracted from
-    /// the Action confirm gate's count and from every operation's eligible set with no
-    /// refresh and no restart
-    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config").
-    /// `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and
-    /// still needs a rebuilt `Core`; Repon never writes it.
-    ///
-    /// A row `delete` removed leaves the table here, through
-    /// [`repon_core::Core::dismiss`] over the report's own removed rows, rather than waiting
-    /// for a Generation to find it gone and mark it Vanished
-    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
-    /// behind"). No Generation starts here either way: `docs/spec/refresh.md`'s Triggers
-    /// table is a closed list naming no management trigger, and dismissing needs none.
-    ///
-    /// `before_sync` and `after_sync` are resolved here too, fresh from `self.document` and
-    /// `self.active_set.name`, and run through
-    /// [`repon_core::Core::run_action_for_entity_blocking`], blocking this call until each
-    /// row's own hook finishes: `sync`'s own outcome per row depends on whether its pre-hook
-    /// passed, which an asynchronous fan-out could not answer before this function returns
-    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync",
-    /// [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)).
-    /// This whole call is reached from `y` over the confirm gate alone, so a hook fires from
-    /// that keystroke and never from a Generation, the same restriction
+    /// `before_sync` and `after_sync` are still resolved here, on the calling thread, fresh
+    /// from `self.document` and `self.active_set.name` and turned into an owned
+    /// [`repon_core::ActionSpec`] before the background thread starts: this whole call is
+    /// still reached from `y` over the confirm gate alone, so a hook still fires from that
+    /// keystroke and never from a Generation, the same restriction
     /// [0029](../../../docs/adr/0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md)
     /// fixes for `on_refresh`.
     ///
-    /// `paint` runs once the gate is down and the running Notice is up, before any of the
-    /// blocking work below, and again before each row's own work starts: a live `Tui` draw
-    /// from [`Self::handle_events`] in production, a no-op everywhere else. `delete`'s own
-    /// worktree walk and hooks can take seconds per row, and the confirm gate is the worst
-    /// frame to leave standing through that, since it still reads as a question a user might
-    /// answer twice; a screen that never moves again once the gate closes is barely better,
-    /// which is why the loop below repaints between rows rather than once at the start alone.
-    fn run_management(
-        &mut self,
-        operation: management::Operation,
-        mut paint: impl FnMut(&mut Self),
-    ) {
-        // scan: management_write_reload begin -- criterion 8: everything between this pair is
-        // what a management write does after the gate is accepted, and the test over this
-        // region asserts it reaches config through `reload_config` and touches no in-memory
-        // document of its own. A marker that moves or is renamed fails that test loudly rather
-        // than reading as "nothing found".
+    /// The background thread runs [`management::run_one_record`] once per target, in the
+    /// plan's own order, exactly as this method used to run it inline; the one new step is
+    /// the check against `cancel` ahead of each row, so `Action::Unwind`'s own
+    /// `CancelManagementOnUnwind` level can stop the loop before its next row starts and
+    /// never mid-row, which is why a `delete` already removing one working tree always
+    /// finishes it. `handle` ([`repon_core::Core::management_handle`]) is this run's own
+    /// clone of the table, moved onto the thread rather than the `Core` this method itself
+    /// holds, which stays a single owner (`Core::run_action`'s own doc comment on why
+    /// cloning `Core` itself is not an option).
+    fn run_management(&mut self, operation: management::Operation) {
         let Some(plan) = self.management_plan.take() else {
             return;
         };
@@ -2216,63 +2224,181 @@ impl App {
         }
         self.action_palette = None;
         self.set_notice(management::running_notice(operation, plan.eligible_count()));
-        paint(self);
+        // scan: management_run_start begin -- criterion 8's first half: everything between
+        // this pair is what a management run reads and does before its own report reaches
+        // the main thread, and the test over this region asserts the sync hooks and the
+        // per-row reads all sit here. A marker that moves or is renamed fails that test
+        // loudly rather than reading as "nothing found".
         let before_sync_hook = self
             .before_sync_action()
             .map(crate::action_palette::to_action_spec);
         let after_sync_hook = self
             .after_sync_action()
             .map(crate::action_palette::to_action_spec);
-        // Each row gets its own Notice, naming it and its position, before that row's own
-        // work starts: over several rows this makes the run legible rather than a frozen
-        // count, and for one large row it is the only thing on screen while it runs.
+        let handle = self.core.management_handle();
+        let config_file = self.config_file.clone();
         let total = plan.targets.len();
-        let mut records = Vec::with_capacity(total);
-        for (index, target) in plan.targets.iter().enumerate() {
-            self.set_notice(management::row_notice(
-                operation,
-                &target.name,
-                index + 1,
-                total,
-            ));
-            paint(self);
-            let run_sync_hook = |hook: &Option<repon_core::ActionSpec>, key: &EntityKey| {
-                let action = hook.as_ref()?;
-                let receipt = self.core.run_action_for_entity_blocking(action, key)?;
-                Some(management::hook_outcome_from_receipt(&receipt))
-            };
-            records.push(management::run_one_record(
-                &plan,
-                target,
-                &self.config_file,
-                |key| self.core.worktree_admin_dir(key).ok(),
-                |key| self.core.linked_worktree_paths(key).unwrap_or_default(),
-                |path| {
-                    self.core
-                        .ignored_directories_for_deletion(path)
-                        .unwrap_or_default()
-                },
-                |key| self.core.attempt_auto_update(key),
-                |key| run_sync_hook(&before_sync_hook, key),
-                |key| run_sync_hook(&after_sync_hook, key),
-            ));
-        }
-        let report = management::Report { operation, records };
-        for record in &report.records {
-            tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
-        }
+        let progress = Arc::new(Mutex::new(RowProgress {
+            name: Arc::from(""),
+            position: 0,
+            total,
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let progress_for_thread = Arc::clone(&progress);
+        let cancel_for_thread = Arc::clone(&cancel);
+        thread::spawn(move || {
+            let mut records = Vec::with_capacity(total);
+            let mut cancelled = false;
+            for (index, target) in plan.targets.iter().enumerate() {
+                if cancel_for_thread.load(Ordering::Acquire) {
+                    cancelled = true;
+                    break;
+                }
+                // Each row's own position is published before that row's own work starts:
+                // over several rows this makes the run legible rather than a frozen count,
+                // and for one large row it is the only thing on screen while it runs
+                // ([`App::draw_frame`] reads it fresh every frame).
+                *progress_for_thread.lock().unwrap() = RowProgress {
+                    name: Arc::clone(&target.name),
+                    position: index + 1,
+                    total,
+                };
+                let run_sync_hook = |hook: &Option<repon_core::ActionSpec>, key: &EntityKey| {
+                    let action = hook.as_ref()?;
+                    let receipt = handle.run_action_for_entity_blocking(action, key)?;
+                    Some(management::hook_outcome_from_receipt(&receipt))
+                };
+                records.push(management::run_one_record(
+                    &plan,
+                    target,
+                    &config_file,
+                    |key| handle.worktree_admin_dir(key).ok(),
+                    |key| handle.linked_worktree_paths(key).unwrap_or_default(),
+                    |path| {
+                        handle
+                            .ignored_directories_for_deletion(path)
+                            .unwrap_or_default()
+                    },
+                    |key| handle.attempt_auto_update(key),
+                    |key| run_sync_hook(&before_sync_hook, key),
+                    |key| run_sync_hook(&after_sync_hook, key),
+                ));
+            }
+            let report = management::Report { operation, records };
+            for record in &report.records {
+                tracing::info!("{}: {}", record.name, management::describe(&record.outcome));
+            }
+            // A closed receiver means the `App` that started this run is already gone
+            // (quit, or dropped mid-test); nothing is left to hand the report to.
+            let _ = tx.send(ManagementRunOutcome { report, cancelled });
+        });
+        // scan: management_run_start end
+        self.management_run = Some(ManagementRun {
+            operation,
+            progress,
+            cancel,
+            outcome: rx,
+        });
+    }
+
+    /// Drains [`Self::management_run`]'s own channel once its background thread's per-row
+    /// loop has finished, applying the report the instant it arrives
+    /// ([`Self::apply_management_report`]) and raising the summary Notice: the ordinary one
+    /// ([`management::Report::summary`]) for a run that reached its own end, or
+    /// [`management::cancelled_summary`] for one `Action::Unwind` stopped between rows. A
+    /// no-op while no run is outstanding, or while one is but has not sent its report yet.
+    /// Called on every `Message::Tick`, never gated behind a keypress or a render, so the
+    /// report is applied as soon as the next tick after the background thread finishes.
+    fn poll_management_run(&mut self) {
+        let Some(run) = &self.management_run else {
+            return;
+        };
+        let Ok(outcome) = run.outcome.try_recv() else {
+            return;
+        };
+        let total = run.progress.lock().unwrap().total;
+        self.management_run = None;
+        let notice = if outcome.cancelled {
+            management::cancelled_summary(&outcome.report, total)
+        } else {
+            outcome.report.summary()
+        };
+        self.apply_management_report(&outcome.report);
+        self.set_notice(notice);
+    }
+
+    /// The effects a management run's own report still makes on this thread once it is
+    /// ready, unchanged from what [`Self::run_management`] used to run inline before its
+    /// per-row work moved onto a background thread
+    /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)):
+    /// the receipt is [`repon_core::Core::record_own_work`]'s, one per row including the ones
+    /// the gate already refused, so the detail pane names per Repo what was done or why it
+    /// was refused (`docs/spec/repo-management.md`'s "Receipts"). A row `delete` removed
+    /// leaves the table here, through [`repon_core::Core::dismiss`] over the report's own
+    /// removed rows, rather than waiting for a Generation to find it gone and mark it
+    /// Vanished (`docs/spec/repo-management.md`'s "What `delete` leaves behind"). The reload
+    /// is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs, so config
+    /// reaches the running app one way and this call touches no in-memory document of its
+    /// own; an `ignore` still takes effect the moment this runs, through the same
+    /// `set_exclusions` reload already gives `Action::ReloadConfig`.
+    fn apply_management_report(&mut self, report: &management::Report) {
+        // scan: management_report_apply begin -- criterion 8's second half: everything
+        // between this pair is what a management write does once its report is ready, and
+        // the test over this region asserts it reaches config through `reload_config` and
+        // touches no in-memory document of its own. A marker that moves or is renamed fails
+        // that test loudly rather than reading as "nothing found".
         self.core
-            .record_own_work(operation.name(), &report.own_work_records());
+            .record_own_work(report.operation.name(), &report.own_work_records());
         for key in report.removed_keys() {
             self.core.dismiss(&key);
             self.selection.remove(&key);
         }
         self.reload_config();
-        // scan: management_write_reload end
+        // scan: management_report_apply end
         // The rows just dropped shortened the table under a standing cursor, the same
         // re-clamp [`Self::dismiss_vanished_at_cursor`] does after its own removal.
         self.set_cursor(self.cursor);
-        self.set_notice(report.summary());
+    }
+
+    /// `true` from the instant a management run's confirm gate is accepted
+    /// ([`Self::run_management`]) until its background thread's report is applied
+    /// ([`Self::poll_management_run`]): what gates the same bindings
+    /// [`Self::action_running`] already gates (`;`, `m`, `s`, the digits, `Ctrl+R`, `e` and
+    /// `q`), so a fan-out and a management run can never both reach for `self.core` or
+    /// `self.document` at once
+    /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)).
+    fn management_running(&self) -> bool {
+        self.management_run.is_some()
+    }
+
+    /// Either background run this crate can have outstanding at once: an Action's own
+    /// fan-out ([`Self::action_running`]) or a management run
+    /// ([`Self::management_running`]), the two conditions `;`, `m`, `s`, the digits,
+    /// `Ctrl+R`, `e` and `q` all refuse a press against, spelled once here rather than
+    /// twice at every one of those call sites.
+    fn any_run_outstanding(&self) -> bool {
+        self.action_running() || self.management_running()
+    }
+
+    /// The Notice naming a management run's current row, read fresh off
+    /// [`Self::management_run`]'s own shared position: `None` while no run is outstanding,
+    /// or while one is but its background thread has not reached its first row yet, in which
+    /// case [`Self::run_management`]'s own `running_notice` is still the one on screen.
+    /// [`Self::draw_frame`] raises this as the live Notice every frame a run is outstanding,
+    /// which is what keeps the row legible across however many keypresses land between the
+    /// rows the run visits (`Self::handle_key_event` clears `self.notice` on every press).
+    fn live_management_row_notice(&self) -> Option<String> {
+        let run = self.management_run.as_ref()?;
+        let progress = run.progress.lock().unwrap();
+        (progress.position > 0).then(|| {
+            management::row_notice(
+                run.operation,
+                &progress.name,
+                progress.position,
+                progress.total,
+            )
+        })
     }
 
     /// Runs `spec` over [`Self::action_targets`], the seam every Action-running path in this
@@ -2809,7 +2935,7 @@ impl App {
                 Message::Resize(columns, rows) => self.resize(tui, columns, rows)?,
                 Message::Render => self.render(tui)?,
                 Message::Error(ref text) => tracing::error!(message = text),
-                Message::Tick => {}
+                Message::Tick => self.poll_management_run(),
             }
             if let Some(message) = self.list.update(message)? {
                 self.message_tx.send(message)?;
@@ -2878,6 +3004,14 @@ impl App {
                 self.theme.style_for(theme::Role::Warn),
             );
             return None;
+        }
+        // A management run in flight publishes its current row on a shared clock the
+        // background thread updates, rather than a `set_notice` call this thread could make
+        // only once per row: reading it fresh here, every frame, is what keeps the row Notice
+        // moving while the loop runs, and overrides whatever a keypress since the last row
+        // cleared it (`Self::handle_key_event` clears `self.notice` on every press).
+        if let Some(text) = self.live_management_row_notice() {
+            self.set_notice(text);
         }
         let mut error = None;
         let snapshot = self.core.snapshot();
@@ -3494,6 +3628,7 @@ mod tests {
             no_fetch: false,
             quit_confirm: false,
             action_run: None,
+            management_run: None,
             refresh_run: None,
             row_order: RowOrder::default(),
             sort_menu_open: false,
@@ -5576,14 +5711,32 @@ mod tests {
         app
     }
 
-    /// Opens the management palette, chooses the operation named `operation` and accepts the
-    /// gate, all through `handle_key_event`: the production key path and nothing beside it,
-    /// so a `y` that stopped running the plan fails every test built on this rather than
-    /// passing a scan over the callee it no longer calls.
+    /// Opens the management palette, chooses the operation named `operation`, accepts the
+    /// gate and waits for the background thread it starts to finish, all through
+    /// `handle_key_event` and [`wait_for_management_run`]: the production key path and
+    /// nothing beside it, so a `y` that stopped running the plan fails every test built on
+    /// this rather than passing a scan over the callee it no longer calls. Every test that
+    /// asserts on the run's own effects (a write on disk, a dropped row, the summary Notice)
+    /// wants this rather than [`open_the_management_gate`] alone: a test that instead needs
+    /// to see the gate closed but the run still outstanding presses `y` itself and reads
+    /// [`App::management_running`] before waiting.
     fn press_through_the_management_gate(app: &mut App, operation: management::Operation) {
         open_the_management_gate(app, operation);
         app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("press y");
+        wait_for_management_run(app);
+    }
+
+    /// Drains [`App::poll_management_run`] until [`App::management_running`] answers false,
+    /// the seam every test needing a management run's own finished effects goes through
+    /// rather than reaching for `Core::action_running`'s own `wait_for` shape directly: unlike
+    /// that one, nothing settles this run's own outstanding state but a poll from this
+    /// thread, so the condition itself has to drive the drain rather than merely read a flag.
+    fn wait_for_management_run(app: &mut App) {
+        wait_for("a management run to finish", || {
+            app.poll_management_run();
+            !app.management_running()
+        });
     }
 
     /// [`press_through_the_management_gate`] stopped one press short, with the gate open and
@@ -5625,14 +5778,17 @@ mod tests {
             .collect()
     }
 
-    /// `run_management`'s own paint hook, the seam a live `Tui` (in `App::run`) or nothing
-    /// (every other caller) is handed through: the first call must land once the gate is
-    /// already down and the running Notice already up, before `management::run_one_record`
-    /// does anything to disk, and a later call must land once that row's own Notice is up. A
-    /// hook that fires late, or fires against a gate still open, fails this the same way a
-    /// real terminal left showing the stale gate for the whole run would.
+    /// `y` over a built-in's confirm gate: the gate closes and [`App::management_running`]
+    /// answers true in the very same call, before the background thread it starts can have
+    /// reported anything back. Nothing the eventual report would change (the entity dropped
+    /// from the table, the working tree gone from disk, the summary Notice) is visible yet,
+    /// since [`App::apply_management_report`] only ever runs from
+    /// [`App::poll_management_run`], which nothing but an explicit drain calls
+    /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)).
+    /// [`wait_for_management_run`] is what a test after this one reaches for once it wants
+    /// those effects instead.
     #[test]
-    fn the_gate_closes_and_a_running_notice_is_set_before_the_blocking_delete_starts() {
+    fn y_over_the_delete_gate_closes_it_at_once_and_leaves_the_row_untouched_until_polled() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
@@ -5642,95 +5798,147 @@ mod tests {
         open_the_management_gate(&mut app, management::Operation::Delete);
         assert!(
             app.action_palette.is_some(),
-            "the fixture must open the gate before the hook can be asked to close it"
+            "the fixture must open the gate before `y` can be asked to close it"
         );
 
-        let mut notices_seen = Vec::new();
-        app.run_management(management::Operation::Delete, |app| {
-            assert!(
-                app.action_palette.is_none(),
-                "the gate must already be closed by the time a frame paints"
-            );
-            assert!(
-                repo.exists(),
-                "every paint before the row's own work must see the tree still there"
-            );
-            notices_seen.push(app.notice().map(str::to_string));
-        });
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
 
-        assert_eq!(
-            notices_seen.first().cloned().flatten().as_deref(),
-            Some("delete: running on 1 repos"),
-            "the first paint must already say what is about to run, got {notices_seen:?}"
+        assert!(
+            app.action_palette.is_none(),
+            "the gate closes the instant the background thread starts, not once it finishes"
         );
         assert!(
-            notices_seen
-                .iter()
-                .any(|notice| notice.as_deref() == Some("delete: repo-a (1/1)")),
-            "a later paint must name the row and its position before that row's own work \
-             starts, got {notices_seen:?}"
+            app.management_plan.is_none(),
+            "the plan is taken the instant the run starts"
         );
+        assert!(
+            app.management_running(),
+            "a run just started must read as running"
+        );
+        assert_eq!(
+            app.core.snapshot().entities.len(),
+            1,
+            "the row is still in the table until the report is applied"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("delete: running on 1 repos"),
+            "the running Notice is set synchronously, before the thread starts"
+        );
+
+        wait_for_management_run(&mut app);
+
         assert!(
             !repo.exists(),
-            "the run still deletes the tree once painted"
+            "the run deletes the tree once its report is applied"
+        );
+        assert!(
+            app.core.snapshot().entities.is_empty(),
+            "the row is dropped from the table once the report is applied"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("delete: 1 done"),
+            "the summary Notice replaces the running one once the report is applied"
         );
     }
 
-    /// Over several rows, not just one: every target gets its own paint before its own work
-    /// starts, naming it and its position among the whole run, in the plan's own order, so a
-    /// multi-row run reads as progress rather than a frozen count
-    /// (issue #336: "over N rows the user cannot tell whether it is on the first or the
-    /// last").
+    /// [`App::draw_frame`] reads a management run's own live position fresh every frame
+    /// ([`App::live_management_row_notice`]), so this drives the mechanism directly against
+    /// a hand-built [`ManagementRun`] rather than racing a background thread's own real
+    /// timing: what row a fast fixture's thread has reached by the time a test gets to draw
+    /// a frame is not a fact a test can pin, but what `draw_frame` does with a known position
+    /// is.
     #[test]
-    fn run_management_paints_once_per_row_naming_each_ones_position_in_order() {
+    fn draw_frame_shows_the_management_runs_current_row_as_the_live_notice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        for name in ["repo-a", "repo-b", "repo-c"] {
-            init_repo(&root.join(name));
-        }
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Ignore,
+            progress: std::sync::Arc::new(std::sync::Mutex::new(RowProgress {
+                name: std::sync::Arc::from("repo-b"),
+                position: 2,
+                total: 3,
+            })),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outcome: rx,
+        });
+        app.set_notice("stale, from a keypress before this frame".to_string());
+
+        render_to_lines(&mut app, 80, 24);
+
+        assert_eq!(
+            app.notice(),
+            Some("ignore: repo-b (2/3)"),
+            "the live row must override whatever Notice a keypress last set"
+        );
+    }
+
+    /// Esc between rows: `Action::Unwind`'s `CancelManagementOnUnwind` level raises the
+    /// run's own `cancel` flag rather than stopping it mid-row, so a `before_sync` hook
+    /// already running finishes clean and the second row of a two-row `sync` never starts
+    /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)'s
+    /// cancellation grain). The first row's own hook sleeps long enough for the test to
+    /// reliably catch the run mid-row before pressing Esc, the same technique `slow_action`
+    /// gives `Core::run_action`'s own equivalent test.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn esc_cancels_a_management_run_between_rows_never_mid_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
         let config_dir = tempfile::tempdir().expect("config temp dir");
         let mut app = test_app_with_config(&root, config_dir.path());
-        let entities = app.core.snapshot().entities;
-        assert_eq!(
-            entities.len(),
-            3,
-            "the fixture must discover all three repos"
-        );
-        let ordered_keys: Vec<_> = entities.iter().map(|entity| entity.key.clone()).collect();
-        app.management_plan = Some(management::Plan::new(
-            management::Operation::Ignore,
-            &entities,
-            &ordered_keys,
-        ));
+        app.document.actions.push(slow_action("before_sync_hook"));
+        app.document.before_sync = Some("before_sync_hook".to_string());
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
 
-        let mut notices_seen = Vec::new();
-        app.run_management(management::Operation::Ignore, |app| {
-            notices_seen.push(app.notice().map(str::to_string));
+        open_the_management_gate(&mut app, management::Operation::Sync);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        assert!(
+            app.management_running(),
+            "the run must still be outstanding while the first row's own hook sleeps"
+        );
+        // The background thread publishes a row's own position before that row's work
+        // starts, so waiting for it here (rather than pressing Esc the instant `y` returns)
+        // is what makes the row's own one-second sleep a reliable window to press Esc
+        // inside, instead of a race against whether the OS has even scheduled the thread.
+        wait_for("the first row to start", || {
+            app.management_run
+                .as_ref()
+                .is_some_and(|run| run.progress.lock().unwrap().position > 0)
         });
 
-        let mut expected = vec![Some("ignore: running on 3 repos".to_string())];
-        expected.extend(entities.iter().enumerate().map(|(index, entity)| {
-            Some(management::row_notice(
-                management::Operation::Ignore,
-                &entity.name,
-                index + 1,
-                3,
-            ))
-        }));
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("press Esc");
+
+        wait_for_management_run(&mut app);
+
         assert_eq!(
-            notices_seen, expected,
-            "each row must paint its own Notice, in order, before that row's own work starts"
+            app.notice()
+                .map(|notice| notice.contains("cancelled after 1/2")),
+            Some(true),
+            "the report must say it reached one of the two rows the gate named, got {:?}",
+            app.notice()
         );
     }
 
     /// The whole gesture, end to end through the real key path: `m`, `Enter`, `y`, and then a
     /// `[[repo]]` entry on disk carrying `exclude = true`, the row subtracted from what any
-    /// operation may reach in the very same frame, and a Notice saying what happened. A `y`
-    /// that ran nothing fails all three ([repo-management.md](../../../docs/spec/repo-management.md)'s
-    /// "Writing config": an `ignore` "takes effect immediately ... without a refresh and
+    /// operation may reach once the run's own report is applied, and a Notice saying what
+    /// happened. A `y` that ran nothing fails all three
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config": an
+    /// `ignore` "takes effect as soon as its own report is applied ... without a refresh and
     /// without a restart").
     #[test]
-    fn y_on_the_ignore_gate_writes_the_entry_and_subtracts_the_row_in_the_same_frame() {
+    fn y_on_the_ignore_gate_writes_the_entry_and_subtracts_the_row_once_the_run_finishes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
@@ -6213,6 +6421,7 @@ mod tests {
 
         app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("press y");
+        wait_for_management_run(&mut app);
 
         assert!(!repo.exists(), "the Repo's own working tree is gone");
         assert!(
@@ -6249,10 +6458,14 @@ mod tests {
     /// The same "computed, not stubbed" claim for what a `delete` run needs to remove a
     /// Worktree the way `git worktree remove` does, what it needs for `delete`'s own ignored-
     /// directories phase 1, and what a `sync` run needs to attempt the fast-forward:
-    /// [`repon_core::Core::worktree_admin_dir`], [`repon_core::Core::linked_worktree_paths`],
-    /// [`repon_core::Core::ignored_directories_for_deletion`] and
-    /// [`repon_core::Core::attempt_auto_update`] at the one call site, not a literal this
-    /// crate could hand [`crate::management::run_one_record`] instead.
+    /// [`repon_core::ManagementHandle::worktree_admin_dir`],
+    /// [`repon_core::ManagementHandle::linked_worktree_paths`],
+    /// [`repon_core::ManagementHandle::ignored_directories_for_deletion`] and
+    /// [`repon_core::ManagementHandle::attempt_auto_update`] at the one call site, not a
+    /// literal this crate could hand [`crate::management::run_one_record`] instead. Through
+    /// the handle [`repon_core::Core::management_handle`] vends, rather than `self.core`
+    /// directly, since this call site runs on the background thread [`App::run_management`]
+    /// starts.
     #[test]
     fn the_delete_run_reads_its_worktree_removal_from_the_core_rather_than_a_literal() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -6268,35 +6481,38 @@ mod tests {
             "expected exactly one place a `delete` run is dispatched, found: {call_sites:?}"
         );
         assert!(
-            source.contains("self.core.worktree_admin_dir(key)"),
-            "the run must read a Worktree's admin dir off the Core"
+            source.contains("handle.worktree_admin_dir(key)"),
+            "the run must read a Worktree's admin dir off the management handle"
         );
         assert!(
-            source.contains("self.core.linked_worktree_paths(key)"),
-            "the run must read a Repo's linked Worktree paths off the Core"
+            source.contains("handle.linked_worktree_paths(key)"),
+            "the run must read a Repo's linked Worktree paths off the management handle"
         );
         assert!(
             source.contains(".ignored_directories_for_deletion(path)"),
-            "the run must enumerate a working tree's ignored directories off the Core"
+            "the run must enumerate a working tree's ignored directories off the management \
+             handle"
         );
         assert!(
-            source.contains("self.core.attempt_auto_update(key)"),
-            "the run must attempt `sync` through the Core rather than a literal"
+            source.contains("handle.attempt_auto_update(key)"),
+            "the run must attempt `sync` through the management handle rather than a literal"
         );
     }
 
     /// The absence half of [0032](../../../docs/adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md)'s
     /// restriction for the sync hooks: the only production call to
-    /// [`repon_core::Core::run_action_for_entity_blocking`] sits inside `run_management`'s
-    /// own `management_write_reload` region, reached from `y` over the confirm gate alone,
-    /// never from a Generation or a timer. Scanned across every workspace crate's `src` for
-    /// the count, the same shape `the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else`
-    /// already takes for `on_refresh`.
+    /// [`repon_core::ManagementHandle::run_action_for_entity_blocking`] sits inside
+    /// `run_management`'s own `management_run_start` region, reached from `y` over the
+    /// confirm gate alone, never from a Generation or a timer. Scanned across every
+    /// workspace crate's `src` for the count, the same shape
+    /// `the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else` already takes
+    /// for `on_refresh`.
     #[test]
     fn the_sync_hooks_fire_from_run_action_for_entity_blocking_inside_run_management_alone() {
-        // The leading `.` is what tells a call site (`self.core.run_action_for_entity_blocking(`)
-        // apart from the method's own `pub fn run_action_for_entity_blocking(` definition in
-        // repon-core, which this same substring would otherwise also match.
+        // The leading `.` is what tells a call site (`handle.run_action_for_entity_blocking(`)
+        // apart from the method's own `pub fn run_action_for_entity_blocking(` definitions in
+        // repon-core (`Core`'s own and `ManagementHandle`'s), which this same substring would
+        // otherwise also match.
         let calls =
             crate::test_support::production_lines_containing(".run_action_for_entity_blocking(");
         assert_eq!(
@@ -6308,7 +6524,7 @@ mod tests {
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
-        let region = crate::test_support::source_region(&source, "management_write_reload")
+        let region = crate::test_support::source_region(&source, "management_run_start")
             .expect("run_management's own scan markers are still in place");
         assert!(
             region.contains(".run_action_for_entity_blocking("),
@@ -6344,15 +6560,15 @@ mod tests {
     /// Criterion 8, second half: after a management write, config reaches the running app
     /// through [`App::reload_config`], the identical path `Action::ReloadConfig` dispatches
     /// to, and the write path itself touches no in-memory state of its own. Read over
-    /// `run_management`'s own marked region rather than the whole file, since
+    /// `apply_management_report`'s own marked region rather than the whole file, since
     /// `reload_config` is legitimately called from elsewhere and `self.document` is
     /// legitimately read all over this one.
     #[test]
     fn a_management_write_reaches_the_running_app_through_the_reload_config_path_alone() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = crate::test_support::production_source_at(&manifest_dir.join("src/app.rs"));
-        let region = crate::test_support::source_region(&source, "management_write_reload")
-            .expect("run_management's own scan markers are still in place");
+        let region = crate::test_support::source_region(&source, "management_report_apply")
+            .expect("apply_management_report's own scan markers are still in place");
 
         assert!(
             region.contains("self.reload_config()"),

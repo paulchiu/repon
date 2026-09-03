@@ -103,8 +103,11 @@ The Step outcome of a Step Repon performed itself, carrying Repon's own words ra
 The Step an Action receipt is executing right now: its label and when it started, present on the receipt only until that Step finishes. Distinct from a Step result, which a Step earns only once it is done; the pane shows a spinner rather than a Step outcome for this one.
 
 **Management operation**:
-One of the four built-in entries in the Action palette that change what Repon operates on, remove a Repo from the machine, or fast-forward one to its upstream: `ignore`, `unignore`, `delete` and `sync`. Built in rather than configured, so the four names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all beyond `sync`'s own optional `before_sync` and `after_sync` hooks.
+One of the four built-in entries in the Action palette that change what Repon operates on, remove a Repo from the machine, or fast-forward one to its upstream: `ignore`, `unignore`, `delete` and `sync`. Built in rather than configured, so the four names are reserved and a config-defined Action may not take one. Fans out over the Selection and shares the Action confirm gate, and runs no child process at all beyond `sync`'s own optional `before_sync` and `after_sync` hooks. A Management operation's own run moves onto a background thread once the confirm gate is accepted, so it never blocks the draw loop, and Esc cancels it between rows rather than mid-row.
 _Avoid_: Management palette (there is one palette; `m` is a filter over it)
+
+**Management handle**:
+The `Send + 'static` handle a Management operation's own background thread carries in place of a live Core: the same read-only, path-driven git reads a Core gives on the calling thread, plus running a `before_sync` or `after_sync` hook, and none of a Core's other state.
 
 **Delete risk**:
 What accepting a `delete` will destroy in one Repo: whether its working tree has uncommitted changes, how many commits are unpushed and on how many branches, and how many linked Worktrees point into it. Read fresh when the gate is built rather than folded out of Cells, because the question has no undo. A Repo with none of the three is listed plainly.

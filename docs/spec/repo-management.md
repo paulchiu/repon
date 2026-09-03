@@ -99,11 +99,15 @@ A Worktree row's own gate line discloses the same first two facts about its own 
 
 ## Once accepted
 
-`y` closes the gate immediately and replaces it with a Notice naming the operation and how many rows it covers, before any of the work below starts. `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and the gate is the worst frame to leave standing through that: it still reads as a question, so a user watching it sit unchanged has no way to tell a dropped keypress from one already running.
+`y` closes the gate immediately, replaces it with a Notice naming the operation and how many rows it covers, and starts the run itself on a background thread rather than the one that draws frames and reads keys ([0033](../adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)). `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and that thread is never the one a keypress or the next frame is waiting on while they run.
 
-That first Notice is followed by one per row, in the Selection's own order: each names the row and its position among the whole run (`delete: manage-pr-1358 (3/12)`), painted before that row's own work starts. A screen that stopped moving the moment the gate closed would be nearly as uninformative as the gate itself, since a multi-row run gives no other sign of whether it is on the first row or the last, and a single large row has nothing else to show while it works. The last row's own Notice is replaced by the summary once the run finishes, the counts "Receipts" below reads its words from.
+That first Notice is followed by one per row, in the Selection's own order: each names the row and its position among the whole run (`delete: manage-pr-1358 (3/12)`), published by the background thread the instant that row's own work starts and read fresh by every frame drawn while it is current. A screen that stopped moving the moment the gate closed would be nearly as uninformative as the gate itself, since a multi-row run gives no other sign of whether it is on the first row or the last, and a single large row has nothing else to show while it works. The last row's own Notice is replaced by the summary once the run finishes and its report is applied, the counts "Receipts" below reads its words from.
 
-This is still the one call [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) already describes: `run_management` starts no Generation and reaches no intermediate state a keypress could observe beyond these Notices, so nothing here changes when `before_sync` and `after_sync` fire or how a Selection resolves.
+A run outstanding refuses every key that would start a second one, exactly the same set an Action's own fan-out already refuses ([keybindings.md](keybindings.md)'s "Quitting, suspending, confirming"): `;`, `m`, `s`, `1` to `9`, `Ctrl+R` and `e` answer with a Notice rather than silence, and `q`/`Ctrl+C` ask for confirmation first, since quitting mid-run abandons the background thread. Every other key, movement and the Filter included, is read exactly as it would be with no run outstanding at all.
+
+Esc cancels a run between rows, never mid-row: it raises a flag the background thread checks before its next row starts, so a `delete` already removing one working tree, or a hook already running, always finishes rather than being torn down partway. The report that follows names how many of the whole Selection the run actually reached before naming what it did to each of those.
+
+This is still the one call [0032](../adr/0032-hooks-around-a-built-in-fire-on-its-own-confirm-gate-never-its-completion.md) already describes: `run_management` starts no Generation, and neither does the background thread it starts; `before_sync` and `after_sync` still fire from the `y` that reached this call, never from a Generation or a timer, and how the Selection resolves is decided before that thread starts, never mid-run.
 
 ## Writing config
 
@@ -130,7 +134,7 @@ That path does not re-apply most of `[[repo]]`, and deliberately: `crates/repon/
 
 The exception is not special pleading. `exclude` is not a discovery-time fact at all: [config.md](config.md) defines it as "listed, never operated on", so the entity is still discovered, still probed and still a row, and all `exclude` decides is whether an operation may reach it. That is an operate-time filter over a table that is already correct, which is why it needs no rebuild, and it is the same shape as `show_submodules`, which reload.rs already names as its one live-updating exception. `default_branch`, the other key a `[[repo]]` entry may carry, is a probe input and keeps the existing behaviour: it reaches the session it was written in only through a restart. Repon never writes it, so nothing here depends on that.
 
-An `ignore` therefore takes effect immediately: the row it names is subtracted from the Action confirm gate's count and from every operation's eligible set in the same frame the write completes, without a refresh and without a restart.
+An `ignore` therefore takes effect as soon as its own report is applied, the first tick after its background thread finishes ("Once accepted" above): the row it names is subtracted from the Action confirm gate's count and from every operation's eligible set from that tick on, without a refresh and without a restart.
 
 ## Keys
 
