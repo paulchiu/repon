@@ -843,14 +843,14 @@ mod tests {
     /// A key prefix matches case-insensitively, like the colon-qualified row above it.
     #[test]
     fn a_key_prefix_matches_case_insensitively() {
-        assert_eq!(typed("S").completions(), typed("s").completions());
+        assert_eq!(typed("S").completions(), vec!["state:", "sync:"]);
     }
 
     /// A leading negation does not change what the prefix offers, mirroring
     /// [`a_bare_colon_offers_every_key`]'s `-:`/`:` pair.
     #[test]
     fn a_negated_key_prefix_offers_the_same_entries_as_the_bare_prefix() {
-        assert_eq!(typed("-s").completions(), typed("s").completions());
+        assert_eq!(typed("-s").completions(), vec!["state:", "sync:"]);
     }
 
     /// The free-text keys (`name`, `branch`, `path`) reach the "known key" row too, but their
