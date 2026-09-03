@@ -1459,7 +1459,11 @@ mod tests {
             "",
             "6 columns must be too narrow for any tier"
         );
-        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 6, 6);
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
+        let buf = draw_sized(&palette, &[], &Theme::default(), 6, 6);
         let bottom = row_text(&buf, 5, 6);
         assert!(
             !bottom.contains("she"),
@@ -1486,7 +1490,7 @@ mod tests {
     /// with nothing typed, so nothing ad hoc is in play yet and the hint has nothing to show.
     #[test]
     fn the_shell_mode_hint_is_absent_while_a_built_in_is_highlighted_on_a_freshly_opened_palette() {
-        let palette = ActionPalette::new();
+        let mut palette = ActionPalette::new();
         let actions: Vec<ActionConfig> = Vec::new();
         assert!(
             matches!(palette.highlighted(&actions), Some(Entry::Builtin(_))),
@@ -1498,6 +1502,17 @@ mod tests {
         assert!(
             !bottom.contains(SHELL_ON_CORE),
             "expected no shell-mode hint while a built-in is highlighted: {bottom:?}"
+        );
+
+        // Absence must hold regardless of the toggle: it is the highlight, not `self.shell`,
+        // that governs whether the hint draws at all.
+        palette.toggle_shell();
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_OFF_CORE),
+            "expected no shell-mode hint while a built-in is highlighted, even with shell \
+             off: {bottom:?}"
         );
     }
 
@@ -1521,6 +1536,17 @@ mod tests {
         assert!(
             !bottom.contains(SHELL_ON_CORE),
             "expected no shell-mode hint while a configured entry is highlighted: {bottom:?}"
+        );
+
+        // Absence must hold regardless of the toggle: it is the highlight, not `self.shell`,
+        // that governs whether the hint draws at all.
+        palette.toggle_shell();
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_OFF_CORE),
+            "expected no shell-mode hint while a configured entry is highlighted, even with \
+             shell off: {bottom:?}"
         );
     }
 
