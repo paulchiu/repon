@@ -2584,6 +2584,54 @@ mod tests {
             .to_string()
     }
 
+    /// The comment block directly above `header` in `example`: the text between the
+    /// nearest blank line before it and `header` itself.
+    fn comment_block_immediately_above<'a>(example: &'a str, header: &str) -> &'a str {
+        let marker = format!("\n\n{header}");
+        let header_at = example
+            .find(&marker)
+            .unwrap_or_else(|| panic!("example has no {header} header"));
+        let before = &example[..header_at];
+        let block_start = before.rfind("\n\n").map_or(0, |i| i + 2);
+        &before[block_start..]
+    }
+
+    /// Refresh, fetch, auto_update and sync name four different things (GLOSSARY.md,
+    /// docs/spec/config.md's "Refresh, fetch and auto-update"), so the comment above the
+    /// block that declares three of them must not let a future edit split them apart
+    /// without naming the fourth, the built-in sync action, that sits beside them.
+    #[test]
+    fn the_refresh_fetch_and_auto_update_block_is_preceded_by_a_comment_naming_all_four_terms() {
+        let block = comment_block_immediately_above(annotated_example(), "[refresh]");
+
+        for term in ["refresh", "fetch", "auto_update", "sync"] {
+            assert!(
+                block.contains(term),
+                "the comment above [refresh] does not mention `{term}`: {block}"
+            );
+        }
+    }
+
+    /// The comment's link must survive a heading rename: if "## Refresh, fetch and
+    /// auto-update" ever moves or is reworded, this fails alongside the dead anchor rather
+    /// than shipping a template that links nowhere.
+    #[test]
+    fn the_refresh_fetch_and_auto_update_comment_links_to_its_own_spec_section() {
+        let spec = read_config_spec();
+        assert!(
+            spec.contains("## Refresh, fetch and auto-update"),
+            "config.md must keep its \"Refresh, fetch and auto-update\" heading"
+        );
+
+        let block = comment_block_immediately_above(annotated_example(), "[refresh]");
+        assert!(
+            block.contains(
+                "https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#refresh-fetch-and-auto-update"
+            ),
+            "the comment above [refresh] does not link to its own spec section: {block}"
+        );
+    }
+
     /// Comparing its fenced block against the shipped `example.toml` byte for byte is what
     /// keeps `repon config --example`'s output and the specification from drifting apart.
     #[test]

@@ -18,6 +18,15 @@ on_refresh = "tidy"
 # before_sync = "tidy"
 # after_sync = "tidy"
 
+# The lifecycle: refresh looks at git state alone, always on; fetch reaches the
+# network to keep that state current, off by default; auto_update rides fetch's
+# cycle to fast-forward what it finds behind. The built-in `sync` action does
+# that same fast-forward on demand, on the same eligibility rule, whenever
+# asked rather than on fetch's own cycle; `sync` is also the name of the Cell
+# comparing an Entity against its upstream, a different thing from the action.
+# Full picture:
+# https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#refresh-fetch-and-auto-update
+
 [refresh]
 poll_interval = "2s"       # "0s" turns the sweep off
 status_stale_after = "5m"
