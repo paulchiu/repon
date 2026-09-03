@@ -57,6 +57,13 @@ const CANCEL_GRACE: Duration = Duration::from_millis(350);
 /// own doc comment) makes the child's pgid equal its pid; [`register`](Self::register) and
 /// [`deregister`](Self::deregister) bracket exactly the span [`run_step`] can have a live
 /// child, so a signal here can never reach a pid this run did not itself spawn.
+///
+/// [`is_cancelled`](Self::is_cancelled) is checked before a step ever spawns, but that
+/// check and the spawn it guards are not one atomic step: a spawn already past the check
+/// when [`cancel`](Self::cancel) runs finishes registering into an empty, already-swept
+/// registry, and nothing would otherwise signal it again. [`register`] closes that gap
+/// itself by checking `cancelled` at the moment a child becomes visible, rather than
+/// trusting `cancel`'s one sweep to have been the only chance a child gets.
 pub(crate) struct RunControl {
     cancelled: AtomicBool,
     live_groups: Mutex<HashSet<libc::pid_t>>,
@@ -77,8 +84,16 @@ impl RunControl {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    fn register(&self, pgid: libc::pid_t) {
+    /// Marks `pgid` live, then, if `cancel` already ran, sends it the same SIGTERM/SIGKILL
+    /// sequence `cancel` itself would have: the insert happens first so that a `cancel`
+    /// racing in between always sees this `pgid` in its own snapshot instead, meaning the
+    /// two together always signal a newly-live child exactly once between them, never zero
+    /// times (see the struct doc comment).
+    fn register(self: &Arc<Self>, pgid: libc::pid_t) {
         self.live_groups.lock().unwrap().insert(pgid);
+        if self.cancelled.load(Ordering::Acquire) {
+            self.escalate(vec![pgid]);
+        }
     }
 
     fn deregister(&self, pgid: libc::pid_t) {
@@ -105,13 +120,20 @@ impl RunControl {
         }
     }
 
-    /// Marks the run cancelled, so a step not yet started never spawns, then SIGTERMs every
-    /// process group currently live and, on a separate thread, SIGKILLs after
-    /// [`CANCEL_GRACE`] whichever of those are still live at that point: SIGTERM is
-    /// trappable, SIGKILL is not.
+    /// Marks the run cancelled, so a step not yet started never spawns, then [`escalate`]s
+    /// every process group currently live.
     pub(crate) fn cancel(self: &Arc<Self>) {
         self.cancelled.store(true, Ordering::Release);
         let groups = self.live_snapshot();
+        self.escalate(groups);
+    }
+
+    /// SIGTERMs every group in `groups`, then, on a separate thread, SIGKILLs after
+    /// [`CANCEL_GRACE`] whichever of those are still live at that point: SIGTERM is
+    /// trappable, SIGKILL is not. Shared by [`Self::cancel`], for the groups live at the
+    /// moment it runs, and by [`Self::register`], for one arriving late enough to have
+    /// missed that sweep entirely.
+    fn escalate(self: &Arc<Self>, groups: Vec<libc::pid_t>) {
         for &pgid in &groups {
             signal_group(pgid, libc::SIGTERM);
         }
@@ -162,13 +184,15 @@ fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
 ///
 /// `control` learns this step's process group the instant it has one, and forgets it the
 /// instant this call is done with it, which is the whole window in which `control.cancel`,
-/// `control.hold` or `control.continue_run` can reach this child at all.
+/// `control.hold` or `control.continue_run` can reach this child at all; `control.register`
+/// itself covers the one case that window cannot, a cancel that already ran by the time
+/// this call reaches it.
 pub(crate) fn run_step(
     argv: &[String],
     shell: bool,
     cwd: &Path,
     env: &[(String, Option<String>)],
-    control: &RunControl,
+    control: &Arc<RunControl>,
 ) -> StepResult {
     let label: Arc<str> = Arc::from(argv.join(" "));
     let start = Instant::now();
@@ -1123,6 +1147,39 @@ mod tests {
         assert!(
             status.is_some_and(|status| !status.success()),
             "a killed child must not report a clean exit"
+        );
+    }
+
+    /// `run_action_for_entity`'s own `is_cancelled` check runs before a step's spawn even
+    /// starts, but a spawn already past that check when `cancel` runs still has to reach
+    /// `register` before anything watches it: reproduced here by construction, `cancel`
+    /// first against an empty registry, `register` after, exactly the ordering a slow
+    /// `open_pty`/`Command::spawn` under load can produce. A step that loses this race
+    /// must still be terminated, not left to outlive the run that cancelled it.
+    #[test]
+    fn a_child_registered_after_cancel_already_swept_an_empty_registry_is_still_terminated() {
+        let dir = tempdir();
+        let control = RunControl::new();
+        control.cancel();
+
+        let sleep_past_the_backstop = format!("sleep {}", FIXTURE_LIFETIME.as_secs());
+        let (master, keepalive, child, pgid) =
+            spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
+        control.register(pgid);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (_raw, status) = drain_until_exit(master, keepalive, child);
+            let _ = tx.send(status);
+        });
+
+        let status = rx.recv_timeout(BACKSTOP).expect(
+            "a child registered after cancel already swept an empty registry must still be \
+             reaped, not outlive the run that cancelled it",
+        );
+        assert!(
+            status.is_some_and(|status| !status.success()),
+            "a terminated child must not report a clean exit"
         );
     }
 
