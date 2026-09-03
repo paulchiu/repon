@@ -1687,6 +1687,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rows_disagreeing_known_cells_print_one_refreshed_line_with_one_label_and_age_per_line() {
+        let now = Timestamp::now();
+        let two_seconds_ago =
+            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
+        let five_seconds_ago =
+            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
+        row.base = settled_known_at(0u32, now, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), now, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, two_seconds_ago, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), five_seconds_ago, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let freshness_line = line_labelled(&lines, "refreshed");
+        assert_eq!(
+            freshness_line, "refreshed       sync, 2s ago\ndirty, 5s ago",
+            "got {freshness_line:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("refreshed"))
+                .count(),
+            1,
+            "expected exactly one refreshed line, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_cell_beside_a_fresh_one_still_counts_as_a_disagreement_and_gets_its_own_breakdown_line()
+     {
+        let at = Timestamp::now();
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), at, false);
+        row.base = settled_known_at(0u32, at, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), at, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), at, true);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let freshness_line = line_labelled(&lines, "refreshed");
+        assert_eq!(
+            freshness_line, "refreshed       dirty, stale just now",
+            "a stale cell beside fresh, same-instant neighbours must still disagree, got \
+             {freshness_line:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("refreshed"))
+                .count(),
+            1,
+            "expected exactly one refreshed line, got {lines:?}"
+        );
+    }
+
     /// The wiring half of criterion 3: `default_branch_diagnostics_lines` above proves the
     /// words are right, but nothing yet proves `content_lines` actually calls it. Without this,
     /// a diagnostics fact computed correctly could still sit unread and never reach the pane.
