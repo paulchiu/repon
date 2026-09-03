@@ -226,6 +226,19 @@ impl<T> Cell<T> {
         }
     }
 
+    /// A Cell already in `settled`, with a re-probe running against it right now: the shape a
+    /// consumer's own test needs to exercise a reprobe of an already-`Known` cell without
+    /// running a real probe. Gated behind `test-util` on the same terms as
+    /// [`Cell::already_settled`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn already_settled_and_in_flight(settled: Settled<T>) -> Self {
+        Cell {
+            settled: Some(settled),
+            in_flight: true,
+            generation: Generation::default(),
+        }
+    }
+
     /// The settled state, or `None` while absent (loading, or never yet probed).
     /// The only way to a `T`.
     pub fn settled(&self) -> Option<&Settled<T>> {

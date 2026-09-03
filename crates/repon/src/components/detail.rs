@@ -1113,7 +1113,7 @@ mod tests {
 
     use repon_core::{
         CaptureElision, Cell, Core, CoreSpec, EntityKey, ProbeError, RecentCommit, SetSpec,
-        StepOutcome, StepResult, liveness::wait_for,
+        StepOutcome, StepResult, WorktreeState, liveness::wait_for,
     };
 
     use super::*;
@@ -1745,6 +1745,109 @@ mod tests {
                 .count(),
             1,
             "expected exactly one refreshed line, got {lines:?}"
+        );
+    }
+
+    /// A `Known` cell with a re-probe running against it right now: the shape a cell keeps
+    /// while its previous value stays on screen and a new one is being fetched.
+    fn settled_known_and_in_flight<T>(value: T, at: Timestamp, stale: bool) -> Cell<T> {
+        Cell::already_settled_and_in_flight(Settled::Known { value, at, stale })
+    }
+
+    #[test]
+    fn a_cell_being_reprobed_reads_loading_and_names_only_the_in_flight_labels() {
+        let at = Timestamp::now();
+        let mut row = entity("a");
+        row.branch = settled_known_at(Head::Unborn(Arc::from("main")), at, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, at, false);
+        row.base = settled_known_at(0u32, at, false);
+        row.default_branch =
+            settled_known_at(DefaultBranch::new(Arc::from("origin/main")), at, false);
+        row.dirty = settled_known_and_in_flight(DirtyCounts::default(), at, false);
+        row.state = settled_known_and_in_flight(WorktreeState::Active, at, false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let freshness_line = line_labelled(&lines, "loading");
+        assert_eq!(
+            freshness_line, "loading         dirty, state",
+            "got {freshness_line:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("refreshed")),
+            "a cell being reprobed must never also show a refreshed line, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_refreshed_lines_position_is_the_same_line_index_whether_loading_or_settled() {
+        let at = Timestamp::now();
+
+        let mut settled = entity("a");
+        settled.branch = settled_known_at(Head::Unborn(Arc::from("main")), at, false);
+
+        let mut loading = entity("a");
+        loading.branch = settled_known_and_in_flight(Head::Unborn(Arc::from("main")), at, false);
+
+        let settled_lines = content_lines(&settled, WIDE, full_glyphs());
+        let loading_lines = content_lines(&loading, WIDE, full_glyphs());
+
+        let default_branch_index = settled_lines
+            .iter()
+            .position(|line| line.starts_with("default branch"))
+            .expect("a default branch line");
+        let settled_freshness_index = settled_lines
+            .iter()
+            .position(|line| line.starts_with("refreshed"))
+            .expect("settled Known cells print a refreshed line");
+        let loading_freshness_index = loading_lines
+            .iter()
+            .position(|line| line.starts_with("loading"))
+            .expect("an in-flight cell prints a loading line");
+
+        assert_eq!(
+            settled_freshness_index,
+            default_branch_index + 1,
+            "got {settled_lines:?}"
+        );
+        assert_eq!(
+            loading_freshness_index,
+            default_branch_index + 1,
+            "got {loading_lines:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_known_cell_yet_the_pane_prints_no_refreshed_line_at_all() {
+        let row = entity("a");
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("refreshed") || line.starts_with("loading")),
+            "a row with nothing Known yet has nothing to report, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_known_cell_still_gets_its_own_refreshed_line_rather_than_no_line_at_all() {
+        let mut row = entity("a");
+        row.dirty = settled_known_at(DirtyCounts::default(), Timestamp::now(), false);
+
+        let lines = content_lines(&row, WIDE, full_glyphs());
+
+        let freshness_line = line_labelled(&lines, "refreshed");
+        assert!(freshness_line.contains("just now"), "got {freshness_line:?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("refreshed"))
+                .count(),
+            1,
+            "one Known cell has nothing to disagree with, so it still gets the row, got \
+             {lines:?}"
         );
     }
 
