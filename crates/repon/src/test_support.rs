@@ -1218,6 +1218,11 @@ mod tests {
     /// the flag reaches gix from a real cancellation. `source_region` returning `None` fails
     /// this test outright, so a renamed or deleted marker pair cannot read as "region empty,
     /// nothing to find".
+    ///
+    /// The same region also sets gix's per-repository thread limit to 1, per
+    /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
+    /// fan-out shape": a claim three documents made before any code backed it, which is how
+    /// it went unimplemented. This assertion is what now keeps the two from splitting again.
     #[test]
     fn dirty_counts_passes_its_own_cancel_flag_to_should_interrupt_owned() {
         let core_source = std::fs::read_to_string(
@@ -1233,6 +1238,11 @@ mod tests {
             normalised.contains("should_interrupt_owned(cancel)"),
             "expected dirty_counts's marked region to pass its own `cancel` parameter to \
              `should_interrupt_owned`, found: {normalised:?}"
+        );
+        assert!(
+            normalised.contains("thread_limit = Some(1)"),
+            "expected dirty_counts's marked region to set gix's per-repository thread limit \
+             to 1, found: {normalised:?}"
         );
     }
 
