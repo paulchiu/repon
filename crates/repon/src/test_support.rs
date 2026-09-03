@@ -1246,6 +1246,42 @@ mod tests {
         );
     }
 
+    // --- The probe fan-out's own pool width was never chosen until a sweep measured it
+    // (docs/adr/0013), and what the sweep found was a plateau rayon's global pool already
+    // sits inside rather than a number worth hand-picking and building a dedicated pool
+    // for. A source scan is what keeps that finding from silently going stale the way the
+    // thread-limit claim above once did: a future dedicated pool is a real decision this
+    // test forces its author to update the ADR for, rather than one that lands unnoticed.
+
+    /// The probe fan-out's own marked region (`// scan: probe-fanout-pool begin`/`end` in
+    /// `repon-core/src/core.rs`) still dispatches each entity's probe with `rayon::spawn`
+    /// rather than a `rayon::ThreadPoolBuilder` of its own. `source_region` returning
+    /// `None` fails this test outright, so a renamed or deleted marker pair cannot read as
+    /// "region empty, nothing to find".
+    #[test]
+    fn probe_fan_out_still_uses_rayons_global_pool_rather_than_a_dedicated_one() {
+        let core_source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../repon-core/src/core.rs"),
+        )
+        .expect("read repon-core's core.rs");
+        let region = source_region(&core_source, "probe-fanout-pool")
+            .expect("core.rs carries the probe-fanout-pool scan markers");
+
+        let normalised = normalised_production(&region);
+
+        assert!(
+            normalised.contains("rayon::spawn("),
+            "expected the probe fan-out's marked region to still dispatch each entity with \
+             rayon::spawn onto the global pool, found: {normalised:?}"
+        );
+        assert!(
+            !normalised.contains("ThreadPoolBuilder"),
+            "found a ThreadPoolBuilder inside the probe fan-out's marked region: the fan-out \
+             now builds a dedicated pool, a real decision docs/adr/0013's own sweep did not \
+             make; update the ADR (and this test) if that is a deliberate change"
+        );
+    }
+
     // --- A `Settled::Known` destructure that hides a field behind `..` compiles silently
     // once a fourth field is added, and quietly ignores it forever.
 

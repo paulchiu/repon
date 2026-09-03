@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "fanout-sweep"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Corpus generator and sweep driver for the probe fan-out width, kept outside the main workspace so it never reaches `just ci`'s build or lint passes."
+
+# Same gix version and feature set as repon-core's own [dependencies], so the status call
+# this tool times is the identical call gix compiles for production, not a lookalike
+# against a different release.
+[dependencies]
+gix = { version = "0.87.1", default-features = false, features = [
+    "max-performance-safe",
+    "sha1",
+    "basic",
+    "status",
+    "dirwalk",
+] }
+rayon = "1.12.0"
