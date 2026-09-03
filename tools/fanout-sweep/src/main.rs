@@ -12,7 +12,10 @@
 //! - `real`: the same sweep, read-only, over already-existing repositories the caller
 //!   names explicitly. Takes no default path and reads no config, environment variable
 //!   or working directory to find one: a root reaches this tool only on the command
-//!   line, so the harness itself never depends on anyone's particular checkout.
+//!   line, so the harness itself never depends on anyone's particular checkout. Reports
+//!   its own tracked-file total in the same shape `synthetic` and `generate` report
+//!   theirs, so the synthetic corpus's resemblance to the real population is something
+//!   a reader can check against a number rather than take on the shape's say-so alone.
 //! - `generate`: builds a corpus and leaves it on disk, for inspecting the shape by
 //!   hand or reusing across several `real`-style runs without rebuilding it.
 
@@ -67,9 +70,14 @@ fn spawn_contention(count: usize, stop: std::sync::Arc<std::sync::atomic::Atomic
 }
 
 /// Runs one full pass over `paths` at `config`, on a dedicated pool built and torn down
-/// for this call alone, mirroring `RefreshHandles::dispatch_probes`'s own choice of a
-/// fresh pool per generation rather than one held open. Returns the wall clock for the
-/// whole pass and every entity's own elapsed time.
+/// for this call alone. This does not mirror production's own pool lifecycle:
+/// `dispatch_probes`'s `rayon::spawn` (`crates/repon-core/src/core.rs`'s
+/// probe-fanout-pool region) always targets rayon's single global pool, live for the
+/// whole process, never a fresh pool per generation or one built and torn down per call.
+/// A dedicated pool here is what lets `pool_width` be swept as a controlled axis at
+/// all; it mirrors production's per-entity task (`probe::probe_entity_task`), not its
+/// pool's own lifetime. Returns the wall clock for the whole pass and every entity's own
+/// elapsed time.
 fn run_once(paths: &[PathBuf], config: Config) -> (Duration, Vec<Duration>) {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let contenders = spawn_contention(config.contend, std::sync::Arc::clone(&stop));
@@ -83,7 +91,7 @@ fn run_once(paths: &[PathBuf], config: Config) -> (Duration, Vec<Duration>) {
     let durations: Vec<Duration> = pool.install(|| {
         paths
             .par_iter()
-            .map(|path| probe::probe_phase_c(path, config.thread_limit))
+            .map(|path| probe::probe_entity_task(path, config.thread_limit))
             .collect()
     });
     let wall = start.elapsed();
@@ -245,6 +253,16 @@ fn is_forbidden_dir_name(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|s| s.eq_ignore_ascii_case("mrx"))
 }
 
+/// Walks `root` for repository boundaries, matching `crates/repon-core/src/discovery.rs`'s
+/// own `is_boundary` rule exactly: "a directory is a boundary when it holds a `.git`
+/// entry, file or directory form alike" (`dir.join(".git").exists()`), which is what
+/// also counts a linked worktree or a submodule's own checkout, both of which point at
+/// their common dir through a `.git` *file* rather than a directory. A recursive
+/// subdirectory this process cannot read is skipped silently and the walk continues
+/// past it, the same as a real corpus walk tolerating one unreadable nested directory
+/// (a permissions-locked cache dir, say) without aborting the whole scan; only a
+/// top-level `--roots` entry gets the loud treatment, in `main`, since a typo or an
+/// unexpanded `~` there should never be swallowed into a silently smaller corpus.
 fn find_git_repos(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
     if out.len() >= 100_000 {
         return;
@@ -257,21 +275,25 @@ fn find_git_repos(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_dir() {
-            continue;
-        }
         let name = entry.file_name();
         if is_forbidden_dir_name(&name) {
             continue;
         }
         if name == ".git" {
+            // A `.git` entry directly inside `root`, file or directory alike, means
+            // `root` itself is a repository boundary: reached when a `--roots` entry
+            // is itself a repository, or a linked worktree's own `.git` file is seen
+            // while iterating its parent's children.
             out.push(root.to_path_buf());
+            continue;
+        }
+        if !file_type.is_dir() {
             continue;
         }
         if name == "node_modules" {
             continue;
         }
-        if path.join(".git").is_dir() {
+        if path.join(".git").exists() {
             out.push(path.clone());
             // A repository boundary stops the walk, matching discovery's own
             // boundary-stop rule: this tool never descends into a repo it already found.
@@ -401,14 +423,48 @@ fn main() {
                     "refusing a --roots entry that names or contains `mrx`: {}",
                     root.display()
                 );
+                // Loud rather than silently dropped: `find_git_repos`'s own recursive
+                // `read_dir` failures are tolerated (a locked-down subdirectory is a
+                // normal thing to meet deep in a real tree), but a `--roots` entry
+                // itself failing to read is never that: it is either a typo or, as
+                // happened in practice, a shell that only tilde-expanded the first of
+                // several comma-joined roots and passed the rest through as a literal
+                // `~`. A truncated `--roots` list must never look like a smaller but
+                // otherwise valid real-corpus run.
+                assert!(
+                    root.is_dir(),
+                    "--roots entry is not a readable directory: {} (an unexpanded `~` \
+                     past the first comma-joined root is a common cause; pass roots as \
+                     separate shell words, e.g. `just sweep-fanout-real ~/dev ~/dev-misc`)",
+                    root.display()
+                );
             }
             let sweep_args = parse_sweep_args(&sweep_args_raw);
             let mut paths = Vec::new();
             for root in &roots {
+                let before = paths.len();
                 find_git_repos(root, max_depth, &mut paths);
+                println!(
+                    "found {} repositories under {}",
+                    paths.len() - before,
+                    root.display()
+                );
             }
             paths.truncate(limit);
             println!("found {} repositories under {} root(s)", paths.len(), roots.len());
+            // Tracked-file count only, read from each repo's own index rather than a
+            // full status walk: enough to compare the real population's shape against
+            // `synthetic`'s own reported "files total" figure without paying for a
+            // second status pass this sweep already runs per config. Working-tree
+            // dirtiness is not summarised here for the same reason: it is exactly what
+            // the sweep below measures, on every repo, at every cell.
+            let total_tracked: usize = paths
+                .iter()
+                .filter_map(|path| gix::open(path).ok())
+                .filter_map(|repo| repo.index().ok())
+                .map(|index| index.entries().len())
+                .sum();
+            println!("{total_tracked} tracked files total across the real population");
             run_sweep(&paths, &sweep_args);
         }
         other => {

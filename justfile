@@ -293,10 +293,14 @@ sweep-fanout entities="400" seed="1":
     cd tools/fanout-sweep && cargo run --release -- synthetic --entities {{entities}} --seed {{seed}}
 
 # The same sweep, read-only, against real repositories rather than a synthetic corpus:
-# pass comma-separated roots, e.g. `just sweep-fanout-real ~/dev,~/dev-misc`. Opens each
+# pass one or more roots as separate shell words, e.g. `just sweep-fanout-real ~/dev
+# ~/dev-misc`, each expanding its own leading `~` the way a single comma-joined argument
+# cannot (only the first `~` in a shell word expands, so `~/dev,~/dev-misc` typed as one
+# argument silently passes the literal string `~/dev-misc` through). Opens each
 # repository exactly as `dirty_counts` does and never fetches, clones or writes. `roots`
 # is never defaulted or read from config or the environment, so this recipe cannot
 # silently depend on any one machine's checkout; naming a repository ADR 0003 excludes
-# from reading is refused rather than skipped.
-sweep-fanout-real roots:
-    cd tools/fanout-sweep && cargo run --release -- real --roots {{roots}}
+# from reading is refused rather than skipped, and a root that is not itself a readable
+# directory fails the run rather than being dropped from it.
+sweep-fanout-real *roots:
+    cd tools/fanout-sweep && cargo run --release -- real --roots {{replace(trim(roots), " ", ",")}}

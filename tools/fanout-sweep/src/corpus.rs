@@ -1,8 +1,11 @@
 //! A synthetic corpus of throwaway git repositories, shaped after
 //! `docs/spec/refresh.md`'s own population: mostly small and clean, a long tail of
-//! heavier working trees, one or two outliers the size of `vial-qmk`'s 40,871 files, and a
-//! small dirty minority. Deterministic from a seed, so two runs against the same
-//! `(entities, seed)` build the same shape and are comparable.
+//! heavier working trees, one or two outliers at 15,000-25,000 files (37-61% of
+//! `vial-qmk`'s real 40,871, scaled down so building a corpus stays fast; a real
+//! `vial-qmk` checkout is cross-checked separately, in isolation, by the single-repo
+//! measurement in `docs/spec/refresh.md`), and a small dirty minority. Deterministic
+//! from a seed, so two runs against the same `(entities, seed)` build the same shape
+//! and are comparable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
