@@ -2557,7 +2557,7 @@ impl Core {
 fn run_action_for_entity(
     entity: &EntityState,
     action: &ActionSpec,
-    control: &executor::RunControl,
+    control: &Arc<executor::RunControl>,
     report: &dyn Fn(ActionReceipt),
 ) -> ActionReceipt {
     let base_env = environment::environment(entity, action.name.as_deref());
@@ -8240,7 +8240,13 @@ mod tests {
         spec.generation_deadline = Duration::ZERO;
         let started = Core::start_for_test(spec, Duration::from_secs(3600), tick_rx).discovered();
         let core = started.core;
-        let snapshot = core.snapshot();
+        // Drained, so launch's own real refresh has already landed on every cell before
+        // either `begin_untracked_probe_for_test` call below puts one artificially back in
+        // flight: skipping this left a real probe for the same cell free to settle it
+        // between that call and the sweep, which turns the sweep's own `is_in_flight`
+        // guard (working exactly as designed, since a cell no longer loading is not the
+        // sweep's to touch) into a race the assertion below loses however rarely.
+        let snapshot = settle_launch(&core);
         let repo_key = snapshot
             .entities
             .iter()
