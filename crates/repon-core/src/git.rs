@@ -546,6 +546,10 @@ pub fn head_shape(repo: &gix::Repository) -> Result<Head, ProbeError> {
 /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md) rejected pays
 /// for redundantly on a population that is 96% clean, and it is why typed counting measured
 /// cheaper than the boolean check it replaces despite counting rather than short-circuiting.
+///
+/// The status platform's thread limit is pinned to 1, per [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The fan-out shape": one rayon task per entity already claims a core each, so leaving gix
+/// free to spawn its own would oversubscribe by an order of magnitude.
 pub(crate) fn dirty_counts(
     repo: &gix::Repository,
     cancel: Arc<AtomicBool>,
@@ -554,6 +558,7 @@ pub(crate) fn dirty_counts(
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|error| ProbeError::Status(error.to_string().into()))?
+        .index_worktree_options_mut(|options| options.thread_limit = Some(1))
         .should_interrupt_owned(cancel);
     // scan: dirty-counts-cancel end
     let iter = platform
