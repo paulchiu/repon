@@ -2041,6 +2041,13 @@ impl RefreshHandles {
             // against, so one still running from an earlier Generation can never signal a
             // gate registered after that Generation dispatched.
             let held_gate = self.phase_c_gates.lock().unwrap().get(&key).cloned();
+            // scan: probe-fanout-pool begin -- rayon's global pool, not a dedicated one:
+            // docs/adr/0013's sweep found the width a dedicated pool would need to pick is
+            // a broad plateau that the global pool's own free default already sits inside
+            // at every corpus size tried, and is the only width that stayed competitive
+            // across idle, fetch-sized and Action-sized concurrent load. A dedicated pool
+            // would cost a second idle thread pool's worth of memory and startup time to
+            // land somewhere this measurement found no better than free.
             rayon::spawn(move || {
                 let branch_outcome = probe_branch(&path, repo.as_deref(), kind, &cancel);
                 let sync_outcome = probe_sync(
@@ -2150,6 +2157,7 @@ impl RefreshHandles {
                     cvar.notify_all();
                 }
             });
+            // scan: probe-fanout-pool end
         }
     }
 
