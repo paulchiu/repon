@@ -2597,6 +2597,67 @@ mod tests {
         );
     }
 
+    /// Reads `llms.txt` at the repo root via `CARGO_MANIFEST_DIR`, following
+    /// [`read_config_spec`]'s precedent: the file lives outside this crate's directory.
+    fn read_llms_txt() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(manifest_dir.join("../../llms.txt")).expect("read llms.txt")
+    }
+
+    /// Every markdown link's url in `text`, in order. A plain scan rather than a regex
+    /// dependency: `](url)` is unambiguous in a file with no other use of `](`.
+    fn markdown_link_urls(text: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let end = after.find(')').expect("an opened markdown link must close");
+            urls.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        }
+        urls
+    }
+
+    /// Issue #352: `llms.txt` is Repon's front door for a coding agent, and it only earns
+    /// that role by staying accurate. Every link must resolve to a real file once the raw
+    /// prefix is stripped, and every `docs/spec/` file must be referenced, so a new spec
+    /// cannot be added without `llms.txt` learning about it.
+    #[test]
+    fn llms_txt_links_all_resolve_and_all_specs_are_listed() {
+        const RAW_PREFIX: &str = "https://raw.githubusercontent.com/paulchiu/repon/main/";
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir.join("../..");
+        let llms_txt = read_llms_txt();
+
+        for url in markdown_link_urls(&llms_txt) {
+            let relative = url
+                .strip_prefix(RAW_PREFIX)
+                .unwrap_or_else(|| panic!("llms.txt link is not rooted at {RAW_PREFIX}: {url}"));
+            assert!(
+                repo_root.join(relative).exists(),
+                "llms.txt references missing file: {relative}"
+            );
+        }
+
+        let spec_names = fs::read_dir(repo_root.join("docs/spec"))
+            .expect("read docs/spec")
+            .map(|entry| {
+                entry
+                    .expect("read a docs/spec entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".md"));
+        for name in spec_names {
+            assert!(
+                llms_txt.contains(&format!("docs/spec/{name}")),
+                "docs/spec/{name} is not referenced in llms.txt"
+            );
+        }
+    }
+
     /// The name of the key carrying an Action's applicability predicate, read out of
     /// [config.md](../../../../docs/spec/config.md)'s own "Actions" table rather than
     /// restated here: the row is the one whose meaning names the Filter grammar, and its
