@@ -399,12 +399,17 @@ pub struct App {
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
     /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
     document: Document,
-    /// This session's own override of `document.show_worktrees`, set by `Action::ToggleWorktrees`
+    /// This scope's own override of `document.show_worktrees`, set by `Action::ToggleWorktrees`
     /// (`t`) and read through [`Self::effective_show_worktrees`] everywhere the config field
-    /// used to be read directly. `None` until the toggle first fires, so the config file keeps
-    /// deciding the starting state; `apply_reloaded_config` resets this to `None` too, so a
-    /// reload always hands the keyboard back to whatever the file currently says
-    /// ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees toggle").
+    /// used to be read directly. `None` until the toggle first fires in this scope, so the
+    /// config file keeps deciding the starting state; `apply_reloaded_config` resets this to
+    /// `None` too, so a reload always hands the keyboard back to whatever the file currently
+    /// says ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees toggle").
+    /// Restored from `state.toml` at startup and written back on quit
+    /// ([`Self::restore_session_state`], [`Self::persist_state`]), so a value the toggle set
+    /// survives a restart the way the Selection and Filter beside it do; a reload's own clear
+    /// is still what a save right after this records, so a reload (not a restart) is what
+    /// actually forgets it ([config.md](../../../docs/spec/config.md#state)).
     worktrees_toggle: Option<bool>,
     /// Where `state.toml` lives, fixed for the process the same way [`config::data_dir`]
     /// itself is; kept as a field rather than re-read from that `OnceLock` on every call so
@@ -671,7 +676,11 @@ impl App {
     /// always beats stored state"). Announces a Filter that ends up active with a Notice
     /// naming its expression and its current match count, so a silently narrowed view
     /// cannot masquerade as the whole set
-    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Also
+    /// restores `self.worktrees_toggle` from the scope's own `show_worktrees`: a scope
+    /// nothing has ever toggled Worktrees in stores `None`, which leaves
+    /// `config.toml`'s own `show_worktrees` deciding exactly as if `t` had never fired this
+    /// process or any before it.
     fn restore_session_state(&mut self, flag_filter: Option<&str>) {
         let scope_state = state::load(&self.data_dir).scope(&self.scope_key());
         let entities = &self.core.snapshot().entities;
@@ -681,6 +690,7 @@ impl App {
             None => Filter::parse(&scope_state.filter),
         };
         self.row_order = scope_state.sort.unwrap_or_else(RowOrder::cold_start);
+        self.worktrees_toggle = scope_state.show_worktrees;
         if self.filter.is_active() {
             let match_count = self.visible_keys().len();
             self.set_notice(restored_filter_notice(&self.filter, match_count));
@@ -689,13 +699,17 @@ impl App {
 
     /// Writes this scope's whole session state to `state.toml`, leaving every other scope's
     /// own entry untouched: the checked rows by name, the committed Filter's own expression,
-    /// and the table's `RowOrder`, plus the Set being viewed at the top level, which is what
-    /// [`reload::resolve_startup_set`] reopens the next run in. Nothing `self.core` computed
-    /// from git is written
-    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)). Called
-    /// on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the same
-    /// grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session is
-    /// already over by the time this runs, so there is nothing left to report to but
+    /// the table's `RowOrder`, and the worktrees toggle, plus the Set being viewed at the top
+    /// level, which is what [`reload::resolve_startup_set`] reopens the next run in. Nothing
+    /// `self.core` computed from git is written
+    /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+    /// `self.worktrees_toggle` is written exactly as it stands, so a reload's own clear back
+    /// to `None` ([`Self::apply_reloaded_config`]) is what a save right after records: the
+    /// override's absence, not its last value
+    /// ([config.md](../../../docs/spec/config.md#state)'s "Reload replaces the override").
+    /// Called on quit ([`Self::run`]). A write failure is logged and otherwise swallowed, the
+    /// same grade `reload.rs`'s own `reload_config` gives a mid-session failure: the session
+    /// is already over by the time this runs, so there is nothing left to report to but
     /// `repon.log`.
     pub(crate) fn persist_state(&self) {
         let entities = &self.core.snapshot().entities;
@@ -703,6 +717,7 @@ impl App {
             selection: self.selection.names(entities),
             filter: self.filter.as_str().to_string(),
             sort: Some(self.row_order),
+            show_worktrees: self.worktrees_toggle,
         };
         let mut file = state::load(&self.data_dir);
         file.set_scope(self.scope_key(), scope_state);
@@ -2379,17 +2394,18 @@ impl App {
     }
 
     /// Whether Worktree rows are drawn this frame: `self.worktrees_toggle` once
-    /// `Action::ToggleWorktrees` has fired this session, else `self.document.show_worktrees`,
-    /// the config file's own value. Every reader that used to name
-    /// `self.document.show_worktrees` directly reads this instead, so the toggle overrides the
-    /// config file for the rest of the session without ever mutating it.
+    /// `Action::ToggleWorktrees` has fired in this scope (this session, or a prior one this
+    /// scope's `state.toml` remembered), else `self.document.show_worktrees`, the config
+    /// file's own value. Every reader that used to name `self.document.show_worktrees`
+    /// directly reads this instead, so the toggle overrides the config file until a reload
+    /// clears it, without ever mutating the file.
     fn effective_show_worktrees(&self) -> bool {
         self.worktrees_toggle
             .unwrap_or(self.document.show_worktrees)
     }
 
     /// `Action::ToggleWorktrees`'s (`t`) whole effect: flips [`Self::effective_show_worktrees`]
-    /// for the rest of the session and re-clamps the cursor onto the table the visibility
+    /// until a reload clears it, and re-clamps the cursor onto the table the visibility
     /// change may have just shrunk ([`Self::set_cursor`]), the identical re-clamp a dismissal
     /// gives. The Selection is deliberately left untouched: a checked Worktree row the toggle
     /// just hid stays checked, exactly as one a narrowing Filter already hides does
@@ -12251,11 +12267,11 @@ refresh_all = "z""#,
         );
     }
 
-    // --- the worktrees toggle (`t`): a session override, cursor re-clamp, the Selection
+    // --- the worktrees toggle (`t`): a per-scope override, cursor re-clamp, the Selection
     // left alone, and the header naming the toggle rather than the file ---
 
     #[test]
-    fn pressing_t_hides_worktree_rows_for_the_session_without_touching_config_toml() {
+    fn pressing_t_hides_worktree_rows_without_touching_config_toml() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
@@ -12274,7 +12290,7 @@ refresh_all = "z""#,
         assert_eq!(
             app.visible_keys().len(),
             1,
-            "the toggle just hid the Worktree row for this session"
+            "the toggle just hid the Worktree row"
         );
         assert!(
             app.document.show_worktrees,
@@ -12398,7 +12414,7 @@ refresh_all = "z""#,
         );
         assert!(
             !text.contains("preference off"),
-            "must never credit config.toml with a session-only toggle: {text:?}"
+            "must never credit config.toml with the toggle's own override: {text:?}"
         );
     }
 
@@ -13188,5 +13204,64 @@ refresh_all = "z""#,
         app_again.restore_session_state(None);
 
         assert_eq!(app_again.row_order, RowOrder::Natural);
+    }
+
+    /// The worktrees toggle round-trips through `state.toml` per scope, next to `selection`,
+    /// `filter` and `sort`: firing `t`, persisting, and restoring a fresh `App` over the same
+    /// scope must come back with Worktrees still hidden, a restart surviving what only a
+    /// reload is meant to clear.
+    #[test]
+    fn the_worktrees_toggle_round_trips_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.toggle_worktrees();
+        assert!(
+            !app.effective_show_worktrees(),
+            "t just turned Worktrees off"
+        );
+        app.persist_state();
+
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert!(
+            !app_again.effective_show_worktrees(),
+            "a restart must restore the toggle a previous session left, not `config.toml`'s \
+             own `show_worktrees = true`"
+        );
+    }
+
+    /// A scope nothing has ever toggled Worktrees in restores with `config.toml`'s own
+    /// `show_worktrees` deciding, exactly as if `t` had never fired in any prior session:
+    /// `None` is not confused with `Some(true)`.
+    #[test]
+    fn a_scope_never_toggled_restores_with_the_configs_own_show_worktrees_deciding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        // Persist a Selection and a Filter without ever pressing `t`, so the written scope
+        // holds a real entry with `show_worktrees` absent from it.
+        app.filter = Filter::parse("is:dirty");
+        app.persist_state();
+
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert!(
+            app_again.effective_show_worktrees(),
+            "Document::default's own `show_worktrees = true` must still decide when nothing \
+             in this scope has ever toggled it"
+        );
     }
 }

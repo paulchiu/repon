@@ -186,7 +186,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::RefreshSelection => "Refresh the Selection",
         Action::RederiveDefaultBranches => "Re-derive default branches over the Selection",
         Action::ExpandWarning => "Expand the warning slot",
-        Action::ToggleWorktrees => "Toggle Worktree rows for the session",
+        Action::ToggleWorktrees => "Toggle Worktree rows",
         Action::OpenSetPicker => "Open the Set picker",
         Action::OpenSortMenu => "Open the sort menu",
         Action::SwitchToSet(_) => "Switch to the Nth declared Set",

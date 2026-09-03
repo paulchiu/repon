@@ -19,14 +19,18 @@ const STATE_FILE: &str = "state.toml";
 const ACTIVE_SET_KEY: &str = "active_set";
 
 /// One scope's whole session state: the Selection as a list of display names, the committed
-/// Filter as its own expression string, and the table's `RowOrder`. Nothing computed from
-/// git is ever a field here, because session state is user input and can only be absent,
-/// never stale ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
+/// Filter as its own expression string, the table's `RowOrder`, and the worktrees toggle.
+/// Nothing computed from git is ever a field here, because session state is user input and
+/// can only be absent, never stale
+/// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
 /// `sort` is `None` for a scope nothing has ever chosen an order for, which
 /// [`crate::app::App::restore_session_state`] reads as [`RowOrder::cold_start`] rather than
 /// [`RowOrder::Natural`]
 /// ([ADR 0030](../../../docs/adr/0030-the-table-has-an-order-the-user-chooses.md)'s
-/// amendment).
+/// amendment). `show_worktrees` is `None` for a scope nothing has ever toggled Worktrees in,
+/// which [`crate::app::App::restore_session_state`] reads the same way `t` never fired: as
+/// deferring to `config.toml`'s own `show_worktrees`
+/// ([config.md](../../../docs/spec/config.md#state)).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScopeState {
     #[serde(default)]
@@ -35,6 +39,8 @@ pub(crate) struct ScopeState {
     pub(crate) filter: String,
     #[serde(default)]
     pub(crate) sort: Option<RowOrder>,
+    #[serde(default)]
+    pub(crate) show_worktrees: Option<bool>,
 }
 
 /// The whole file: the Set last viewed, then a map of scope key to its own [`ScopeState`],
@@ -138,6 +144,7 @@ mod tests {
                 selection: vec!["repo-a".to_string(), "repo-b".to_string()],
                 filter: "kind:worktree".to_string(),
                 sort: None,
+                show_worktrees: None,
             },
         );
 
@@ -150,17 +157,18 @@ mod tests {
                 selection: vec!["repo-a".to_string(), "repo-b".to_string()],
                 filter: "kind:worktree".to_string(),
                 sort: None,
+                show_worktrees: None,
             }
         );
     }
 
     /// Criterion 2's own risk: a round trip of one field proves nothing about what else the
-    /// file carries. This asserts the whole written file's content is exactly the three
+    /// file carries. This asserts the whole written file's content is exactly the four
     /// fields a scope owns, so a later field added to the struct (a branch name, a commit
     /// id) would fail this the moment it serialised, not only when some other test happened
     /// to read it back.
     #[test]
-    fn the_written_file_holds_only_selection_filter_and_sort_nothing_else() {
+    fn the_written_file_holds_only_selection_filter_sort_and_show_worktrees_nothing_else() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut file = StateFile::default();
         file.set_scope(
@@ -169,6 +177,7 @@ mod tests {
                 selection: vec!["repo-a".to_string()],
                 filter: "is:dirty".to_string(),
                 sort: Some(RowOrder::cold_start()),
+                show_worktrees: Some(false),
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -184,9 +193,9 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["filter", "selection", "sort"],
-            "a scope must hold exactly `selection`, `filter` and `sort`, nothing git \
-             computed: {text:?}"
+            vec!["filter", "selection", "show_worktrees", "sort"],
+            "a scope must hold exactly `selection`, `filter`, `sort` and `show_worktrees`, \
+             nothing git computed: {text:?}"
         );
     }
 
@@ -210,6 +219,7 @@ mod tests {
                     column: SortColumn::Dirty,
                     direction: Direction::Descending,
                 }),
+                show_worktrees: None,
             },
         );
         file.set_scope(
@@ -218,6 +228,7 @@ mod tests {
                 selection: vec![],
                 filter: String::new(),
                 sort: Some(RowOrder::Natural),
+                show_worktrees: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -231,6 +242,49 @@ mod tests {
             })
         );
         assert_eq!(reloaded.scope("natural").sort, Some(RowOrder::Natural));
+    }
+
+    /// The worktrees toggle (`Action::ToggleWorktrees`, `t`) round-trips the same way `sort`
+    /// does: both booleans a scope can hold survive a save and a reload.
+    #[test]
+    fn a_recorded_worktrees_toggle_round_trips_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut file = StateFile::default();
+        file.set_scope(
+            "hidden".to_string(),
+            ScopeState {
+                show_worktrees: Some(false),
+                ..ScopeState::default()
+            },
+        );
+        file.set_scope(
+            "shown".to_string(),
+            ScopeState {
+                show_worktrees: Some(true),
+                ..ScopeState::default()
+            },
+        );
+        save(dir.path(), &file).expect("save state.toml");
+
+        let reloaded = load(dir.path());
+        assert_eq!(reloaded.scope("hidden").show_worktrees, Some(false));
+        assert_eq!(reloaded.scope("shown").show_worktrees, Some(true));
+    }
+
+    /// A scope nothing has ever toggled Worktrees in loads `show_worktrees` as `None`, which
+    /// [`crate::app::App::restore_session_state`] reads as "let `config.toml` decide", exactly
+    /// as if the toggle had never fired.
+    #[test]
+    fn a_scope_with_no_show_worktrees_key_loads_it_as_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(STATE_FILE),
+            "[work]\nselection = [\"repo-a\"]\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write a pre-toggle state.toml");
+
+        let scope = load(dir.path()).scope("work");
+        assert_eq!(scope.show_worktrees, None);
     }
 
     /// A scope with no `sort` key at all, exactly what an older build's own `state.toml`
@@ -264,6 +318,7 @@ mod tests {
                 selection: vec!["repo-a".to_string()],
                 filter: "is:dirty".to_string(),
                 sort: None,
+                show_worktrees: None,
             },
         );
         file.set_active_set("work".to_string());
@@ -337,6 +392,7 @@ mod tests {
                 selection: vec!["repo-a".to_string()],
                 filter: "kind:worktree".to_string(),
                 sort: None,
+                show_worktrees: None,
             },
         );
         file.set_scope(
@@ -345,6 +401,7 @@ mod tests {
                 selection: vec!["dotfiles".to_string()],
                 filter: String::new(),
                 sort: None,
+                show_worktrees: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -424,6 +481,7 @@ mod tests {
                 selection: vec!["repo-a".to_string()],
                 filter: "is:dirty".to_string(),
                 sort: None,
+                show_worktrees: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");

@@ -30,9 +30,10 @@ use crate::elapsed::format_elapsed;
 
 /// Why Worktree rows are off when [`HeaderContent::worktrees_note`] is `Some`: config.toml's
 /// own `show_worktrees` ([config.md](../../../../docs/spec/config.md)'s "the stake on
-/// `show_worktrees`"), or this session's own `t` toggle overriding it
+/// `show_worktrees`"), or `t`'s own toggle overriding it, whether it fired this session or a
+/// prior one this scope's `state.toml` remembered
 /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "The worktrees toggle").
-/// [`trailing_items`] picks its wording from this so a toggle-off session never reads as if
+/// [`trailing_items`] picks its wording from this so a toggled-off scope never reads as if
 /// config.toml said so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorktreesHiddenBy {

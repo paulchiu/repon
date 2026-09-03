@@ -550,9 +550,10 @@ mod tests {
         );
     }
 
-    /// `Action::ToggleWorktrees` (`t`) is session state, not something a reload should carry
-    /// forward: [keybindings.md](../../../../docs/spec/keybindings.md)'s "The worktrees
-    /// toggle" promises the override stands only "until the app exits or config is reloaded".
+    /// `Action::ToggleWorktrees` (`t`) is remembered across a restart but not across a
+    /// reload: [keybindings.md](../../../../docs/spec/keybindings.md)'s "The worktrees
+    /// toggle" promises a reload clears it, `config.toml`'s freshly-loaded value deciding
+    /// again as though `t` had never fired.
     #[test]
     fn a_reload_clears_the_worktrees_toggle_back_to_whatever_the_file_currently_says() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -567,7 +568,7 @@ mod tests {
         app.toggle_worktrees();
         assert!(
             !app.effective_show_worktrees(),
-            "the toggle just turned Worktrees off for the session"
+            "the toggle just turned Worktrees off"
         );
 
         let mut document = Document::default();
@@ -578,6 +579,40 @@ mod tests {
             app.effective_show_worktrees(),
             "a reload must clear the session override and fall back to the freshly-loaded \
              `show_worktrees = true` again"
+        );
+    }
+
+    /// A reload clears the override in memory, per the test above; this pins what happens to
+    /// the persisted copy. A save right after a reload must write the override's absence, not
+    /// its last value, so a later restart in the same scope defers to `config.toml` exactly
+    /// as a scope nothing has ever toggled Worktrees in would
+    /// ([config.md](../../../../docs/spec/config.md#state)'s "Reload replaces the override
+    /// with whatever the file currently says").
+    #[test]
+    fn a_save_right_after_a_reload_records_the_toggles_absence_not_its_last_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+
+        let mut app = test_app(&root);
+        app.data_dir = state_dir.path().to_path_buf();
+        app.toggle_worktrees();
+        app.persist_state();
+
+        let mut document = Document::default();
+        document.sets.push(matching_set_config(&root));
+        app.apply_reloaded_config(config_with_document(document));
+        app.persist_state();
+
+        let mut app_again = test_app(&root);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert!(
+            app_again.effective_show_worktrees(),
+            "the save after the reload must have overwritten the earlier `Some(false)` with \
+             `None`, so a restart now defers to `config.toml`'s own `show_worktrees = true`"
         );
     }
 

@@ -18,7 +18,7 @@ Seven named contexts. `global` is live in `list` and `detail` only, and is suspe
 
 An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, Home, End, the cursor keys and the Ctrl and Alt chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
-`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every listed row (not just this screenful), `t` toggles Worktree rows for the session. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those six letters keep every meaning they already have.
+`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every listed row (not just this screenful), `t` toggles Worktree rows. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those six letters keep every meaning they already have.
 
 ## The default map
 
@@ -38,7 +38,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `R` | Refresh the Selection |
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
-| `t` | Toggle Worktree rows for the session |
+| `t` | Toggle Worktree rows |
 | `s`, `Tab` | Open the Set picker |
 | `o` | Open the sort menu |
 | `1` to `9` | Switch to the Nth declared Set |
@@ -376,11 +376,11 @@ An unbound printable key is ignored in silence and never beeps, because a split 
 
 ## The worktrees toggle
 
-`t` flips whether Worktree rows are drawn, for this session alone: it overrides [config.md](config.md)'s `show_worktrees` without writing to `config.toml`, and the override stands until the app exits or a reload (`Ctrl+R`, or `e`'s own reload on return) re-reads the file, at which point the file's current value decides again exactly as if the toggle had never fired.
+`t` flips whether Worktree rows are drawn: it overrides [config.md](config.md)'s `show_worktrees` without writing to `config.toml`. The override is remembered per scope in `state.toml` beside the Selection, the Filter and `sort` ([config.md](config.md#state)), so quitting and relaunching over the same scope restores it. Only a reload (`Ctrl+R`, or `e`'s own reload on return) clears it: the file's current value decides again exactly as if the toggle had never fired, and the save that follows records that absence, so the next restart in turn defers to `config.toml` too.
 
 The toggle changes what is drawn and what the cursor can reach, nothing more: discovery, probing and what a Set matches are untouched, since the Worktrees are still there and still refreshed, merely undrawn. Hiding the row the cursor sits on re-clamps the cursor onto the table the same way a dismissal does (`d`, above). The Selection is left exactly alone: a checked Worktree row the toggle just hid stays checked, the same as one a narrowing Filter already hides ([The Selection](#the-selection)'s own "must not change" rule), so it still counts toward the next Action or Launcher's targets and the palette's own border-title count still names it; nothing is silently dropped from a Selection a keystroke did not touch.
 
-The header's own `worktrees: N (preference off)` note ([config.md](config.md)'s "the stake on `show_worktrees`") changes its wording to name whichever of the two is actually why Worktrees are off: `(preference off)` when `show_worktrees` in the file is what hides them, `(toggled off)` once `t` has fired this session, so the note never credits the file with a session-only override or the reverse.
+The header's own `worktrees: N (preference off)` note ([config.md](config.md)'s "the stake on `show_worktrees`") changes its wording to name whichever of the two is actually why Worktrees are off: `(preference off)` when `show_worktrees` in the file is what hides them, `(toggled off)` once `t` has fired and the override still stands, so the note never credits the file with a session override or the reverse. A toggle restored from a previous session on relaunch is still an override, not the file's own preference, so it reads `(toggled off)` too: what fired `t` is irrelevant, only whether an override is currently why Worktrees are off.
 
 ## Open
 
