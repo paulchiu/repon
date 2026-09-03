@@ -202,7 +202,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::HalfPageUp => "Half page up",
         Action::ToggleSelection => "Toggle this row's Selection",
         Action::AnchorRange => "Anchor a range at the cursor, extended with `j` and `k`",
-        Action::SelectAllVisible => "Select every visible row",
+        Action::SelectAllVisible => "Select every listed row, not just this screenful",
         Action::ClearSelection => "Clear the Selection",
         Action::OpenDetail => "Open the detail pane",
         Action::DismissVanished => "Dismiss a Vanished row",
@@ -2197,6 +2197,21 @@ mod tests {
                 row.3
             );
         }
+    }
+
+    /// `a`'s description must not read as "the rows on this screen": `visible_keys()` is the
+    /// whole Filter- and toggle-narrowed list, page or no page, so "visible" alone is the
+    /// word that misled. `compiled_table_matches_the_spec_default_map_row_for_row` already
+    /// pins this string against keybindings.md's `list` table row; this test pins the
+    /// wording itself so it cannot drift back to the ambiguous phrase.
+    #[test]
+    fn select_all_visible_s_description_does_not_read_as_this_screenful() {
+        let text = description(Action::SelectAllVisible);
+        assert_eq!(text, "Select every listed row, not just this screenful");
+        assert!(
+            !text.contains("visible"),
+            "description {text:?} still uses \"visible\", the word a screenful can misread"
+        );
     }
 
     /// The two rows [`compiled_table_matches_the_spec_default_map_row_for_row`] cannot see:

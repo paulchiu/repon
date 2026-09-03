@@ -18,7 +18,7 @@ Seven named contexts. `global` is live in `list` and `detail` only, and is suspe
 
 An input context takes the whole keyboard, because if `q` quit globally then typing `q` into a Filter would quit. Only Esc, Enter, Tab, Backspace, Home, End, the cursor keys and the Ctrl and Alt chords named below are reserved there; everything else printable is text. The same holds for `confirm`, where only `y`, `n`, Enter and Esc do anything.
 
-`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every visible row, `t` toggles Worktree rows for the session. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those six letters keep every meaning they already have.
+`sort` is a context of its own for the same reason, read the other way round. Its six column keys are letters that already mean something in `global` and `list`: `b` re-derives default branches, `s` opens the Set picker, `n` jumps to the next failed row, `d` dismisses a Vanished row, `a` selects every listed row (not just this screenful), `t` toggles Worktree rows for the session. Binding a column to one of those globally would let a stray press reorder the table from underneath the list, so the column keys are rows of this context and of no other, and `global` is suspended here the way it is in the other four. Outside the menu those six letters keep every meaning they already have.
 
 ## The default map
 
@@ -59,7 +59,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Ctrl+U`, `PageUp` | Half page up |
 | `Space` | Toggle this row's Selection |
 | `v` | Anchor a range at the cursor, extended with `j` and `k` |
-| `a` | Select every visible row |
+| `a` | Select every listed row, not just this screenful |
 | `A` | Clear the Selection |
 | `Enter` | Open the detail pane |
 | `d` | Dismiss a Vanished row |
