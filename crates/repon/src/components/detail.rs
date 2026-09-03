@@ -1818,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn with_no_known_cell_yet_the_pane_prints_no_refreshed_line_at_all() {
+    fn a_row_with_no_known_cell_yet_prints_no_refreshed_line_at_all() {
         let row = entity("a");
 
         let lines = content_lines(&row, WIDE, full_glyphs());
