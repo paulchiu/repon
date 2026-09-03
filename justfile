@@ -304,3 +304,16 @@ sweep-fanout entities="400" seed="1":
 # directory fails the run rather than being dropped from it.
 sweep-fanout-real *roots:
     cd tools/fanout-sweep && cargo run --release -- real --roots {{replace(trim(roots), " ", ",")}}
+
+# Sweeps gix's decoded-object cache size over phase D (patch equivalence), which is the
+# one phase it acts on and the one the two recipes above deliberately do not run: their
+# synthetic corpus is all `Kind::Repo` with a single branch, and production never runs
+# phase D for a `Kind::Repo` at all. Read-only, and eligible only for entities whose HEAD
+# has actually diverged from its own default branch, which is what `landing::probe`
+# answers Outstanding for. Same `roots` discipline as `sweep-fanout-real`: separate shell
+# words, never defaulted, never read from config or the environment. Reports peak RSS
+# alongside wall clock, since an object cache is a time-against-memory trade and a run
+# that printed only one of the two could not settle it. `docs/spec/refresh.md`'s "The
+# fan-out shape" and `docs/adr/0013` carry what the last run found.
+sweep-landing *roots:
+    cd tools/fanout-sweep && cargo run --release -- landing --roots {{replace(trim(roots), " ", ",")}} --cache-limits off,1,4,16,64

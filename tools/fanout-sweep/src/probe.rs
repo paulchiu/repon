@@ -104,6 +104,28 @@ fn probe_base(repo: &gix::Repository) {
     let _ = repo.remote_names();
 }
 
+/// Opens `path` with gix's own decoded-object cache set to `cache_limit` bytes, or left
+/// off where that is `None`, which is also what production does today
+/// (`crates/repon-core/src/git.rs`'s `open_thread_safe` calls plain `gix::open`, and an
+/// unset `gitoxide.objects.cacheLimit` parses to 0, which `setup_objects` reads as "no
+/// cache"). The override goes on at open time rather than through
+/// `Repository::object_cache_size` because `setup_objects` re-runs from the stored config
+/// on every handle derived from a `ThreadSafeRepository`, so this is the one lever that a
+/// `to_thread_local` in a later generation would inherit; setting it on an already-derived
+/// handle would not survive.
+pub fn open_with_cache(path: &Path, cache_limit: Option<usize>) -> Result<gix::Repository, String> {
+    match cache_limit {
+        None => gix::open(path).map_err(|error| error.to_string()),
+        Some(bytes) => {
+            let options = gix::open::Options::default()
+                .config_overrides([format!("gitoxide.objects.cacheLimit={bytes}")]);
+            gix::ThreadSafeRepository::open_opts(path, options)
+                .map(|repo| repo.to_thread_local())
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
 /// Opens `path` fresh and runs the full per-entity task against it: phases A and B
 /// (branch, sync, default branch, base), then phase C's status walk, with gix's own
 /// per-repository thread limit on the status platform set to `thread_limit` (`None`
@@ -111,8 +133,12 @@ fn probe_base(repo: &gix::Repository) {
 /// always passes `Some(1)`). Returns how long the whole task took, excluding the open,
 /// the same unit `dispatch_probes`'s own `rayon::spawn` closure commits one pool slot to
 /// (see the module doc for the one phase, worktree state, this does not include).
-pub fn probe_entity_task(path: &Path, thread_limit: Option<usize>) -> Duration {
-    let repo = gix::open(path)
+pub fn probe_entity_task(
+    path: &Path,
+    thread_limit: Option<usize>,
+    cache_limit: Option<usize>,
+) -> Duration {
+    let repo = open_with_cache(path, cache_limit)
         .unwrap_or_else(|error| panic!("open corpus repository {}: {error}", path.display()));
     let cancel = Arc::new(AtomicBool::new(false));
 

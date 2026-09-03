@@ -464,6 +464,25 @@ pub(crate) fn common_dir_of(path: &Path) -> Result<Arc<Path>, ProbeError> {
     ))
 }
 
+/// The size of gix's decoded-object cache on every handle repon opens, in bytes.
+///
+/// gix leaves this off by default (an unset `gitoxide.objects.cacheLimit` parses to 0,
+/// which `setup_objects` reads as "no cache"), and its own docs ask for one on every
+/// rev-walk and tree-diff entry point. Only one of repon's phases is such an entry point
+/// in a way that pays: phase D's patch equivalence, whose `scan_default_branch` diffs each
+/// commit on the default branch against its own first parent, so consecutive iterations
+/// decode the same tree twice and every subtree the two commits share on both sides.
+///
+/// Measured, per [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+/// "The fan-out shape": phase D over the owner's real population goes from 878-1025ms
+/// uncached to 475-560ms cached, at every pool width tried, while the cheap phases and the
+/// status walk do not move at all (0.8%, inside noise). Every cap between 1MiB and 64MiB
+/// lands at that same floor, so the number is not a tuned optimum and nothing here depends
+/// on it being 4: it is the smallest cap with headroom over the ~2MB per-handle high-water
+/// mark actually observed, and the cache grows lazily to a ceiling rather than reserving,
+/// so a cap is a bound on the worst case rather than memory spent up front.
+const OBJECT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Opens `path` as a git repository and hands back the thread-safe form.
 ///
 /// `gix::Repository` holds a `RefCell` free-list of buffers, so it is `Send` but
@@ -473,9 +492,19 @@ pub(crate) fn common_dir_of(path: &Path) -> Result<Arc<Path>, ProbeError> {
 /// task opens through here once and has each task derive its own `Repository` via
 /// [`gix::ThreadSafeRepository::to_thread_local`], never sharing one `Repository`
 /// across tasks.
+///
+/// The object cache is set here, at open time, rather than through
+/// `Repository::object_cache_size` on a derived handle: that method takes `&mut self` and
+/// the cache lives on the handle, so a later `to_thread_local` would get a fresh one with
+/// no cache at all. gix re-runs `setup_objects` from the stored config on every handle it
+/// derives, so a config override applied once here is the only form every generation's
+/// handles inherit. It is an override rather than a default, so it also wins over a
+/// `gitoxide.objects.cacheLimit` in the user's own git config; that key is gitoxide-specific
+/// and repon has measured its own value for it ([`OBJECT_CACHE_BYTES`]).
 pub(crate) fn open_thread_safe(path: &Path) -> Result<gix::ThreadSafeRepository, ProbeError> {
-    gix::open(path)
-        .map(gix::Repository::into_sync)
+    let options = gix::open::Options::default()
+        .config_overrides([format!("gitoxide.objects.cacheLimit={OBJECT_CACHE_BYTES}")]);
+    gix::ThreadSafeRepository::open_opts(path, options)
         .map_err(|error| ProbeError::Open(error.to_string().into()))
 }
 
@@ -872,6 +901,36 @@ mod tests {
     /// different threads, each read `HEAD` correctly, proving the shared handle is
     /// never the thing actually touched by a probe, only the source each task's
     /// own private handle is derived from.
+    /// Pins the mechanism [`OBJECT_CACHE_BYTES`] depends on: the cache is configured at
+    /// open time, and gix re-applies it from the stored config on every handle derived
+    /// from the shared `ThreadSafeRepository`, so a probe running in a later generation
+    /// still gets one. A plain `gix::open` is checked alongside it, since the whole change
+    /// is the difference between the two and a test that only asserted the positive would
+    /// still pass if gix started setting a cache by default.
+    #[test]
+    fn every_derived_handle_carries_an_object_cache_and_a_plain_open_does_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+
+        let shared = open_thread_safe(dir.path()).expect("open");
+        assert!(
+            shared.to_thread_local().objects.has_object_cache(),
+            "the first handle derived from the shared repository must carry an object cache"
+        );
+        assert!(
+            shared.to_thread_local().objects.has_object_cache(),
+            "a second handle, standing in for a later generation's probe, must carry one too"
+        );
+
+        assert!(
+            !gix::open(dir.path())
+                .expect("plain open")
+                .objects
+                .has_object_cache(),
+            "gix still leaves the object cache off by default, which is what this change is"
+        );
+    }
+
     #[test]
     fn two_threads_each_derive_their_own_repository_from_one_shared_handle() {
         let dir = tempfile::tempdir().expect("temp dir");

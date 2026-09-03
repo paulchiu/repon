@@ -241,6 +241,7 @@ name = "fanout-sweep"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "libc",
  "rayon",
 ]
 
