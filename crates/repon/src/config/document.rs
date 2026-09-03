@@ -243,6 +243,13 @@ pub struct Document {
     pub glyphs: Glyphs,
     pub show_worktrees: bool,
     pub show_submodules: bool,
+    /// Whether `space` (`Action::ToggleSelection`) moves the cursor to the next row after
+    /// toggling this one, through the same [`crate::app::App::move_cursor`] path `j` already
+    /// drives ([keybindings.md](../../../../docs/spec/keybindings.md)'s `space` paragraph).
+    /// It governs `space` alone: `v`'s range anchor, `a` and `A` are untouched. On the last
+    /// row there is nothing to advance to, so the cursor stays put; nothing else in the list
+    /// wraps.
+    pub advance_on_toggle: bool,
     /// How long a Notice ([theming.md](../../../../docs/spec/theming.md)'s "Warnings and
     /// Notices") stays on the status row before its own timeout clears it. `"0s"` turns the
     /// timer off rather than turning Notices off, leaving the next keypress or a replacement
@@ -290,6 +297,7 @@ impl Default for Document {
             glyphs: Glyphs::default(),
             show_worktrees: true,
             show_submodules: false,
+            advance_on_toggle: false,
             notice_timeout: Duration::from_secs(3),
             on_refresh: None,
             before_sync: None,
@@ -2119,6 +2127,7 @@ mod tests {
             glyphs: _,
             show_worktrees: _,
             show_submodules: _,
+            advance_on_toggle: _,
             notice_timeout: _,
             on_refresh: _,
             before_sync: _,
@@ -2138,6 +2147,7 @@ mod tests {
                 "glyphs",
                 "show_worktrees",
                 "show_submodules",
+                "advance_on_toggle",
                 "notice_timeout",
                 "on_refresh",
                 "before_sync",

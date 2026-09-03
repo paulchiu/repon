@@ -176,7 +176,7 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
-`space` toggles and `v` anchors a range. `v` is lazygit's. `space` is not: lazygit's `Universal.Select` is a per-context action key and lazygit has no point-toggle multi-select at all. The real precedents for space are k9s, ranger, nnn, yazi, gitui, lf and htop.
+`space` toggles and `v` anchors a range. `v` is lazygit's. `space` is not: lazygit's `Universal.Select` is a per-context action key and lazygit has no point-toggle multi-select at all. The real precedents for space are k9s, ranger, nnn, yazi, gitui, lf and htop. Five of those, k9s, ranger, nnn, yazi and lf, also advance the cursor after the toggle; Repon departs from them and leaves the cursor put by default, since an advance means `space space` unchecks the row below rather than undoing the row just checked, a real way to lose track. `advance_on_toggle` ([config.md](config.md)) opts back into their behaviour.
 
 Ruling out prefix counts freed `1` to `9`, which lazygit, gitui, k9s and nnn all spend on jumping between panes. Repon has two panes and does not need them, so they switch Sets instead.
 

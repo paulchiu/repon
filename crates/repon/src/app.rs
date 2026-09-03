@@ -1198,6 +1198,9 @@ impl App {
             Some(Action::ToggleSelection) => {
                 if let Some(key) = self.cursor_key() {
                     self.selection.toggle(key);
+                    if self.document.advance_on_toggle {
+                        self.move_cursor(1);
+                    }
                 }
                 None
             }
@@ -7154,6 +7157,97 @@ mod tests {
             repo_b.join("marker").exists(),
             "an empty Selection must reach every remaining visible row, not zero rows"
         );
+    }
+
+    /// `advance_on_toggle`'s default: unset, `space` leaves the cursor exactly where it
+    /// found it, the behaviour every existing user keeps.
+    #[test]
+    fn space_leaves_the_cursor_put_when_advance_on_toggle_is_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        assert!(!app.document.advance_on_toggle, "the key defaults to off");
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("toggle the cursor row");
+
+        assert_eq!(app.cursor, 0, "the cursor must not move with the key off");
+    }
+
+    /// `advance_on_toggle = true` turns `space` into check-and-advance: the row toggles and
+    /// the cursor moves down by one, the same `Self::move_cursor` path `j` already drives, so
+    /// it also re-clamps through `follow_cursor` rather than needing a scroll of its own.
+    #[test]
+    fn space_advances_the_cursor_by_one_row_when_advance_on_toggle_is_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.advance_on_toggle = true;
+        let visible = app.visible_keys();
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("toggle and advance");
+
+        assert!(
+            app.selection.contains(&visible[0]),
+            "the row under the cursor before the advance must still be the one toggled"
+        );
+        assert_eq!(app.cursor, 1, "the cursor must advance to the next row");
+    }
+
+    /// No wrap: nothing else in the list wraps, and the last row has nothing below it to
+    /// advance to, so `space` toggles it and the cursor stays exactly there.
+    #[test]
+    fn space_on_the_last_row_toggles_and_does_not_wrap_even_with_advance_on_toggle_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.advance_on_toggle = true;
+        let visible = app.visible_keys();
+        let last = visible.len() - 1;
+        app.set_cursor(last);
+
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("toggle the last row");
+
+        assert!(app.selection.contains(&visible[last]));
+        assert_eq!(
+            app.cursor, last,
+            "the cursor must stay on the last row, not wrap to 0"
+        );
+    }
+
+    /// `advance_on_toggle` governs `space` alone: `v`'s range anchor is a per-row gesture,
+    /// not one a cursor move would help, and must leave the cursor exactly where it landed.
+    #[test]
+    fn advance_on_toggle_never_moves_the_cursor_for_v_a_or_shift_a() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.advance_on_toggle = true;
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        assert_eq!(app.cursor, 0, "v must not move the cursor");
+
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select all visible");
+        assert_eq!(app.cursor, 0, "a must not move the cursor");
+
+        app.handle_key_event(press(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .expect("clear the selection");
+        assert_eq!(app.cursor, 0, "shift-a must not move the cursor");
     }
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
