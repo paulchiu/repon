@@ -1,0 +1,29 @@
+# Repon
+
+> Repon is short for 'Repo-N', where N stands in for many. It is a terminal UI for seeing and acting across many git repositories at once.
+
+Repon reads one file, `~/.config/repon/config.toml` (XDG on Unix including macOS, the native location on Windows). `REPON_CONFIG` names a different directory to look in and `--config <path>` names the file directly, beating it; either must exist if given. A missing file at the default path is not an error: it runs zero config, with one implicit Set named `all` rooted at the working directory. `repon config` prints the resolved config paths and `repon config --example` prints a fully annotated example file, so both what is currently in force and what a complete file looks like are one command away without reading the spec. The top-level shape is `theme` and `glyphs` as bare scalars, `[refresh]`, `[fetch]`, `[auto_update]` and `[keys]` as tables, and `[[set]]`, `[[repo]]`, `[[launcher]]` and `[[action]]` as arrays of tables. Malformed TOML or a bad value in a known key exits non-zero before the terminal is claimed, reporting the offending line and column; an unknown key only warns and names its dotted path, so a typo never blocks startup. Full detail, including every key's type and default: [docs/spec/config.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/config.md).
+
+## Documentation
+
+- [README.md](https://raw.githubusercontent.com/paulchiu/repon/main/README.md): what Repon is, what it does today, and how to install and build it.
+- [GLOSSARY.md](https://raw.githubusercontent.com/paulchiu/repon/main/GLOSSARY.md): the project's terms (Repo, Worktree, Set, Filter, Selection, Launcher, Action) as the code and every other document use them.
+- [docs/spec/actions.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/actions.md): what an Action runs, captures and reports, and how a run reads on screen.
+- [docs/spec/config.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/config.md): every config key, its type, its default and its failure mode.
+- [docs/spec/core-api.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/core-api.md): the boundary between `repon-core` and its consumers, and the machine-readable wire format.
+- [docs/spec/default-branch.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/default-branch.md): how a Repo's default branch is resolved, and what depends on it.
+- [docs/spec/discovery.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/discovery.md): the walk that finds Repos, Worktrees and Submodules before anything is probed.
+- [docs/spec/filter.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/filter.md): the Filter grammar, its vocabulary, and where it sits on screen.
+- [docs/spec/head.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/head.md): HEAD's three shapes and what each one costs to refresh.
+- [docs/spec/keybindings.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/keybindings.md): the context-sensitive key map, and how the footer, help overlay and config merge derive from it.
+- [docs/spec/layout-and-provenance.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/layout-and-provenance.md): the screen's frame, and how provenance renders as a row gutter and blank cells.
+- [docs/spec/refresh.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/refresh.md): when Repon looks again, what one look covers, and how a newer look beats an older one.
+- [docs/spec/releasing.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/releasing.md): the release channels, their triggers, and what the first crates.io publish still needs.
+- [docs/spec/repo-management.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/repo-management.md): the built-in operations that change what Repon operates on or remove a Repo from the machine.
+- [docs/spec/theming.md](https://raw.githubusercontent.com/paulchiu/repon/main/docs/spec/theming.md): the theme as a correction layer over the terminal's own palette.
+
+## Optional
+
+- [docs/adr/](https://raw.githubusercontent.com/paulchiu/repon/main/docs/adr/): architecture decision records, why each spec claim is what it is rather than something else.
+- [docs/research/](https://raw.githubusercontent.com/paulchiu/repon/main/docs/research/): the research the decisions rest on.
+- [AGENTS.md](https://raw.githubusercontent.com/paulchiu/repon/main/AGENTS.md): how work moves through this repo, for contributors rather than for running the tool.
