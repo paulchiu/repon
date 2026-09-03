@@ -1945,6 +1945,7 @@ mod tests {
                 output: StdArc::from(&b""[..]),
                 elapsed: Duration::ZERO,
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: repon_core::Timestamp::now(),
@@ -1959,6 +1960,7 @@ mod tests {
                 output: StdArc::from(&b""[..]),
                 elapsed: Duration::ZERO,
                 elision: None,
+                shell: false,
             }]),
             ..passing
         };

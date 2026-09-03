@@ -1454,6 +1454,7 @@ impl App {
                 | Action::ClearLine
                 | Action::OpenInEditor
                 | Action::InsertNewline
+                | Action::ToggleShell
                 | Action::MoveCursorLeft
                 | Action::MoveCursorRight
                 | Action::MoveCursorWordLeft
@@ -1720,6 +1721,11 @@ impl App {
                     palette.insert_newline(&self.document.actions);
                 }
             }
+            Some(Action::ToggleShell) => {
+                if let Some(palette) = &mut self.action_palette {
+                    palette.toggle_shell();
+                }
+            }
             Some(Action::OpenInEditor) => self.pending_action_editor_handoff = true,
             Some(Action::AcceptCompletion) => {}
             None => {}
@@ -1842,10 +1848,11 @@ impl App {
                     line.move_cursor(cursor_motion(action));
                 }
             }
-            // Both inert here, permanently: the Filter line is one line by definition
+            // All three inert here, permanently: the Filter line is one line by definition
             // ([filter.md](../../../docs/spec/filter.md)), so it has no newline to insert,
-            // and keybindings.md scopes `Ctrl+O` to the ad hoc command field.
-            Some(Action::OpenInEditor | Action::InsertNewline) => {}
+            // keybindings.md scopes `Ctrl+O` to the ad hoc command field, and there is no
+            // shell mode to toggle over a Filter predicate.
+            Some(Action::OpenInEditor | Action::InsertNewline | Action::ToggleShell) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or Text, \
@@ -1909,10 +1916,15 @@ impl App {
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_launcher(),
-            // All three inert here: this palette has no completion list, and its query is a
+            // All four inert here: this palette has no completion list, and its query is a
             // one-line name to match rather than a command to write, so neither the editor
-            // handoff nor the newline has anything to act on.
-            Some(Action::AcceptCompletion | Action::OpenInEditor | Action::InsertNewline) => {}
+            // handoff, the newline nor the shell toggle has anything to act on.
+            Some(
+                Action::AcceptCompletion
+                | Action::OpenInEditor
+                | Action::InsertNewline
+                | Action::ToggleShell,
+            ) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or \
@@ -11331,15 +11343,30 @@ refresh_all = "z""#,
     // Action already uses.
     // =====================================================================================
 
-    /// Opens the Action palette, pastes `text` as one bracketed-paste event, presses Enter,
-    /// then waits for the real fan-out to finish. Panics if nothing was queued to run, so a
-    /// caller does not need to separately assert the palette actually dispatched something.
+    /// Opens the Action palette, pastes `text` as one bracketed-paste event, presses Enter to
+    /// open the confirm gate and `y` to accept it, then waits for the real fan-out to finish.
+    /// Panics if nothing was queued to run, so a caller does not need to separately assert
+    /// the palette actually dispatched something. Shell mode is left at its default (on);
+    /// [`run_ad_hoc_command_with_shell`] is the variant that can toggle it off first.
     fn run_ad_hoc_command(app: &mut App, text: &str) {
+        run_ad_hoc_command_with_shell(app, text, true);
+    }
+
+    /// [`run_ad_hoc_command`], but pressing `Alt+S` before typing `text` when `shell` is
+    /// `false`, so a caller can exercise either mode through the identical key-driven path
+    /// rather than reaching into the palette's own field.
+    fn run_ad_hoc_command_with_shell(app: &mut App, text: &str, shell: bool) {
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
+        if !shell {
+            app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::ALT))
+                .expect("toggle shell mode off");
+        }
         app.handle_paste_event(text);
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("run the ad hoc command");
+            .expect("open the confirm gate on the ad hoc command");
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("accept the confirm gate");
         // Every caller reads the receipt, which the fan-out writes before it clears
         // `action_running`; the completion Generation this used to settle for touches
         // nothing any of them assert on.
@@ -11415,21 +11442,21 @@ refresh_all = "z""#,
         assert!(repo.join("second-line").exists());
     }
 
-    /// Criterion 2's first half, proven at the child rather than the construction site.
-    /// `$HOME` is not word-split into two arguments (`shell-words` only splits on quoting
-    /// and whitespace, never on `$`), so a well-behaved ad hoc step passes the literal two
-    /// bytes `$HOME` straight to `echo` through a direct, unwrapped `execve`. If it were ever
-    /// implicitly run with `shell = true` instead, `executor::run_step` would rejoin `argv`
-    /// into one string and hand it to `$SHELL -c`, and that shell would expand `$HOME` to a
-    /// real path before `echo` ever saw it, printing something other than the literal token.
+    /// [#351](https://github.com/paulchiu/repon/issues/351): an ad hoc command defaults to
+    /// shell mode, proven at the child rather than the construction site. `echo $(pwd)` run
+    /// through `$SHELL -c` expands `$(pwd)` to the step's own working directory before
+    /// `echo` ever runs, printing the real path rather than the four literal characters
+    /// `$(pwd)`. The receipt's own `StepResult::shell` also carries the mode that produced
+    /// this output, so a reader is never left guessing which one ran.
     #[test]
-    fn an_ad_hoc_command_never_gets_an_implicit_shell() {
+    fn an_ad_hoc_command_defaults_to_shell_mode_and_expands_metacharacters() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        init_repo(&root.join("repo-a"));
+        let repo = root.join("repo-a");
+        init_repo(&repo);
         let mut app = test_app(&root);
 
-        run_ad_hoc_command(&mut app, "echo $HOME");
+        run_ad_hoc_command(&mut app, "echo $(pwd)");
 
         let receipt = app.core.snapshot().entities[0]
             .last_action
@@ -11437,9 +11464,42 @@ refresh_all = "z""#,
             .expect("receipt written");
         assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
         assert_eq!(
-            &*receipt.steps[0].output, b"$HOME\n",
-            "an implicit shell would have expanded $HOME to a real path instead of passing \
-             the literal token through"
+            &*receipt.steps[0].output,
+            format!("{}\n", repo.display()).as_bytes(),
+            "the default shell mode must have expanded $(pwd) to the real working directory"
+        );
+        assert!(
+            receipt.steps[0].shell,
+            "the receipt must carry the shell mode the step actually ran under"
+        );
+    }
+
+    /// The toggle's own escape hatch: `Alt+S` before typing turns shell mode off for the
+    /// run, and `$(pwd)` then reaches `echo` as four literal characters, the behaviour this
+    /// field had before #351 and still offers on request. `shell-words` still unquotes the
+    /// line the same way either mode does ([actions.md](../../../docs/spec/actions.md)'s
+    /// "Regression surface"), so this is the one line in the pair that actually diverges.
+    #[test]
+    fn toggling_shell_off_keeps_metacharacters_literal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+
+        run_ad_hoc_command_with_shell(&mut app, "echo $(pwd)", false);
+
+        let receipt = app.core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps[0].outcome, repon_core::StepOutcome::Ok);
+        assert_eq!(
+            &*receipt.steps[0].output, b"$(pwd)\n",
+            "shell mode off must pass $(pwd) through literally, unexpanded"
+        );
+        assert!(
+            !receipt.steps[0].shell,
+            "the receipt must carry the shell mode the step actually ran under"
         );
     }
 

@@ -224,6 +224,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: std::time::Duration::from_millis(1),
                 elision: None,
+                shell: false,
             })
             .collect::<Vec<_>>();
         ActionReceipt {
@@ -796,6 +797,7 @@ mod tests {
             finished_at: Timestamp::now(),
             running: Some(crate::entity::RunningStep {
                 label: Arc::from("pnpm install"),
+                shell: false,
                 started_at: Timestamp::now(),
             }),
         });
@@ -817,10 +819,12 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: std::time::Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
             running: Some(crate::entity::RunningStep {
+                shell: false,
                 label: Arc::from("step 1"),
                 started_at: Timestamp::now(),
             }),
@@ -845,6 +849,7 @@ mod tests {
             skip: None,
             finished_at: Timestamp::now(),
             running: Some(crate::entity::RunningStep {
+                shell: false,
                 label: Arc::from("step 0"),
                 started_at: Timestamp::now(),
             }),

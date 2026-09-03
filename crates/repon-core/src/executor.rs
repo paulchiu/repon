@@ -202,6 +202,7 @@ pub(crate) fn run_step(
         Err(failure) => {
             return step_failure(
                 label,
+                shell,
                 cwd,
                 failure.code(),
                 failure.detail(),
@@ -214,14 +215,14 @@ pub(crate) fn run_step(
     // child's own program (see `duplicate_cloexec`).
     let slave_dup = match duplicate_cloexec(&slave) {
         Ok(fd) => fd,
-        Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
+        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
     };
     // The parent's own reference onto the slave, held for as long as draining takes
     // (see `drain_until_exit`) so the pty's slave side never sees its last close while
     // there might still be output to read.
     let keepalive = match duplicate_cloexec(&slave) {
         Ok(fd) => fd,
-        Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
+        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
     };
 
     let resolved_argv = if shell {
@@ -232,7 +233,7 @@ pub(crate) fn run_step(
     let mut command = build_command(&resolved_argv, cwd, env, slave, slave_dup);
     let child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return spawn_failure(label, cwd, &error, start.elapsed()),
+        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
     };
     // The child's own slave-side descriptors (dup2'd onto its 1 and 2 during exec setup)
     // now live only in the child; this process's copies, passed in above, are closed by
@@ -262,6 +263,7 @@ pub(crate) fn run_step(
         output: Arc::from(output),
         elapsed: start.elapsed(),
         elision,
+        shell,
     }
 }
 
@@ -714,9 +716,16 @@ fn nonblocking_read(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
 /// the same `NotFound` / raw OS error 2, and telling a user their command is missing
 /// when their Repo is gone is exactly the confusion `docs/spec/actions.md`'s "Failure"
 /// section exists to prevent.
-fn spawn_failure(label: Arc<str>, cwd: &Path, error: &io::Error, elapsed: Duration) -> StepResult {
+fn spawn_failure(
+    label: Arc<str>,
+    shell: bool,
+    cwd: &Path,
+    error: &io::Error,
+    elapsed: Duration,
+) -> StepResult {
     step_failure(
         label,
+        shell,
         cwd,
         error.raw_os_error().unwrap_or(-1),
         error,
@@ -730,6 +739,7 @@ fn spawn_failure(label: Arc<str>, cwd: &Path, error: &io::Error, elapsed: Durati
 /// read differently.
 fn step_failure(
     label: Arc<str>,
+    shell: bool,
     cwd: &Path,
     code: i32,
     detail: impl std::fmt::Display,
@@ -749,6 +759,7 @@ fn step_failure(
         output: Arc::from(output.into_bytes()),
         elapsed,
         elision: None,
+        shell,
     }
 }
 
@@ -1009,6 +1020,41 @@ mod tests {
 
         assert_eq!(result.outcome, StepOutcome::Ok);
         assert_eq!(&*result.output, b"[repon]\n");
+    }
+
+    /// [`StepResult::shell`] carries the mode `run_step` was actually called with, on the
+    /// success path: the receipt's own claim about how `label` was interpreted, not a value
+    /// inferred from the outcome or the argv.
+    #[test]
+    fn step_result_shell_matches_the_mode_run_step_was_called_with() {
+        let dir = tempdir();
+
+        assert!(run_shell("true", dir.path()).shell);
+        assert!(!run(&["true"], dir.path()).shell);
+    }
+
+    /// The same claim on the failure path a step that never reached exec takes
+    /// ([`step_failure`], `docs/spec/actions.md`'s "Failure"): a spawn failure still says
+    /// which mode it was trying to run under, since a reader comparing a failed shell step
+    /// against a failed argv one needs that fact too.
+    #[test]
+    fn step_result_shell_matches_the_mode_even_on_a_step_that_never_reached_exec() {
+        let missing_dir = tempdir();
+        let missing_dir_path = missing_dir.path().join("gone");
+
+        let shell_result = run_shell("true", &missing_dir_path);
+        let argv_result = run(&["true"], &missing_dir_path);
+
+        assert!(
+            shell_result.outcome.is_failure(),
+            "a gone cwd must fail the step"
+        );
+        assert!(shell_result.shell);
+        assert!(
+            argv_result.outcome.is_failure(),
+            "a gone cwd must fail the step"
+        );
+        assert!(!argv_result.shell);
     }
 
     /// The trap `docs/spec/config.md`'s `shell = true` sentence names: POSIX `sh -c`

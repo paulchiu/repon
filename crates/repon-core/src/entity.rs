@@ -335,6 +335,13 @@ pub struct StepResult {
     pub elapsed: Duration,
     /// What the bound dropped out of `output`, or `None` when the output fitted whole.
     pub elision: Option<CaptureElision>,
+    /// Whether `label` ran through `$SHELL -c` rather than as a literal argv
+    /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+    /// "The Selection and the gate"). `label` alone answers "what ran" for an argv step, but
+    /// not for a shell one, whose string is an interpreter's input rather than its own
+    /// finished command line; this is the mode that input was read under. `false` for a step
+    /// Repon performed itself, which ran through no interpreter at all.
+    pub shell: bool,
 }
 
 /// The step an [`ActionReceipt`] is executing right now, present only while its run has not
@@ -352,6 +359,9 @@ pub struct RunningStep {
     /// once this step finishes.
     pub label: Arc<str>,
     pub started_at: Timestamp,
+    /// [`StepResult::shell`]'s own claim, carried here too so a running step's mode is on
+    /// screen from the moment it starts rather than only once it finishes.
+    pub shell: bool,
 }
 
 /// The most recent Action run against this Entity: a receipt of something Repon did,
@@ -973,6 +983,7 @@ mod tests {
                     output: Arc::from(&b""[..]),
                     elapsed: Duration::from_millis(1),
                     elision: None,
+                    shell: false,
                 }],
             )
         };
@@ -992,6 +1003,7 @@ mod tests {
             output: Arc::from(&b""[..]),
             elapsed: Duration::from_millis(1),
             elision: None,
+            shell: false,
         }
     }
 
@@ -1002,6 +1014,7 @@ mod tests {
             output: Arc::from(&b"boom"[..]),
             elapsed: Duration::from_millis(2),
             elision: None,
+            shell: false,
         }
     }
 
@@ -1033,6 +1046,7 @@ mod tests {
         let StepResult {
             label: step_label,
             outcome,
+            shell: _,
             output: _,
             elapsed: _,
             elision: _,
@@ -1065,6 +1079,7 @@ mod tests {
                     output: Arc::from(&b""[..]),
                     elapsed: Duration::from_millis(1),
                     elision: None,
+                    shell: false,
                 }]
             )
             .failed(),
@@ -1425,6 +1440,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),

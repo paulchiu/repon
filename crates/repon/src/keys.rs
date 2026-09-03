@@ -95,6 +95,9 @@ pub(crate) enum Action {
     /// `Alt+Enter`: a literal newline in the ad hoc command field, the one `input` surface
     /// that holds more than one line.
     InsertNewline,
+    /// `Alt+S`: toggles the ad hoc command field's own shell mode for the run about to
+    /// happen. Inert everywhere else `input` fires, the same way `InsertNewline` is.
+    ToggleShell,
     /// The six motions a field's cursor answers to, all of them acting on
     /// [`crate::edit_buffer::EditBuffer`]'s own cursor rather than on the text.
     MoveCursorLeft,
@@ -228,6 +231,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::ClearLine => "Clear the line",
         Action::OpenInEditor => "Open the field in `$EDITOR`",
         Action::InsertNewline => "Insert a newline (the ad hoc command field only)",
+        Action::ToggleShell => "Toggle shell mode (the ad hoc command field only)",
         Action::MoveCursorLeft => "Move the cursor left",
         Action::MoveCursorRight => "Move the cursor right",
         Action::MoveCursorWordLeft => "Move the cursor back one word",
@@ -575,6 +579,7 @@ const BINDINGS: &[Binding] = &[
     // input (the printable-character catch-all is `dispatch`'s fallback, not a row here)
     binding(Context::Input, KeyCode::Enter, NONE, Action::Apply),
     binding(Context::Input, KeyCode::Enter, ALT, Action::InsertNewline),
+    binding(Context::Input, KeyCode::Char('s'), ALT, Action::ToggleShell),
     binding(Context::Input, KeyCode::Esc, NONE, Action::Cancel),
     binding(Context::Input, KeyCode::Up, NONE, Action::PreviousEntry),
     binding(
@@ -1011,6 +1016,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::ClearLine => "clear_line",
         Action::OpenInEditor => "open_in_editor",
         Action::InsertNewline => "insert_newline",
+        Action::ToggleShell => "toggle_shell",
         Action::MoveCursorLeft => "move_cursor_left",
         Action::MoveCursorRight => "move_cursor_right",
         Action::MoveCursorWordLeft => "move_cursor_word_left",
@@ -1792,7 +1798,17 @@ mod tests {
         );
     }
 
-    /// The letter Alt chords the table binds are `Alt+B` and `Alt+F` alone, so every other
+    /// `Alt+S` toggles the ad hoc field's own shell mode, a plain letter chord like `Alt+B`
+    /// and `Alt+F` rather than a chord on a control key like `Alt+Enter`.
+    #[test]
+    fn alt_s_toggles_shell_mode() {
+        assert_eq!(
+            dispatch(Context::Input, press(KeyCode::Char('s'), ALT)),
+            Some(Action::ToggleShell)
+        );
+    }
+
+    /// The letter Alt chords the table binds are `Alt+B`, `Alt+F` and `Alt+S`, so every other
     /// Alt letter stays what it was: a printable character typed into the field.
     #[test]
     fn an_unbound_alt_chord_is_still_text_in_the_input_context() {
