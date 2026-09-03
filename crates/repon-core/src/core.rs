@@ -1194,6 +1194,17 @@ impl Core {
         Some(run_action_for_entity(&entity, action, &control, &|_| {}))
     }
 
+    /// Vends a [`ManagementHandle`]: the `Send + 'static` seam a management run's own
+    /// per-row work moves onto a background thread through, so it stops blocking the caller
+    /// the way [`Self::run_action`]'s own fan-out already moves an `Arc<RwLock<Table>>`
+    /// clone onto its own thread
+    /// ([0033](https://github.com/paulchiu/repon/blob/main/docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)).
+    pub fn management_handle(&self) -> ManagementHandle {
+        ManagementHandle {
+            table: Arc::clone(&self.table),
+        }
+    }
+
     /// Drops one entity from the table, cancelling any probe in flight against it.
     pub fn dismiss(&self, key: &EntityKey) {
         let mut table = self.table.write().unwrap();
@@ -1603,7 +1614,7 @@ impl Core {
     /// Replaces the live `exclude` half of `[[repo]]` and re-applies it over every row the
     /// table already holds, so the next [`Core::snapshot`] answers with the new reading
     /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
-    /// "Writing config": an `ignore` takes effect in the frame the write completes).
+    /// "Writing config": an `ignore` takes effect as soon as this call returns).
     ///
     /// Starts no Generation, dispatches nothing and rediscovers nothing, for the same reason
     /// [`Core::set_show_submodules`] does not: `exclude` decides only whether an operation
@@ -1622,6 +1633,90 @@ impl Core {
         for entity in &mut table.entities {
             entity.excluded = excluded_by(&resolved, entity.key.path(), &entity.common_dir);
         }
+    }
+}
+
+/// The read-only, path-driven operations a management run's per-row work needs
+/// (`crates/repon/src/management.rs`'s own `run_one_record`), cloned out of
+/// [`Core::management_handle`] rather than borrowed from a live `Core`: `Send + 'static`, so
+/// a caller can move it onto a background thread the way [`Core::run_action`]'s own fan-out
+/// thread already moves its `Arc<RwLock<Table>>` clone there. Grants none of `Core`'s other
+/// state (`action_running`, `action_control`, the clock thread): a management run is a
+/// distinct concern from the one fan-out those track, and this handle's own methods touch
+/// only the table, exactly as [`Core::run_action_for_entity_blocking`] already does.
+#[derive(Clone)]
+pub struct ManagementHandle {
+    table: Arc<RwLock<Table>>,
+}
+
+impl ManagementHandle {
+    /// Identical to [`Core::worktree_admin_dir`], against this handle's own table clone.
+    pub fn worktree_admin_dir(&self, key: &EntityKey) -> Result<PathBuf, git::ProbeError> {
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        Ok(git::worktree_admin_dir(&repo))
+    }
+
+    /// Identical to [`Core::linked_worktree_paths`], against this handle's own table clone.
+    pub fn linked_worktree_paths(&self, key: &EntityKey) -> Result<Vec<PathBuf>, git::ProbeError> {
+        let repo = git::open_thread_safe(key.path())?.to_thread_local();
+        git::linked_worktree_paths(&repo)
+    }
+
+    /// Identical to [`Core::ignored_directories_for_deletion`], against this handle's own
+    /// table clone.
+    pub fn ignored_directories_for_deletion(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<PathBuf>, git::ProbeError> {
+        let repo = git::open_thread_safe(path)?.to_thread_local();
+        git::ignored_directories_for_deletion(&repo)
+    }
+
+    /// Identical to [`Core::attempt_auto_update`].
+    #[cfg(feature = "fetch")]
+    pub fn attempt_auto_update(&self, key: &EntityKey) -> AutoUpdateAttempt {
+        match crate::auto_update::attempt(key.path()) {
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotClean) => {
+                AutoUpdateAttempt::NotClean
+            }
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NoUpstream) => {
+                AutoUpdateAttempt::NoUpstream
+            }
+            crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotBehind) => {
+                AutoUpdateAttempt::NotBehind
+            }
+            crate::auto_update::Outcome::Ineligible(
+                crate::auto_update::Ineligible::NotFastForward,
+            ) => AutoUpdateAttempt::NotFastForward,
+            crate::auto_update::Outcome::Updated { .. } => AutoUpdateAttempt::Updated,
+            crate::auto_update::Outcome::Failed(error) => AutoUpdateAttempt::Failed(error),
+        }
+    }
+
+    /// Without the `fetch` cargo feature, [`Core::attempt_auto_update`]'s own unreachable
+    /// twin: the mechanism this would call does not exist to call.
+    #[cfg(not(feature = "fetch"))]
+    pub fn attempt_auto_update(&self, _key: &EntityKey) -> AutoUpdateAttempt {
+        unreachable!(
+            "sync's own eligibility refuses every row before this is reached without the \
+             `fetch` cargo feature"
+        )
+    }
+
+    /// Identical to [`Core::run_action_for_entity_blocking`], against this handle's own
+    /// table clone rather than a live `Core`.
+    pub fn run_action_for_entity_blocking(
+        &self,
+        action: &ActionSpec,
+        key: &EntityKey,
+    ) -> Option<ActionReceipt> {
+        let entity = {
+            let table = self.table.read().unwrap();
+            let idx = *table.index.get(key)?;
+            table.entities[idx].clone()
+        };
+        let control = executor::RunControl::new();
+        Some(run_action_for_entity(&entity, action, &control, &|_| {}))
     }
 }
 
