@@ -406,6 +406,7 @@ mod tests {
                 output: Arc::from(&b"boom"[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),

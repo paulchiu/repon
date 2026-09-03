@@ -17,15 +17,25 @@
 //! [`ad_hoc_steps`], which reads the typed text itself as the command to run
 //! ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
 //! one step, split into argv with shell-words, and the lines gate exactly as config steps
-//! do"). `Enter` runs that command, so the key that inserts a literal newline into it is a
-//! chord on `Enter`: `Alt+Enter` ([`ActionPalette::insert_newline`]). The two obvious keys
-//! are not available, which is why the chord looks like an odd choice and is not: Shift+Enter
-//! and Ctrl+Enter do not exist without the kitty keyboard protocol, which this crate does not
-//! opt into, and Ctrl+J is the newline byte itself, indistinguishable from Enter on every
-//! terminal this crate targets. A newline still reaches this field the other two ways as
-//! well, through a whole paste ([`ActionPalette::paste`]) or a round trip through `$EDITOR`
-//! ([`ActionPalette::text`], [`ActionPalette::set_text`]), and all three mean the same thing
-//! to a step ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+//! do"). `Enter` opens the confirm gate on it, exactly as a configured Action's own `Enter`
+//! does, so the key that inserts a literal newline into it is a chord on `Enter`: `Alt+Enter`
+//! ([`ActionPalette::insert_newline`]). The two obvious keys are not available, which is why
+//! the chord looks like an odd choice and is not: Shift+Enter and Ctrl+Enter do not exist
+//! without the kitty keyboard protocol, which this crate does not opt into, and Ctrl+J is the newline byte itself, indistinguishable from Enter on every terminal this crate targets.
+//! A newline still reaches this field the other two ways as well, through a whole paste
+//! ([`ActionPalette::paste`]) or a round trip through `$EDITOR` ([`ActionPalette::text`],
+//! [`ActionPalette::set_text`]), and all three mean the same thing to a step
+//! ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)).
+//!
+//! The field also carries a live shell-mode toggle
+//! ([`ActionPalette::toggle_shell`], `Alt+S`): an ad hoc command defaults to running through
+//! `$SHELL -c`, and the toggle turns that off for the run about to happen. It resets to the
+//! default every time the palette opens ([`ActionPalette::scoped`]), since a sticky off-state
+//! the user has forgotten about reproduces the silent no-op the default exists to remove. The
+//! mode reaches three places: this field's own bottom border while
+//! [`Stage::Choosing`] ([`shell_mode_hint`]), the confirm gate's own text
+//! ([`ActionPalette::draw`]'s `Chosen::AdHoc` arm), and the receipt itself
+//! ([`repon_core::Step::shell`], which [`repon_core::StepResult::shell`] then carries).
 
 use ratatui::{
     Frame,
@@ -77,34 +87,43 @@ pub(crate) const QUERY_PLACEHOLDER: &str = "; select action or type a command";
 /// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
 const PROMPT_WIDTH: u16 = 2;
 
-/// The ad hoc field's own bottom-border hint, in three priority tiers rather than one
-/// string, so a narrow frame drops a clause instead of clipping mid-word
-/// ([actions.md](../../../docs/spec/actions.md): the ad hoc field is never implicitly
-/// `shell = true`, so `$VAR` and `$(cmd)` reach argv as literal characters). The mechanism
-/// clause drops first: once "no shell" is on screen a shell-literate reader can guess *why*,
-/// but not the fix, so `sh -c '...'` outlives it. "no shell" itself never drops once
-/// anything is shown at all.
-const NO_SHELL_CORE: &str = "no shell";
-const NO_SHELL_MECHANISM: &str = ": $VAR and $(cmd) are literal";
-const NO_SHELL_FIX: &str = "; use sh -c '...'";
+/// The ad hoc field's own bottom-border readout of the live shell toggle, in three priority
+/// tiers rather than one string, so a narrow frame drops a clause instead of clipping
+/// mid-word. The core fact ("shell on" or "shell off") is [`Priority::Pinned`] and never
+/// drops once anything is shown at all; the mechanism clause explaining what that means for
+/// `$VAR` and `$(cmd)` drops first, since a shell-literate reader can guess it from the core
+/// fact alone; the toggle clause naming `Alt+S` drops second, on the same reasoning
+/// [the footer](../../../docs/spec/keybindings.md#the-footer) already applies to its own
+/// hints.
+const SHELL_ON_CORE: &str = "shell on";
+const SHELL_ON_MECHANISM: &str = ": $VAR and $(cmd) expand";
+const SHELL_ON_TOGGLE: &str = "; alt+s turns it off";
+const SHELL_OFF_CORE: &str = "shell off";
+const SHELL_OFF_MECHANISM: &str = ": $VAR and $(cmd) are literal";
+const SHELL_OFF_TOGGLE: &str = "; alt+s turns it on";
 
-/// [`NO_SHELL_CORE`], [`NO_SHELL_MECHANISM`] and [`NO_SHELL_FIX`] budgeted with
-/// [`degrade::budget`] against `frame_width`, then wrapped in the leading/trailing space
-/// [`ActionPalette::border_title`] and [`crate::help::BORDER_TITLE`] already pad every
-/// title with. Empty once even [`NO_SHELL_CORE`] alone cannot fit, which
-/// [`ActionPalette::draw`] reads as "draw no bottom title" rather than a half-drawn one.
-fn no_shell_hint(frame_width: u16) -> String {
+/// The three tiers for `shell`'s current state, budgeted with [`degrade::budget`] against
+/// `frame_width`, then wrapped in the leading/trailing space [`ActionPalette::border_title`]
+/// and [`crate::help::BORDER_TITLE`] already pad every title with. Empty once even the core
+/// fact cannot fit, which [`ActionPalette::draw`] reads as "draw no bottom title" rather than
+/// a half-drawn one.
+fn shell_mode_hint(shell: bool, frame_width: u16) -> String {
+    let (core, mechanism, toggle) = if shell {
+        (SHELL_ON_CORE, SHELL_ON_MECHANISM, SHELL_ON_TOGGLE)
+    } else {
+        (SHELL_OFF_CORE, SHELL_OFF_MECHANISM, SHELL_OFF_TOGGLE)
+    };
     let items = [
         degrade::Item {
-            content: NO_SHELL_CORE,
+            content: core,
             priority: Priority::Pinned,
         },
         degrade::Item {
-            content: NO_SHELL_MECHANISM,
+            content: mechanism,
             priority: Priority::Drop(1),
         },
         degrade::Item {
-            content: NO_SHELL_FIX,
+            content: toggle,
             priority: Priority::Drop(2),
         },
     ];
@@ -117,6 +136,13 @@ fn no_shell_hint(frame_width: u16) -> String {
     } else {
         format!(" {} ", line.render("", ""))
     }
+}
+
+/// The word the confirm gate's own text names the mode by, beside the run count
+/// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate"): the same
+/// core fact [`shell_mode_hint`] pins, read on its own with no frame to budget against.
+fn shell_mode_word(shell: bool) -> &'static str {
+    if shell { SHELL_ON_CORE } else { SHELL_OFF_CORE }
 }
 
 /// The most interior rows the typed query is ever given, however many lines it holds
@@ -337,25 +363,40 @@ pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
 /// read one from.
 const AD_HOC_CONCURRENCY: u32 = 4;
 
-/// `text` split into the steps an ad hoc run executes, or `None` if any non-empty line fails
-/// to word-split (an unterminated quote): the whole command is refused rather than running a
-/// truncated version of what was typed. Each non-empty line becomes one step, split with
-/// `shell-words` rather than a shell string
+/// `text` split into the steps an ad hoc run executes, or `None` if `shell` is off and any
+/// non-empty line fails to word-split (an unterminated quote): the whole command is refused
+/// rather than running a truncated version of what was typed. A blank line contributes no
+/// step at all either way.
+///
+/// With `shell` off, each non-empty line is split into argv with `shell-words`
 /// ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
-/// one step, split into argv with shell-words"); a blank line contributes no step at all.
-/// `shell` is always `false`: an ad hoc command has no config entry in which that flag could
-/// be made visible, so it is never implicitly given one
-/// ([0007](../../../docs/adr/0007-launchers-are-argv-vectors.md)), and `env` is always empty,
-/// since there is nowhere to type a per-step override either.
-fn ad_hoc_steps(text: &str) -> Option<Vec<Step>> {
+/// one step, split into argv with shell-words"), the same argv a Launcher or a config step
+/// with `shell = false` runs literally.
+///
+/// With `shell` on (the default), each non-empty line becomes one step whose `argv` holds
+/// that line whole, unsplit and with its quoting intact: [`repon_core::Step`]'s own "shell =
+/// true" convention, one argv element carrying the entire command string for
+/// `executor::run_step` to hand to `$SHELL -c`. Splitting the line here first and rejoining
+/// it in `executor::shell_argv` would lose the very quoting a real shell is about to
+/// re-parse, so this mode never calls `shell-words` at all: there is nothing to fail to
+/// split, which is why only the `shell`-off arm can return `None`.
+fn ad_hoc_steps(text: &str, shell: bool) -> Option<Vec<Step>> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            shell_words::split(line).map(|argv| Step {
-                argv,
-                shell: false,
-                env: Vec::new(),
-            })
+        .map(|line| -> Result<Step, shell_words::ParseError> {
+            if shell {
+                Ok(Step {
+                    argv: vec![line.to_string()],
+                    shell: true,
+                    env: Vec::new(),
+                })
+            } else {
+                Ok(Step {
+                    argv: shell_words::split(line)?,
+                    shell: false,
+                    env: Vec::new(),
+                })
+            }
         })
         .collect::<Result<Vec<_>, _>>()
         .ok()
@@ -394,6 +435,14 @@ pub(crate) enum Stage {
 #[derive(Debug, Clone)]
 pub(crate) enum Chosen {
     Configured(ActionConfig),
+    /// A typed ad hoc command about to run: the `ActionSpec` already built from it, and
+    /// whether it was built with shell mode on, which [`ActionPalette::draw`]'s own confirm
+    /// text names beside the command and the run count
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    AdHoc {
+        spec: ActionSpec,
+        shell: bool,
+    },
     /// A built-in management operation. The rows it will act on, and what accepting
     /// destroys, are `App`'s own [`crate::management::Plan`]: this palette carries which
     /// operation was chosen and nothing about the world.
@@ -421,8 +470,9 @@ pub(crate) enum Decision {
 /// The Action palette's own state: the typed text, which doubles as the query narrowing
 /// `Document::actions` and, once nothing is highlighted, as the ad hoc command itself
 /// ([`ad_hoc_steps`]); which of the (possibly narrowed) matches is highlighted; which
-/// [`Stage`] it is in; and a refusal message from the last time Enter found zero operable
-/// rows.
+/// [`Stage`] it is in; a refusal message from the last time Enter found zero operable rows;
+/// and the ad hoc field's own live shell toggle, reset to the default (`true`) every time the
+/// palette opens ([`Self::scoped`]) rather than carried over from the last run.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionPalette {
     query: EditBuffer,
@@ -430,6 +480,7 @@ pub(crate) struct ActionPalette {
     stage: Stage,
     refusal: Option<String>,
     scope: Scope,
+    shell: bool,
 }
 
 /// What the palette needs to know about the run it is drawing over, bundled into one
@@ -505,11 +556,28 @@ impl ActionPalette {
             stage: Stage::Choosing,
             refusal: None,
             scope,
+            shell: true,
         }
     }
 
     pub(crate) fn stage(&self) -> &Stage {
         &self.stage
+    }
+
+    /// `Alt+S` while [`Stage::Choosing`]: flips the ad hoc field's own shell toggle for the
+    /// run about to happen. A no-op once the confirm gate is up, since `App` only dispatches
+    /// this action to that stage in the first place (its own `Context::Input` vs
+    /// `Context::Confirm` split).
+    pub(crate) fn toggle_shell(&mut self) {
+        self.shell = !self.shell;
+    }
+
+    /// The ad hoc field's own live shell toggle, read by [`Self::draw`] for the field's
+    /// chrome and by tests that need to observe it directly rather than only through
+    /// [`Self::choose`]'s built `ActionSpec`.
+    #[cfg(test)]
+    pub(crate) fn shell(&self) -> bool {
+        self.shell
     }
 
     /// Not read outside tests until something other than [`Self::draw`] itself needs the
@@ -633,13 +701,15 @@ impl ActionPalette {
     /// A highlighted named entry always wins: it is chosen exactly as before, gated behind
     /// `Stage::Confirming` unless its own `confirm` is `false`. Only once nothing is
     /// highlighted does the typed text become an ad hoc command in its own right
-    /// ([`ad_hoc_steps`]), which is what keeps a query that happens to match a configured
-    /// Action's name from ever running as a different, typed-out command instead. An ad hoc
-    /// command never enters `Stage::Confirming`: it runs the instant Enter is pressed, the
-    /// same as a Launcher hands off immediately
-    /// ([keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field): "Enter
-    /// runs it"). `None` when there is nothing to run at all: no highlighted entry and no
-    /// non-empty typed line, or a line that failed to word-split.
+    /// ([`ad_hoc_steps`], read with [`Self::shell`]'s current toggle), which is what keeps a
+    /// query that happens to match a configured Action's name from ever running as a
+    /// different, typed-out command instead. An ad hoc command now always enters
+    /// `Stage::Confirming` too: the string is about to reach every operable Repo under
+    /// whichever shell mode the toggle currently holds, and that gate's own text is where the
+    /// mode is named beside the count
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate"). `None`
+    /// when there is nothing to run at all: no highlighted entry and no non-empty typed line,
+    /// or a line that failed to word-split.
     pub(crate) fn choose(
         &mut self,
         actions: &[ActionConfig],
@@ -677,7 +747,7 @@ impl ActionPalette {
                 }
             }
             None => {
-                let steps = ad_hoc_steps(self.query.as_str())?;
+                let steps = ad_hoc_steps(self.query.as_str(), self.shell)?;
                 if steps.is_empty() {
                     return None;
                 }
@@ -689,20 +759,25 @@ impl ActionPalette {
                     return Some(Decision::Refused);
                 }
                 self.refusal = None;
-                Some(Decision::RunImmediately(to_ad_hoc_action_spec(
-                    self.query.as_str(),
-                    steps,
-                )))
+                let spec = to_ad_hoc_action_spec(self.query.as_str(), steps);
+                self.stage = Stage::Confirming(Chosen::AdHoc {
+                    spec,
+                    shell: self.shell,
+                });
+                Some(Decision::NeedsConfirm)
             }
         }
     }
 
     /// `y` (`Action::Run`) in `Stage::Confirming`: the `ActionSpec` to run, or `None` if
     /// called while still `Stage::Choosing` (never reached through `App`'s own dispatch,
-    /// which only calls this once `Context::Confirm` is live).
+    /// which only calls this once `Context::Confirm` is live). An ad hoc run's `ActionSpec`
+    /// was already built at `Self::choose` time, so this clones it rather than rebuilding it
+    /// from the query text, which the gate no longer holds a live cursor into.
     pub(crate) fn confirm_run(&self) -> Option<ActionSpec> {
         match &self.stage {
             Stage::Confirming(Chosen::Configured(entry)) => Some(to_action_spec(entry)),
+            Stage::Confirming(Chosen::AdHoc { spec, .. }) => Some(spec.clone()),
             Stage::Confirming(Chosen::Management(_)) | Stage::Choosing => None,
         }
     }
@@ -713,7 +788,9 @@ impl ActionPalette {
     pub(crate) fn confirm_management(&self) -> Option<Operation> {
         match &self.stage {
             Stage::Confirming(Chosen::Management(operation)) => Some(*operation),
-            Stage::Confirming(Chosen::Configured(_)) | Stage::Choosing => None,
+            Stage::Confirming(Chosen::Configured(_) | Chosen::AdHoc { .. }) | Stage::Choosing => {
+                None
+            }
         }
     }
 
@@ -732,7 +809,7 @@ impl ActionPalette {
     ) -> Option<&'a ActionConfig> {
         match &self.stage {
             Stage::Confirming(Chosen::Configured(entry)) => Some(entry),
-            Stage::Confirming(Chosen::Management(_)) => None,
+            Stage::Confirming(Chosen::AdHoc { .. } | Chosen::Management(_)) => None,
             Stage::Choosing => match self.highlighted(actions)? {
                 Entry::Configured(action) => Some(action),
                 Entry::Builtin(_) => None,
@@ -854,10 +931,10 @@ impl ActionPalette {
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
             .title(Self::border_title(&count));
-        // Only while the ad hoc field itself can be typed into: the confirm gate types
-        // nothing, so it has nothing here to warn about.
+        // Only while the ad hoc field itself can be typed into: the confirm gate's own text
+        // already names the mode beside the run count, so it has nothing further to add here.
         if matches!(self.stage, Stage::Choosing) {
-            let hint = no_shell_hint(area.width);
+            let hint = shell_mode_hint(self.shell, area.width);
             if !hint.is_empty() {
                 block = block.title_bottom(Line::from(hint));
             }
@@ -871,6 +948,14 @@ impl ActionPalette {
                     Chosen::Configured(entry) => vec![format!(
                         "run \"{}\" on {run_count} repos?",
                         entry.name.get_ref()
+                    )],
+                    // The one place besides the receipt an ad hoc command's own shell mode is
+                    // named beside the string about to reach `run_count` repos, the last
+                    // screen before it does.
+                    Chosen::AdHoc { spec, shell } => vec![format!(
+                        "run \"{}\" ({}) on {run_count} repos?",
+                        one_line(&spec.label),
+                        shell_mode_word(*shell)
                     )],
                     // The built-in's own gate is `App`'s [`crate::management::Plan`], which
                     // already carries the headline, the per-Repo lines and the no-undo
@@ -1240,108 +1325,141 @@ mod tests {
         );
     }
 
-    // --- the ad hoc field's own "no shell" hint ---
+    // --- the ad hoc field's own live shell-mode hint ---
 
     /// [keybindings.md](../../../docs/spec/keybindings.md#the-ad-hoc-command-field)'s own
-    /// backtick-quoted copy of the sentence, read at test time rather than retyped here, so
+    /// backtick-quoted copy of both sentences, read at test time rather than retyped here, so
     /// a wording edit to either the doc or the constants cannot silently drift from the
     /// other.
     #[test]
-    fn the_no_shell_hint_matches_keybindings_mds_own_quoted_sentence() {
+    fn the_shell_mode_hint_matches_keybindings_mds_own_quoted_sentences() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/keybindings.md"))
             .expect("read docs/spec/keybindings.md");
-        let quoted = spec
-            .split("it draws: `")
-            .nth(1)
-            .and_then(|rest| rest.split('`').next())
-            .expect("keybindings.md still carries the quoted no-shell sentence");
-        let built = format!("{NO_SHELL_CORE}{NO_SHELL_MECHANISM}{NO_SHELL_FIX}");
+        let quoted = |marker: &str| {
+            spec.split(marker)
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+                .unwrap_or_else(|| panic!("keybindings.md still carries {marker:?}"))
+                .to_string()
+        };
         assert_eq!(
-            built, quoted,
-            "the module's three constants must join into keybindings.md's own quoted sentence"
+            format!("{SHELL_ON_CORE}{SHELL_ON_MECHANISM}{SHELL_ON_TOGGLE}"),
+            quoted("it draws: `"),
+            "the on-mode constants must join into keybindings.md's own quoted sentence"
+        );
+        assert_eq!(
+            format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}"),
+            quoted("once toggled, `"),
+            "the off-mode constants must join into keybindings.md's own quoted sentence"
         );
     }
 
-    /// Wide enough that all three tiers fit.
+    /// Wide enough that all three tiers fit, in the default (shell on) state a freshly opened
+    /// palette carries.
     #[test]
-    fn the_no_shell_hint_reads_the_whole_sentence_when_the_frame_is_wide_enough() {
-        let expected = format!("{NO_SHELL_CORE}{NO_SHELL_MECHANISM}{NO_SHELL_FIX}");
+    fn the_shell_mode_hint_reads_the_whole_sentence_when_the_frame_is_wide_enough() {
+        let expected = format!("{SHELL_ON_CORE}{SHELL_ON_MECHANISM}{SHELL_ON_TOGGLE}");
         let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 70, 6);
         let bottom = row_text(&buf, 5, 70);
         assert!(
             bottom.contains(&expected),
-            "expected the whole no-shell sentence on the bottom border at 70 columns: \
+            "expected the whole shell-on sentence on the bottom border at 70 columns: \
              {bottom:?}"
         );
+    }
+
+    /// `Alt+S` flips the toggle, which the field's own chrome reflects immediately, and the
+    /// off sentence reads correctly too.
+    #[test]
+    fn toggling_shell_off_flips_the_field_chromes_hint() {
+        let mut palette = ActionPalette::new();
+        assert!(
+            palette.shell(),
+            "a freshly opened palette defaults to shell on"
+        );
+
+        palette.toggle_shell();
+
+        assert!(!palette.shell());
+        let expected = format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}");
+        let buf = draw_sized(&palette, &[], &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            bottom.contains(&expected),
+            "expected the whole shell-off sentence once toggled: {bottom:?}"
+        );
+
+        palette.toggle_shell();
+        assert!(palette.shell(), "a second toggle returns to shell on");
     }
 
     /// The mechanism clause is the first of the three tiers to give way: a frame too narrow
-    /// for the whole sentence still teaches "no shell" and the escape hatch, dropping only
-    /// the explanation of why, by the same discoverability-cost reasoning
+    /// for the whole sentence still teaches the mode and the toggle chord, dropping only the
+    /// explanation of why, by the same discoverability-cost reasoning
     /// [keybindings.md](../../../docs/spec/keybindings.md#the-footer) applies to the footer.
     #[test]
-    fn the_no_shell_hint_drops_the_mechanism_clause_before_the_escape_hatch() {
+    fn the_shell_mode_hint_drops_the_mechanism_clause_before_the_toggle_clause() {
         let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 40, 6);
         let bottom = row_text(&buf, 5, 40);
         assert!(
-            bottom.contains(NO_SHELL_CORE) && bottom.contains("sh -c"),
-            "expected \"no shell\" and the escape hatch to survive at 40 columns: {bottom:?}"
+            bottom.contains(SHELL_ON_CORE) && bottom.contains("alt+s"),
+            "expected \"shell on\" and the toggle clause to survive at 40 columns: {bottom:?}"
         );
         assert!(
-            !bottom.contains("literal"),
-            "expected the mechanism clause dropped before the escape hatch at 40 columns: \
+            !bottom.contains("expand"),
+            "expected the mechanism clause dropped before the toggle clause at 40 columns: \
              {bottom:?}"
         );
     }
 
-    /// "no shell" is the one tier that never drops once anything is drawn at all: a frame
-    /// too narrow even for the escape hatch still names the fact, never a half-drawn clause.
+    /// The core fact is the one tier that never drops once anything is drawn at all: a frame
+    /// too narrow even for the toggle clause still names the mode, never a half-drawn clause.
     #[test]
-    fn the_no_shell_hint_keeps_the_bare_words_once_the_escape_hatch_no_longer_fits() {
+    fn the_shell_mode_hint_keeps_the_bare_words_once_the_toggle_clause_no_longer_fits() {
         let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 20, 6);
         let bottom = row_text(&buf, 5, 20);
         assert!(
-            bottom.contains(NO_SHELL_CORE),
-            "expected the bare \"no shell\" words to survive at 20 columns: {bottom:?}"
+            bottom.contains(SHELL_ON_CORE),
+            "expected the bare \"shell on\" words to survive at 20 columns: {bottom:?}"
         );
         assert!(
-            !bottom.contains("sh -c"),
-            "expected the escape hatch dropped before \"no shell\" itself at 20 columns: \
+            !bottom.contains("alt+s"),
+            "expected the toggle clause dropped before \"shell on\" itself at 20 columns: \
              {bottom:?}"
         );
     }
 
-    /// Below the width even "no shell" alone needs, nothing is drawn: the hint disappears
+    /// Below the width even the core fact alone needs, nothing is drawn: the hint disappears
     /// as a whole rather than clipping to a fragment ratatui's own title truncation would
     /// otherwise cut mid-word.
     #[test]
-    fn the_no_shell_hint_disappears_whole_rather_than_clipping_when_nothing_fits() {
+    fn the_shell_mode_hint_disappears_whole_rather_than_clipping_when_nothing_fits() {
         assert_eq!(
-            no_shell_hint(6),
+            shell_mode_hint(true, 6),
             "",
             "6 columns must be too narrow for any tier"
         );
         let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 6, 6);
         let bottom = row_text(&buf, 5, 6);
         assert!(
-            !bottom.contains("no"),
+            !bottom.contains("she"),
             "expected no fragment of the hint at 6 columns: {bottom:?}"
         );
     }
 
-    /// The confirm gate types nothing, so it has nothing for this hint to warn about: it is
-    /// drawn only while [`Stage::Choosing`] is what the field shows.
+    /// The confirm gate's own text already names the mode, so this hint has nothing further
+    /// to add there: it is drawn only while [`Stage::Choosing`] is what the field shows.
     #[test]
-    fn the_no_shell_hint_is_absent_while_the_confirm_gate_is_showing() {
+    fn the_shell_mode_hint_is_absent_while_the_confirm_gate_is_showing() {
         let mut palette = ActionPalette::new();
         let actions = vec![action("reinstall", true)];
         palette.choose(&actions, 3);
         let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
         let bottom = row_text(&buf, 5, 70);
         assert!(
-            !bottom.contains(NO_SHELL_CORE),
-            "expected no \"no shell\" hint while confirming: {bottom:?}"
+            !bottom.contains(SHELL_ON_CORE),
+            "expected no shell-mode hint while confirming: {bottom:?}"
         );
     }
 
@@ -1440,11 +1558,12 @@ mod tests {
     // --- Criterion 1: the ad hoc command field ---
 
     /// The crux of this ticket's change to `choose`: text that names no configured Action
-    /// used to leave the palette untouched with nothing chosen; it now runs as an ad hoc
-    /// command in its own right, with `shell` off and no name, and never enters
-    /// `Stage::Confirming`.
+    /// used to leave the palette untouched with nothing chosen; it now builds an ad hoc run
+    /// with `shell` on by default and no name, and enters `Stage::Confirming` on it exactly
+    /// as a configured Action does, rather than running immediately.
     #[test]
-    fn choosing_text_that_matches_no_configured_action_runs_it_as_an_ad_hoc_command() {
+    fn choosing_text_that_matches_no_configured_action_opens_the_confirm_gate_on_an_ad_hoc_command()
+    {
         let actions = vec![action("reinstall", true)];
         let mut palette = ActionPalette::new();
         for c in "zz".chars() {
@@ -1453,24 +1572,58 @@ mod tests {
 
         let decision = palette.choose(&actions, 5);
 
-        match decision {
-            Some(Decision::RunImmediately(spec)) => {
-                assert_eq!(spec.steps.len(), 1);
-                assert_eq!(spec.steps[0].argv, vec!["zz".to_string()]);
-                assert!(
-                    !spec.steps[0].shell,
-                    "an ad hoc step must never get an implicit shell"
-                );
-                assert!(
-                    spec.name.is_none(),
-                    "REPON_ACTION must stay unset for an ad hoc run, exactly as for a Launcher"
-                );
-            }
-            other => panic!("expected an ad hoc RunImmediately decision, got {other:?}"),
-        }
         assert!(
-            matches!(palette.stage(), Stage::Choosing),
-            "an ad hoc run never enters the confirm stage"
+            matches!(decision, Some(Decision::NeedsConfirm)),
+            "an ad hoc command must open the confirm gate rather than run immediately, got \
+             {decision:?}"
+        );
+        let spec = palette
+            .confirm_run()
+            .expect("the confirm gate must carry the built ActionSpec");
+        assert_eq!(spec.steps.len(), 1);
+        assert_eq!(spec.steps[0].argv, vec!["zz".to_string()]);
+        assert!(spec.steps[0].shell, "an ad hoc step defaults to shell on");
+        assert!(
+            spec.name.is_none(),
+            "REPON_ACTION must stay unset for an ad hoc run, exactly as for a Launcher"
+        );
+    }
+
+    /// Toggling the field's shell mode off before choosing carries through to the built
+    /// `ActionSpec` the confirm gate holds.
+    #[test]
+    fn toggling_shell_off_before_choosing_builds_an_ad_hoc_run_with_shell_off() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        palette.toggle_shell();
+        for c in "zz".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        palette.choose(&actions, 5);
+
+        let spec = palette.confirm_run().expect("a confirm gate was opened");
+        assert!(
+            !spec.steps[0].shell,
+            "the toggle must carry through to the step the confirm gate holds"
+        );
+    }
+
+    /// [`ActionPalette::scoped`]'s own contract: the toggle resets to the default every time
+    /// a new palette is opened, so a sticky off-state from a previous run cannot survive to
+    /// silently reproduce the no-op the default exists to remove.
+    #[test]
+    fn the_shell_toggle_resets_to_on_every_time_a_new_palette_is_opened() {
+        let mut first = ActionPalette::new();
+        first.toggle_shell();
+        assert!(!first.shell());
+
+        let second = ActionPalette::new();
+
+        assert!(
+            second.shell(),
+            "a freshly opened palette must default to shell on regardless of a previous one's \
+             toggle"
         );
     }
 
@@ -1487,15 +1640,15 @@ mod tests {
         assert!(matches!(palette.stage(), Stage::Choosing));
     }
 
-    /// The word-splitting and blank-line claims, pinned directly against
+    /// With `shell` off, the word-splitting and blank-line claims, pinned directly against
     /// [`ad_hoc_steps`]'s own return value rather than through a real run: a blank line in
     /// the middle contributes no step, and a quoted argument survives as one argv element
     /// rather than being split on its own internal space.
     #[test]
-    fn ad_hoc_steps_skips_blank_lines_and_respects_quoting_in_the_remaining_ones() {
+    fn ad_hoc_steps_with_shell_off_skips_blank_lines_and_respects_quoting_in_the_remaining_ones() {
         let text = "false\n\necho \"a b\"";
 
-        let steps = ad_hoc_steps(text).expect("well-formed quoting must parse");
+        let steps = ad_hoc_steps(text, false).expect("well-formed quoting must parse");
 
         assert_eq!(
             steps.len(),
@@ -1512,10 +1665,39 @@ mod tests {
         assert!(!steps[1].shell);
     }
 
+    /// With `shell` on, each non-empty line becomes one step whose `argv` holds that line
+    /// whole rather than split: the quoting inside it is left for the real shell
+    /// [`repon_core`]'s executor hands the string to, never unquoted here. A blank line still
+    /// contributes no step.
     #[test]
-    fn a_line_that_fails_to_word_split_aborts_the_whole_ad_hoc_command() {
+    fn ad_hoc_steps_with_shell_on_keeps_each_line_whole_and_unsplit() {
+        let text = "false\n\necho \"a b\"";
+
+        let steps = ad_hoc_steps(text, true).expect("shell mode never fails to parse");
+
+        assert_eq!(
+            steps.len(),
+            2,
+            "the blank middle line must contribute no step"
+        );
+        assert_eq!(steps[0].argv, vec!["false".to_string()]);
+        assert!(steps[0].shell);
+        assert_eq!(
+            steps[1].argv,
+            vec!["echo \"a b\"".to_string()],
+            "shell mode must hand the whole line to the shell unsplit, quoting intact"
+        );
+        assert!(steps[1].shell);
+    }
+
+    /// Malformed quoting only matters to `shell-words`, which only the `shell`-off path
+    /// calls: with `shell` off (the default palette toggled once), it aborts the whole
+    /// command rather than running a truncated version of what was typed.
+    #[test]
+    fn a_line_that_fails_to_word_split_aborts_the_whole_ad_hoc_command_with_shell_off() {
         let actions: Vec<ActionConfig> = Vec::new();
         let mut palette = ActionPalette::new();
+        palette.toggle_shell();
         for c in "echo \"unterminated".chars() {
             palette.type_char(c, &actions);
         }
@@ -1527,6 +1709,24 @@ mod tests {
             "malformed quoting must refuse the whole command rather than run a truncated \
              version of what was typed"
         );
+    }
+
+    /// With `shell` on (the default), there is no word-splitting to fail: the same
+    /// unbalanced quote that `shell`-off refuses instead becomes one step handed whole to
+    /// the shell, which is free to error on it at run time the way a real prompt would.
+    #[test]
+    fn a_line_that_would_fail_to_word_split_still_parses_with_shell_on() {
+        let actions: Vec<ActionConfig> = Vec::new();
+        let mut palette = ActionPalette::new();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(matches!(decision, Some(Decision::NeedsConfirm)));
+        let spec = palette.confirm_run().expect("a confirm gate was opened");
+        assert_eq!(spec.steps[0].argv, vec!["echo \"unterminated".to_string()]);
     }
 
     #[test]
@@ -1643,11 +1843,18 @@ mod tests {
 
     /// A newline typed with the chord means exactly what a pasted one means
     /// ([actions.md](../../../docs/spec/actions.md)): each non-empty line is one step's own
-    /// command string, argv-split, and never implicitly `shell = true`.
+    /// command string, argv-split, and every line shares the one shell mode the field's
+    /// toggle held at the moment `Enter` was pressed.
     #[test]
-    fn a_typed_newline_makes_the_second_line_a_step_of_its_own_with_no_implicit_shell() {
+    fn a_typed_newline_makes_the_second_line_a_step_of_its_own_sharing_the_first_lines_shell_mode()
+    {
         let actions: Vec<ActionConfig> = Vec::new();
         let mut palette = ActionPalette::new();
+        // Toggled off so the splitting this test checks is meaningful: under the default
+        // shell mode every line is one unsplit argv element regardless of its own spaces,
+        // which `ad_hoc_steps_with_shell_on_keeps_each_line_whole_and_unsplit` already
+        // covers.
+        palette.toggle_shell();
         for c in "echo one".chars() {
             palette.type_char(c, &actions);
         }
@@ -1657,7 +1864,8 @@ mod tests {
         }
 
         match palette.choose(&actions, 5) {
-            Some(Decision::RunImmediately(spec)) => {
+            Some(Decision::NeedsConfirm) => {
+                let spec = palette.confirm_run().expect("a confirm gate was opened");
                 assert_eq!(spec.steps.len(), 2, "each line is one step");
                 assert_eq!(
                     spec.steps[0].argv,
@@ -1669,10 +1877,10 @@ mod tests {
                 );
                 assert!(
                     spec.steps.iter().all(|step| !step.shell),
-                    "a newline must not turn the typed command into a shell string"
+                    "a newline must not change the shell mode from what the toggle held"
                 );
             }
-            other => panic!("expected an ad hoc RunImmediately decision, got {other:?}"),
+            other => panic!("expected an ad hoc NeedsConfirm decision, got {other:?}"),
         }
     }
 

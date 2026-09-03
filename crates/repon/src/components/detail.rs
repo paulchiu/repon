@@ -522,8 +522,18 @@ fn finished_step_line(index: usize, step: &StepResult) -> ContentLine {
     }
 }
 
-/// A child process step's own header line: its number, its outcome, its label and its elapsed
-/// time.
+/// `step.shell`'s own mark on the label, present only when it is `true`: a config step
+/// defaults to argv and stays unmarked, so this only draws attention to the case worth
+/// noticing, an ad hoc command's own default
+/// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
+/// "The Selection and the gate"). One rendering path for both origins, since `StepResult`
+/// carries no field saying which one produced it.
+fn shell_tag(shell: bool) -> &'static str {
+    if shell { "[shell] " } else { "" }
+}
+
+/// A child process step's own header line: its number, its outcome, its label (marked
+/// [`shell_tag`] when it ran through a shell) and its elapsed time.
 fn child_step_line(index: usize, step: &StepResult) -> ContentLine {
     ContentLine::Styled(vec![
         (format!("  step {}  ", index + 1), Role::Dim),
@@ -533,7 +543,8 @@ fn child_step_line(index: usize, step: &StepResult) -> ContentLine {
         ),
         (
             format!(
-                "   {}   {}",
+                "   {}{}   {}",
+                shell_tag(step.shell),
                 step.label,
                 format_seconds_elapsed(step.elapsed)
             ),
@@ -582,7 +593,12 @@ fn running_step_line(
         ),
         ("running".to_string(), Meaning::LoadingSpinner.role()),
         (
-            format!("   {}   {}", running.label, format_seconds_elapsed(elapsed)),
+            format!(
+                "   {}{}   {}",
+                shell_tag(running.shell),
+                running.label,
+                format_seconds_elapsed(elapsed)
+            ),
             Role::Dim,
         ),
     ])
@@ -1099,6 +1115,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -1118,6 +1135,7 @@ mod tests {
             output: Arc::from(output),
             elapsed,
             elision: None,
+            shell: false,
         }
     }
 
@@ -2040,6 +2058,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(3),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -2705,6 +2724,7 @@ mod tests {
             Some(RunningStep {
                 label: Arc::from("pnpm install"),
                 started_at: Timestamp::now(),
+                shell: false,
             }),
         ));
 
@@ -2745,6 +2765,83 @@ mod tests {
         );
     }
 
+    // --- A step's own shell mode reaches the pane (#351) ---
+
+    /// [`StepResult::shell`] marks a finished step's own label with [`shell_tag`] when it ran
+    /// through a shell, and leaves an argv step unmarked: the reader sees which one produced
+    /// the output above it without opening the receipt's own fields.
+    #[test]
+    fn a_finished_step_that_ran_through_a_shell_is_marked_and_an_argv_step_is_not() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "deploy",
+            vec![
+                step_result(
+                    "rm -rf node_modules",
+                    StepOutcome::Ok,
+                    b"",
+                    Duration::from_millis(1),
+                ),
+                StepResult {
+                    shell: true,
+                    ..step_result(
+                        "echo $(pwd)",
+                        StepOutcome::Ok,
+                        b"",
+                        Duration::from_millis(1),
+                    )
+                },
+            ],
+            None,
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        let argv_line = lines
+            .lines()
+            .find(|line| line.contains("rm -rf node_modules"))
+            .expect("expected the argv step's own line");
+        let shell_line = lines
+            .lines()
+            .find(|line| line.contains("echo $(pwd)"))
+            .expect("expected the shell step's own line");
+        assert!(
+            !argv_line.contains("[shell]"),
+            "an argv step must carry no shell mark, got: {argv_line:?}"
+        );
+        assert!(
+            shell_line.contains("[shell]"),
+            "a step that ran through a shell must carry its mark, got: {shell_line:?}"
+        );
+    }
+
+    /// The same mark on a step still running, read off [`RunningStep::shell`] rather than
+    /// waiting for the step to finish.
+    #[test]
+    fn a_running_step_that_is_shelling_out_is_marked_before_it_finishes() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "deploy",
+            Vec::new(),
+            Some(RunningStep {
+                label: Arc::from("echo $(pwd)"),
+                started_at: Timestamp::now(),
+                shell: true,
+            }),
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        let running_line = lines
+            .lines()
+            .find(|line| line.contains("echo $(pwd)"))
+            .expect("expected the running step's own line");
+        assert!(
+            running_line.contains("[shell]"),
+            "a running shell step must carry its mark before it finishes, got: {running_line:?}"
+        );
+    }
+
     // --- The capture elision mark is the consumer's, chosen from the live glyph set ---
 
     /// A finished step whose capture was bounded: `kept_head` head lines, then `kept_tail`
@@ -2769,6 +2866,7 @@ mod tests {
                 dropped_lines,
                 kept_head_lines: kept_head,
             }),
+            shell: false,
         }
     }
 
@@ -2945,6 +3043,7 @@ mod tests {
                 dropped_lines,
                 kept_head_lines: kept_head,
             }),
+            shell: false,
         }
     }
 

@@ -1576,6 +1576,7 @@ impl Core {
                     output: Arc::from(&b""[..]),
                     elapsed: *elapsed,
                     elision: None,
+                    shell: false,
                 }]),
                 skip: None,
                 finished_at,
@@ -2577,6 +2578,7 @@ fn run_action_for_entity(
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::ZERO,
                 elision: None,
+                shell: step.shell,
             });
             continue;
         }
@@ -2589,6 +2591,7 @@ fn run_action_for_entity(
             running: Some(RunningStep {
                 label: Arc::clone(&label),
                 started_at: Timestamp::now(),
+                shell: step.shell,
             }),
         });
         // The step's own `env` table is applied after the environment contract's
@@ -5970,6 +5973,41 @@ mod tests {
         assert_eq!(receipt.steps.len(), 1);
         assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
         assert_eq!(&*receipt.steps[0].output, b"[repon]\n");
+        assert!(
+            receipt.steps[0].shell,
+            "the receipt's own StepResult::shell must carry the mode the step ran under"
+        );
+    }
+
+    /// [`StepResult::shell`]'s own claim on the plain argv side, so the two modes are
+    /// proven end to end through `run_action` rather than only `shell = true`: an ordinary
+    /// step's receipt must read `false`, not merely default to it by construction.
+    #[test]
+    fn an_argv_step_runs_through_run_action_with_shell_false_on_its_receipt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![Step {
+            argv: vec!["true".to_string()],
+            shell: false,
+            env: Vec::new(),
+        }];
+
+        let started = core.run_action(action("argv-step", steps), std::slice::from_ref(&key));
+
+        assert!(started);
+        wait_for("the fan-out to finish and write a receipt", || {
+            !core.action_running()
+        });
+        let receipt = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert!(!receipt.steps[0].shell);
     }
 
     /// Criterion 3's first half. `begin_shared_generation_for_test` puts the entity
@@ -6869,6 +6907,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -6909,6 +6948,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -8326,6 +8366,7 @@ mod tests {
                 output: Arc::from(&b""[..]),
                 elapsed: Duration::from_millis(1),
                 elision: None,
+                shell: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
