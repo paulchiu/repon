@@ -44,6 +44,10 @@ pub enum ProbeError {
     /// The unpushed-commit count behind a `delete` confirm gate could not run: refs that
     /// would not list, or a missing or corrupt commit, never a stand-in for zero.
     Unpushed(Arc<str>),
+    /// `delete`'s phase 1 dirwalk enumerating ignored directories could not run: an index
+    /// that would not load, or a walk that errored partway through, never a stand-in for
+    /// "nothing is ignored".
+    IgnoredDirectories(Arc<str>),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -68,6 +72,9 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Status(message) => write!(f, "failed to read status: {message}"),
             ProbeError::Unpushed(message) => {
                 write!(f, "failed to count unpushed commits: {message}")
+            }
+            ProbeError::IgnoredDirectories(message) => {
+                write!(f, "failed to enumerate ignored directories: {message}")
             }
         }
     }
@@ -606,6 +613,81 @@ pub(crate) fn linked_worktree_paths(repo: &gix::Repository) -> Result<Vec<PathBu
 /// "What `delete` does to a Worktree").
 pub(crate) fn worktree_admin_dir(repo: &gix::Repository) -> PathBuf {
     repo.git_dir().to_path_buf()
+}
+
+/// `repo`'s own ignored directories, collapsed to their own root rather than walked file by
+/// file: `delete`'s phase 1
+/// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)'s
+/// "Deleting a working tree").
+///
+/// gix's dirwalk stops descending the moment it classifies a directory as ignored
+/// ([`gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories`], the
+/// default it is set to here), so a `node_modules` with tens of thousands of files inside is
+/// one returned entry, never one per file, and the walk pays only for the tracked and
+/// untracked part of the tree, which is the small part. `EmissionMode::CollapseDirectory` on
+/// `emit_ignored` is what turns "every ignored file" into "the directory holding them";
+/// `for_deletion` is set for the same call, which gix requires so it does not collapse a
+/// directory holding a precious file.
+///
+/// A bare repository has no working tree to walk, so this returns an empty list rather than
+/// erroring: there is nothing for `delete`'s phase 2 to act on either way.
+pub(crate) fn ignored_directories_for_deletion(
+    repo: &gix::Repository,
+) -> Result<Vec<PathBuf>, ProbeError> {
+    if repo.workdir().is_none() {
+        return Ok(Vec::new());
+    }
+    let index = repo
+        .index_or_load_from_head_or_empty()
+        .map_err(|error| ProbeError::IgnoredDirectories(error.to_string().into()))?;
+    let options = repo
+        .dirwalk_options()
+        .map_err(|error| ProbeError::IgnoredDirectories(error.to_string().into()))?
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
+        .for_deletion(Some(
+            gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories,
+        ));
+    let should_interrupt = AtomicBool::new(false);
+    let mut ignored = IgnoredEntries::default();
+    let outcome = repo
+        .dirwalk(
+            &index,
+            Vec::<&str>::new(),
+            &should_interrupt,
+            options,
+            &mut ignored,
+        )
+        .map_err(|error| ProbeError::IgnoredDirectories(error.to_string().into()))?;
+    Ok(ignored
+        .rela_paths
+        .into_iter()
+        .map(|rela_path| {
+            outcome
+                .traversal_root
+                .join(gix::path::from_bstring(rela_path))
+        })
+        .collect())
+}
+
+/// A [`gix::dir::walk::Delegate`] that keeps only the ignored entries a walk emits, rather
+/// than every entry the built-in `Collect` delegate would buffer (tracked and untracked
+/// entries included): [`ignored_directories_for_deletion`] has no use for either.
+#[derive(Default)]
+struct IgnoredEntries {
+    rela_paths: Vec<gix::bstr::BString>,
+}
+
+impl gix::dir::walk::Delegate for IgnoredEntries {
+    fn emit(
+        &mut self,
+        entry: gix::dir::EntryRef<'_>,
+        _collapsed_directory_status: Option<gix::dir::entry::Status>,
+    ) -> gix::dir::walk::Action {
+        if matches!(entry.status, gix::dir::entry::Status::Ignored(_)) {
+            self.rela_paths.push(entry.rela_path.into_owned());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 /// Whether `repo`'s index differs from `HEAD`: the half [`dirty_counts`] deliberately does
@@ -1544,5 +1626,60 @@ mod tests {
         let (commits, branches) = unpushed(&opened(dir.path())).expect("count unpushed");
 
         assert_eq!((commits, branches), (0, 0));
+    }
+
+    // --- `delete`'s phase 1: ignored directories (docs/spec/repo-management.md) ---
+
+    /// The defining behaviour: a `node_modules` full of files collapses to one returned
+    /// entry, the directory itself, rather than one per file inside it.
+    #[test]
+    fn ignored_directories_for_deletion_collapses_an_ignored_tree_to_its_own_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_with_a_commit(&root);
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").expect("write .gitignore");
+        std::fs::create_dir_all(root.join("node_modules").join("a-package"))
+            .expect("create node_modules");
+        std::fs::write(
+            root.join("node_modules").join("a-package").join("index.js"),
+            "module.exports = {};\n",
+        )
+        .expect("write nested file");
+        git(&root, &["add", ".gitignore"]);
+        git(&root, &["commit", "-m", "ignore node_modules"]);
+
+        let ignored = ignored_directories_for_deletion(&opened(&root)).expect("enumerate ignored");
+
+        assert_eq!(ignored, vec![root.join("node_modules")]);
+    }
+
+    /// Nothing tracked or merely untracked is ignored, so a working tree with neither
+    /// reports no ignored directories at all.
+    #[test]
+    fn ignored_directories_for_deletion_is_empty_with_no_gitignore() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo_with_a_commit(&root);
+        std::fs::write(root.join("tracked.txt"), "tracked\n").expect("write tracked file");
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-m", "add tracked file"]);
+        std::fs::write(root.join("untracked.txt"), "untracked\n").expect("write untracked file");
+
+        let ignored = ignored_directories_for_deletion(&opened(&root)).expect("enumerate ignored");
+
+        assert_eq!(ignored, Vec::<PathBuf>::new());
+    }
+
+    /// A bare repository has no working tree to walk: this is "nothing to enumerate", never
+    /// the error `dirwalk` itself would raise for a missing workdir.
+    #[test]
+    fn ignored_directories_for_deletion_on_a_bare_repository_is_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init_bare(dir.path()).expect("init bare");
+
+        let ignored =
+            ignored_directories_for_deletion(&opened(dir.path())).expect("enumerate ignored");
+
+        assert_eq!(ignored, Vec::<PathBuf>::new());
     }
 }

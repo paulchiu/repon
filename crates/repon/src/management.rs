@@ -739,8 +739,10 @@ impl Report {
 /// loop itself rather than losing control to `run` for the whole thing at once; `run` itself
 /// is this called once per target, in order, with nothing between calls.
 ///
-/// `worktree_admin_dir`, `linked_worktree_paths` and `attempt_sync` are
-/// [`repon_core::Core::worktree_admin_dir`], [`repon_core::Core::linked_worktree_paths`] and
+/// `worktree_admin_dir`, `linked_worktree_paths`, `ignored_directories_for_deletion` and
+/// `attempt_sync` are [`repon_core::Core::worktree_admin_dir`],
+/// [`repon_core::Core::linked_worktree_paths`],
+/// [`repon_core::Core::ignored_directories_for_deletion`] and
 /// [`repon_core::Core::attempt_auto_update`] at the one call site; taken as parameters, the
 /// same way [`Plan::with_risk`] takes `read`, so this module never needs a `Core` to be
 /// tested. `run_before_sync_hook` and `run_after_sync_hook` are consulted for
@@ -753,6 +755,7 @@ pub(crate) fn run_one_record(
     config_file: &Path,
     worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
+    ignored_directories_for_deletion: impl Fn(&Path) -> Vec<PathBuf>,
     attempt_sync: impl Fn(&EntityKey) -> AutoUpdateAttempt,
     run_before_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
     run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
@@ -766,6 +769,7 @@ pub(crate) fn run_one_record(
             config_file,
             &worktree_admin_dir,
             &linked_worktree_paths,
+            &ignored_directories_for_deletion,
             &attempt_sync,
             &run_before_sync_hook,
             &run_after_sync_hook,
@@ -788,6 +792,7 @@ pub(crate) fn run_one_record(
 /// [`crate::config::config_file`] fixes. Every row is [`run_one_record`], called once per
 /// target with nothing of this function's own between calls; a caller that needs to act
 /// between rows drives `run_one_record` itself instead.
+#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)] // exercised by this module's own tests; production drives run_one_record
 // itself, to repaint between rows
 pub(crate) fn run(
@@ -795,6 +800,7 @@ pub(crate) fn run(
     config_file: &Path,
     worktree_admin_dir: impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: impl Fn(&EntityKey) -> Vec<PathBuf>,
+    ignored_directories_for_deletion: impl Fn(&Path) -> Vec<PathBuf>,
     attempt_sync: impl Fn(&EntityKey) -> AutoUpdateAttempt,
     run_before_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
     run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
@@ -809,6 +815,7 @@ pub(crate) fn run(
                 config_file,
                 &worktree_admin_dir,
                 &linked_worktree_paths,
+                &ignored_directories_for_deletion,
                 &attempt_sync,
                 &run_before_sync_hook,
                 &run_after_sync_hook,
@@ -828,6 +835,7 @@ fn run_one(
     config_file: &Path,
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
+    ignored_directories_for_deletion: &impl Fn(&Path) -> Vec<PathBuf>,
     attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
     run_before_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
     run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
@@ -849,6 +857,7 @@ fn run_one(
             config_file,
             worktree_admin_dir,
             linked_worktree_paths,
+            ignored_directories_for_deletion,
         ),
         Operation::Sync => Ok(sync_one(
             target,
@@ -896,23 +905,68 @@ fn sync_one(
     outcome
 }
 
+/// The worker count [`delete_ignored_directories`] bounds its own pool to: a fixed constant
+/// rather than `available_parallelism`, since the right number for metadata-heavy deletion on
+/// a given filesystem is a measured fact, not one the OS's own core count states
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a working tree").
+const IGNORED_DIRECTORY_DELETE_WORKERS: usize = 4;
+
+/// `delete`'s phase 2: deletes each of `directories` independently on a bounded rayon pool
+/// built and torn down for this call alone, the same shape
+/// `repon_core`'s own periodic-fetch `run_bounded` uses for the identical reason: this must
+/// never take a worker away from rayon's global pool, where every probe already lives.
+///
+/// Returns the directories that would not remove, rather than stopping at the first one: a
+/// stuck permission bit on one large ignored subtree must not hold back the rest, and phase 3
+/// ([`remove_working_tree`]) still runs against whatever this call leaves behind, so a failure
+/// here is never fatal to `delete` as a whole.
+fn delete_ignored_directories(directories: Vec<PathBuf>) -> Vec<PathBuf> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    if directories.is_empty() {
+        return Vec::new();
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(IGNORED_DIRECTORY_DELETE_WORKERS)
+        .build()
+        .expect("build the ignored-directory delete pool");
+    pool.install(|| {
+        directories
+            .into_par_iter()
+            .filter(|dir| fs::remove_dir_all(dir).is_err())
+            .collect()
+    })
+}
+
 /// `delete` on one row: a Repo takes its linked Worktrees' own directories with it, a
 /// Worktree is removed the way `git worktree remove` does when its parent Repo can still be
 /// opened and falls back to a bare directory removal when it cannot, and a Submodule never
 /// reaches here at all, since [`Operation::eligibility`] always refuses it first.
+///
+/// Each working tree removed here goes through two phases first, per
+/// [repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a working
+/// tree": `ignored_directories_for_deletion` enumerates that tree's own ignored
+/// directories (phase 1), [`delete_ignored_directories`] drains them independently (phase 2),
+/// and only then does [`remove_working_tree`] run (phase 3, unchanged from before this
+/// existed). Phase 2 deletes a strict subset of what phase 3 deletes anyway, so a crash, or a
+/// phase-2 failure this function ignores, between the two leaves nothing this row's own
+/// `delete` cannot still finish.
 fn delete_one(
     target: &Target,
     config_file: &Path,
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
+    ignored_directories_for_deletion: &impl Fn(&Path) -> Vec<PathBuf>,
 ) -> Result<Outcome> {
     match target.kind {
         Kind::Repo => {
             for worktree in linked_worktree_paths(&target.key) {
+                delete_ignored_directories(ignored_directories_for_deletion(&worktree));
                 // Best effort: a sibling Worktree that will not remove is not this row's own
                 // outcome, and the Repo's own removal below is what the report names.
                 let _ = remove_working_tree(&worktree);
             }
+            delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
             remove_working_tree(target.key.path())?;
             let config_entry_removed =
                 repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
@@ -924,6 +978,7 @@ fn delete_one(
             // Read before either removal runs: once the working tree is gone, its own
             // `.git` file is gone with it and the admin dir can no longer be found.
             let admin_dir = worktree_admin_dir(&target.key);
+            delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
             // The working tree first, the admin dir second: the same order
             // `git worktree remove` itself uses, so a failure part-way through (a
             // permissions error inside `remove_dir_all`, say) leaves the parent still
@@ -1036,6 +1091,7 @@ mod tests {
             plan,
             config_file,
             |_| None,
+            |_| Vec::new(),
             |_| Vec::new(),
             |_| panic!("run_plain does not exercise sync"),
             |_| panic!("run_plain declares no before_sync hook"),
@@ -1243,6 +1299,7 @@ mod tests {
             &config_file,
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
+            |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
             |_| panic!("this test declares no before_sync hook"),
             |_| panic!("this test declares no after_sync hook"),
@@ -1280,6 +1337,7 @@ mod tests {
             &config_file,
             |_| Some(admin_dir.clone()),
             |_| Vec::new(),
+            |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
             |_| panic!("this test declares no before_sync hook"),
             |_| panic!("this test declares no after_sync hook"),
@@ -1312,6 +1370,7 @@ mod tests {
             &plan(Operation::Delete, &entities),
             &config_file,
             |_| None,
+            |_| Vec::new(),
             |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
             |_| panic!("this test declares no before_sync hook"),
@@ -1349,6 +1408,7 @@ mod tests {
             &config_file,
             |_| None,
             |_| siblings.to_vec(),
+            |_| Vec::new(),
             |_| panic!("this test does not exercise sync"),
             |_| panic!("this test declares no before_sync hook"),
             |_| panic!("this test declares no after_sync hook"),
@@ -1360,6 +1420,225 @@ mod tests {
         assert_eq!(
             report.records[0].outcome,
             Outcome::Deleted {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    // =====================================================================================
+    // `delete`'s phase 1 and phase 2: enumerating and draining a working tree's own ignored
+    // directories before phase 3, `remove_working_tree`, runs (docs/spec/repo-management.md's
+    // "Deleting a working tree").
+    // =====================================================================================
+
+    /// [`delete_ignored_directories`] itself, independent of `delete_one`: every directory it
+    /// is given disappears, nested content included.
+    #[test]
+    fn delete_ignored_directories_removes_each_directory_it_is_given() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let node_modules = dir.path().join("node_modules");
+        std::fs::create_dir_all(node_modules.join("a-package")).expect("create node_modules");
+        std::fs::write(node_modules.join("a-package").join("index.js"), "x")
+            .expect("write nested file");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).expect("create target");
+
+        let failed = delete_ignored_directories(vec![node_modules.clone(), target.clone()]);
+
+        assert!(
+            failed.is_empty(),
+            "both directories should remove cleanly, got {failed:?}"
+        );
+        assert!(!node_modules.exists());
+        assert!(!target.exists());
+    }
+
+    /// A directory that will not remove is reported rather than panicking, and does not stop
+    /// a sibling directory from being drained: `delete`'s own phase 3 still runs afterwards
+    /// regardless of what phase 2 could not finish.
+    #[test]
+    fn delete_ignored_directories_reports_a_directory_that_will_not_remove_without_stopping_the_rest()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("already-gone");
+        let present = dir.path().join("present");
+        std::fs::create_dir_all(&present).expect("create present");
+
+        let failed = delete_ignored_directories(vec![missing.clone(), present.clone()]);
+
+        assert_eq!(failed, vec![missing]);
+        assert!(
+            !present.exists(),
+            "a failure removing one directory must not hold back the rest"
+        );
+    }
+
+    #[test]
+    fn delete_ignored_directories_does_nothing_when_given_nothing() {
+        assert_eq!(
+            delete_ignored_directories(Vec::new()),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// The safety argument's other half: phase 2 is asked about, and only about, the exact
+    /// path `delete_one` was given, a Worktree's own [`EntityKey`] path here, never a
+    /// literal or a path phase 2 invented on its own.
+    #[test]
+    fn deleting_a_worktree_asks_for_ignored_directories_at_the_worktrees_own_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| Vec::new(),
+            |path| {
+                asked.borrow_mut().push(path.to_path_buf());
+                Vec::new()
+            },
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert_eq!(asked.into_inner(), vec![tree.clone()]);
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::DirectoryRemoved {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    /// The Repo cascade gets the same treatment as the Repo's own tree: phase 1 and phase 2
+    /// run once for the Repo's own path and once more for each linked Worktree
+    /// `linked_worktree_paths` names, never only for one or the other.
+    #[test]
+    fn deleting_a_repo_asks_for_ignored_directories_at_its_own_path_and_every_linked_worktrees() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(sibling.join(".git")).expect("create the sibling");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+        let siblings = [sibling.clone()];
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| siblings.to_vec(),
+            |path| {
+                asked.borrow_mut().push(path.to_path_buf());
+                Vec::new()
+            },
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        let mut asked = asked.into_inner();
+        asked.sort();
+        let mut expected = vec![repo.clone(), sibling.clone()];
+        expected.sort();
+        assert_eq!(asked, expected);
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::Deleted {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    /// Phase 2 and phase 3 together remove exactly what the old single-phase
+    /// `remove_working_tree` alone removed: a real ignored subtree drained by phase 2 leaves
+    /// nothing behind for phase 3 to trip over, and the working tree ends up gone either way.
+    #[test]
+    fn phase_two_and_phase_three_together_remove_the_whole_working_tree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        let node_modules = tree.join("node_modules");
+        std::fs::create_dir_all(node_modules.join("a-package")).expect("create node_modules");
+        std::fs::write(node_modules.join("a-package").join("index.js"), "x")
+            .expect("write nested file");
+        std::fs::write(tree.join("source.rs"), "fn main() {}\n").expect("write a tracked file");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| Vec::new(),
+            |path| vec![path.join("node_modules")],
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(
+            !tree.exists(),
+            "phase 2 draining node_modules must not stop phase 3 from removing the rest"
+        );
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::DirectoryRemoved {
+                config_entry_removed: false
+            }
+        );
+    }
+
+    /// Crash recovery: phase 2 finishing (or failing) on its own, with `delete` itself never
+    /// reaching phase 3, leaves the working tree still on disk and still eligible. Re-running
+    /// `delete` finds less for phase 1 to enumerate and still finishes the removal phase 3
+    /// would have finished the first time.
+    #[test]
+    fn a_working_tree_left_behind_after_phase_two_alone_still_deletes_cleanly_on_a_re_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        let node_modules = tree.join("node_modules");
+        std::fs::create_dir_all(node_modules.join("a-package")).expect("create node_modules");
+
+        // Stands in for a crash right after phase 2 finished but before `delete` reached
+        // phase 3 at all: the ignored subtree is already gone, the tree is still there.
+        let failed = delete_ignored_directories(vec![node_modules.clone()]);
+        assert!(failed.is_empty());
+        assert!(!node_modules.exists());
+        assert!(
+            tree.exists(),
+            "the crash this stands in for happens before phase 3 ever runs"
+        );
+
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| Vec::new(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(
+            !tree.exists(),
+            "the re-run finishes the removal the interrupted first run left half done"
+        );
+        assert_eq!(
+            report.records[0].outcome,
+            Outcome::DirectoryRemoved {
                 config_entry_removed: false
             }
         );
@@ -1705,6 +1984,7 @@ mod tests {
             Path::new("/tmp/unused-config.toml"),
             |_| None,
             |_| Vec::new(),
+            |_| Vec::new(),
             move |_| attempt.clone(),
             |_| None,
             |_| None,
@@ -1723,6 +2003,7 @@ mod tests {
             plan,
             Path::new("/tmp/unused-config.toml"),
             |_| None,
+            |_| Vec::new(),
             |_| Vec::new(),
             move |_| attempt.clone(),
             move |_| before_sync.clone(),
@@ -1819,6 +2100,7 @@ mod tests {
             Path::new("/tmp/unused-config.toml"),
             |_| None,
             |_| Vec::new(),
+            |_| Vec::new(),
             |_| panic!("a failing pre-hook must stop sync before attempt_sync is ever called"),
             |_| Some(HookOutcome::Failed("exit 1".to_string())),
             |_| panic!("a before_sync failure must never reach the after_sync hook either"),
@@ -1899,6 +2181,7 @@ mod tests {
             &built,
             Path::new("/tmp/unused-config.toml"),
             |_| None,
+            |_| Vec::new(),
             |_| Vec::new(),
             |_| AutoUpdateAttempt::NotBehind,
             |_| None,
