@@ -245,7 +245,7 @@ mod tests {
 
     fn full_header() -> HeaderContent {
         HeaderContent {
-            entity_count: 403,
+            entity_count: 242,
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
             worktrees_note: Some((161, header::WorktreesHiddenBy::Preference)),
