@@ -393,9 +393,9 @@ pub struct App {
     /// `Tab`) and closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
     /// touching the active Set or starting a Generation. Its own `Action::Choose` (`Enter`)
-    /// routes the highlighted row through [`Self::switch_to_set`], the exact path the
-    /// positional `1`-`9` keys already take, so this can never become a second
-    /// implementation of the same switch.
+    /// and its `1`-`9` rows both route through [`Self::switch_to_set`], the exact path the
+    /// positional keys take outside it, so this can never become a second implementation of
+    /// the same switch.
     set_picker: Option<SetPicker>,
     /// The live Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
@@ -1820,12 +1820,11 @@ impl App {
     /// Generation untouched.
     ///
     /// `SwitchToSet(nth)` (a bare digit, `overlay`'s own row for it) takes the same
-    /// [`Self::switch_to_set`] call `Choose` does, but whether the picker closes is decided
-    /// here rather than inside that call: `nth` naming a declared Set closes the picker along
-    /// with switching, while `nth` past however many Sets are declared leaves the picker open
-    /// with the active Set untouched, `switch_to_set`'s own out-of-range Notice standing in
-    /// place of a switch that cannot happen. Checked against `self.document.sets` before the
-    /// call, not after, since `switch_to_set` returns nothing to branch on.
+    /// [`Self::switch_to_set`] call `Choose` does and closes the picker only if that call
+    /// reports it switched. A refusal leaves the picker open with the active Set untouched
+    /// and `switch_to_set`'s own Notice standing, which covers both of its refusal reasons
+    /// (a digit past however many Sets are declared, and a run already outstanding) without
+    /// this arm having to know either.
     ///
     /// The trailing `unreachable!` arm is the same proof-made-loud shape
     /// [`Self::handle_action_palette_key`] already uses: `dispatch(Context::Overlay, _)` can
@@ -1842,13 +1841,10 @@ impl App {
                 self.set_picker = None;
             }
             Some(Action::SwitchToSet(nth)) => {
-                let names_a_declared_set = self
-                    .document
-                    .sets
-                    .get(usize::from(nth).wrapping_sub(1))
-                    .is_some();
-                self.switch_to_set(nth);
-                if names_a_declared_set {
+                // Bound rather than tested inline: as a match guard this would perform the
+                // switch while deciding which arm to take.
+                let switched = self.switch_to_set(nth);
+                if switched {
                     self.set_picker = None;
                 }
             }
@@ -13626,6 +13622,87 @@ refresh_all = "z""#,
             Some("only 1 Set declared; press s to pick one"),
             "expected the same out-of-range Notice the positional digit raises outside the \
              picker"
+        );
+    }
+
+    /// `switch_to_set` refuses for two reasons, not one: an out-of-range digit and a live
+    /// fan-out. The picker stays open for both, since in neither case did the Set actually
+    /// change, and a picker that closes on a refusal hides the Notice explaining it.
+    #[test]
+    fn a_digit_refused_because_a_run_is_outstanding_also_leaves_the_picker_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("other", &root)];
+
+        // The picker opens first: `s` is itself gated while a run is outstanding, so a run
+        // started before it would leave nothing open for the digit to be refused in.
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        let slow = repon_core::ActionSpec {
+            label: std::sync::Arc::from("slow"),
+            name: Some(std::sync::Arc::from("slow")),
+            steps: vec![repon_core::Step {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                shell: false,
+                env: Vec::new(),
+            }],
+            concurrency: 1,
+            when: None,
+        };
+        assert!(app.core.run_action(slow, &keys));
+
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("press a perfectly valid digit while the fan-out is live");
+
+        assert!(
+            app.set_picker.is_some(),
+            "a digit refused because a run is outstanding must leave the picker open, the \
+             way an out-of-range digit does"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "the refused switch must leave the active Set untouched"
+        );
+
+        app.core.stop_action();
+    }
+
+    /// The digits reach `Context::Overlay`, which the help overlay shares with the Set
+    /// picker, so what keeps them out of help's search query is dispatch order alone:
+    /// `keys::printable` is consulted before `Context::Overlay` while a query is open. That
+    /// ordering is load-bearing and otherwise unasserted, so a reordering would silently
+    /// turn typing `2` into a Set switch mid-search.
+    #[test]
+    fn a_digit_typed_into_the_help_overlays_search_is_query_text_not_a_set_switch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("other", &root)];
+
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open the help overlay");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter help's search mode");
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("type a digit into the query");
+
+        let overlay = app.help.as_ref().expect("the help overlay stays open");
+        assert!(overlay.is_searching(), "help stays in search mode");
+        assert_eq!(overlay.query(), "2", "the digit is query text");
+        assert_eq!(
+            app.active_set.name, "test",
+            "typing a digit into help's search must not switch Sets"
         );
     }
 
