@@ -86,6 +86,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Enter` | Apply the Filter, or run the highlighted entry. In the Filter line it **always** commits and never accepts a completion ([filter.md](filter.md)) |
 | `Alt+Enter` | Insert a newline (the ad hoc command field only) |
 | `Alt+S` | Toggle shell mode (the ad hoc command field only) |
+| `Alt+/` | Clear the committed Filter |
 | `Esc` | Cancel |
 | `Up`, `Ctrl+K` | Previous entry |
 | `Down`, `Ctrl+J` | Next entry |
@@ -174,7 +175,7 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 
 `t` for the worktrees toggle is free on the same terms: unbound in Global, List, Detail, Input, Overlay and Confirm, so no context-specific binding is left to shadow it while `list` or `detail` has focus. Its one other appearance in the whole table is `sort`'s own `t` (`Sort by state`), a context `global` never falls back into and that never falls back into `global` either ([The contexts](#the-contexts)), so the two cannot collide at dispatch. It is also the one column key `sort` binds that carried no meaning outside the menu before this ticket; giving it one here means every column letter now reads the same way in or out of the menu, the way `b`, `s`, `n`, `d` and `a` already did.
 
-`Alt+/` clears a committed Filter directly, the same physical key that opens one with a modifier rather than Shift. `?` was the natural pair, mirroring `/`, but it is already bound `Global` to `OpenHelp`: binding it in `list` too would shadow help on the main screen and leave `?` reachable only from the detail pane, which is a worse cost than an unfamiliar modifier. `Alt+/` is unbound in every context, and it does not touch the unwind stack's own last rung, which still clears a Filter as [Esc](#esc)'s slowest, innermost-first route to the same effect.
+`Alt+/` clears a committed Filter directly, the same physical key that opens one with a modifier rather than Shift. `?` was the natural pair, mirroring `/`, but it is already bound `Global` to `OpenHelp`: binding it in `list` too would shadow help on the main screen and leave `?` reachable only from the detail pane, which is a worse cost than an unfamiliar modifier. `Alt+/` is bound a second time, in `input`, since `global` is suspended there ([The contexts](#the-contexts)) and no fallback could ever carry `list`'s own row into the Filter line; from inside it, `Alt+/` closes the line the same way `Esc` does, but clears the committed Filter it closes over instead of restoring it. Elsewhere `Alt+/` is unbound, and neither row touches the unwind stack's own last rung, which still clears a Filter as [Esc](#esc)'s slowest, innermost-first route to the same effect.
 
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
@@ -315,7 +316,15 @@ The Action palette's own footer is 55 columns at full width, drawn on the palett
  10  esc cancel
 ```
 
-The other two are short enough to survive almost any frame: `enter apply  esc cancel` at 23 columns for the Filter line, which sits one row above it ([filter.md](filter.md)), and `y run  n cancel` at 15 for the confirm gate.
+The Filter line's own footer, which sits one row above the line itself ([filter.md](filter.md)), is 43 columns at full width. `enter apply` and `esc cancel` are pinned, the way in and the way out; `alt-/ clear filter` is the newest of the three and the first to go, since the line is still usable without it. It degrades like this:
+
+```
+ 43  enter apply  esc cancel  alt-/ clear filter
+ 30  enter apply  esc cancel ...
+ 23  enter apply  esc cancel
+```
+
+The confirm gate's own footer is short enough to survive almost any frame: `y run  n cancel` at 15 columns.
 
 `o` itself is not in the list or detail footer. Both are already at their documented full widths with no room for a ninth hint, and `o` is a `global` binding, so the help overlay already lists it in its `global` section wherever it is open from. The column keys are taught by the menu's own footer at the one moment they mean anything.
 

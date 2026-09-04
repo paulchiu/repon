@@ -520,9 +520,10 @@ pub struct App {
     /// Enter commit one.
     filter: Filter,
     /// `Some` while the Filter line has focus, opened by `Action::EnterFilter` (`/`) and
-    /// closed either by `Action::Apply` (Enter, which also commits its live text into
-    /// `self.filter`) or `Action::Cancel` (Esc, which abandons the edit and leaves `self.filter`
-    /// untouched). Dispatched through `Context::Input` like `action_palette` and
+    /// closed by `Action::Apply` (Enter, which also commits its live text into `self.filter`),
+    /// `Action::Cancel` (Esc, which abandons the edit and leaves `self.filter` untouched), or
+    /// `Action::ClearFilter` (`Alt+/`, which abandons the edit and clears `self.filter`
+    /// instead). Dispatched through `Context::Input` like `action_palette` and
     /// `launcher_palette`, but drawn inline above the footer rather than as a full-screen
     /// overlay, since the list keeps narrowing live underneath it
     /// ([filter.md](../../../docs/spec/filter.md)).
@@ -1796,7 +1797,10 @@ impl App {
                 }
             }
             Some(Action::OpenInEditor) => self.pending_action_editor_handoff = true,
-            Some(Action::AcceptCompletion) => {}
+            // `AcceptCompletion` is inert for the reason given above; `ClearFilter` (`Alt+/`)
+            // is inert here permanently, since the Action palette narrows no committed Filter
+            // of its own for it to clear.
+            Some(Action::AcceptCompletion | Action::ClearFilter) => {}
             None => {}
             Some(other) => unreachable!(
                 "dispatch(Context::Input, _) only ever returns the input vocabulary or \
@@ -1858,12 +1862,30 @@ impl App {
     /// (`Tab`) and `PreviousEntry`/`NextEntry` (`Ctrl+K`/`Ctrl+J`, `Up`/`Down`) forward
     /// straight to [`crate::filter_line::FilterLine`], which owns the completion list itself.
     /// `OpenInEditor` stays inert: filter.md never routes the Filter line through `$EDITOR`,
-    /// unlike the Action palette's own ad hoc command field. The trailing `unreachable!` arm
-    /// is the same proof-made-loud shape [`Self::handle_action_palette_key`] already uses for
+    /// unlike the Action palette's own ad hoc command field. `ClearFilter` (`Alt+/`) is bound
+    /// here too, since `Global`'s own `list` row can never reach an input context: it closes
+    /// the line exactly as `Cancel` does, but clears `self.filter` rather than leaving it
+    /// standing, which is what keeps the two gestures distinct
+    /// ([filter.md](../../../docs/spec/filter.md)). The trailing `unreachable!` arm is the
+    /// same proof-made-loud shape [`Self::handle_action_palette_key`] already uses for
     /// `Context::Input`.
     fn handle_filter_line_key(&mut self, key: KeyEvent) {
         match self.bindings.dispatch(Context::Input, key) {
             Some(Action::Cancel) => self.filter_line = None,
+            // Closes the line the same way `Cancel` does, but clears the committed Filter it
+            // closes over instead of restoring it: unavailable with a Notice, and the line
+            // left open, when there is nothing committed to clear.
+            Some(Action::ClearFilter) => {
+                let mut clear_filter = ClearFilterOnUnwind {
+                    filter: &mut self.filter,
+                };
+                if clear_filter.unwind() {
+                    self.filter_line = None;
+                    self.follow_cursor();
+                } else {
+                    self.set_notice(NO_FILTER_TO_CLEAR_NOTICE.to_string());
+                }
+            }
             Some(Action::Apply) => {
                 if let Some(line) = self.filter_line.take() {
                     self.filter = line.live_filter();
@@ -1985,14 +2007,16 @@ impl App {
                 }
             }
             Some(Action::Apply) => self.choose_highlighted_launcher(),
-            // All four inert here: this palette has no completion list, and its query is a
-            // one-line name to match rather than a command to write, so neither the editor
-            // handoff, the newline nor the shell toggle has anything to act on.
+            // All five inert here: this palette has no completion list and no committed
+            // Filter of its own to clear, and its query is a one-line name to match rather
+            // than a command to write, so neither the editor handoff, the newline nor the
+            // shell toggle has anything to act on.
             Some(
                 Action::AcceptCompletion
                 | Action::OpenInEditor
                 | Action::InsertNewline
-                | Action::ToggleShell,
+                | Action::ToggleShell
+                | Action::ClearFilter,
             ) => {}
             None => {}
             Some(other) => unreachable!(
@@ -2718,10 +2742,10 @@ impl App {
     /// The context [`Self::render`]'s footer draws for: `Context::Confirm` while
     /// [`Self::quit_confirm`] is armed, naming its own `y run  n cancel` hint
     /// ([keybindings.md](../../../docs/spec/keybindings.md#the-footer)); otherwise
-    /// `Context::Input` while the Filter line is open, naming its own `enter apply  esc
-    /// cancel` hint; otherwise `self.focus`. Named as its own method so a mutation that
-    /// hardcoded `Context::List` there instead is something a test can call directly rather
-    /// than needing a full terminal render to observe.
+    /// `Context::Input` while the Filter line is open, naming its own `enter apply`, `esc
+    /// cancel` and `alt-/ clear filter` hints; otherwise `self.focus`. Named as its own method
+    /// so a mutation that hardcoded `Context::List` there instead is something a test can call
+    /// directly rather than needing a full terminal render to observe.
     fn footer_context(&self) -> Context {
         if self.quit_confirm {
             Context::Confirm
@@ -5587,6 +5611,56 @@ mod tests {
                 .text(),
             "gi",
             "the Launcher palette's query stays one line"
+        );
+    }
+
+    /// The same `input` table serves the two palettes, so `Alt+/` reaches them too. Neither
+    /// owns a Filter, so the chord does nothing there rather than closing the palette or
+    /// clearing the list's own committed Filter out from under it.
+    #[test]
+    fn the_clear_filter_chord_is_inert_in_the_action_and_launcher_palettes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("keep-b"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the Filter line");
+        for c in "keep".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a Filter");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the Filter");
+        assert!(app.filter.is_active(), "sanity: a Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the Action palette");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("alt+/ must not panic in the Action palette");
+        assert!(
+            app.action_palette.is_some(),
+            "the Action palette stays open"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter survives alt+/ pressed in the Action palette"
+        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close the Action palette");
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the Launcher palette");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("alt+/ must not panic in the Launcher palette");
+        assert!(
+            app.launcher_palette.is_some(),
+            "the Launcher palette stays open"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter survives alt+/ pressed in the Launcher palette"
         );
     }
 
@@ -14161,8 +14235,107 @@ refresh_all = "z""#,
         );
     }
 
-    // --- `Alt+/`: a direct route to the unwind stack's own last rung
-    // (docs/spec/keybindings.md's "Esc"), bound in `list` only ---
+    // --- `Alt+/` from inside the Filter line: `Global`'s own `list` row can never reach
+    // `Context::Input` ([keybindings.md](../../../docs/spec/keybindings.md)'s "The contexts"),
+    // so this is a binding of its own rather than a fallback ---
+
+    #[test]
+    fn alt_slash_from_the_filter_input_closes_the_line_and_clears_the_committed_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.filter = Filter::parse("repo-a");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter, prefilled with the committed one");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears the committed Filter from inside the line");
+
+        assert!(
+            app.filter_line.is_none(),
+            "Alt+/ must close the Filter line the way Cancel does"
+        );
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must clear the committed Filter rather than restore it"
+        );
+        assert_eq!(app.visible_keys().len(), 2, "no Filter is left active");
+        assert_eq!(
+            app.notice, None,
+            "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
+        );
+    }
+
+    #[test]
+    fn alt_slash_from_the_filter_input_with_no_committed_filter_is_inert_and_leaves_the_line_open()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert!(!app.filter.is_active(), "sanity: no Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter");
+        app.handle_key_event(press(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("type a draft that was never committed");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ with nothing committed to clear");
+
+        assert!(
+            app.filter_line.is_some(),
+            "an unavailable Alt+/ must leave the line open"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                app.filter_line
+                    .as_ref()
+                    .expect("the Filter line is open")
+                    .live_filter()
+            ),
+            format!("{:?}", Filter::parse("x")),
+            "the draft the user was typing survives an unavailable Alt+/ untouched"
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(NO_FILTER_TO_CLEAR_NOTICE),
+            "an inert Built binding answers the press with a Notice naming why \
+             (docs/adr/0023)"
+        );
+    }
+
+    /// Pins the distinction the two gestures must keep
+    /// ([filter.md](../../../docs/spec/filter.md)): both close the Filter line, but `Esc`
+    /// restores the Filter that was committed before the line opened, while `Alt+/` clears it.
+    /// A regression collapsing the two into the same effect would pass every other test above,
+    /// since each is checked against its own gesture alone.
+    #[test]
+    fn esc_restores_the_committed_filter_where_alt_slash_would_have_cleared_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.filter = Filter::parse("repo-a");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter, prefilled with the committed one");
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("Esc cancels the edit");
+
+        assert!(app.filter_line.is_none(), "Esc must close the Filter line");
+        assert_eq!(
+            app.filter.as_str(),
+            "repo-a",
+            "Esc must restore the previously committed Filter, not clear it"
+        );
+    }
+
+    // --- `Alt+/` in `list`: a direct route to the unwind stack's own last rung
+    // (docs/spec/keybindings.md's "Esc") ---
 
     #[test]
     fn alt_slash_clears_a_committed_filter_leaving_selection_pane_and_action_untouched() {

@@ -68,7 +68,9 @@ pub(crate) enum Action {
     /// detail pane or a running Action
     /// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)'s unwind stack still
     /// clears one too, at its own last rung; this is a second, direct route to the same
-    /// effect, not a replacement for it).
+    /// effect, not a replacement for it). Bound in `list` and, separately, in `input`, since
+    /// `Global` is suspended there and a fallback could never reach it from inside the Filter
+    /// line.
     ClearFilter,
     OpenDetail,
     DismissVanished,
@@ -584,6 +586,9 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Input, KeyCode::Enter, NONE, Action::Apply),
     binding(Context::Input, KeyCode::Enter, ALT, Action::InsertNewline),
     binding(Context::Input, KeyCode::Char('s'), ALT, Action::ToggleShell),
+    // `Global`'s own `Alt+/` never reaches here (`Global` is suspended in `input`), so the
+    // Filter line gets its own row rather than relying on a fallback that cannot fire.
+    binding(Context::Input, KeyCode::Char('/'), ALT, Action::ClearFilter),
     binding(Context::Input, KeyCode::Esc, NONE, Action::Cancel),
     binding(Context::Input, KeyCode::Up, NONE, Action::PreviousEntry),
     binding(
@@ -1670,6 +1675,25 @@ mod tests {
         fn suspended_in_confirm() {
             assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
         }
+    }
+
+    // --- `Alt+/` reaches `Context::Input` directly, since `Global`'s own `list` row is
+    // suspended there and no fallback could ever carry it into the Filter line ---
+
+    #[test]
+    fn alt_slash_dispatches_clear_filter_in_the_input_context_where_global_is_suspended() {
+        assert_eq!(
+            dispatch(Context::Input, press(KeyCode::Char('/'), ALT)),
+            Some(Action::ClearFilter)
+        );
+    }
+
+    #[test]
+    fn alt_slash_still_dispatches_clear_filter_in_the_list_context_unchanged() {
+        assert_eq!(
+            dispatch(Context::List, press(KeyCode::Char('/'), ALT)),
+            Some(Action::ClearFilter)
+        );
     }
 
     /// `e` (`Action::EditConfig`) is free across every context: Global's own row fires it
