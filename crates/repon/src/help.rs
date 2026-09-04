@@ -126,6 +126,7 @@ fn meaning_text(meaning: Meaning) -> &'static str {
         Meaning::Behind => "behind by n",
         Meaning::Changed => "n changed files",
         Meaning::ChildRow => "child row",
+        Meaning::OrphanChildRow => "child with no visible parent",
         Meaning::Checked => "checked (the Selection's own marker)",
         Meaning::Truncated => "truncated name",
     }

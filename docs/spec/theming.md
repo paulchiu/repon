@@ -151,6 +151,7 @@ One switch, two vetted sets, no way to mix them:
 | behind by n | `↓n` | `<n` |
 | n changed files | `●n` | `*n` |
 | child row | `└` | `` ` `` |
+| child with no visible parent | `┆` | `:` |
 | checked (the Selection's own marker) | `✓` | `+` |
 | truncated name | `$` | `$` |
 | sort arrow (ascending, descending) | `↑↓` | `^v` |

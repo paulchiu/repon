@@ -400,10 +400,16 @@ impl List {
             theme: &self.theme,
             columns,
         };
-        for (screen_row, entity) in visible_rows
-            .into_iter()
-            .skip(skip)
-            .map(|index| &snapshot.entities[index])
+        // Sliced by `skip` before this runs, so a row scrolled off the top is never treated
+        // as a visible parent: the topmost drawn row always starts a fresh run, exactly as
+        // if nothing were rendered above it, because nothing is.
+        let windowed_rows = &visible_rows[skip..];
+        let parent_visibilities = parent_visible_flags(&snapshot.entities, windowed_rows);
+        for (screen_row, (entity, parent_visibility)) in windowed_rows
+            .iter()
+            .copied()
+            .zip(parent_visibilities)
+            .map(|(index, parent_visibility)| (&snapshot.entities[index], parent_visibility))
             .enumerate()
         {
             let Some(y) = interior.y.checked_add(first_row + screen_row as u16) else {
@@ -416,9 +422,9 @@ impl List {
             }
             let checked = self.selection.contains(&entity.key);
             if compact {
-                draw_row_compact(buf, interior, y, entity, checked, &ctx);
+                draw_row_compact(buf, interior, y, entity, checked, parent_visibility, &ctx);
             } else {
-                draw_row(buf, interior, y, entity, checked, &ctx);
+                draw_row(buf, interior, y, entity, checked, parent_visibility, &ctx);
             }
             // Painted after the row's own cells, over the row's full interior width, so it
             // reaches every column and every gap between them rather than only the cells a
@@ -767,6 +773,53 @@ fn group_key(entity: &EntityState) -> &Path {
     }
 }
 
+/// Which marker a child row draws, picked by [`parent_visible_flags`] and read only in
+/// [`draw_name_cell`]: `Connected` for the connector, `Orphaned` for the orphan marker.
+/// Meaningless for a top-level row, which never reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParentVisibility {
+    Connected,
+    Orphaned,
+}
+
+impl ParentVisibility {
+    fn from_traces_to_a_visible_repo(traces_to_a_visible_repo: bool) -> Self {
+        if traces_to_a_visible_repo {
+            Self::Connected
+        } else {
+            Self::Orphaned
+        }
+    }
+}
+
+/// Whether the row directly above each row in `visible_rows` traces an unbroken run of the
+/// same group back to a visible Repo row, which is what a child row's connector points at
+/// ([`draw_name_cell`]); position 0 has no row above and is never visible-parented. A run
+/// this reaches transitively rather than by checking only the immediate row above, so a
+/// Worktree and a Submodule under the same visible Repo both draw the connector even though
+/// only the first of them has the Repo itself directly above
+/// ([`grouped_row_order`] keeps a group contiguous whenever its Repo survives). A run whose
+/// own Repo was never a candidate at all (`kind:worktree`, a Filter that drops the parent's
+/// name) has no visible-Repo row to trace back to, so every row in it reads `Orphaned`,
+/// however many siblings it holds. Indexed exactly like `visible_rows`, so a caller pairs
+/// entry `i` with `entities[visible_rows[i]]`.
+fn parent_visible_flags(entities: &[EntityState], visible_rows: &[usize]) -> Vec<ParentVisibility> {
+    let mut flags = Vec::with_capacity(visible_rows.len());
+    let mut previous: Option<(&Path, bool)> = None;
+    for &index in visible_rows {
+        let entity = &entities[index];
+        let key = group_key(entity);
+        let parent_visible =
+            previous.is_some_and(|(prev_key, prev_attached)| prev_key == key && prev_attached);
+        let attached_to_a_visible_repo = matches!(entity.kind, Kind::Repo) || parent_visible;
+        flags.push(ParentVisibility::from_traces_to_a_visible_repo(
+            parent_visible,
+        ));
+        previous = Some((key, attached_to_a_visible_repo));
+    }
+    flags
+}
+
 /// Reorders `candidates` (indices into `entities`, in the order a caller wants them
 /// considered) so each included Repo is immediately followed by its own included Worktrees
 /// and Submodules, preserving each Repo's own relative order and each child's own relative
@@ -855,12 +908,15 @@ pub(crate) fn name_cell_meaning(kind: Kind) -> Meaning {
 /// child-row geometry constants are read, so [`draw_row`] and [`draw_row_compact`] can never
 /// draw a child row two different ways. The marker itself is structural, like the gutter, and
 /// stays unstyled; only the name text takes [`name_cell_meaning`]'s role, since the marker
-/// names no meaning of its own in theming.md.
+/// names no meaning of its own in theming.md. `parent_visibility`
+/// ([`ParentVisibility`], from [`parent_visible_flags`]) picks between the connector and the
+/// orphan marker; it is meaningless for a top-level row and unread there.
 fn draw_name_cell(
     buf: &mut Buffer,
     interior: Rect,
     y: u16,
     entity: &EntityState,
+    parent_visibility: ParentVisibility,
     ctx: &RowContext,
 ) {
     let RowContext {
@@ -872,13 +928,17 @@ fn draw_name_cell(
     let name_style = theme.style_for(name_cell_meaning(entity.kind).role());
     let (name_x, name_width) = if is_child_row(entity.kind) {
         let marker_x = interior.x + columns.name.x + CHILD_ROW_INDENT_WIDTH;
+        let marker = match parent_visibility {
+            ParentVisibility::Connected => glyphs.child_row,
+            ParentVisibility::Orphaned => glyphs.orphan_child_row,
+        };
         write_cell(
             buf,
             interior,
             marker_x,
             y,
             CHILD_ROW_MARKER_WIDTH,
-            &glyphs.child_row.to_string(),
+            &marker.to_string(),
             Style::new(),
         );
         (
@@ -989,6 +1049,7 @@ fn draw_row(
     y: u16,
     entity: &EntityState,
     checked: bool,
+    parent_visibility: ParentVisibility,
     ctx: &RowContext,
 ) {
     let RowContext {
@@ -1020,7 +1081,7 @@ fn draw_row(
         Style::new(),
     );
     draw_selected_marker(buf, interior, y, checked, glyphs, theme);
-    draw_name_cell(buf, interior, y, entity, ctx);
+    draw_name_cell(buf, interior, y, entity, parent_visibility, ctx);
     // The one other column long enough to overflow its own budget, now that it grows into
     // the frame's slack: a branch cut silently at a grapheme boundary reads exactly like a
     // whole branch name, which is why `name` already carries the mark (ADR 0020's tenth
@@ -1106,6 +1167,7 @@ fn draw_row_compact(
     y: u16,
     entity: &EntityState,
     checked: bool,
+    parent_visibility: ParentVisibility,
     ctx: &RowContext,
 ) {
     let RowContext {
@@ -1125,7 +1187,7 @@ fn draw_row_compact(
         Style::new(),
     );
     draw_selected_marker(buf, interior, y, checked, glyphs, theme);
-    draw_name_cell(buf, interior, y, entity, ctx);
+    draw_name_cell(buf, interior, y, entity, parent_visibility, ctx);
 }
 
 /// Selects `loading`'s current frame from `elapsed`, so the mark moves at `interval`'s pace
@@ -4743,6 +4805,230 @@ mod tests {
                 "expected the marker read off the active table itself"
             );
         }
+    }
+
+    /// The bug this issue fixes: under `kind:worktree` no Repo row is ever a candidate, so
+    /// the lone surviving Worktree row has no row above it at all. It must draw the orphan
+    /// marker rather than the connector, which used to be drawn from `is_child_row` alone
+    /// with no reference to what actually sits on screen.
+    #[test]
+    fn a_child_row_with_no_visible_parent_draws_the_orphan_marker_instead_of_the_connector() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+
+        let mut list = list_showing_submodules();
+        list.set_filter(Filter::parse("kind:worktree"));
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        let worktree_y = entity_row_y(0);
+        assert_eq!(
+            cell_text(buf, name_x(buf) + CHILD_ROW_INDENT_WIDTH, worktree_y, 1),
+            glyphs.orphan_child_row.to_string(),
+            "expected the orphan marker, not the connector, since no Repo row is ever a \
+             candidate under kind:worktree"
+        );
+    }
+
+    /// The compact/sidebar render path draws `parent_visibility` through the same
+    /// [`draw_name_cell`] as the full list, but nothing else in this file drives
+    /// `draw_row_compact` with an orphaned child. A mutation swapping which glyph
+    /// `draw_row_compact` passes would pass every other test in this file unchanged.
+    #[test]
+    fn the_compact_render_path_also_draws_the_orphan_marker_for_a_child_with_no_visible_parent() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+
+        let mut list = List::default();
+        list.set_filter(Filter::parse("kind:worktree"));
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                list.draw_sidebar(frame, area, &snapshot, true)
+                    .expect("draw the sidebar");
+            })
+            .expect("draw the frame");
+        let buf = terminal.backend().buffer();
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(buf, name_x(buf) + CHILD_ROW_INDENT_WIDTH, 1, 1),
+            glyphs.orphan_child_row.to_string(),
+            "expected the orphan marker from draw_row_compact, the sidebar's own row \
+             renderer, since no Repo row is ever a candidate under kind:worktree"
+        );
+    }
+
+    /// Criterion 1 under scrolling rather than filtering: the Repo is a candidate and would
+    /// draw the connector if it were on screen, but `set_offset` has scrolled it off the top
+    /// so the Worktree is the topmost rendered row. No Repo row is visible anywhere on
+    /// screen, so this must draw the orphan marker exactly as the `kind:worktree` case above
+    /// does, rather than reading connectedness from the unwindowed candidate order.
+    #[test]
+    fn a_child_scrolled_to_the_top_of_the_viewport_draws_the_orphan_marker_when_its_parent_is_scrolled_off()
+     {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (repo_row, _) = find_entity_row(&snapshot, "parent");
+        let (worktree_row, _) = find_entity_row(&snapshot, "feature-worktree");
+        assert_eq!(
+            worktree_row,
+            repo_row + 1,
+            "expected the Worktree to sit directly under its Repo in grouped order"
+        );
+
+        let mut list = list_showing_submodules();
+        list.set_offset(worktree_row);
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+        assert_eq!(
+            cell_text(
+                buf,
+                name_x(buf) + CHILD_ROW_INDENT_WIDTH,
+                entity_row_y(0),
+                1
+            ),
+            glyphs.orphan_child_row.to_string(),
+            "expected the orphan marker: the Worktree's own Repo is scrolled off the top of \
+             the viewport, so no parent row is visible anywhere on screen"
+        );
+    }
+
+    /// Criterion 1's positive half, at the point the naive "only the literal row above
+    /// counts" reading of the rule would get wrong: the Submodule's own row above is its
+    /// sibling Worktree, not the Repo, yet the whole run still traces back to the Repo two
+    /// rows up, so it keeps the connector rather than falling back to the orphan marker.
+    #[test]
+    fn a_child_whose_own_row_above_is_a_sibling_rather_than_the_repo_still_draws_the_connector() {
+        let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
+        let (submodule_row, submodule_entity) = find_entity_row(&snapshot, "vendor/lib");
+        assert!(matches!(submodule_entity.kind, Kind::Submodule));
+
+        let mut list = list_showing_submodules();
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(
+            cell_text(
+                buf,
+                name_x(buf) + CHILD_ROW_INDENT_WIDTH,
+                entity_row_y(submodule_row),
+                1
+            ),
+            glyphs.child_row.to_string(),
+            "the submodule's Repo is visible two rows up, through an unbroken run of its \
+             own already-attached Worktree sibling, so the connector still applies"
+        );
+    }
+
+    /// Criterion 3 taken at more than one sibling: under `kind:worktree` two Worktrees of
+    /// the very same Repo survive as candidates and land next to each other
+    /// ([`grouped_row_order`]'s own original-order fallback for a group whose parent never
+    /// made it in), so a rule that only checked the immediate row above would let the
+    /// second one read its first sibling as a stand-in parent and wrongly draw the
+    /// connector. Neither may: the Repo itself is never a candidate at all.
+    #[test]
+    fn every_sibling_of_a_hidden_parent_draws_the_orphan_marker_not_only_the_first() {
+        use repon_core::{Core, CoreSpec, SetSpec};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo_on_branch(&parent, "main");
+        worktree_add(&parent, &root.join("wt-a"), "feature-a");
+        worktree_add(&parent, &root.join("wt-b"), "feature-b");
+
+        let core = Core::start_discovered(CoreSpec {
+            set: SetSpec {
+                name: "test".to_string(),
+                roots: vec![root],
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            overrides: Vec::new(),
+            poll_interval: Duration::from_secs(3600),
+            status_stale_after: Duration::from_secs(3600),
+            generation_deadline: Duration::from_secs(3600),
+            show_submodules: false,
+            fetch: repon_core::FetchSpec {
+                enabled: false,
+                interval: Duration::from_secs(3600),
+                concurrency: 4,
+            },
+            auto_update: repon_core::AutoUpdateSpec { enabled: false },
+        });
+        let keys: Vec<_> = core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        core.refresh(&keys);
+        let snapshot = core.settle();
+
+        let mut list = List::default();
+        list.set_filter(Filter::parse("kind:worktree"));
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot);
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        for row in [0usize, 1] {
+            assert_eq!(
+                cell_text(
+                    buf,
+                    name_x(buf) + CHILD_ROW_INDENT_WIDTH,
+                    entity_row_y(row),
+                    1
+                ),
+                glyphs.orphan_child_row.to_string(),
+                "row {row} must show the orphan marker: the Repo is never a candidate under \
+                 kind:worktree, however many Worktree siblings survive next to each other"
+            );
+        }
+    }
+
+    /// A Repo row can sit directly above a child row without being that child's own parent:
+    /// `worktree_b`'s own group is absent from the candidates, so [`grouped_row_order`]
+    /// appends it after `repo_a`'s group, directly beneath an unrelated Repo. Only the group
+    /// key comparison, not the row above's kind alone, must catch that and draw the orphan
+    /// marker rather than the connector. Exercised through a rendered `List`, the same seam
+    /// every other marker test in this file reads, rather than calling
+    /// [`parent_visible_flags`] directly.
+    #[test]
+    fn a_different_repos_row_directly_above_a_child_does_not_count_as_its_visible_parent() {
+        let repo_a = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("/roots/a"))),
+            Arc::from("repo-a"),
+            Arc::from(Path::new("/roots/a")),
+            Kind::Repo,
+        );
+        let worktree_b = EntityState::new(
+            EntityKey::new(Arc::from(Path::new("/roots/b/wt"))),
+            Arc::from("wt-b"),
+            Arc::from(Path::new("/roots/b")),
+            Kind::Worktree,
+        );
+        let snap = snapshot(vec![repo_a, worktree_b]);
+
+        let terminal = render(140, 24, &snap);
+        let buf = terminal.backend().buffer();
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(
+            cell_text(
+                buf,
+                name_x(buf) + CHILD_ROW_INDENT_WIDTH,
+                entity_row_y(1),
+                1
+            ),
+            glyphs.orphan_child_row.to_string(),
+            "wt-b's own parent is /roots/b, not /roots/a, so a different Repo directly \
+             above it on screen must not draw the connector"
+        );
     }
 
     /// Criterion 3's positive cells, at the list level rather than the detail pane: a real,
