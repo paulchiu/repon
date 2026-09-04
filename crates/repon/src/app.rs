@@ -927,6 +927,7 @@ impl App {
             acknowledged: &self.acknowledged_warnings,
             refresh,
             sort: self.row_order.label(self.glyphs),
+            range_anchor_active: self.selection.has_range_anchor(),
         }
     }
 
@@ -1293,8 +1294,20 @@ impl App {
                 }
                 None
             }
+            // With an anchor already live, `v` commits the range instead of moving the
+            // anchor: the rows it already covers stay selected and the anchor releases, so
+            // the cursor can cross a gap before a later `v` starts a second range.
+            //
+            // The commit extends to the cursor first, so a range never moved off its own
+            // anchor still covers the anchored row rather than committing nothing. Both
+            // calls are no-ops with no anchor live, which is what leaves the `else` below to
+            // drop one.
             Some(Action::AnchorRange) => {
-                if let Some(key) = self.cursor_key() {
+                let visible = self.visible_keys();
+                self.selection.extend_range(self.cursor, &visible);
+                if !self.selection.cancel_range_anchor()
+                    && let Some(key) = self.cursor_key()
+                {
                     self.selection.anchor_range(key);
                 }
                 None
@@ -4119,6 +4132,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         }
     }
 
@@ -7656,6 +7670,251 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('A'), KeyModifiers::SHIFT))
             .expect("clear the selection");
         assert_eq!(app.cursor, 0, "shift-a must not move the cursor");
+    }
+
+    // =====================================================================================
+    // `v` toggles rather than only ever anchoring: with an anchor already live, a second `v`
+    // commits the range it covers and releases the anchor, so a later cursor move crosses a
+    // gap instead of sweeping it into the Selection.
+    // =====================================================================================
+
+    /// AC1: with no anchor live, `v` still just drops one at the cursor, extended by `j`/`k`
+    /// exactly as before this ticket.
+    #[test]
+    fn committing_a_range_that_never_moved_selects_the_anchored_row_rather_than_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit it without ever moving");
+
+        let visible = app.visible_keys();
+        assert!(!app.selection.has_range_anchor(), "the anchor must release");
+        assert!(
+            app.selection.contains(&visible[0]),
+            "committing a one-row range must select that row: a gesture that reads as \
+             \"select this and release\" cannot commit nothing"
+        );
+        assert!(
+            !app.selection.contains(&visible[1]),
+            "and must not reach past the anchored row"
+        );
+    }
+
+    #[test]
+    fn committing_a_range_whose_anchor_is_no_longer_visible_selects_nothing_and_still_releases() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        // Named so the anchored row sorts first and the Filter below hides it.
+        init_repo(&root.join("aaa-hidden"));
+        init_repo(&root.join("keep-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+        let anchored = app.visible_keys()[0].clone();
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        // Hide the anchored row behind a Filter, then commit against what is left.
+        app.filter = Filter::parse("keep");
+        app.set_cursor(0);
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit with the anchor filtered out");
+
+        assert!(!app.selection.has_range_anchor(), "the anchor must release");
+        assert!(
+            !app.selection.contains(&anchored),
+            "a row the Filter is hiding must never enter the Selection through a commit"
+        );
+    }
+
+    #[test]
+    fn v_with_no_anchor_live_drops_one_at_the_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+
+        assert!(app.selection.has_range_anchor());
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend the range down one row");
+        let visible = app.visible_keys();
+        assert!(
+            app.selection.contains(&visible[0]) && app.selection.contains(&visible[1]),
+            "the freshly dropped anchor must still extend with j exactly as before"
+        );
+    }
+
+    /// AC2: a second `v` while the anchor is live releases it rather than moving it, and the
+    /// rows the range already swept in stay checked.
+    #[test]
+    fn v_pressed_again_while_an_anchor_is_live_releases_it_and_keeps_the_swept_rows_checked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 1");
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("release the anchor");
+
+        assert!(
+            !app.selection.has_range_anchor(),
+            "a second v must release the anchor rather than re-anchoring it here"
+        );
+        let visible = app.visible_keys();
+        assert!(
+            app.selection.contains(&visible[0]) && app.selection.contains(&visible[1]),
+            "the rows the range already covers must stay checked once the anchor releases"
+        );
+    }
+
+    /// AC3: once the anchor has released, moving the cursor changes nothing, so the gap
+    /// between a committed range and wherever the cursor goes next stays unselected.
+    #[test]
+    fn moving_the_cursor_after_a_release_sweeps_nothing_so_the_gap_stays_unselected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..4 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 1");
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("release the anchor");
+
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move to row 2, the gap");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move to row 3");
+
+        let visible = app.visible_keys();
+        assert_eq!(
+            app.selection.checked().len(),
+            2,
+            "the move past the released anchor must add nothing to the Selection"
+        );
+        assert!(
+            !app.selection.contains(&visible[2]),
+            "the gap row must stay unselected"
+        );
+        assert!(
+            !app.selection.contains(&visible[3]),
+            "the row the cursor lands on must stay unselected too"
+        );
+    }
+
+    /// AC4, the sharpest criterion: anchor, extend, commit, move across a gap, anchor again,
+    /// extend again. The resulting Selection must hold both ranges and none of the rows
+    /// between them; a build that only ever supports one live range at a time, or that loses
+    /// the first range when the second is built, fails this.
+    #[test]
+    fn a_second_range_built_after_a_release_joins_the_first_without_the_gap_between_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..8 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        // First range: rows 0..=2.
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor the first range at row 0");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 1");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 2");
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit the first range and release the anchor");
+
+        // Cross the gap: row 3 alone.
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move into the gap at row 3");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move to row 4, where the second range starts");
+
+        // Second range: rows 4..=6.
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor the second range at row 4");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 5");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend to row 6");
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit the second range and release the anchor");
+
+        assert!(
+            !app.selection.has_range_anchor(),
+            "the second commit must release the anchor too"
+        );
+        let visible = app.visible_keys();
+        for row in [0, 1, 2, 4, 5, 6] {
+            assert!(
+                app.selection.contains(&visible[row]),
+                "row {row} belongs to one of the two ranges and must be checked"
+            );
+        }
+        assert!(
+            !app.selection.contains(&visible[3]),
+            "row 3, the gap between the two ranges, must never have been swept in"
+        );
+        assert!(
+            !app.selection.contains(&visible[7]),
+            "row 7 was never reached by either range and must stay unselected"
+        );
+        assert_eq!(
+            app.selection.checked().len(),
+            6,
+            "exactly the six rows from both ranges, nothing more, must be checked"
+        );
+    }
+
+    /// AC5: the status row's own content must carry a live anchor through to the rendered
+    /// indicator, on and off, rather than only `Selection` knowing about it internally.
+    #[test]
+    fn status_row_content_carries_a_live_range_anchor_and_drops_it_once_released() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+        let snapshot = app.core.snapshot();
+
+        assert!(
+            !app.status_row_content(&snapshot, &[]).range_anchor_active,
+            "sanity: no anchor is live before v is pressed"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        assert!(app.status_row_content(&snapshot, &[]).range_anchor_active);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("release the anchor");
+        assert!(!app.status_row_content(&snapshot, &[]).range_anchor_active);
     }
 
     /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s

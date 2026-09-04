@@ -8,7 +8,7 @@
 //! `crate::app` decides whether a live Notice pre-empts this module's whole row; this module
 //! owns only the row's other shape, the one list under one drop table.
 //!
-//! Every item's [`Priority::Drop`] is `9` less its published rank, this module's own four and
+//! Every item's [`Priority::Drop`] is `9` less its published rank, this module's own five and
 //! [`crate::header::trailing_items`]'s four alike, so a rank read off the spec's table is the
 //! number in the code with no second mapping to keep in step.
 
@@ -41,6 +41,9 @@ pub(crate) struct StatusRowContent<'a> {
     /// ([`crate::sort::RowOrder::label`]), or `None` in the natural grouped order, which is
     /// the absence of a sort rather than a sort with nothing to say.
     pub(crate) sort: Option<String>,
+    /// Whether `v`'s range anchor is live this frame
+    /// ([`crate::selection::Selection::has_range_anchor`]), read for rank 9's own indicator.
+    pub(crate) range_anchor_active: bool,
 }
 
 /// Which Refresh the refresh key dispatched: every known Entity (`Action::RefreshAll`, `r`
@@ -139,6 +142,16 @@ fn sort_item(sort: Option<&String>) -> Option<degrade::Item<String>> {
     })
 }
 
+/// Rank 9, present only while `v`'s range anchor is live: the newest fact this row carries,
+/// so it ranks below every established one and drops first under width pressure rather than
+/// displacing any of them.
+fn range_anchor_item(active: bool) -> Option<degrade::Item<String>> {
+    active.then(|| degrade::Item {
+        content: "range anchor".to_string(),
+        priority: Priority::Drop(0),
+    })
+}
+
 /// The bracketed count of outstanding warnings, reserved out of the row's budget before any
 /// item is laid out and drawn whether or not rank 2's message survives; `None`, costing no
 /// columns, with nothing outstanding
@@ -190,6 +203,7 @@ pub(crate) fn render(
     items.extend(refresh_item(content.refresh.as_ref()));
     items.extend(sort_item(content.sort.as_ref()));
     items.extend(header::trailing_items(&content.header));
+    items.extend(range_anchor_item(content.range_anchor_active));
 
     let rest =
         degrade::budget(&items, items_budget, SEPARATOR, ELLIPSIS).render(SEPARATOR, ELLIPSIS);
@@ -275,6 +289,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         // "work 403 entities" alone is 17 columns, wider than this width; even the reserved
         // indicator's own budget leaves nothing for it.
@@ -300,6 +315,7 @@ mod tests {
                 acknowledged: &[],
                 refresh: None,
                 sort: None,
+                range_anchor_active: false,
             },
             &bindings(),
             width,
@@ -318,6 +334,7 @@ mod tests {
                 acknowledged: &one_warning,
                 refresh: None,
                 sort: None,
+                range_anchor_active: false,
             },
             &bindings(),
             width,
@@ -348,6 +365,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let acknowledged = StatusRowContent {
             set_name: "work",
@@ -356,6 +374,7 @@ mod tests {
             acknowledged: &warnings,
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
 
         let before = render(&unacknowledged, &bindings(), 88).to_string();
@@ -389,6 +408,7 @@ mod tests {
             acknowledged: &seen,
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let after_a_new_condition_arrives = StatusRowContent {
             set_name: "work",
@@ -397,6 +417,7 @@ mod tests {
             acknowledged: &seen,
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
 
         let before = render(&acknowledged_before_the_new_one_arrived, &bindings(), 150).to_string();
@@ -438,6 +459,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         // Wide enough that a name cut to some short prefix (a truncating implementation's
         // typical failure mode) would still fit; the real 60-`x` name must not.
@@ -462,6 +484,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         // Wide enough for the indicator and rank 1, far too narrow for the 200-column message.
         let rendered = render(&content, &bindings(), 25).to_string();
@@ -562,6 +585,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: Some("sort dirty \u{2193}".to_string()),
+            range_anchor_active: false,
         };
         let rendered = render(&sorted, &bindings, 160).to_string();
         assert!(
@@ -602,6 +626,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
         for (width, expected) in rows {
@@ -637,6 +662,7 @@ mod tests {
             acknowledged: &warnings,
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
 
@@ -674,6 +700,7 @@ mod tests {
                 running: true,
             }),
             sort: Some("sort dirty \u{2193}".to_string()),
+            range_anchor_active: false,
         };
         let bindings = bindings();
 
@@ -716,6 +743,7 @@ mod tests {
             acknowledged: &[],
             refresh: Some(refresh),
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
         for (width, expected) in rows {
@@ -746,6 +774,7 @@ mod tests {
             acknowledged: &[],
             refresh: Some(refresh),
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
         // One column narrower than the full line: only the least-priority survivor may
@@ -776,6 +805,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 3);
@@ -801,6 +831,7 @@ mod tests {
             acknowledged: &[],
             refresh: None,
             sort: None,
+            range_anchor_active: false,
         };
         let bindings = bindings();
         let backend = TestBackend::new(88, 1);
@@ -830,6 +861,70 @@ mod tests {
             buf[(4, 0)].style().fg,
             dim_style.fg,
             "rank 1 after the indicator"
+        );
+    }
+
+    // --- criterion: rank 9, the range anchor indicator ---
+
+    #[test]
+    fn the_range_anchor_indicator_appears_only_while_the_anchor_is_live() {
+        let bindings = bindings();
+        let content = |range_anchor_active| StatusRowContent {
+            set_name: "work",
+            header: empty_header(),
+            warnings: &[],
+            acknowledged: &[],
+            refresh: None,
+            sort: None,
+            range_anchor_active,
+        };
+        let inactive = content(false);
+        let active = content(true);
+
+        assert!(
+            !render(&inactive, &bindings, 200)
+                .to_string()
+                .contains("range anchor"),
+            "no anchor is live, so the indicator must be absent"
+        );
+        assert!(
+            render(&active, &bindings, 200)
+                .to_string()
+                .contains("range anchor"),
+            "a live anchor must show the indicator"
+        );
+    }
+
+    /// The AC this row exists for: the indicator degrades like every other item on the row
+    /// rather than being [`Priority::Pinned`], so it is the first thing this row drops under
+    /// width pressure, not something that survives ahead of the entity count or a warning.
+    #[test]
+    fn the_range_anchor_indicator_is_the_first_item_dropped_under_width_pressure() {
+        let content = StatusRowContent {
+            set_name: "work",
+            header: full_header(),
+            warnings: &[],
+            acknowledged: &[],
+            refresh: None,
+            sort: None,
+            range_anchor_active: true,
+        };
+        let bindings = bindings();
+
+        let full = render(&content, &bindings, 999).to_string();
+        assert!(
+            full.contains("range anchor"),
+            "sanity: the indicator must render at full width, got {full:?}"
+        );
+
+        let narrowed = render(&content, &bindings, full.chars().count() as u16 - 1).to_string();
+        assert!(
+            !narrowed.contains("range anchor"),
+            "the indicator must be the first item this row drops, got {narrowed:?}"
+        );
+        assert!(
+            narrowed.contains("12.0s"),
+            "the header's own lowest-priority item must outlast it, got {narrowed:?}"
         );
     }
 }

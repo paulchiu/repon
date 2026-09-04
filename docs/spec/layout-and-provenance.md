@@ -42,6 +42,7 @@ Priority, after the indicator is reserved:
 | 6 | the Filter's match count | [filter.md](filter.md) |
 | 7 | the worktrees note | [config.md](config.md) |
 | 8 | timing | [actions.md](actions.md) |
+| 9 | the range anchor, while `v`'s own anchor is live | [keybindings.md](keybindings.md#the-range-anchor) |
 
 The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
 
@@ -52,6 +53,8 @@ Vanished entities are the mirror of an abandoned discovery and stand as a warnin
 Rank 1 names the **active Set**, where the program's own name used to sit: `work 242 entities`, and `all 403 entities` running zero-config. A Set bounds the work rather than the view ([config.md](config.md)), so the count is the size of what the Set bounds, less whatever Worktree or Submodule rows `show_worktrees` or `show_submodules` currently hide ([config.md](config.md)'s "the stake on `show_worktrees`"): the count is not the whole Set when a kind preference is hiding part of it, since a header disagreeing with the rows on screen is worse than a smaller number ([#397](https://github.com/paulchiu/repon/issues/397)). A committed Filter never moves this number, whether it narrows the list or, naming a hidden kind explicitly, widens it back past a preference: the Filter's own narrowing is `filter: N matches` below, and the two stay two different facts about the table. The name and the count are one item rather than two, which is also what stops a count surviving on a row its own name has dropped from. The name is never truncated: the item renders whole or drops whole, because a Set name is user-supplied, two Sets can share a prefix, and a cut name reads exactly like a name ([0027](../adr/0027-the-active-set-names-the-status-row-and-the-picker-is-the-strip.md)). There is no tab strip. `s` and `Tab` open the Set picker, numbered in file order, and [keybindings.md](keybindings.md) carries it along with what a switch says.
 
 Rank 4 is the **sort**: `sort dirty ↓`, the sorted column's own header text and the same arrow that column's header carries. It is absent in the natural grouped order, which is the absence of a sort rather than a sort by discovery, so a session that has never opened the sort menu spends no columns on it. It is text here and a glyph there for one reason: the sorted column can be off screen, clipped off a narrow frame or hidden behind the detail pane, and an order nothing on the row names is an order the user cannot check. It ranks above run progress, which is a fact about a fan-out rather than about the table, and below rank 3 for the one reason that separates the two: a Refresh's state has no other surface on the screen at all, where a sort still has its own arrow on the sorted column's header at every width that column survives. This row is the sort's second witness and the Refresh's only one. Session state, persisted to `state.toml` beside the Selection and the Filter, per scope ([0030](../adr/0030-the-table-has-an-order-the-user-chooses.md)'s amendment).
+
+Rank 9 is the **range anchor**: the literal text `range anchor`, present only while `v`'s own anchor is live ([keybindings.md](keybindings.md#the-range-anchor)). It ranks last because it is the newest fact this row carries and the least established: every rank above it already had a reason to survive a narrow frame before this one existed, so it is the first thing this row drops rather than displacing any of them, the one property that tells it apart from rank 1's `Priority::Pinned`.
 
 `w` **acknowledges**. Opening the expanded list marks every currently outstanding condition seen, and the row falls back to the indicator alone, freeing the message's columns for the items below it. A condition arriving that has not been seen expands the row again. Acknowledgement is not dismissal: the indicator keeps its full count either way, and a condition leaves the row only by ceasing to be true. It is session state and never persists ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)).
 
@@ -69,6 +72,15 @@ One warning outstanding and unacknowledged, a run in flight, so every item is li
 ```
 
 Acknowledged, the message leaves and the ladder is [actions.md](actions.md)'s own shifted four columns by the reserved indicator: 95, 91, 57, 36, 25, 21, and the same 3-column floor. The last line is what the whole rule buys. A row too narrow for the entity count still says that something is wrong and that `w` asks what, which is what neither of the two obvious rankings could do.
+
+The same row with a range anchor live too, widest and one column narrower:
+
+```
+171  [1] work 242 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12.0s · range anchor
+170  [1] work 242 entities · theme `solarized-dark` named in config.toml does not exist · run 7/12 · filter: 12 matches · worktrees: 161 (preference off) · 12.0s ...
+```
+
+One column narrower than the widest line drops `range anchor` whole, not the timing item beside it, which is rank 9 answering for itself rather than being pinned.
 
 One warning outstanding and unacknowledged, a Refresh in progress, nothing from the header live:
 
