@@ -319,7 +319,7 @@ The Action palette's own footer is 55 columns at full width, drawn on the palett
 The Filter line's own footer, which sits one row above the line itself ([filter.md](filter.md)), is 43 columns at full width. `enter apply` and `esc cancel` are pinned, the way in and the way out; `alt-/ clear filter` is the newest of the three and the first to go, since the line is still usable without it. It degrades like this:
 
 ```
- 44  enter apply  esc cancel  alt-/ clear filter
+ 43  enter apply  esc cancel  alt-/ clear filter
  30  enter apply  esc cancel ...
  23  enter apply  esc cancel
 ```

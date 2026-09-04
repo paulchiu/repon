@@ -5614,6 +5614,56 @@ mod tests {
         );
     }
 
+    /// The same `input` table serves the two palettes, so `Alt+/` reaches them too. Neither
+    /// owns a Filter, so the chord does nothing there rather than closing the palette or
+    /// clearing the list's own committed Filter out from under it.
+    #[test]
+    fn the_clear_filter_chord_is_inert_in_the_action_and_launcher_palettes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("keep-b"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the Filter line");
+        for c in "keep".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a Filter");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the Filter");
+        assert!(app.filter.is_active(), "sanity: a Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the Action palette");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("alt+/ must not panic in the Action palette");
+        assert!(
+            app.action_palette.is_some(),
+            "the Action palette stays open"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter survives alt+/ pressed in the Action palette"
+        );
+
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close the Action palette");
+        app.handle_key_event(press(KeyCode::Char('!'), KeyModifiers::NONE))
+            .expect("open the Launcher palette");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("alt+/ must not panic in the Launcher palette");
+        assert!(
+            app.launcher_palette.is_some(),
+            "the Launcher palette stays open"
+        );
+        assert!(
+            app.filter.is_active(),
+            "the committed Filter survives alt+/ pressed in the Launcher palette"
+        );
+    }
+
     /// Every action `dispatch(Context::Input, _)` can return is named arm by arm in every
     /// handler that dispatches through that context, so an action joining the input
     /// vocabulary is a red test rather than a runtime `unreachable!` on the key press. The
@@ -14236,7 +14286,18 @@ refresh_all = "z""#,
 
         assert!(
             app.filter_line.is_some(),
-            "an unavailable Alt+/ must leave the line open, its draft untouched"
+            "an unavailable Alt+/ must leave the line open"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                app.filter_line
+                    .as_ref()
+                    .expect("the Filter line is open")
+                    .live_filter()
+            ),
+            format!("{:?}", Filter::parse("x")),
+            "the draft the user was typing survives an unavailable Alt+/ untouched"
         );
         assert_eq!(
             app.notice.as_deref(),
