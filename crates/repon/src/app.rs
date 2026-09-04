@@ -11045,6 +11045,121 @@ refresh_all = "z""#,
         );
     }
 
+    /// `Down` must reach the same `NextEntry` action `Ctrl+J` does, not fall through as an
+    /// unbound key: the same end-to-end shape the Set picker's own `Up`/`Down` coverage uses,
+    /// closed here for the Action palette.
+    #[test]
+    fn down_moves_the_action_palettes_own_highlight_onto_the_second_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("alpha", true, &root.join("unused-a")));
+        app.document
+            .actions
+            .push(action_config("beta", true, &root.join("unused-b")));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the highlight down");
+
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("beta".to_string()),
+            "Down must move the palette's own highlight onto the second declared Action"
+        );
+    }
+
+    /// `Up` must walk the highlight back the same way `Down` walked it forward, proven
+    /// through the same end-to-end path as the test above rather than at `move_highlight`'s
+    /// own unit level.
+    #[test]
+    fn up_moves_the_action_palettes_own_highlight_back_onto_the_first_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("alpha", true, &root.join("unused-a")));
+        app.document
+            .actions
+            .push(action_config("beta", true, &root.join("unused-b")));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the highlight down");
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("beta".to_string()),
+            "sanity: Down must have actually moved the highlight before Up walks it back"
+        );
+
+        app.handle_key_event(press(KeyCode::Up, KeyModifiers::NONE))
+            .expect("move the highlight back up");
+
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("alpha".to_string()),
+            "Up must move the palette's own highlight back onto the first declared Action"
+        );
+    }
+
+    /// The readline alternate chords, proven through the same end-to-end path as the arrow
+    /// keys above rather than only at `keys.rs`'s own dispatch unit level.
+    #[test]
+    fn ctrl_j_and_ctrl_k_move_the_action_palettes_own_highlight_the_same_as_the_arrow_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(action_config("alpha", true, &root.join("unused-a")));
+        app.document
+            .actions
+            .push(action_config("beta", true, &root.join("unused-b")));
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::CONTROL))
+            .expect("move the highlight down");
+
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("beta".to_string()),
+            "Ctrl+J must move the palette's own highlight the same way Down does"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .expect("move the highlight back up");
+
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("alpha".to_string()),
+            "Ctrl+K must move the palette's own highlight the same way Up does"
+        );
+    }
+
     // --- issue #98: the Launcher palette ---
 
     /// A declared `[[launcher]]` entry with a real, literal argv (never a shell string, per
