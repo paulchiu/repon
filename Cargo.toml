@@ -30,3 +30,8 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# The profile that dist builds with, on top of the release profile above.
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -4,7 +4,9 @@ Repon's release channels are whatever its tag pipeline publishes, and nothing is
 
 ## A version move is not a release
 
-`Cargo.toml`'s version is a build marker, not a release: it moves on every shipped change, on `main` after that change merges rather than on the branch that carried it, with `cargo set-version --workspace <version>`, the same command that moves both crates and the pinned inter-crate `repon-core` dependency together that [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s `prepare` job already runs. That move publishes nothing, tags nothing and opens no channel, so [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) stands exactly as written. The tag is the release; until a tag exists, the version in `Cargo.toml` and a release are simply unrelated. What the marker buys is that installing a build locally to try it, which `AGENTS.md`'s dev loop already asks for after every merge, produces a binary that can say which change it is.
+`Cargo.toml`'s version moves on `main` after a change merges, never on the branch that carried it, with `cargo set-version --workspace --bump <label>`. That command moves both crates and the pinned inter-crate `repon-core` dependency together. Nobody runs it: `version-tag.yml` runs it when a labelled pull request merges, then commits the bump and pushes a `vX.Y.Z` tag, and the tag is what starts a release.
+
+The label on the pull request is what picks the bump, and `check-labels.yml` fails any pull request that carries none of `major`, `minor`, `patch` and `norelease`, or more than one. `norelease` merges and moves nothing.
 
 The number is semantic, with the major held at 0. A change that gives someone something they could not do before moves the minor; a change that fixes, tightens or documents what was already there moves the patch. A breaking change also moves the minor rather than the major, which is what semantic versioning already says a 0.x line means. The major moves to 1 exactly once, when the maintainer says the interface is one they are willing to keep, and never as a side effect of a change being large.
 
@@ -15,11 +17,19 @@ So a new key, a new column behaviour or a new operation is a minor, and a defect
 | channel | status | trigger |
 | --- | --- | --- |
 | `cargo install --git` | live | none; it works against `main` today |
-| crates.io | at beta | the four blockers below cleared; the tag pipeline now carries the publish job, but no tag has been cut yet |
-| prebuilt binaries | deferred | beta; a binary is worth shipping when there is a user without a Rust toolchain to hand it to |
-| Homebrew | deferred | the repository clearing homebrew-core's age and notability bars, at which point the path is a personal tap |
+| crates.io | open | a `vX.Y.Z` tag; the four blockers below are cleared |
+| prebuilt binaries | open | the same tag; macOS on both architectures and Linux x86_64 |
+| Homebrew | open | the same tag, which pushes a formula to `paulchiu/homebrew-tap` |
 
-The one live channel, verbatim:
+Every channel but the first is fed by one tag, and no tag has been cut yet, so nothing is published today. Cutting the first one is a separate act from opening the channels.
+
+The Homebrew route, once a tag exists:
+
+```sh
+brew install paulchiu/tap/repon
+```
+
+The `cargo install --git` route, which needs no tag and works now:
 
 ```sh
 cargo install --git https://github.com/paulchiu/repon --locked repon
@@ -58,6 +68,7 @@ Enforcement is `just msrv`, which reads the number out of `cargo metadata` rathe
 | `quality-check` | `just ci` | a matrix of `ubuntu-latest` and `macos-latest` |
 | `msrv` | `just msrv` | `ubuntu-latest` |
 | `publish-check` | `just publish-check` | `ubuntu-latest` |
+| `workflows` | `just workflows` | `ubuntu-latest` |
 | `ci` | asserts every job above succeeded | `ubuntu-latest` |
 
 The justfile owns what CI means. Each job's only step of substance is `just <recipe>`, so a green local run is a green pipeline and the definition of passing cannot drift between the two. `just ci` composes `fmt-check lint test docs check-core-isolation build`: rustfmt in check mode, clippy with warnings as errors across all targets, the workspace tests, rustdoc with warnings as errors (which is what catches a broken intra-doc link), the isolation check below, and a debug build, everything `--locked`. All of these passed on the untouched tree before any of this was added, so the gates started green; nothing was relaxed to obtain a first passing run.
@@ -69,6 +80,8 @@ There is no CI job proving the Windows refusal. One existed once, asserting `car
 `check-core-isolation` is where [0015](../adr/0015-the-core-owns-the-table.md)'s enforcement finally lands. It reads `cargo tree -p repon-core --edges normal --depth 1` and fails unless the direct dependency set is exactly `crossbeam-channel gix rayon`. It is an allowlist rather than the denylist 0015 described, and deliberately so: a denylist bans ratatui and crossterm by name, and a rendering crate nobody thought to ban walks straight past it, while an allowlist makes every new core dependency a deliberate edit to the recipe with the boundary argument in front of whoever makes it.
 
 `publish-check` is a separate job rather than a sixth recipe inside `just ci` for a mechanical reason: `cargo publish` refuses a dirty working tree, and `ci` is the recipe you run locally with work in progress. Folding the rehearsal into `ci` would make the local gate fail on every uncommitted change, so it runs beside `ci` in the pipeline and on demand locally.
+
+`workflows` parses every file under `.github/workflows` and checks that each job whose `uses:` names a local file names one that exists. `release.yml` is generated by dist and is four hundred lines nobody reads, so a hand-written workflow beside it with a typo, or a call pointing at a file that is not there, would otherwise surface as a failed release rather than as a failed check. It is Linux only and outside `just ci` because it needs PyYAML, and `just ci` is the recipe you run on a laptop.
 
 The aggregate `ci` job exists so branch protection names a single required status check. When a job is added, `needs` grows by one word and branch protection needs no editing; without the aggregate, every new job is a settings change in the GitHub UI that the repository's history never records.
 
@@ -113,13 +126,13 @@ Two mechanics were each got wrong once, and measured, so they are recorded:
 
 ## Before the first crates.io publish
 
-The channel is at beta, and the gap between now and then is not polish. crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever 0.1.0 contains is carried forever, so the four items below are blockers rather than preferences.
+crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever 0.1.0 contains is carried forever, so the four items below are blockers rather than preferences.
 
 This spec has always carried four items in this gate. [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s own Consequences section names only the first two, the surface demolition and the config move, because it was written before the tag pipeline and the README's registry-copy review existed as separate, checkable items. That gap is recorded here rather than resolved by editing the ADR, which is a point-in-time record of the decision as it stood; this spec is the living checklist, so it carries all four.
 
 1. [0015](../adr/0015-the-core-owns-the-table.md)'s core API has landed. **Done.** `crates/repon-core/src/lib.rs` declares `mod fanout;` and `mod git;` with no `pub`, and no `Box<dyn std::error::Error>` remains anywhere in the crate; the git error is now a closed, cloneable enum. Verified against the tree at commit `c44a8fc`.
 2. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)'s config path has moved to `etcetera`. **Done.** `crates/repon/src/config/mod.rs` resolves `config_dir()` from `etcetera::choose_base_strategy`, not `directories::ProjectDirs`. `directories` is still a dependency, but only for `data_dir()`, which 0014's own Consequences section says explicitly stays on `directories`; the concern this item names, config read from the wrong platform path, is closed.
-3. The tag pipeline has a crates.io publish job, for the reason [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) records: a channel fed by hand is a channel that silently stops being fed. **Done.** `.github/workflows/release.yml`'s `publish` job runs `cargo publish --workspace --locked` on every version tag; see below.
+3. The tag pipeline has a crates.io publish job, for the reason [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) records: a channel fed by hand is a channel that silently stops being fed. **Done.** `.github/workflows/publish-crates.yml` runs `cargo publish --workspace --locked` and is called by `release.yml` as one of its publish jobs; see below.
 4. The README's Influences section has been read as what it is: the crates.io page. `readme` ships in both archives, so every sentence in it becomes front matter on a public registry page rather than a repository aside. **Done**, as of this review: the section names mrx, superfile and lazygit as influences and links each of them. mrx's upstream is named because it is a public repository and naming one makes no licence claim, which [0003](../adr/0003-clean-room-from-mrx.md) records. What stays out is what is not the upstream author's to publish: no private-conversation quote, no local path, no description of mrx's internals or history, and no framing of mrx by a relationship to anyone rather than by what it is. This re-read has to happen again before the actual first publish; once here is not enough.
 
 All four blockers are now cleared, but nothing has been published: no tag has been cut, and the tag pipeline's crates.io leg has never run. Cutting the first tag is a separate act from clearing the gate.
@@ -132,27 +145,44 @@ Done already, proved by CI on every push:
 
 ## What the tag pipeline does
 
-`.github/workflows/release.yml` is two jobs, because a tag pushed by an automated step and a tag pushed by a human need different tokens to fire the second job at all:
+`.github/workflows/release.yml` is generated by [dist](https://github.com/axodotdev/cargo-dist) 0.32.0 from `dist-workspace.toml` and is never hand-edited; `dist generate` rewrites it from that config. It triggers on a pushed tag matching `**[0-9]+.[0-9]+.[0-9]+*` and runs:
 
-| job | trigger | does |
+| job | does |
+| --- | --- |
+| `plan` | works out which artifacts this tag needs |
+| `build-local-artifacts` | builds and archives one binary per target, on a runner matching each |
+| `build-global-artifacts` | the installers, checksums and the manifest |
+| `host` | creates the GitHub release and uploads everything to it |
+| `publish-homebrew-formula` | writes the formula into `paulchiu/homebrew-tap` |
+| `custom-publish-crates` | calls `.github/workflows/publish-crates.yml` |
+| `announce` | marks the release published once every job above has passed or skipped |
+
+The tag comes from `.github/workflows/version-tag.yml`, which fires when a labelled pull request merges to `main`: it reads the `major`, `minor` or `patch` label, runs `cargo set-version --workspace --bump`, commits, and pushes `main` and the tag. A pull request labelled `norelease` merges and nothing runs.
+
+The targets are `aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-unknown-linux-gnu`, the two platforms "Platform support" above claims, with macOS shipping one archive per architecture rather than a universal binary because Homebrew picks the archive matching the machine it installs on.
+
+crates.io is a custom publish job rather than one of dist's own, because dist does not publish to registries. It is inside the pipeline all the same, which is what [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) requires and what the owner's blubat is the evidence for: blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21, thirteen releases stale on the one channel that sat outside its pipeline. Adopting dist here does not repeat that: dist's custom-publish-job seam keeps the registry leg inside.
+
+A changelog is produced by the pipeline rather than by hand: GitHub's release notes, built from the commits and merged pull requests since the previous tag.
+
+Three secrets make it run, and adding them is a manual step in the repository settings that no change in this repository can perform:
+
+| secret | read by | is |
 | --- | --- | --- |
-| `prepare` | `workflow_dispatch`, a maintainer supplies the version | `cargo set-version --workspace` (moving both crates' version and the pinned `repon-core` dependency version together in one command), commits the bump, tags it `vX.Y.Z`, pushes both |
-| `publish` | a pushed tag matching `v*.*.*` | `cargo publish --workspace --locked`, the rehearsal command minus `--dry-run`; then creates a GitHub release with `generate_release_notes: true` |
+| `RELEASE_TOKEN` | `version-tag.yml` | a token with push access to this repository. GitHub's recursion guard means a tag pushed with the default `GITHUB_TOKEN` starts no further workflow runs, so a tag pushed that way would never reach `release.yml`. Without it the bump and the tag still land and the release has to be started by hand. |
+| `CARGO_REGISTRY_TOKEN` | `publish-crates.yml` | a crates.io API token. Cargo's own conventional name for it. |
+| `HOMEBREW_TAP_TOKEN` | `publish-homebrew-formula` | a token with push access to `paulchiu/homebrew-tap`. |
 
-The `prepare` job pushes using a `RELEASE_TOKEN` secret, not the default `GITHUB_TOKEN`. GitHub's own recursion guard means a push authenticated with `GITHUB_TOKEN` starts no further workflow runs, so a tag pushed that way would never reach the `publish` job; `RELEASE_TOKEN` is a personal access token, a deploy key or a GitHub App token would also do, with repo push scope. The `publish` job's `cargo publish` step reads a `CARGO_REGISTRY_TOKEN` secret, cargo's own conventional name for it.
+All three are set on `paulchiu/repon`. One fine-grained token with no expiry covers both `RELEASE_TOKEN` and `HOMEBREW_TAP_TOKEN`, since the two repositories it needs are this one and the tap. A token that does expire takes the release pipeline with it silently: `version-tag.yml` falls back to `GITHUB_TOKEN`, so the bump and the tag keep landing and only the release stops.
 
-The registry publish job stays mandatory in this pipeline even if release tooling that excludes registries is adopted later. cargo-dist states its own scope boundary as not handling "publishing to crates.io", and the consequence is observable in the wild: the owner's blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21, thirteen releases stale on the one channel that sat outside its pipeline. That is the evidence this rule rests on.
+crates.io trusted publishing (OIDC, no stored token) stays unverified for a crate name that does not exist yet, so the pipeline uses a stored token and sidesteps the question. It stays a candidate for after the first publish, once `repon` and `repon-core` are on the index to configure it against.
 
-A changelog is produced by this pipeline rather than by hand: GitHub's auto-generated release notes, built from the commits and merged pull requests since the previous tag, attached to the release the `publish` job creates.
-
-The two questions the previous revision of this section left open are answered by what got built rather than by further research: the pipeline is hand-rolled, not cargo-dist, because cargo-dist's own scope excludes the one channel this project actually needs, crates.io; and crates.io trusted publishing (OIDC, no stored token) is still unverified for a crate name that does not yet exist, so the pipeline uses a stored `CARGO_REGISTRY_TOKEN` instead and sidesteps the question rather than resolving it. Trusted publishing stays a candidate for after the first publish, once `repon` and `repon-core` exist on the index to configure it against.
-
-Neither job has been exercised against a real tag; `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"` confirms the workflow parses, which is what a doc-and-CI change can prove before the first real release cuts it.
+No job here has been exercised against a real tag. `just workflows` parses every workflow and checks that each local `uses:` resolves, which is what a change like this one can prove before the first real release cuts it.
 
 ## What is deliberately not here
 
-- **Prebuilt binaries.** The gzipped release binary is 774,513 bytes, so the asset is cheap; what is missing is anyone to hand it to. The trigger is beta.
-- **Homebrew.** The repository is two days old with 0 stars, 0 forks and 0 watchers. homebrew-core's rule that "a code repository less than 30 days old is normally not eligible" rules it out before its notability bar (30 forks, 30 watchers or 75 stars for a third-party submission; 90, 90 or 225 for a self-submission) is even reached. When the trigger fires, the path is a personal tap, not a core submission.
-- **release-plz.** Choosing release automation before the pipeline is designed would be the pipeline decision made by default; the pipeline that got built is hand-rolled instead, per "What the tag pipeline does" above.
+- **A homebrew-core submission.** The formula goes to `paulchiu/homebrew-tap`. homebrew-core's notability bar is 30 forks, 30 watchers or 75 stars for a third-party submission and 90, 90 or 225 for a self-submission, and a tap has no bar at all.
+- **A Windows target.** The library refuses to compile there, per "Platform support" above.
+- **release-plz.** Its value is coordinating a release-pull-request review cycle that does not exist with one maintainer.
 - **A support-window MSRV promise**, per the MSRV section.
 - **Reserving the crate name with a placeholder publish.** `repon`, `repon-core`, `repo-n` and `repo_n` are all unclaimed, and the neighbourhood is occupied: `reponest` 0.1.0-alpha ("A TUI/CLI tool for managing multiple git repositories written in Rust", published 2025-12-14) and `gitpane` ("Multi-repo Git workspace dashboard TUI", 1,638 downloads, released 2026-08-29) both sit one search away. The risk of losing the name is real and accepted, because a placeholder publish is itself a publish: permanent, and of nothing.

@@ -31,3 +31,15 @@ The namespace risk is stated plainly rather than buried. `repon`, `repon-core`, 
 - The missing version requirement on the `repon-core` dependency and the missing licence text in both packaged crates are fixed here, and both were found by rehearsing rather than by reading. `just publish-check` runs that rehearsal on every change, since `cargo publish --workspace --dry-run` verifies both crates without touching the index, so the next defect of that shape is found the same way.
 - The unclaimed names stay unclaimed, and `gitpane`'s 2026-08-29 release shows the neighbourhood is moving. That is the accepted cost of refusing a placeholder publish.
 - The tag pipeline itself is not designed here and is the next ticket: whether it is dist (whose scope boundary excludes crates.io, so a publish job is added beside it) or hand-rolled, and whether crates.io trusted publishing can be configured for a crate that does not exist yet, which is unverified.
+
+## Amended by #416
+
+The pipeline this ADR left as "the next ticket" is now built, and it is dist rather than hand-rolled. The rule is unchanged: every channel is fed by the tag, and nothing is published by hand. What changed is the reading of dist's scope boundary. dist does not publish to registries, which is the fact this ADR rests its blubat evidence on, but it does accept a custom publish job, so crates.io runs inside the pipeline as `.github/workflows/publish-crates.yml` rather than beside it. That is the first of the two options this ADR's own last consequence named, taken for the reason it named: dist already builds the binaries and pushes the Homebrew formula, and reimplementing those to keep a hand-rolled crates.io job would trade the whole of dist for one job dist has a seam for.
+
+blubat's thirteen-release staleness therefore stands as evidence for the rule and is no longer evidence against dist. It went stale because its crates.io leg sat outside its pipeline entirely, not because dist forbade one.
+
+Two deferrals also expire. Prebuilt binaries and Homebrew were each refused for want of anyone to hand them to, and Homebrew additionally against homebrew-core's age and notability bars. A personal tap has neither bar, this ADR itself named a tap as the path, and `paulchiu/homebrew-tap` already exists, so the refusal now rests on the audience argument alone, which the maintainer has answered: the app is good enough to publish.
+
+The version bump moves too. It was a hand-run `cargo set-version` on `main` after each merge, which moved the number on every change while a tag was cut only when someone remembered, the same gap between a channel and a standing promise this ADR is about. A version label on the pull request now decides the bump, and merging a labelled pull request cuts the tag.
+
+See [#416](https://github.com/paulchiu/repon/issues/416).
