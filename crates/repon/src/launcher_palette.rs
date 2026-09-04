@@ -348,6 +348,7 @@ mod tests {
             name: name.to_string(),
             source: Source::Args(vec!["true".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         }

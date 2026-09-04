@@ -1165,6 +1165,7 @@ mod tests {
             steps: vec![repon_core::Step {
                 argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
                 shell: false,
+                interactive: false,
                 env: Vec::new(),
             }],
             concurrency: 1,

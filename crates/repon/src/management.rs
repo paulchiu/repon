@@ -2182,6 +2182,7 @@ mod tests {
                 elapsed: Duration::ZERO,
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: repon_core::Timestamp::now(),
@@ -2197,6 +2198,7 @@ mod tests {
                 elapsed: Duration::ZERO,
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             ..passing
         };

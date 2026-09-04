@@ -132,6 +132,7 @@ The active Set is named on screen, as the status row's first item, ahead of the 
 | `args` | array of strings | The argv vector; with `shell = true`, one element holding the command string |
 | `from_env` | string | Names an environment variable to read the argv from; mutually exclusive with `args` |
 | `shell` | bool, default `false` | Run through `$SHELL -c` |
+| `interactive` | bool, default `false` | Run through `$SHELL -ic` instead of `$SHELL -c`, sourcing the user's own rc file first; requires `shell = true` |
 | `takes_terminal` | bool, default `true` | Whether the command takes over the terminal; `false` runs it without leaving the screen |
 | `env` | map of string to string | Merged over the guaranteed set |
 | `disabled` | bool, default `false` | Drops a shipped default |
@@ -141,6 +142,8 @@ Every Launcher starts in the entity's own working directory. `cwd` is not a fiel
 `from_env` reads the named variable and splits it with `shell-words`, so `EDITOR="code --wait"` becomes two argv elements with no shell involved and no way for a value to break out of its word. The shipped editor's chain is `VISUAL`, then `EDITOR`, then `vi`: the first variable set and non-empty wins. `GIT_EDITOR` and `core.editor` are deliberately not in it: on the design machine `git var GIT_EDITOR` returns `true` while `EDITOR` is `nvim` and `core.editor` is `/usr/bin/vim`, because tooling exports `GIT_EDITOR=true` to stop editors opening, so git's own chain resolves to a Launcher that opens nothing.
 
 `shell = true` runs `$SHELL -c <string>` with a literal `repon` passed as `$0`, because POSIX `sh -c` fills `$0` from the first argument after the command string and a naive call silently eats an argument. It is the visible opt-in [0007](../adr/0007-launchers-are-argv-vectors.md) requires.
+
+`$SHELL -c` is non-interactive, so for zsh it sources `.zshenv` and not `.zshrc`: an alias, a shell function, or a `PATH` entry defined only in the interactive rc file is invisible to it, the same word that resolves fine at a real prompt failing with "command not found" here. `interactive = true` runs `$SHELL -ic` instead, sourcing that rc file first, so the command resolves the same way it does interactively. It stays a second, declared mode rather than the default: an interactive rc file is arbitrary user code that runs once per invocation, so a slow one (`compinit`, a version-manager hook) or a noisy one (writing to stderr, which a captured PTY shows as step output) pays that cost every time, not only when it is wanted. Declaring `interactive = true` without `shell = true` is a config error naming both keys, the same failure grade `args` and `from_env` declared together already gets, rather than a flag silently ignored.
 
 Four Launchers ship as defaults: lazygit, tuicr, an editor via `from_env`, and a shell. The file is the order: declared entries fill the palette in file order, and the shipped defaults the file never names follow them, keeping their own relative order. Declaring a `[[launcher]]` with a shipped name replaces that default and moves it to the position the file gives it, so an entry naming one with neither `args` nor `from_env` keeps the shipped argv and says only where it goes; `disabled = true` drops it. There is no `order` key, because a file that already has a sequence does not need a second one to go stale next to it.
 
@@ -181,12 +184,14 @@ Repon exports nothing of its own selection state. `REPON_SET` stays an input var
 | --- | --- | --- |
 | `name` | string, required | Palette name, unique in the file |
 | `description` | string | Shown in the palette |
-| `steps` | ordered list of step tables, required | Each step has `args`, and optionally `shell` and `env` |
+| `steps` | ordered list of step tables, required | Each step has `args`, and optionally `shell`, `interactive` and `env` |
 | `confirm` | bool, default `true` | Ask before fanning out |
 | `concurrency` | integer, default `4` | Entities in flight at once |
 | `when` | string, optional | A predicate in the Filter grammar ([filter.md](filter.md)), evaluated over already-settled Cells: which of the Selection's operable rows the Action actually runs on, reported by the palette before it runs ([actions.md](actions.md)) |
 
 Steps run in order and stop at the first failure, where failure is a nonzero exit. Gating is implicit, following GitHub Actions' shape: there is no `on_success` field to write, and a later step that ran is proof the earlier ones succeeded.
+
+A step's own `interactive` is the Launchers section's key, on the same terms: it swaps `-c` for `-ic` so the step's shell sources the user's own rc file, exists to resolve an alias, a shell function or a rc-installed `PATH` entry the way it would at a real prompt, and requires `shell = true` on the same step, `interactive = true` alone being rejected at load naming both keys. It is opt-in rather than the default because the rc file's own cost, whatever it is, is paid once per step per operable Repo, across the whole fan-out.
 
 `when` reuses [filter.md](filter.md)'s language rather than extending it, and is never a load error of any grade: that grammar is total, so an unrecognised term inside a `when` is advisory exactly as it is on the Filter line, and there is no entry for it under "Cross-key validity" below. An entry with no `when` is applicable everywhere, which is what an Action without one already meant. It decides the set the fan-out acts on, not only the count the palette shows: a row it proves runs, a row it disproves or cannot settle does not; [actions.md](actions.md) settles the readings of the border title that count produces and the reversal of the earlier decision that let every operable row run regardless.
 
@@ -344,6 +349,7 @@ from_env = "EDITOR"
 name = "log"
 args = ["git log --oneline -20 | less"]
 shell = true
+# interactive = false        # $SHELL -ic instead of -c: sources your rc file, needs shell = true
 
 # tmux returns the instant the pane exists, so Repon keeps its screen rather than
 # tearing it down and reclaiming it for nothing.
@@ -365,6 +371,7 @@ when = "kind:repo"          # skip Worktrees and Submodules: they share node_mod
 args = ["rm", "-rf", "node_modules"]
 # shell = false              # runs through $SHELL -c
                               # without it, $VAR and $(cmd) above stay literal, not expanded
+# interactive = false        # $SHELL -ic instead of -c: sources your rc file, needs shell = true
 # env = {}                   # merged over the guaranteed environment contract
 
 [[action.steps]]

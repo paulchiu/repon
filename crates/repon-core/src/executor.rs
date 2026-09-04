@@ -171,10 +171,14 @@ fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
 /// one element holding the whole command string
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// "Launchers"), and this runs it as [`shell_argv`] builds it rather than as a literal
-/// binary name. Blocks until the child exits or its output stream closes, whichever comes
-/// last; there is no per-step timeout (`docs/spec/actions.md`'s "Cancellation, suspend and
-/// quit" accepts the residual risk that a step whose child never exits holds its
-/// concurrency slot until the run is cancelled or Repon quits).
+/// binary name. `interactive` is meaningless unless `shell` is also set (the consumer
+/// already rejects that combination at config load, per
+/// [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// `interactive` sentence) and otherwise picks `-ic` over `-c` so the child shell sources
+/// the user's own rc file. Blocks until the child exits or its output stream closes,
+/// whichever comes last; there is no per-step timeout (`docs/spec/actions.md`'s
+/// "Cancellation, suspend and quit" accepts the residual risk that a step whose child never
+/// exits holds its concurrency slot until the run is cancelled or Repon quits).
 ///
 /// Only ever returns [`StepOutcome::Ok`] or [`StepOutcome::Failed`]: `NotRun` and
 /// `Cancelled` belong to the multi-step sequencing this function does not do, which is also
@@ -190,6 +194,7 @@ fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
 pub(crate) fn run_step(
     argv: &[String],
     shell: bool,
+    interactive: bool,
     cwd: &Path,
     env: &[(String, Option<String>)],
     control: &Arc<RunControl>,
@@ -203,6 +208,7 @@ pub(crate) fn run_step(
             return step_failure(
                 label,
                 shell,
+                interactive,
                 cwd,
                 failure.code(),
                 failure.detail(),
@@ -215,25 +221,31 @@ pub(crate) fn run_step(
     // child's own program (see `duplicate_cloexec`).
     let slave_dup = match duplicate_cloexec(&slave) {
         Ok(fd) => fd,
-        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
+        Err(error) => {
+            return spawn_failure(label, shell, interactive, cwd, &error, start.elapsed());
+        }
     };
     // The parent's own reference onto the slave, held for as long as draining takes
     // (see `drain_until_exit`) so the pty's slave side never sees its last close while
     // there might still be output to read.
     let keepalive = match duplicate_cloexec(&slave) {
         Ok(fd) => fd,
-        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
+        Err(error) => {
+            return spawn_failure(label, shell, interactive, cwd, &error, start.elapsed());
+        }
     };
 
     let resolved_argv = if shell {
-        shell_argv(argv)
+        shell_argv(argv, interactive)
     } else {
         argv.to_vec()
     };
     let mut command = build_command(&resolved_argv, cwd, env, slave, slave_dup);
     let child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return spawn_failure(label, shell, cwd, &error, start.elapsed()),
+        Err(error) => {
+            return spawn_failure(label, shell, interactive, cwd, &error, start.elapsed());
+        }
     };
     // The child's own slave-side descriptors (dup2'd onto its 1 and 2 during exec setup)
     // now live only in the child; this process's copies, passed in above, are closed by
@@ -264,6 +276,7 @@ pub(crate) fn run_step(
         elapsed: start.elapsed(),
         elision,
         shell,
+        interactive,
     }
 }
 
@@ -445,9 +458,15 @@ fn set_cloexec_or_fail(fd: &OwnedFd) -> io::Result<()> {
 /// from the first argument after the command string, and a naive call with nothing there
 /// leaves `$0` reading whatever the shell defaults it to instead. Falls back to `/bin/sh`
 /// when `$SHELL` is unset, matching a Launcher's own `shell = true` in the `repon` crate.
-fn shell_argv(argv: &[String]) -> Vec<String> {
+/// `interactive` swaps `-c` for `-ic`, which is what makes the shell source the user's own
+/// rc file before running the command
+/// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+/// `interactive` sentence): an alias or function defined only there is otherwise invisible
+/// to a non-interactive `$SHELL -c`.
+fn shell_argv(argv: &[String], interactive: bool) -> Vec<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    vec![shell, "-c".to_string(), argv.join(" "), "repon".to_string()]
+    let flag = if interactive { "-ic" } else { "-c" };
+    vec![shell, flag.to_string(), argv.join(" "), "repon".to_string()]
 }
 
 /// A second descriptor onto the same open slave, marked close-on-exec at creation
@@ -719,6 +738,7 @@ fn nonblocking_read(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
 fn spawn_failure(
     label: Arc<str>,
     shell: bool,
+    interactive: bool,
     cwd: &Path,
     error: &io::Error,
     elapsed: Duration,
@@ -726,6 +746,7 @@ fn spawn_failure(
     step_failure(
         label,
         shell,
+        interactive,
         cwd,
         error.raw_os_error().unwrap_or(-1),
         error,
@@ -740,6 +761,7 @@ fn spawn_failure(
 fn step_failure(
     label: Arc<str>,
     shell: bool,
+    interactive: bool,
     cwd: &Path,
     code: i32,
     detail: impl std::fmt::Display,
@@ -760,6 +782,7 @@ fn step_failure(
         elapsed,
         elision: None,
         shell,
+        interactive,
     }
 }
 
@@ -946,12 +969,32 @@ mod tests {
 
     fn run(argv: &[&str], cwd: &Path) -> StepResult {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        run_step(&argv, false, cwd, &[], &RunControl::new())
+        run_step(&argv, false, false, cwd, &[], &RunControl::new())
     }
 
     /// `shell = true`'s own convention: one argv element, the whole command string.
     fn run_shell(command: &str, cwd: &Path) -> StepResult {
-        run_step(&[command.to_string()], true, cwd, &[], &RunControl::new())
+        run_step(
+            &[command.to_string()],
+            true,
+            false,
+            cwd,
+            &[],
+            &RunControl::new(),
+        )
+    }
+
+    /// `shell = true` plus `interactive = true`: the same single-element convention, run
+    /// through `$SHELL -ic` instead of `$SHELL -c`.
+    fn run_interactive_shell(command: &str, cwd: &Path) -> StepResult {
+        run_step(
+            &[command.to_string()],
+            true,
+            true,
+            cwd,
+            &[],
+            &RunControl::new(),
+        )
     }
 
     fn tempdir() -> tempfile::TempDir {
@@ -1055,6 +1098,38 @@ mod tests {
             "a gone cwd must fail the step"
         );
         assert!(!argv_result.shell);
+    }
+
+    // --- `interactive = true`: `$SHELL -ic` sources the user's own rc file ---
+
+    /// Pure construction, no child spawned: `interactive` swaps `-c` for `-ic` in the argv
+    /// [`shell_argv`] builds, which is what makes the shell source the user's own rc file
+    /// before running the command ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// `interactive` sentence). Asserted on the constructed argv rather than on execution,
+    /// so this test never depends on the developer's own rc file.
+    #[test]
+    fn interactive_true_builds_argv_with_the_ic_flag_instead_of_c() {
+        let argv = vec!["echo hi".to_string()];
+
+        let non_interactive = shell_argv(&argv, false);
+        let interactive = shell_argv(&argv, true);
+
+        assert_eq!(non_interactive[1], "-c");
+        assert_eq!(interactive[1], "-ic");
+        // Everything else about the call is unchanged: only the flag differs.
+        assert_eq!(non_interactive[0], interactive[0]);
+        assert_eq!(non_interactive[2..], interactive[2..]);
+    }
+
+    /// [`StepResult::interactive`] carries the mode `run_step` was actually called with, the
+    /// same claim [`StepResult::shell`] already makes, meaningful only alongside `shell`.
+    #[test]
+    fn step_result_interactive_matches_the_mode_run_step_was_called_with() {
+        let dir = tempdir();
+
+        assert!(run_interactive_shell("true", dir.path()).interactive);
+        assert!(!run_shell("true", dir.path()).interactive);
+        assert!(!run(&["true"], dir.path()).interactive);
     }
 
     /// The trap `docs/spec/config.md`'s `shell = true` sentence names: POSIX `sh -c`
@@ -1701,7 +1776,7 @@ print(1 if inherited else 0)"
             "-c".to_string(),
             "echo \"${REPON_EXECUTOR_TEST_VAR:-unset}\"".to_string(),
         ];
-        let result = run_step(&argv, false, dir.path(), &env, &RunControl::new());
+        let result = run_step(&argv, false, false, dir.path(), &env, &RunControl::new());
 
         assert_eq!(result.outcome, StepOutcome::Ok);
         assert_eq!(&*result.output, b"unset\n");

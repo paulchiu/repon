@@ -25,6 +25,11 @@ pub struct Launcher {
     pub name: String,
     pub source: Source,
     pub shell: bool,
+    /// Runs `shell = true`'s own `$SHELL -c` as `$SHELL -ic` instead, sourcing the user's
+    /// own rc file first ([config.md](../../../../docs/spec/config.md#launchers)'s
+    /// `interactive` key). Meaningless, and always `false`, unless `shell` is also set; a
+    /// document declaring one without the other is rejected at config load.
+    pub interactive: bool,
     /// Whether this Launcher's command takes over the terminal
     /// ([config.md](../../../../docs/spec/config.md#launchers)'s `takes_terminal`). `false`
     /// keeps Repon's screen for the whole run and gives the child no terminal at all; the
@@ -100,6 +105,7 @@ fn shipped_defaults() -> Vec<Launcher> {
             name: "lazygit".to_string(),
             source: Source::Args(vec!["lazygit".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         },
@@ -107,6 +113,7 @@ fn shipped_defaults() -> Vec<Launcher> {
             name: "tuicr".to_string(),
             source: Source::Args(vec!["tuicr".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         },
@@ -114,6 +121,7 @@ fn shipped_defaults() -> Vec<Launcher> {
             name: "editor".to_string(),
             source: Source::EditorChain,
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         },
@@ -121,6 +129,7 @@ fn shipped_defaults() -> Vec<Launcher> {
             name: "shell".to_string(),
             source: Source::ShellFallback,
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         },
@@ -144,6 +153,7 @@ impl Launcher {
             name: config.name.get_ref().clone(),
             source,
             shell: config.shell,
+            interactive: config.interactive,
             takes_terminal: config.takes_terminal,
             env: config.env.clone(),
         }
@@ -211,10 +221,13 @@ pub(crate) fn build_command(launcher: &Launcher, entity: &EntityState) -> Comman
 
     let mut command = if launcher.shell {
         // ADR 0007's visible opt-in: `$SHELL -c <string>` with a literal `repon` as `$0`, so
-        // POSIX `sh -c` does not silently eat the first real argument.
+        // POSIX `sh -c` does not silently eat the first real argument. `interactive` swaps
+        // `-c` for `-ic`, sourcing the user's own rc file first
+        // ([config.md](../../../../docs/spec/config.md#launchers)'s `interactive` key).
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let flag = if launcher.interactive { "-ic" } else { "-c" };
         let mut command = Command::new(shell);
-        command.arg("-c").arg(argv.join(" ")).arg("repon");
+        command.arg(flag).arg(argv.join(" ")).arg("repon");
         command
     } else {
         command_from_argv(&argv)
@@ -252,6 +265,7 @@ mod tests {
             args: args.map(|args| args.into_iter().map(str::to_string).collect()),
             from_env: from_env.map(str::to_string),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
             disabled,
@@ -621,6 +635,7 @@ mod tests {
             name: "test".to_string(),
             source: Source::Args(vec!["echo".to_string(), "a && b; c | d`e`".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         };
@@ -647,6 +662,7 @@ mod tests {
             name: "log".to_string(),
             source: Source::Args(vec!["git log --oneline -20 | less".to_string()]),
             shell: true,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         };
@@ -667,6 +683,36 @@ mod tests {
         );
     }
 
+    /// `interactive = true` alongside `shell = true` swaps `-c` for `-ic`
+    /// ([config.md](../../../../docs/spec/config.md#launchers)'s `interactive` key), so the
+    /// shell sources the user's own rc file before running the command; asserted on the
+    /// actual argv the child receives, the same way the plain shell-mode test above is.
+    #[test]
+    fn interactive_true_wraps_the_configured_command_with_the_ic_flag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let entity = entity_at(dir.path());
+        let launcher = Launcher {
+            name: "log".to_string(),
+            source: Source::Args(vec!["git log --oneline -20 | less".to_string()]),
+            shell: true,
+            interactive: true,
+            takes_terminal: true,
+            env: BTreeMap::new(),
+        };
+
+        let command = build_command(&launcher, &entity);
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-ic"),
+                std::ffi::OsStr::new("git log --oneline -20 | less"),
+                std::ffi::OsStr::new("repon"),
+            ],
+            "interactive = true must swap -c for -ic, everything else unchanged"
+        );
+    }
+
     // Criterion 3: "a merged environment over the guaranteed set". A declared `env` override
     // must win over the environment contract's own guaranteed pair for the same name, not
     // merely sit alongside it.
@@ -680,6 +726,7 @@ mod tests {
             name: "test".to_string(),
             source: Source::Args(vec!["true".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env,
         };
@@ -755,6 +802,7 @@ mod tests {
             name: "probe".to_string(),
             source: Source::Args(vec!["printenv".to_string(), "REPON_BRANCH".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: BTreeMap::new(),
         };
