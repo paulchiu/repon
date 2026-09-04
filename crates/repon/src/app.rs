@@ -840,13 +840,9 @@ impl App {
     }
 
     /// `snapshot`'s entities that a kind preference (Worktrees off, Submodules off) does not
-    /// hide, with `worktrees_shown` standing in for [`Self::effective_show_worktrees`] so a
-    /// caller already holding it need not recompute it. A Filter-free
-    /// [`crate::components::list::kind_is_visible`] check rather than `visible.len()`, so a
-    /// committed Filter's narrowing or kind override never moves this count. Shared by the
-    /// header's own entity count ([`Self::status_row_content`]) and `Action::RefreshAll`'s
-    /// reported count, so the two can never disagree about how many rows a kind preference
-    /// hides.
+    /// hide, via a Filter-free [`crate::components::list::kind_is_visible`] check. Shared by
+    /// the header's own entity count ([`Self::status_row_content`]) and `Action::RefreshAll`'s
+    /// reported count, so the two can never disagree.
     fn kind_visible_entity_count(&self, snapshot: &Snapshot, worktrees_shown: bool) -> usize {
         snapshot
             .entities
