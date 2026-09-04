@@ -3583,10 +3583,7 @@ mod tests {
         assert!(all_rows(&runs_as_command_state).contains(RUNS_AS_COMMAND_MESSAGE));
         assert!(all_rows(&no_match_state).contains(NO_MATCHES_MESSAGE));
         assert!(all_rows(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
-        assert_ne!(
-            all_rows(&runs_as_command_state),
-            all_rows(&no_match_state)
-        );
+        assert_ne!(all_rows(&runs_as_command_state), all_rows(&no_match_state));
         assert_ne!(
             all_rows(&runs_as_command_state),
             all_rows(&nothing_configured_state)
