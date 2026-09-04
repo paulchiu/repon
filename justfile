@@ -108,6 +108,36 @@ check-core-isolation:
         "${base_allowed_with_reasons[@]}" \
         "serde:the settled document's wire format on stdout, off by default (ADR 0015)"
 
+    # The other half of the depth-1 check above, which cannot see this either way: the
+    # fetch path's network stack is now in the default build of both crates, with no
+    # feature gating it. Asserted rather than assumed, because re-gating only gix's own
+    # network features would put the tree back as it was while leaving every manifest,
+    # spec and ADR here still claiming otherwise, and nothing else in this repo reads the
+    # transitive tree.
+    check_network_stack_is_unconditional() {
+        local -a network_crates=(reqwest rustls hyper-rustls tokio-rustls)
+
+        local core_tree repon_tree
+        core_tree=$(cargo tree -p repon-core --edges normal --prefix none)
+        repon_tree=$(cargo tree -p repon --edges normal --prefix none)
+
+        for name in "${network_crates[@]}"; do
+            if ! grep -qE "^${name} v" <<<"$core_tree"; then
+                echo "$name is absent from repon-core's default build; fetch is unconditional" >&2
+                echo "now, so the network stack must reach the tree with no feature asked for" >&2
+                exit 1
+            fi
+            if ! grep -qE "^${name} v" <<<"$repon_tree"; then
+                echo "$name is absent from repon's default build; the binary a user installs" >&2
+                echo "with a plain 'cargo install repon' must carry the fetch path" >&2
+                exit 1
+            fi
+        done
+        echo "repon-core's and repon's own default builds both pull: ${network_crates[*]}"
+    }
+
+    check_network_stack_is_unconditional
+
 # Build and test against the declared floor
 #
 # The number is read out of the manifest rather than written here, so the version
