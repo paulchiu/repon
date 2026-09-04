@@ -161,7 +161,7 @@ The tag comes from `.github/workflows/version-tag.yml`, which fires when a label
 
 The targets are `aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-unknown-linux-gnu`, the two platforms "Platform support" above claims, with macOS shipping one archive per architecture rather than a universal binary because Homebrew picks the archive matching the machine it installs on.
 
-crates.io is a custom publish job rather than one of dist's own, because dist does not publish to registries. It is inside the pipeline all the same, which is what [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) requires and what the owner's blubat is the evidence for: blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21, thirteen releases stale on the one channel that sat outside its pipeline. Adopting dist here does not repeat that, because dist's custom-publish-job seam is what keeps the registry leg inside.
+crates.io is a custom publish job rather than one of dist's own, because dist does not publish to registries. It is inside the pipeline all the same, which is what [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) requires and what the owner's blubat is the evidence for: blubat published 0.4.0 of both its crates on 2026-08-02 and nothing since, while shipping GitHub releases through v0.17.2 on 2026-08-21, thirteen releases stale on the one channel that sat outside its pipeline. Adopting dist here does not repeat that: dist's custom-publish-job seam keeps the registry leg inside.
 
 A changelog is produced by the pipeline rather than by hand: GitHub's release notes, built from the commits and merged pull requests since the previous tag.
 
@@ -172,6 +172,8 @@ Three secrets make it run, and adding them is a manual step in the repository se
 | `RELEASE_TOKEN` | `version-tag.yml` | a token with push access to this repository. GitHub's recursion guard means a tag pushed with the default `GITHUB_TOKEN` starts no further workflow runs, so a tag pushed that way would never reach `release.yml`. Without it the bump and the tag still land and the release has to be started by hand. |
 | `CARGO_REGISTRY_TOKEN` | `publish-crates.yml` | a crates.io API token. Cargo's own conventional name for it. |
 | `HOMEBREW_TAP_TOKEN` | `publish-homebrew-formula` | a token with push access to `paulchiu/homebrew-tap`. |
+
+All three are set on `paulchiu/repon`. One fine-grained token with no expiry covers both `RELEASE_TOKEN` and `HOMEBREW_TAP_TOKEN`, since the two repositories it needs are this one and the tap. A token that does expire takes the release pipeline with it silently: `version-tag.yml` falls back to `GITHUB_TOKEN`, so the bump and the tag keep landing and only the release stops.
 
 crates.io trusted publishing (OIDC, no stored token) stays unverified for a crate name that does not exist yet, so the pipeline uses a stored token and sidesteps the question. It stays a candidate for after the first publish, once `repon` and `repon-core` are on the index to configure it against.
 
