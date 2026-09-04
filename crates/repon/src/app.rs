@@ -9843,6 +9843,75 @@ mod tests {
         );
     }
 
+    /// Decisions already made: a pinned row is visible but not counted in the header's own
+    /// match count, and `Action::SelectAllVisible` (`a`) never sweeps it in, since it is
+    /// being held past the Filter rather than claimed to satisfy it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_pinned_row_is_absent_from_the_header_match_count_and_from_select_all_visible() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+        assert!(
+            app.selection.is_empty(),
+            "sanity: repo-a must start unchecked, or `a` proves nothing about pinning"
+        );
+
+        let (_tx, rx) = mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(vec![repo_a_key.clone()]),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from("repo-a"),
+                position: 1,
+                total: 1,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        });
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must still be pinned, or this proves nothing about what the \
+             header and `a` do with it"
+        );
+
+        let snapshot = app.core.snapshot();
+        let content = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            content.header.filter_match_count,
+            Some(0),
+            "repo-a is pinned, not matching, so the header's own count must read 0, not the \
+             1 `Self::visible_keys` would give"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("press a");
+        assert!(
+            !app.selection.contains(&repo_a_key),
+            "`a` must never check a row the Filter itself does not match, pinned or not"
+        );
+    }
+
     /// The first "Done when": `on_refresh = "sync"` runs that Action once after a Refresh
     /// started by `r`, over every row that Refresh covers. The entry declares
     /// `confirm = true`, so a build that put the hook behind the Action confirm gate would
