@@ -111,9 +111,10 @@ The trigger, after stripping any leading `-`:
 | empty (an empty line, or just after a space) | every key |
 | `:` alone, the empty key | every key |
 | a known key up to or past its `:` | that key's values |
+| a colon-less prefix of one or more keys | those keys' own entries |
 | anything else | nothing |
 
-Nothing else triggers it. In particular a bare word never does: a bare word is a name search, and offering `branch:` to someone typing the repository `brackets` would be the language fighting the user at the one place it must be invisible. The colon is the user committing to the keyed namespace, and it is the only unambiguous signal available. Since `/` prefills, the line is rarely empty, so `:` is what actually carries discoverability of the keyed namespace rather than being a convenience.
+A colon-less term that is a prefix of one or more keys offers each of their own entries (`key:`), narrowing as more of it is typed and vanishing once no key's name starts with it. This is what makes the keyed namespace discoverable before the user commits to a colon, at the accepted cost that a repository named `state` or `sync` sees its own name suggested back as a key while it is still being typed: accepting a completion always needs `Tab`, so the live filter keeps treating the typed text as a name search regardless, and the suggestion costs nothing beyond the screen space it occupies. Since `/` prefills, the line is rarely empty, so this prefix behaviour is what actually carries discoverability of the keyed namespace day to day, more than the empty-line and bare-colon rows above it.
 
 Keys, in the `input` context ([keybindings.md](keybindings.md)):
 
