@@ -8,14 +8,15 @@
 //! two that grow into the frame's slack, so every column's position is a [`Columns`] computed
 //! per frame rather than a constant.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use repon_core::{
-    Cell, DirtyCounts, EntityState, Filter, Head, Kind, RowSummary, Settled, Snapshot, SyncState,
-    WorktreeState, summary,
+    Cell, DirtyCounts, EntityKey, EntityState, Filter, Head, Kind, RowSummary, Settled, Snapshot,
+    SyncState, WorktreeState, summary,
 };
 
 use super::Component;
@@ -248,6 +249,12 @@ pub struct List {
     /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
     /// every row) until one arrives, which is every unit test in this module.
     filter: Filter,
+    /// The keys `filter` alone would drop that this draw shows anyway, handed in every frame
+    /// by [`crate::app::App::render`] ([`Self::set_pinned`]) the same way `filter` is:
+    /// `App`'s own still-pending rows of an in-flight run
+    /// ([`crate::app::App::pinned_keys`]). Empty until one arrives, which is every unit test
+    /// in this module.
+    pinned: HashSet<EntityKey>,
     /// The cursor's offset into the visible row list, handed in every frame
     /// ([`Self::set_cursor`]).
     cursor: usize,
@@ -280,6 +287,7 @@ impl Default for List {
             show_worktrees: true,
             show_submodules: false,
             filter: Filter::default(),
+            pinned: HashSet::new(),
             cursor: 0,
             offset: 0,
             theme: Theme::default(),
@@ -323,6 +331,7 @@ impl List {
             self.show_submodules,
             &self.filter,
             self.row_order,
+            &self.pinned,
         );
 
         // `Component::draw`'s own doc comment: focus is communicated by border colour
@@ -483,6 +492,13 @@ impl List {
     /// config handshake carries.
     pub(crate) fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
+    }
+
+    /// Hands this draw the pinned-key set overriding `filter` for this frame, read fresh the
+    /// same way [`Self::set_filter`] is: an in-flight run's own still-pending rows change
+    /// every time its progress marker moves, not on a keystroke.
+    pub(crate) fn set_pinned(&mut self, pinned: HashSet<EntityKey>) {
+        self.pinned = pinned;
     }
 
     /// Hands this draw the cursor's offset into the rendered row order, read fresh every
@@ -710,18 +726,25 @@ pub(crate) fn kind_is_visible(
 /// rather than dropped
 /// ([layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s "The
 /// list"). With every row surviving, this is identical to grouping the whole list.
+///
+/// `pinned` overrides `filter.matches` alone, never `kind_is_visible`: a row named in it is
+/// a candidate whether or not it currently matches, the exception
+/// [filter.md](../../../../docs/spec/filter.md)'s "the visible rows, the matching rows ...
+/// are all the same set" now carries, for a row an in-flight run still has pending
+/// (`crate::app::App`'s own pinned-key set). Empty for every caller with no such run.
 pub(crate) fn visible_row_order(
     entities: &[EntityState],
     show_worktrees: bool,
     show_submodules: bool,
     filter: &Filter,
     order: RowOrder,
+    pinned: &HashSet<EntityKey>,
 ) -> Vec<usize> {
     let mut candidates: Vec<usize> = (0..entities.len())
         .filter(|&index| {
             let entity = &entities[index];
             kind_is_visible(entity.kind, show_worktrees, show_submodules, filter)
-                && filter.matches(entity)
+                && (filter.matches(entity) || pinned.contains(&entity.key))
         })
         .collect();
     order_candidates(entities, &mut candidates, order);
@@ -3833,7 +3856,7 @@ mod tests {
             let natural = RowOrder::default().choose(column);
             for order in [natural, natural.choose(column)] {
                 let rows: Vec<&EntityState> =
-                    visible_row_order(&entities, true, true, &filter, order)
+                    visible_row_order(&entities, true, true, &filter, order, &HashSet::new())
                         .into_iter()
                         .map(|index| &entities[index])
                         .collect();
@@ -3883,10 +3906,17 @@ mod tests {
             entity_of_kind("apex-worktree-a", Kind::Worktree, "/apex"),
         ];
         let order = RowOrder::default().choose(SortColumn::Name);
-        let names: Vec<&str> = visible_row_order(&entities, true, true, &Filter::default(), order)
-            .into_iter()
-            .map(|index| entities[index].name.as_ref())
-            .collect();
+        let names: Vec<&str> = visible_row_order(
+            &entities,
+            true,
+            true,
+            &Filter::default(),
+            order,
+            &HashSet::new(),
+        )
+        .into_iter()
+        .map(|index| entities[index].name.as_ref())
+        .collect();
 
         assert_eq!(
             names,
@@ -3955,7 +3985,14 @@ mod tests {
             );
         }
 
-        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
+        let visible = visible_row_order(
+            &entities,
+            true,
+            true,
+            &filter,
+            RowOrder::Natural,
+            &HashSet::new(),
+        );
         let unfiltered = grouped_row_order(&entities, &every_index(&entities));
 
         assert_eq!(
@@ -3979,7 +4016,14 @@ mod tests {
         ];
         let filter = Filter::parse("worktree");
 
-        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
+        let visible = visible_row_order(
+            &entities,
+            true,
+            true,
+            &filter,
+            RowOrder::Natural,
+            &HashSet::new(),
+        );
 
         assert_eq!(
             visible,
@@ -4003,7 +4047,14 @@ mod tests {
         ];
         let filter = Filter::parse("keep");
 
-        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural);
+        let visible = visible_row_order(
+            &entities,
+            true,
+            true,
+            &filter,
+            RowOrder::Natural,
+            &HashSet::new(),
+        );
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -4037,7 +4088,14 @@ mod tests {
             "fixture's own filter must be active, or this proves nothing"
         );
 
-        let visible = visible_row_order(&entities, false, true, &filter, RowOrder::Natural);
+        let visible = visible_row_order(
+            &entities,
+            false,
+            true,
+            &filter,
+            RowOrder::Natural,
+            &HashSet::new(),
+        );
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -4048,6 +4106,169 @@ mod tests {
             vec!["repo-a-x", "submodule-a-x", "repo-b-x"],
             "both Worktrees must be hidden by show_worktrees, and submodule-a-x must still \
              group immediately under repo-a-x rather than trailing after repo-b-x"
+        );
+    }
+
+    /// A row named in `pinned` is a candidate even once the Committed Filter itself would
+    /// drop it: the override an in-flight run's own still-pending rows need, so a row's own
+    /// disappearance never races the run touching it.
+    #[test]
+    fn a_row_pinned_by_an_in_flight_run_stays_visible_even_once_it_stops_matching_the_committed_filter()
+     {
+        let entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+        ];
+        let filter = Filter::parse("name:repo-b");
+        let mut pinned = HashSet::new();
+        pinned.insert(entities[0].key.clone());
+
+        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["repo-a", "repo-b"],
+            "repo-a fails the Committed Filter but must still appear, pinned"
+        );
+    }
+
+    /// The other half of the override: dropping a key from `pinned` (what the run's own
+    /// progress marker moving past a row does, one frame at a time) drops that row from the
+    /// very next call, with nothing else about the row or the Filter changed. No lag of any
+    /// kind sits between the two.
+    #[test]
+    fn a_row_pinned_by_an_in_flight_run_leaves_the_list_the_frame_the_run_moves_past_it() {
+        let entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+        ];
+        let filter = Filter::parse("name:repo-b");
+        let mut pinned = HashSet::new();
+        pinned.insert(entities[0].key.clone());
+
+        let while_pinned =
+            visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        assert!(
+            while_pinned.contains(&0),
+            "sanity: repo-a must still be a candidate while its key is in `pinned`"
+        );
+
+        pinned.remove(&entities[0].key);
+        let once_unpinned =
+            visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+
+        assert!(
+            !once_unpinned.contains(&0),
+            "repo-a must leave the moment `pinned` no longer names it, not on some later call"
+        );
+    }
+
+    /// Pinning holds a row's own membership in the candidate set, never a value drawn from
+    /// it: `repo-a`'s own dirty count still reaches the screen even though it fails the
+    /// Committed Filter and is shown only because it is pinned, proving nothing here freezes
+    /// or blanks a pinned row's own cells.
+    #[test]
+    fn a_pinned_row_still_renders_its_own_cells_live_only_its_membership_is_held() {
+        let mut repo_a = entity("repo-a");
+        repo_a.dirty = Cell::already_settled(Settled::Known {
+            value: DirtyCounts {
+                modified: 3,
+                untracked: 0,
+                deleted: 0,
+            },
+            at: Timestamp::now(),
+            stale: false,
+        });
+        let filter = Filter::parse("name:does-not-match-repo-a");
+        assert!(
+            !filter.matches(&repo_a),
+            "fixture's own Filter must fail to match repo-a, or this proves nothing"
+        );
+        let mut list = List::default();
+        list.set_filter(filter);
+        let mut pinned = HashSet::new();
+        pinned.insert(repo_a.key.clone());
+        list.set_pinned(pinned);
+
+        let terminal = render_with_list(&mut list, 140, 24, &snapshot(vec![repo_a]));
+        let buf = terminal.backend().buffer();
+        let y = entity_row_y(0);
+        let glyphs = GlyphSet::for_config(crate::config::document::Glyphs::default());
+
+        assert_eq!(
+            cell_text(buf, name_x(buf), y, 6),
+            "repo-a",
+            "the pinned row must still draw, by name"
+        );
+        assert_eq!(
+            cell_text(buf, dirty_x(buf), y, 2),
+            format!("{}3", glyphs.changed),
+            "the pinned row's own dirty count must still read live, not blank or frozen"
+        );
+    }
+
+    /// A row `pinned` never names is judged by the Filter alone, whether or not some other
+    /// run is outstanding: pinning is per-key, not a global "a run is live somewhere" switch.
+    #[test]
+    fn pinning_never_reaches_a_row_outside_the_runs_own_selection() {
+        let entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+        ];
+        let filter = Filter::parse("name:repo-c");
+        let mut pinned = HashSet::new();
+        pinned.insert(entities[0].key.clone());
+
+        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["repo-a"],
+            "repo-a is pinned so it stays despite matching nothing; repo-b is neither \
+             pinned nor matching and must stay absent"
+        );
+    }
+
+    /// `pinned` overrides `filter.matches` alone, never `kind_is_visible`
+    /// ([docs/spec/repo-management.md](../../../../docs/spec/repo-management.md)'s "Once
+    /// accepted": pinning "does not override `show_worktrees` or `show_submodules`"). A
+    /// pinned Worktree with `show_worktrees` off must stay hidden exactly as an unpinned one
+    /// would.
+    #[test]
+    fn a_pinned_worktree_stays_hidden_while_show_worktrees_is_off() {
+        let entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("worktree-a", Kind::Worktree, "/repo-a"),
+        ];
+        let filter = Filter::default();
+        assert!(
+            !filter.requests_kind(Kind::Worktree),
+            "fixture's own filter must not itself request Worktrees, or this proves nothing \
+             about pinning bypassing show_worktrees"
+        );
+        let mut pinned = HashSet::new();
+        pinned.insert(entities[1].key.clone());
+
+        let visible =
+            visible_row_order(&entities, false, true, &filter, RowOrder::Natural, &pinned);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["repo-a"],
+            "worktree-a is pinned but show_worktrees is off, so it must stay hidden: \
+             pinning overrides the Filter, never show_worktrees"
         );
     }
 
@@ -5131,7 +5352,14 @@ mod tests {
         let (snapshot, _ids) = settled_snapshot_for_the_head_shape_matrix();
         let filter = Filter::parse("head:detached");
 
-        let visible = visible_row_order(&snapshot.entities, true, true, &filter, RowOrder::Natural);
+        let visible = visible_row_order(
+            &snapshot.entities,
+            true,
+            true,
+            &filter,
+            RowOrder::Natural,
+            &HashSet::new(),
+        );
         let names: std::collections::BTreeSet<&str> = visible
             .iter()
             .map(|&index| snapshot.entities[index].name.as_ref())

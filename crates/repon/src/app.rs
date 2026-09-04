@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -263,13 +264,14 @@ struct ManagementRunOutcome {
 
 /// State for one management run moved off the calling thread
 /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)):
-/// the operation, for the row Notice's own wording; the shared position
-/// [`App::draw_frame`] reads every frame it is `Some`; the flag `Action::Unwind` raises to
-/// stop the loop before its next row starts, never mid-row; and the channel the finished
-/// [`ManagementRunOutcome`] arrives on, drained by [`App::poll_management_run`] on every
-/// [`Message::Tick`].
+/// the operation, for the row Notice's own wording; the run's own ordered Selection, for
+/// [`App::pending_management_keys`]; the shared position [`App::draw_frame`] reads every
+/// frame it is `Some`; the flag `Action::Unwind` raises to stop the loop before its next row
+/// starts, never mid-row; and the channel the finished [`ManagementRunOutcome`] arrives on,
+/// drained by [`App::poll_management_run`] on every [`Message::Tick`].
 struct ManagementRun {
     operation: management::Operation,
+    targets: Arc<[EntityKey]>,
     progress: Arc<Mutex<RowProgress>>,
     cancel: Arc<AtomicBool>,
     outcome: mpsc::Receiver<ManagementRunOutcome>,
@@ -839,11 +841,12 @@ impl App {
     /// entity count folded into the same rank-1 item, `warnings`, and every warning
     /// [`Self::acknowledged_warnings`] has marked seen. `filter_match_count` and
     /// `worktrees_note` read [`Self::active_filter`] and `visible_row_order`
-    /// ([`crate::components::list`]) so the header's own count is the identical set the list
-    /// draws ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the matching
-    /// rows, the header's match count ... are all the same set"). `run_progress` and
-    /// `elapsed` come from `self.action_run` while [`Self::action_running`] is true, and are
-    /// `None` otherwise.
+    /// ([`crate::components::list`]) with no pinned key of its own, so the header's own count
+    /// is the Filter's own matching set, never widened by a row an in-flight run is merely
+    /// holding past it ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the
+    /// matching rows, the header's match count ... are all the same set", with a pinned row
+    /// as the named exception). `run_progress` and `elapsed` come from `self.action_run`
+    /// while [`Self::action_running`] is true, and are `None` otherwise.
     fn status_row_content<'a>(
         &'a self,
         snapshot: &Snapshot,
@@ -857,6 +860,7 @@ impl App {
             self.document.show_submodules,
             &filter,
             self.row_order,
+            &HashSet::new(),
         );
         let filter_match_count = filter.is_active().then_some(visible.len());
         let worktrees_override = !worktrees_shown && filter.requests_kind(Kind::Worktree);
@@ -1277,7 +1281,7 @@ impl App {
                 None
             }
             Some(Action::SelectAllVisible) => {
-                self.selection.select_all_visible(&self.visible_keys());
+                self.selection.select_all_visible(&self.matching_keys());
                 None
             }
             Some(Action::ClearSelection) => {
@@ -2238,6 +2242,14 @@ impl App {
         let handle = self.core.management_handle();
         let config_file = self.config_file.clone();
         let total = plan.targets.len();
+        // Cloned ahead of `plan` moving into the thread below: `Self::pending_management_keys`
+        // reads this from the calling thread, in the plan's own order, while the background
+        // thread's `plan` is a separate, moved copy it never reaches into.
+        let targets: Arc<[EntityKey]> = plan
+            .targets
+            .iter()
+            .map(|target| target.key.clone())
+            .collect();
         let progress = Arc::new(Mutex::new(RowProgress {
             name: Arc::from(""),
             position: 0,
@@ -2296,6 +2308,7 @@ impl App {
         // scan: management_run_start end
         self.management_run = Some(ManagementRun {
             operation,
+            targets,
             progress,
             cancel,
             outcome: rx,
@@ -2399,6 +2412,49 @@ impl App {
                 progress.total,
             )
         })
+    }
+
+    /// The keys [`Self::management_run`]'s own ordered targets still have work pending for:
+    /// the row currently executing (`RowProgress::position`) and every row still to come, in
+    /// `plan.targets`' own order, per [`Self::run_management`]'s own doc comment on
+    /// `targets`. Empty once the run finishes (`self.management_run` is `None`) or before its
+    /// first row has published a position, in which case the whole run is still ahead of
+    /// itself and every target is pending.
+    fn pending_management_keys(&self) -> &[EntityKey] {
+        let Some(run) = &self.management_run else {
+            return &[];
+        };
+        let position = run.progress.lock().unwrap().position;
+        // Clamped rather than trusted: a position past `targets.len()` never arises from a
+        // real run, only from a hand-built fixture whose two fields disagree, and this must
+        // degrade to nothing pending rather than panic on it.
+        let start = position.saturating_sub(1).min(run.targets.len());
+        &run.targets[start..]
+    }
+
+    /// The keys [`crate::components::list::visible_row_order`] should show even past the
+    /// Committed Filter this frame: [`Self::pending_management_keys`], plus every row an
+    /// ordinary fan-out Action still has its own step running against
+    /// (`last_action.running.is_some()`, the signal [`repon_core::Core::run_action`] already
+    /// writes per step). Neither widens past its own run: an entity outside both is never
+    /// pinned ([docs/spec/repo-management.md](../../../docs/spec/repo-management.md)'s "Once
+    /// accepted").
+    fn pinned_keys(&self, snapshot: &Snapshot) -> HashSet<EntityKey> {
+        let mut pinned: HashSet<EntityKey> =
+            self.pending_management_keys().iter().cloned().collect();
+        pinned.extend(
+            snapshot
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.running.is_some())
+                })
+                .map(|entity| entity.key.clone()),
+        );
+        pinned
     }
 
     /// Runs `spec` over [`Self::action_targets`], the seam every Action-running path in this
@@ -2569,14 +2625,11 @@ impl App {
         }
     }
 
-    /// Every currently shown Entity's key, in the same order
-    /// [`crate::components::list::List`] draws
-    /// ([`crate::components::list::visible_row_order`]): this crate's whole "visible list",
-    /// narrowed by [`Self::effective_show_worktrees`], the show-submodules preference and
-    /// [`Self::active_filter`], and what `select_all_visible`, `extend_range` and the cursor
-    /// bounds all read.
-    fn visible_keys(&self) -> Vec<EntityKey> {
-        let snapshot = self.core.snapshot();
+    /// [`Self::visible_keys`] and [`Self::matching_keys`]'s shared pipeline: `snapshot`'s
+    /// entities narrowed by [`Self::effective_show_worktrees`], the show-submodules
+    /// preference, [`Self::active_filter`] and `pinned`, in [`Self::row_order`]
+    /// ([`crate::components::list::visible_row_order`]).
+    fn keys_for(&self, snapshot: &Snapshot, pinned: &HashSet<EntityKey>) -> Vec<EntityKey> {
         let filter = self.active_filter();
         crate::components::list::visible_row_order(
             &snapshot.entities,
@@ -2584,10 +2637,33 @@ impl App {
             self.document.show_submodules,
             &filter,
             self.row_order,
+            pinned,
         )
         .into_iter()
         .map(|index| snapshot.entities[index].key.clone())
         .collect()
+    }
+
+    /// Every currently shown Entity's key, in the same order
+    /// [`crate::components::list::List`] draws: this crate's whole "visible list", narrowed
+    /// by [`Self::keys_for`]'s own pipeline plus [`Self::pinned_keys`], and what
+    /// `extend_range` and the cursor bounds all read. [`Self::matching_keys`] is the
+    /// Filter's own narrower set, for the one caller (`Action::SelectAllVisible`) that must
+    /// never pick up a row the Filter itself would drop.
+    fn visible_keys(&self) -> Vec<EntityKey> {
+        let snapshot = self.core.snapshot();
+        let pinned = self.pinned_keys(&snapshot);
+        self.keys_for(&snapshot, &pinned)
+    }
+
+    /// [`Self::visible_keys`] with no pinned key of its own: the rows `Self::active_filter`
+    /// alone keeps, read by `Action::SelectAllVisible` (`a`) so a row an in-flight run is
+    /// merely holding past the Filter is never swept into the Selection as if it had matched
+    /// (`docs/spec/repo-management.md`'s "Once accepted": a pinned row "is being held past
+    /// the Filter, not claimed to satisfy it").
+    fn matching_keys(&self) -> Vec<EntityKey> {
+        let snapshot = self.core.snapshot();
+        self.keys_for(&snapshot, &HashSet::new())
     }
 
     /// The row the cursor sits on, if the table is non-empty.
@@ -2693,12 +2769,14 @@ impl App {
     fn visible_failed(&self) -> Vec<bool> {
         let snapshot = self.core.snapshot();
         let filter = self.active_filter();
+        let pinned = self.pinned_keys(&snapshot);
         crate::components::list::visible_row_order(
             &snapshot.entities,
             self.effective_show_worktrees(),
             self.document.show_submodules,
             &filter,
             self.row_order,
+            &pinned,
         )
         .into_iter()
         .map(|index| {
@@ -3082,6 +3160,10 @@ impl App {
         // its own draw methods runs below.
         let filter = self.active_filter();
         self.list.set_filter(filter);
+        // The pinned-key set overriding `filter` for this frame alone, handed to `self.list`
+        // the same per-frame way, so what the list draws and what `Self::visible_keys` reads
+        // for the cursor and every navigation key can never disagree.
+        self.list.set_pinned(self.pinned_keys(&snapshot));
         // The cursor, its viewport offset and the loaded theme, handed to `self.list`
         // the same per-frame way as `filter` above, so the cursor row's highlight
         // ([`theme::Theme::selection_style`]) and the window it is drawn in always
@@ -3495,6 +3577,25 @@ mod tests {
                 "add a file",
             ],
         );
+    }
+
+    /// A real Repo at `root.join(name)`, cloned from a disposable upstream outside `root`
+    /// (`clone_repo`'s own reason for one) and already `fetch`ed one commit behind it, so
+    /// `sync:behind` matches it from discovery's own first probe with nothing to wait out
+    /// beyond that probe settling.
+    #[cfg(feature = "fetch")]
+    fn behind_repo(
+        canonical_dir: &std::path::Path,
+        root: &std::path::Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let upstream = canonical_dir.join(format!("{name}-upstream"));
+        init_repo(&upstream);
+        let repo = root.join(name);
+        clone_repo(&upstream, &repo);
+        commit_a_file(&upstream, "b.txt", "b");
+        run_git(&repo, &["fetch", "origin"]);
+        repo
     }
 
     /// Adds a real linked Worktree at `worktree`, on a new branch, off `parent`'s own repo.
@@ -5859,6 +5960,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.management_run = Some(ManagementRun {
             operation: management::Operation::Ignore,
+            targets: Arc::from(Vec::<EntityKey>::new()),
             progress: std::sync::Arc::new(std::sync::Mutex::new(RowProgress {
                 name: std::sync::Arc::from("repo-b"),
                 position: 2,
@@ -9378,6 +9480,526 @@ mod tests {
         assert!(
             repo.join(marker).exists(),
             "the after_sync hook must have run against the real Repo once sync fast-forwarded it"
+        );
+    }
+
+    /// A hand-built [`ManagementRun`] for a `Sync` operation over `targets`, pinned at
+    /// `position` of `total`: the shared fixture every sync-pinning test below needs to
+    /// drive `App`'s reaction to a known position without racing a background thread's own
+    /// timing, the same call
+    /// [`draw_frame_shows_the_management_runs_current_row_as_the_live_notice`]'s own doc
+    /// comment makes.
+    #[cfg(feature = "fetch")]
+    fn pinned_sync_run(targets: Vec<EntityKey>, position: usize, total: usize) -> ManagementRun {
+        let (_tx, rx) = mpsc::channel();
+        ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(targets),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from(""),
+                position,
+                total,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        }
+    }
+
+    /// The bug this issue fixes, reproduced against real state: `sync:behind` matches
+    /// `repo-a` at discovery, a hand-built [`ManagementRun`] pins it as still pending
+    /// (position 1 of 1, nothing yet past it), then the real fast-forward
+    /// ([`ManagementHandle::attempt_auto_update`], the mechanism `sync` itself calls) and the
+    /// unrelated periodic metadata poll re-probing it (simulated here with a direct
+    /// `Core::refresh`, since its own two-second clock is not a fact a test can pin) must not
+    /// drop it from the filtered list before the run's own progress marker has moved past it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_still_pending_in_a_running_sync_stays_in_the_sync_behind_filter_after_its_branch_catches_up()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must start inside sync:behind, or this proves nothing"
+        );
+
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            !app.filter.matches(
+                app.core
+                    .snapshot()
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == repo_a_key)
+                    .expect("repo-a is still in the table")
+            ),
+            "sanity: the re-probe must have caught the Cell up with the real fast-forward, \
+             or this proves nothing"
+        );
+
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "repo-a is still pending in the run (position 1 of 1) so it must stay in the \
+             sync:behind filter even though its own branch has caught up"
+        );
+    }
+
+    /// The other half of the same run: once its progress marker moves past a row (position
+    /// 2 of 2, `repo-a`'s own turn already done, `repo-b`'s own turn current), `repo-a`'s
+    /// slot in `Self::pending_management_keys` is gone the instant that happens, so a real
+    /// fast-forward plus the same re-probe drops it from the filter at once, on the very
+    /// frame this reads, never lagging behind the marker.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_whose_own_turn_in_the_management_run_has_already_finished_drops_out_of_the_filter_immediately()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let repo_a_key = key_named("repo-a");
+        let repo_b_key = key_named("repo-b");
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "sanity: both repos must start inside sync:behind, or this proves nothing"
+        );
+
+        app.management_run = Some(pinned_sync_run(
+            vec![repo_a_key.clone(), repo_b_key.clone()],
+            2,
+            2,
+        ));
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&repo_a_key),
+            "repo-a's own turn already finished (position 2 of 2), so it must drop out the \
+             instant its branch catches up rather than staying pinned"
+        );
+        assert!(
+            visible.contains(&repo_b_key),
+            "repo-b is still behind and untouched by this test, and must stay in the filter \
+             regardless of what repo-a's own row is doing"
+        );
+    }
+
+    /// A run in flight is not a blanket "hold every currently-behind row": `repo-b` is
+    /// behind but never named in the run's own `targets`, so once its branch catches up (the
+    /// same real fast-forward and re-probe the pinned cases above use) it must drop out of
+    /// `sync:behind` exactly as it would with no run outstanding at all, regardless of
+    /// `repo-a`'s own row still pending in that run.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_management_runs_pinning_never_holds_a_repo_outside_its_own_selection_in_the_filtered_list()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let repo_a_key = key_named("repo-a");
+        let repo_b_key = key_named("repo-b");
+
+        // `repo-b` is deliberately absent: this run's own Selection is `repo-a` alone.
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_b_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_b_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&repo_b_key),
+            "repo-b was never in this run's own Selection, so its catching up must drop it \
+             from sync:behind even while the run over repo-a alone is still outstanding"
+        );
+        assert!(
+            visible.contains(&repo_a_key),
+            "repo-a is still pending in its own run and untouched by this test, and must \
+             stay in the filter"
+        );
+    }
+
+    /// Once the run finishes ([`App::poll_management_run`]'s own effect on
+    /// `self.management_run`, driven directly here so this is not a race against a
+    /// background thread's own timing), `Self::pending_management_keys` goes back to empty
+    /// and every row the run touched, `repo-a` included, is judged by `sync:behind` alone
+    /// again: caught up, it must be gone.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn once_the_management_run_finishes_every_row_it_touched_is_judged_by_the_filter_alone_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must still be pinned while the run is outstanding, or this \
+             proves nothing about what its finishing changes"
+        );
+
+        app.management_run = None;
+
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "the run is over, so repo-a must be judged by sync:behind alone and drop out \
+             now that its branch has caught up"
+        );
+    }
+
+    /// The four tests above drive [`App`]'s reaction to a hand-built [`ManagementRun`], the
+    /// same known-position technique
+    /// [`draw_frame_shows_the_management_runs_current_row_as_the_live_notice`] uses; this one
+    /// drives [`App::run_management`]'s own background thread for real instead, over two
+    /// behind repos with a `before_sync` hook slow enough to give the test a reliable window
+    /// (the same technique `esc_cancels_a_management_run_between_rows_never_mid_row` uses):
+    /// whichever repo the real thread names current in its own [`RowProgress`] stays pinned
+    /// once it is fast-forwarded and re-probed mid-turn, then drops out the instant the real
+    /// thread's own position moves past it, proving the actual publish-before-work sequencing
+    /// [`App::run_management`] documents, not just how `App` reacts to a position handed to
+    /// it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_pinned_by_a_real_sync_run_drops_out_the_instant_the_runs_own_thread_moves_past_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.document.actions.push(hook_action_config(
+            "slow-before-sync",
+            &["sh", "-c", "sleep 1"],
+        ));
+        app.document.before_sync = Some("slow-before-sync".to_string());
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "sanity: both repos must start inside sync:behind, or this proves nothing"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+        open_the_management_gate(&mut app, management::Operation::Sync);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        // The background thread publishes a row's own position before that row's own work
+        // starts, so waiting for it here turns the row's own one-second `before_sync` sleep
+        // into a reliable window rather than a race against thread scheduling.
+        wait_for("the first row to start", || {
+            app.management_run
+                .as_ref()
+                .is_some_and(|run| run.progress.lock().unwrap().position > 0)
+        });
+
+        let current_name = app
+            .management_run
+            .as_ref()
+            .expect("the run must still be outstanding while the first row's own hook sleeps")
+            .progress
+            .lock()
+            .unwrap()
+            .name
+            .to_string();
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let current_key = key_named(&current_name);
+        let other_key = key_named(if current_name == "repo-a" {
+            "repo-b"
+        } else {
+            "repo-a"
+        });
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&current_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&current_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            !app.filter.matches(
+                app.core
+                    .snapshot()
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == current_key)
+                    .expect("the row is still in the table")
+            ),
+            "sanity: the re-probe must have caught the Cell up with the real fast-forward"
+        );
+        assert!(
+            app.visible_keys().contains(&current_key),
+            "the real thread's own position still names this row current, so it must stay \
+             pinned even though its branch has caught up"
+        );
+
+        wait_for("the run's own thread to move past the current row", || {
+            app.management_run
+                .as_ref()
+                .is_some_and(|run| run.progress.lock().unwrap().position > 1)
+        });
+
+        assert!(
+            !app.visible_keys().contains(&current_key),
+            "the real thread's own progress marker moved past this row, so it must drop out \
+             of the filter at once rather than staying pinned"
+        );
+        assert!(
+            app.visible_keys().contains(&other_key),
+            "the other row is still behind and never touched by this test, so it must stay \
+             in the filter regardless of what the run just did to its sibling"
+        );
+
+        wait_for_management_run(&mut app);
+    }
+
+    /// Decisions already made: the pin also covers an ordinary fan-out Action's own
+    /// in-flight rows, the identical `last_action.running.is_some()` signal
+    /// `Core::run_action` already writes per step, since [`Self::pinned_keys`] is the one
+    /// shared choke point and that signal already exists for free.
+    #[test]
+    fn a_row_with_an_ordinary_fan_out_actions_own_step_running_stays_visible_past_a_filter_it_never_matched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+        // Excludes repo-a alone, so the cursor still has repo-b to sit on: pressing `;` and
+        // `Enter` needs a real cursor row, and a Filter hiding every row would leave nothing
+        // for that key path to dispatch from at all.
+        app.filter = Filter::parse("name:repo-b");
+        let snapshot = app.core.snapshot();
+        let repo_a_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-a")
+            .expect("repo-a must be in the table")
+            .key
+            .clone();
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "sanity: the Filter must exclude repo-a before any Action runs, or this proves \
+             nothing"
+        );
+        // Checked despite being hidden ([`Selection::targets`]'s own "must not change"
+        // criterion), which is what routes the fan-out at repo-a rather than the cursor's
+        // own row, repo-b.
+        app.selection.toggle(repo_a_key.clone());
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+        // `action_running` flips before the step's own `RunningStep` is written, which
+        // happens once rayon's pool actually starts the step: waited out explicitly, the
+        // same race `Core::run_action`'s own tests take this wait for.
+        wait_for("repo-a's own step to actually start running", || {
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .find(|entity| entity.key == repo_a_key)
+                .is_some_and(|entity| {
+                    entity
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.running.is_some())
+                })
+        });
+
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "repo-a's own step is running, so it must stay visible past a Filter it never \
+             matched, the same pin an in-flight management run's own rows get"
+        );
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "once the step finishes, repo-a must be judged by the Filter alone again"
+        );
+    }
+
+    /// Decisions already made: a pinned row is visible but not counted in the header's own
+    /// match count, and `Action::SelectAllVisible` (`a`) never sweeps it in, since it is
+    /// being held past the Filter rather than claimed to satisfy it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_pinned_row_is_absent_from_the_header_match_count_and_from_select_all_visible() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+        assert!(
+            app.selection.is_empty(),
+            "sanity: repo-a must start unchecked, or `a` proves nothing about pinning"
+        );
+
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must still be pinned, or this proves nothing about what the \
+             header and `a` do with it"
+        );
+
+        let snapshot = app.core.snapshot();
+        let content = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            content.header.filter_match_count,
+            Some(0),
+            "repo-a is pinned, not matching, so the header's own count must read 0, not the \
+             1 `Self::visible_keys` would give"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("press a");
+        assert!(
+            !app.selection.contains(&repo_a_key),
+            "`a` must never check a row the Filter itself does not match, pinned or not"
         );
     }
 
