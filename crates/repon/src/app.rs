@@ -3584,6 +3584,25 @@ mod tests {
         );
     }
 
+    /// A real Repo at `root.join(name)`, cloned from a disposable upstream outside `root`
+    /// (`clone_repo`'s own reason for one) and already `fetch`ed one commit behind it, so
+    /// `sync:behind` matches it from discovery's own first probe with nothing to wait out
+    /// beyond that probe settling.
+    #[cfg(feature = "fetch")]
+    fn behind_repo(
+        canonical_dir: &std::path::Path,
+        root: &std::path::Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let upstream = canonical_dir.join(format!("{name}-upstream"));
+        init_repo(&upstream);
+        let repo = root.join(name);
+        clone_repo(&upstream, &repo);
+        commit_a_file(&upstream, "b.txt", "b");
+        run_git(&repo, &["fetch", "origin"]);
+        repo
+    }
+
     /// Adds a real linked Worktree at `worktree`, on a new branch, off `parent`'s own repo.
     fn worktree_add(parent: &std::path::Path, worktree: &std::path::Path, branch: &str) {
         let status = std::process::Command::new("git")
@@ -9466,6 +9485,287 @@ mod tests {
         assert!(
             repo.join(marker).exists(),
             "the after_sync hook must have run against the real Repo once sync fast-forwarded it"
+        );
+    }
+
+    /// The bug this issue fixes, reproduced against real state: `sync:behind` matches
+    /// `repo-a` at discovery, a hand-built [`ManagementRun`] pins it as still pending
+    /// (position 1 of 1, nothing yet past it), then the real fast-forward
+    /// ([`ManagementHandle::attempt_auto_update`], the mechanism `sync` itself calls) and the
+    /// unrelated periodic metadata poll re-probing it (simulated here with a direct
+    /// `Core::refresh`, since its own two-second clock is not a fact a test can pin) must not
+    /// drop it from the filtered list before the run's own progress marker has moved past it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_still_pending_in_a_running_sync_stays_in_the_sync_behind_filter_after_its_branch_catches_up()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must start inside sync:behind, or this proves nothing"
+        );
+
+        let (_tx, rx) = mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(vec![repo_a_key.clone()]),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from("repo-a"),
+                position: 1,
+                total: 1,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        });
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            !app.filter.matches(
+                app.core
+                    .snapshot()
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == repo_a_key)
+                    .expect("repo-a is still in the table")
+            ),
+            "sanity: the re-probe must have caught the Cell up with the real fast-forward, \
+             or this proves nothing"
+        );
+
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "repo-a is still pending in the run (position 1 of 1) so it must stay in the \
+             sync:behind filter even though its own branch has caught up"
+        );
+    }
+
+    /// The other half of the same run: once its progress marker moves past a row (position
+    /// 2 of 2, `repo-a`'s own turn already done, `repo-b`'s own turn current), `repo-a`'s
+    /// slot in `Self::pending_management_keys` is gone the instant that happens, so a real
+    /// fast-forward plus the same re-probe drops it from the filter at once, on the very
+    /// frame this reads, never lagging behind the marker.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_whose_own_turn_in_the_management_run_has_already_finished_drops_out_of_the_filter_immediately()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let repo_a_key = key_named("repo-a");
+        let repo_b_key = key_named("repo-b");
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "sanity: both repos must start inside sync:behind, or this proves nothing"
+        );
+
+        let (_tx, rx) = mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(vec![repo_a_key.clone(), repo_b_key.clone()]),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from("repo-b"),
+                position: 2,
+                total: 2,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        });
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&repo_a_key),
+            "repo-a's own turn already finished (position 2 of 2), so it must drop out the \
+             instant its branch catches up rather than staying pinned"
+        );
+        assert!(
+            visible.contains(&repo_b_key),
+            "repo-b is still behind and untouched by this test, and must stay in the filter \
+             regardless of what repo-a's own row is doing"
+        );
+    }
+
+    /// A run in flight is not a blanket "hold every currently-behind row": `repo-b` is
+    /// behind but never named in the run's own `targets`, so once its branch catches up (the
+    /// same real fast-forward and re-probe the pinned cases above use) it must drop out of
+    /// `sync:behind` exactly as it would with no run outstanding at all, regardless of
+    /// `repo-a`'s own row still pending in that run.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_management_runs_pinning_never_holds_a_repo_outside_its_own_selection_in_the_filtered_list()
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let repo_a_key = key_named("repo-a");
+        let repo_b_key = key_named("repo-b");
+
+        let (_tx, rx) = mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Sync,
+            // `repo-b` is deliberately absent: this run's own Selection is `repo-a` alone.
+            targets: Arc::from(vec![repo_a_key.clone()]),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from("repo-a"),
+                position: 1,
+                total: 1,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        });
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_b_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_b_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+
+        let visible = app.visible_keys();
+        assert!(
+            !visible.contains(&repo_b_key),
+            "repo-b was never in this run's own Selection, so its catching up must drop it \
+             from sync:behind even while the run over repo-a alone is still outstanding"
+        );
+        assert!(
+            visible.contains(&repo_a_key),
+            "repo-a is still pending in its own run and untouched by this test, and must \
+             stay in the filter"
+        );
+    }
+
+    /// Once the run finishes ([`App::poll_management_run`]'s own effect on
+    /// `self.management_run`, driven directly here so this is not a race against a
+    /// background thread's own timing), `Self::pending_management_keys` goes back to empty
+    /// and every row the run touched, `repo-a` included, is judged by `sync:behind` alone
+    /// again: caught up, it must be gone.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn once_the_management_run_finishes_every_row_it_touched_is_judged_by_the_filter_alone_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        let repo_a_key = app.core.snapshot().entities[0].key.clone();
+
+        let (_tx, rx) = mpsc::channel();
+        app.management_run = Some(ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(vec![repo_a_key.clone()]),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from("repo-a"),
+                position: 1,
+                total: 1,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        });
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&repo_a_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&repo_a_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "sanity: repo-a must still be pinned while the run is outstanding, or this \
+             proves nothing about what its finishing changes"
+        );
+
+        app.management_run = None;
+
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "the run is over, so repo-a must be judged by sync:behind alone and drop out \
+             now that its branch has caught up"
         );
     }
 
