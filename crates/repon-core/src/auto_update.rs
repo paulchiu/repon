@@ -72,12 +72,12 @@ pub(crate) enum Outcome {
 pub(crate) fn attempt(path: &Path) -> Outcome {
     let repo = match gix::open(path) {
         Ok(repo) => repo,
-        Err(error) => return Outcome::Failed(render_error_chain(&error)),
+        Err(error) => return Outcome::Failed(describe_error_chain(error)),
     };
 
     let head = match git::head_shape(&repo) {
         Ok(head) => head,
-        Err(error) => return Outcome::Failed(render_error_chain(&error)),
+        Err(error) => return Outcome::Failed(describe_error_chain(error)),
     };
     let Head::Branch {
         name,
@@ -153,23 +153,21 @@ fn is_repo_clean_for_auto_update(
     head_commit: gix::ObjectId,
 ) -> Result<bool, String> {
     let cancel = Arc::new(AtomicBool::new(false));
-    let counts = git::dirty_counts(repo, cancel).map_err(|error| render_error_chain(&error))?;
+    let counts = git::dirty_counts(repo, cancel).map_err(describe_error_chain)?;
     if counts.total() > 0 {
         return Ok(false);
     }
 
     let head_tree = repo
         .find_commit(head_commit)
-        .map_err(|error| render_error_chain(&error))?
+        .map_err(describe_error_chain)?
         .tree_id()
-        .map_err(|error| render_error_chain(&error))?
+        .map_err(describe_error_chain)?
         .detach();
     let expected_index = repo
         .index_from_tree(&head_tree)
-        .map_err(|error| render_error_chain(&error))?;
-    let actual_index = repo
-        .open_index()
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
+    let actual_index = repo.open_index().map_err(describe_error_chain)?;
     Ok(index_snapshot(&expected_index) == index_snapshot(&actual_index))
 }
 
@@ -204,23 +202,14 @@ fn fast_forward(
 ) -> Result<(), String> {
     let from_tree = repo
         .find_commit(from)
-        .map_err(|error| render_error_chain(&error))?
+        .map_err(describe_error_chain)?
         .tree()
-        .map_err(|error| render_error_chain(&error))?;
-    let to_commit = repo
-        .find_commit(to)
-        .map_err(|error| render_error_chain(&error))?;
-    let to_tree = to_commit
-        .tree()
-        .map_err(|error| render_error_chain(&error))?;
-    let to_tree_id = to_commit
-        .tree_id()
-        .map_err(|error| render_error_chain(&error))?
-        .detach();
+        .map_err(describe_error_chain)?;
+    let to_commit = repo.find_commit(to).map_err(describe_error_chain)?;
+    let to_tree = to_commit.tree().map_err(describe_error_chain)?;
+    let to_tree_id = to_commit.tree_id().map_err(describe_error_chain)?.detach();
 
-    let mut changes = from_tree
-        .changes()
-        .map_err(|error| render_error_chain(&error))?;
+    let mut changes = from_tree.changes().map_err(describe_error_chain)?;
     changes.options(|options| {
         options.track_path();
         options.track_rewrites(None);
@@ -230,22 +219,22 @@ fn fast_forward(
             apply_change(change, work_dir)?;
             Ok(Action::Continue(()))
         })
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
 
     let mut new_index = repo
         .index_from_tree(&to_tree_id)
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
     new_index
         .write(Default::default())
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
 
     let full_ref = format!("refs/heads/{branch_name}");
     let mut reference = repo
         .find_reference(full_ref.as_str())
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
     reference
         .set_target_id(to, "repon: fast-forward auto-update")
-        .map_err(|error| render_error_chain(&error))?;
+        .map_err(describe_error_chain)?;
     Ok(())
 }
 
@@ -284,16 +273,15 @@ fn apply_change(change: Change<'_, '_, '_>, work_dir: &Path) -> Result<(), Strin
     }
 }
 
-/// Renders `error` and its full `source()` chain, outermost first, joined on one line:
-/// every `map_err` in this module reports through this rather than `to_string()` alone,
-/// which keeps only a wrapper's own message and drops the cause underneath it (gix's
-/// `for_each::Error::ForEach`, "The user-provided callback failed", is the case that
-/// motivated this).
-fn render_error_chain(error: &dyn std::error::Error) -> String {
-    let mut message = format!("{error}");
+/// Describes `error` and its full `source()` chain, outermost first, on one line: every
+/// `map_err` in this module reports through this rather than `to_string()` alone, which
+/// keeps only a wrapper's own message and drops the cause underneath it.
+fn describe_error_chain<E: std::error::Error>(error: E) -> String {
+    let mut message = format!("{error}").replace('\n', " ");
     let mut source = error.source();
     while let Some(current) = source {
-        message.push_str(&format!(": {current}"));
+        message.push_str(": ");
+        message.push_str(&format!("{current}").replace('\n', " "));
         source = current.source();
     }
     message
@@ -303,7 +291,7 @@ fn relative_path(location: &BStr) -> Result<&Path, String> {
     location.to_str().map(Path::new).map_err(|error| {
         format!(
             "non-UTF-8 path in a tree diff: {}",
-            render_error_chain(&error)
+            describe_error_chain(error)
         )
     })
 }
@@ -320,31 +308,30 @@ fn write_entry(
 ) -> Result<(), String> {
     let full_path = work_dir.join(relative_path(location)?);
     if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| render_error_chain(&error))?;
+        fs::create_dir_all(parent).map_err(describe_error_chain)?;
     }
-    let object = id.object().map_err(|error| render_error_chain(&error))?;
+    let object = id.object().map_err(describe_error_chain)?;
     match entry_mode.kind() {
         EntryKind::Blob => {
-            fs::write(&full_path, &object.data).map_err(|error| render_error_chain(&error))?;
+            fs::write(&full_path, &object.data).map_err(describe_error_chain)?;
             set_permissions(&full_path, 0o644)?;
         }
         EntryKind::BlobExecutable => {
-            fs::write(&full_path, &object.data).map_err(|error| render_error_chain(&error))?;
+            fs::write(&full_path, &object.data).map_err(describe_error_chain)?;
             set_permissions(&full_path, 0o755)?;
         }
         EntryKind::Link => {
             let target = object
                 .data
                 .to_path()
-                .map_err(|error| render_error_chain(&error))?
+                .map_err(describe_error_chain)?
                 .to_path_buf();
             match fs::remove_file(&full_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(render_error_chain(&error)),
+                Err(error) => return Err(describe_error_chain(error)),
             }
-            std::os::unix::fs::symlink(target, &full_path)
-                .map_err(|error| render_error_chain(&error))?;
+            std::os::unix::fs::symlink(target, &full_path).map_err(describe_error_chain)?;
         }
         EntryKind::Tree => {
             return Err(format!(
@@ -363,8 +350,7 @@ fn write_entry(
 }
 
 fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|error| render_error_chain(&error))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(describe_error_chain)
 }
 
 /// Removes `location` under `work_dir`, then prunes now-empty parent directories up to
@@ -376,7 +362,7 @@ fn remove_entry(work_dir: &Path, location: &BStr) -> Result<(), String> {
     match fs::remove_file(&full_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(render_error_chain(&error)),
+        Err(error) => return Err(describe_error_chain(error)),
     }
     let mut dir = full_path.parent();
     while let Some(candidate) = dir {
@@ -395,27 +381,90 @@ mod tests {
         commit_file, current_branch, git, head_sha, push_new_commit, remote_and_clone,
     };
 
-    /// No production line in this module renders an error by `to_string()` alone: every
-    /// `map_err` must go through [`render_error_chain`], the shared helper, or a call
-    /// site added by hand goes on quietly collapsing its own chain the way `fast_forward`
-    /// did before this ticket. Scans this file's own source rather than trusting review,
-    /// since the whole point is that a lone `to_string()` compiles just as cleanly.
+    /// The text between the `(` that opens at `open` (the index just past it) and its
+    /// matching `)`, tracking nesting depth so a call full of its own nested parens
+    /// (`format!("...", inner(..))`) does not fool the scan into stopping early.
+    fn balanced_parens(source: &str, open: usize) -> &str {
+        let mut depth = 1usize;
+        for (offset, character) in source[open..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses in module source starting at index {open}");
+    }
+
+    /// Every `.map_err(` call in this module, where a `dyn std::error::Error` is turned
+    /// into the `String` this module returns (directly, as `.map_err(describe_error_chain)`,
+    /// or through a closure that adds its own formatting around the call), renders
+    /// through [`describe_error_chain`]: a call site added by hand could otherwise
+    /// collapse its own chain the way `fast_forward` did before this ticket, and compile
+    /// just as cleanly. Checks for the *presence* of the helper's call in each site's own
+    /// argument, not the *absence* of one banned spelling of the bug (`.to_string()`), so
+    /// a differently-spelled bypass (`format!("{error}")`, say) cannot silently slip past
+    /// this test the way it slipped past an earlier version that only banned that one
+    /// spelling. [`write_entry`]'s two `fs::remove_file` match arms take the same shape
+    /// by hand rather than through `map_err` (matching on the `io::Error` first, to skip
+    /// a not-found error); `two_bare_err_arms_in_write_entry_and_remove_entry_also_render_through_describe_error_chain`
+    /// covers those two separately, by exact count rather than this scan's generic parsing.
     #[test]
-    fn no_production_line_in_this_module_renders_an_error_by_to_string_alone() {
+    fn every_map_err_closure_in_this_module_renders_through_describe_error_chain() {
         let source = include_str!("auto_update.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("splitting on a literal always yields at least the part before it");
 
-        let offending: Vec<&str> = production
-            .lines()
-            .filter(|line| line.contains(".to_string()"))
-            .collect();
+        let mut checked = 0;
+        let mut search_from = 0;
+        while let Some(relative) = production[search_from..].find(".map_err(") {
+            let open = search_from + relative + ".map_err(".len();
+            let argument = balanced_parens(production, open);
+            assert!(
+                argument.contains("describe_error_chain"),
+                "a .map_err( call does not render through describe_error_chain: {argument:?}"
+            );
+            checked += 1;
+            search_from = open;
+        }
 
         assert!(
-            offending.is_empty(),
-            "found `.to_string()` outside render_error_chain in production code: {offending:?}"
+            checked >= 20,
+            "expected at least 20 .map_err( sites in this module, found {checked}; \
+             the scan's own marker may no longer match this file's shape"
+        );
+    }
+
+    /// The two places this module turns an `io::Error` into the `String` it returns by
+    /// hand, outside a `.map_err(` closure ([`write_entry`]'s symlink overwrite and
+    /// [`remove_entry`], each matching the error first to let a not-found error through
+    /// as a no-op), by an exact count of the one literal arm shape both use: a rewrite to
+    /// any other spelling, `.to_string()` or `format!("{error}")` alike, changes the
+    /// count and fails this test.
+    #[test]
+    fn two_bare_err_arms_in_write_entry_and_remove_entry_also_render_through_describe_error_chain()
+    {
+        let source = include_str!("auto_update.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("splitting on a literal always yields at least the part before it");
+
+        let occurrences = production
+            .matches("Err(error) => return Err(describe_error_chain(error)),")
+            .count();
+
+        assert_eq!(
+            occurrences, 2,
+            "expected exactly 2 bare `Err(error) => return Err(describe_error_chain(error)),` \
+             arms (write_entry's symlink overwrite and remove_entry), found {occurrences}"
         );
     }
 
@@ -424,7 +473,7 @@ mod tests {
     }
 
     /// A purpose-built error with no `source()`, standing in for a leaf failure
-    /// ([`render_error_chain`]'s tests never reuse a real gix or io error, so the chain
+    /// ([`describe_error_chain`]'s tests never reuse a real gix or io error, so the chain
     /// length is exactly what the test author put there, not whatever a library happens
     /// to produce today).
     #[derive(Debug)]
@@ -439,7 +488,7 @@ mod tests {
     impl std::error::Error for LeafError {}
 
     /// An error whose `source()` is another error, for building a chain deeper than one
-    /// hop in [`render_error_chain`]'s own tests.
+    /// hop in [`describe_error_chain`]'s own tests.
     #[derive(Debug)]
     struct WrapperError {
         message: &'static str,
@@ -461,10 +510,10 @@ mod tests {
     /// A single-layer error with no source renders exactly as it does today: its own
     /// message, no trailing separator, no empty segment appended for the absent source.
     #[test]
-    fn render_error_chain_of_a_sourceless_error_is_exactly_its_own_message() {
+    fn describe_error_chain_of_a_sourceless_error_is_exactly_its_own_message() {
         let error = LeafError("disk is full");
 
-        let rendered = render_error_chain(&error);
+        let rendered = describe_error_chain(error);
 
         assert_eq!(rendered, "disk is full");
     }
@@ -472,7 +521,7 @@ mod tests {
     /// A cause nested two levels deep (a wrapper whose source is itself sourced) is still
     /// visible in the rendered text, outermost first, on one line.
     #[test]
-    fn render_error_chain_of_a_two_deep_source_includes_every_level_outermost_first() {
+    fn describe_error_chain_of_a_two_deep_source_includes_every_level_outermost_first() {
         let root_cause = LeafError("permission denied");
         let middle = WrapperError {
             message: "the user-provided callback failed",
@@ -483,12 +532,32 @@ mod tests {
             source: Box::new(middle),
         };
 
-        let rendered = render_error_chain(&outer);
+        let rendered = describe_error_chain(&outer);
 
         assert_eq!(
             rendered,
             "fast-forward failed: the user-provided callback failed: permission denied"
         );
+        assert!(
+            !rendered.contains('\n'),
+            "the message must stay on one line"
+        );
+    }
+
+    /// A `source()` whose own `Display` text spans multiple lines (some real errors read
+    /// that way) still renders onto one line, its embedded newline flattened, not left to
+    /// break the one-line guarantee every other test here only ever checks against
+    /// newline-free literals.
+    #[test]
+    fn describe_error_chain_flattens_a_multi_line_source_onto_one_line() {
+        let error = WrapperError {
+            message: "fast-forward failed",
+            source: Box::new(LeafError("disk is full\nretry later")),
+        };
+
+        let rendered = describe_error_chain(error);
+
+        assert_eq!(rendered, "fast-forward failed: disk is full retry later");
         assert!(
             !rendered.contains('\n'),
             "the message must stay on one line"
@@ -552,46 +621,31 @@ mod tests {
         );
     }
 
-    /// Pushes a commit that adds `dir/file` to `remote`, `dir` created fresh so the
-    /// commit always introduces that directory rather than assuming it already exists.
-    fn push_nested_file(remote: &Path, dir: &str, file: &str, contents: &str) {
-        let contributor = tempfile::tempdir().expect("temp dir");
-        let status = std::process::Command::new("git")
-            .arg("clone")
-            .arg(remote)
-            .arg(contributor.path())
-            .status()
-            .expect("run git clone");
-        assert!(status.success());
-        std::fs::create_dir(contributor.path().join(dir)).expect("mkdir");
-        std::fs::write(contributor.path().join(dir).join(file), contents)
-            .expect("write nested file");
-        git(contributor.path(), &["add", "."]);
-        git(contributor.path(), &["commit", "-m", "add a nested file"]);
-        git(contributor.path(), &["push", "origin", "main"]);
-    }
-
-    /// A callback failure ([`apply_change`] cannot write a path because the working tree
-    /// already has a plain file where the new commit needs a directory) must surface its
-    /// own message, not just gix's wrapper text, `The user-provided callback failed`, the
-    /// exact string this ticket was filed against.
+    /// A callback failure whose cause is [`write_entry`]'s own `fs::write` (the new
+    /// commit's file lands where the working tree already has a same-named directory)
+    /// must surface that io error's own message, not just gix's wrapper text, `The
+    /// user-provided callback failed`, the exact string this ticket was filed against.
+    /// `blocked` sits at the tree root, a plain [`Change::Addition`] of `EntryKind::Blob`
+    /// reaching `write_entry` directly: a nested path instead would hit gix's own
+    /// directory-level change notice first (`EntryKind::Tree`, handled by the untouched,
+    /// pre-existing arm below), never reaching a fs call this ticket touched at all.
     #[test]
     fn a_fast_forward_failure_from_a_callback_error_reports_the_callback_message() {
         let (remote, clone) = remote_and_clone();
         let from_sha = git_rev_parse(clone.path(), "refs/heads/main");
-        push_nested_file(remote.path(), "blocked", "inner.txt", "new content\n");
+        push_new_commit(remote.path(), "blocked", "new content\n");
         git(clone.path(), &["fetch", "origin"]);
         let to_sha = git_rev_parse(clone.path(), "refs/remotes/origin/main");
-        // `blocked` already exists in the working tree as a plain file, so writing the
-        // new commit's `blocked/inner.txt` cannot create that directory.
-        std::fs::write(clone.path().join("blocked"), "not a directory\n")
-            .expect("write a blocking file");
+        // `blocked` already exists in the working tree as a directory, so writing the new
+        // commit's `blocked` file there fails, an OS-level type mismatch that holds
+        // regardless of which user or permissions the test runs under.
+        std::fs::create_dir(clone.path().join("blocked")).expect("create a blocking directory");
         let repo = gix::open(clone.path()).expect("open the clone");
         let from = gix::ObjectId::from_hex(from_sha.as_bytes()).expect("parse from sha");
         let to = gix::ObjectId::from_hex(to_sha.as_bytes()).expect("parse to sha");
 
         let error = fast_forward(&repo, clone.path(), "main", from, to)
-            .expect_err("a file blocking the new directory must fail the fast-forward");
+            .expect_err("a directory blocking the new file must fail the fast-forward");
 
         assert!(
             error.starts_with("The user-provided callback failed: "),
