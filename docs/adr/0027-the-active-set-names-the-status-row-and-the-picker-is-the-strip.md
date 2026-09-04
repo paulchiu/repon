@@ -21,3 +21,11 @@ Three consequences follow. The status row's rank 1 is the active Set's name and 
 ## Amended by #258
 
 `s` is not the only key that draws the picker anymore. `Tab` does too, reported from manual use as the key a user reaches for to open the thing they tab through; moving focus between list and detail, Tab's old meaning in `global`, moves to `Shift+Tab` instead. The reasoning above is unaffected: it argues there is no strip drawn permanently across the top of the screen, not that `s` is the only route to the picker that draws in its place. See [keybindings.md](../spec/keybindings.md) for the updated map and [#258](https://github.com/paulchiu/repon/issues/258).
+
+## Amended by #398
+
+The picker teaches the numbers and now answers them. `1` to `9` are live while it is open, switching to that Set and closing it, where before they were inert there and worked everywhere else.
+
+This sharpens the argument above rather than reversing it. Numbering the rows was chosen as "the teaching surface for `1` to `9`, at the one moment the numbers are worth knowing", and a number shown at the moment it is worth knowing that does nothing when pressed is the gap between teaching and telling: the user reads `2` beside a name, presses it, and the surface built to explain the shortcut is the one place it did not work. Both routes now reach the same `App::switch_to_set`, so the picker gained no second implementation of the switch.
+
+Two boundaries. A refusal leaves the picker open, for either of `switch_to_set`'s two reasons, an out-of-range digit or a run already outstanding, so the Notice explaining the refusal is readable against the rows it refers to. And rows past the ninth still carry a name and no number, which makes `Enter` the only way to reach a tenth Set and the one thing the digits cannot do, exactly as the reasoning above requires. See [#398](https://github.com/paulchiu/repon/issues/398).

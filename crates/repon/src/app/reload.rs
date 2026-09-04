@@ -318,10 +318,13 @@ impl App {
     /// answering two different reasons with two different texts: refused for an out-of-range
     /// digit reads differently from refused because a run is live, which is what proves the
     /// reason is computed here rather than fixed for `SwitchToSet` as a whole.
-    pub(crate) fn switch_to_set(&mut self, nth: u8) {
+    /// Returns whether the switch actually happened, so a caller with its own surface to
+    /// close (the Set picker) branches on the outcome rather than recomputing one of the two
+    /// refusal conditions and missing the other.
+    pub(crate) fn switch_to_set(&mut self, nth: u8) -> bool {
         if self.any_run_outstanding() {
             self.set_notice(action_running_notice("Set switch"));
-            return;
+            return false;
         }
         let document = self.document.clone();
         let index = usize::from(nth).wrapping_sub(1);
@@ -329,9 +332,11 @@ impl App {
             Some(chosen) => {
                 self.apply_active_set(chosen, &document);
                 self.set_notice(switched_to_notice(chosen.name.get_ref()));
+                true
             }
             None => {
                 self.set_notice(no_such_set_notice(document.sets.len()));
+                false
             }
         }
     }

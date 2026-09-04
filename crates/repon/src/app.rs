@@ -393,9 +393,9 @@ pub struct App {
     /// `Tab`) and closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
     /// touching the active Set or starting a Generation. Its own `Action::Choose` (`Enter`)
-    /// routes the highlighted row through [`Self::switch_to_set`], the exact path the
-    /// positional `1`-`9` keys already take, so this can never become a second
-    /// implementation of the same switch.
+    /// and its `1`-`9` rows both route through [`Self::switch_to_set`], the exact path the
+    /// positional keys take outside it, so this can never become a second implementation of
+    /// the same switch.
     set_picker: Option<SetPicker>,
     /// The live Notice ([GLOSSARY.md](../../../GLOSSARY.md)'s glossary entry), if any: raised
     /// by [`Self::switch_to_set`] (naming the Set switched to, or naming how many are
@@ -1070,8 +1070,10 @@ impl App {
     ///
     /// `OpenSetPicker` (`s` or `Tab`) opens [`Self::set_picker`]
     /// ([keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context);
-    /// [`Self::handle_set_picker_key`] is what its own `Enter` routes through
-    /// [`Self::switch_to_set`], the same path `1` to `9` (`SwitchToSet`) already take.
+    /// [`Self::handle_set_picker_key`] is what its own `Enter` and its own `1` to `9`
+    /// (`SwitchToSet`, `overlay`'s own row for it) both route through
+    /// [`Self::switch_to_set`], the same call `1` to `9` already make from `list` and
+    /// `detail`.
     ///
     /// `OpenLauncher` (`!`) opens [`Self::launcher_palette`], `Context::Input` like the
     /// Action palette rather than `Context::Overlay` like the Set picker
@@ -1815,9 +1817,19 @@ impl App {
     /// [`Self::switch_to_set`] before closing the picker, the exact call the positional `1`
     /// to `9` keys make, never a second implementation of the same switch; `Close` (`Esc` or
     /// `q`) closes the picker with no such call at all, leaving the active Set and its
-    /// Generation untouched. The trailing `unreachable!` arm is the same proof-made-loud
-    /// shape [`Self::handle_action_palette_key`] already uses: `dispatch(Context::Overlay,
-    /// _)` can only ever return `Choose`, `Close`, one of the six scroll actions, or `None`.
+    /// Generation untouched.
+    ///
+    /// `SwitchToSet(nth)` (a bare digit, `overlay`'s own row for it) takes the same
+    /// [`Self::switch_to_set`] call `Choose` does and closes the picker only if that call
+    /// reports it switched. A refusal leaves the picker open with the active Set untouched
+    /// and `switch_to_set`'s own Notice standing, which covers both of its refusal reasons
+    /// (a digit past however many Sets are declared, and a run already outstanding) without
+    /// this arm having to know either.
+    ///
+    /// The trailing `unreachable!` arm is the same proof-made-loud shape
+    /// [`Self::handle_action_palette_key`] already uses: `dispatch(Context::Overlay, _)` can
+    /// only ever return `Choose`, `Close`, `SwitchToSet`, one of the six scroll actions, or
+    /// `None`.
     fn handle_set_picker_key(&mut self, key: KeyEvent) {
         match self.bindings.dispatch(Context::Overlay, key) {
             Some(Action::Close) => self.set_picker = None,
@@ -1827,6 +1839,14 @@ impl App {
                     self.switch_to_set(nth);
                 }
                 self.set_picker = None;
+            }
+            Some(Action::SwitchToSet(nth)) => {
+                // Bound rather than tested inline: as a match guard this would perform the
+                // switch while deciding which arm to take.
+                let switched = self.switch_to_set(nth);
+                if switched {
+                    self.set_picker = None;
+                }
             }
             Some(
                 action @ (Action::ScrollDown
@@ -1843,8 +1863,8 @@ impl App {
             }
             None => {}
             Some(other) => unreachable!(
-                "dispatch(Context::Overlay, _) only ever returns Choose, Close, a scroll \
-                 action or None while the Set picker is open, got {other:?}"
+                "dispatch(Context::Overlay, _) only ever returns Choose, Close, SwitchToSet, \
+                 a scroll action or None while the Set picker is open, got {other:?}"
             ),
         }
     }
@@ -7001,6 +7021,34 @@ mod tests {
         wait_for("the cancelled fan-out to finish", || {
             !app.core.action_running()
         });
+    }
+
+    /// AC5: the confirm gate dispatches through `Context::Confirm`, which answers only `y`,
+    /// `n` and Esc; a digit is none of those, so it must do nothing at all rather than reach
+    /// `SwitchToSet`. `app.quit_confirm` is set directly rather than driven through a real
+    /// fan-out, since [`Self::handle_quit_confirm_key`] is what is under test here, not how
+    /// the dialog opens.
+    #[test]
+    fn a_digit_pressed_at_the_quit_confirm_gate_does_nothing_rather_than_switching_sets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+        app.quit_confirm = true;
+
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("press a digit against the quit confirm gate");
+
+        assert!(
+            app.quit_confirm,
+            "a digit is not y, n or Esc, so the confirm gate must still be open"
+        );
+        assert!(!app.should_quit, "a digit must never confirm the quit");
+        assert_eq!(
+            app.active_set.name, "test",
+            "a digit at the confirm gate must never reach SwitchToSet"
+        );
     }
 
     /// `Ctrl+C` and `Ctrl+Z` are both unbound, so neither dispatches anything even mid
@@ -13048,6 +13096,32 @@ refresh_all = "z""#,
         assert_eq!(&*receipt.steps[0].output, b"UNSET");
     }
 
+    /// AC5: the Action palette's input dispatches through `Context::Input` the same as the
+    /// Filter line does, so a digit is text typed into the query, never `SwitchToSet`.
+    #[test]
+    fn a_digit_typed_into_the_action_palettes_input_is_text_not_a_set_switch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("type a digit into the palette's input");
+
+        assert_eq!(
+            app.action_palette.as_ref().map(ActionPalette::text),
+            Some("2"),
+            "the digit must land in the palette's own typed text"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "a digit typed into the Action palette's input must never reach SwitchToSet"
+        );
+    }
+
     /// Criterion 3: `Ctrl+O` must queue the same handoff `Self::run` drains with a live
     /// `Tui`, never run one on the spot. `pending_action_editor_handoff` staying `false`
     /// until that key is pressed, and the palette's own text staying untouched, is what
@@ -13435,11 +13509,15 @@ refresh_all = "z""#,
         );
     }
 
-    /// `keybindings.md`'s "suspended entirely" reading of `global` while `overlay` is
-    /// focused: a positional digit is `global`'s own binding, so it must not reach
-    /// `SwitchToSet` while the picker sits on top of it.
+    /// `overlay`'s own row for `SwitchToSet` ([keybindings.md](../../../docs/spec/keybindings.md)'s
+    /// "overlay" table): pressing a digit that names a declared Set while the picker is open
+    /// switches to it directly, with the cursor never moved onto that row first, and closes
+    /// the picker the same way `Enter` does. This is the picker's whole point: the numbers
+    /// it prints beside each Set are live where they are printed, not only from `list` and
+    /// `detail`.
     #[test]
-    fn a_positional_digit_is_inert_while_the_set_picker_is_open() {
+    fn pressing_a_declared_sets_own_digit_switches_to_it_and_closes_the_picker_without_moving_the_cursor_there_first()
+     {
         let dir_a = tempfile::tempdir().expect("temp dir a");
         let root_a = dir_a
             .path()
@@ -13458,15 +13536,173 @@ refresh_all = "z""#,
         app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
             .expect("open the picker");
         app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
-            .expect("press 2 while the picker is open");
+            .expect("press 2 while the picker is open, cursor still on row 0");
+
+        assert!(
+            app.set_picker.is_none(),
+            "a digit naming a declared Set must close the picker"
+        );
+        assert_eq!(
+            app.active_set.name, "second",
+            "2 must switch to the second declared Set even though the cursor never moved \
+             onto its row"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("switched to `second`"),
+            "the digit must raise the same Notice the picker's own Enter and the positional \
+             digit from `list` both raise"
+        );
+    }
+
+    /// Criterion 2: each digit names its own Set number, not the one before or after it.
+    /// Three declared Sets so an off-by-one in either direction (`2` landing on `alpha` or
+    /// `gamma` instead of `beta`) is distinguishable from the correct answer, not merely from
+    /// "nothing happened".
+    #[test]
+    fn each_digit_pressed_in_the_picker_names_its_own_set_number_not_a_neighbour() {
+        let names = ["alpha", "beta", "gamma"];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in names {
+            init_repo(&root.join(format!("repo-{name}")));
+        }
+        let sets = || {
+            names
+                .iter()
+                .map(|name| set_config(name, &root))
+                .collect::<Vec<_>>()
+        };
+
+        for (digit, expected) in [('1', "alpha"), ('2', "beta"), ('3', "gamma")] {
+            let mut app = test_app(&root);
+            app.document.sets = sets();
+
+            app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+                .expect("open the picker");
+            app.handle_key_event(press(KeyCode::Char(digit), KeyModifiers::NONE))
+                .expect("press the digit");
+
+            assert_eq!(
+                app.active_set.name, expected,
+                "{digit:?} must switch to {expected:?}, not a neighbouring declared Set"
+            );
+        }
+    }
+
+    /// AC3: a digit past however many Sets are declared must leave the picker open and the
+    /// active Set untouched, the same refusal [`crate::app::reload`]'s own
+    /// `switch_to_set_computes_its_refusal_reason_at_the_point_of_refusal_not_fixed_per_action`
+    /// pins for the positional digit outside the picker, reused here rather than a second
+    /// refusal path: `handle_set_picker_key` decides whether to close the picker from the
+    /// same bounds check `switch_to_set` itself refuses on.
+    #[test]
+    fn a_digit_naming_no_declared_set_leaves_the_picker_open_and_the_active_set_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root)];
+
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Char('9'), KeyModifiers::NONE))
+            .expect("press 9 against a document declaring only one Set");
 
         assert!(
             app.set_picker.is_some(),
-            "an inert key must leave the picker open"
+            "a digit naming no declared Set must leave the picker open"
         );
         assert_eq!(
             app.active_set.name, "test",
-            "the positional digit must not reach SwitchToSet while overlay suspends global"
+            "a digit naming no declared Set must not change the active Set"
+        );
+        assert_eq!(
+            app.notice(),
+            Some("only 1 Set declared; press s to pick one"),
+            "expected the same out-of-range Notice the positional digit raises outside the \
+             picker"
+        );
+    }
+
+    /// `switch_to_set` refuses for two reasons, not one: an out-of-range digit and a live
+    /// fan-out. The picker stays open for both, since in neither case did the Set actually
+    /// change, and a picker that closes on a refusal hides the Notice explaining it.
+    #[test]
+    fn a_digit_refused_because_a_run_is_outstanding_also_leaves_the_picker_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("other", &root)];
+
+        // The picker opens first: `s` is itself gated while a run is outstanding, so a run
+        // started before it would leave nothing open for the digit to be refused in.
+        app.handle_key_event(press(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("open the picker");
+
+        let keys: Vec<_> = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .map(|entity| entity.key.clone())
+            .collect();
+        let slow = repon_core::ActionSpec {
+            label: std::sync::Arc::from("slow"),
+            name: Some(std::sync::Arc::from("slow")),
+            steps: vec![repon_core::Step {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                shell: false,
+                env: Vec::new(),
+            }],
+            concurrency: 1,
+            when: None,
+        };
+        assert!(app.core.run_action(slow, &keys));
+
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("press a perfectly valid digit while the fan-out is live");
+
+        assert!(
+            app.set_picker.is_some(),
+            "a digit refused because a run is outstanding must leave the picker open, the \
+             way an out-of-range digit does"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "the refused switch must leave the active Set untouched"
+        );
+
+        app.core.stop_action();
+    }
+
+    /// The digits reach `Context::Overlay`, which the help overlay shares with the Set
+    /// picker, so what keeps them out of help's search query is dispatch order alone:
+    /// `keys::printable` is consulted before `Context::Overlay` while a query is open. That
+    /// ordering is load-bearing and otherwise unasserted, so a reordering would silently
+    /// turn typing `2` into a Set switch mid-search.
+    #[test]
+    fn a_digit_typed_into_the_help_overlays_search_is_query_text_not_a_set_switch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("other", &root)];
+
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("open the help overlay");
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter help's search mode");
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("type a digit into the query");
+
+        let overlay = app.help.as_ref().expect("the help overlay stays open");
+        assert!(overlay.is_searching(), "help stays in search mode");
+        assert_eq!(overlay.query(), "2", "the digit is query text");
+        assert_eq!(
+            app.active_set.name, "test",
+            "typing a digit into help's search must not switch Sets"
         );
     }
 
@@ -14204,6 +14440,34 @@ refresh_all = "z""#,
         );
         assert_eq!(app.filter.as_str(), "shown");
         assert_eq!(app.visible_keys().len(), 1);
+    }
+
+    /// AC5: the Filter line dispatches through `Context::Input`
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s contexts table), which never
+    /// falls back to `overlay`'s `SwitchToSet` row, so a digit is query text like any other
+    /// character, never a Set switch.
+    #[test]
+    fn a_digit_typed_into_the_filter_line_is_text_not_a_set_switch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.sets = vec![set_config("test", &root), set_config("second", &root)];
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter");
+        app.handle_key_event(press(KeyCode::Char('2'), KeyModifiers::NONE))
+            .expect("type a digit into the Filter line");
+
+        assert_eq!(
+            app.active_filter().as_str(),
+            "2",
+            "the digit must land in the Filter line's own live buffer as text"
+        );
+        assert_eq!(
+            app.active_set.name, "test",
+            "a digit typed into the Filter line must never reach SwitchToSet"
+        );
     }
 
     #[test]
