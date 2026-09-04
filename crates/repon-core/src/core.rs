@@ -4318,14 +4318,14 @@ fn probe_patch_equivalence(
             // No shared history at all: a real negative, mirrored from
             // `patch_equivalence::probe`'s own handling. This entity needs no
             // bound and no shared scan, so it reports and settles without
-            // waiting on either; an empty set is never actually consulted,
-            // since `probe` recomputes the same `None` and returns `Active`
-            // before it would look.
+            // waiting on either; the empty set is never actually consulted,
+            // since `probe` returns `Active` for a `None` merge base before it
+            // would look.
             report.report_now(None);
             return Some(patch_equivalence::probe(
                 repo,
                 entity_tip,
-                default_tip,
+                None,
                 &patch_equivalence::PatchIdentitySet::new(),
             ));
         }
@@ -4350,7 +4350,7 @@ fn probe_patch_equivalence(
     Some(patch_equivalence::probe(
         repo,
         entity_tip,
-        default_tip,
+        Some(merge_base),
         &shared,
     ))
 }
