@@ -65,6 +65,12 @@ pub(crate) enum Action {
     AnchorRange,
     SelectAllVisible,
     ClearSelection,
+    /// `Alt+/`: clears a committed Filter directly, without touching the Selection, the
+    /// detail pane or a running Action
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)'s unwind stack still
+    /// clears one too, at its own last rung; this is a second, direct route to the same
+    /// effect, not a replacement for it).
+    ClearFilter,
     OpenDetail,
     DismissVanished,
     NextFailed,
@@ -207,6 +213,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::AnchorRange => "Anchor a range at the cursor, extended with `j` and `k`",
         Action::SelectAllVisible => "Select every listed row, not just this screenful",
         Action::ClearSelection => "Clear the Selection",
+        Action::ClearFilter => "Clear the committed Filter",
         Action::OpenDetail => "Open the detail pane",
         Action::DismissVanished => "Dismiss a Vanished row",
         Action::NextFailed => "Next failed row",
@@ -531,6 +538,7 @@ const BINDINGS: &[Binding] = &[
         SHIFT,
         Action::ClearSelection,
     ),
+    binding(Context::List, KeyCode::Char('/'), ALT, Action::ClearFilter),
     binding(Context::List, KeyCode::Enter, NONE, Action::OpenDetail),
     binding(
         Context::List,
@@ -995,6 +1003,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::AnchorRange => "anchor_range",
         Action::SelectAllVisible => "select_all_visible",
         Action::ClearSelection => "clear_selection",
+        Action::ClearFilter => "clear_filter",
         Action::OpenDetail => "open_detail",
         Action::DismissVanished => "dismiss_vanished",
         Action::NextFailed => "next_failed",

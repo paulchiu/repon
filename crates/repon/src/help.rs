@@ -843,8 +843,10 @@ mod tests {
     }
 
     /// A frame comfortably larger than the border/content minimum, for every test that is not
-    /// itself exercising the degrade threshold.
-    const ROOMY_FRAME: Rect = Rect::new(0, 0, 100, 40);
+    /// itself exercising the degrade threshold. Tall enough to hold every `List`-context line
+    /// (its own bindings, `global`'s, and the glyph legend) with room to spare, so a binding
+    /// added to the default map does not silently scroll the legend heading out of view here.
+    const ROOMY_FRAME: Rect = Rect::new(0, 0, 100, 70);
 
     /// Renders `overlay` at `width`x`height` for `context` and hands back the terminal so a
     /// test can read its buffer: the one render path every rendering test below shares.
@@ -928,6 +930,19 @@ mod tests {
             HelpLine::Blank => panic!("expected a real line, not the blank separator"),
         };
         text.chars().next().expect("expected a non-empty line")
+    }
+
+    /// The symbol [`HelpOverlay::draw_line`] actually paints at `line`'s own row, first
+    /// column: [`leading_char`] for a real line, or a bare space for [`HelpLine::Blank`],
+    /// which paints nothing and so reads back as the buffer's own untouched cell. Unlike
+    /// `leading_char`, this never panics: a test asserting "the left column keeps going" past
+    /// where a shorter right column ran out must hold whichever line lands there, blank
+    /// separator included, rather than assuming row counts always dodge one.
+    fn rendered_symbol(line: &HelpLine) -> String {
+        match line {
+            HelpLine::Blank => " ".to_string(),
+            other => leading_char(other).to_string(),
+        }
     }
 
     // --- content is derived, not transcribed, and stays unjoined ---
@@ -2349,10 +2364,9 @@ mod tests {
             " ",
             "expected nothing painted in the right column once it runs out of rows"
         );
-        let left_char = leading_char(&left[exhausted_row]);
         assert_eq!(
             buf[(area.x, y)].symbol(),
-            left_char.to_string(),
+            rendered_symbol(&left[exhausted_row]),
             "expected the left column to keep going past where the right one ran out"
         );
     }
