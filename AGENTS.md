@@ -6,7 +6,11 @@
 
 **2. Pull the issue and work in a worktree.** Read it with `gh issue view <number> --comments`, then branch into a worktree of its own rather than working in place. Reach for the cheapest subagent that can do the job, and a workflow only when the work genuinely fans out.
 
-**3. Ship it.** Once `just ci` passes, push, open the PR, merge. On `main`, after the merge, bump the version with `cargo set-version --workspace <version>` and commit it: this is the ship step's job, not the feature branch's, since every branch working off the same `main` would otherwise bump to the same number and collide on `Cargo.toml` and `Cargo.lock` for no reason. The number is semantic. A change that gives a user something they could not do before moves the minor; one that fixes or tightens what was already there moves the patch; a breaking change moves the minor as well, because the major is held at 0 until the maintainer says Repon is ready for 1.0. Never move the major yourself. Then either publish a new version or install locally so it can be tried.
+**3. Ship it.** Once `just ci` passes, push and open the PR. Every PR carries exactly one of the labels `major`, `minor`, `patch` or `norelease`, and a check fails the PR until it does. Merging a labelled PR bumps the version by that label, tags it and releases it; `norelease` merges and moves nothing. Do not run `cargo set-version` yourself and do not commit a version bump on a branch: the version is the tag pipeline's to move, and two branches off the same `main` would otherwise bump to the same number and collide on `Cargo.toml` and `Cargo.lock`.
+
+The label is semantic. A change that gives a user something they could not do before is `minor`; one that fixes or tightens what was already there is `patch`; a breaking change is `minor` too, because the major is held at 0 until the maintainer says Repon is ready for 1.0. Never apply `major` yourself. `norelease` is for a change that alters nothing a user or a consumer of `repon-core` can observe, so a docs-only or CI-only change; when in doubt, `patch`.
+
+What the tag then does is [docs/spec/releasing.md](docs/spec/releasing.md): both crates go to crates.io, binaries and a Homebrew formula go out with them.
 
 ## What you need to know first
 

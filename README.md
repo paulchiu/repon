@@ -10,13 +10,25 @@ Repon owns the outer loop: the combined state of many Repos, and acting on many 
 
 Pre-alpha, but no longer the skeleton this section once described. Repon discovers Repos, Worktrees and Submodules and refreshes their state in a cancellable background generation. The list filters live against a total, three-valued Filter language, where an unsettled cell answers neither a term nor its negation. Configured or typed Actions fan out across a Selection as PTY-backed child processes, with the detail pane showing each step's output as it runs. A Launcher hands off to lazygit, an editor or a shell in the Repo under the cursor and restores the terminal on return. `ignore`, `unignore` and `delete` manage the `[[repo]]` entries Repon owns. Themes correct the terminal's own palette, degrading to a vetted ASCII glyph set when a font lacks the full one.
 
-The periodic fetch and the fast-forward-only auto-update it can carry run whenever `config.toml` turns them on. Still no crates.io, still Unix-only. What's cleared and what's left before the first publish is [docs/spec/releasing.md](docs/spec/releasing.md).
+The periodic fetch and the fast-forward-only auto-update it can carry run whenever `config.toml` turns them on. Unix-only, deliberately. The release pipeline is built and every channel below is wired to one tag, but no tag has been cut yet: [docs/spec/releasing.md](docs/spec/releasing.md).
 
 ## Installing
 
 Repon runs on macOS and Linux. It is not portable to Windows and will not be: an Action puts each step in a new session with `setsid(2)` and reads it back over a PTY, and Windows has neither.
 
-Nothing is published to crates.io yet, so install from the repository:
+Once the first release is tagged, Homebrew is the shortest route and needs no Rust toolchain:
+
+```sh
+brew install paulchiu/tap/repon
+```
+
+crates.io opens with the same tag:
+
+```sh
+cargo install repon --locked
+```
+
+No tag has been cut yet, so until then install from the repository:
 
 ```sh
 cargo install --git https://github.com/paulchiu/repon --locked repon
@@ -24,7 +36,7 @@ cargo install --git https://github.com/paulchiu/repon --locked repon
 
 That needs a Rust toolchain and takes about a minute. If your git configuration rewrites GitHub HTTPS URLs to SSH, cargo's own git client cannot authenticate against it; prefix the command with `CARGO_NET_GIT_FETCH_WITH_CLI=true` to fetch through the git CLI instead.
 
-The release story, including what has to be true before the first crates.io publish, is [ADR 0021](docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) and [docs/spec/releasing.md](docs/spec/releasing.md).
+What each channel is and what feeds it is [ADR 0021](docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) and [docs/spec/releasing.md](docs/spec/releasing.md).
 
 ## Building
 

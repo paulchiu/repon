@@ -1,0 +1,41 @@
+# The crates.io leg of the release, called by the dist-generated release.yml as
+# a custom publish job. It is a job inside that pipeline rather than a workflow
+# of its own because 0021 requires the registry to be fed by the same trigger as
+# every other channel: a channel fed by hand is a channel that silently stops
+# being fed. dist does not publish to registries, so this is the seam it offers
+# for one that does.
+
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # docs/spec/releasing.md's rehearsal command minus --dry-run. --workspace
+      # is what makes it work at all: cargo orders the publishes itself, library
+      # first, and waits for the index between them, so repon's pinned
+      # dependency on repon-core resolves from the workspace rather than from a
+      # registry that does not carry it yet.
+      - name: Publish both crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked
