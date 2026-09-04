@@ -92,9 +92,12 @@ impl Tui {
     /// (explicit, against an inherited enabled state), focus reporting on. Also diverts fd 2
     /// to the log file ([`redirect_stderr_to_log`]) for as long as the screen is held: a
     /// separate concern from the five, since it has no ANSI trace and nothing releases it,
-    /// only [`restore`] putting the real fd back.
+    /// only [`restore`] putting the real fd back. Stdin's `O_NONBLOCK` flag
+    /// ([`set_stdin_nonblocking`]) is a third such concern, needed only for as long as the
+    /// event thread is the one reading it.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
+        set_stdin_nonblocking()?;
         redirect_stderr_to_log()?;
         write_enter_sequence(&mut stdout())?;
         self.start();
@@ -224,8 +227,47 @@ pub fn restore() -> std::io::Result<()> {
     // not skip disabling raw mode, which is the half the shell inherits.
     let left = write_restore_sequence(&mut stdout());
     let raw = crossterm::terminal::disable_raw_mode();
+    let blocking = clear_stdin_nonblocking();
     let stderr = restore_stderr();
-    left.and(raw).and(stderr)
+    left.and(raw).and(blocking).and(stderr)
+}
+
+/// Makes stdin's raw reads return `WouldBlock` once nothing more is immediately available
+/// rather than parking the calling thread: what the event thread's underlying event source
+/// (crossterm's `mio`-based reader, [`event_loop`]) already handles on a `WouldBlock`, but
+/// never itself arranges, since it inherits stdin from the shell as an ordinary blocking
+/// descriptor. Without this, a partial escape sequence left in stdin (crossterm's own CSI
+/// parser waits unconditionally past its first two bytes, regardless of whether a further byte
+/// is actually coming) leaves the thread's next raw read blocked on bytes that may never
+/// arrive, deaf to [`Tui::stop`] clearing `running`.
+fn set_stdin_nonblocking() -> std::io::Result<()> {
+    set_fd_nonblocking(libc::STDIN_FILENO, true)
+}
+
+/// The mirror of [`set_stdin_nonblocking`], called by [`restore`] so a handed-off child, or the
+/// shell once Repon exits, finds stdin exactly as blocking as it was handed.
+fn clear_stdin_nonblocking() -> std::io::Result<()> {
+    set_fd_nonblocking(libc::STDIN_FILENO, false)
+}
+
+/// Adds or removes `O_NONBLOCK` on `fd`'s current flags, preserving every other flag already
+/// set.
+fn set_fd_nonblocking(fd: RawFd, nonblocking: bool) -> std::io::Result<()> {
+    // Safety: `fd` is a valid, currently-open descriptor for the duration of both calls below.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // Safety: same as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The real fd 2, saved by [`redirect_stderr_to_log`] so [`restore_stderr`] can put it back.

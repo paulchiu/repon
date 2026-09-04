@@ -83,6 +83,11 @@ fn main() -> color_eyre::Result<()> {
     }
 
     #[cfg(debug_assertions)]
+    if args.exit_after_delay_once_tui_entered {
+        return exit_after_delay_once_tui_entered();
+    }
+
+    #[cfg(debug_assertions)]
     if let Some(new_value) = &args.reprint_config_path_after_env_change {
         return reprint_config_path_after_env_change(new_value);
     }
@@ -251,6 +256,23 @@ fn write_raw_stderr_after_tui_enter() -> color_eyre::Result<()> {
     .join()
     .expect("the stderr-writing thread must not panic");
     tui.exit()?;
+    Ok(())
+}
+
+/// Claims the terminal, waits long enough for a test to act, then calls `Tui::exit` and prints
+/// a marker. A minimal harness for `terminal_restoration.rs` to inject a partial escape
+/// sequence into stdin during that wait and observe whether `Tui::exit` (`Tui::stop` joining
+/// the event thread) still returns, rather than only asserting a description of it: quitting on
+/// a real keypress instead would depend on crossterm's own parser ever producing one again,
+/// which a stranded escape sequence is not guaranteed to do, and is not what this proves.
+#[cfg(debug_assertions)]
+fn exit_after_delay_once_tui_entered() -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    tui.exit()?;
+    println!("EXIT_AFTER_DELAY_MARKER");
     Ok(())
 }
 
