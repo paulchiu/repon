@@ -1134,7 +1134,7 @@ mod tests {
             offending.is_empty(),
             "found `{needle}`; a legitimate step can take minutes, so there is no per-step \
              timeout, configurable or fixed, only per-step elapsed time \
-             (docs/spec/actions.md's \"Cancellation, suspend and quit\"), at: {offending:?}"
+             (docs/spec/actions.md's \"Cancellation and quit\"), at: {offending:?}"
         );
     }
 
@@ -1421,8 +1421,8 @@ mod tests {
     /// all.
     ///
     /// Four go through `Core::refresh`, which takes the order the caller computed:
-    /// returning from suspension (`App::on_resume`, shared by a bare `SIGTSTP` and a
-    /// Launcher's own handoff), `Action::RefreshAll`, terminal focus gained
+    /// returning from a terminal handoff (`App::on_resume`, shared by a Launcher's own
+    /// handoff and the ad-hoc `$EDITOR` one), `Action::RefreshAll`, terminal focus gained
     /// (`App::on_focus_gained`) and `Action::RefreshSelection`.
     ///
     /// Three go through `Core::start`, whose own first walk is that `Core`'s Generation 1
@@ -1634,8 +1634,8 @@ mod tests {
     /// `repon-core` for the same reason `RefreshHandles::dispatch` above is, and scanned the
     /// same confined way. Its three production callers are `Core::run_action`'s own first
     /// move (an Action starting, one of the nine triggers), `spawn_clock_thread`'s handling
-    /// of `ClockControl::Pause` (the Suspension mechanism `App::run`'s `SIGTSTP` branch and
-    /// `App::around_entity_handoff` both drive through `Core::pause`), and `Core::drop`
+    /// of `ClockControl::Pause` (which `App::around_entity_handoff` and
+    /// `App::around_ad_hoc_editor_handoff` both drive through `Core::pause`), and `Core::drop`
     /// (a `Core` going away, which a Set switch's rebuild does while its fan-out is still
     /// running). None of the three is a trigger of its own: each only ever cancels and
     /// starts nothing, so none mints a Generation for this ticket's own "exactly nine" to

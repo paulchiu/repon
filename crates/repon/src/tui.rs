@@ -818,11 +818,10 @@ mod tests {
     }
 
     /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-and-confirming): raw mode
-    /// clears ISIG, so quit is an ordinary key handler rather than a signal handler, and
-    /// `Tui::suspend`'s own `SIGTSTP` raise was this crate's only legitimate `signal_hook`
-    /// use. With that gone, this crate has no legitimate use for it at all, so the guard now
-    /// polices the dependency's absence directly, in `Cargo.toml` and in source, rather than
-    /// the one call site that used to be its only user.
+    /// clears ISIG, so quit is an ordinary key handler rather than a signal handler, and this
+    /// crate raises no signal at itself for any reason. It therefore has no legitimate use
+    /// for `signal_hook` at all, which is why the guard polices the dependency's absence
+    /// outright rather than allowing one blessed call site.
     #[test]
     fn no_trace_of_the_removed_signal_dependency_remains() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

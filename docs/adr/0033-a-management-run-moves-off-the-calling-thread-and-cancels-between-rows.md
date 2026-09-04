@@ -29,3 +29,7 @@ So `Action::Unwind`'s own `CancelManagementOnUnwind` level, tried at the same in
 - `docs/spec/repo-management.md`'s "Once accepted" is rewritten to describe the background thread, the keys still gated and still live, and the between-rows cancellation grain; its "Writing config" section's "same frame the write completes" is now "the first tick after its background thread finishes", since a write genuinely no longer completes inside the keystroke's own frame.
 - `docs/spec/keybindings.md`'s "Quitting, suspending, confirming" now names a management run alongside an Action fan-out everywhere it already named the latter alone.
 - No change to what a management operation does, what it gates, or what it writes: `repo-management.md`'s receipts, refusals and confirm-gate wording otherwise stand, and the safety guards `remove_working_tree` and its callers already carry (the absolute-path and `.git` checks) are unmoved, since only which thread calls them changed.
+
+## Amended by #399
+
+Two references above name things that no longer exist. `docs/spec/keybindings.md`'s section is now "Quitting and confirming", and the gate this ADR gave `q` and `Ctrl+C` alike is `q`'s alone, since `Ctrl+C` is unbound. The decision itself is untouched: a management run and an Action fan-out are still both outstanding work that a quit would abandon, `App::any_run_outstanding` still combines them, and the confirm still stands in front of the one binding that can now reach it. See [#399](https://github.com/paulchiu/repon/issues/399).

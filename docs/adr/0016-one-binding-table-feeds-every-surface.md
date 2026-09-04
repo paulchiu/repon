@@ -49,3 +49,11 @@ The table is no longer a pure function of context. While an Action is fanning ou
 - Quit and suspend are implemented rather than inherited: raw mode delivers Ctrl+C and Ctrl+Z as key events, so Repon handles them or nothing does.
 - Mouse support is a deliberate no with a named reopening condition, someone wanting to try it, because capture takes the terminal's select-and-copy away from a screen full of copyable paths.
 - The `[keys]` schema is keyed on action names, so renaming an action is a breaking config change and carries the same weight as removing a key from config.toml.
+
+## Amended by #399
+
+Quit is still implemented rather than inherited; suspend is no longer implemented at all. The consequence above reads "Repon handles them or nothing does" as an argument for handling both, and for Ctrl+Z the second half is now the answer taken deliberately: nothing does. `Ctrl+C` and `Ctrl+Z` bind nothing in any context, `Action::Suspend` and `Tui::suspend` are gone, and `q` is the whole of quitting.
+
+The premise the consequence rests on is untouched and is exactly why this is a decision rather than a bug. `cfmakeraw` really does clear ISIG, so these two chords really do arrive as key events, and a user pressing Ctrl+C in Repon really does get nothing. That is the cost, accepted with open eyes: the chords read as shell reflexes a user expects the terminal to provide, and providing a private imitation of them earns a binding, a help row and a footer hint each for behaviour `q` already covers, plus a suspend path whose only reason to exist was the chord that drove it. Two entries in the surviving Ctrl set (`c` and `z`) come back for a future binding that has a reason of its own.
+
+Ctrl+S and Ctrl+Q were always in this position and the map never bound them either, so the shape is not new here; what changed is that the map now treats Ctrl+C and Ctrl+Z the same way, and a test asserts neither appears in `BINDINGS` in any context rather than trusting the table to be read. See [#399](https://github.com/paulchiu/repon/issues/399).

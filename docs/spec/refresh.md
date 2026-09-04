@@ -22,7 +22,7 @@ One refresh is one generation, identified by a monotonic counter. Every job disp
 
 Only the two refresh keys carry the hook, and the rest of this table deliberately does not. Terminal focus gained is best effort and terminal dependent, so a script would run or not run depending on a multiplexer option; a resume is the moment the user was doing inner-loop work by hand; and a finished fetch is a background tick nobody aimed at anything. All three are Repon deciding rather than the user asking, which is the line [0002](../adr/0002-repon-owns-the-outer-loop-only.md) draws. "The refresh key" names an Action, not a character: a chord dispatching `Action::RefreshAll` or `Action::RefreshSelection` carries the hook whether it is `r`, `F5` or a user's own rebind, because the hook is wired to the Action the merged binding table dispatches rather than to the keystroke itself.
 
-The Launcher return is the most precise signal in the design. Repon suspends, execs the tool and resumes, so the `SIGTSTP` call returning is a deterministic 'I am back' moment, and Repon knows exactly which entity the user was just working in.
+The Launcher return is the most precise signal in the design. Repon releases the terminal, execs the tool and reclaims it, so the child's own wait returning is a deterministic 'I am back' moment, and Repon knows exactly which entity the user was just working in.
 
 ## The phases
 

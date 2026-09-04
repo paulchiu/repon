@@ -117,7 +117,7 @@ fn no_such_set_notice(declared: usize) -> String {
 }
 
 /// The Notice each binding inert while an Action is fanning out
-/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+/// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting and
 /// confirming") raises, in place of the silence they answer with today: `what` names the
 /// thing the press would otherwise have opened or done, read at the point of refusal rather
 /// than a table keyed on the action, which is what let `m` join them for one call site rather
@@ -312,7 +312,7 @@ impl App {
     ///
     /// Checked first, ahead of either of those two reasons: `1` to `9` is one of the four
     /// bindings inert while an Action is fanning out or a management run is outstanding
-    /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// ([keybindings.md](../../../../docs/spec/keybindings.md)'s "Quitting and
     /// confirming"), and a Set switch discards discovery and starts a fresh Generation, which
     /// must never race a fan-out's own completion Generation. This is the same action
     /// answering two different reasons with two different texts: refused for an out-of-range

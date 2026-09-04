@@ -449,7 +449,7 @@ pub struct App {
     /// lives in: kept as fields, not re-derived, so [`Self::reread_theme`] can read the same
     /// file again on every return from suspension without touching `Config` at all.
     /// theming.md: "The theme is read at startup and read again on resume, both from a
-    /// Launcher returning and from SIGTSTP."
+    /// Launcher returning and from the ad-hoc `$EDITOR` handoff."
     theme_name: String,
     theme_source: theme::ThemeSource,
     themes_dir: PathBuf,
@@ -2859,7 +2859,8 @@ impl App {
     /// Re-reads the theme file this run resolved to (`self.theme_name` under
     /// `self.theme_source`, in `self.themes_dir`), updating `self.theme` and
     /// `self.theme_warnings` in place. theming.md: "The theme is read at startup and read
-    /// again on resume, both from a Launcher returning and from SIGTSTP." A failure here is
+    /// again on resume, both from a Launcher returning and from the ad-hoc `$EDITOR`
+    /// handoff." A failure here is
     /// logged and otherwise swallowed, the same grade `Self::apply_reloaded_config`'s own
     /// theme reload gives a failure once the terminal is already claimed.
     fn reread_theme(&mut self) {
@@ -2921,20 +2922,14 @@ impl App {
     }
 
     /// Resumes background work and starts a normal Generation over everything, then re-reads
-    /// the theme file. Shared by every return from suspension: refresh.md's "On resume ... a
-    /// normal generation starts. Nothing is queued to fire on return," and theming.md's
-    /// theme-reread rule, both stated once for `SIGTSTP` and a Launcher's own handoff alike.
-    /// The population and cursor are still the ones suspension found, since nothing about
-    /// discovery changes across a suspend, so [`Self::refresh_everything_order`]'s tiering
-    /// applies unchanged.
+    /// the theme file. Shared by every return from a terminal handoff: refresh.md's "On
+    /// resume ... a normal generation starts. Nothing is queued to fire on return," and
+    /// theming.md's theme-reread rule, stated once for a Launcher's own handoff and for the
+    /// ad-hoc `$EDITOR` one alike. The population and cursor are still the ones the handoff
+    /// found, since nothing about discovery changes across one, so
+    /// [`Self::refresh_everything_order`]'s tiering applies unchanged.
     fn on_resume(&mut self) {
         self.core.resume();
-        // `continue_action` undoes `hold_action`'s own SIGSTOP; called unconditionally, the
-        // same shape `resume` above already takes, since it is a no-op with no fan-out held
-        // (in particular, harmless here on the return path from a Launcher handoff, which
-        // never held one in the first place: `!` stays live during a run precisely because
-        // that handoff sends the fan-out's step groups no signal at all).
-        self.core.continue_action();
         self.core.refresh(&self.refresh_everything_order());
         self.reread_theme();
     }
@@ -10393,8 +10388,8 @@ mod tests {
         );
     }
 
-    /// "It never runs after ... a resume", covering both ways back into the screen: a bare
-    /// `SIGTSTP` and a Launcher's own handoff share `App::on_resume`.
+    /// "It never runs after ... a resume", covering both ways back into the screen: the
+    /// ad-hoc `$EDITOR` handoff and a Launcher's own share `App::on_resume`.
     #[test]
     fn a_resume_never_runs_the_on_refresh_action() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11114,8 +11109,8 @@ refresh_all = "z""#,
         );
     }
 
-    /// theming.md: "read again on resume, both from a Launcher returning and from SIGTSTP."
-    /// `around_entity_handoff` is the Launcher-return half.
+    /// theming.md: "read again on resume, both from a Launcher returning and from the ad-hoc
+    /// `$EDITOR` handoff." `around_entity_handoff` is the Launcher-return half.
     #[test]
     fn returning_from_a_handoff_rereads_the_theme_file_from_disk() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11146,9 +11141,9 @@ refresh_all = "z""#,
         );
     }
 
-    /// theming.md's other half: the theme file is also re-read on a bare `SIGTSTP` resume,
-    /// which has no handed-off entity at all. `on_resume` is the shared tail
-    /// [`App::run`]'s `SIGTSTP` branch calls directly.
+    /// theming.md's other half: the theme file is also re-read returning from a handoff with
+    /// no handed-off entity at all. `on_resume` is the shared tail
+    /// [`App::around_ad_hoc_editor_handoff`] reaches without an entity to re-probe.
     #[test]
     fn on_resume_rereads_the_theme_file_from_disk_with_no_entity_involved() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11892,7 +11887,8 @@ refresh_all = "z""#,
     /// called `launcher::run` directly and skipped `on_resume` would still pass a
     /// reprobe-only check, since re-probing and rereading the theme are two separate calls
     /// inside `around_entity_handoff`; this asserts the one a copy is easiest to drop.
-    /// theming.md: "read again on resume, both from a Launcher returning and from SIGTSTP."
+    /// theming.md: "read again on resume, both from a Launcher returning and from the ad-hoc
+    /// `$EDITOR` handoff."
     #[test]
     fn choosing_a_launcher_rereads_the_theme_file_through_the_shared_handoff_path() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11941,7 +11937,7 @@ refresh_all = "z""#,
             app.theme.text,
             ratatui::style::Color::Blue,
             "expected the theme file re-read after the Launcher handoff returned, the same \
-             reread SIGTSTP and a direct `around_entity_handoff` call both already give"
+             reread a direct `around_entity_handoff` call already gives"
         );
     }
 
@@ -13017,8 +13013,8 @@ refresh_all = "z""#,
     /// Criterion 3's reuse claim: the ad hoc `$EDITOR` handoff's own pause/resume lifecycle
     /// must be [`App::around_entity_handoff`]'s own shape, not a second one that skips the
     /// theme reread `Self::on_resume` gives every other return from suspension
-    /// (theming.md: "read again on resume, both from a Launcher returning and from
-    /// SIGTSTP"). No real `Tui` is needed to prove this half: only the terminal-owning
+    /// (theming.md: "read again on resume, both from a Launcher returning and from the
+    /// ad-hoc `$EDITOR` handoff"). No real `Tui` is needed to prove this half: only the terminal-owning
     /// `editor::edit` call itself needs one, and that is what
     /// `tests/terminal_restoration.rs`'s pty harness already proves for `editor::edit` as a
     /// caller of `Tui::suspend_for_child` independent of a Launcher.
@@ -13048,7 +13044,7 @@ refresh_all = "z""#,
             app.theme.text,
             ratatui::style::Color::Blue,
             "expected the theme file re-read through the same on_resume path a Launcher \
-             handoff and SIGTSTP both already take"
+             handoff already takes"
         );
     }
 
