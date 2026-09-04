@@ -148,7 +148,7 @@ Every value carries one of the five states from [0001](../adr/0001-per-cell-prov
 The detail pane always reports provenance per cell, which is the escape hatch from the gutter's row-level summary. It shows:
 
 - The entity's identity and path.
-- One line per value, with its provenance spelled out in words and its age, for example "refreshed 9s ago", the reading's own age rather than a property of the value. A Refresh settles a row's Known cells together, so when they all agree this is printed once, as its own line, rather than once per cell; a cell whose age genuinely differs from its neighbours keeps its own.
+- One line per value, with its provenance spelled out in words but no age of its own: `branch`, `sync`, `base`, `dirty`, `state` and `default branch` each show only their settled value's words. A fixed row immediately below, in the same slot on every render, carries the age instead: `refreshed` with the shared age when every Known cell agrees, or a `label, age` breakdown, one line per cell that disagrees with the majority, when they do not; while a re-probe is running against any of the six it reads `loading` and names only those cells, outranking a stale or disagreeing age the same way `is_in_flight` already outranks a settled state elsewhere; with nothing Known yet it prints nothing. Moving age off the per-cell line and into one fixed row is what stops the row's own position moving mid-refresh, which used to read as a flash whenever the phases in [refresh.md](refresh.md) settled the six cells at different speeds.
 - Recent commits.
 - The labelled per-step output of the last Action, each step separately readable, surviving the run.
 
