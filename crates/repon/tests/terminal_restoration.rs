@@ -1543,3 +1543,130 @@ fn a_launcher_handoffs_child_writes_to_the_real_stderr_not_the_redirected_one() 
          for this crate's own dependency threads, got: {log_contents:?}"
     );
 }
+
+/// A partial escape sequence left in stdin (what a full-screen child such as `nvim` leaves
+/// behind when it exits mid-handshake) must not stop `Tui::exit` from returning. Two raw
+/// bytes, `ESC` and `[` with nothing to follow, are a real incomplete CSI sequence crossterm's
+/// own parser (`parse_csi`) waits on unconditionally once it has exactly that much, never
+/// treating a read that stops there as final; on a stdin still in blocking mode, the event
+/// thread's next raw read then parks on bytes that never arrive, deaf to `Tui::stop` clearing
+/// `running`. `--exit-after-delay-once-tui-entered` claims the terminal, waits 500ms, then
+/// calls `Tui::exit` and exits; this test writes the incomplete sequence once raw mode is
+/// confirmed active (the same `EnterAlternateScreen`-gated timing
+/// `no_warning_reaches_the_terminal_as_a_bare_newline_once_the_terminal_is_claimed` uses, so the
+/// bytes are not lost to canonical mode) and well inside that window, giving the event thread
+/// every chance to have already parked on its own next read before `exit` is even called.
+/// Quitting on a real keypress instead would depend on crossterm's own parser ever producing
+/// one again once fed only single, separated bytes, which it is not guaranteed to do (its
+/// generic "could not parse" branch discards whatever byte happens to complete a stray
+/// sequence, and a still-blocking stdin can just as easily park the *next* raw read on the very
+/// next byte); this harness sidesteps that unrelated wrinkle entirely; against the parked
+/// `read()` bug, `exit` (and so the process) never returns, and `wait_for_or`'s own backstop is
+/// what reports that, exactly as it would for any other liveness property this file waits on.
+#[test]
+fn a_partial_escape_sequence_left_in_stdin_does_not_block_tui_exit() {
+    let (master, slave_path) = open_pty();
+    let held_slave = open_parent_held_slave(&slave_path);
+    let mut writer = master.try_clone().expect("clone pty master for writing");
+    let child = spawn_attached_to_pty(&slave_path, "--exit-after-delay-once-tui-entered");
+
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+    let reader = std::thread::spawn(move || -> DrainEnd {
+        let mut master = master;
+        loop {
+            let mut chunk = [0u8; 4096];
+            match classify_pty_read(master.read(&mut chunk)) {
+                Ok(n) => {
+                    chunk_tx
+                        .send(chunk[..n].to_vec())
+                        .expect("chunk receiver dropped before the reader stopped");
+                }
+                Err(end) => break end,
+            }
+        }
+    });
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let output = RefCell::new(Vec::<u8>::new());
+    let sent_partial_escape = Cell::new(false);
+    let exited = Cell::new(None);
+    let child_cell = RefCell::new(child);
+    wait_for_or(
+        "repon with a partial escape sequence ahead of Tui::exit to exit",
+        || {
+            match chunk_rx.recv_timeout(CHUNK_POLL) {
+                Ok(chunk) => output.borrow_mut().extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            }
+            if !sent_partial_escape.get()
+                && output
+                    .borrow()
+                    .windows(enter_alt.len())
+                    .any(|window| window == enter_alt.as_bytes())
+            {
+                // One write, so both bytes land in the same raw read: two separate
+                // single-byte writes would let a lone ESC resolve as the Escape key instead
+                // of the incomplete CSI sequence this test means to leave behind.
+                writer
+                    .write_all(b"\x1b[")
+                    .expect("write the partial escape sequence to the pty master");
+                sent_partial_escape.set(true);
+            }
+            exited.set(
+                child_cell
+                    .borrow_mut()
+                    .try_wait()
+                    .expect("poll child status"),
+            );
+            exited.get().is_some()
+        },
+        || {
+            let mut child = child_cell.borrow_mut();
+            let _ = child.kill();
+            let _ = child.wait();
+            format!(
+                "{}, output so far: {:?}",
+                if sent_partial_escape.get() {
+                    "the partial escape sequence was sent and repon still did not exit"
+                } else {
+                    "the terminal was never claimed, so nothing was ever sent"
+                },
+                String::from_utf8_lossy(&output.borrow())
+            )
+        },
+    );
+    assert!(
+        sent_partial_escape.get(),
+        "the partial escape sequence was never sent (EnterAlternateScreen never appeared), so \
+         this run proves nothing about the bug it means to reproduce"
+    );
+    let status = exited
+        .get()
+        .expect("the wait above only returns once the child has exited");
+
+    drop(held_slave);
+    let mut output = output.into_inner();
+    while let Ok(chunk) = chunk_rx.recv_timeout(DRAIN_POLL) {
+        output.extend_from_slice(&chunk);
+    }
+    let end = reader.join().expect("pty reader thread panicked");
+    assert!(
+        matches!(end, DrainEnd::Eof | DrainEnd::EofViaEio),
+        "expected the pty drain to end on a real end of file, got {end:?}; output so far: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = String::from_utf8_lossy(&output).into_owned();
+
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+    assert!(
+        output.contains("EXIT_AFTER_DELAY_MARKER"),
+        "expected the harness's own marker, proving the process reached the line after \
+         Tui::exit rather than exiting through some other path, got: {output:?}"
+    );
+    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
+    assert!(
+        output.contains(&leave_alt),
+        "expected the terminal restored on the way out, got: {output:?}"
+    );
+}

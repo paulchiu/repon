@@ -99,6 +99,14 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub write_raw_stderr_after_tui_enter: bool,
 
+    /// Claims the terminal, waits briefly, then calls `Tui::exit` and exits. Debug-only:
+    /// exists so a test can inject a partial escape sequence into stdin during that wait and
+    /// observe whether `Tui::exit` (`Tui::stop` joining the event thread) still returns,
+    /// rather than trusting a description of it, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub exit_after_delay_once_tui_entered: bool,
+
     /// Resolves the config path, prints it, sets `REPON_CONFIG` to the given value, resolves
     /// again and prints that too, then exits, claiming no terminal at all. Debug-only: exists
     /// so a test can observe that a path resolved from a flag or the environment is fixed for

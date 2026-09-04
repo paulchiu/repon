@@ -92,9 +92,12 @@ impl Tui {
     /// (explicit, against an inherited enabled state), focus reporting on. Also diverts fd 2
     /// to the log file ([`redirect_stderr_to_log`]) for as long as the screen is held: a
     /// separate concern from the five, since it has no ANSI trace and nothing releases it,
-    /// only [`restore`] putting the real fd back.
+    /// only [`restore`] putting the real fd back. Stdin's `O_NONBLOCK` flag
+    /// ([`set_stdin_nonblocking`]) is a third such concern, needed only for as long as the
+    /// event thread is the one reading it.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
+        set_stdin_nonblocking()?;
         redirect_stderr_to_log()?;
         write_enter_sequence(&mut stdout())?;
         self.start();
@@ -224,8 +227,47 @@ pub fn restore() -> std::io::Result<()> {
     // not skip disabling raw mode, which is the half the shell inherits.
     let left = write_restore_sequence(&mut stdout());
     let raw = crossterm::terminal::disable_raw_mode();
+    let blocking = clear_stdin_nonblocking();
     let stderr = restore_stderr();
-    left.and(raw).and(stderr)
+    left.and(raw).and(blocking).and(stderr)
+}
+
+/// Makes stdin's raw reads return `WouldBlock` once nothing more is immediately available
+/// rather than parking the calling thread: what the event thread's underlying event source
+/// (crossterm's `mio`-based reader, [`event_loop`]) already handles on a `WouldBlock`, but
+/// never itself arranges, since it inherits stdin from the shell as an ordinary blocking
+/// descriptor. Without this, a partial escape sequence left in stdin (crossterm's own CSI
+/// parser waits unconditionally past its first two bytes, regardless of whether a further byte
+/// is actually coming) leaves the thread's next raw read blocked on bytes that may never
+/// arrive, deaf to [`Tui::stop`] clearing `running`.
+fn set_stdin_nonblocking() -> std::io::Result<()> {
+    set_fd_nonblocking(libc::STDIN_FILENO, true)
+}
+
+/// The mirror of [`set_stdin_nonblocking`], called by [`restore`] so a handed-off child, or the
+/// shell once Repon exits, finds stdin exactly as blocking as it was handed.
+fn clear_stdin_nonblocking() -> std::io::Result<()> {
+    set_fd_nonblocking(libc::STDIN_FILENO, false)
+}
+
+/// Adds or removes `O_NONBLOCK` on `fd`'s current flags, preserving every other flag already
+/// set.
+fn set_fd_nonblocking(fd: RawFd, nonblocking: bool) -> std::io::Result<()> {
+    // Safety: `fd` is a valid, currently-open descriptor for the duration of both calls below.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // Safety: same as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The real fd 2, saved by [`redirect_stderr_to_log`] so [`restore_stderr`] can put it back.
@@ -489,6 +531,51 @@ mod tests {
 
         // With nothing saved, restoring must be a no-op rather than an error.
         restore_stderr().expect("restore_stderr with nothing saved must be a no-op");
+    }
+
+    /// [`set_fd_nonblocking`] against a pipe end this test owns outright, rather than the real
+    /// stdin a unit test's own harness may or may not have: a non-blocking read of an empty
+    /// pipe must return `WouldBlock` immediately instead of parking the test, and clearing the
+    /// flag again must show up in the fd's own reported flags.
+    #[test]
+    fn set_fd_nonblocking_toggles_would_block_without_leaking_into_other_flags() {
+        let mut fds = [0 as std::os::raw::c_int; 2];
+        // Safety: `fds` is a valid two-element out-array for `pipe(2)`.
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "create a scratch pipe"
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        set_fd_nonblocking(read_fd, true).expect("set the read end non-blocking");
+        let mut byte = [0u8; 1];
+        // Safety: `byte` is a valid one-byte buffer for the duration of this call.
+        let read = unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        assert_eq!(
+            read, -1,
+            "expected a non-blocking read of an empty pipe to fail rather than return data"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "expected WouldBlock rather than parking this test on an empty pipe"
+        );
+
+        set_fd_nonblocking(read_fd, false).expect("clear non-blocking on the read end");
+        // Safety: `read_fd` is still open; `F_GETFL` takes no further argument.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "expected O_NONBLOCK cleared after set_fd_nonblocking(fd, false)"
+        );
+
+        // Safety: both ends are this test's own, opened above and not yet closed.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
