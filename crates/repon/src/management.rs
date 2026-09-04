@@ -89,6 +89,15 @@ impl Operation {
             .find(|operation| operation.name() == name)
     }
 
+    /// Whether this operation widens to every visible row on an empty Selection, the way a
+    /// declared Action already does, rather than falling back to the cursor row alone.
+    /// `sync` alone widens; `ignore`, `unignore` and, safety-critically, `delete` (which
+    /// permanently removes working trees) keep the cursor-row fallback
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    pub(crate) fn widens_to_every_visible_row_when_selection_is_empty(self) -> bool {
+        matches!(self, Operation::Sync)
+    }
+
     /// Whether `entity` is operated on, or the reason it is not, per
     /// [repo-management.md](../../../docs/spec/repo-management.md)'s "eligible" column. Every
     /// pairing of the four operations with the three Kinds is named here rather than falling

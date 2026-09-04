@@ -2097,11 +2097,14 @@ impl App {
             // `operable_count` subtracts: `unignore`'s eligible set is exactly the
             // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
             // operations table), which the Action gate's own subtraction would zero. It
-            // reads the cursor-row fallback too, where a configured entry and an ad hoc
-            // command both read `action_targets`.
+            // reads `management_targets`, `sync`'s own widening included, rather than the
+            // plain `action_targets` a configured entry and an ad hoc command read.
             Some(Entry::Builtin(operation)) => Count::selection(
-                self.management_plan_for(operation, &self.selection.targets(&cursor_key))
-                    .eligible_count(),
+                self.management_plan_for(
+                    operation,
+                    &self.management_targets(operation, &cursor_key),
+                )
+                .eligible_count(),
             ),
             Some(Entry::Configured(_)) | None => {
                 self.narrowed_count(palette, &self.action_targets())
@@ -2112,15 +2115,34 @@ impl App {
     /// The rows an Action fans out over: the checked rows, or every visible row when the
     /// Selection is empty ([actions.md](../../../docs/spec/actions.md)'s "The Selection and
     /// the gate"). A second resolution beside [`Selection::targets`] rather than a widening
-    /// of it, because the management operations keep the cursor-row fallback that seam
-    /// gives them. Bounded by visibility, so a row a Filter hides is never reached, and the
-    /// border title and the confirm gate both count from here so neither can name a number
-    /// the run would not act on.
+    /// of it, because three of the four management operations keep the cursor-row fallback
+    /// that seam gives them; `sync` is the exception and reads this resolution too, through
+    /// [`Self::management_targets`]. Bounded by visibility, so a row a Filter hides is never
+    /// reached, and the border title and the confirm gate both count from here so neither
+    /// can name a number the run would not act on.
     fn action_targets(&self) -> Vec<EntityKey> {
         if self.selection.is_empty() {
             self.visible_keys()
         } else {
             self.selection.checked()
+        }
+    }
+
+    /// A management operation's own targets: [`Self::action_targets`] for `sync` alone,
+    /// which widens to every visible row on an empty Selection the way a declared Action
+    /// does, or [`Selection::targets`]'s cursor-row fallback for `ignore`, `unignore` and
+    /// `delete`, unchanged. `delete` shares this seam and permanently destroys working
+    /// trees, so its branch here is the one this function must never widen
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    fn management_targets(
+        &self,
+        operation: management::Operation,
+        cursor_key: &EntityKey,
+    ) -> Vec<EntityKey> {
+        if operation.widens_to_every_visible_row_when_selection_is_empty() {
+            self.action_targets()
+        } else {
+            self.selection.targets(cursor_key)
         }
     }
 
@@ -2157,14 +2179,13 @@ impl App {
     /// [`Self::action_targets`] through [`repon_core::Core::operable_count`], the identical
     /// computation [`Self::action_palette_count`]'s own border title and confirm dialog
     /// read, then hands it to [`ActionPalette::choose`]. A built-in reads
-    /// [`Selection::targets`] instead, the cursor-row fallback it keeps. A missing cursor
-    /// (an empty table) leaves the palette untouched, the same as choosing with no match at
-    /// all.
+    /// [`Self::management_targets`] instead: the cursor-row fallback for `ignore`,
+    /// `unignore` and `delete`, or `sync`'s own widening. A missing cursor (an empty table)
+    /// leaves the palette untouched, the same as choosing with no match at all.
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
         };
-        let management_targets = self.selection.targets(&cursor_key);
         let chosen_builtin = self.action_palette.as_ref().and_then(|palette| {
             match palette.highlighted(&self.document.actions) {
                 Some(Entry::Builtin(operation)) => Some(operation),
@@ -2175,7 +2196,8 @@ impl App {
         // walks its refs. A plan with nothing eligible reads nothing, since `with_risk` only
         // fills the rows the run would act on.
         let plan = chosen_builtin.map(|operation| {
-            self.management_plan_for(operation, &management_targets)
+            let targets = self.management_targets(operation, &cursor_key);
+            self.management_plan_for(operation, &targets)
                 .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
         });
         // Read for a config-defined Action and an ad hoc command alone: those two are
@@ -12281,12 +12303,18 @@ refresh_all = "z""#,
     }
 
     /// The deliberate exception, pinned so a later change cannot widen the destructive path
-    /// by accident: each of the four management operations with nothing checked still gates
-    /// the cursor row alone and never names the other visible row. `delete` over every
-    /// visible row behind a single confirm is the trade this refuses.
+    /// by accident: `ignore`, `unignore` and `delete`, with nothing checked, still gate the
+    /// cursor row alone and never name the other visible row. `delete` over every visible
+    /// row behind a single confirm is the trade this refuses. `sync` is deliberately absent
+    /// from this loop: it is the one operation this issue widens, and its own test is
+    /// [`sync_with_an_empty_selection_plans_over_every_visible_row_not_the_cursor_row_alone`].
     #[test]
     fn every_management_operation_with_an_empty_selection_still_gates_the_cursor_row_alone() {
-        for operation in crate::management::OPERATIONS {
+        for operation in [
+            management::Operation::Ignore,
+            management::Operation::Unignore,
+            management::Operation::Delete,
+        ] {
             let dir = tempfile::tempdir().expect("temp dir");
             let root = dir.path().canonicalize().expect("canonicalize temp dir");
             init_repo(&root.join("repo-a"));
@@ -12317,6 +12345,223 @@ refresh_all = "z""#,
                 operation.name()
             );
         }
+    }
+
+    /// The safety property this issue's whole change must not touch: `delete` permanently
+    /// removes working trees, and its cursor-row fallback on an empty Selection is what
+    /// stops it reaching every visible row the way an Action now does. Pinned on its own,
+    /// separate from the loop above, so a change that widens the shared resolution seam
+    /// fails this test by name rather than only as one iteration of a loop covering four
+    /// operations at once.
+    #[test]
+    fn delete_with_an_empty_selection_still_plans_over_the_cursor_row_alone_never_every_visible_row()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        assert_eq!(visible.len(), 2, "the fixture must discover both repos");
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+        let cursor_name = row_name(&visible[0]);
+        let other_name = row_name(&visible[1]);
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+
+        let gate = app
+            .management_plan
+            .as_ref()
+            .expect("delete always opens its own gate")
+            .confirm_lines()
+            .join("\n");
+        assert!(
+            gate.contains(&cursor_name),
+            "delete must still gate the cursor row, got:\n{gate}"
+        );
+        assert!(
+            !gate.contains(&other_name),
+            "delete must never widen to every visible row: this is the property that stops \
+             an empty Selection from destroying every working tree in view, got:\n{gate}"
+        );
+    }
+
+    /// The behaviour this issue adds: `sync` alone widens to every visible row when the
+    /// Selection is empty, the way a declared Action already does, rather than keeping the
+    /// other three built-ins' cursor-row fallback.
+    #[test]
+    fn sync_with_an_empty_selection_plans_over_every_visible_row_not_the_cursor_row_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        assert_eq!(visible.len(), 2, "the fixture must discover both repos");
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+        let cursor_name = row_name(&visible[0]);
+        let other_name = row_name(&visible[1]);
+
+        open_the_management_gate(&mut app, management::Operation::Sync);
+
+        let gate = app
+            .management_plan
+            .as_ref()
+            .expect("sync always opens its own gate")
+            .confirm_lines()
+            .join("\n");
+        assert!(
+            gate.contains(&cursor_name),
+            "sync must still reach the cursor row, got:\n{gate}"
+        );
+        assert!(
+            gate.contains(&other_name),
+            "an empty Selection must let sync reach every visible row, not the cursor row \
+             alone, got:\n{gate}"
+        );
+    }
+
+    /// The other half of the rule sync now shares with a declared Action: once a row is
+    /// checked, sync acts on exactly the checked rows, never the rest of the visible list,
+    /// and never the cursor row if the cursor has moved off the checked one.
+    #[test]
+    fn sync_with_a_checked_row_plans_over_exactly_that_row_not_the_cursor_or_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+        let checked_name = row_name(&visible[1]);
+        let cursor_name = row_name(&visible[0]);
+        let unchecked_name = row_name(&visible[2]);
+
+        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move the cursor onto the row to check");
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("check that row");
+        app.handle_key_event(press(KeyCode::Up, KeyModifiers::NONE))
+            .expect("move the cursor off the checked row");
+        assert_eq!(app.selection.count(), 1, "exactly one row is checked");
+
+        open_the_management_gate(&mut app, management::Operation::Sync);
+
+        let gate = app
+            .management_plan
+            .as_ref()
+            .expect("sync always opens its own gate")
+            .confirm_lines()
+            .join("\n");
+        assert!(
+            gate.contains(&checked_name),
+            "sync must reach the checked row, got:\n{gate}"
+        );
+        assert!(
+            !gate.contains(&cursor_name),
+            "sync must not fall back to the cursor row once something is checked, got:\n{gate}"
+        );
+        assert!(
+            !gate.contains(&unchecked_name),
+            "sync must not widen past the checked rows, got:\n{gate}"
+        );
+    }
+
+    /// Sync's widened reach is still bounded by visibility: a row a committed Filter hides
+    /// is never planned over, the same rule an ordinary Action's own widening already keeps
+    /// ([`an_empty_selections_action_reaches_the_rows_a_committed_filter_shows_and_no_others`]).
+    #[test]
+    fn sync_with_an_empty_selection_reaches_only_the_rows_a_committed_filter_shows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let alpha = root.join("alpha");
+        let beta_one = root.join("beta-one");
+        let beta_two = root.join("beta-two");
+        for repo in [&alpha, &beta_one, &beta_two] {
+            init_repo(repo);
+        }
+        let mut app = test_app(&root);
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("open the filter line");
+        for c in "beta".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("commit the filter");
+        assert_eq!(app.visible_keys().len(), 2, "the Filter narrows to the two");
+
+        open_the_management_gate(&mut app, management::Operation::Sync);
+
+        let gate = app
+            .management_plan
+            .as_ref()
+            .expect("sync always opens its own gate")
+            .confirm_lines()
+            .join("\n");
+        assert!(gate.contains("beta-one"), "got:\n{gate}");
+        assert!(gate.contains("beta-two"), "got:\n{gate}");
+        assert!(
+            !gate.contains("alpha"),
+            "a row the Filter hides is never planned over, even though sync now widens over \
+             an empty Selection, got:\n{gate}"
+        );
+    }
+
+    /// The border title, before `Enter`, and the confirm gate that opens once it is pressed
+    /// must count the identical resolution: both read [`App::management_targets`], so
+    /// neither can name a number the run itself would not act on
+    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn the_sync_border_title_and_the_confirm_gate_count_the_same_resolution_the_run_uses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+        app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("press m");
+        let sync_index = crate::management::OPERATIONS
+            .iter()
+            .position(|candidate| *candidate == management::Operation::Sync)
+            .expect("sync is one of the built-ins");
+        for _ in 0..sync_index {
+            app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move the highlight onto sync");
+        }
+        let before_enter = app
+            .action_palette_count()
+            .expect("the palette is open")
+            .operable;
+        assert_eq!(
+            before_enter, 2,
+            "before Enter, the border title must already count every visible row (the fetch \
+             feature makes both real Repos eligible), not the cursor row alone"
+        );
+
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+
+        let plan = app
+            .management_plan
+            .as_ref()
+            .expect("sync always opens its own gate");
+        assert_eq!(
+            plan.eligible_count(),
+            before_enter,
+            "the confirm gate must count the identical resolution the border title already \
+             showed, so neither can name a number the run would not act on"
+        );
     }
 
     // =====================================================================================
