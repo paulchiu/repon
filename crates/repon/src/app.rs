@@ -1896,11 +1896,14 @@ impl App {
             Some(Action::Cancel) => self.filter_line = None,
             // Closes the line the same way `Cancel` does, but clears whatever is narrowing
             // the list instead of restoring it: the live draft (`Self::active_filter`), the
-            // committed Filter underneath it, or both. Unavailable with a Notice, and the
-            // line left open, only when the draft is empty and nothing is committed either,
-            // since an empty draft narrows nothing.
+            // committed Filter underneath it, or both. `self.filter` is checked separately
+            // from `Self::active_filter` because that helper reads only the live draft while
+            // the line is open, so an emptied draft over a still-committed Filter would
+            // otherwise look inactive. Unavailable with a Notice, and the line left open,
+            // only when the draft is empty and nothing is committed either, since an empty
+            // draft narrows nothing.
             Some(Action::ClearFilter) => {
-                if self.active_filter().is_active() {
+                if self.active_filter().is_active() || self.filter.is_active() {
                     self.filter = Filter::default();
                     self.filter_line = None;
                     self.follow_cursor();
@@ -14610,6 +14613,58 @@ refresh_all = "z""#,
             app.visible_keys().len(),
             2,
             "neither the draft nor the committed Filter may narrow the list afterwards"
+        );
+        assert_eq!(
+            app.notice, None,
+            "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
+        );
+    }
+
+    /// The prefilled draft mirrors the committed Filter until edited, so backspacing it to
+    /// empty is exactly [filter.md](../../../docs/spec/filter.md)'s "an empty draft ... over
+    /// a committed Filter": the live view narrows nothing, but the Filter is still committed
+    /// underneath, and `Alt+/` must still clear it and close the line rather than treating
+    /// the empty draft as nothing to clear.
+    #[test]
+    fn alt_slash_from_the_filter_input_with_an_emptied_draft_over_a_committed_filter_clears_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.filter = Filter::parse("repo-a");
+        assert!(app.filter.is_active(), "sanity: a Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter, prefilled with the committed one");
+        for _ in 0.."repo-a".len() {
+            app.handle_key_event(press(KeyCode::Backspace, KeyModifiers::NONE))
+                .expect("backspace the prefilled draft down to empty");
+        }
+        assert_eq!(
+            app.filter_line
+                .as_ref()
+                .expect("the Filter line is open")
+                .live_filter()
+                .as_str(),
+            "",
+            "sanity: the draft is now empty"
+        );
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "sanity: the emptied draft narrows nothing live"
+        );
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears the committed Filter still underneath the emptied draft");
+
+        assert!(
+            app.filter_line.is_none(),
+            "Alt+/ must close the Filter line the way Cancel does"
+        );
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must clear the committed Filter even when the draft over it is empty"
         );
         assert_eq!(
             app.notice, None,
