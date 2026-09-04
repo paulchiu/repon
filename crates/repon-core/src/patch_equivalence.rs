@@ -34,7 +34,7 @@ use gix::bstr::BString;
 
 use crate::cell::{Settled, Timestamp};
 use crate::entity::WorktreeState;
-use crate::git::{self, ProbeError};
+use crate::git::ProbeError;
 
 /// One changed path between two trees, kept at blob-identity granularity: an
 /// add or delete carries the one side's object id, a modification both. Mode
@@ -89,7 +89,7 @@ pub(crate) type PatchIdentitySet = HashSet<PatchIdentity>;
 /// one of `shared`'s identities, `Active` when it does not, and `Failed` only
 /// for a genuine read error. A `merge_base` of `None` means the two tips share
 /// no history at all, a real negative rather than a failure, the same
-/// discipline [`crate::landing::is_ancestor`] holds.
+/// discipline [`crate::landing::probe`] holds.
 pub(crate) fn probe(
     repo: &gix::Repository,
     entity_tip: gix::ObjectId,
@@ -209,18 +209,6 @@ fn to_entry(change: gix::object::tree::diff::ChangeDetached) -> Option<PatchEntr
     }
 }
 
-/// `commit`'s ancestor common with `other`, via [`git::checked_merge_base`].
-/// `Ok(None)` is the real "no shared history at all" answer (two orphan
-/// roots), not a failure; `Err` is reserved for an actual read error.
-pub(crate) fn merge_base(
-    repo: &gix::Repository,
-    commit: gix::ObjectId,
-    other: gix::ObjectId,
-) -> Result<Option<gix::ObjectId>, ProbeError> {
-    git::checked_merge_base(repo, commit, other)
-        .map_err(|error| ProbeError::PatchEquivalence(error.into()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -310,11 +298,6 @@ mod tests {
         let main_sha = head_sha(&repo);
 
         let opened = open(&repo);
-        assert_eq!(
-            merge_base(&opened, id(&feature_sha), id(&main_sha)).expect("merge base"),
-            Some(id(&base_sha)),
-            "the value the caller threads in must be the branch's fork point"
-        );
         let shared =
             scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
 
@@ -326,7 +309,8 @@ mod tests {
                 from_the_fork_point,
                 Settled::Known {
                     value: WorktreeState::Merged,
-                    ..
+                    at: _,
+                    stale: _
                 }
             ),
             "expected the fork point to yield the whole squashed range, got              {from_the_fork_point:?}"
@@ -336,7 +320,8 @@ mod tests {
                 from_mid_branch,
                 Settled::Known {
                     value: WorktreeState::Active,
-                    ..
+                    at: _,
+                    stale: _
                 }
             ),
             "expected a base halfway along the branch to yield only b.txt, which the              squash commit does not match, got {from_mid_branch:?}"
@@ -458,7 +443,7 @@ mod tests {
     }
 
     /// No shared history at all is a real negative, not a failure: mirrors
-    /// [`crate::landing::is_ancestor`]'s own `unrelated_histories_...` test.
+    /// [`crate::landing`]'s own `unrelated_histories_...` test.
     #[test]
     fn unrelated_histories_settle_active_not_failed() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -488,7 +473,8 @@ mod tests {
 
     /// A commit object that is simply missing must be `Failed`, never folded
     /// into a confident `Active`: the same defect class the existence check in
-    /// [`merge_base`] exists to rule out, held here by the diff instead.
+    /// [`crate::git::checked_merge_base`] rules out for the first pass, held
+    /// here by the diff instead.
     #[test]
     fn a_deleted_commit_object_settles_failed_not_a_confident_answer() {
         let dir = tempfile::tempdir().expect("temp dir");

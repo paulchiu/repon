@@ -4257,79 +4257,48 @@ fn probe_worktree_state(
     let local = repo.to_thread_local();
     match landing::probe(&local, default_branch_settled) {
         landing::Outcome::Settle(settled) => Some(settled),
-        landing::Outcome::Outstanding => probe_patch_equivalence(
-            &local,
-            default_branch_settled,
-            common_dir,
-            cancel,
-            memo,
-            report,
-        ),
+        landing::Outcome::Outstanding(outstanding) => {
+            probe_patch_equivalence(&local, &outstanding, common_dir, cancel, memo, report)
+        }
     }
 }
 
 /// Phase D's expensive half, reached only when `landing::probe` answered
 /// `Outstanding`: this is the seam that keeps patch equivalence off every
-/// entity ancestry already settled. Re-derives the entity's own HEAD commit and
-/// the default branch's own commit, computes this entity's own merge base and
-/// reports it to `report` *before* asking for the shared scan, then checks patch
-/// equivalence against `memo`'s per-common-dir cache, per
+/// entity ancestry already settled. Reports the merge base the first pass
+/// already walked to `report` *before* asking for the shared scan, then checks
+/// patch equivalence against `memo`'s per-common-dir cache, per
 /// [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
 /// "Two passes on screen" and its bound on the scan's own depth.
 fn probe_patch_equivalence(
     repo: &gix::Repository,
-    default_branch_settled: &Settled<DefaultBranch>,
+    outstanding: &landing::Outstanding,
     common_dir: &Arc<Path>,
     cancel: &AtomicBool,
     memo: &PatchEquivalenceMemo<'_>,
     report: &mut GateReport<'_>,
 ) -> Option<Settled<WorktreeState>> {
-    let Settled::Known {
-        value,
-        at: _,
-        stale: _,
-    } = default_branch_settled
-    else {
-        // `landing::probe` only returns `Outstanding` once the default branch
-        // resolved; reached only if that invariant breaks.
-        return None;
-    };
-    let Ok(head) = repo.head() else {
-        return None;
-    };
-    let Some(entity_tip) = head.id().map(|id| id.detach()) else {
-        // Unreachable via `landing::probe`, which now settles Not applicable for
-        // an unborn HEAD directly rather than reaching this second pass at all;
-        // kept only as a defensive fallback settling the same value, rather than
-        // reintroducing an unsettled cell, if HEAD's own commit were ever to
-        // disappear between the two reads within one probe cycle.
-        return Some(Settled::NotApplicable);
-    };
     if cancel.load(Ordering::Acquire) {
         return None;
     }
-    let default_tip = match landing::resolve_ref_commit(repo, value.name()) {
-        Ok(id) => id,
-        Err(error) => return Some(Settled::Failed(error)),
-    };
-    let merge_base = match patch_equivalence::merge_base(repo, entity_tip, default_tip) {
-        Ok(Some(base)) => base,
-        Ok(None) => {
-            // No shared history at all: a real negative, mirrored from
-            // `patch_equivalence::probe`'s own handling. This entity needs no
-            // bound and no shared scan, so it reports and settles without
-            // waiting on either; the empty set is never actually consulted,
-            // since `probe` returns `Active` for a `None` merge base before it
-            // would look.
-            report.report_now(None);
-            return Some(patch_equivalence::probe(
-                repo,
-                entity_tip,
-                None,
-                &patch_equivalence::PatchIdentitySet::new(),
-            ));
-        }
-        Err(error) => return Some(Settled::Failed(error)),
+    let landing::Outstanding {
+        entity_tip,
+        default_tip,
+        merge_base,
+    } = *outstanding;
+    let Some(merge_base) = merge_base else {
+        // No shared history at all: a real negative the first pass already
+        // established. This entity needs no bound and no shared scan, so it
+        // reports and settles without waiting on either; the empty set is never
+        // actually consulted, since `probe` returns `Active` for a `None` merge
+        // base before it would look.
+        report.report_now(None);
+        return Some(patch_equivalence::probe(
+            repo,
+            entity_tip,
+            None,
+            &patch_equivalence::PatchIdentitySet::new(),
+        ));
     };
     // Reported now, not left to `report`'s `Drop`: the wait just below blocks
     // on every entity sharing this common dir having reported, this entity
@@ -11061,7 +11030,7 @@ mod tests {
     /// actually recorded into `memo.scan_bounds`. `deep_sha`'s contribution is
     /// pre-reported by hand, standing in for a sibling entity that already ran
     /// this Generation; the one entity this test drives through the real
-    /// function is detached at `shallow_sha`, so its own merge base against
+    /// function arrives at `shallow_sha`, so its own merge base against
     /// `default_tip` is `shallow_sha`, strictly shallower than `deep_sha`. A
     /// regression that bounds the scan by the arriving entity's own merge base
     /// instead of the gate's answer would record `shallow_sha` here, and would
@@ -11083,29 +11052,13 @@ mod tests {
         git(&repo_path, &["commit", "-m", "default tip"]);
         let default_tip_hex = head_sha(&repo_path);
 
-        git(&repo_path, &["branch", "-M", "main"]);
-        git(
-            &repo_path,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://example.invalid/repo.git",
-            ],
-        );
-        git(
-            &repo_path,
-            &["update-ref", "refs/remotes/origin/main", &default_tip_hex],
-        );
-        // Detached at `shallow`, standing in for a Worktree entity whose own
-        // tip is not main's actual tip.
-        git(&repo_path, &["checkout", &shallow_sha_hex]);
-
         let repo = gix::open(&repo_path).expect("open repo");
-        let default_branch_settled = Settled::Known {
-            value: DefaultBranch::new("origin/main".into()),
-            at: Timestamp::now(),
-            stale: false,
+        // What `landing::probe` hands over for a Worktree entity sitting at
+        // `shallow`, whose own tip is not main's actual tip.
+        let outstanding = landing::Outstanding {
+            entity_tip: shallow_sha,
+            default_tip: id(&default_tip_hex),
+            merge_base: Some(shallow_sha),
         };
         let common_dir: Arc<Path> = Arc::from(repo_path.join(".git"));
         let cancel = AtomicBool::new(false);
@@ -11126,7 +11079,7 @@ mod tests {
 
         probe_patch_equivalence(
             &repo,
-            &default_branch_settled,
+            &outstanding,
             &common_dir,
             &cancel,
             &memo,

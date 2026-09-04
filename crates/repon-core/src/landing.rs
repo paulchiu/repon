@@ -15,7 +15,9 @@
 //! (configured, but its remote-tracking ref no longer resolves); only a branch
 //! with a live upstream ancestry still could not clear leaves
 //! [`Outcome::Outstanding`], the seam a second pass, comparing patch identities
-//! against the merge base, settles later. That pass is not built here.
+//! against the merge base, settles later. That pass is not built here, but it
+//! is supplied from here: [`Outstanding`] carries out the commit pair and the
+//! merge base this pass already walked, so the second pass reads neither again.
 //!
 //! Only ever called for a Worktree entity. A Repo or Submodule's `state` is
 //! [`Settled::NotApplicable`] from construction ([`crate::entity::EntityState::new`])
@@ -34,10 +36,23 @@ pub(crate) enum Outcome {
     /// The cell should settle to this value now.
     Settle(Settled<WorktreeState>),
     /// An attached branch with a live upstream that ancestry could not prove
-    /// landed: only the still-unbuilt patch-equivalence pass can tell a
-    /// squash-merged `Merged` from a genuinely `Active` branch here. The cell
-    /// is left untouched.
-    Outstanding,
+    /// landed: only the patch-equivalence pass can tell a squash-merged
+    /// `Merged` from a genuinely `Active` branch here. The cell is left
+    /// untouched.
+    Outstanding(Outstanding),
+}
+
+/// What the ancestry pass already established about an entity it could not
+/// prove landed, carried out to the patch-equivalence pass rather than read
+/// again there: the same commit pair and the same merge base, on the same
+/// handle.
+pub(crate) struct Outstanding {
+    /// The entity's own HEAD commit.
+    pub(crate) entity_tip: gix::ObjectId,
+    /// The commit `default_branch` currently resolves to.
+    pub(crate) default_tip: gix::ObjectId,
+    /// Their merge base, `None` when the two share no history at all.
+    pub(crate) merge_base: Option<gix::ObjectId>,
 }
 
 /// The ancestry-only first pass: `Merged` when the entity's own commit is an
@@ -81,12 +96,25 @@ pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBran
         Err(error) => return Outcome::Settle(Settled::Failed(error)),
     };
 
-    match is_ancestor(repo, commit, default_commit) {
-        Ok(true) => settle_known(WorktreeState::Merged),
-        Ok(false) if head.is_detached() => Outcome::Settle(Settled::NotApplicable),
-        Ok(false) => classify_unmerged_branch(repo, head),
-        Err(error) => Outcome::Settle(Settled::Failed(error)),
+    let base = match merge_base(repo, commit, default_commit) {
+        Ok(base) => base,
+        Err(error) => return Outcome::Settle(Settled::Failed(error)),
+    };
+    if base == Some(commit) {
+        return settle_known(WorktreeState::Merged);
     }
+    if head.is_detached() {
+        return Outcome::Settle(Settled::NotApplicable);
+    }
+    classify_unmerged_branch(
+        repo,
+        head,
+        Outstanding {
+            entity_tip: commit,
+            default_tip: default_commit,
+            merge_base: base,
+        },
+    )
 }
 
 /// Classifies an attached branch ancestry could not prove landed, by its own
@@ -100,11 +128,15 @@ pub(crate) fn probe(repo: &gix::Repository, default_branch: &Settled<DefaultBran
 /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
 /// "The periodic fetch" and [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
 /// "Gone".
-fn classify_unmerged_branch(repo: &gix::Repository, head: gix::Head) -> Outcome {
+fn classify_unmerged_branch(
+    repo: &gix::Repository,
+    head: gix::Head,
+    outstanding: Outstanding,
+) -> Outcome {
     let Some(reference) = head.try_into_referent() else {
         // An attached, born HEAD always has a referent to peel; reached only if
         // that invariant breaks.
-        return Outcome::Outstanding;
+        return Outcome::Outstanding(outstanding);
     };
     match reference.remote_ref_name(gix::remote::Direction::Fetch) {
         None => settle_known(WorktreeState::LocalOnly),
@@ -121,7 +153,7 @@ fn classify_unmerged_branch(repo: &gix::Repository, head: gix::Head) -> Outcome 
             ))),
             Some(Ok(tracking_name)) => {
                 match repo.try_find_reference(tracking_name.to_string().as_str()) {
-                    Ok(Some(_)) => Outcome::Outstanding,
+                    Ok(Some(_)) => Outcome::Outstanding(outstanding),
                     Ok(None) => settle_known(WorktreeState::Gone),
                     Err(error) => Outcome::Settle(Settled::Failed(ProbeError::Ancestry(
                         error.to_string().into(),
@@ -142,18 +174,21 @@ fn settle_known(value: WorktreeState) -> Outcome {
     })
 }
 
-/// Whether `commit` is an ancestor of `ancestor_of`, `git merge-base
-/// --is-ancestor`'s own three-way contract: `Ok(true)` for an ancestor,
-/// `Ok(false)` for a real negative answer (including two commits with no shared
-/// history at all), and `Err` for anything else, via [`git::checked_merge_base`].
-fn is_ancestor(
+/// `commit`'s merge base with `ancestor_of`, which carries `git merge-base
+/// --is-ancestor`'s own three-way contract: the base is `Some(commit)` exactly
+/// when `commit` is an ancestor, any other `Ok` is a real negative answer
+/// (`None` being two commits with no shared history at all), and `Err` is
+/// anything else, via [`git::checked_merge_base`].
+///
+/// Computed once per entity: the value reaches the patch-equivalence pass
+/// through [`Outstanding`] rather than being walked again there.
+fn merge_base(
     repo: &gix::Repository,
     commit: gix::ObjectId,
     ancestor_of: gix::ObjectId,
-) -> Result<bool, ProbeError> {
-    let base = git::checked_merge_base(repo, commit, ancestor_of)
-        .map_err(|error| ProbeError::Ancestry(error.into()))?;
-    Ok(base == Some(commit))
+) -> Result<Option<gix::ObjectId>, ProbeError> {
+    git::checked_merge_base(repo, commit, ancestor_of)
+        .map_err(|error| ProbeError::Ancestry(error.into()))
 }
 
 /// Resolves `name` (as [`DefaultBranch::name`] hands it back, e.g. `origin/main`)
@@ -200,6 +235,10 @@ mod tests {
 
     fn open(path: &Path) -> gix::Repository {
         gix::open(path).expect("open repo")
+    }
+
+    fn id(sha: &str) -> gix::ObjectId {
+        gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha")
     }
 
     fn known_default_branch(name: &str) -> Settled<DefaultBranch> {
@@ -319,9 +358,42 @@ mod tests {
         let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
 
         assert!(
-            matches!(outcome, Outcome::Outstanding),
+            matches!(outcome, Outcome::Outstanding(_)),
             "an attached branch with a live upstream ancestry says no for must stay Outstanding, never settle"
         );
+    }
+
+    /// Outstanding is a handoff, not just a verdict: it carries the commit
+    /// pair and the merge base the ancestry proof already walked, so the second
+    /// pass diffs from them rather than reading the same three facts again.
+    /// The expected merge base is the fork point the fixture recorded before
+    /// `feature` was branched.
+    #[test]
+    fn an_outstanding_outcome_carries_the_commit_pair_and_merge_base_ancestry_already_walked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        let fork_point = head_sha(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "main moves on"]);
+        let main_sha = head_sha(&repo);
+        set_default_branch_ref(&repo, &main_sha);
+        git(&repo, &["checkout", "-b", "feature", &fork_point]);
+        git(&repo, &["commit", "--allow-empty", "-m", "unmerged work"]);
+        let feature_sha = head_sha(&repo);
+        configure_upstream(&repo, "feature");
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/feature", &feature_sha],
+        );
+
+        let outcome = probe(&open(&repo), &known_default_branch("origin/main"));
+
+        let Outcome::Outstanding(outstanding) = outcome else {
+            panic!("a diverged branch with a live upstream must stay Outstanding");
+        };
+        assert_eq!(outstanding.entity_tip, id(&feature_sha), "entity tip");
+        assert_eq!(outstanding.default_tip, id(&main_sha), "default tip");
+        assert_eq!(outstanding.merge_base, Some(id(&fork_point)), "merge base");
     }
 
     /// `Local only`'s defining case: an attached branch ancestry could not
@@ -495,19 +567,22 @@ mod tests {
         git(&repo, &["commit", "--allow-empty", "-m", "unrelated root"]);
         let two = head_sha(&repo);
 
-        let result = is_ancestor(
+        let result = merge_base(
             &open(&repo),
             gix::ObjectId::from_hex(two.as_bytes()).expect("parse sha"),
             gix::ObjectId::from_hex(one.as_bytes()).expect("parse sha"),
         );
 
-        assert!(matches!(result, Ok(false)));
+        assert!(
+            matches!(result, Ok(None)),
+            "two unrelated roots must have no merge base, not an error, got {result:?}"
+        );
     }
 
     /// A genuine failure (here, a commit object that exists on disk but will
-    /// not decode) must be `Err`, never folded into `Ok(false)`: an
-    /// implementation written as `.unwrap_or(false)` passes every other test in
-    /// this module and fails only this one.
+    /// not decode) must be `Err`, never folded into a confident negative: an
+    /// implementation written as `.unwrap_or_default()` passes every other test
+    /// in this module and fails only this one.
     #[test]
     fn a_corrupt_commit_object_is_a_real_failure_not_a_confident_no() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -518,7 +593,7 @@ mod tests {
         let tip_sha = head_sha(&repo);
         corrupt_loose_object(&repo, &tip_sha);
 
-        let result = is_ancestor(
+        let result = merge_base(
             &open(&repo),
             gix::ObjectId::from_hex(tip_sha.as_bytes()).expect("parse sha"),
             gix::ObjectId::from_hex(base_sha.as_bytes()).expect("parse sha"),
@@ -533,8 +608,8 @@ mod tests {
     /// A commit object that is simply missing (never written, or deleted) must
     /// be `Err` too: `gix::Repository::merge_base` reports the exact same
     /// `NotFound` for this as it does for two commits with no shared history at
-    /// all, which is the defect the existence check in `is_ancestor` exists to
-    /// catch.
+    /// all, which is the defect the existence check in [`git::checked_merge_base`]
+    /// exists to catch.
     #[test]
     fn a_deleted_commit_object_is_a_real_failure_not_a_confident_no() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -545,7 +620,7 @@ mod tests {
         let tip_sha = head_sha(&repo);
         delete_loose_object(&repo, &tip_sha);
 
-        let result = is_ancestor(
+        let result = merge_base(
             &open(&repo),
             gix::ObjectId::from_hex(tip_sha.as_bytes()).expect("parse sha"),
             gix::ObjectId::from_hex(base_sha.as_bytes()).expect("parse sha"),
