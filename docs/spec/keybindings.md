@@ -106,7 +106,11 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 
 The expanded warning list, the Set picker, and the help overlay all dispatch through this one
 context. `Search` is a help-only addition: neither the warning list nor the Set picker reads it
-out of their own key handler, so it does nothing for either.
+out of their own key handler, so it does nothing for either. `1` to `9` is a Set-picker addition
+the same way: the warning list and help's own reading mode do not read `SwitchToSet` out of their
+key handler either, so a digit does nothing for both. Help's search mode never reaches this table
+for a digit at all, printable and part of the query before `overlay`'s own bindings are even
+consulted (see "The help overlay" below).
 
 | key | action |
 | --- | --- |
@@ -119,6 +123,7 @@ out of their own key handler, so it does nothing for either.
 | `Enter` | Choose (Set picker only) |
 | `Esc`, `q` | Close |
 | `/` | Search |
+| `1` to `9` | Switch to the Nth declared Set |
 
 ### confirm
 
@@ -396,6 +401,8 @@ A Launcher declaring `takes_terminal = false` ([config.md](config.md#launchers))
 The picker's own chrome is recorded here for the same reason the help overlay's is above: this spec fixed the picker's content and behaviour and said nothing about its presentation, which used to mean it drew its rows flush with no border at all while every panel around it was framed. That is a presentation decision, not a spec violation. The picker draws in the house style, a bordered block taking its characters from the active glyph set exactly as the list and detail panes do, titled ` sets `, and its rows sit one cell inset from the border rather than flush against the border characters themselves. A Set name too long for that interior is clamped to it, so a user-supplied name can never paint over the frame's own right border.
 
 Switching answers. `1` to `9`, and the picker's own `Enter`, raise a Notice naming the Set switched to, because the visible effect of a switch is the table emptying and refilling, which says that something changed and not what it changed to. A digit past the last declared Set is unavailable rather than unbuilt, the range being advertised as a range, so it answers with a Notice naming how many Sets are declared and pointing at `s`. `s set` is deliberately absent from the list footer's ladder above: it costs 8 of the one column free at 88 and would drop `r refresh` to buy it, and the row that names the active Set is not the row that has to teach the key for leaving it.
+
+The picker is where the numbers are printed, and it is where they work: pressing a declared Set's own digit while the picker is open switches to it and closes the picker, the exact `App::switch_to_set` call the same digit already makes from `list` or `detail`, never a second implementation of the switch. A digit naming no declared Set answers with the same "only N Sets declared" Notice it always has and, because there is nothing to switch to, leaves the picker open and the active Set untouched rather than closing it, the one way pressing a digit inside the picker differs from pressing its own `Enter` (whose cursor can never point past the last row).
 
 `w` does two things with one press: it opens the expanded warning list, and opening it acknowledges every condition currently outstanding, which is what returns the status row to its indicator. The footer and the help overlay advertise the first, since that is what the user is reaching for; [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the second. It is not a dismissal and no key dismisses a warning: a standing condition leaves the row by ceasing to be true.
 

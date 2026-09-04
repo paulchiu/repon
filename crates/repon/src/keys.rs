@@ -46,7 +46,8 @@ pub(crate) enum Action {
     ToggleWorktrees,
     OpenSetPicker,
     OpenSortMenu,
-    /// `1` to `9`: which Set to switch to.
+    /// `1` to `9`: which Set to switch to, bound in both `global` (list and detail) and
+    /// `overlay` (the Set picker).
     SwitchToSet(u8),
     ReloadConfig,
     EditConfig,
@@ -690,6 +691,66 @@ const BINDINGS: &[Binding] = &[
     binding(Context::Overlay, KeyCode::Esc, NONE, Action::Close),
     binding(Context::Overlay, KeyCode::Char('q'), NONE, Action::Close),
     binding(Context::Overlay, KeyCode::Char('/'), NONE, Action::Search),
+    // The Set picker's own positional shortcut: the same nine digits `global` already binds
+    // to `SwitchToSet`, reused rather than a second action, so `1` switches to the first
+    // declared Set from the picker exactly as it does from the list. The help overlay and
+    // the expanded warning list also dispatch through `overlay`, but neither reads
+    // `SwitchToSet` out of its own key handler, so a digit does nothing for either, the same
+    // way `Search` already does nothing outside help.
+    binding(
+        Context::Overlay,
+        KeyCode::Char('1'),
+        NONE,
+        Action::SwitchToSet(1),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('2'),
+        NONE,
+        Action::SwitchToSet(2),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('3'),
+        NONE,
+        Action::SwitchToSet(3),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('4'),
+        NONE,
+        Action::SwitchToSet(4),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('5'),
+        NONE,
+        Action::SwitchToSet(5),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('6'),
+        NONE,
+        Action::SwitchToSet(6),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('7'),
+        NONE,
+        Action::SwitchToSet(7),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('8'),
+        NONE,
+        Action::SwitchToSet(8),
+    ),
+    binding(
+        Context::Overlay,
+        KeyCode::Char('9'),
+        NONE,
+        Action::SwitchToSet(9),
+    ),
     // confirm (every other key is `dispatch`'s fallback of "nothing happens", not a row here)
     binding(Context::Confirm, KeyCode::Char('y'), NONE, Action::Run),
     binding(Context::Confirm, KeyCode::Char('n'), NONE, Action::Decline),
@@ -969,10 +1030,11 @@ impl BindingTable {
 /// excluded, the same shape [`description`] already takes.
 ///
 /// `Text` and `SwitchToSet` return `None`: `Text` is `dispatch`'s printable-character
-/// catch-all and never occupies a [`BINDINGS`] row to rebind, and `SwitchToSet`'s nine rows
-/// are positional (`1` to `9`, "the Nth declared Set") with no name a flat `[keys]` value
-/// could give a single one of without inventing a numbering scheme keybindings.md never
-/// specifies; both are deliberately out of this ticket's scope rather than an oversight.
+/// catch-all and never occupies a [`BINDINGS`] row to rebind, and `SwitchToSet`'s rows (nine
+/// in `global`, nine more in `overlay` for the Set picker) are positional (`1` to `9`, "the
+/// Nth declared Set") with no name a flat `[keys]` value could give a single one of without
+/// inventing a numbering scheme keybindings.md never specifies; both are deliberately out of
+/// this ticket's scope rather than an oversight.
 fn action_name(action: Action) -> Option<&'static str> {
     Some(match action {
         Action::OpenHelp => "open_help",
@@ -1517,6 +1579,23 @@ mod tests {
                 dispatch(Context::Global, press(KeyCode::Char(c), NONE)),
                 Some(Action::SwitchToSet(n)),
                 "expected {c:?} to switch to Set {n}"
+            );
+        }
+    }
+
+    /// The Set picker's own crux: a digit must reach `SwitchToSet` through `overlay`, not
+    /// merely through `global` (which `overlay` never falls back to,
+    /// `global_bindings_never_dispatch_while_overlay_is_focused` already pins). Same
+    /// per-digit check as [`each_digit_key_switches_to_its_own_set_number`], against the
+    /// context the picker actually dispatches through.
+    #[test]
+    fn overlay_binds_each_digit_to_its_own_switch_to_set_number() {
+        for n in 1..=9u8 {
+            let c = char::from_digit(u32::from(n), 10).expect("1..=9 is a single ASCII digit");
+            assert_eq!(
+                dispatch(Context::Overlay, press(KeyCode::Char(c), NONE)),
+                Some(Action::SwitchToSet(n)),
+                "expected {c:?} to switch to Set {n} from the overlay context"
             );
         }
     }
