@@ -835,7 +835,7 @@ mod tests {
                 "the row's own Kind, spelled out as \"submodule\" in the \
                                         detail pane and read from the child marker in the list"
             }
-            Meaning::Age => "the age text itself, e.g. \"9s ago\"",
+            Meaning::Age => "the age text itself, e.g. \"10s ago\"",
             Meaning::ColumnHeader => "the header's own text",
             Meaning::ActionStepNotRunOrCancelled => {
                 "the step's own word (\"cancelled\", \"none yet\")"

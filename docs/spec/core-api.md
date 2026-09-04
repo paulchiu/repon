@@ -95,7 +95,7 @@ Three named instances, from [0010](../adr/0010-provenance-renders-as-a-row-gutte
 
 ### The timestamp
 
-`Timestamp` is a wall clock, RFC 3339 on the wire. `std::time::Instant` cannot be serialised at all, and `std::time::SystemTime` serialises through serde's built-in impl to `{"secs_since_epoch":1800000000,"nanos_since_epoch":0}`, which no consumer wants. Supersession arbitrates entirely on the Generation and never on the timestamp, so the timestamp has no correctness role: it exists for 'fresh 9s ago' and for a machine consumer's absolute time. A wall clock that jumps backwards therefore produces a negative age, which renders as 'just now' rather than being defended against.
+`Timestamp` is a wall clock, RFC 3339 on the wire. `std::time::Instant` cannot be serialised at all, and `std::time::SystemTime` serialises through serde's built-in impl to `{"secs_since_epoch":1800000000,"nanos_since_epoch":0}`, which no consumer wants. Supersession arbitrates entirely on the Generation and never on the timestamp, so the timestamp has no correctness role: it exists for 'fresh just now' and for a machine consumer's absolute time. A wall clock that jumps backwards therefore produces a negative age, which renders as 'just now' rather than being defended against.
 
 ### Staleness
 

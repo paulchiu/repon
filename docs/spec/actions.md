@@ -243,7 +243,7 @@ While the detail pane is open beside the list, moving the cursor re-targets it. 
 │serve-frontend   repo                                                                 │
 │~/dev/serve-frontend                                                                  │
 │                                                                                      │
-│branch    main   fresh 9s ago                                                         │
+│branch    main   fresh just now                                                       │
 │                                                                                      │
 │last action   reinstall   failed   1m ago                                             │
 │  step 1  ok       rm -rf node_modules   0.3s                                         │
