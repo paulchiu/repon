@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -263,13 +264,14 @@ struct ManagementRunOutcome {
 
 /// State for one management run moved off the calling thread
 /// ([0033](../../../docs/adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)):
-/// the operation, for the row Notice's own wording; the shared position
-/// [`App::draw_frame`] reads every frame it is `Some`; the flag `Action::Unwind` raises to
-/// stop the loop before its next row starts, never mid-row; and the channel the finished
-/// [`ManagementRunOutcome`] arrives on, drained by [`App::poll_management_run`] on every
-/// [`Message::Tick`].
+/// the operation, for the row Notice's own wording; the run's own ordered Selection, for
+/// [`App::pending_management_keys`]; the shared position [`App::draw_frame`] reads every
+/// frame it is `Some`; the flag `Action::Unwind` raises to stop the loop before its next row
+/// starts, never mid-row; and the channel the finished [`ManagementRunOutcome`] arrives on,
+/// drained by [`App::poll_management_run`] on every [`Message::Tick`].
 struct ManagementRun {
     operation: management::Operation,
+    targets: Arc<[EntityKey]>,
     progress: Arc<Mutex<RowProgress>>,
     cancel: Arc<AtomicBool>,
     outcome: mpsc::Receiver<ManagementRunOutcome>,
@@ -839,11 +841,12 @@ impl App {
     /// entity count folded into the same rank-1 item, `warnings`, and every warning
     /// [`Self::acknowledged_warnings`] has marked seen. `filter_match_count` and
     /// `worktrees_note` read [`Self::active_filter`] and `visible_row_order`
-    /// ([`crate::components::list`]) so the header's own count is the identical set the list
-    /// draws ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the matching
-    /// rows, the header's match count ... are all the same set"). `run_progress` and
-    /// `elapsed` come from `self.action_run` while [`Self::action_running`] is true, and are
-    /// `None` otherwise.
+    /// ([`crate::components::list`]) with no pinned key of its own, so the header's own count
+    /// is the Filter's own matching set, never widened by a row an in-flight run is merely
+    /// holding past it ([filter.md](../../../docs/spec/filter.md)'s "the visible rows, the
+    /// matching rows, the header's match count ... are all the same set", with a pinned row
+    /// as the named exception). `run_progress` and `elapsed` come from `self.action_run`
+    /// while [`Self::action_running`] is true, and are `None` otherwise.
     fn status_row_content<'a>(
         &'a self,
         snapshot: &Snapshot,
@@ -857,6 +860,7 @@ impl App {
             self.document.show_submodules,
             &filter,
             self.row_order,
+            &HashSet::new(),
         );
         let filter_match_count = filter.is_active().then_some(visible.len());
         let worktrees_override = !worktrees_shown && filter.requests_kind(Kind::Worktree);
@@ -1277,7 +1281,7 @@ impl App {
                 None
             }
             Some(Action::SelectAllVisible) => {
-                self.selection.select_all_visible(&self.visible_keys());
+                self.selection.select_all_visible(&self.matching_keys());
                 None
             }
             Some(Action::ClearSelection) => {
@@ -2238,6 +2242,14 @@ impl App {
         let handle = self.core.management_handle();
         let config_file = self.config_file.clone();
         let total = plan.targets.len();
+        // Cloned ahead of `plan` moving into the thread below: `Self::pending_management_keys`
+        // reads this from the calling thread, in the plan's own order, while the background
+        // thread's `plan` is a separate, moved copy it never reaches into.
+        let targets: Arc<[EntityKey]> = plan
+            .targets
+            .iter()
+            .map(|target| target.key.clone())
+            .collect();
         let progress = Arc::new(Mutex::new(RowProgress {
             name: Arc::from(""),
             position: 0,
@@ -2296,6 +2308,7 @@ impl App {
         // scan: management_run_start end
         self.management_run = Some(ManagementRun {
             operation,
+            targets,
             progress,
             cancel,
             outcome: rx,
@@ -2399,6 +2412,49 @@ impl App {
                 progress.total,
             )
         })
+    }
+
+    /// The keys [`Self::management_run`]'s own ordered targets still have work pending for:
+    /// the row currently executing (`RowProgress::position`) and every row still to come, in
+    /// `plan.targets`' own order, per [`Self::run_management`]'s own doc comment on
+    /// `targets`. Empty once the run finishes (`self.management_run` is `None`) or before its
+    /// first row has published a position, in which case the whole run is still ahead of
+    /// itself and every target is pending.
+    fn pending_management_keys(&self) -> &[EntityKey] {
+        let Some(run) = &self.management_run else {
+            return &[];
+        };
+        let position = run.progress.lock().unwrap().position;
+        // Clamped rather than trusted: a position past `targets.len()` never arises from a
+        // real run, only from a hand-built fixture whose two fields disagree, and this must
+        // degrade to nothing pending rather than panic on it.
+        let start = position.saturating_sub(1).min(run.targets.len());
+        &run.targets[start..]
+    }
+
+    /// The keys [`crate::components::list::visible_row_order`] should show even past the
+    /// Committed Filter this frame: [`Self::pending_management_keys`], plus every row an
+    /// ordinary fan-out Action still has its own step running against
+    /// (`last_action.running.is_some()`, the signal [`repon_core::Core::run_action`] already
+    /// writes per step). Neither widens past its own run: an entity outside both is never
+    /// pinned ([docs/spec/repo-management.md](../../../docs/spec/repo-management.md)'s "Once
+    /// accepted").
+    fn pinned_keys(&self, snapshot: &Snapshot) -> HashSet<EntityKey> {
+        let mut pinned: HashSet<EntityKey> =
+            self.pending_management_keys().iter().cloned().collect();
+        pinned.extend(
+            snapshot
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.running.is_some())
+                })
+                .map(|entity| entity.key.clone()),
+        );
+        pinned
     }
 
     /// Runs `spec` over [`Self::action_targets`], the seam every Action-running path in this
@@ -2572,10 +2628,34 @@ impl App {
     /// Every currently shown Entity's key, in the same order
     /// [`crate::components::list::List`] draws
     /// ([`crate::components::list::visible_row_order`]): this crate's whole "visible list",
-    /// narrowed by [`Self::effective_show_worktrees`], the show-submodules preference and
-    /// [`Self::active_filter`], and what `select_all_visible`, `extend_range` and the cursor
-    /// bounds all read.
+    /// narrowed by [`Self::effective_show_worktrees`], the show-submodules preference,
+    /// [`Self::active_filter`] and [`Self::pinned_keys`], and what `extend_range` and the
+    /// cursor bounds all read. [`Self::matching_keys`] is the Filter's own narrower set,
+    /// for the one caller (`Action::SelectAllVisible`) that must never pick up a row the
+    /// Filter itself would drop.
     fn visible_keys(&self) -> Vec<EntityKey> {
+        let snapshot = self.core.snapshot();
+        let filter = self.active_filter();
+        let pinned = self.pinned_keys(&snapshot);
+        crate::components::list::visible_row_order(
+            &snapshot.entities,
+            self.effective_show_worktrees(),
+            self.document.show_submodules,
+            &filter,
+            self.row_order,
+            &pinned,
+        )
+        .into_iter()
+        .map(|index| snapshot.entities[index].key.clone())
+        .collect()
+    }
+
+    /// [`Self::visible_keys`] with no pinned key of its own: the rows `Self::active_filter`
+    /// alone keeps, read by `Action::SelectAllVisible` (`a`) so a row an in-flight run is
+    /// merely holding past the Filter is never swept into the Selection as if it had matched
+    /// (`docs/spec/repo-management.md`'s "Once accepted": a pinned row "is being held past
+    /// the Filter, not claimed to satisfy it").
+    fn matching_keys(&self) -> Vec<EntityKey> {
         let snapshot = self.core.snapshot();
         let filter = self.active_filter();
         crate::components::list::visible_row_order(
@@ -2584,6 +2664,7 @@ impl App {
             self.document.show_submodules,
             &filter,
             self.row_order,
+            &HashSet::new(),
         )
         .into_iter()
         .map(|index| snapshot.entities[index].key.clone())
@@ -2693,12 +2774,14 @@ impl App {
     fn visible_failed(&self) -> Vec<bool> {
         let snapshot = self.core.snapshot();
         let filter = self.active_filter();
+        let pinned = self.pinned_keys(&snapshot);
         crate::components::list::visible_row_order(
             &snapshot.entities,
             self.effective_show_worktrees(),
             self.document.show_submodules,
             &filter,
             self.row_order,
+            &pinned,
         )
         .into_iter()
         .map(|index| {
@@ -3082,6 +3165,10 @@ impl App {
         // its own draw methods runs below.
         let filter = self.active_filter();
         self.list.set_filter(filter);
+        // The pinned-key set overriding `filter` for this frame alone, handed to `self.list`
+        // the same per-frame way, so what the list draws and what `Self::visible_keys` reads
+        // for the cursor and every navigation key can never disagree.
+        self.list.set_pinned(self.pinned_keys(&snapshot));
         // The cursor, its viewport offset and the loaded theme, handed to `self.list`
         // the same per-frame way as `filter` above, so the cursor row's highlight
         // ([`theme::Theme::selection_style`]) and the window it is drawn in always
@@ -5859,6 +5946,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.management_run = Some(ManagementRun {
             operation: management::Operation::Ignore,
+            targets: Arc::from(Vec::<EntityKey>::new()),
             progress: std::sync::Arc::new(std::sync::Mutex::new(RowProgress {
                 name: std::sync::Arc::from("repo-b"),
                 position: 2,
