@@ -159,7 +159,7 @@ A Repo or Worktree an earlier Refresh found and the current one did not. It keep
 An optional background cycle, off by default, that fetches every remote with pruning and fires immediately on being enabled rather than waiting for its first tick. It always prunes, since `Gone` only appears after a prune; fails closed on a credential prompt rather than hanging; touches nothing in the working tree; and is bounded to a configured concurrency. A finished cycle starts one normal Generation, the same completion path an Action's own fan-out finishing already takes.
 
 **Fetch spec**:
-The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Present only when the core is built with its `fetch` cargo feature, the mutating path's own isolation boundary. Not a FetchConfig, which names the consumer's parsed TOML shape rather than the core's.
+The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Not a FetchConfig, which names the consumer's parsed TOML shape rather than the core's.
 
 **Fetch failures**:
 The most recently completed periodic fetch cycle's own count of repositories it could not fetch, read fresh rather than latched: a cycle where every fetch succeeds carries none. Never the underlying error text, since that text is arbitrary bytes from a remote; the individual failures, with their paths, reach the log instead. One repository's own failure never stops another's, the per-repository independence the periodic fetch already holds to.
@@ -168,10 +168,7 @@ The most recently completed periodic fetch cycle's own count of repositories it 
 An optional mutation that rides the periodic fetch cycle rather than carrying a timer of its own, off by default. It acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, never fixed, by leaving its true Cells to say so on the next Generation. It never rebases, merges, commits or resets: moving the branch a fast-forward's own way (a ref update and the working-tree writes a tree diff between the two commits names) is the whole mechanism.
 
 **Auto update spec**:
-The auto-update's own bounding data as the core receives it: whether it runs at all, plain data with no TOML type. Present regardless of the `fetch` cargo feature, the same way Fetch spec is; inert without it, and inert while Fetch spec's own `enabled` is false.
-
-**Fetch available**:
-Whether the build in hand carries the periodic fetch's own mechanism rather than only the bounding data on Core spec. False on a default build, where Fetch spec's `enabled` is accepted and inert, which a consumer is expected to say out loud rather than leave silent.
+The auto-update's own bounding data as the core receives it: whether it runs at all, plain data with no TOML type. Inert while Fetch spec's own `enabled` is false, since it rides that cycle rather than carrying a timer of its own.
 
 **Auto update attempt**:
 One on-demand result of the fast-forward-only auto-update against a single Repo, read fresh rather than from a Cell: fast-forwarded, or one of its own four ineligible reasons, or a git read or write that failed partway through. The core's own on-demand entry point for a consumer to call by hand, reusing the identical rules the periodic fetch's own auto-update already runs rather than a second implementation of them.

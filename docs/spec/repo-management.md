@@ -11,7 +11,7 @@ Management operations change what Repon operates on, or remove a Repo from the m
 | `ignore` | Writes `exclude = true` for the entity's path | A Repo or Worktree not already excluded |
 | `unignore` | Removes `exclude` for the entity's path | A Repo or Worktree currently excluded by a `[[repo]]` entry |
 | `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one and its path from every `[[set]]` array that names it, then drops its row | A Repo or Worktree |
-| `sync` | Fast-forwards the branch to its tracked upstream, reusing the periodic fetch's own auto-update rules | A Repo, on a build with the `fetch` cargo feature; whether it is behind, ahead, clean and tracking an upstream right now is read by attempting it, never a gate refusal |
+| `sync` | Fast-forwards the branch to its tracked upstream, reusing the periodic fetch's own auto-update rules | A Repo; whether it is behind, ahead, clean and tracking an upstream right now is read by attempting it, never a gate refusal |
 
 The four names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
 
@@ -46,8 +46,6 @@ This replaces the rename-then-delete strategy an earlier design considered and d
 `sync` is refused on a Submodule: it tracks a pinned commit, not a branch, so there is nothing to fast-forward.
 
 `sync` is refused on a Worktree: the auto-update it reuses acts on a Repo's own branch, and `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly that reason. A Worktree sharing a common dir with a Repo is listed, never operated on, the same rule [config.md](config.md) already states for the periodic fetch's own common-dir filter, and this row says so rather than silently doing nothing.
-
-`sync` is refused on every row, whatever its Kind, on a build with no `fetch` cargo feature: the fast-forward mechanism it reuses does not exist to call on a build like that, the same "accepted and inert" fact [config.md](config.md)'s `fetch.enabled` warning already names for the periodic fetch. The reason names the same install command that warning does, `cargo install --git https://github.com/paulchiu/repon --locked --features fetch repon` ([releasing.md](releasing.md)), rather than inventing a second way to say it.
 
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
 

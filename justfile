@@ -15,16 +15,6 @@ release:
 # Run all tests
 test:
     cargo test --workspace --locked
-    # The run above uses default features, so it never reaches a single test behind the
-    # `fetch` feature: the periodic fetch and the fast-forward-only update both live there,
-    # and without this second run their suites are written and then executed on nobody's
-    # machine but the author's.
-    cargo test -p repon-core --locked --features fetch
-    # `repon`'s own built-in `sync` action is eligible only on a build with the `fetch`
-    # feature (0031), so its own crate needs the identical second run: without this, the
-    # `Eligible` half of that decision is untested on anyone's machine but the author's,
-    # the same gap the run above closes for `repon-core`.
-    cargo test -p repon --locked --features fetch --bin repon
 
 # Format code with rustfmt
 fmt:
@@ -37,11 +27,6 @@ fmt-check:
 # Lint with clippy, warnings are errors
 lint:
     cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
-    # The run above uses default features, so the `fetch` module is only ever compiled by
-    # `just test`'s own fetch pass, as a test target, where a field the production path
-    # ignores still reads as live. Without this, dead code behind the feature reaches a
-    # user's `cargo install --features fetch` as a warning CI never saw.
-    cargo clippy --workspace --all-targets --locked --no-deps --features fetch -- -D warnings
 
 # Fail on a broken intra-doc link or a malformed doc comment
 docs:
@@ -122,66 +107,36 @@ check-core-isolation:
     check_isolation "serde feature on, the settled document's wire format" serde \
         "${base_allowed_with_reasons[@]}" \
         "serde:the settled document's wire format on stdout, off by default (ADR 0015)"
-    # The periodic fetch's blocking network client, HTTP transport and credential
-    # machinery resolve inside gix's own already-allowed subtree, so they never
-    # surface as a direct dependency and the allowed set here is identical to the
-    # base build. That identity is not itself evidence of anything: a depth-1 check
-    # cannot see them either way, which is what `check_network_stack_is_gated`
-    # below exists to cover (ADR 0015's "The read-only invariant is scoped to the
-    # probe path").
-    check_isolation "fetch feature on, the periodic fetch" fetch "${base_allowed_with_reasons[@]}"
 
-    # The claim the depth-1 check above is structurally blind to: the mutating
-    # path's network stack is absent from the default build and present only under
-    # the feature. Read over the whole transitive tree, since that is the depth the
-    # crates actually live at.
-    #
-    # Checked against both `repon-core` alone and the `repon` binary a user actually
-    # builds, because `repon-core` passing this in isolation already did once while
-    # `repon`'s own manifest requested `repon-core/fetch` unconditionally, putting the
-    # network stack (and aws-lc-sys's C sources, which fail to cross-compile to
-    # Windows) in every ordinary `cargo build`. `repon` now carries its own opt-in
-    # `fetch` feature forwarding to `repon-core/fetch` (`Cargo.toml`'s own comment on
-    # the dependency line), the one path `cargo install --features fetch` reaches, so
-    # its "on" case is asserted here too: without it, `repon`'s own `[features]`
-    # entry could be spelled wrong, forward to nothing, or forward to the wrong
-    # feature name, and this check would still pass.
-    check_network_stack_is_gated() {
+    # The other half of the depth-1 check above, which cannot see this either way: the
+    # fetch path's network stack is now in the default build of both crates, with no
+    # feature gating it. Asserted rather than assumed, because re-gating only gix's own
+    # network features would put the tree back as it was while leaving every manifest,
+    # spec and ADR here still claiming otherwise, and nothing else in this repo reads the
+    # transitive tree.
+    check_network_stack_is_unconditional() {
         local -a network_crates=(reqwest rustls hyper-rustls tokio-rustls)
 
-        local core_default_tree core_fetch_tree repon_default_tree repon_fetch_tree
-        core_default_tree=$(cargo tree -p repon-core --edges normal --prefix none)
-        core_fetch_tree=$(cargo tree -p repon-core --edges normal --prefix none --features fetch)
-        repon_default_tree=$(cargo tree -p repon --edges normal --prefix none)
-        repon_fetch_tree=$(cargo tree -p repon --edges normal --prefix none --features fetch)
+        local core_tree repon_tree
+        core_tree=$(cargo tree -p repon-core --edges normal --prefix none)
+        repon_tree=$(cargo tree -p repon --edges normal --prefix none)
 
         for name in "${network_crates[@]}"; do
-            if grep -qE "^${name} v" <<<"$core_default_tree"; then
-                echo "$name is in repon-core's default build; the mutating fetch path's" >&2
-                echo "network stack must reach the tree only under the fetch feature" >&2
+            if ! grep -qE "^${name} v" <<<"$core_tree"; then
+                echo "$name is absent from repon-core's default build; fetch is unconditional" >&2
+                echo "now, so the network stack must reach the tree with no feature asked for" >&2
                 exit 1
             fi
-            if grep -qE "^${name} v" <<<"$repon_default_tree"; then
-                echo "$name is in repon's own default build; the binary a user actually" >&2
-                echo "builds must not pull the fetch path's network stack in either" >&2
-                exit 1
-            fi
-            if ! grep -qE "^${name} v" <<<"$core_fetch_tree"; then
-                echo "$name is absent even with the fetch feature on; this check is naming a" >&2
-                echo "crate the fetch path no longer pulls, so it proves nothing as written" >&2
-                exit 1
-            fi
-            if ! grep -qE "^${name} v" <<<"$repon_fetch_tree"; then
-                echo "$name is absent from 'cargo build -p repon --features fetch'; repon's" >&2
-                echo "own fetch feature must forward to repon-core/fetch, the one path" >&2
-                echo "'cargo install --features fetch' actually reaches" >&2
+            if ! grep -qE "^${name} v" <<<"$repon_tree"; then
+                echo "$name is absent from repon's default build; the binary a user installs" >&2
+                echo "with a plain 'cargo install repon' must carry the fetch path" >&2
                 exit 1
             fi
         done
-        echo "repon-core's and repon's own default builds pull none of: ${network_crates[*]}, and both crates' fetch feature pulls all of them"
+        echo "repon-core's and repon's own default builds both pull: ${network_crates[*]}"
     }
 
-    check_network_stack_is_gated
+    check_network_stack_is_unconditional
 
 # Build and test against the declared floor
 #
@@ -198,7 +153,6 @@ msrv:
     fi
     rustup toolchain install "$version" --profile minimal
     cargo "+$version" test --workspace --locked
-    cargo "+$version" test -p repon-core --locked --features fetch
 
 # The single definition of CI: the GitHub workflow runs this recipe, so a green
 # run here is a green pipeline

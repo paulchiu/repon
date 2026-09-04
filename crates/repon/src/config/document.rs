@@ -327,9 +327,6 @@ pub enum Warning {
     RepoPathMatchesNothing { path: String },
     /// `auto_update.enabled` with `fetch.enabled = false`, which can never fire.
     AutoUpdateWithoutFetch,
-    /// `fetch.enabled` on a build that carries no fetch mechanism, which is equally inert
-    /// and equally silent without this.
-    FetchEnabledButNotBuilt,
     /// `on_refresh` naming an Action no `[[action]]` declares, so the hook can never fire.
     OnRefreshNamesNoAction { name: String },
     /// A `[[set]].on_refresh` naming an Action no `[[action]]` declares, so the hook can
@@ -370,13 +367,6 @@ impl std::fmt::Display for Warning {
             Warning::RepoPathMatchesNothing { path } => {
                 write!(f, "[[repo]] path `{path}` matches no discovered entity")
             }
-            Warning::FetchEnabledButNotBuilt => write!(
-                f,
-                "fetch.enabled is true but this build carries no fetch mechanism, so nothing \
-                 is ever fetched; install with `cargo install --git \
-                 https://github.com/paulchiu/repon --locked --features fetch repon` to turn \
-                 it on"
-            ),
             Warning::AutoUpdateWithoutFetch => write!(
                 f,
                 "auto_update.enabled is true but fetch.enabled is false, so auto-update can never fire"
@@ -801,10 +791,6 @@ pub(crate) fn resolve_after_sync_name<'a>(
 /// working directory and warning about it would say nothing useful.
 fn cross_key_warnings(document: &Document) -> Vec<Warning> {
     let mut warnings = Vec::new();
-
-    if document.fetch.enabled && !repon_core::FETCH_AVAILABLE {
-        warnings.push(Warning::FetchEnabledButNotBuilt);
-    }
 
     if document.auto_update.enabled && !document.fetch.enabled {
         warnings.push(Warning::AutoUpdateWithoutFetch);
@@ -1606,52 +1592,6 @@ mod tests {
         assert_eq!(overrides[1].path, PathBuf::from("/absolute/vendor-mirror"));
         assert_eq!(overrides[1].default_branch, None);
         assert!(overrides[1].excluded);
-    }
-
-    /// A config key that is accepted and does nothing, with nothing said about it, is the
-    /// defect ADR 0023 rules out for a keybinding; the same reasoning covers a build that
-    /// carries the fetch's bounding data but not its mechanism. Both directions, since the
-    /// warning must not fire on a build that can actually fetch.
-    #[test]
-    fn fetch_enabled_warns_exactly_when_this_build_carries_no_fetch_mechanism() {
-        let enabled = parse_ok("[fetch]\nenabled = true\n");
-        assert_eq!(
-            enabled.warnings.contains(&Warning::FetchEnabledButNotBuilt),
-            !repon_core::FETCH_AVAILABLE,
-            "the warning must fire on a build with no mechanism and stay silent on one with it"
-        );
-
-        let disabled = parse_ok("[fetch]\nenabled = false\n");
-        assert!(
-            !disabled
-                .warnings
-                .contains(&Warning::FetchEnabledButNotBuilt),
-            "a key left off is not a key that cannot act"
-        );
-    }
-
-    /// `Warning::FetchEnabledButNotBuilt` must name a command a user can actually type,
-    /// per the issue this warning text was written to close: "rebuild with the `fetch`
-    /// feature" tells nobody what to type. Read out of `docs/spec/releasing.md`'s own
-    /// fetch-enabled install line rather than hand-copied, so the warning and the spec
-    /// cannot silently drift apart.
-    #[test]
-    fn fetch_enabled_but_not_built_names_releasings_own_fetch_install_command() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let releasing = std::fs::read_to_string(manifest_dir.join("../../docs/spec/releasing.md"))
-            .expect("read docs/spec/releasing.md");
-        let command = releasing
-            .lines()
-            .find(|line| line.starts_with("cargo install") && line.contains("--features fetch"))
-            .expect("releasing.md must carry a fetch-enabled `cargo install` line")
-            .trim();
-
-        let message = Warning::FetchEnabledButNotBuilt.to_string();
-        assert!(
-            message.contains(command),
-            "the warning must name releasing.md's own fetch-enabled install command \
-             verbatim; warning was: {message}"
-        );
     }
 
     // Cross-key check: auto_update.enabled with fetch.enabled = false can never fire.

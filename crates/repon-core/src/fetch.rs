@@ -1,8 +1,6 @@
 //! The periodic fetch: the one place, alongside the fast-forward-only update, that
 //! mutates a repository. `git.rs`'s "gix reads; nothing here writes" does not cover
-//! this module: a fetch always prunes, which rewrites `refs/remotes/`. Isolated
-//! behind the `fetch` cargo feature, so a consumer that never turns it on pulls in
-//! none of the blocking network client or transport dependencies this needs. See
+//! this module: a fetch always prunes, which rewrites `refs/remotes/`. See
 //! `docs/spec/refresh.md`'s "The periodic fetch" and
 //! [ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)'s
 //! "The read-only invariant is scoped to the probe path".

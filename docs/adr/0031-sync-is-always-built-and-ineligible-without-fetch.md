@@ -1,5 +1,19 @@
 # `sync` is always built, and ineligible without `fetch`
 
+> Superseded in part by [0015](0015-the-core-owns-the-table.md)'s amendment: fetch is
+> unconditional in both crates now, with no cargo feature gating it, so there is no build
+> left in which `sync` has nothing to call. `Eligibility::Refused(Refusal::FetchNotBuilt)`
+> and `Warning::FetchEnabledButNotBuilt` are gone along with the feature; `sync` is eligible
+> on a Repo unconditionally now, and refused on a Worktree or a Submodule only for the two
+> reasons below that never depended on the feature in the first place. The title's second
+> half no longer holds. What stands, and is why this record is kept rather than deleted:
+> `crate::management::OPERATIONS` still carries `sync` as one of four unconditional entries
+> rather than a variant that comes and goes with a build, `Operation::eligibility` still
+> matches exhaustively on `(Operation, Kind)` with no `cfg`-only arm, and
+> `Core::attempt_auto_update` still reuses `auto_update`'s own five rules rather than a
+> second implementation, all argued below and all still true of a codebase where `sync` was
+> never gated at all.
+
 The built-in `sync` action exists in every build of Repon. A `cargo install` with no `--features fetch` shows the same four entries in the Action palette a `--features fetch` install does, `ignore`, `unignore`, `delete` and `sync`; the difference is that `sync` refuses every row on the plain build, naming why, rather than being missing from the list.
 
 The alternative was to gate the variant itself: compile `sync` into `Operation` only under `repon`'s own `fetch` feature, so a plain install never sees it at all. That mirrors how the mechanism it calls, `repon-core`'s `auto_update` module, is already gated, and it would have been the smaller diff. It is refused here for the same reason [0023](0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) refuses an unbuilt keybinding for anything but a genuinely compile-time absence: a `[[action]]` name collision check, a help overlay, a spec table, and now a palette listing, all read `crate::management::OPERATIONS` as the one list of built-in names, and a name that comes and goes with a cargo feature makes every one of those four surfaces a claim that is only sometimes true. `Operation::eligibility` already matches exhaustively on `(Operation, Kind)`, which is the property this decision means to keep rather than work around: a `#[cfg(feature = "fetch")]` fourth variant would have needed a second, feature-gated `Operation` shape, or a `cfg`-only arm inside an otherwise unconditional match, either of which reopens exactly the "hand enumeration instead of an exhaustive match" defect the rest of this module was written to avoid.

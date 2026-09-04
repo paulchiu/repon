@@ -29,19 +29,13 @@ Measured, that costs 44.9 seconds and produces a 1,599,200 byte binary. A cold r
 
 The channel has one measured wart. On a machine whose git config rewrites GitHub HTTPS to SSH (`url.ssh://git@github.com/.insteadOf https://github.com/`), cargo's built-in git transport fails with "no authentication methods succeeded". `CARGO_NET_GIT_FETCH_WITH_CLI=true` fixes it with the rewrite still in place, because the git CLI holds the SSH credentials cargo's own transport cannot reach. The README carries the same advice, because the README is where a failing user is standing when it happens.
 
-The plain command above builds `repon-core` without its `fetch` feature, so [`FETCH_AVAILABLE`](../../crates/repon-core/src/lib.rs) is false and [refresh.md](refresh.md)'s periodic fetch and fast-forward-only auto-update stay inert: `fetch.enabled = true` in `config.toml` is accepted and does nothing. A user who wants that mechanism installs with the `fetch` feature instead:
-
-```sh
-cargo install --git https://github.com/paulchiu/repon --locked --features fetch repon
-```
-
-`crates/repon/Cargo.toml` forwards this to `repon-core/fetch`, the one deliberately mutating path this crate carries ([0015](../adr/0015-the-core-owns-the-table.md)); it stays out of `default` for the reason recorded on that dependency line, so the plain command above is unaffected and pulls in none of it. This is the exact command the `fetch.enabled` warning names when it fires against a build that lacks the feature.
+The command above builds `repon-core` with its periodic fetch and fast-forward-only auto-update mechanism unconditionally: [refresh.md](refresh.md)'s periodic fetch runs whenever `config.toml` sets `fetch.enabled = true`, with no separate feature flag to discover or ask for.
 
 ## Platform support
 
-Repon runs on macOS and Linux, and never on Windows. That is a decision, not a current limitation: the workspace compiles clean for `x86_64-pc-windows-msvc` today (a 27.2 second `cargo check`), and [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) is what closes that window, because [actions.md](actions.md) puts `setsid(2)` in `pre_exec`, opens the capture channel with `openpty(3)` through libc and hands the child `/dev/null` on stdin, and Windows has none of the three.
+Repon runs on macOS and Linux, and never on Windows. That is a decision, not a current limitation: [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) is what closes that window, because [actions.md](actions.md) puts `setsid(2)` in `pre_exec`, opens the capture channel with `openpty(3)` through libc and hands the child `/dev/null` on stdin, and Windows has none of the three.
 
-The guard is a `compile_error!` under `cfg(not(unix))` in `crates/repon-core/src/lib.rs`, so a Windows build fails at once with a sentence rather than later with a missing libc symbol. It belongs to the library rather than the binary because [0015](../adr/0015-the-core-owns-the-table.md) assigns Action fan-out and the child-process environment contract to the core: the crate that owns the Unix-only work is the crate that declares the requirement, and any future consumer of `repon-core` inherits the claim without knowing to ask for it.
+The guard is a `compile_error!` under `cfg(not(unix))` in `crates/repon-core/src/lib.rs`, so a Windows build meant to reach it fails at once with a sentence rather than later with a missing libc symbol. It belongs to the library rather than the binary because [0015](../adr/0015-the-core-owns-the-table.md) assigns Action fan-out and the child-process environment contract to the core: the crate that owns the Unix-only work is the crate that declares the requirement, and any future consumer of `repon-core` inherits the claim without knowing to ask for it. In practice a Windows `cargo check` today fails earlier, in `aws-lc-sys`'s build script, since the periodic fetch's network stack (pulled in unconditionally, per "Where Repon can be installed from" above) does not cross-compile to Windows; the guard still fires in any configuration that reaches compilation, but that configuration no longer exists for this workspace.
 
 docs.rs would trip over the guard: it builds five default targets and two of them are Windows (`x86_64-pc-windows-msvc`, `i686-pc-windows-msvc`), which would put two failed builds on every release's documentation page. Both crates therefore set `[package.metadata.docs.rs] targets` to one Linux and one Darwin triple (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`), the two platforms the support claim actually names.
 
@@ -57,19 +51,20 @@ Enforcement is `just msrv`, which reads the number out of `cargo metadata` rathe
 
 ## What CI does
 
-`.github/workflows/ci.yml` is five jobs:
+`.github/workflows/ci.yml` is four jobs:
 
 | job | runs | on |
 | --- | --- | --- |
 | `quality-check` | `just ci` | a matrix of `ubuntu-latest` and `macos-latest` |
-| `windows-target-guard` | `cargo check` against `x86_64-pc-windows-msvc`, asserting it fails with the guard's message | `ubuntu-latest` |
 | `msrv` | `just msrv` | `ubuntu-latest` |
 | `publish-check` | `just publish-check` | `ubuntu-latest` |
 | `ci` | asserts every job above succeeded | `ubuntu-latest` |
 
 The justfile owns what CI means. Each job's only step of substance is `just <recipe>`, so a green local run is a green pipeline and the definition of passing cannot drift between the two. `just ci` composes `fmt-check lint test docs check-core-isolation build`: rustfmt in check mode, clippy with warnings as errors across all targets, the workspace tests, rustdoc with warnings as errors (which is what catches a broken intra-doc link), the isolation check below, and a debug build, everything `--locked`. All of these passed on the untouched tree before any of this was added, so the gates started green; nothing was relaxed to obtain a first passing run.
 
-There are two OS legs in `quality-check` because standard GitHub runners are free on public repositories, macOS included. macOS is the primary development platform and Linux the other supported one, so both are proven on every push, and the matrix sets `fail-fast: false` so a failure on one still reports the other. A separate `windows-target-guard` job proves the platform claim above rather than contradicting it: `cargo check` never reaches the linker, so it adds the `x86_64-pc-windows-msvc` target on `ubuntu-latest`, no Windows runner needed, and runs `cargo check --workspace` against it. The job fails unless the build fails, and fails again unless the failure carries the guard's own message, so it proves the refusal rather than merely running something green.
+There are two OS legs in `quality-check` because standard GitHub runners are free on public repositories, macOS included. macOS is the primary development platform and Linux the other supported one, so both are proven on every push, and the matrix sets `fail-fast: false` so a failure on one still reports the other.
+
+There is no CI job proving the Windows refusal. One existed once, asserting `cargo check --workspace --target x86_64-pc-windows-msvc` failed with the Unix `compile_error!`'s own message, which was true while some configuration of `repon-core` had no network stack in it: `cargo check` never reaches the linker, so the guard fired first and cleanly, before anything else could fail. Once the periodic fetch's network stack became unconditional, `aws-lc-sys`'s C sources fail in a build script before the compiler ever reaches the guard, on every target the workspace resolves for, Windows included. There is no longer a configuration in which the Unix `compile_error!` is the first failure, so a job asserting it fired would pass for the wrong reason, or not at all; a job that passes without proving its claim is worse than no job, so the job was deleted rather than retargeted at a diagnostic that is no longer the guard's own.
 
 `check-core-isolation` is where [0015](../adr/0015-the-core-owns-the-table.md)'s enforcement finally lands. It reads `cargo tree -p repon-core --edges normal --depth 1` and fails unless the direct dependency set is exactly `crossbeam-channel gix rayon`. It is an allowlist rather than the denylist 0015 described, and deliberately so: a denylist bans ratatui and crossterm by name, and a rendering crate nobody thought to ban walks straight past it, while an allowlist makes every new core dependency a deliberate edit to the recipe with the boundary argument in front of whoever makes it.
 
@@ -133,7 +128,7 @@ Done already, proved by CI on every push:
 
 - the `version` on the `repon-core` path dependency, `rust-version`, `readme`, `homepage`, `authors`, `keywords`, `categories` and the symlinked `LICENSE`, all of which `just publish-check` rehearses
 - the docs.rs target override in both crates, which nothing local can prove because only docs.rs builds those targets
-- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc` and proved by the `windows-target-guard` job, which fails with the guard's own sentence and no other diagnostic
+- the Unix `compile_error!` guard, verified by hand against `x86_64-pc-windows-msvc`: no CI job proves it, per "What CI does" above
 
 ## What the tag pipeline does
 

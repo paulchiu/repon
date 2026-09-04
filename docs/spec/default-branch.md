@@ -71,7 +71,7 @@ It is coupled to fetch instead. A fetch handshake already advertises HEAD, so th
 - `.with_credentials(|_| Ok(None))`, so a missing credential fails closed instead of prompting on a terminal Repon has taken the alternate screen of.
 - `handshake::Ref::Symbolic { full_ref_name: "HEAD", target, .. }` carries the answer. `Ref::Unborn` covers an empty remote and is not an error.
 
-The transport needs `blocking-network-client` plus an HTTP transport feature, which pulls in a dependency set well beyond the read-only surface the core was scaffolded with. It is isolated behind a cargo feature.
+The transport needs `blocking-network-client` plus an HTTP transport feature, which pulls in a dependency set well beyond the read-only surface the core was scaffolded with; this crate carries both unconditionally rather than behind a cargo feature ([0015](../adr/0015-the-core-owns-the-table.md)).
 
 A user-triggered re-derive over the Selection uses the same path without fetching, on `b` ([keybindings.md](keybindings.md)).
 
