@@ -146,7 +146,25 @@ impl Tui {
         self.exit()?;
         let status = command.status();
         self.enter()?;
+        self.force_full_repaint()?;
         Ok(status?)
+    }
+
+    /// Forces the next `Terminal::draw` to write every cell rather than diff against the
+    /// buffer from before a full-screen child ran: `command` may have painted over cells
+    /// this buffer still believes are unchanged, and a frame that redraws them identically
+    /// would then leave them as the child left them
+    /// ([keybindings.md](../../../docs/spec/keybindings.md#terminal-state)'s terminal-state
+    /// contract). Resizes to the terminal's own current size, which resets ratatui's back
+    /// buffer as a side effect of the same call that also picks up a size change the child
+    /// made while it held the terminal, rather than calling `Terminal::clear`: that queries
+    /// the backend for the cursor position, which blocks on a reply a plain pty with nothing
+    /// on its other end (this crate's own pty tests included) never sends.
+    fn force_full_repaint(&mut self) -> Result<()> {
+        let size = self.terminal.size()?;
+        self.terminal
+            .resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+        Ok(())
     }
 
     /// Runs `command` to completion without ever leaving the screen: the other half of

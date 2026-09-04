@@ -90,6 +90,15 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub unspawnable_launcher_after_tui_enter: bool,
 
+    /// Claims the terminal, draws a marker, hands off to a synthetic Launcher that exits
+    /// immediately, then draws the identical marker again before exiting. Debug-only: exists
+    /// so a test can observe whether the second draw actually rewrites cells a diff against
+    /// the pre-handoff buffer would otherwise call unchanged, rather than trusting a
+    /// description of it, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub redraw_marker_after_suspend_for_child: bool,
+
     /// Claims the terminal, then writes to fd 2 from a spawned thread through
     /// `std::io::stderr()`, the same path a dependency's own thread takes rather than one of
     /// this crate's call sites, then exits. Debug-only: exists so a test can observe that a
