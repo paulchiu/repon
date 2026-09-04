@@ -3523,6 +3523,110 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_or_whitespace_only_query_still_shows_no_matches_since_enter_does_nothing() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "whitespace-only text contributes no ad hoc step, so Enter does nothing and the \
+             row must keep the true no-matches wording: {:?}",
+            row_text(&buf, 2, 40)
+        );
+    }
+
+    #[test]
+    fn with_shell_off_a_query_that_fails_to_word_split_still_shows_no_matches_since_enter_refuses_it()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.toggle_shell();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "an unterminated quote fails to word-split with shell off, so Enter refuses the \
+             whole command and the row must keep the true no-matches wording: {:?}",
+            row_text(&buf, 2, 40)
+        );
+    }
+
+    #[test]
+    fn the_runs_as_command_message_and_the_no_matches_message_and_nothing_configured_are_pairwise_distinct()
+     {
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+
+        let mut runs_as_command = ActionPalette::new();
+        for c in "zzq".chars() {
+            runs_as_command.type_char(c, &actions);
+        }
+        let runs_as_command_state =
+            draw_to_buffer(&runs_as_command, &actions, &theme, Count::selection(3));
+
+        let mut no_match = ActionPalette::new();
+        no_match.type_char(' ', &actions);
+        no_match.type_char(' ', &actions);
+        let no_match_state = draw_to_buffer(&no_match, &actions, &theme, Count::selection(3));
+
+        let nothing_configured_state =
+            draw_to_buffer(&ActionPalette::new(), &[], &theme, Count::selection(0));
+
+        assert!(all_rows(&runs_as_command_state).contains(RUNS_AS_COMMAND_MESSAGE));
+        assert!(all_rows(&no_match_state).contains(NO_MATCHES_MESSAGE));
+        assert!(all_rows(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
+        assert_ne!(
+            all_rows(&runs_as_command_state),
+            all_rows(&no_match_state)
+        );
+        assert_ne!(
+            all_rows(&runs_as_command_state),
+            all_rows(&nothing_configured_state)
+        );
+        assert_ne!(
+            all_rows(&no_match_state),
+            all_rows(&nothing_configured_state)
+        );
+    }
+
+    #[test]
+    fn a_query_that_still_matches_a_configured_action_or_built_in_never_shows_the_runs_as_command_message()
+     {
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+
+        let mut matches_action = ActionPalette::new();
+        matches_action.type_char('r', &actions);
+        let matches_action_buf =
+            draw_to_buffer(&matches_action, &actions, &theme, Count::selection(3));
+        assert!(
+            !all_rows(&matches_action_buf).contains(RUNS_AS_COMMAND_MESSAGE),
+            "a query still matching the configured Action must never show the \
+             runs-as-command message: {:?}",
+            all_rows(&matches_action_buf)
+        );
+
+        let mut matches_builtin = ActionPalette::new();
+        matches_builtin.type_char('d', &actions); // matches the built-in "delete"
+        let matches_builtin_buf =
+            draw_to_buffer(&matches_builtin, &actions, &theme, Count::selection(3));
+        assert!(
+            !all_rows(&matches_builtin_buf).contains(RUNS_AS_COMMAND_MESSAGE),
+            "a query still matching a built-in must never show the runs-as-command message: \
+             {:?}",
+            all_rows(&matches_builtin_buf)
+        );
+    }
+
+    #[test]
     fn clearing_the_query_restores_the_full_list_on_screen() {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
