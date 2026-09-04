@@ -32,8 +32,9 @@
 //! `$SHELL -c`, and the toggle turns that off for the run about to happen. It resets to the
 //! default every time the palette opens ([`ActionPalette::scoped`]), since a sticky off-state
 //! the user has forgotten about reproduces the silent no-op the default exists to remove. The
-//! mode reaches three places: this field's own bottom border while
-//! [`Stage::Choosing`] ([`shell_mode_hint`]), the confirm gate's own text
+//! mode reaches three places: this field's own bottom border while nothing is highlighted,
+//! the same moment `Enter` would build an ad hoc command
+//! ([`ActionPalette::highlighted`], [`shell_mode_hint`]), the confirm gate's own text
 //! ([`ActionPalette::draw`]'s `Chosen::AdHoc` arm), and the receipt itself
 //! ([`repon_core::Step::shell`], which [`repon_core::StepResult::shell`] then carries).
 
@@ -931,9 +932,12 @@ impl ActionPalette {
             .bordered_block(&mut scratch)
             .border_style(theme.style_for(Meaning::ActionPaletteBorder.role()))
             .title(Self::border_title(&count));
-        // Only while the ad hoc field itself can be typed into: the confirm gate's own text
-        // already names the mode beside the run count, so it has nothing further to add here.
-        if matches!(self.stage, Stage::Choosing) {
+        // Only while the typed query matches no built-in or configured entry, the same
+        // moment `Enter` would build an ad hoc command: a highlighted named entry runs as
+        // itself regardless of `self.shell`, and the confirm gate's own text already names
+        // the mode beside the run count once one is chosen, so this hint has nothing to add
+        // in either case.
+        if matches!(self.stage, Stage::Choosing) && self.highlighted(actions).is_none() {
             let hint = shell_mode_hint(self.shell, area.width);
             if !hint.is_empty() {
                 block = block.title_bottom(Line::from(hint));
@@ -1360,7 +1364,11 @@ mod tests {
     #[test]
     fn the_shell_mode_hint_reads_the_whole_sentence_when_the_frame_is_wide_enough() {
         let expected = format!("{SHELL_ON_CORE}{SHELL_ON_MECHANISM}{SHELL_ON_TOGGLE}");
-        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 70, 6);
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
+        let buf = draw_sized(&palette, &[], &Theme::default(), 70, 6);
         let bottom = row_text(&buf, 5, 70);
         assert!(
             bottom.contains(&expected),
@@ -1382,6 +1390,9 @@ mod tests {
         palette.toggle_shell();
 
         assert!(!palette.shell());
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
         let expected = format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}");
         let buf = draw_sized(&palette, &[], &Theme::default(), 70, 6);
         let bottom = row_text(&buf, 5, 70);
@@ -1400,7 +1411,11 @@ mod tests {
     /// [keybindings.md](../../../docs/spec/keybindings.md#the-footer) applies to the footer.
     #[test]
     fn the_shell_mode_hint_drops_the_mechanism_clause_before_the_toggle_clause() {
-        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 40, 6);
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
+        let buf = draw_sized(&palette, &[], &Theme::default(), 40, 6);
         let bottom = row_text(&buf, 5, 40);
         assert!(
             bottom.contains(SHELL_ON_CORE) && bottom.contains("alt+s"),
@@ -1417,7 +1432,11 @@ mod tests {
     /// too narrow even for the toggle clause still names the mode, never a half-drawn clause.
     #[test]
     fn the_shell_mode_hint_keeps_the_bare_words_once_the_toggle_clause_no_longer_fits() {
-        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 20, 6);
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
+        let buf = draw_sized(&palette, &[], &Theme::default(), 20, 6);
         let bottom = row_text(&buf, 5, 20);
         assert!(
             bottom.contains(SHELL_ON_CORE),
@@ -1440,7 +1459,11 @@ mod tests {
             "",
             "6 columns must be too narrow for any tier"
         );
-        let buf = draw_sized(&ActionPalette::new(), &[], &Theme::default(), 6, 6);
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &[]);
+        }
+        let buf = draw_sized(&palette, &[], &Theme::default(), 6, 6);
         let bottom = row_text(&buf, 5, 6);
         assert!(
             !bottom.contains("she"),
@@ -1460,6 +1483,92 @@ mod tests {
         assert!(
             !bottom.contains(SHELL_ON_CORE),
             "expected no shell-mode hint while confirming: {bottom:?}"
+        );
+    }
+
+    /// A freshly opened palette highlights the first built-in ([`entries`]'s own ordering)
+    /// with nothing typed, so nothing ad hoc is in play yet and the hint has nothing to show.
+    #[test]
+    fn the_shell_mode_hint_is_absent_while_a_built_in_is_highlighted_on_a_freshly_opened_palette() {
+        let mut palette = ActionPalette::new();
+        let actions: Vec<ActionConfig> = Vec::new();
+        assert!(
+            matches!(palette.highlighted(&actions), Some(Entry::Builtin(_))),
+            "the fixture must leave a built-in highlighted for the claim below to mean \
+             anything"
+        );
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_ON_CORE),
+            "expected no shell-mode hint while a built-in is highlighted: {bottom:?}"
+        );
+
+        // Absence must hold regardless of the toggle: it is the highlight, not `self.shell`,
+        // that governs whether the hint draws at all.
+        palette.toggle_shell();
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_OFF_CORE),
+            "expected no shell-mode hint while a built-in is highlighted, even with shell \
+             off: {bottom:?}"
+        );
+    }
+
+    /// A typed query that narrows the list down to a single configured entry: `Enter` would
+    /// run that entry as itself, with no ad hoc command in play, so the hint has nothing to
+    /// show either.
+    #[test]
+    fn the_shell_mode_hint_is_absent_while_a_typed_query_narrows_to_a_configured_entry() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "reinstall".chars() {
+            palette.type_char(c, &actions);
+        }
+        assert!(
+            matches!(palette.highlighted(&actions), Some(Entry::Configured(_))),
+            "the fixture must leave the configured entry highlighted for the claim below to \
+             mean anything"
+        );
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_ON_CORE),
+            "expected no shell-mode hint while a configured entry is highlighted: {bottom:?}"
+        );
+
+        // Absence must hold regardless of the toggle: it is the highlight, not `self.shell`,
+        // that governs whether the hint draws at all.
+        palette.toggle_shell();
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            !bottom.contains(SHELL_OFF_CORE),
+            "expected no shell-mode hint while a configured entry is highlighted, even with \
+             shell off: {bottom:?}"
+        );
+    }
+
+    /// A typed query matching no built-in or configured name is exactly the moment `Enter`
+    /// would build an ad hoc command instead, so this is where the hint has something to say.
+    #[test]
+    fn the_shell_mode_hint_appears_once_the_typed_query_matches_no_entry_and_would_build_an_ad_hoc_command()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        for c in "zz".chars() {
+            palette.type_char(c, &actions);
+        }
+        assert!(
+            palette.highlighted(&actions).is_none(),
+            "the fixture must leave nothing highlighted for the claim below to mean anything"
+        );
+        let buf = draw_sized(&palette, &actions, &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            bottom.contains(SHELL_ON_CORE),
+            "expected the shell-mode hint once the query matches nothing: {bottom:?}"
         );
     }
 
