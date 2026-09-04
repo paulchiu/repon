@@ -11046,8 +11046,8 @@ refresh_all = "z""#,
     }
 
     /// `Down` must reach the same `NextEntry` action `Ctrl+J` does, not fall through as an
-    /// unbound key: the same end-to-end shape #283 added for the Set picker's own `Up`/`Down`
-    /// gap, closed here for the Action palette.
+    /// unbound key: the same end-to-end shape the Set picker's own `Up`/`Down` coverage uses,
+    /// closed here for the Action palette.
     #[test]
     fn down_moves_the_action_palettes_own_highlight_onto_the_second_entry() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11096,6 +11096,15 @@ refresh_all = "z""#,
             .expect("open the palette");
         app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
             .expect("move the highlight down");
+        assert_eq!(
+            app.action_palette
+                .as_ref()
+                .and_then(|palette| palette.highlighted(&app.document.actions))
+                .map(|entry| entry.name().to_string()),
+            Some("beta".to_string()),
+            "sanity: Down must have actually moved the highlight before Up walks it back"
+        );
+
         app.handle_key_event(press(KeyCode::Up, KeyModifiers::NONE))
             .expect("move the highlight back up");
 
