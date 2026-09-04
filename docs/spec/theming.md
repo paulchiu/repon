@@ -107,7 +107,7 @@ Mirrors tuicr, so two of the same person's tools do not disagree about where a t
 - A theme file is `themes/<name>.toml` in a directory beside `config.toml`, which [the config spec](config.md) settles at `~/.config/repon/themes/` on macOS as well as Linux. State and the log stay in the platform data directory, the same split tuicr uses.
 - `default` is reserved for the compiled-in theme. `theme = "default"` always means the real default, and a `themes/default.toml` is ignored with a warning. With no other bundled themes, `default` is the entire reserved set.
 
-The theme is read at startup and read again on resume, both from a Launcher returning ([0007](../adr/0007-launchers-are-argv-vectors.md)) and from SIGTSTP. Resume is the one moment the file plausibly changed, since a user can open their theme in `$EDITOR` from inside Repon, and the reload costs a file read on a path already doing a full redraw. There is no filesystem watch and no runtime `:theme` command, because with one bundled theme there is nothing to switch to.
+The theme is read at startup and read again on resume, both from a Launcher returning ([0007](../adr/0007-launchers-are-argv-vectors.md)) and from the ad-hoc `$EDITOR` handoff. Resume is the one moment the file plausibly changed, since a user can open their theme in `$EDITOR` from inside Repon, and the reload costs a file read on a path already doing a full redraw. There is no filesystem watch and no runtime `:theme` command, because with one bundled theme there is nothing to switch to.
 
 ## Glyphs are not themeable
 

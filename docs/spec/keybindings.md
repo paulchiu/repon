@@ -28,8 +28,6 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | --- | --- |
 | `?` | Open the help overlay |
 | `q` | Quit |
-| `Ctrl+C` | Quit |
-| `Ctrl+Z` | Suspend |
 | `!` | Open the Launcher palette |
 | `;` | Open the Action palette |
 | `m` | Open the Action palette filtered to management operations |
@@ -206,9 +204,9 @@ Esc never quits, at any depth. It unwinds exactly one level per press. If an Act
 
 Esc-twice gestures were measured safe against human typing: crossterm collapses two Esc bytes into one event only when both arrive in a single `read()`, and at a 0.5ms gap it is already two events. They are still not used, because that measurement stops holding over SSH.
 
-## Quitting, suspending, confirming
+## Quitting and confirming
 
-`q` and `Ctrl+C` both quit, and both ask for confirmation while an Action is fanning out or a management run is outstanding, because quitting orphans the children (an Action's) or abandons the background thread mid-run (a management run's). `Ctrl+Z` suspends and is deliberately not gated the same way: it stops the step groups rather than orphaning them, and suspending is reversible where quitting is not. While a fan-out or a management run is in flight `;` and `m`, `s`, `1` to `9`, `Ctrl+R` and `e` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself, and `e` ends in the identical reload; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md). Raw mode clears ISIG, so none of these are inherited from the terminal driver: they are implemented.
+`q` quits, and asks for confirmation while an Action is fanning out or a management run is outstanding, because quitting orphans the children (an Action's) or abandons the background thread mid-run (a management run's). While a fan-out or a management run is in flight `;` and `m`, `s`, `1` to `9`, `Ctrl+R` and `e` are inert, because a second Action, a Set switch and a config reload each invalidate the run underneath itself, and `e` ends in the identical reload; `!` stays live. Inert here means unavailable rather than unbuilt, so each stays advertised and answers the press with a Notice ([Built and available](#built-and-available)). That is a binding conditional on runtime state rather than on context, which is a cost [0018](../adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md) prices against [0016](../adr/0016-one-binding-table-feeds-every-surface.md).
 
 The confirm gate takes `y` to run and `n` or Esc to decline. **Enter does nothing at all.** Enter defaulting to yes is one reflex away from running an arbitrary command across ninety-nine Repos, which is the failure [0008](../adr/0008-two-palettes-not-one.md) exists to prevent, and `y` is far enough from `n` to be deliberate.
 
@@ -376,7 +374,7 @@ The collision case is the one worth explaining. [theming.md](theming.md) refused
 | Mouse capture | **off** | **no** | It takes the terminal's own select-and-copy away, and the screen is mostly Repo paths and branch names people copy out of it |
 | Focus reporting | on | yes | [refresh.md](refresh.md) refreshes on focus gained |
 
-This is the terminal-state contract, stated here once and pointed at from [config.md](config.md#launchers) rather than counted again there. Repon claims all five on entry and leaves no residue: every piece it *enables* is released on every exit from the screen, which means a Launcher handoff, `Ctrl+Z`, quitting and the panic hook alike, not the handoff alone.
+This is the terminal-state contract, stated here once and pointed at from [config.md](config.md#launchers) rather than counted again there. Repon claims all five on entry and leaves no residue: every piece it *enables* is released on every exit from the screen, which means a Launcher handoff, quitting and the panic hook alike, not the handoff alone.
 
 Mouse capture is the one piece Repon *disables* rather than enables, so it has nothing to release. It is held off for the whole run and never written on the way out. The terminal cannot be asked what it was, and a terminal found with capture on is one some earlier program crashed out of rather than one anybody configured, so the unconditional disable on entry repairs that state instead of destroying it. The `released` column is the whole exception set, and a second `no` in it is a decision rather than an implementation detail: see [0024](../adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md).
 

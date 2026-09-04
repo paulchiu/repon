@@ -53,11 +53,6 @@ fn main() -> color_eyre::Result<()> {
     }
 
     #[cfg(debug_assertions)]
-    if args.suspend_after_tui_enter {
-        return suspend_after_tui_enter();
-    }
-
-    #[cfg(debug_assertions)]
     if args.launcher_marker_after_tui_enter {
         return launcher_marker_after_tui_enter();
     }
@@ -132,18 +127,6 @@ fn panic_after_tui_enter() -> color_eyre::Result<()> {
     panic!("repon: test-triggered panic after claiming the terminal");
 }
 
-/// Claims the terminal, suspends it, then exits, so a test can attach to a real process over
-/// a pty and observe suspend-time restoration ordering, rather than trusting a description of
-/// it. Bypasses `Config` and the event loop: nothing here needs either.
-#[cfg(debug_assertions)]
-fn suspend_after_tui_enter() -> color_eyre::Result<()> {
-    errors::init()?;
-    let mut tui = tui::Tui::new()?;
-    tui.enter()?;
-    tui.suspend()?;
-    Ok(())
-}
-
 /// A minimal, otherwise-unpopulated Entity: enough for [`launcher::run`] to resolve a
 /// working directory and an environment contract from, with nothing else read by the debug
 /// scenarios that use it.
@@ -162,10 +145,9 @@ fn synthetic_entity() -> repon_core::EntityState {
 /// `config.toml` pipeline ([`config::Config::new`] then [`launcher::resolve`]) rather than
 /// hand-built, whose child writes a marker to the terminal's own stdio, then exits. A test
 /// attached to a real pty can then find the marker positioned between the handoff's restore
-/// and its reclaim, which is the same proof [`suspend_after_tui_enter`] gives for `SIGTSTP`
-/// applied to a Launcher's suspend-and-exec instead, and going through the real pipeline is
-/// what exercises `[[launcher]]` parsing and merge in a real process rather than only in a
-/// unit test.
+/// and its reclaim, proving the suspend-and-exec ordering rather than trusting a description
+/// of it, and going through the real pipeline is what exercises `[[launcher]]` parsing and
+/// merge in a real process rather than only in a unit test.
 #[cfg(debug_assertions)]
 fn launcher_marker_after_tui_enter() -> color_eyre::Result<()> {
     errors::init()?;

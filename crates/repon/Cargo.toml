@@ -60,7 +60,6 @@ serde_json = "1.0.145"
 # Splits a Launcher's `from_env` value, and the editor chain's, into argv with no shell
 # involved; already in the dependency tree transitively via gix-command, per ADR 0018.
 shell-words = "1.1.1"
-signal-hook = "0.4.4"
 # The ad hoc-editor handoff's scratch file: a real dependency here, not only a dev one, since
 # `editor::edit` writes and rereads one in production.
 tempfile = "3.27.0"

@@ -483,7 +483,7 @@ pub struct Core {
     /// [`Core::stop_action`] each look up before doing anything, so all three are no-ops
     /// with no fan-out live. Deliberately its own field rather than folded into `pause`/
     /// `resume`'s machinery, per [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
-    /// "Cancellation, suspend and quit": the core is contractually not told why background
+    /// own hold and stop verbs: the core is contractually not told why background
     /// work stopped, and a step's child needs SIGSTOP/SIGTERM/SIGKILL, information `pause`
     /// must never carry.
     action_control: Arc<Mutex<Option<Arc<executor::RunControl>>>>,
@@ -1450,7 +1450,7 @@ impl Core {
     /// started, reversible with [`Self::continue_action`]: suspending a run is reversible,
     /// where cancelling one is not
     /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-    /// "Cancellation, suspend and quit"). A no-op while no fan-out is running. Its own verb,
+    /// "Cancellation and quit"). A no-op while no fan-out is running. Its own verb,
     /// kept apart from [`Self::pause`], which stays ignorant of why background work stopped.
     pub fn hold_action(&self) {
         if let Some(control) = self.action_control.lock().unwrap().as_ref() {
@@ -1472,7 +1472,7 @@ impl Core {
     /// called becomes `Cancelled`; so does a step, or a whole entity's run, that had not
     /// started, which stays distinct from `NotRun`
     /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-    /// "Cancellation, suspend and quit"). A no-op while no fan-out is running. Its own verb,
+    /// "Cancellation and quit"). A no-op while no fan-out is running. Its own verb,
     /// kept apart from [`Self::pause`] for the same reason [`Self::hold_action`] is.
     pub fn stop_action(&self) {
         if let Some(control) = self.action_control.lock().unwrap().as_ref() {

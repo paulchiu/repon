@@ -142,7 +142,7 @@ The one line above the frame. It carries a Notice alone, or otherwise one list o
 The record that the user has read the outstanding Warnings, made by opening the expanded list. It frees the Warning's message from the Status row and leaves the indicator, a `!` and a count, which is reserved ahead of every item and is the one thing on that row that never drops.
 
 **Terminal state**:
-The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff that takes the terminal, `Ctrl+Z`, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
+The five pieces of the terminal Repon claims on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four are enables and are released on every exit from the screen, a Launcher handoff that takes the terminal, quitting and the panic hook alike. Mouse capture is the one Repon disables rather than enables, so it is held off for the whole run and never released. Not 'left exactly as found' or 'all five restored', both of which promise a symmetry only four pieces have.
 
 **Residue**:
 Anything Repon enabled in the terminal that is still on after Repon has given the terminal back. The contract is that there is none; it is not that the terminal is as it was, since a state Repon turned off may legitimately stay off.

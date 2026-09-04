@@ -43,7 +43,7 @@ const PTY_WIDTH: u16 = 120;
 
 /// How long a cancelled step's process group is given to exit on its own SIGTERM before
 /// [`RunControl::cancel`] escalates to the uncatchable SIGKILL: SIGTERM is trappable and
-/// SIGKILL is not (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
+/// SIGKILL is not (`docs/spec/actions.md`'s "Cancellation and quit").
 const CANCEL_GRACE: Duration = Duration::from_millis(350);
 
 /// One Action run's own reach into its steps' children, from outside the call stack that
@@ -106,7 +106,7 @@ impl RunControl {
 
     /// SIGSTOPs every step's process group currently live. Reversible with
     /// [`Self::continue_run`]; kept apart from `Core::pause`, which stays ignorant of why
-    /// background work stopped (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
+    /// background work stopped (`docs/spec/actions.md`'s "Cancellation and quit").
     pub(crate) fn hold(&self) {
         for pgid in self.live_snapshot() {
             signal_group(pgid, libc::SIGSTOP);

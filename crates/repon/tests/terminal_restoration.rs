@@ -23,16 +23,13 @@ use repon_core::liveness::{BACKSTOP, wait_for_or};
 
 // Safety contract: every call site below passes a valid, currently-open fd and, for
 // `ptsname_r`, a buffer at least as long as the `buflen` it also passes; for `ioctl`, a
-// `Winsize` pointer valid for the duration of the call. `waitpid`'s contract is the same as
-// its libc signature: `pid` names a still-live child of this process and `status` is a valid
-// out-pointer for the duration of the call.
+// `Winsize` pointer valid for the duration of the call.
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn setpgid(pid: c_int, pgid: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
     fn unlockpt(fd: c_int) -> c_int;
     fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
-    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     // Declared variadic, matching libc's own `int ioctl(int, unsigned long, ...)`, rather
     // than as a fixed three-argument function: Apple's arm64 ABI passes variadic arguments
     // on the stack even where a fixed-arity call of the same shape would use a register, so
@@ -40,10 +37,6 @@ unsafe extern "C" {
     // as `ioctl` failing with `EFAULT` there, harmlessly correct on x86_64 by coincidence).
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
-
-/// POSIX-standard on both macOS and Linux: also report a stopped child, not only an exited
-/// one.
-const WUNTRACED: c_int = 2;
 
 /// POSIX-standard on both macOS and Linux (`errno.h`): what a pty master read reports once its
 /// last slave descriptor has closed, on Linux. macOS reports the same condition as `Ok(0)`
@@ -247,12 +240,6 @@ fn ansi(command: impl crossterm::Command) -> String {
     buf
 }
 
-/// Whether a `waitpid` status reports the child stopped (`WIFSTOPPED`), the same test macro
-/// on both macOS and Linux.
-fn wifstopped(status: c_int) -> bool {
-    (status & 0xff) == 0x7f
-}
-
 /// Why a pty drain's reader thread stopped reading from the master.
 ///
 /// Both platforms agree only that a slave-less pty read must stop the drain; they report the
@@ -336,9 +323,9 @@ fn expect_eof(
 
 /// Spawns `repon` with `args` and `envs` over a real pty, drains the pty concurrently with
 /// the child (the same reason every test above does its own draining), waits for it to exit,
-/// and returns the exit status alongside everything the child wrote. Shared by the handoff tests
-/// below, which only care about the final output and exit code rather than an intermediate
-/// state like `suspend_restores_the_terminal_before_the_process_actually_stops` does.
+/// and returns the exit status alongside everything the child wrote. Shared by the handoff
+/// tests below, which only care about the final output and exit code rather than any
+/// intermediate state along the way.
 fn run_over_pty(args: &[&str], envs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
     let (master, slave_path) = open_pty();
     let held_slave = open_parent_held_slave(&slave_path);
@@ -434,63 +421,6 @@ fn terminal_state_is_claimed_and_restored_symmetrically_even_when_the_process_pa
     assert!(
         focus_off_at < paste_off_at && paste_off_at < leave_at,
         "the panic-time restore must be the enter sequence's mirror image, focus first: \
-         {output:?}"
-    );
-}
-
-/// `Tui::suspend` must restore the terminal *before* raising `SIGTSTP`: raw mode clears the
-/// signal-generating flag, so a process that stops first leaves the user's terminal broken
-/// until it is resumed. Proves the ordering by watching a real process stop (`waitpid` with
-/// `WUNTRACED`, since the child never receives a `SIGCONT` here) and checking the restore
-/// sequence already reached the pty by the time it does.
-#[test]
-fn suspend_restores_the_terminal_before_the_process_actually_stops() {
-    let (master, slave_path) = open_pty();
-    let held_slave = open_parent_held_slave(&slave_path);
-    let mut child = spawn_attached_to_pty(&slave_path, "--suspend-after-tui-enter");
-    let pid = child.id() as c_int;
-
-    // Drains the pty concurrently, the same reason the panic test above does: reading only
-    // after the child stops would race the pty buffer against this thread's own timeout.
-    let (reader, rx) = spawn_pty_reader(master);
-
-    // `waitpid` blocks, so it runs on its own thread and reports back over a channel, giving
-    // this test a bounded wait instead of a risk of hanging on a child that never stops.
-    let (stop_tx, stop_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut status: c_int = 0;
-        // Safety: `pid` is the child spawned above and is still alive; `status` is a valid
-        // local out-pointer for the duration of this call.
-        let rc = unsafe { waitpid(pid, &mut status, WUNTRACED) };
-        let _ = stop_tx.send((rc, status));
-    });
-
-    let (rc, status) = stop_rx.recv_timeout(BACKSTOP).unwrap_or_else(|_| {
-        let _ = child.kill();
-        panic!("waitpid did not report a state change; the child may never have stopped")
-    });
-    assert_eq!(
-        rc, pid,
-        "waitpid must report on the child this test spawned"
-    );
-    assert!(
-        wifstopped(status),
-        "expected the child to be stopped (WIFSTOPPED), got status {status:#x}"
-    );
-
-    // The child is confirmed stopped, not exited: SIGKILL terminates it outright without
-    // resuming it first, so the test does not depend on ever sending SIGCONT.
-    let _ = child.kill();
-    let _ = child.wait();
-
-    drop(held_slave);
-    let output = expect_eof(reader, rx, "repon --suspend-after-tui-enter");
-
-    let leave_alt = ansi(crossterm::terminal::LeaveAlternateScreen);
-    assert!(
-        output.contains(&leave_alt),
-        "the terminal must be restored before the process stops, but no \
-         LeaveAlternateScreen appeared in the output collected while it was stopped: \
          {output:?}"
     );
 }

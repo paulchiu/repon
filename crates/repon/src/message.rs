@@ -5,9 +5,6 @@ pub enum Message {
     Tick,
     Render,
     Resize(u16, u16),
-    Suspend,
-    Resume,
     Quit,
-    ClearScreen,
     Error(String),
 }
