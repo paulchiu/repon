@@ -289,10 +289,10 @@ These snapshots were generated from the prototype; colour does not survive the d
 │  acquiring-gateway             ││fix/settlement-retry   worktree                                                                         │
 │   └ fix/settlement-retry       ││~/dev/acquiring-gateway/fix/settlement-retry                                                            │
 │   └ chore/bump-tonic           ││                                                                                                        │
-│   └ spike/idempotency          ││branch    fix/settlement-retry   fresh 11s ago                                                          │
-│  vendor/legacy-terminal-sdk    ││sync      3 ahead, 0 behind   fresh 9s ago                                                              │
-│! vendor/broken-checkout        ││dirty     4 changed   fresh 9s ago                                                                      │
-│  scratch/perf-notes            ││state     active   fresh 9s ago                                                                         │
+│   └ spike/idempotency          ││branch    fix/settlement-retry   fresh 10s ago                                                          │
+│  vendor/legacy-terminal-sdk    ││sync      3 ahead, 0 behind   fresh just now                                                            │
+│! vendor/broken-checkout        ││dirty     4 changed   fresh just now                                                                    │
+│  scratch/perf-notes            ││state     active   fresh just now                                                                       │
 │   └ acquiring-gateway/protos   ││                                                                                                        │
 │  checkout-web                  ││recent                                                                                                  │
 │  checkout-web-e2e              ││  9ab7712  Split the checkout reducer per step                                                          │
@@ -318,10 +318,10 @@ These snapshots were generated from the prototype; colour does not survive the d
 │fix/settlement-retry   worktree                                                       │
 │~/dev/acquiring-gateway/fix/settlement-retry                                          │
 │                                                                                      │
-│branch    fix/settlement-retry   fresh 11s ago                                        │
-│sync      3 ahead, 0 behind   fresh 9s ago                                            │
-│dirty     4 changed   fresh 9s ago                                                    │
-│state     active   fresh 9s ago                                                       │
+│branch    fix/settlement-retry   fresh 10s ago                                        │
+│sync      3 ahead, 0 behind   fresh just now                                          │
+│dirty     4 changed   fresh just now                                                  │
+│state     active   fresh just now                                                     │
 │                                                                                      │
 │recent                                                                                │
 │  9ab7712  Split the checkout reducer per step                                        │

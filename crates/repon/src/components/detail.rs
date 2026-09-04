@@ -1002,14 +1002,16 @@ fn describe_unknown(reason: Unknown) -> &'static str {
 
 /// A value's age against the settled timestamp, computed by [`Timestamp::elapsed`] rather than
 /// against a fixed epoch: a backward clock jump therefore reads "just now" because `elapsed`
-/// itself reads zero for a future timestamp, with no extra clamp layered on here.
+/// itself reads zero for a future timestamp, with no extra clamp layered on here. Below a
+/// minute the text is quantised to 10-second steps so a poll shorter than that cannot retext
+/// it on every frame.
 fn format_age(at: Timestamp) -> String {
     let elapsed = at.elapsed();
     let secs = elapsed.as_secs();
-    if secs == 0 {
+    if secs < 10 {
         "just now".to_string()
     } else if secs < 60 {
-        format!("{secs}s ago")
+        format!("{}s ago", secs / 10 * 10)
     } else if secs < 3_600 {
         format!("{}m ago", secs / 60)
     } else if secs < 86_400 {
@@ -1300,11 +1302,11 @@ mod tests {
 
     #[test]
     fn age_is_computed_from_the_settled_timestamp_not_a_fixed_epoch() {
-        let recent = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let recent = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(45));
         let old = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(7_200));
 
         assert!(
-            age_annotation(recent, false).ends_with("5s ago"),
+            age_annotation(recent, false).ends_with("40s ago"),
             "got {:?}",
             age_annotation(recent, false)
         );
@@ -1325,6 +1327,70 @@ mod tests {
             "got {:?}",
             age_annotation(backward_clock_jump, false)
         );
+    }
+
+    #[test]
+    fn elapsed_under_ten_seconds_reads_just_now() {
+        for secs in [0, 1, 5, 9] {
+            let at = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(secs));
+
+            assert_eq!(format_age(at), "just now", "elapsed {secs}s");
+        }
+    }
+
+    #[test]
+    fn between_ten_seconds_and_a_minute_rounds_down_to_the_nearest_ten() {
+        let cases = [
+            (19, "10s ago"),
+            (59, "50s ago"),
+            (10, "10s ago"),
+            (20, "20s ago"),
+        ];
+        for (secs, expected) in cases {
+            let at = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(secs));
+
+            assert_eq!(format_age(at), expected, "elapsed {secs}s");
+        }
+    }
+
+    #[test]
+    fn a_minute_or_more_keeps_the_existing_minute_hour_and_day_rungs() {
+        let cases = [
+            (60, "1m ago"),
+            (3_599, "59m ago"),
+            (3_600, "1h ago"),
+            (86_399, "23h ago"),
+            (86_400, "1d ago"),
+        ];
+        for (secs, expected) in cases {
+            let at = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(secs));
+
+            assert_eq!(format_age(at), expected, "elapsed {secs}s");
+        }
+    }
+
+    /// The property that makes the 2s-poll flicker impossible rather than merely
+    /// unlikely: any two elapsed times sharing a 10-second bucket must render the same
+    /// text, checked over several bucket boundaries and several offsets within each
+    /// rather than one hand-picked pair.
+    #[test]
+    fn two_elapsed_values_in_the_same_ten_second_bucket_render_identically() {
+        for bucket_start in [0, 10, 20, 30, 40, 50] {
+            for (offset_a, offset_b) in [(0, 9), (1, 8), (3, 6)] {
+                let a = Timestamp::at(
+                    std::time::SystemTime::now() - Duration::from_secs(bucket_start + offset_a),
+                );
+                let b = Timestamp::at(
+                    std::time::SystemTime::now() - Duration::from_secs(bucket_start + offset_b),
+                );
+
+                assert_eq!(
+                    format_age(a),
+                    format_age(b),
+                    "bucket starting at {bucket_start}s: offsets {offset_a}s and {offset_b}s diverged"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1721,15 +1787,16 @@ mod tests {
     #[test]
     fn a_rows_disagreeing_known_cells_print_one_refreshed_line_with_one_label_and_age_per_line() {
         let now = Timestamp::now();
-        let two_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
-        let five_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let ten_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(12));
+        let twenty_seconds_ago =
+            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(25));
         let mut row = entity("a");
         row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
         row.base = settled_known_at(0u32, now, false);
         row.default_branch =
             settled_known_at(DefaultBranch::new(Arc::from("origin/main")), now, false);
-        row.sync = settled_known_at(SyncState::NoUpstream, two_seconds_ago, false);
-        row.dirty = settled_known_at(DirtyCounts::default(), five_seconds_ago, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, ten_seconds_ago, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), twenty_seconds_ago, false);
 
         let lines = content_lines(&row, WIDE, full_glyphs());
 
@@ -1738,12 +1805,12 @@ mod tests {
             .position(|line| line.starts_with("refreshed"))
             .expect("expected a refreshed line");
         assert_eq!(
-            lines[freshness_index], "refreshed       sync, 2s ago",
+            lines[freshness_index], "refreshed       sync, 10s ago",
             "got {lines:?}"
         );
         assert_eq!(
             lines[freshness_index + 1],
-            "                dirty, 5s ago",
+            "                dirty, 20s ago",
             "expected the second breakdown entry on its own line, indented under the label, \
              got {lines:?}"
         );
@@ -1768,15 +1835,16 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let now = Timestamp::now();
-        let two_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(2));
-        let five_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(5));
+        let ten_seconds_ago = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(12));
+        let twenty_seconds_ago =
+            Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(25));
         let mut row = entity("a");
         row.branch = settled_known_at(Head::Unborn(Arc::from("main")), now, false);
         row.base = settled_known_at(0u32, now, false);
         row.default_branch =
             settled_known_at(DefaultBranch::new(Arc::from("origin/main")), now, false);
-        row.sync = settled_known_at(SyncState::NoUpstream, two_seconds_ago, false);
-        row.dirty = settled_known_at(DirtyCounts::default(), five_seconds_ago, false);
+        row.sync = settled_known_at(SyncState::NoUpstream, ten_seconds_ago, false);
+        row.dirty = settled_known_at(DirtyCounts::default(), twenty_seconds_ago, false);
 
         let glyphs = full_glyphs();
         let detail = Detail::default();
@@ -1805,12 +1873,12 @@ mod tests {
             .position(|line| line.starts_with("refreshed"))
             .unwrap_or_else(|| panic!("no refreshed row drawn, got {rows:?}"));
         assert!(
-            rows[refreshed_row].contains("sync, 2s ago") && !rows[refreshed_row].contains("dirty"),
+            rows[refreshed_row].contains("sync, 10s ago") && !rows[refreshed_row].contains("dirty"),
             "expected only the first breakdown entry on the refreshed row, got {:?}",
             rows[refreshed_row]
         );
         assert!(
-            rows[refreshed_row + 1].contains("dirty, 5s ago")
+            rows[refreshed_row + 1].contains("dirty, 20s ago")
                 && !rows[refreshed_row + 1].contains("refreshed"),
             "expected the second breakdown entry on its own row below, got {:?}",
             rows[refreshed_row + 1]
@@ -1824,7 +1892,7 @@ mod tests {
     #[test]
     fn a_three_three_split_names_every_cell_rather_than_hide_half_behind_an_arbitrary_majority() {
         let group_a = Timestamp::now();
-        let group_b = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(1));
+        let group_b = Timestamp::at(std::time::SystemTime::now() - Duration::from_secs(15));
         let mut row = entity("a");
         row.branch = settled_known_at(Head::Unborn(Arc::from("main")), group_a, false);
         row.sync = settled_known_at(SyncState::NoUpstream, group_a, false);
