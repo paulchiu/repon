@@ -899,12 +899,9 @@ impl App {
                 entity_count: run.entity_count,
                 running: self.core.refresh_running(),
             });
-        // Excludes rows a kind preference hides (Worktrees off, Submodules off), the same
-        // rule the list itself applies, so the header never reads a number the rows on
-        // screen cannot reconcile. Uses a Filter-free check rather than `visible.len()`: a
-        // Filter narrows the list too, and a committed Filter (whether it narrows the list
-        // or, naming a hidden kind explicitly, widens it past the preference) must never
-        // move this count, which is what keeps it a different fact from `filter: N matches`.
+        // Excludes rows a kind preference hides (Worktrees off, Submodules off). A
+        // Filter-free `kind_is_visible` check rather than `visible.len()`, so a committed
+        // Filter's narrowing or kind override never moves this count.
         let entity_count = snapshot
             .entities
             .iter()
