@@ -212,9 +212,10 @@ fn confirm_items(table: &BindingTable) -> Vec<Item> {
 }
 
 /// The Filter line's own footer
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): both hints pinned,
-/// since the whole line is documented at 23 columns, `enter apply  esc cancel`, short enough
-/// to survive almost any frame.
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#the-footer)): `enter apply` and
+/// `esc cancel` are pinned, the way in and the way out of the line. `alt-/ clear filter` is
+/// the newest of the three and the first to drop, since the other two are what makes the line
+/// usable at all.
 fn filter_items(table: &BindingTable) -> Vec<Item> {
     let item = |(hint, built), priority| Item {
         hint,
@@ -229,6 +230,10 @@ fn filter_items(table: &BindingTable) -> Vec<Item> {
         item(
             hint_item(table, Context::Input, Action::Cancel, "cancel"),
             Priority::Pinned,
+        ),
+        item(
+            hint_item(table, Context::Input, Action::ClearFilter, "clear filter"),
+            Priority::Drop(1),
         ),
     ]
 }
@@ -915,11 +920,22 @@ mod tests {
     // --- input: the Filter line's own footer ---
 
     #[test]
-    fn filter_line_footer_matches_the_documented_text_at_its_full_width() {
-        assert_eq!(
-            render(&default_table(), Context::Input, 23),
-            "enter apply  esc cancel"
+    fn filter_footer_matches_the_documented_degradation_table_at_every_named_width() {
+        let spec = read_spec();
+        let rows = parse_degradation_table(
+            &spec,
+            "The Filter line's own footer, which sits one row above the line itself",
         );
+        assert!(!rows.is_empty(), "expected at least one documented width");
+        let table = default_table();
+        for row in rows {
+            assert_eq!(
+                budget(&filter_items(&table), row.width as usize).to_string(),
+                row.expected,
+                "filter footer mismatch at width {}",
+                row.width
+            );
+        }
     }
 
     #[test]
