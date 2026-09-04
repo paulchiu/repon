@@ -43,7 +43,7 @@ Closed. A key exists only where the fact it names is on `EntityState` ([core-api
 
 Notes the table cannot carry:
 
-- **A bare word is always a name.** It is never a reserved term, in any position, forever. That is what makes a repository genuinely called `failed` reachable by typing `failed`, and it is what lets this table grow without changing the meaning of a Filter someone already typed.
+- **A bare word is always a name.** It is never a reserved term, in any position, forever. That keeps a repository genuinely called `failed` reachable by typing `failed`, and lets this table grow without changing the meaning of a Filter someone already typed.
 - **`branch:` and HEAD's shapes.** A detached row has no branch name and never matches `branch:`, whatever the text ([head.md](head.md)). An unborn row matches on the name it will have.
 - **`sync:ahead sync:behind` is divergence**, since terms AND. `sync:ahead,behind` is the OR of the two.
 - **`row:` is the fold, not a column.** It mirrors `RowSummary` exactly, which is the same value the gutter glyph renders, so `row:failed` and "every row showing `!`" are the same set by construction and cannot drift. There is deliberately no way to ask which rows failed to read one particular cell; that is what the detail pane is for.
@@ -100,7 +100,7 @@ The Filter applies **live, on every keystroke**. Enter commits it and returns fo
 
 Because the grammar is total, the line has no error state and nothing reaches the status bar or `repon.log`. It has an **advisory**: a fixed one-character slot at the right end of the line carries `?` when any term is unrecognised, and a space otherwise, while the offending term itself takes the `warn` role in place. The slot exists because an unrecognised term and a genuine zero-match look identical in the list and the header's match count cannot tell them apart. `?` is reused deliberately: it means "Repon has no answer for this" in the gutter and "Repon has no meaning for this" in the Filter line, which is the same idea one level up. The glyph carries the meaning and the role only points at it, per [theming.md](theming.md).
 
-A warning-sign icon was measured and refused. `⚠` (U+26A0) is present in 1 of the 5 macOS system monospace faces (Menlo yes; SF Mono, Monaco, Courier and PT Mono no), against `?` in 5 of 5 — the same failure [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) found for braille, only slightly less bad. The width is worse than the coverage: bare `⚠` measures one column and `⚠️` with U+FE0F measures two, so two spellings of the same icon differ in width by an invisible codepoint, and the emoji form renders only by falling back to a proportional colour face inside a monospace grid. There is also no ASCII counterpart to put in the `glyphs = "ascii"` set.
+A warning-sign icon was measured and refused. `⚠` (U+26A0) is present in 1 of the 5 macOS system monospace faces (Menlo yes; SF Mono, Monaco, Courier and PT Mono no), against `?` in 5 of 5. That is the same failure [0020](../adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md) found for braille, only slightly less bad. The width is worse than the coverage: bare `⚠` measures one column and `⚠️` with U+FE0F measures two, so two spellings of the same icon differ in width by an invisible codepoint, and the emoji form renders only by falling back to a proportional colour face inside a monospace grid. There is also no ASCII counterpart to put in the `glyphs = "ascii"` set.
 
 ## Completion
 
@@ -118,7 +118,7 @@ The trigger, after stripping any leading `-`:
 | a colon-less prefix of one or more keys | those keys' own entries |
 | anything else | nothing |
 
-A colon-less term that is a prefix of one or more keys offers each of their own entries (`key:`), narrowing as more of it is typed and vanishing once no key's name starts with it. This is what makes the keyed namespace discoverable before the user commits to a colon, at the accepted cost that a repository named `state` or `sync` sees its own name suggested back as a key while it is still being typed: accepting a completion always needs `Tab`, so the live filter keeps treating the typed text as a name search regardless, and the suggestion costs nothing beyond the screen space it occupies. Since `/` prefills, the line is rarely empty, so this prefix behaviour is what actually carries discoverability of the keyed namespace day to day, more than the empty-line and bare-colon rows above it.
+A colon-less term that is a prefix of one or more keys offers each of their own entries (`key:`), narrowing as more of it is typed and vanishing once no key's name starts with it. This makes the keyed namespace discoverable before the user commits to a colon, at the accepted cost that a repository named `state` or `sync` sees its own name suggested back as a key while it is still being typed: accepting a completion always needs `Tab`, so the live filter keeps treating the typed text as a name search regardless, and the suggestion costs nothing beyond the screen space it occupies. Since `/` prefills, the line is rarely empty, so this prefix behaviour actually carries discoverability of the keyed namespace day to day, more than the empty-line and bare-colon rows above it.
 
 Keys, in the `input` context ([keybindings.md](keybindings.md)):
 
@@ -150,7 +150,7 @@ The header cannot host the input, measured against [actions.md](actions.md)'s ow
 
 [config.md](config.md) stores `filter` as a plain string per scope in `state.toml`. Because the grammar is total there is nothing to normalise and nothing that can fail to reparse, so **the string round-trips byte for byte** and a corrupt-Filter case cannot exist.
 
-A restored Filter is **committed**, not typed: it is applied, it announces its match count, and one Esc clears it. That is what makes config.md's announcement meaningful at all.
+A restored Filter is **committed**, not typed: it is applied, it announces its match count, and one Esc clears it. That is why config.md's announcement means anything at all.
 
 A Filter that arrived via `--filter <text>` persists like any other. "Transient" in config.md describes its precedence over stored state at startup, not its lifetime; a taint bit making two identical Filters behave differently is exactly the invisible state [0006](../adr/0006-no-git-state-cache-session-state-by-name.md) avoids, and the announced match count plus one Esc is the escape hatch.
 
@@ -158,7 +158,7 @@ A Filter that arrived via `--filter <text>` persists like any other. "Transient"
 
 ## The second consumer
 
-The machine-readable consumer takes `--filter <text>` on the same total grammar and emits only matching entities. [core-api.md](core-api.md) assigns the predicate to the core and the decision to apply it to the consumer, and calls `repon sets` what makes the second consumer real rather than a special case; having it exercise the one core-owned thing whose application is consumer-decided is the enforcement [0015](../adr/0015-the-core-owns-the-table.md) asked for.
+The machine-readable consumer takes `--filter <text>` on the same total grammar and emits only matching entities. [core-api.md](core-api.md) assigns the predicate to the core and the decision to apply it to the consumer, and treats `repon sets` as proof the second consumer is real rather than a special case; having it exercise the one core-owned thing whose application is consumer-decided is the enforcement [0015](../adr/0015-the-core-owns-the-table.md) asked for.
 
 Two properties fall out. The filter applies **after** `settle`, so the probe still covers every entity, which makes [config.md](config.md)'s "a Set narrows what exists, a Filter narrows what is visible" testable at the second consumer rather than merely asserted. And it never writes to `state.toml`, because a one-shot run has no session.
 
