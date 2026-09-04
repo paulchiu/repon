@@ -51,13 +51,6 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub panic_after_tui_enter: bool,
 
-    /// Claims the terminal, suspends it, then exits, before the event loop starts.
-    /// Debug-only: exists so a test can observe suspend-time restoration ordering in a real
-    /// process rather than describing it, and must not reach a release binary.
-    #[cfg(debug_assertions)]
-    #[arg(long, hide = true)]
-    pub suspend_after_tui_enter: bool,
-
     /// Claims the terminal, runs a synthetic Launcher that writes a marker to its own stdio,
     /// then exits. Debug-only: exists so a test can observe a real child writing to the same
     /// pty between the handoff's restore and its reclaim, rather than describing it, and must

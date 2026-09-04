@@ -304,7 +304,6 @@ pub struct App {
     /// changes mid-session outside a config reload.
     glyphs: &'static GlyphSet,
     should_quit: bool,
-    should_suspend: bool,
     /// The rows this session's Actions and Launchers will act on, and the innermost
     /// Escape-unwind level ([`unwind`]): cancelling a live range anchor. Persisted to
     /// `state.toml` by name, never by index, on quit ([`Self::persist_state`]) and restored
@@ -536,9 +535,8 @@ pub struct App {
     /// `true` while the quit confirm dialog has focus: `Action::Quit` raises this instead of
     /// `Message::Quit` directly whenever `Core::action_running` is true, because quitting
     /// mid-fan-out orphans the children ([keybindings.md](../../../docs/spec/keybindings.md)'s
-    /// "Quitting, suspending, confirming"). Dispatched through `Context::Confirm`, the same
-    /// `y`/`n`/Esc vocabulary [`Stage::Confirming`] uses; `Action::Suspend` is never gated
-    /// this way, since suspending is reversible where quitting is not.
+    /// "Quitting and confirming"). Dispatched through `Context::Confirm`, the same
+    /// `y`/`n`/Esc vocabulary [`Stage::Confirming`] uses.
     quit_confirm: bool,
     /// The most recent fan-out `start_action` dispatched, read by `status_row_content` only
     /// while `Core::action_running` is true; a stale value between runs costs nothing since
@@ -648,7 +646,6 @@ impl App {
             detail: Detail::default(),
             glyphs: glyph_set,
             should_quit: false,
-            should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
             list_offset: 0,
@@ -933,7 +930,7 @@ impl App {
 
     /// Whether one Action fan-out's steps are still running
     /// ([`repon_core::Core::action_running`]): what gates `;`, `s`, `1` to `9` and `Ctrl+R`
-    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting and
     /// confirming", [ADR 0023](../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
     /// Available half).
     fn action_running(&self) -> bool {
@@ -1007,9 +1004,7 @@ impl App {
             self.handle_messages(&mut tui)?;
             // Choosing a Launcher only queues the choice rather than running it inline, since
             // `handle_key_event` never holds a live `Tui` of its own; this is the one point
-            // in the loop that drains the queued choice with a live `Tui` in hand, the same
-            // reason `should_suspend` below is a flag `handle_key_event` sets and only `run`
-            // itself acts on.
+            // in the loop that drains the queued choice with a live `Tui` in hand.
             if let Some((entity_key, launcher)) = self.pending_launcher_handoff.take() {
                 self.run_launcher_handoff(&mut tui, &entity_key, &launcher);
             }
@@ -1021,22 +1016,7 @@ impl App {
                 self.pending_config_editor_handoff = false;
                 self.run_config_editor_handoff(&mut tui);
             }
-            if self.should_suspend {
-                // refresh.md's "Suspension": all background work stops while the TUI is
-                // suspended, so pausing wraps the whole `SIGTSTP` round trip, not only a
-                // Launcher's own handoff ([`Self::around_entity_handoff`]). `hold_action`
-                // is its own verb, a no-op with no fan-out live: Ctrl+Z stays ungated and
-                // SIGSTOPs a running fan-out's own step groups rather than orphaning them
-                // the way `pause` alone (probe cancellation only) would leave them running
-                // unattended (`docs/spec/actions.md`'s "Cancellation, suspend and quit").
-                self.core.pause();
-                self.core.hold_action();
-                tui.suspend()?;
-                self.message_tx.send(Message::Resume)?;
-                self.message_tx.send(Message::ClearScreen)?;
-                tui.enter()?;
-                self.on_resume();
-            } else if self.should_quit {
+            if self.should_quit {
                 tui.stop();
                 break;
             }
@@ -1077,7 +1057,7 @@ impl App {
     /// `Context::Overlay` while the expanded warning list or the Set picker is open instead,
     /// [`Self::handle_action_palette_key`]'s own `Context::Input`/`Context::Confirm`
     /// split while the Action palette is open, `self.focus` (`List` or `Detail`) otherwise,
-    /// so `Global`'s bindings stay live from either. `Quit` and `Suspend` raise a
+    /// so `Global`'s bindings stay live from either. `Quit` raises a
     /// [`Message`], the movement and Selection actions
     /// mutate `cursor` and `selection` directly, `OpenDetail`/`ClosePane` open and close the
     /// pane, `MoveFocusBetweenListAndDetail`/`ReturnFocusToList` move focus between the two
@@ -1237,15 +1217,13 @@ impl App {
         // than reading as "nothing found".
         let message = match self.bindings.dispatch(self.focus, key) {
             // Gated behind a confirm dialog while a fan-out or a management run is in
-            // flight, because quitting orphans the children (keybindings.md's "Quitting,
-            // suspending, confirming"); `Action::Suspend` just below is never gated the same
-            // way, since suspending is reversible where quitting is not.
+            // flight, because quitting orphans the children (keybindings.md's "Quitting
+            // and confirming").
             Some(Action::Quit) if !self.any_run_outstanding() => Some(Message::Quit),
             Some(Action::Quit) => {
                 self.quit_confirm = true;
                 None
             }
-            Some(Action::Suspend) => Some(Message::Suspend),
             Some(Action::ReloadConfig) => {
                 if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Reload config"));
@@ -2034,11 +2012,10 @@ impl App {
     /// Closes the palette and queues the choice in `self.pending_launcher_handoff` for
     /// [`Self::run`]'s own loop to drain with a live [`Tui`] in hand
     /// ([`Self::run_launcher_handoff`] is what actually calls
-    /// [`Self::around_entity_handoff`]): `handle_key_event` never holds one of its own, the
-    /// same reason `Action::Suspend` only sets `self.should_suspend` here and leaves the
-    /// real `tui.suspend()` call to `Self::run`. A missing cursor (an empty table) or an empty
-    /// match list leaves the palette open and untouched, the same as
-    /// [`Self::choose_highlighted_action`] does for a query matching nothing.
+    /// [`Self::around_entity_handoff`]): `handle_key_event` never holds one of its own. A
+    /// missing cursor (an empty table) or an empty match list leaves the palette open and
+    /// untouched, the same as [`Self::choose_highlighted_action`] does for a query matching
+    /// nothing.
     fn choose_highlighted_launcher(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
             return;
@@ -2057,8 +2034,8 @@ impl App {
     /// Runs a queued Launcher choice: re-reads `entity_key`'s current `EntityState` off the
     /// live Snapshot (never a copy the palette drew from, which could be a Generation stale
     /// by the time `tui` is free to hand off with) and, if the row is still present, hands it
-    /// to [`launcher::run`] through [`Self::around_entity_handoff`], the one path a return
-    /// from suspension, `SIGTSTP` and a Launcher handoff now all share.
+    /// to [`launcher::run`] through [`Self::around_entity_handoff`], which ends in
+    /// [`Self::on_resume`].
     ///
     /// A vanished row is silently a no-op; a failed handoff is logged rather than propagated,
     /// the same grade [`Self::reread_theme`] gives a failed reread, since a Launcher failing
@@ -3074,9 +3051,6 @@ impl App {
             }
             match message {
                 Message::Quit => self.should_quit = true,
-                Message::Suspend => self.should_suspend = true,
-                Message::Resume => self.should_suspend = false,
-                Message::ClearScreen => tui.terminal.clear()?,
                 Message::Resize(columns, rows) => self.resize(tui, columns, rows)?,
                 Message::Render => self.render(tui)?,
                 Message::Error(ref text) => tracing::error!(message = text),
@@ -3720,7 +3694,6 @@ mod tests {
             detail: Detail::default(),
             glyphs: GlyphSet::for_config(document::Glyphs::default()),
             should_quit: false,
-            should_suspend: false,
             selection: Selection::new(),
             cursor: 0,
             list_offset: 0,
@@ -5034,7 +5007,7 @@ mod tests {
 
     /// `m` is the fifth key that goes inert while a fan-out is in flight, for the same reason
     /// `;` is: it opens the same palette
-    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting and
     /// confirming"). Asserted on the palette itself, not on the Notice alone: a guard that
     /// raised the Notice and opened the palette anyway would satisfy the Notice half.
     #[test]
@@ -5500,7 +5473,7 @@ mod tests {
     /// The Launcher key is the one exception the ticket calls out by name: `!` stays live
     /// while a fan-out is in flight, because handing one Repo to lazygit while another
     /// installs is a thing a person may legitimately want
-    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting, suspending,
+    /// ([keybindings.md](../../../docs/spec/keybindings.md)'s "Quitting and
     /// confirming"). A version of this gate that swept `!` in too would open the palette
     /// nowhere and raise no Notice either, which is exactly what this test rules out.
     #[test]
@@ -6878,12 +6851,11 @@ mod tests {
 
     // =====================================================================================
     // Criterion 3: quitting is gated behind a confirm dialog while a fan-out is in flight,
-    // because quitting orphans the children; suspending is never gated the same way, since
-    // it is reversible.
+    // because quitting orphans the children.
     // =====================================================================================
 
     #[test]
-    fn q_and_ctrl_c_open_a_confirm_dialog_while_fanning_out_and_y_or_n_decide_it() {
+    fn q_opens_a_confirm_dialog_while_fanning_out_and_y_or_n_decide_it() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -6912,12 +6884,9 @@ mod tests {
         assert!(!app.quit_confirm, "n must close the dialog");
         assert!(!app.should_quit, "declining must never quit");
 
-        app.handle_key_event(press(KeyCode::Char('c'), KeyModifiers::CONTROL))
-            .expect("press ctrl+c while an Action is fanning out");
-        assert!(
-            app.quit_confirm,
-            "ctrl+c must open the same confirm dialog q does"
-        );
+        app.handle_key_event(press(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("press q again while an Action is fanning out");
+        assert!(app.quit_confirm, "sanity: q must reopen the dialog");
 
         app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
             .expect("confirm the quit");
@@ -6965,13 +6934,13 @@ mod tests {
         });
     }
 
-    /// Ctrl+Z is deliberately never gated the way `q`/`Ctrl+C` are: suspending is reversible
-    /// where quitting is not ([keybindings.md](../../../docs/spec/keybindings.md)'s
-    /// "Quitting, suspending, confirming"). Checked at the same dispatch seam the quit gate
-    /// itself is proven at, with an Action genuinely fanning out, so this is the direct
-    /// negative of the test above rather than merely "Suspend still exists somewhere".
+    /// `Ctrl+C` and `Ctrl+Z` are both unbound, so neither dispatches anything even mid
+    /// fan-out: no confirm dialog, no inert-binding Notice, no `Message` at all. Checked at
+    /// the same dispatch seam the quit gate itself is proven at, with an Action genuinely
+    /// fanning out, so this is the direct negative of the test above rather than merely
+    /// "nothing named Suspend exists any more".
     #[test]
-    fn suspend_is_never_gated_behind_a_confirm_while_an_action_is_fanning_out() {
+    fn ctrl_c_and_ctrl_z_dispatch_nothing_while_an_action_is_fanning_out() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -6987,22 +6956,24 @@ mod tests {
             "sanity: the fan-out must be live"
         );
 
-        app.handle_key_event(press(KeyCode::Char('z'), KeyModifiers::CONTROL))
-            .expect("press ctrl+z while an Action is fanning out");
+        for c in ['c', 'z'] {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::CONTROL))
+                .unwrap_or_else(|_| panic!("press ctrl+{c} while an Action is fanning out"));
 
-        assert!(
-            !app.quit_confirm,
-            "suspend must never open the quit confirm dialog"
-        );
-        assert_eq!(
-            app.notice(),
-            None,
-            "suspend must never answer with the inert-binding Notice either"
-        );
-        assert!(
-            matches!(app.message_rx.try_recv(), Ok(Message::Suspend)),
-            "ctrl+z must still raise Suspend while a fan-out is running"
-        );
+            assert!(
+                !app.quit_confirm,
+                "ctrl+{c} must never open the quit confirm dialog"
+            );
+            assert_eq!(
+                app.notice(),
+                None,
+                "ctrl+{c} must never answer with the inert-binding Notice either"
+            );
+            assert!(
+                app.message_rx.try_recv().is_err(),
+                "ctrl+{c} is unbound, so it must raise no Message at all"
+            );
+        }
 
         app.core.stop_action();
         wait_for("the cancelled fan-out to finish", || {

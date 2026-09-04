@@ -117,13 +117,6 @@ impl Tui {
         Ok(())
     }
 
-    pub fn suspend(&mut self) -> Result<()> {
-        self.exit()?;
-        #[cfg(not(windows))]
-        signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
-        Ok(())
-    }
-
     /// Hands the terminal to `command` and takes it back: the shared machinery a Launcher
     /// that takes the terminal and the ad hoc command field's `$EDITOR` handoff both stand on
     /// ([config.md](../../../../docs/spec/config.md#launchers)'s "suspends and execs in the
@@ -644,9 +637,9 @@ mod tests {
     }
 
     /// [`crate::test_support::production_source_at`] over this file itself: the same
-    /// self-scan technique `no_signal_handler_is_installed_anywhere_in_this_crates_source`
-    /// below uses, applied here to prove raw mode's own enable/disable calls exist rather
-    /// than trusting a comment about them.
+    /// self-scan technique `no_trace_of_the_removed_signal_dependency_remains` below uses,
+    /// applied here to prove raw mode's own enable/disable calls exist rather than trusting a
+    /// comment about them.
     fn this_files_production_source() -> String {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         crate::test_support::production_source_at(&manifest_dir.join("src/tui.rs"))
@@ -824,18 +817,26 @@ mod tests {
         ));
     }
 
-    /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-suspending-confirming):
-    /// raw mode clears ISIG, so quit and suspend are ordinary key handlers rather than signal
-    /// handlers. The only legitimate `signal_hook` use in this crate is [`Tui::suspend`]
-    /// raising `SIGTSTP` on itself after the terminal is restored; nothing may install a
-    /// handler for a signal arriving from outside the process.
+    /// [keybindings.md](../../../docs/spec/keybindings.md#quitting-and-confirming): raw mode
+    /// clears ISIG, so quit is an ordinary key handler rather than a signal handler, and
+    /// `Tui::suspend`'s own `SIGTSTP` raise was this crate's only legitimate `signal_hook`
+    /// use. With that gone, this crate has no legitimate use for it at all, so the guard now
+    /// polices the dependency's absence directly, in `Cargo.toml` and in source, rather than
+    /// the one call site that used to be its only user.
     #[test]
-    fn no_signal_handler_is_installed_anywhere_in_this_crates_source() {
+    fn no_trace_of_the_removed_signal_dependency_remains() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+            .expect("read this crate's Cargo.toml");
+        assert!(
+            !cargo_toml.contains("signal-hook"),
+            "expected the signal-hook dependency to be gone from this crate's Cargo.toml"
+        );
+
         // Built from pieces so this line is never a self-match once this file is scanned,
         // the same trick `app.rs`'s own source-scan tests use.
         let needle = format!("{}_{}", "signal", "hook");
-        let allowed_call = format!("{needle}::{}::{}", "low_level", "raise");
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offending_locations = Vec::new();
         for path in rust_source_files(&manifest_dir.join("src")) {
             let source = std::fs::read_to_string(&path).expect("read a crate source file");
@@ -844,15 +845,15 @@ mod tests {
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                if line.contains(&needle) && !line.contains(&allowed_call) {
+                if line.contains(&needle) {
                     offending_locations.push(format!("{}:{}", path.display(), number + 1));
                 }
             }
         }
         assert!(
             offending_locations.is_empty(),
-            "quit and suspend must stay ordinary key handlers rather than signal handlers; \
-             found {needle} usage other than raising SIGTSTP at: {offending_locations:?}"
+            "expected no `{needle}` usage anywhere in this crate's source, found: \
+             {offending_locations:?}"
         );
     }
 }

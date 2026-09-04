@@ -33,7 +33,6 @@ pub(crate) enum Action {
     // global
     OpenHelp,
     Quit,
-    Suspend,
     OpenLauncher,
     OpenActionPalette,
     OpenManagementPalette,
@@ -184,7 +183,6 @@ pub(crate) fn description(action: Action) -> &'static str {
     match action {
         Action::OpenHelp => "Open the help overlay",
         Action::Quit => "Quit",
-        Action::Suspend => "Suspend",
         Action::OpenLauncher => "Open the Launcher palette",
         Action::OpenActionPalette => "Open the Action palette",
         Action::OpenManagementPalette => {
@@ -354,8 +352,6 @@ const BINDINGS: &[Binding] = &[
     // global
     binding(Context::Global, KeyCode::Char('?'), NONE, Action::OpenHelp),
     binding(Context::Global, KeyCode::Char('q'), NONE, Action::Quit),
-    binding(Context::Global, KeyCode::Char('c'), CTRL, Action::Quit),
-    binding(Context::Global, KeyCode::Char('z'), CTRL, Action::Suspend),
     binding(
         Context::Global,
         KeyCode::Char('!'),
@@ -976,7 +972,6 @@ fn action_name(action: Action) -> Option<&'static str> {
     Some(match action {
         Action::OpenHelp => "open_help",
         Action::Quit => "quit",
-        Action::Suspend => "suspend",
         Action::OpenLauncher => "open_launcher",
         Action::OpenActionPalette => "open_action_palette",
         Action::OpenManagementPalette => "open_management_palette",
@@ -1472,26 +1467,37 @@ mod tests {
         );
     }
 
+    /// `q` is the only quit binding left: no Ctrl chord dispatches `Action::Quit`, or
+    /// anything else, anywhere.
     #[test]
-    fn global_quit_and_suspend_only_fire_with_their_control_modifier() {
+    fn global_quit_fires_only_from_the_bare_q() {
         assert_eq!(
-            dispatch(Context::List, press(KeyCode::Char('c'), CTRL)),
+            dispatch(Context::List, press(KeyCode::Char('q'), NONE)),
             Some(Action::Quit)
         );
-        assert_eq!(
-            dispatch(Context::List, press(KeyCode::Char('z'), CTRL)),
-            Some(Action::Suspend)
-        );
-        // crossterm delivers a Ctrl chord as the lowercase char with CONTROL set, never as
-        // the bare char alone; a lookup that ignored modifiers would fire on these too.
-        assert_eq!(
-            dispatch(Context::List, press(KeyCode::Char('c'), NONE)),
-            None
-        );
-        assert_eq!(
-            dispatch(Context::List, press(KeyCode::Char('z'), NONE)),
-            None
-        );
+    }
+
+    /// `Ctrl+C` and `Ctrl+Z` bind nothing anywhere: no context's own table claims either and
+    /// neither is a Global fallback, unlike `q` above.
+    #[test]
+    fn ctrl_c_and_ctrl_z_are_unbound_in_every_context() {
+        for code in [KeyCode::Char('c'), KeyCode::Char('z')] {
+            for context in [
+                Context::Global,
+                Context::List,
+                Context::Detail,
+                Context::Input,
+                Context::Overlay,
+                Context::Confirm,
+                Context::Sort,
+            ] {
+                assert_eq!(
+                    dispatch(context, press(code, CTRL)),
+                    None,
+                    "expected {code:?} with Ctrl to dispatch nothing in {context:?}"
+                );
+            }
+        }
     }
 
     /// The spec collapses `1` through `9` into one shared description ("Switch to the Nth
@@ -1541,20 +1547,18 @@ mod tests {
     /// A representative sample of Global's own keys, none of which is bound by name in
     /// Input, Overlay or Confirm, so a leak through a broken gate is unambiguous. Covers
     /// both plain and Ctrl-modified Global bindings, since a gate could plausibly fail on
-    /// one and not the other (a stray `Ctrl+C` reaching the Confirm gate would quit mid
-    /// fan-out). `q` is deliberately excluded: Overlay binds it to `Close` in its own right,
-    /// which is a correct context-specific override rather than a leak, so it would not tell
-    /// the two apart. `Tab` is excluded for the same reason (Input binds it to
+    /// one and not the other (a stray `Ctrl+R` reaching the Confirm gate would reload config
+    /// mid-dialog). `q` is deliberately excluded: Overlay binds it to `Close` in its own
+    /// right, which is a correct context-specific override rather than a leak, so it would
+    /// not tell the two apart. `Tab` is excluded for the same reason (Input binds it to
     /// `AcceptCompletion`) and is instead probed directly against Overlay and Confirm below,
     /// where it is unambiguous.
-    const GLOBAL_PROBE_KEYS: [(KeyCode, KeyModifiers); 8] = [
+    const GLOBAL_PROBE_KEYS: [(KeyCode, KeyModifiers); 6] = [
         (KeyCode::Char('!'), NONE),
         (KeyCode::Char(';'), NONE),
         (KeyCode::Char('/'), NONE),
         (KeyCode::Char('r'), NONE),
         (KeyCode::Char('s'), NONE),
-        (KeyCode::Char('c'), CTRL),
-        (KeyCode::Char('z'), CTRL),
         (KeyCode::Char('r'), CTRL),
     ];
 
