@@ -160,8 +160,6 @@ Computed git state is never cached ([0006](../adr/0006-no-git-state-cache-sessio
 
 Off by default. When `fetch.enabled` is true it runs every `fetch.interval` (default 5 minutes) and fires immediately on being enabled rather than waiting for the first tick; the predecessor waited five minutes for its first cycle and that 'reads as a dead key'.
 
-This mechanism is gated behind `repon-core`'s own `fetch` cargo feature (Fetch available, in the glossary), which the plain install in [releasing.md](releasing.md) does not turn on. `fetch.enabled = true` against that build is accepted and does nothing; [releasing.md](releasing.md)'s "Where Repon can be installed from" names the `cargo install --features fetch` command that produces a binary where it does.
-
 Four rules govern it:
 
 - It always prunes, because `Gone` only appears after a prune and a plain fetch never produces it.
@@ -175,7 +173,7 @@ A finished fetch starts a normal generation, so the new behind counts arrive thr
 
 One repository's own fetch failure never stops the cycle: the rest still fetch. The cycle counts how many failed and surfaces the count as a Warning ([theming.md](theming.md)'s "Warnings and Notices"), never the underlying error text, since that text is arbitrary bytes from a remote. Each individual failure, with its path, still reaches `repon.log`.
 
-A user-triggered counterpart exists too: the built-in `sync` action in the Action palette ([repo-management.md](repo-management.md)) runs the identical fast-forward-only auto-update on demand over the Selection, rather than waiting for this cycle's own timer. It shares this mechanism's own `fetch` cargo feature gate, since the fast-forward it calls lives behind the same boundary, but not `fetch.enabled` or `auto_update.enabled`: those two govern what Repon decides to do unbidden, where `sync` is what the user asked for, behind the Action confirm gate ([0002](../adr/0002-repon-owns-the-outer-loop-only.md), [0031](../adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
+A user-triggered counterpart exists too: the built-in `sync` action in the Action palette ([repo-management.md](repo-management.md)) runs the identical fast-forward-only auto-update on demand over the Selection, rather than waiting for this cycle's own timer, and not gated on `fetch.enabled` or `auto_update.enabled` either: those two govern what Repon decides to do unbidden, where `sync` is what the user asked for, behind the Action confirm gate ([0002](../adr/0002-repon-owns-the-outer-loop-only.md)).
 
 ## Configuration
 

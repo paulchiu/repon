@@ -10,7 +10,7 @@ Repon owns the outer loop: the combined state of many Repos, and acting on many 
 
 Pre-alpha, but no longer the skeleton this section once described. Repon discovers Repos, Worktrees and Submodules and refreshes their state in a cancellable background generation. The list filters live against a total, three-valued Filter language, where an unsettled cell answers neither a term nor its negation. Configured or typed Actions fan out across a Selection as PTY-backed child processes, with the detail pane showing each step's output as it runs. A Launcher hands off to lazygit, an editor or a shell in the Repo under the cursor and restores the terminal on return. `ignore`, `unignore` and `delete` manage the `[[repo]]` entries Repon owns. Themes correct the terminal's own palette, degrading to a vetted ASCII glyph set when a font lacks the full one.
 
-What's designed but not shipped: the periodic fetch and the fast-forward-only auto-update it can carry exist in `repon-core` behind a cargo feature the `repon` binary never enables, so no build fetches a remote or moves a branch on its own yet. Still no crates.io, still Unix-only. What's cleared and what's left before the first publish is [docs/spec/releasing.md](docs/spec/releasing.md).
+The periodic fetch and the fast-forward-only auto-update it can carry run whenever `config.toml` turns them on. Still no crates.io, still Unix-only. What's cleared and what's left before the first publish is [docs/spec/releasing.md](docs/spec/releasing.md).
 
 ## Installing
 

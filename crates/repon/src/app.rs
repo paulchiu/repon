@@ -3600,7 +3600,6 @@ mod tests {
 
     /// A real `git clone` of `source` into `dest`, tracking `source` as `origin` the way
     /// `sync`'s own fast-forward needs.
-    #[cfg(feature = "fetch")]
     fn clone_repo(source: &std::path::Path, dest: &std::path::Path) {
         let status = std::process::Command::new("git")
             .args(["clone", "--quiet"])
@@ -3615,7 +3614,6 @@ mod tests {
 
     /// Writes `name` with `contents` in `dir` and commits it there, real bytes on disk a
     /// clone's own `git fetch` can see move.
-    #[cfg(feature = "fetch")]
     fn commit_a_file(dir: &std::path::Path, name: &str, contents: &str) {
         std::fs::write(dir.join(name), contents).expect("write the fixture file");
         run_git(dir, &["add", name]);
@@ -3637,7 +3635,6 @@ mod tests {
     /// (`clone_repo`'s own reason for one) and already `fetch`ed one commit behind it, so
     /// `sync:behind` matches it from discovery's own first probe with nothing to wait out
     /// beyond that probe settling.
-    #[cfg(feature = "fetch")]
     fn behind_repo(
         canonical_dir: &std::path::Path,
         root: &std::path::Path,
@@ -6042,7 +6039,6 @@ mod tests {
     /// reliably catch the run mid-row before pressing Esc, the same technique `slow_action`
     /// gives `Core::run_action`'s own equivalent test.
     #[test]
-    #[cfg(feature = "fetch")]
     fn esc_cancels_a_management_run_between_rows_never_mid_row() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -9461,7 +9457,6 @@ mod tests {
     /// Declares `before_sync = <name>` and the `[[action]]` it names, whose one step touches
     /// `marker` in each row `sync` runs it against
     /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Hooks around sync").
-    #[cfg(feature = "fetch")]
     fn declare_before_sync_hook(app: &mut App, name: &str, marker: &str) {
         app.document
             .actions
@@ -9470,7 +9465,6 @@ mod tests {
     }
 
     /// [`declare_before_sync_hook`]'s sibling for `after_sync`.
-    #[cfg(feature = "fetch")]
     fn declare_after_sync_hook(app: &mut App, name: &str, marker: &str) {
         app.document
             .actions
@@ -9485,7 +9479,6 @@ mod tests {
     /// afterwards; the marker file is the proof the hook ran for real rather than only in
     /// [`crate::management`]'s own injected-closure tests.
     #[test]
-    #[cfg(feature = "fetch")]
     fn before_sync_runs_the_named_action_against_the_real_repo_before_sync_is_attempted() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -9509,7 +9502,6 @@ mod tests {
     /// gets fast-forwarded, and the declared `after_sync` Action runs against it once that
     /// fast-forward actually happened.
     #[test]
-    #[cfg(feature = "fetch")]
     fn after_sync_runs_the_named_action_against_the_real_repo_once_it_fast_forwards() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -9543,7 +9535,6 @@ mod tests {
     /// timing, the same call
     /// [`draw_frame_shows_the_management_runs_current_row_as_the_live_notice`]'s own doc
     /// comment makes.
-    #[cfg(feature = "fetch")]
     fn pinned_sync_run(targets: Vec<EntityKey>, position: usize, total: usize) -> ManagementRun {
         let (_tx, rx) = mpsc::channel();
         ManagementRun {
@@ -9567,7 +9558,6 @@ mod tests {
     /// `Core::refresh`, since its own two-second clock is not a fact a test can pin) must not
     /// drop it from the filtered list before the run's own progress marker has moved past it.
     #[test]
-    #[cfg(feature = "fetch")]
     fn a_row_still_pending_in_a_running_sync_stays_in_the_sync_behind_filter_after_its_branch_catches_up()
      {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9626,7 +9616,6 @@ mod tests {
     /// fast-forward plus the same re-probe drops it from the filter at once, on the very
     /// frame this reads, never lagging behind the marker.
     #[test]
-    #[cfg(feature = "fetch")]
     fn a_row_whose_own_turn_in_the_management_run_has_already_finished_drops_out_of_the_filter_immediately()
      {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9696,7 +9685,6 @@ mod tests {
     /// `sync:behind` exactly as it would with no run outstanding at all, regardless of
     /// `repo-a`'s own row still pending in that run.
     #[test]
-    #[cfg(feature = "fetch")]
     fn a_management_runs_pinning_never_holds_a_repo_outside_its_own_selection_in_the_filtered_list()
     {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9758,7 +9746,6 @@ mod tests {
     /// and every row the run touched, `repo-a` included, is judged by `sync:behind` alone
     /// again: caught up, it must be gone.
     #[test]
-    #[cfg(feature = "fetch")]
     fn once_the_management_run_finishes_every_row_it_touched_is_judged_by_the_filter_alone_again() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -9812,7 +9799,6 @@ mod tests {
     /// [`App::run_management`] documents, not just how `App` reacts to a position handed to
     /// it.
     #[test]
-    #[cfg(feature = "fetch")]
     fn a_row_pinned_by_a_real_sync_run_drops_out_the_instant_the_runs_own_thread_moves_past_it() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -10003,7 +9989,6 @@ mod tests {
     /// match count, and `Action::SelectAllVisible` (`a`) never sweeps it in, since it is
     /// being held past the Filter rather than claimed to satisfy it.
     #[test]
-    #[cfg(feature = "fetch")]
     fn a_pinned_row_is_absent_from_the_header_match_count_and_from_select_all_visible() {
         let dir = tempfile::tempdir().expect("temp dir");
         let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
@@ -10203,10 +10188,10 @@ mod tests {
     /// "It never runs after a fetch-started generation". A finished periodic fetch starts
     /// its Generation through `RefreshHandles::dispatch`, the identical body `Core::refresh`
     /// calls (`refresh.md`'s "A finished fetch starts a normal generation", and
-    /// `test_support.rs`'s own count of that primitive's three callers), and the `fetch`
-    /// cargo feature is off in this crate's build, so driving `Core::refresh` directly is
-    /// this seam's own reachable form of that trigger. The claim it cannot make alone, that
-    /// no other production path reaches the hook, is
+    /// `test_support.rs`'s own count of that primitive's three callers), so driving
+    /// `Core::refresh` directly is this seam's own reachable form of that trigger without
+    /// waiting out a real fetch cycle. The claim it cannot make alone, that no other
+    /// production path reaches the hook, is
     /// [`the_on_refresh_hook_fires_from_the_two_refresh_keys_and_nowhere_else`]'s.
     #[test]
     fn a_generation_started_the_way_a_finished_fetch_starts_one_never_runs_the_on_refresh_action() {
@@ -12533,7 +12518,6 @@ refresh_all = "z""#,
     /// neither can name a number the run itself would not act on
     /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
     #[test]
-    #[cfg(feature = "fetch")]
     fn the_sync_border_title_and_the_confirm_gate_count_the_same_resolution_the_run_uses() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");

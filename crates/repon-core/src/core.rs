@@ -257,14 +257,8 @@ fn dispatches_kind(kind: Kind, show_submodules: bool) -> bool {
 /// The periodic fetch's own crossing data
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// `[fetch]` table): whether it runs at all, its cadence, and how many run at once.
-///
-/// Always present, regardless of the `fetch` cargo feature: this is plain bounding
-/// data, not the mutating mechanism, so a consumer can always express "run the
-/// periodic fetch" in `CoreSpec` without the feature's blocking network client, HTTP
-/// transport and credential machinery ever entering its dependency tree. Only
-/// `fetch.rs` and the scheduler's own dispatch of a real cycle are gated behind the
-/// feature ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)):
-/// without it, `enabled: true` here is inert and no cycle ever runs.
+/// Plain bounding data, not the mutating mechanism itself: `enabled: false` here is
+/// what keeps the cycle from running, not the absence of any machinery to run it.
 #[derive(Debug, Clone)]
 pub struct FetchSpec {
     pub enabled: bool,
@@ -276,12 +270,10 @@ pub struct FetchSpec {
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// `[auto_update]` table): whether it runs at all.
 ///
-/// Always present, regardless of the `fetch` cargo feature, for the same reason
-/// [`FetchSpec`] is: plain bounding data, not the mutating mechanism. Carries no
-/// interval or concurrency of its own, because it never ticks on its own clock; it
-/// rides the periodic fetch cycle [`FetchSpec`] already schedules; a build with the
-/// `fetch` feature off has `run_fetch_cycle`'s no-op stub, so `enabled: true` here is
-/// then inert the same way `FetchSpec::enabled` is.
+/// Plain bounding data, not the mutating mechanism, for the same reason [`FetchSpec`]
+/// is. Carries no interval or concurrency of its own, because it never ticks on its
+/// own clock; it rides the periodic fetch cycle [`FetchSpec`] already schedules, so
+/// `enabled: true` here is inert while `FetchSpec::enabled` is false.
 #[derive(Debug, Clone, Copy)]
 pub struct AutoUpdateSpec {
     pub enabled: bool,
@@ -310,11 +302,6 @@ pub struct FetchFailures {
 /// eligibility rule), flattened into one return type so the built-in `sync` action
 /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md))
 /// can report every ineligible reason to the user rather than a bare "did nothing".
-///
-/// Always present, regardless of the `fetch` cargo feature, the same way [`AutoUpdateSpec`]
-/// is: plain data describing an outcome, not the mutating mechanism. Without the feature,
-/// [`Core::attempt_auto_update`] is never reached at all, because `sync`'s own eligibility
-/// already refuses every row first, so this needs no "not built" case of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoUpdateAttempt {
     /// The working tree or index carried a change of its own.
@@ -347,13 +334,12 @@ pub struct CoreSpec {
     /// Live-updatable afterwards through [`Core::set_show_submodules`], which is what lets
     /// toggling it skip a Core rebuild and the rediscovery that would come with one.
     pub show_submodules: bool,
-    /// The periodic fetch's own bounding data. See [`FetchSpec`]: always present,
-    /// inert without the `fetch` cargo feature.
+    /// The periodic fetch's own bounding data. See [`FetchSpec`].
     pub fetch: FetchSpec,
     /// The fast-forward-only auto-update's own bounding data. See [`AutoUpdateSpec`]:
-    /// always present, inert without the `fetch` cargo feature and while
-    /// `fetch.enabled` is itself `false` (`Warning::AutoUpdateWithoutFetch` is what
-    /// tells a config author that combination can never fire).
+    /// inert while `fetch.enabled` is itself `false`
+    /// (`Warning::AutoUpdateWithoutFetch` is what tells a config author that
+    /// combination can never fire).
     pub auto_update: AutoUpdateSpec,
 }
 
@@ -543,10 +529,7 @@ pub struct Core {
     /// repository had a remote to fetch: the immediate first cycle plus one per
     /// `fetch.interval` tick since. Read only by `fetch_cycle_count_for_test`,
     /// which is what proves the immediate cycle ran without waiting on the
-    /// recurring cadence at all. Present only when this crate is built with the
-    /// `fetch` cargo feature, the mutating path's own isolation boundary
-    /// ([ADR 0015](https://github.com/paulchiu/repon/blob/main/docs/adr/0015-the-core-owns-the-table.md)).
-    #[cfg(feature = "fetch")]
+    /// recurring cadence at all.
     #[allow(dead_code)] // read only by fetch_cycle_count_for_test
     fetch_cycle_count: Arc<AtomicUsize>,
     /// The network's advertised default branch, per common dir, read from a fetch
@@ -559,16 +542,10 @@ pub struct Core {
     /// later Generation for the life of this `Core`, which is what "supersedes
     /// the local one for that session" means: never written back to any
     /// reference, and gone the moment this `Core` is dropped, per ADR 0012.
-    /// Always present, even without the `fetch` cargo feature, so every probe
-    /// site reads the same field regardless: without the feature nothing ever
-    /// writes to it, so a lookup here always misses, the same "inert" shape
-    /// [`FetchSpec`] already takes.
     network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
     /// The most recently completed periodic-fetch cycle's own failures, replaced
     /// wholesale by [`run_fetch_cycle`] every time it runs. Read through
-    /// [`Core::fetch_failures`]. Always present, even without the `fetch` cargo
-    /// feature, the same "inert" shape `network_default_branch` above already
-    /// takes: without it nothing ever writes here, so a read always finds it empty.
+    /// [`Core::fetch_failures`].
     fetch_failures: Arc<Mutex<FetchFailures>>,
     /// Orders every spawned dispatch body this `Core` starts; see
     /// [`DispatchTurnstile`].
@@ -614,10 +591,6 @@ impl Core {
         let interval = spec.poll_interval.max(Duration::from_nanos(1));
         let ticks = crossbeam_channel::tick(interval);
         let alive = Arc::new(AtomicBool::new(true));
-        // `spec.fetch` is always present (see `FetchSpec`'s own doc comment), so this
-        // reads it unconditionally: without the `fetch` cargo feature, `run_fetch_cycle`
-        // is a no-op stub regardless of what this schedules, so there is no separate
-        // "feature off" branch to maintain here.
         let fetch_start = FetchStart {
             enabled: spec.fetch.enabled,
             concurrency: spec.fetch.concurrency.max(1),
@@ -692,14 +665,12 @@ impl Core {
     /// is left exactly as it was, and so is every cell but `default_branch` on a
     /// key inside it.
     ///
-    /// Runs the local chain exactly as any other refresh would, then, where this
-    /// crate is built with the `fetch` cargo feature, a handshake-only network
-    /// probe per distinct common dir among `keys` (`fetch::probe_remote_head`):
-    /// no pack requested and no ref updated, which is "without fetching". Its
-    /// answer, once landed on `network_default_branch`, is what
-    /// `supersede_with_network` applies here and on every later probe of that
-    /// common dir for the life of this `Core`. Without the feature, only the
-    /// local chain runs, the same "inert" shape the periodic fetch itself takes.
+    /// Runs the local chain exactly as any other refresh would, then a
+    /// handshake-only network probe per distinct common dir among `keys`
+    /// (`fetch::probe_remote_head`): no pack requested and no ref updated, which is
+    /// "without fetching". Its answer, once landed on `network_default_branch`, is
+    /// what `supersede_with_network` applies here and on every later probe of that
+    /// common dir for the life of this `Core`.
     ///
     /// Returns immediately, which is also why a stalled remote has nothing to end
     /// it here: the deadline sweep is per entity, not per cell, so this is on the
@@ -1129,16 +1100,11 @@ impl Core {
     }
 
     /// Attempts the fast-forward-only auto-update on `key`'s own Repo, on demand: exactly
-    /// [`crate::auto_update::attempt`]'s own five rules and its own fast-forward, reused
+    /// `crate::auto_update::attempt`'s own five rules and its own fast-forward, reused
     /// rather than a second implementation for the built-in `sync` action to call by hand
     /// ([repo-management.md](https://github.com/paulchiu/repon/blob/main/docs/spec/repo-management.md)).
     /// Read fresh right now, the same tense [`Self::delete_risk`] reads in: eligibility can
     /// change between the gate and the run, so this is never answered from a Cell.
-    ///
-    /// Without the `fetch` cargo feature this is never reached: `sync`'s own eligibility
-    /// check refuses every row before a run gets here, since the mechanism does not exist
-    /// to call.
-    #[cfg(feature = "fetch")]
     pub fn attempt_auto_update(&self, key: &EntityKey) -> AutoUpdateAttempt {
         match crate::auto_update::attempt(key.path()) {
             crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotClean) => {
@@ -1156,17 +1122,6 @@ impl Core {
             crate::auto_update::Outcome::Updated { .. } => AutoUpdateAttempt::Updated,
             crate::auto_update::Outcome::Failed(error) => AutoUpdateAttempt::Failed(error),
         }
-    }
-
-    /// Without the `fetch` cargo feature, the auto-update mechanism this delegates to on a
-    /// build that has it does not exist to call: `sync`'s own eligibility refuses every row
-    /// on a build like this one before a run ever reaches here.
-    #[cfg(not(feature = "fetch"))]
-    pub fn attempt_auto_update(&self, _key: &EntityKey) -> AutoUpdateAttempt {
-        unreachable!(
-            "sync's own eligibility refuses every row before this is reached without the \
-             `fetch` cargo feature"
-        )
     }
 
     /// Runs `action`'s own steps against one Entity, on the calling thread, blocking until
@@ -1673,7 +1628,6 @@ impl ManagementHandle {
     }
 
     /// Identical to [`Core::attempt_auto_update`].
-    #[cfg(feature = "fetch")]
     pub fn attempt_auto_update(&self, key: &EntityKey) -> AutoUpdateAttempt {
         match crate::auto_update::attempt(key.path()) {
             crate::auto_update::Outcome::Ineligible(crate::auto_update::Ineligible::NotClean) => {
@@ -1691,16 +1645,6 @@ impl ManagementHandle {
             crate::auto_update::Outcome::Updated { .. } => AutoUpdateAttempt::Updated,
             crate::auto_update::Outcome::Failed(error) => AutoUpdateAttempt::Failed(error),
         }
-    }
-
-    /// Without the `fetch` cargo feature, [`Core::attempt_auto_update`]'s own unreachable
-    /// twin: the mechanism this would call does not exist to call.
-    #[cfg(not(feature = "fetch"))]
-    pub fn attempt_auto_update(&self, _key: &EntityKey) -> AutoUpdateAttempt {
-        unreachable!(
-            "sync's own eligibility refuses every row before this is reached without the \
-             `fetch` cargo feature"
-        )
     }
 
     /// Identical to [`Core::run_action_for_entity_blocking`], against this handle's own
@@ -2526,7 +2470,6 @@ impl Core {
     /// waiting out a real `fetch.interval`. `spec.fetch.enabled` still governs
     /// whether the immediate first cycle fires; `fetch_ticks` governs every cycle
     /// after that.
-    #[cfg(feature = "fetch")]
     pub(crate) fn start_for_test_with_fetch(
         spec: CoreSpec,
         warn_after: Duration,
@@ -2553,7 +2496,6 @@ impl Core {
     /// How many periodic-fetch cycles have run in total: the immediate first one
     /// plus one per `fetch.interval` tick since, whether or not any repository had
     /// a remote to fetch.
-    #[cfg(feature = "fetch")]
     pub(crate) fn fetch_cycle_count_for_test(&self) -> usize {
         self.fetch_cycle_count.load(Ordering::Acquire)
     }
@@ -3042,7 +2984,6 @@ fn start_internal(
             status_stale_after: spec.status_stale_after,
             poll_reprobed,
             poll_sweep_count,
-            #[cfg(feature = "fetch")]
             fetch_cycle_count,
             network_default_branch,
             fetch_failures,
@@ -3071,9 +3012,7 @@ struct PollHandles {
 
 /// What [`start_internal`] needs from `CoreSpec::fetch` to schedule the periodic fetch,
 /// bundled into one argument rather than three so this crate's own `clippy::too_many_arguments`
-/// budget has room for it: extracted once at each of `Core::start`'s two callers, which is
-/// what keeps `start_internal`'s own signature identical whether or not this crate is built
-/// with the `fetch` cargo feature (see [`FetchSpec`]'s own doc comment).
+/// budget has room for it: extracted once at each of `Core::start`'s two callers.
 struct FetchStart {
     enabled: bool,
     concurrency: usize,
@@ -3082,12 +3021,10 @@ struct FetchStart {
 
 /// The periodic fetch's own scheduling inputs, threaded through [`start_internal`]
 /// and [`spawn_clock_thread`] as plain values rather than reading `CoreSpec::fetch`
-/// directly: extracting them once at each of the two callers is what keeps both
-/// functions' own signatures identical whether or not this crate is built with the
-/// `fetch` cargo feature. Carries no `enabled` flag of its own: `ticks` is
-/// [`crossbeam_channel::never`] whenever the periodic fetch is off, so the arm that
-/// reads it simply never fires, the same way the poll's own `ticks` does when a
-/// test has no interest in it.
+/// directly: extracted once at each of the two callers. Carries no `enabled` flag
+/// of its own: `ticks` is [`crossbeam_channel::never`] whenever the periodic fetch
+/// is off, so the arm that reads it simply never fires, the same way the poll's
+/// own `ticks` does when a test has no interest in it.
 struct FetchSchedule {
     concurrency: usize,
     ticks: Receiver<Instant>,
@@ -3193,12 +3130,6 @@ fn spawn_clock_thread(
 /// the dedicated thread's own tick channel can prove a tick reached this function
 /// at all, the same proof [`Core::poll_sweep_count_for_test`] gives the poll.
 ///
-/// A no-op without the `fetch` cargo feature: `fetch.ticks` is
-/// [`crossbeam_channel::never`] whenever this crate is built without it (see
-/// [`FetchSchedule`]), so this is never actually reached in that build; the stub
-/// exists so [`spawn_clock_thread`]'s own signature does not depend on the
-/// feature.
-///
 /// Two things worth recording beside this scheduler rather than only in
 /// [refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md):
 /// `Gone` is systematically under-reported without this cycle running, because a
@@ -3209,7 +3140,6 @@ fn spawn_clock_thread(
 /// minutes is [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// stated number, not one this crate has measured against a real population the
 /// way the poll interval and the generation deadline were.
-#[cfg(feature = "fetch")]
 fn run_fetch_cycle(
     table: &Arc<RwLock<Table>>,
     concurrency: usize,
@@ -3287,17 +3217,6 @@ fn run_fetch_cycle(
     refresh.dispatch(&all_keys);
 }
 
-#[cfg(not(feature = "fetch"))]
-fn run_fetch_cycle(
-    _table: &Arc<RwLock<Table>>,
-    _concurrency: usize,
-    _refresh: &RefreshHandles,
-    _cycle_count: &Arc<AtomicUsize>,
-    _failures: &Arc<Mutex<FetchFailures>>,
-    _auto_update_enabled: bool,
-) {
-}
-
 /// Every non-excluded Repo's own working directory, one per distinct common dir the
 /// table currently knows: the auto-update acts on a Repo's own row, per
 /// `docs/spec/config.md`'s "acts only on a Repo", so a Worktree sharing that common
@@ -3306,7 +3225,6 @@ fn run_fetch_cycle(
 /// operated on, mirrors the same `excluded` rule the fetch loop's own common-dir
 /// filter applies, checked here against the Repo entity's own flag rather than any
 /// Worktree that happens to share its common dir.
-#[cfg(feature = "fetch")]
 fn repos_eligible_for_auto_update_attempt(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
     table
         .read()
@@ -3324,7 +3242,6 @@ fn repos_eligible_for_auto_update_attempt(table: &Arc<RwLock<Table>>) -> Vec<Pat
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md#per-repo-entries)'s
 /// "listed, never operated on"), since a Worktree named directly by its own path
 /// can carry a different `excluded` than an entry it would otherwise inherit.
-#[cfg(feature = "fetch")]
 fn distinct_fetchable_common_dirs(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
     let table = table.read().unwrap();
     let mut seen: HashMap<PathBuf, bool> = HashMap::new();
@@ -3344,7 +3261,6 @@ fn distinct_fetchable_common_dirs(table: &Arc<RwLock<Table>>) -> Vec<PathBuf> {
 /// [`supersede_with_network`] to read back. `Unborn` and a probe failure both
 /// leave any earlier session answer for that common dir untouched, the same
 /// convention [`run_fetch_cycle`] already follows.
-#[cfg(feature = "fetch")]
 fn probe_network_default_branches(
     common_dirs: &HashSet<Arc<Path>>,
     network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
@@ -3359,16 +3275,6 @@ fn probe_network_default_branches(
                 .insert(common_dir.to_path_buf(), Arc::from(name));
         }
     }
-}
-
-/// Without the `fetch` cargo feature, [`Core::rederive_default_branches`] runs
-/// the local chain alone: there is no blocking network client to probe with, the
-/// same "inert" shape [`FetchSpec`] already takes.
-#[cfg(not(feature = "fetch"))]
-fn probe_network_default_branches(
-    _common_dirs: &HashSet<Arc<Path>>,
-    _network_default_branch: &Mutex<HashMap<PathBuf, Arc<str>>>,
-) {
 }
 
 /// One entity [`Core::rederive_default_branches`] gathered under the table lock,
@@ -11774,7 +11680,6 @@ mod tests {
     /// "The periodic fetch"). Every fixture here is a bare repo this test creates plus a
     /// real `git clone` of it, per the standing constraint that a fetch test never
     /// touches a real remote or the network.
-    #[cfg(feature = "fetch")]
     mod fetch_scheduler {
         use super::*;
         use crate::liveness::wait_for_or;
@@ -12185,7 +12090,6 @@ mod tests {
     /// is proven here, at the one seam a reimplementation could actually diverge from the
     /// rules it is supposed to reuse. Every fixture is a bare repo this test creates plus a
     /// real `git clone` of it, the same standing constraint `fetch_scheduler` above follows.
-    #[cfg(feature = "fetch")]
     mod attempt_auto_update {
         use super::*;
 
@@ -12321,7 +12225,6 @@ mod tests {
     /// same lookup on demand, over exactly the given keys, without fetching). Every fixture
     /// here is a bare repo this test creates plus a real `git clone` of it, the same standing
     /// constraint `fetch_scheduler` above already follows.
-    #[cfg(feature = "fetch")]
     mod network_default_branch {
         use super::*;
 

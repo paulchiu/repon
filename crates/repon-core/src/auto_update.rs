@@ -1,8 +1,7 @@
 //! The fast-forward-only auto-update: the second and last mutating git operation this
-//! program ever performs, alongside the periodic fetch's own fetch-and-prune. Isolated
-//! behind the `fetch` cargo feature for the same reason `fetch.rs` is: it can only ever
-//! act on what a fetch just learned, so a consumer that never turns fetching on pulls in
-//! none of this either. See `docs/spec/config.md`'s "Refresh, fetch and auto-update" and
+//! program ever performs, alongside the periodic fetch's own fetch-and-prune. It can only
+//! ever act on what a fetch just learned. See `docs/spec/config.md`'s "Refresh, fetch and
+//! auto-update" and
 //! [ADR 0002](https://github.com/paulchiu/repon/blob/main/docs/adr/0002-repon-owns-the-outer-loop-only.md)'s
 //! narrowest-safe-operation rule.
 //!

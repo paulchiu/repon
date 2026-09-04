@@ -79,7 +79,6 @@ pub(crate) fn loose_object_count(repo: &Path) -> usize {
 /// must go through a throwaway checkout and a push, never a direct write. Shared
 /// by `fetch.rs` and `core.rs`'s own periodic-fetch fixtures, which both need
 /// exactly this shape: a "remote" the test itself creates, never a real one.
-#[cfg(feature = "fetch")]
 pub(crate) fn init_bare(path: &Path) {
     let status = Command::new("git")
         .arg("init")
@@ -93,7 +92,6 @@ pub(crate) fn init_bare(path: &Path) {
 
 /// Writes `name` with `contents` into the working tree at `path` and commits it,
 /// with the fixed identity [`git`] already supplies.
-#[cfg(feature = "fetch")]
 pub(crate) fn commit_file(path: &Path, name: &str, contents: &str) {
     fs::write(path.join(name), contents).expect("write fixture file");
     git(path, &["add", name]);
@@ -104,7 +102,6 @@ pub(crate) fn commit_file(path: &Path, name: &str, contents: &str) {
 /// commit into) by cloning it into a throwaway checkout, committing there, and
 /// pushing back: this is what stands in for "a collaborator pushed" in every
 /// fetch fixture.
-#[cfg(feature = "fetch")]
 pub(crate) fn push_new_commit(remote: &Path, name: &str, contents: &str) {
     let contributor = tempfile::tempdir().expect("temp dir");
     let status = Command::new("git")
@@ -122,7 +119,6 @@ pub(crate) fn push_new_commit(remote: &Path, name: &str, contents: &str) {
 /// `git clone` of it into a second temp dir: the only shape a periodic-fetch
 /// fixture is allowed to take, per the standing constraint that this ticket's
 /// tests never fetch over the network or point at a real remote.
-#[cfg(feature = "fetch")]
 pub(crate) fn remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
     let remote = tempfile::tempdir().expect("temp dir");
     init_bare(remote.path());
@@ -147,7 +143,6 @@ pub(crate) fn remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
 
 /// Gives `path`'s own repository a committer identity, so nothing depends on whether the
 /// machine running the tests happens to have one configured globally.
-#[cfg(feature = "fetch")]
 pub(crate) fn set_identity(path: &Path) {
     for (key, value) in [("user.email", "test@example.com"), ("user.name", "Test")] {
         let status = Command::new("git")

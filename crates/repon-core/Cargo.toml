@@ -28,33 +28,27 @@ test-util = []
 # on gix's own `serde` feature (needed for `gix::ObjectId` on a settled `Head`) and serde's
 # `rc` feature, without which `Arc<str>` does not implement `Serialize` at all.
 serde = ["dep:serde", "gix/serde"]
-# Off by default, per ADR 0015: the one mutating path in this crate, isolated so a
-# consumer that never turns it on pulls in none of gix's blocking network client,
-# HTTP transport (reqwest, rustls and their own dependency trees) or credential
-# machinery. These resolve inside gix's own already-allowed subtree, so the direct-dependency
-# check cannot see them either way; `check-core-isolation`'s `check_network_stack_is_gated`
-# reads the whole transitive tree instead, and is what proves they are absent by default.
-fetch = [
-    "gix/blocking-network-client",
-    "gix/blocking-http-transport-reqwest-rust-tls",
-    "gix/credentials",
-]
 
 [dependencies]
 crossbeam-channel.workspace = true
 # Matched against a Set's roots case-sensitively, per docs/spec/config.md; discovery's
 # boundary walk is the sole consumer.
 globset = "0.4.20"
-# Read-only surface by choice on the probe path: these defaults pull in none of gix's
-# mutation, merge, blame, archive or credentials machinery. The `fetch` feature below is
-# the one deliberate exception (ADR 0015's "The read-only invariant is scoped to the
-# probe path"), adding blocking network and transport features of its own.
+# Mostly a read-only surface: these features pull in none of gix's merge, blame or archive
+# machinery. `blocking-network-client`, `blocking-http-transport-reqwest-rust-tls` and
+# `credentials` are the one mutating path in this crate, the periodic fetch (ADR 0015's "The
+# read-only invariant is scoped to the probe path"), unconditional rather than behind a cargo
+# feature: they bring gix's blocking network client, HTTP transport (reqwest, rustls) and
+# credential machinery into every build of this crate, published library included.
 gix = { version = "0.87.1", default-features = false, features = [
     "max-performance-safe",
     "sha1",
     "basic",
     "status",
     "dirwalk",
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "credentials",
 ] }
 # setsid(2) and openpty(3) for an Action step's PTY-backed child (ADR 0018), already in the
 # dependency tree transitively via backtrace, color-eyre, cpufeatures and sha1, so this only
@@ -70,8 +64,8 @@ serde = { version = "1.0.229", optional = true, features = ["derive", "rc"] }
 # integration test under `tests/` links against the library built *without* `cfg(test)`,
 # so `liveness` and `Core::settle` are invisible to it unless something in the graph asks
 # for the feature. `repon`'s own dev-dependency already did that for `cargo test
-# --workspace`, and only for that: `cargo test -p repon-core`, which `just test` runs on
-# its own for the `fetch` feature, resolves without `repon` and saw neither. Stripped on
-# publish, like every path-only dev-dependency.
+# --workspace`, and only for that: `cargo test -p repon-core`, which `just test` also runs
+# on its own, resolves without `repon` and saw neither. Stripped on publish, like every
+# path-only dev-dependency.
 repon-core = { path = ".", features = ["test-util"] }
 tempfile = "3.27.0"

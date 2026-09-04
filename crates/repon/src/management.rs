@@ -1,10 +1,8 @@
 //! The four built-in management operations: `ignore`, `unignore`, `delete` and `sync`.
 //!
-//! [repo-management.md](../../../docs/spec/repo-management.md) is the specification,
+//! [repo-management.md](../../../docs/spec/repo-management.md) is the specification and
 //! [0028](../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) the reasoning for
-//! the first three, and
-//! [0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md) the
-//! reasoning for `sync`'s own feature gate. They are built-in entries in the Action palette
+//! the first three. They are built-in entries in the Action palette
 //! rather than a third palette, and they fan out over the Selection sharing the Action
 //! confirm gate's shape (a count, with ineligible entities subtracted and named) and none of
 //! the pty machinery in [actions.md](../../../docs/spec/actions.md) for the operation itself,
@@ -107,10 +105,6 @@ impl Operation {
     /// through a catch-all, so a fifth Kind fails to compile instead of quietly becoming
     /// eligible for a destructive operation.
     ///
-    /// `sync` on a build with no `fetch` cargo feature is refused before its Kind is even
-    /// read, whatever Kind the row is: the mechanism it would call does not exist on a build
-    /// like that
-    /// ([0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
     /// What the auto-update's own five rules find ineligible right now (dirty, no upstream,
     /// not behind, not fast-forward) is a different fact, read only by attempting it, so it
     /// is never a gate refusal here; [`run`]'s own `sync_one` is where that surfaces.
@@ -136,9 +130,6 @@ impl Operation {
             (Operation::Delete, Kind::Repo | Kind::Worktree) => Eligibility::Eligible,
             (Operation::Delete, Kind::Submodule) => {
                 Eligibility::Refused(Refusal::SubmoduleCannotBeDeleted)
-            }
-            (Operation::Sync, _) if !repon_core::FETCH_AVAILABLE => {
-                Eligibility::Refused(Refusal::FetchNotBuilt)
             }
             (Operation::Sync, Kind::Repo) => Eligibility::Eligible,
             (Operation::Sync, Kind::Worktree) => {
@@ -184,10 +175,6 @@ pub(crate) enum Refusal {
     /// `sync` on a Submodule: it tracks a pinned commit, not a branch, so there is nothing
     /// to fast-forward.
     SubmoduleCannotSync,
-    /// `sync` on a build with no `fetch` cargo feature: the fast-forward mechanism it
-    /// reuses does not exist to call
-    /// ([0031](../../../docs/adr/0031-sync-is-always-built-and-ineligible-without-fetch.md)).
-    FetchNotBuilt,
 }
 
 impl Refusal {
@@ -209,11 +196,6 @@ impl Refusal {
             Refusal::SubmoduleCannotSync => {
                 "a Submodule tracks a pinned commit, not a branch, so there is nothing to \
                  fast-forward"
-            }
-            Refusal::FetchNotBuilt => {
-                "this build has no fetch mechanism; install with `cargo install --git \
-                 https://github.com/paulchiu/repon --locked --features fetch repon` to turn \
-                 it on"
             }
         }
     }
@@ -1903,50 +1885,33 @@ mod tests {
     }
 
     // =====================================================================================
-    // `sync`'s own eligibility: a Repo is eligible by Kind on a build with the `fetch`
-    // feature and refused with a reason otherwise; a Worktree and a Submodule are always
-    // refused with a reason of their own, whatever the build. Every assertion below holds
-    // in both feature configurations at once, the same "prove it both ways" shape
-    // `config::document`'s own `fetch_enabled_warns_exactly_when_this_build_carries_no_fetch_mechanism`
-    // test already uses, so this suite is meaningful whichever way `just test` compiles it.
+    // `sync`'s own eligibility: a Repo is always eligible by Kind; a Worktree and a
+    // Submodule are always refused with a reason of their own.
     // =====================================================================================
 
-    /// A Repo is eligible for `sync` exactly when this build carries the `fetch` mechanism,
-    /// and refused with a reason naming that otherwise: never silently ineligible.
+    /// A Repo is eligible for `sync`.
     #[test]
-    fn sync_is_eligible_on_a_repo_exactly_when_fetch_is_available() {
+    fn sync_is_eligible_on_a_repo() {
         let repo = entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo);
 
         let eligibility = Operation::Sync.eligibility(&repo);
 
-        if repon_core::FETCH_AVAILABLE {
-            assert_eq!(eligibility, Eligibility::Eligible);
-        } else {
-            assert_eq!(
-                eligibility,
-                Eligibility::Refused(Refusal::FetchNotBuilt),
-                "a build with no fetch mechanism must refuse with a reason, not run"
-            );
-        }
+        assert_eq!(eligibility, Eligibility::Eligible);
     }
 
-    /// A Worktree is refused with its own reason, never silently ineligible, whatever the
-    /// build carries: `repos_eligible_for_auto_update_attempt` is Repo-only, so a Worktree
-    /// sharing a common dir must say so rather than doing nothing.
+    /// A Worktree is refused with its own reason, never silently ineligible:
+    /// `repos_eligible_for_auto_update_attempt` is Repo-only, so a Worktree sharing a common
+    /// dir must say so rather than doing nothing.
     #[test]
     fn sync_is_refused_on_a_worktree_and_named_and_counted() {
         let worktree = entity(Path::new("/tmp/x/tree"), "tree", Kind::Worktree);
 
         let eligibility = Operation::Sync.eligibility(&worktree);
 
-        if repon_core::FETCH_AVAILABLE {
-            assert_eq!(
-                eligibility,
-                Eligibility::Refused(Refusal::WorktreeSyncsThroughItsRepo)
-            );
-        } else {
-            assert_eq!(eligibility, Eligibility::Refused(Refusal::FetchNotBuilt));
-        }
+        assert_eq!(
+            eligibility,
+            Eligibility::Refused(Refusal::WorktreeSyncsThroughItsRepo)
+        );
 
         let entities = vec![worktree];
         let plan = plan(Operation::Sync, &entities);
@@ -1965,44 +1930,16 @@ mod tests {
 
         let eligibility = Operation::Sync.eligibility(&submodule);
 
-        if repon_core::FETCH_AVAILABLE {
-            assert_eq!(
-                eligibility,
-                Eligibility::Refused(Refusal::SubmoduleCannotSync)
-            );
-        } else {
-            assert_eq!(eligibility, Eligibility::Refused(Refusal::FetchNotBuilt));
-        }
-    }
-
-    /// A build with no `fetch` cargo feature names the same install command
-    /// [config.md](../../../docs/spec/config.md)'s own `fetch.enabled` warning does, read
-    /// from [releasing.md](../../../docs/spec/releasing.md) at test time rather than
-    /// restated, so the two messages cannot silently say two different things.
-    #[test]
-    fn fetch_not_built_names_releasings_own_fetch_install_command() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let releasing = std::fs::read_to_string(manifest_dir.join("../../docs/spec/releasing.md"))
-            .expect("read docs/spec/releasing.md");
-        let command = releasing
-            .lines()
-            .find(|line| line.starts_with("cargo install") && line.contains("--features fetch"))
-            .expect("releasing.md must carry a fetch-enabled `cargo install` line")
-            .trim();
-
-        assert!(
-            Refusal::FetchNotBuilt.reason().contains(command),
-            "the reason must name releasing.md's own fetch-enabled install command verbatim, \
-             got {:?}",
-            Refusal::FetchNotBuilt.reason()
+        assert_eq!(
+            eligibility,
+            Eligibility::Refused(Refusal::SubmoduleCannotSync)
         );
     }
 
     // =====================================================================================
     // `sync`'s own run: every `AutoUpdateAttempt` the injected closure returns becomes the
-    // matching `Outcome`, proven independently of the `fetch` cargo feature since the
-    // closure stands in for `Core::attempt_auto_update` here, the same way `with_risk`'s
-    // own `read` stands in for `Core::delete_risk`.
+    // matching `Outcome`, since the closure stands in for `Core::attempt_auto_update` here,
+    // the same way `with_risk`'s own `read` stands in for `Core::delete_risk`.
     // =====================================================================================
 
     fn run_with_sync(plan: &Plan, attempt: AutoUpdateAttempt) -> Report {
@@ -2041,11 +1978,7 @@ mod tests {
     #[test]
     fn sync_updated_becomes_synced() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        // Forced eligible regardless of this build's own `fetch` feature: `run`'s own
-        // dispatch reads `target.eligibility`, not `Operation::eligibility` again, so this
-        // is the one seam that lets the outcome mapping be tested on every build.
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run_with_sync(&built, AutoUpdateAttempt::Updated);
 
@@ -2071,8 +2004,7 @@ mod tests {
         ];
 
         for (attempt, expected) in cases {
-            let mut built = plan(Operation::Sync, &entities);
-            built.targets[0].eligibility = Eligibility::Eligible;
+            let built = plan(Operation::Sync, &entities);
 
             let report = run_with_sync(&built, attempt.clone());
 
@@ -2098,8 +2030,7 @@ mod tests {
     #[test]
     fn sync_failed_becomes_a_failure_never_an_ineligible_reason() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run_with_sync(&built, AutoUpdateAttempt::Failed("git said no".to_string()));
 
@@ -2119,8 +2050,7 @@ mod tests {
     #[test]
     fn a_failing_before_sync_hook_stops_sync_from_being_attempted() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run(
             &built,
@@ -2150,8 +2080,7 @@ mod tests {
     #[test]
     fn a_passing_before_sync_hook_still_lets_sync_run() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run_with_sync_and_hooks(
             &built,
@@ -2169,8 +2098,7 @@ mod tests {
     #[test]
     fn a_failing_after_sync_hook_never_undoes_the_fast_forward_it_already_did() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run_with_sync_and_hooks(
             &built,
@@ -2201,8 +2129,7 @@ mod tests {
     #[test]
     fn after_sync_hook_is_not_consulted_when_sync_did_not_fast_forward() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run(
             &built,
@@ -2226,8 +2153,7 @@ mod tests {
     #[test]
     fn a_passing_after_sync_hook_leaves_the_outcome_as_plain_synced() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
-        let mut built = plan(Operation::Sync, &entities);
-        built.targets[0].eligibility = Eligibility::Eligible;
+        let built = plan(Operation::Sync, &entities);
 
         let report = run_with_sync_and_hooks(
             &built,
