@@ -39,7 +39,7 @@ The workspace is two crates. `crates/repon-core` computes state and knows nothin
 
 ## Design principles
 
-Every displayed value knows whether it is unknown, loading, fresh, stale, or failed, and rendering is a total function of that state. The screen never contradicts itself, and an absent value never renders as zero. This is recorded as [ADR 0001](docs/adr/0001-per-cell-provenance.md).
+Every displayed value knows whether it is unknown, loading, fresh, stale, or failed, and rendering is a total function of that state. The screen never contradicts itself, and an absent value never renders as zero. This is the central decision of the project, recorded as [ADR 0001](docs/adr/0001-per-cell-provenance.md).
 
 Anything automatic performs the narrowest operation that cannot lose work, or none at all. Anything ineligible is reported rather than fixed.
 

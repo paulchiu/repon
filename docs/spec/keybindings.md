@@ -57,7 +57,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `Ctrl+U`, `PageUp` | Half page up |
 | `Space` | Toggle this row's Selection |
 | `v` | Anchor a range at the cursor, extended with `j` and `k` |
-| `a` | Select every listed row, not just this screenful |
+| `a` | Select every listed row, including rows off screen |
 | `A` | Clear the Selection |
 | `Alt+/` | Clear whatever is narrowing the list |
 | `Enter` | Open the detail pane |

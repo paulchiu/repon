@@ -186,6 +186,6 @@ A user-triggered counterpart exists too: the built-in `sync` action in the Actio
 | `fetch.interval` | `"5m"` | Cadence of the periodic fetch |
 | `fetch.concurrency` | `4` | Concurrent fetches in flight |
 
-`on_refresh` is not in this table because it is not a `[refresh]` key: it is a top-level bare scalar naming an Action, settled in [the config spec](config.md) and [actions.md](actions.md).
+`on_refresh` is not in this table because it is a top-level bare scalar naming an Action rather than a `[refresh]` key, settled in [the config spec](config.md) and [actions.md](actions.md).
 
 Naming and nesting are settled in [the config spec](config.md): `[refresh]` and `[fetch]` are tables, and every duration is a humantime string. The disable value is amended from `0` to `"0s"`, since `humantime-serde` rejects a bare TOML integer. Disabling the poll does not remove `~`, since the status age threshold and the Launcher return still produce it.

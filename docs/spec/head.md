@@ -33,7 +33,7 @@ Unborn is the exact mirror of detached: a branch name and no commit, where detac
 
 `dirty` is unchanged in all three shapes. 9 of the 125 detached entities are Dirty.
 
-`state` needs a section of its own, next.
+`state` is the most involved cell here and takes a section of its own, next.
 
 All three shapes on one screen, with a Submodule row for the fourth case that reaches the same rendering by a different route:
 
