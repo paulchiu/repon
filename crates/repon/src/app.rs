@@ -841,6 +841,25 @@ impl App {
         .into_warnings()
     }
 
+    /// `snapshot`'s entities that a kind preference (Worktrees off, Submodules off) does not
+    /// hide, via a Filter-free [`crate::components::list::kind_is_visible`] check. Shared by
+    /// the header's own entity count ([`Self::status_row_content`]) and `Action::RefreshAll`'s
+    /// reported count, so the two can never disagree.
+    fn kind_visible_entity_count(&self, snapshot: &Snapshot, worktrees_shown: bool) -> usize {
+        snapshot
+            .entities
+            .iter()
+            .filter(|entity| {
+                crate::components::list::kind_is_visible(
+                    entity.kind,
+                    worktrees_shown,
+                    self.document.show_submodules,
+                    &Filter::default(),
+                )
+            })
+            .count()
+    }
+
     /// The status row's own content for this frame: the active Set's name, `snapshot`'s
     /// entity count folded into the same rank-1 item, `warnings`, and every warning
     /// [`Self::acknowledged_warnings`] has marked seen. `filter_match_count` and
@@ -899,21 +918,7 @@ impl App {
                 entity_count: run.entity_count,
                 running: self.core.refresh_running(),
             });
-        // Excludes rows a kind preference hides (Worktrees off, Submodules off). A
-        // Filter-free `kind_is_visible` check rather than `visible.len()`, so a committed
-        // Filter's narrowing or kind override never moves this count.
-        let entity_count = snapshot
-            .entities
-            .iter()
-            .filter(|entity| {
-                crate::components::list::kind_is_visible(
-                    entity.kind,
-                    worktrees_shown,
-                    self.document.show_submodules,
-                    &Filter::default(),
-                )
-            })
-            .count();
+        let entity_count = self.kind_visible_entity_count(snapshot, worktrees_shown);
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
@@ -1455,9 +1460,13 @@ impl App {
             Some(Action::RefreshAll) => {
                 let order = self.refresh_everything_order();
                 self.core.refresh(&order);
+                let entity_count = self.kind_visible_entity_count(
+                    &self.core.snapshot(),
+                    self.effective_show_worktrees(),
+                );
                 self.refresh_run = Some(RefreshRun {
                     scope: status_row::RefreshScope::All,
-                    entity_count: order.len(),
+                    entity_count,
                 });
                 self.fire_on_refresh_hook(&order);
                 None
@@ -5277,6 +5286,136 @@ mod tests {
             .expect("the refresh item must be populated the instant the key is handled");
         assert_eq!(refresh.scope, status_row::RefreshScope::All);
         assert_eq!(refresh.entity_count, 2);
+    }
+
+    // --- Issue #413: `Action::RefreshAll`'s reported count follows the header's own
+    // kind-visible rule rather than the raw dispatch size ---
+
+    /// With Worktrees hidden by the preference, `r`'s reported count must match the
+    /// header's own kind-visible entity count, not the total (which still includes the
+    /// hidden Worktree row).
+    #[test]
+    fn refresh_all_reports_the_kind_visible_count_not_the_total_when_worktrees_are_hidden() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "sanity: the Repo and its Worktree both discovered"
+        );
+        let header_count = app.status_row_content(&snapshot, &[]).header.entity_count;
+        assert_eq!(header_count, 1, "sanity: the header hides the Worktree row");
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        let refresh = app
+            .status_row_content(&app.core.snapshot(), &[])
+            .refresh
+            .expect("RefreshAll must populate the refresh item");
+        assert_eq!(
+            refresh.entity_count, header_count,
+            "the refresh count must equal the header's own kind-visible count, not the raw \
+             total of 2"
+        );
+    }
+
+    /// With Worktrees shown, `r`'s reported count is unchanged: it still names every known
+    /// Entity.
+    #[test]
+    fn refresh_all_reports_the_total_when_worktrees_are_shown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        assert!(
+            app.effective_show_worktrees(),
+            "sanity: Worktrees are shown by default"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        let refresh = app
+            .status_row_content(&app.core.snapshot(), &[])
+            .refresh
+            .expect("RefreshAll must populate the refresh item");
+        assert_eq!(
+            refresh.entity_count, 2,
+            "with Worktrees shown the reported count still names every known Entity"
+        );
+    }
+
+    /// A committed Filter that overrides the kind preference (`kind:worktree`, widening the
+    /// visible set past it) must not move the reported count either, matching the header
+    /// count's own Filter-free rule.
+    #[test]
+    fn refresh_all_reports_a_count_unmoved_by_a_committed_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+        app.filter = Filter::parse("kind:worktree");
+        assert!(
+            !app.visible_keys().is_empty(),
+            "sanity: the overriding Filter widens the visible set"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+
+        let refresh = app
+            .status_row_content(&app.core.snapshot(), &[])
+            .refresh
+            .expect("RefreshAll must populate the refresh item");
+        assert_eq!(
+            refresh.entity_count, 1,
+            "a committed Filter overriding the kind preference must not move the reported \
+             count"
+        );
+    }
+
+    /// `Action::RefreshAll` still dispatches over every known Entity, hidden rows included:
+    /// only the reported count changes, never what actually gets refreshed. The `on_refresh`
+    /// hook running in the hidden Worktree's own directory is the observable proof.
+    #[test]
+    fn refresh_all_still_dispatches_over_hidden_rows_even_though_they_are_not_counted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("repo-a-wt");
+        worktree_add(&repo, &worktree, "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+        declare_on_refresh_hook(&mut app);
+
+        app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("handle RefreshAll");
+        wait_for("the on_refresh hook to finish", || {
+            !app.core.action_running()
+        });
+
+        assert!(
+            hook_ran_in(&repo) && hook_ran_in(&worktree),
+            "the hidden Worktree row must still be dispatched over, even though it is not \
+             counted"
+        );
     }
 
     /// Once `Core::refresh_running` reads false the item's text switches from "refreshing"
