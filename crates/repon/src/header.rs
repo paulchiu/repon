@@ -127,7 +127,7 @@ mod tests {
     /// item present, matching the documented ladder's widest rung.
     fn sample_content() -> HeaderContent {
         HeaderContent {
-            entity_count: 403,
+            entity_count: 242,
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
             worktrees_note: Some((161, WorktreesHiddenBy::Preference)),
@@ -360,7 +360,7 @@ mod tests {
             ("worktrees: 161 (preference off)", "12.0s"),
             ("filter: 12 matches", "worktrees: 161 (preference off)"),
             ("run 7/12", "filter: 12 matches"),
-            ("403 entities", "run 7/12"),
+            ("242 entities", "run 7/12"),
         ];
         for (present, absent) in pairs {
             let row = rows

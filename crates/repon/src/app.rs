@@ -899,10 +899,25 @@ impl App {
                 entity_count: run.entity_count,
                 running: self.core.refresh_running(),
             });
+        // Excludes rows a kind preference hides (Worktrees off, Submodules off). A
+        // Filter-free `kind_is_visible` check rather than `visible.len()`, so a committed
+        // Filter's narrowing or kind override never moves this count.
+        let entity_count = snapshot
+            .entities
+            .iter()
+            .filter(|entity| {
+                crate::components::list::kind_is_visible(
+                    entity.kind,
+                    worktrees_shown,
+                    self.document.show_submodules,
+                    &Filter::default(),
+                )
+            })
+            .count();
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
-                entity_count: snapshot.entities.len(),
+                entity_count,
                 run_progress,
                 filter_match_count,
                 worktrees_note,
@@ -13549,6 +13564,145 @@ refresh_all = "z""#,
         assert!(
             !text.contains("preference off"),
             "a Filter that never names kind:worktree overrides nothing: {text:?}"
+        );
+    }
+
+    // --- the entity count excludes rows a kind preference hides, but never follows the
+    // Filter's own narrowing ---
+
+    #[test]
+    fn entity_count_excludes_worktrees_hidden_by_the_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "sanity: the Repo and its Worktree both discovered"
+        );
+
+        let content = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            content.header.entity_count, 1,
+            "the hidden Worktree must not count, even though the raw snapshot holds it"
+        );
+    }
+
+    #[test]
+    fn entity_count_includes_worktrees_once_the_preference_is_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let app = test_app(&root);
+        let snapshot = app.core.snapshot();
+        let content = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            content.header.entity_count, 2,
+            "with the preference on the count is unchanged from the raw snapshot"
+        );
+    }
+
+    #[test]
+    fn entity_count_excludes_submodules_hidden_by_the_default_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let parent = root.join("parent");
+        init_repo(&parent);
+        write_gitmodules(&parent, "lib", "vendor/lib");
+        std::fs::create_dir_all(parent.join("vendor").join("lib")).expect("create submodule dir");
+
+        let app = test_app(&root);
+        let snapshot = app.core.snapshot();
+        assert_eq!(
+            snapshot.entities.len(),
+            2,
+            "sanity: the Repo and its Submodule both discovered"
+        );
+
+        let content = app.status_row_content(&snapshot, &[]);
+        assert_eq!(
+            content.header.entity_count, 1,
+            "show_submodules defaults off, so the Submodule must not count"
+        );
+    }
+
+    /// A committed Filter is a distinct fact from a kind preference: it must never move the
+    /// entity count, whether it narrows the list or, naming a hidden kind explicitly, widens
+    /// it past the preference (this test's `kind:worktree` case). The Filter's own narrowing
+    /// stays reported only by `filter: N matches`.
+    #[test]
+    fn entity_count_is_unmoved_by_a_committed_filter_even_one_that_overrides_the_kind_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+
+        let mut app = test_app(&root);
+        app.document.show_worktrees = false;
+        let snapshot = app.core.snapshot();
+        let without_filter = app.status_row_content(&snapshot, &[]).header.entity_count;
+        let worktree_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| matches!(entity.kind, repon_core::Kind::Worktree))
+            .expect("a discovered Worktree, hidden or not")
+            .key
+            .clone();
+        assert!(
+            !app.visible_keys().contains(&worktree_key),
+            "sanity: the Worktree row starts hidden by the preference"
+        );
+
+        app.filter = Filter::parse("kind:worktree");
+        assert!(
+            app.visible_keys().contains(&worktree_key),
+            "sanity: the Filter must actually override the preference and show the Worktree row"
+        );
+        let with_overriding_filter = app.status_row_content(&snapshot, &[]).header.entity_count;
+        assert_eq!(
+            with_overriding_filter, without_filter,
+            "an overriding Filter widens the list but must not move the entity count"
+        );
+
+        app.filter = Filter::parse("name-never-matches-anything");
+        let with_narrowing_filter = app.status_row_content(&snapshot, &[]).header.entity_count;
+        assert_eq!(
+            with_narrowing_filter, without_filter,
+            "a narrowing Filter must not move the entity count either; that is `filter: N matches`'s job"
+        );
+    }
+
+    #[test]
+    fn pressing_t_moves_the_entity_count_in_the_same_frame_the_worktree_rows_appear() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let mut app = test_app(&root);
+
+        let snapshot = app.core.snapshot();
+        let before = app.status_row_content(&snapshot, &[]).header.entity_count;
+        assert_eq!(before, 2, "sanity: both rows count with the preference on");
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        let snapshot = app.core.snapshot();
+        let after = app.status_row_content(&snapshot, &[]).header.entity_count;
+        assert_eq!(
+            after, 1,
+            "the toggle just hid the Worktree row, and the count must move with it"
         );
     }
 
