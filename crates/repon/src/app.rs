@@ -192,10 +192,9 @@ impl UnwindLevel for ClosePaneOnUnwind<'_> {
 }
 
 /// Clearing a committed Filter is the unwind stack's fourth and last level
-/// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)), the reason clearing a
-/// Filter has no key of its own
-/// ([filter.md](../../../../docs/spec/filter.md)'s "The input line"). Live only while
-/// `self.filter` is active, and tried only once every earlier level is already empty.
+/// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)), tried only once every
+/// earlier level is already empty. `Action::ClearFilter` reuses this same rule as a direct
+/// route, live whenever `self.filter` is active rather than only at the end of an unwind.
 struct ClearFilterOnUnwind<'a> {
     filter: &'a mut Filter,
 }
@@ -1293,13 +1292,15 @@ impl App {
                 self.selection.clear();
                 None
             }
-            // `Alt+/`: a direct route to the unwind stack's own last rung
-            // ([`ClearFilterOnUnwind`]), leaving the Selection, the detail pane and a
-            // running Action untouched. `follow_cursor` widens the viewport under a
-            // standing cursor the same way the unwind rung's own call does.
+            // `Alt+/`: a direct route to the unwind stack's own last rung, reusing
+            // [`ClearFilterOnUnwind`] so the one clearing rule lives in one place. Leaves the
+            // Selection, the detail pane and a running Action untouched; see `Action::Unwind`
+            // below for why the active path also calls `follow_cursor`.
             Some(Action::ClearFilter) => {
-                if self.filter.is_active() {
-                    self.filter = Filter::default();
+                let mut clear_filter = ClearFilterOnUnwind {
+                    filter: &mut self.filter,
+                };
+                if clear_filter.unwind() {
                     self.follow_cursor();
                 } else {
                     self.set_notice(NO_FILTER_TO_CLEAR_NOTICE.to_string());
@@ -13612,6 +13613,10 @@ refresh_all = "z""#,
         assert!(
             app.core.action_running(),
             "Alt+/ must leave a running Action untouched"
+        );
+        assert_eq!(
+            app.notice, None,
+            "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
 
         app.core.stop_action();
