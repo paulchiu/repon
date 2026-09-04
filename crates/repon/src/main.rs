@@ -79,7 +79,12 @@ fn main() -> color_eyre::Result<()> {
 
     #[cfg(debug_assertions)]
     if args.redraw_marker_after_suspend_for_child {
-        return redraw_marker_after_suspend_for_child();
+        return redraw_marker_after_suspend_for_child("true");
+    }
+
+    #[cfg(debug_assertions)]
+    if args.redraw_marker_after_unspawnable_child {
+        return redraw_marker_after_suspend_for_child("repon-no-such-program-on-any-PATH-anywhere");
     }
 
     #[cfg(debug_assertions)]
@@ -252,24 +257,25 @@ fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
 /// to a real pty can then confirm the marker appears again after the reclaim, rather than
 /// trusting a description of it.
 #[cfg(debug_assertions)]
-fn redraw_marker_after_suspend_for_child() -> color_eyre::Result<()> {
+fn redraw_marker_after_suspend_for_child(program: &str) -> color_eyre::Result<()> {
     errors::init()?;
     let mut tui = tui::Tui::new()?;
     tui.enter()?;
-    tui.draw(|frame| {
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new("REDRAW_MARKER_CONTENT"),
-            frame.area(),
-        );
-    })?;
-    let mut command = std::process::Command::new("true");
-    tui.suspend_for_child(&mut command)?;
-    tui.draw(|frame| {
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new("REDRAW_MARKER_CONTENT"),
-            frame.area(),
-        );
-    })?;
+    let draw_marker = |tui: &mut tui::Tui| -> color_eyre::Result<()> {
+        tui.draw(|frame| {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new("REDRAW_MARKER_CONTENT"),
+                frame.area(),
+            );
+        })?;
+        Ok(())
+    };
+    draw_marker(&mut tui)?;
+    let mut command = std::process::Command::new(program);
+    // Discarded rather than propagated: reclaiming the screen is what this harness is here to
+    // show, and it must happen whether the child ran, failed, or could not be spawned at all.
+    let _ = tui.suspend_for_child(&mut command);
+    draw_marker(&mut tui)?;
     tui.exit()?;
     Ok(())
 }

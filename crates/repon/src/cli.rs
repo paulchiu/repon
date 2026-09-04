@@ -99,6 +99,15 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub redraw_marker_after_suspend_for_child: bool,
 
+    /// Same as `redraw_marker_after_suspend_for_child`, but hands off to a program that
+    /// cannot be spawned at all. Debug-only: exists so a test can observe that reclaiming the
+    /// screen, and forcing the repaint that goes with it, happens on the failure path too,
+    /// which is where `suspend_for_child`'s own promise that `enter` runs regardless is
+    /// easiest to break unnoticed, and must not reach a release binary.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    pub redraw_marker_after_unspawnable_child: bool,
+
     /// Claims the terminal, then writes to fd 2 from a spawned thread through
     /// `std::io::stderr()`, the same path a dependency's own thread takes rather than one of
     /// this crate's call sites, then exits. Debug-only: exists so a test can observe that a
