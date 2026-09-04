@@ -1636,6 +1636,11 @@ fn a_partial_escape_sequence_left_in_stdin_does_not_block_tui_exit() {
             )
         },
     );
+    assert!(
+        sent_partial_escape.get(),
+        "the partial escape sequence was never sent (EnterAlternateScreen never appeared), so \
+         this run proves nothing about the bug it means to reproduce"
+    );
     let status = exited
         .get()
         .expect("the wait above only returns once the child has exited");

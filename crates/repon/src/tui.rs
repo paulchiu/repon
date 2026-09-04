@@ -533,6 +533,51 @@ mod tests {
         restore_stderr().expect("restore_stderr with nothing saved must be a no-op");
     }
 
+    /// [`set_fd_nonblocking`] against a pipe end this test owns outright, rather than the real
+    /// stdin a unit test's own harness may or may not have: a non-blocking read of an empty
+    /// pipe must return `WouldBlock` immediately instead of parking the test, and clearing the
+    /// flag again must show up in the fd's own reported flags.
+    #[test]
+    fn set_fd_nonblocking_toggles_would_block_without_leaking_into_other_flags() {
+        let mut fds = [0 as std::os::raw::c_int; 2];
+        // Safety: `fds` is a valid two-element out-array for `pipe(2)`.
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "create a scratch pipe"
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        set_fd_nonblocking(read_fd, true).expect("set the read end non-blocking");
+        let mut byte = [0u8; 1];
+        // Safety: `byte` is a valid one-byte buffer for the duration of this call.
+        let read = unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        assert_eq!(
+            read, -1,
+            "expected a non-blocking read of an empty pipe to fail rather than return data"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "expected WouldBlock rather than parking this test on an empty pipe"
+        );
+
+        set_fd_nonblocking(read_fd, false).expect("clear non-blocking on the read end");
+        // Safety: `read_fd` is still open; `F_GETFL` takes no further argument.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "expected O_NONBLOCK cleared after set_fd_nonblocking(fd, false)"
+        );
+
+        // Safety: both ends are this test's own, opened above and not yet closed.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
     /// Renders one crossterm `Command` to its ANSI bytes, the same way `execute!` would, so
     /// an expectation here comes from crossterm's own encoding rather than a hand-copied
     /// escape sequence that could silently drift from what a future crossterm version emits.
