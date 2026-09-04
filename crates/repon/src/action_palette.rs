@@ -3557,6 +3557,11 @@ mod tests {
              whole command and the row must keep the true no-matches wording: {:?}",
             row_text(&buf, 2, 40)
         );
+        assert!(
+            shell_words::split("echo \"unterminated").is_err(),
+            "the fixture must independently fail to word-split, not merely match what \
+             ad_hoc_steps happens to encode"
+        );
     }
 
     #[test]
@@ -3592,6 +3597,79 @@ mod tests {
             all_rows(&no_match_state),
             all_rows(&nothing_configured_state)
         );
+    }
+
+    // --- the drawn message must predict what choose() (Enter) actually does, not just look
+    // right in isolation: each case below draws the row, then calls choose() on that same
+    // palette state and checks the real outcome against what the row promised. ---
+
+    #[test]
+    fn a_query_showing_the_runs_as_command_message_actually_opens_the_confirm_gate_on_it_when_chosen()
+     {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            matches!(decision, Some(Decision::NeedsConfirm)),
+            "the row promising Enter runs this as a command must be backed by choose() \
+             actually opening the confirm gate on it, got {decision:?}"
+        );
+        let spec = palette
+            .confirm_run()
+            .expect("the confirm gate must carry the ad hoc ActionSpec the row promised");
+        assert_eq!(spec.steps[0].argv, vec!["zzq".to_string()]);
+    }
+
+    #[test]
+    fn a_query_showing_no_matches_because_it_is_blank_or_whitespace_only_actually_does_nothing_when_chosen()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            decision.is_none(),
+            "the row promising no matches must be backed by choose() actually doing \
+             nothing, got {decision:?}"
+        );
+        assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    #[test]
+    fn a_query_showing_no_matches_because_shell_off_fails_to_word_split_actually_does_nothing_when_chosen()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.toggle_shell();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            decision.is_none(),
+            "the row promising no matches must be backed by choose() actually refusing the \
+             unparsable command, got {decision:?}"
+        );
+        assert!(matches!(palette.stage(), Stage::Choosing));
     }
 
     #[test]
