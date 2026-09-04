@@ -199,6 +199,7 @@ glyph_set! {
         Behind: behind,
         Changed: changed,
         ChildRow: child_row,
+        OrphanChildRow: orphan_child_row,
         Checked: checked,
         Truncated: truncated,
     },
@@ -228,6 +229,9 @@ pub const FULL: GlyphSet = GlyphSet {
     behind: '↓',
     changed: '●',
     child_row: '└',
+    // A dashed vertical reads as the same corner with its upward run broken, for a child
+    // whose row above is not its parent (`components::list`'s `is_child_row`).
+    orphan_child_row: '┆',
     // 2 of 5 surveyed faces (SF Mono, Menlo), the same coverage tier as the panel border's
     // own corners just below, not the pathological one-of-five or zero-of-five tier that
     // singled the braille spinner out as ADR 0020's one open defect. Not one glance from any
@@ -283,6 +287,11 @@ pub const ASCII: GlyphSet = GlyphSet {
     behind: '<',
     changed: '*',
     child_row: '`',
+    // A colon reads as the connector's own vertical run reduced to two disconnected dots,
+    // the same "broken line" idea as `full`'s dashed vertical, and unlike `` ` `` it is one
+    // of `check-ref-format`'s seven forbidden branch characters, so it cannot collide with a
+    // real name.
+    orphan_child_row: ':',
     // Repeats the border's own corner character below, permitted on the same terms this
     // table's `-` already repeats the border's horizontal rule: the frame is exempt from
     // the row interior's disjointness rule, and a border is read as a region around the
@@ -716,10 +725,10 @@ mod tests {
     /// a meaning the spec names and the code does not implement fails here, as does a value
     /// meaning the code implements and the spec's table does not name, and a meaning both
     /// sides name but render with a different character also fails here. `ChildRow`,
-    /// `Checked` and `Truncated` are excluded on the code side: each marks a row's shape or
-    /// state (a nested Worktree or Submodule line, a row the Selection holds, a name cut to
-    /// fit its column), specified in its own paragraph, not an in-cell value this table
-    /// covers.
+    /// `OrphanChildRow`, `Checked` and `Truncated` are excluded on the code side: each marks
+    /// a row's shape or state (a nested Worktree or Submodule line, whether that line's own
+    /// parent is the row above it, a row the Selection holds, a name cut to fit its column),
+    /// specified in its own paragraph, not an in-cell value this table covers.
     ///
     /// If the spec gains a seventh glyph, this test fails two different ways depending on
     /// what the code does: an unrecognised meaning phrase panics inside
@@ -766,6 +775,7 @@ mod tests {
                         | Meaning::Failed
                         | Meaning::Loading
                         | Meaning::ChildRow
+                        | Meaning::OrphanChildRow
                         | Meaning::Checked
                         | Meaning::Truncated
                 )
