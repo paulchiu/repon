@@ -212,7 +212,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::HalfPageUp => "Half page up",
         Action::ToggleSelection => "Toggle this row's Selection",
         Action::AnchorRange => "Anchor a range at the cursor, extended with `j` and `k`",
-        Action::SelectAllVisible => "Select every listed row, not just this screenful",
+        Action::SelectAllVisible => "Select every listed row, including rows off screen",
         Action::ClearSelection => "Clear the Selection",
         Action::ClearFilter => "Clear whatever is narrowing the list",
         Action::OpenDetail => "Open the detail pane",
@@ -2339,7 +2339,7 @@ mod tests {
     #[test]
     fn select_all_visible_s_description_does_not_read_as_this_screenful() {
         let text = description(Action::SelectAllVisible);
-        assert_eq!(text, "Select every listed row, not just this screenful");
+        assert_eq!(text, "Select every listed row, including rows off screen");
         assert!(
             !text.contains("visible"),
             "description {text:?} still uses \"visible\", the word a screenful can misread"
