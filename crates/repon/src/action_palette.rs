@@ -72,6 +72,12 @@ pub(crate) const NO_MATCHES_MESSAGE: &str = "no matches";
 /// never configured an Action has no reason to know where one is declared.
 pub(crate) const NO_ACTIONS_CONFIGURED_MESSAGE: &str = "no actions; see [[action]]";
 
+/// [`Stage::Choosing`]'s second row in [`NO_MATCHES_MESSAGE`]'s place when the query matches
+/// no configured entry but [`ad_hoc_steps`] still turns it into at least one step: `Enter`
+/// (`ActionPalette::choose`) is about to run it, so "no matches" would misreport what is
+/// about to happen.
+pub(crate) const RUNS_AS_COMMAND_MESSAGE: &str = "enter runs this as a command";
+
 /// The query row's own text while `self.query` is empty, replaced by the prompt character
 /// and typed text on the first keystroke; opens in the prompt character, a verb, then what
 /// it acts on that [`crate::launcher_palette::QUERY_PLACEHOLDER`] and
@@ -1028,11 +1034,20 @@ impl ActionPalette {
                 let rows_below_query =
                     interior.height.saturating_sub(list_top).saturating_sub(1) as usize;
                 if matches.is_empty() {
+                    // The same call `choose()` makes on `Enter`: if it would build at least
+                    // one step, "no matches" is misleading, since Enter is about to run the
+                    // query as a command rather than doing nothing.
+                    let runs_as_command = ad_hoc_steps(self.query.as_str(), self.shell)
+                        .is_some_and(|steps| !steps.is_empty());
                     draw_row(
                         frame,
                         interior,
                         list_top,
-                        NO_MATCHES_MESSAGE,
+                        if runs_as_command {
+                            RUNS_AS_COMMAND_MESSAGE
+                        } else {
+                            NO_MATCHES_MESSAGE
+                        },
                         theme.style_for(Role::Dim),
                     );
                 } else {
@@ -2020,7 +2035,7 @@ mod tests {
 
         let one_line = draw_to_buffer(&palette, &actions, &theme, Count::selection(3));
         assert!(
-            row_text(&one_line, 2, 40).contains(NO_MATCHES_MESSAGE),
+            row_text(&one_line, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE),
             "a one-line query leaves the interior's second row to the list: {:?}",
             row_text(&one_line, 2, 40)
         );
@@ -2037,7 +2052,7 @@ mod tests {
             row_text(&two_lines, 2, 40)
         );
         assert!(
-            row_text(&two_lines, 3, 40).contains(NO_MATCHES_MESSAGE),
+            row_text(&two_lines, 3, 40).contains(RUNS_AS_COMMAND_MESSAGE),
             "the list must start one row lower, not be painted over: {:?}",
             row_text(&two_lines, 3, 40)
         );
@@ -2054,7 +2069,7 @@ mod tests {
         let buf = draw_sized(&palette, &actions, &Theme::default(), 40, 20);
 
         assert!(
-            row_text(&buf, 1 + QUERY_MAX_ROWS as u16, 40).contains(NO_MATCHES_MESSAGE),
+            row_text(&buf, 1 + QUERY_MAX_ROWS as u16, 40).contains(RUNS_AS_COMMAND_MESSAGE),
             "the list must begin exactly {QUERY_MAX_ROWS} rows below the query's own first \
              row: {:?}",
             row_text(&buf, 1 + QUERY_MAX_ROWS as u16, 40)
@@ -3387,9 +3402,10 @@ mod tests {
     fn a_query_matching_no_action_says_so_without_leaving_stale_rows() {
         let actions = vec![action("reinstall", true), action("deploy", true)];
         let mut palette = ActionPalette::new();
-        for c in "zzq".chars() {
-            palette.type_char(c, &actions);
-        }
+        // Whitespace-only: a genuine no-op query, since shell mode on by default would turn
+        // a fixture like "zzq" into a runnable ad hoc command instead.
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
 
         let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
 
@@ -3429,9 +3445,8 @@ mod tests {
         let theme = Theme::default();
         let some_actions = vec![action("reinstall", true)];
         let mut no_match = ActionPalette::new();
-        for c in "zzq".chars() {
-            no_match.type_char(c, &some_actions);
-        }
+        no_match.type_char(' ', &some_actions);
+        no_match.type_char(' ', &some_actions);
         let nothing_configured = ActionPalette::new();
 
         let no_match_buf = draw_to_buffer(&no_match, &some_actions, &theme, Count::selection(3));
@@ -3456,9 +3471,8 @@ mod tests {
         let matching_state =
             draw_to_buffer(&ActionPalette::new(), &actions, &theme, Count::selection(3));
         let mut no_match = ActionPalette::new();
-        for c in "zzq".chars() {
-            no_match.type_char(c, &actions);
-        }
+        no_match.type_char(' ', &actions);
+        no_match.type_char(' ', &actions);
         let no_match_state = draw_to_buffer(&no_match, &actions, &theme, Count::selection(3));
         let nothing_configured_state =
             draw_to_buffer(&ActionPalette::new(), &[], &theme, Count::selection(0));
@@ -3479,6 +3493,211 @@ mod tests {
         assert_ne!(
             all_rows(&no_match_state),
             all_rows(&nothing_configured_state)
+        );
+    }
+
+    // --- the runs-as-command message: an empty match list that Enter would still act on ---
+
+    #[test]
+    fn a_query_matching_no_configured_entry_that_still_runs_through_shell_shows_the_runs_as_command_message_not_no_matches()
+     {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+
+        assert!(
+            row_text(&buf, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE),
+            "shell mode is on by default, so \"zzq\" is a runnable ad hoc command and Enter \
+             is about to run it: expected the runs-as-command message, got: {:?}",
+            row_text(&buf, 2, 40)
+        );
+        assert!(
+            !row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "the stale no-matches wording must not also appear: {:?}",
+            row_text(&buf, 2, 40)
+        );
+    }
+
+    #[test]
+    fn a_blank_or_whitespace_only_query_still_shows_no_matches_since_enter_does_nothing() {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "whitespace-only text contributes no ad hoc step, so Enter does nothing and the \
+             row must keep the true no-matches wording: {:?}",
+            row_text(&buf, 2, 40)
+        );
+    }
+
+    #[test]
+    fn with_shell_off_a_query_that_fails_to_word_split_still_shows_no_matches_since_enter_refuses_it()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.toggle_shell();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+
+        assert!(
+            row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE),
+            "an unterminated quote fails to word-split with shell off, so Enter refuses the \
+             whole command and the row must keep the true no-matches wording: {:?}",
+            row_text(&buf, 2, 40)
+        );
+        assert!(
+            shell_words::split("echo \"unterminated").is_err(),
+            "the fixture must independently fail to word-split, not merely match what \
+             ad_hoc_steps happens to encode"
+        );
+    }
+
+    #[test]
+    fn the_runs_as_command_message_and_the_no_matches_message_and_nothing_configured_are_pairwise_distinct()
+     {
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+
+        let mut runs_as_command = ActionPalette::new();
+        for c in "zzq".chars() {
+            runs_as_command.type_char(c, &actions);
+        }
+        let runs_as_command_state =
+            draw_to_buffer(&runs_as_command, &actions, &theme, Count::selection(3));
+
+        let mut no_match = ActionPalette::new();
+        no_match.type_char(' ', &actions);
+        no_match.type_char(' ', &actions);
+        let no_match_state = draw_to_buffer(&no_match, &actions, &theme, Count::selection(3));
+
+        let nothing_configured_state =
+            draw_to_buffer(&ActionPalette::new(), &[], &theme, Count::selection(0));
+
+        assert!(all_rows(&runs_as_command_state).contains(RUNS_AS_COMMAND_MESSAGE));
+        assert!(all_rows(&no_match_state).contains(NO_MATCHES_MESSAGE));
+        assert!(all_rows(&nothing_configured_state).contains(NO_ACTIONS_CONFIGURED_MESSAGE));
+        assert_ne!(all_rows(&runs_as_command_state), all_rows(&no_match_state));
+        assert_ne!(
+            all_rows(&runs_as_command_state),
+            all_rows(&nothing_configured_state)
+        );
+        assert_ne!(
+            all_rows(&no_match_state),
+            all_rows(&nothing_configured_state)
+        );
+    }
+
+    // --- the drawn message must predict what choose() (Enter) actually does, not just look
+    // right in isolation: each case below draws the row, then calls choose() on that same
+    // palette state and checks the real outcome against what the row promised. ---
+
+    #[test]
+    fn a_query_showing_the_runs_as_command_message_actually_opens_the_confirm_gate_on_it_when_chosen()
+     {
+        let actions = vec![action("reinstall", true), action("deploy", true)];
+        let mut palette = ActionPalette::new();
+        for c in "zzq".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            matches!(decision, Some(Decision::NeedsConfirm)),
+            "the row promising Enter runs this as a command must be backed by choose() \
+             actually opening the confirm gate on it, got {decision:?}"
+        );
+        let spec = palette
+            .confirm_run()
+            .expect("the confirm gate must carry the ad hoc ActionSpec the row promised");
+        assert_eq!(spec.steps[0].argv, vec!["zzq".to_string()]);
+    }
+
+    #[test]
+    fn a_query_showing_no_matches_because_it_is_blank_or_whitespace_only_actually_does_nothing_when_chosen()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.type_char(' ', &actions);
+        palette.type_char(' ', &actions);
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            decision.is_none(),
+            "the row promising no matches must be backed by choose() actually doing \
+             nothing, got {decision:?}"
+        );
+        assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    #[test]
+    fn a_query_showing_no_matches_because_shell_off_fails_to_word_split_actually_does_nothing_when_chosen()
+     {
+        let actions = vec![action("reinstall", true)];
+        let mut palette = ActionPalette::new();
+        palette.toggle_shell();
+        for c in "echo \"unterminated".chars() {
+            palette.type_char(c, &actions);
+        }
+
+        let buf = draw_to_buffer(&palette, &actions, &Theme::default(), Count::selection(3));
+        assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
+
+        let decision = palette.choose(&actions, 5);
+
+        assert!(
+            decision.is_none(),
+            "the row promising no matches must be backed by choose() actually refusing the \
+             unparsable command, got {decision:?}"
+        );
+        assert!(matches!(palette.stage(), Stage::Choosing));
+    }
+
+    #[test]
+    fn a_query_that_still_matches_a_configured_action_or_built_in_never_shows_the_runs_as_command_message()
+     {
+        let theme = Theme::default();
+        let actions = vec![action("reinstall", true)];
+
+        let mut matches_action = ActionPalette::new();
+        matches_action.type_char('r', &actions);
+        let matches_action_buf =
+            draw_to_buffer(&matches_action, &actions, &theme, Count::selection(3));
+        assert!(
+            !all_rows(&matches_action_buf).contains(RUNS_AS_COMMAND_MESSAGE),
+            "a query still matching the configured Action must never show the \
+             runs-as-command message: {:?}",
+            all_rows(&matches_action_buf)
+        );
+
+        let mut matches_builtin = ActionPalette::new();
+        matches_builtin.type_char('d', &actions); // matches the built-in "delete"
+        let matches_builtin_buf =
+            draw_to_buffer(&matches_builtin, &actions, &theme, Count::selection(3));
+        assert!(
+            !all_rows(&matches_builtin_buf).contains(RUNS_AS_COMMAND_MESSAGE),
+            "a query still matching a built-in must never show the runs-as-command message: \
+             {:?}",
+            all_rows(&matches_builtin_buf)
         );
     }
 
@@ -3524,9 +3743,11 @@ mod tests {
 
         let actions = vec![action("reinstall", true)];
         let mut action_palette = ActionPalette::new();
-        for c in "zz".chars() {
-            action_palette.type_char(c, &actions);
-        }
+        // Two spaces rather than the Launcher side's "zz": shell mode on by default would
+        // turn a bare word into a runnable ad hoc command, painting the runs-as-command
+        // message instead of the true no-op wording this test compares.
+        action_palette.type_char(' ', &actions);
+        action_palette.type_char(' ', &actions);
 
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(40, 10);
