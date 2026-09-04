@@ -106,6 +106,12 @@ pub struct RepoOverride {
 pub struct Step {
     pub argv: Vec<String>,
     pub shell: bool,
+    /// Runs `argv` through `$SHELL -ic` rather than `$SHELL -c`, sourcing the user's own rc
+    /// file first ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// `interactive` key). Meaningless, and always `false`, unless `shell` is also set; the
+    /// consumer rejects `interactive` without `shell` at config load rather than this crate
+    /// silently ignoring it.
+    pub interactive: bool,
     pub env: Vec<(String, String)>,
 }
 
@@ -1558,6 +1564,7 @@ impl Core {
                     elapsed: *elapsed,
                     elision: None,
                     shell: false,
+                    interactive: false,
                 }]),
                 skip: None,
                 finished_at,
@@ -2639,6 +2646,7 @@ fn run_action_for_entity(
                 elapsed: Duration::ZERO,
                 elision: None,
                 shell: step.shell,
+                interactive: step.interactive,
             });
             continue;
         }
@@ -2652,6 +2660,7 @@ fn run_action_for_entity(
                 label: Arc::clone(&label),
                 started_at: Timestamp::now(),
                 shell: step.shell,
+                interactive: step.interactive,
             }),
         });
         // The step's own `env` table is applied after the environment contract's
@@ -2664,8 +2673,14 @@ fn run_action_for_entity(
                 .iter()
                 .map(|(name, value)| (name.clone(), Some(value.clone()))),
         );
-        let mut result =
-            executor::run_step(&step.argv, step.shell, entity.key.path(), &env, control);
+        let mut result = executor::run_step(
+            &step.argv,
+            step.shell,
+            step.interactive,
+            entity.key.path(),
+            &env,
+            control,
+        );
         if control.is_cancelled() {
             result.outcome = StepOutcome::Cancelled;
             cancelled = true;
@@ -4867,6 +4882,7 @@ mod tests {
         Step {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             shell: false,
+            interactive: false,
             env: Vec::new(),
         }
     }
@@ -4876,6 +4892,18 @@ mod tests {
         Step {
             argv: vec![command.to_string()],
             shell: true,
+            interactive: false,
+            env: Vec::new(),
+        }
+    }
+
+    /// `shell = true` plus `interactive = true`: the same convention, run through
+    /// `$SHELL -ic` instead of `$SHELL -c`.
+    fn interactive_shell_step(command: &str) -> Step {
+        Step {
+            argv: vec![command.to_string()],
+            shell: true,
+            interactive: true,
             env: Vec::new(),
         }
     }
@@ -5972,6 +6000,48 @@ mod tests {
         );
     }
 
+    /// `Step::interactive` must actually reach `run_step` end to end through `run_action`,
+    /// the same proof `a_shell_true_step_runs_through_shell_c_with_repon_as_its_own_dollar_zero`
+    /// already gives `shell`: this asserts `core.rs` sets `interactive` on the `Step` it
+    /// builds and that the receipt carries it back, not the shell's own rc-sourcing
+    /// behaviour, which `executor.rs`'s own `shell_argv` unit test already covers on the
+    /// constructed argv.
+    #[test]
+    fn an_interactive_shell_true_step_runs_through_run_action_with_interactive_on_its_receipt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let steps = vec![interactive_shell_step("true")];
+
+        let started = core.run_action(
+            action("interactive-step", steps),
+            std::slice::from_ref(&key),
+        );
+
+        assert!(started);
+        wait_for("the fan-out to finish and write a receipt", || {
+            !core.action_running()
+        });
+        let receipt = core.snapshot().entities[0]
+            .last_action
+            .clone()
+            .expect("receipt written");
+        assert_eq!(receipt.steps.len(), 1);
+        assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+        assert!(
+            receipt.steps[0].shell,
+            "an interactive step is still a shell step"
+        );
+        assert!(
+            receipt.steps[0].interactive,
+            "the receipt's own StepResult::interactive must carry the mode the step ran under"
+        );
+    }
+
     /// [`StepResult::shell`]'s own claim on the plain argv side, so the two modes are
     /// proven end to end through `run_action` rather than only `shell = true`: an ordinary
     /// step's receipt must read `false`, not merely default to it by construction.
@@ -5987,6 +6057,7 @@ mod tests {
         let steps = vec![Step {
             argv: vec!["true".to_string()],
             shell: false,
+            interactive: false,
             env: Vec::new(),
         }];
 
@@ -6901,6 +6972,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -6942,6 +7014,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -8360,6 +8433,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),

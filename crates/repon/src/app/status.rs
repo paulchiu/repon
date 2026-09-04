@@ -407,6 +407,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),

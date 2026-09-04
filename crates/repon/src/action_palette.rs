@@ -29,14 +29,17 @@
 //!
 //! The field also carries a live shell-mode toggle
 //! ([`ActionPalette::toggle_shell`], `Alt+S`): an ad hoc command defaults to running through
-//! `$SHELL -c`, and the toggle turns that off for the run about to happen. It resets to the
-//! default every time the palette opens ([`ActionPalette::scoped`]), since a sticky off-state
-//! the user has forgotten about reproduces the silent no-op the default exists to remove. The
-//! mode reaches three places: this field's own bottom border while nothing is highlighted,
-//! the same moment `Enter` would build an ad hoc command
-//! ([`ActionPalette::highlighted`], [`shell_mode_hint`]), the confirm gate's own text
+//! `$SHELL -c`, and the toggle cycles through three states, [`ShellMode`], rather than a
+//! plain on/off: `Shell` (the default), `Off`, and `Interactive` (`$SHELL -ic`, sourcing the
+//! user's own rc file, per [#414](https://github.com/paulchiu/repon/issues/414)). It resets
+//! to the default every time the palette opens ([`ActionPalette::scoped`]), since a sticky
+//! off-state or a sticky interactive one the user has forgotten about reproduces the silent
+//! no-op the default exists to remove. The mode reaches three places: this field's own
+//! bottom border while nothing is highlighted, the same moment `Enter` would build an ad hoc
+//! command ([`ActionPalette::highlighted`], [`shell_mode_hint`]), the confirm gate's own text
 //! ([`ActionPalette::draw`]'s `Chosen::AdHoc` arm), and the receipt itself
-//! ([`repon_core::Step::shell`], which [`repon_core::StepResult::shell`] then carries).
+//! ([`repon_core::Step::shell`] and [`repon_core::Step::interactive`], which
+//! [`repon_core::StepResult`]'s own two fields then carry).
 
 use ratatui::{
     Frame,
@@ -94,12 +97,53 @@ pub(crate) const QUERY_PLACEHOLDER: &str = "; select action or type a command";
 /// instead, the same split [`crate::filter_line::FilterLine::draw`] uses for the same reason.
 const PROMPT_WIDTH: u16 = 2;
 
+/// The ad hoc field's own live toggle state: `Alt+S` cycles through all three
+/// ([`ActionPalette::toggle_shell`]). `Shell` is the default a freshly opened palette
+/// carries; `Off` splits each line into argv with `shell-words` and runs it literally;
+/// `Interactive` is `Shell` plus [#414](https://github.com/paulchiu/repon/issues/414)'s
+/// `$SHELL -ic`, sourcing the user's own rc file before the command runs. The cycle order,
+/// `Shell -> Off -> Interactive -> Shell`, keeps a single press of the escape hatch
+/// (`Shell` to `Off`) exactly the gesture it always was; a second press reaches the more
+/// capable, more expensive mode rather than the plain default, since a reader who has
+/// already reached for the toggle once is the reader `-ic` exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ShellMode {
+    Off,
+    #[default]
+    Shell,
+    Interactive,
+}
+
+impl ShellMode {
+    /// `Alt+S`'s own step: `Shell -> Off -> Interactive -> Shell`.
+    fn next(self) -> Self {
+        match self {
+            ShellMode::Shell => ShellMode::Off,
+            ShellMode::Off => ShellMode::Interactive,
+            ShellMode::Interactive => ShellMode::Shell,
+        }
+    }
+
+    /// [`repon_core::Step::shell`]'s own claim: `true` for both `Shell` and `Interactive`,
+    /// since the latter is the former plus rc-sourcing, never a mode of its own that skips
+    /// the shell entirely.
+    fn shell(self) -> bool {
+        !matches!(self, ShellMode::Off)
+    }
+
+    /// [`repon_core::Step::interactive`]'s own claim.
+    fn interactive(self) -> bool {
+        matches!(self, ShellMode::Interactive)
+    }
+}
+
 /// The ad hoc field's own bottom-border readout of the live shell toggle, in three priority
 /// tiers rather than one string, so a narrow frame drops a clause instead of clipping
-/// mid-word. The core fact ("shell on" or "shell off") is [`Priority::Pinned`] and never
-/// drops once anything is shown at all; the mechanism clause explaining what that means for
-/// `$VAR` and `$(cmd)` drops first, since a shell-literate reader can guess it from the core
-/// fact alone; the toggle clause naming `Alt+S` drops second, on the same reasoning
+/// mid-word. The core fact (`shell on`, `shell off` or `shell on, interactive`) is
+/// [`Priority::Pinned`] and never drops once anything is shown at all; the mechanism clause
+/// explaining what that means for `$VAR`, `$(cmd)` or rc aliases drops first, since a
+/// shell-literate reader can guess it from the core fact alone; the toggle clause naming
+/// `Alt+S` drops second, on the same reasoning
 /// [the footer](../../../docs/spec/keybindings.md#the-footer) already applies to its own
 /// hints.
 const SHELL_ON_CORE: &str = "shell on";
@@ -107,18 +151,25 @@ const SHELL_ON_MECHANISM: &str = ": $VAR and $(cmd) expand";
 const SHELL_ON_TOGGLE: &str = "; alt+s turns it off";
 const SHELL_OFF_CORE: &str = "shell off";
 const SHELL_OFF_MECHANISM: &str = ": $VAR and $(cmd) are literal";
-const SHELL_OFF_TOGGLE: &str = "; alt+s turns it on";
+const SHELL_OFF_TOGGLE: &str = "; alt+s makes it interactive";
+const INTERACTIVE_ON_CORE: &str = "interactive";
+const INTERACTIVE_ON_MECHANISM: &str = ": aliases resolve too";
+const INTERACTIVE_ON_TOGGLE: &str = "; alt+s stops being interactive";
 
-/// The three tiers for `shell`'s current state, budgeted with [`degrade::budget`] against
+/// The three tiers for `mode`'s current state, budgeted with [`degrade::budget`] against
 /// `frame_width`, then wrapped in the leading/trailing space [`ActionPalette::border_title`]
 /// and [`crate::help::BORDER_TITLE`] already pad every title with. Empty once even the core
 /// fact cannot fit, which [`ActionPalette::draw`] reads as "draw no bottom title" rather than
 /// a half-drawn one.
-fn shell_mode_hint(shell: bool, frame_width: u16) -> String {
-    let (core, mechanism, toggle) = if shell {
-        (SHELL_ON_CORE, SHELL_ON_MECHANISM, SHELL_ON_TOGGLE)
-    } else {
-        (SHELL_OFF_CORE, SHELL_OFF_MECHANISM, SHELL_OFF_TOGGLE)
+fn shell_mode_hint(mode: ShellMode, frame_width: u16) -> String {
+    let (core, mechanism, toggle) = match mode {
+        ShellMode::Shell => (SHELL_ON_CORE, SHELL_ON_MECHANISM, SHELL_ON_TOGGLE),
+        ShellMode::Off => (SHELL_OFF_CORE, SHELL_OFF_MECHANISM, SHELL_OFF_TOGGLE),
+        ShellMode::Interactive => (
+            INTERACTIVE_ON_CORE,
+            INTERACTIVE_ON_MECHANISM,
+            INTERACTIVE_ON_TOGGLE,
+        ),
     };
     let items = [
         degrade::Item {
@@ -148,8 +199,12 @@ fn shell_mode_hint(shell: bool, frame_width: u16) -> String {
 /// The word the confirm gate's own text names the mode by, beside the run count
 /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate"): the same
 /// core fact [`shell_mode_hint`] pins, read on its own with no frame to budget against.
-fn shell_mode_word(shell: bool) -> &'static str {
-    if shell { SHELL_ON_CORE } else { SHELL_OFF_CORE }
+fn shell_mode_word(mode: ShellMode) -> &'static str {
+    match mode {
+        ShellMode::Shell => SHELL_ON_CORE,
+        ShellMode::Off => SHELL_OFF_CORE,
+        ShellMode::Interactive => INTERACTIVE_ON_CORE,
+    }
 }
 
 /// The most interior rows the typed query is ever given, however many lines it holds
@@ -338,6 +393,7 @@ fn to_steps(steps: &[StepConfig]) -> Vec<Step> {
         .map(|step| Step {
             argv: step.args.clone(),
             shell: step.shell,
+            interactive: step.interactive,
             env: step
                 .env
                 .iter()
@@ -370,37 +426,40 @@ pub(crate) fn to_action_spec(config: &ActionConfig) -> ActionSpec {
 /// read one from.
 const AD_HOC_CONCURRENCY: u32 = 4;
 
-/// `text` split into the steps an ad hoc run executes, or `None` if `shell` is off and any
-/// non-empty line fails to word-split (an unterminated quote): the whole command is refused
-/// rather than running a truncated version of what was typed. A blank line contributes no
-/// step at all either way.
+/// `text` split into the steps an ad hoc run executes, or `None` if `mode` is
+/// [`ShellMode::Off`] and any non-empty line fails to word-split (an unterminated quote):
+/// the whole command is refused rather than running a truncated version of what was typed.
+/// A blank line contributes no step at all either way.
 ///
-/// With `shell` off, each non-empty line is split into argv with `shell-words`
+/// [`ShellMode::Off`] splits each non-empty line into argv with `shell-words`
 /// ([actions.md](../../../docs/spec/actions.md): "Each non-empty line of the ad hoc field is
 /// one step, split into argv with shell-words"), the same argv a Launcher or a config step
 /// with `shell = false` runs literally.
 ///
-/// With `shell` on (the default), each non-empty line becomes one step whose `argv` holds
-/// that line whole, unsplit and with its quoting intact: [`repon_core::Step`]'s own "shell =
-/// true" convention, one argv element carrying the entire command string for
-/// `executor::run_step` to hand to `$SHELL -c`. Splitting the line here first and rejoining
-/// it in `executor::shell_argv` would lose the very quoting a real shell is about to
-/// re-parse, so this mode never calls `shell-words` at all: there is nothing to fail to
-/// split, which is why only the `shell`-off arm can return `None`.
-fn ad_hoc_steps(text: &str, shell: bool) -> Option<Vec<Step>> {
+/// [`ShellMode::Shell`] and [`ShellMode::Interactive`] (the default is `Shell`) both turn
+/// each non-empty line into one step whose `argv` holds that line whole, unsplit and with
+/// its quoting intact: [`repon_core::Step`]'s own "shell = true" convention, one argv
+/// element carrying the entire command string for `executor::run_step` to hand to
+/// `$SHELL -c` or, once `interactive` is also set, `$SHELL -ic`. Splitting the line here
+/// first and rejoining it in `executor::shell_argv` would lose the very quoting a real
+/// shell is about to re-parse, so neither mode calls `shell-words` at all: there is nothing
+/// to fail to split, which is why only `Off` can return `None`.
+fn ad_hoc_steps(text: &str, mode: ShellMode) -> Option<Vec<Step>> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| -> Result<Step, shell_words::ParseError> {
-            if shell {
+            if mode.shell() {
                 Ok(Step {
                     argv: vec![line.to_string()],
                     shell: true,
+                    interactive: mode.interactive(),
                     env: Vec::new(),
                 })
             } else {
                 Ok(Step {
                     argv: shell_words::split(line)?,
                     shell: false,
+                    interactive: false,
                     env: Vec::new(),
                 })
             }
@@ -443,12 +502,12 @@ pub(crate) enum Stage {
 pub(crate) enum Chosen {
     Configured(ActionConfig),
     /// A typed ad hoc command about to run: the `ActionSpec` already built from it, and
-    /// whether it was built with shell mode on, which [`ActionPalette::draw`]'s own confirm
+    /// which [`ShellMode`] it was built under, which [`ActionPalette::draw`]'s own confirm
     /// text names beside the command and the run count
     /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
     AdHoc {
         spec: ActionSpec,
-        shell: bool,
+        mode: ShellMode,
     },
     /// A built-in management operation. The rows it will act on, and what accepting
     /// destroys, are `App`'s own [`crate::management::Plan`]: this palette carries which
@@ -478,8 +537,9 @@ pub(crate) enum Decision {
 /// `Document::actions` and, once nothing is highlighted, as the ad hoc command itself
 /// ([`ad_hoc_steps`]); which of the (possibly narrowed) matches is highlighted; which
 /// [`Stage`] it is in; a refusal message from the last time Enter found zero operable rows;
-/// and the ad hoc field's own live shell toggle, reset to the default (`true`) every time the
-/// palette opens ([`Self::scoped`]) rather than carried over from the last run.
+/// and the ad hoc field's own live [`ShellMode`] toggle, reset to the default (`Shell`)
+/// every time the palette opens ([`Self::scoped`]) rather than carried over from the last
+/// run.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionPalette {
     query: EditBuffer,
@@ -487,7 +547,7 @@ pub(crate) struct ActionPalette {
     stage: Stage,
     refusal: Option<String>,
     scope: Scope,
-    shell: bool,
+    mode: ShellMode,
 }
 
 /// What the palette needs to know about the run it is drawing over, bundled into one
@@ -563,7 +623,7 @@ impl ActionPalette {
             stage: Stage::Choosing,
             refusal: None,
             scope,
-            shell: true,
+            mode: ShellMode::default(),
         }
     }
 
@@ -571,20 +631,20 @@ impl ActionPalette {
         &self.stage
     }
 
-    /// `Alt+S` while [`Stage::Choosing`]: flips the ad hoc field's own shell toggle for the
-    /// run about to happen. A no-op once the confirm gate is up, since `App` only dispatches
-    /// this action to that stage in the first place (its own `Context::Input` vs
+    /// `Alt+S` while [`Stage::Choosing`]: steps the ad hoc field's own [`ShellMode`] toggle
+    /// for the run about to happen. A no-op once the confirm gate is up, since `App` only
+    /// dispatches this action to that stage in the first place (its own `Context::Input` vs
     /// `Context::Confirm` split).
     pub(crate) fn toggle_shell(&mut self) {
-        self.shell = !self.shell;
+        self.mode = self.mode.next();
     }
 
-    /// The ad hoc field's own live shell toggle, read by [`Self::draw`] for the field's
-    /// chrome and by tests that need to observe it directly rather than only through
-    /// [`Self::choose`]'s built `ActionSpec`.
+    /// The ad hoc field's own live [`ShellMode`] toggle, read by [`Self::draw`] for the
+    /// field's chrome and by tests that need to observe it directly rather than only
+    /// through [`Self::choose`]'s built `ActionSpec`.
     #[cfg(test)]
-    pub(crate) fn shell(&self) -> bool {
-        self.shell
+    pub(crate) fn mode(&self) -> ShellMode {
+        self.mode
     }
 
     /// Not read outside tests until something other than [`Self::draw`] itself needs the
@@ -708,7 +768,7 @@ impl ActionPalette {
     /// A highlighted named entry always wins: it is chosen exactly as before, gated behind
     /// `Stage::Confirming` unless its own `confirm` is `false`. Only once nothing is
     /// highlighted does the typed text become an ad hoc command in its own right
-    /// ([`ad_hoc_steps`], read with [`Self::shell`]'s current toggle), which is what keeps a
+    /// ([`ad_hoc_steps`], read with [`Self::mode`]'s current toggle), which is what keeps a
     /// query that happens to match a configured Action's name from ever running as a
     /// different, typed-out command instead. An ad hoc command now always enters
     /// `Stage::Confirming` too: the string is about to reach every operable Repo under
@@ -754,7 +814,7 @@ impl ActionPalette {
                 }
             }
             None => {
-                let steps = ad_hoc_steps(self.query.as_str(), self.shell)?;
+                let steps = ad_hoc_steps(self.query.as_str(), self.mode)?;
                 if steps.is_empty() {
                     return None;
                 }
@@ -769,7 +829,7 @@ impl ActionPalette {
                 let spec = to_ad_hoc_action_spec(self.query.as_str(), steps);
                 self.stage = Stage::Confirming(Chosen::AdHoc {
                     spec,
-                    shell: self.shell,
+                    mode: self.mode,
                 });
                 Some(Decision::NeedsConfirm)
             }
@@ -940,11 +1000,11 @@ impl ActionPalette {
             .title(Self::border_title(&count));
         // Only while the typed query matches no built-in or configured entry, the same
         // moment `Enter` would build an ad hoc command: a highlighted named entry runs as
-        // itself regardless of `self.shell`, and the confirm gate's own text already names
+        // itself regardless of `self.mode`, and the confirm gate's own text already names
         // the mode beside the run count once one is chosen, so this hint has nothing to add
         // in either case.
         if matches!(self.stage, Stage::Choosing) && self.highlighted(actions).is_none() {
-            let hint = shell_mode_hint(self.shell, area.width);
+            let hint = shell_mode_hint(self.mode, area.width);
             if !hint.is_empty() {
                 block = block.title_bottom(Line::from(hint));
             }
@@ -962,10 +1022,10 @@ impl ActionPalette {
                     // The one place besides the receipt an ad hoc command's own shell mode is
                     // named beside the string about to reach `run_count` repos, the last
                     // screen before it does.
-                    Chosen::AdHoc { spec, shell } => vec![format!(
+                    Chosen::AdHoc { spec, mode } => vec![format!(
                         "run \"{}\" ({}) on {run_count} repos?",
                         one_line(&spec.label),
-                        shell_mode_word(*shell)
+                        shell_mode_word(*mode)
                     )],
                     // The built-in's own gate is `App`'s [`crate::management::Plan`], which
                     // already carries the headline, the per-Repo lines and the no-undo
@@ -1037,7 +1097,7 @@ impl ActionPalette {
                     // The same call `choose()` makes on `Enter`: if it would build at least
                     // one step, "no matches" is misleading, since Enter is about to run the
                     // query as a command rather than doing nothing.
-                    let runs_as_command = ad_hoc_steps(self.query.as_str(), self.shell)
+                    let runs_as_command = ad_hoc_steps(self.query.as_str(), self.mode)
                         .is_some_and(|steps| !steps.is_empty());
                     draw_row(
                         frame,
@@ -1146,6 +1206,7 @@ mod tests {
             steps: vec![StepConfig {
                 args: vec!["true".to_string()],
                 shell: false,
+                interactive: false,
                 env: Default::default(),
             }],
             confirm,
@@ -1365,12 +1426,17 @@ mod tests {
         assert_eq!(
             format!("{SHELL_ON_CORE}{SHELL_ON_MECHANISM}{SHELL_ON_TOGGLE}"),
             quoted("it draws: `"),
-            "the on-mode constants must join into keybindings.md's own quoted sentence"
+            "the Shell-mode constants must join into keybindings.md's own quoted sentence"
         );
         assert_eq!(
             format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}"),
             quoted("once toggled, `"),
-            "the off-mode constants must join into keybindings.md's own quoted sentence"
+            "the Off-mode constants must join into keybindings.md's own quoted sentence"
+        );
+        assert_eq!(
+            format!("{INTERACTIVE_ON_CORE}{INTERACTIVE_ON_MECHANISM}{INTERACTIVE_ON_TOGGLE}"),
+            quoted("toggled again, `"),
+            "the Interactive-mode constants must join into keybindings.md's own quoted sentence"
         );
     }
 
@@ -1392,32 +1458,52 @@ mod tests {
         );
     }
 
-    /// `Alt+S` flips the toggle, which the field's own chrome reflects immediately, and the
-    /// off sentence reads correctly too.
+    /// `Alt+S` steps the toggle through its full three-state cycle, `Shell -> Off ->
+    /// Interactive -> Shell`, and the field's own chrome reflects each state immediately.
     #[test]
-    fn toggling_shell_off_flips_the_field_chromes_hint() {
+    fn toggling_shell_cycles_through_all_three_modes_and_flips_the_field_chromes_hint() {
         let mut palette = ActionPalette::new();
-        assert!(
-            palette.shell(),
-            "a freshly opened palette defaults to shell on"
+        assert_eq!(
+            palette.mode(),
+            ShellMode::Shell,
+            "a freshly opened palette defaults to Shell"
         );
 
         palette.toggle_shell();
 
-        assert!(!palette.shell());
+        assert_eq!(palette.mode(), ShellMode::Off);
         for c in "zz".chars() {
             palette.type_char(c, &[]);
         }
-        let expected = format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}");
+        let expected_off = format!("{SHELL_OFF_CORE}{SHELL_OFF_MECHANISM}{SHELL_OFF_TOGGLE}");
         let buf = draw_sized(&palette, &[], &Theme::default(), 70, 6);
         let bottom = row_text(&buf, 5, 70);
         assert!(
-            bottom.contains(&expected),
+            bottom.contains(&expected_off),
             "expected the whole shell-off sentence once toggled: {bottom:?}"
         );
 
         palette.toggle_shell();
-        assert!(palette.shell(), "a second toggle returns to shell on");
+        assert_eq!(
+            palette.mode(),
+            ShellMode::Interactive,
+            "a second toggle reaches Interactive, not back to the plain default"
+        );
+        let expected_interactive =
+            format!("{INTERACTIVE_ON_CORE}{INTERACTIVE_ON_MECHANISM}{INTERACTIVE_ON_TOGGLE}");
+        let buf = draw_sized(&palette, &[], &Theme::default(), 70, 6);
+        let bottom = row_text(&buf, 5, 70);
+        assert!(
+            bottom.contains(&expected_interactive),
+            "expected the whole interactive sentence once toggled twice: {bottom:?}"
+        );
+
+        palette.toggle_shell();
+        assert_eq!(
+            palette.mode(),
+            ShellMode::Shell,
+            "a third toggle completes the cycle back to Shell"
+        );
     }
 
     /// The mechanism clause is the first of the three tiers to give way: a frame too narrow
@@ -1470,7 +1556,7 @@ mod tests {
     #[test]
     fn the_shell_mode_hint_disappears_whole_rather_than_clipping_when_nothing_fits() {
         assert_eq!(
-            shell_mode_hint(true, 6),
+            shell_mode_hint(ShellMode::Shell, 6),
             "",
             "6 columns must be too narrow for any tier"
         );
@@ -1740,13 +1826,14 @@ mod tests {
     fn the_shell_toggle_resets_to_on_every_time_a_new_palette_is_opened() {
         let mut first = ActionPalette::new();
         first.toggle_shell();
-        assert!(!first.shell());
+        assert_eq!(first.mode(), ShellMode::Off);
 
         let second = ActionPalette::new();
 
-        assert!(
-            second.shell(),
-            "a freshly opened palette must default to shell on regardless of a previous one's \
+        assert_eq!(
+            second.mode(),
+            ShellMode::Shell,
+            "a freshly opened palette must default to Shell regardless of a previous one's \
              toggle"
         );
     }
@@ -1772,7 +1859,7 @@ mod tests {
     fn ad_hoc_steps_with_shell_off_skips_blank_lines_and_respects_quoting_in_the_remaining_ones() {
         let text = "false\n\necho \"a b\"";
 
-        let steps = ad_hoc_steps(text, false).expect("well-formed quoting must parse");
+        let steps = ad_hoc_steps(text, ShellMode::Off).expect("well-formed quoting must parse");
 
         assert_eq!(
             steps.len(),
@@ -1797,7 +1884,7 @@ mod tests {
     fn ad_hoc_steps_with_shell_on_keeps_each_line_whole_and_unsplit() {
         let text = "false\n\necho \"a b\"";
 
-        let steps = ad_hoc_steps(text, true).expect("shell mode never fails to parse");
+        let steps = ad_hoc_steps(text, ShellMode::Shell).expect("shell mode never fails to parse");
 
         assert_eq!(
             steps.len(),
@@ -1812,6 +1899,19 @@ mod tests {
             "shell mode must hand the whole line to the shell unsplit, quoting intact"
         );
         assert!(steps[1].shell);
+    }
+
+    /// `ShellMode::Interactive` is `Shell` again (each line whole and unsplit) plus
+    /// `Step::interactive`, which is what makes `executor::run_step` hand the string to
+    /// `$SHELL -ic` rather than `$SHELL -c`.
+    #[test]
+    fn ad_hoc_steps_with_interactive_mode_sets_interactive_on_every_step() {
+        let steps = ad_hoc_steps("true", ShellMode::Interactive)
+            .expect("interactive mode never fails to parse");
+
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].shell, "interactive is still a shell step");
+        assert!(steps[0].interactive);
     }
 
     /// Malformed quoting only matters to `shell-words`, which only the `shell`-off path
@@ -2343,12 +2443,17 @@ mod tests {
         config.steps = vec![StepConfig {
             args: vec!["deploy.sh --prod".to_string()],
             shell: true,
+            interactive: true,
             env: std::collections::BTreeMap::from([("STAGE".to_string(), "prod".to_string())]),
         }];
 
         let spec = to_action_spec(&config);
 
         assert!(spec.steps[0].shell);
+        assert!(
+            spec.steps[0].interactive,
+            "interactive must cross to repon_core::Step unresolved, the same way shell does"
+        );
         assert_eq!(
             spec.steps[0].env,
             vec![("STAGE".to_string(), "prod".to_string())]
@@ -3734,6 +3839,7 @@ mod tests {
             name: "lazygit".to_string(),
             source: crate::launcher::Source::Args(vec!["true".to_string()]),
             shell: false,
+            interactive: false,
             takes_terminal: true,
             env: std::collections::BTreeMap::new(),
         }];

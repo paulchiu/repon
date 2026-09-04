@@ -150,6 +150,7 @@ fn the_actions_own_pool_never_starves_a_refresh_dispatched_on_the_global_pool_wh
         steps: vec![Step {
             argv: vec!["sh".to_string(), "-c".to_string(), block_command],
             shell: false,
+            interactive: false,
             env: Vec::new(),
         }],
         concurrency: 2,

@@ -88,6 +88,7 @@ from_env = "EDITOR"
 name = "log"
 args = ["git log --oneline -20 | less"]
 shell = true
+# interactive = false        # $SHELL -ic instead of -c: sources your rc file, needs shell = true
 
 # tmux returns the instant the pane exists, so Repon keeps its screen rather than
 # tearing it down and reclaiming it for nothing.
@@ -109,6 +110,7 @@ when = "kind:repo"          # skip Worktrees and Submodules: they share node_mod
 args = ["rm", "-rf", "node_modules"]
 # shell = false              # runs through $SHELL -c
                               # without it, $VAR and $(cmd) above stay literal, not expanded
+# interactive = false        # $SHELL -ic instead of -c: sources your rc file, needs shell = true
 # env = {}                   # merged over the guaranteed environment contract
 
 [[action.steps]]

@@ -342,6 +342,11 @@ pub struct StepResult {
     /// finished command line; this is the mode that input was read under. `false` for a step
     /// Repon performed itself, which ran through no interpreter at all.
     pub shell: bool,
+    /// Whether `label` ran through `$SHELL -ic` rather than `$SHELL -c`
+    /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
+    /// `interactive` key). Meaningless unless `shell` is also `true`; always `false`
+    /// otherwise, since a non-shell or own-work step read no interpreter flag at all.
+    pub interactive: bool,
 }
 
 /// The step an [`ActionReceipt`] is executing right now, present only while its run has not
@@ -362,6 +367,8 @@ pub struct RunningStep {
     /// [`StepResult::shell`]'s own claim, carried here too so a running step's mode is on
     /// screen from the moment it starts rather than only once it finishes.
     pub shell: bool,
+    /// [`StepResult::interactive`]'s own claim, carried here too for the same reason.
+    pub interactive: bool,
 }
 
 /// The most recent Action run against this Entity: a receipt of something Repon did,
@@ -984,6 +991,7 @@ mod tests {
                     elapsed: Duration::from_millis(1),
                     elision: None,
                     shell: false,
+                    interactive: false,
                 }],
             )
         };
@@ -1004,6 +1012,7 @@ mod tests {
             elapsed: Duration::from_millis(1),
             elision: None,
             shell: false,
+            interactive: false,
         }
     }
 
@@ -1015,6 +1024,7 @@ mod tests {
             elapsed: Duration::from_millis(2),
             elision: None,
             shell: false,
+            interactive: false,
         }
     }
 
@@ -1047,6 +1057,7 @@ mod tests {
             label: step_label,
             outcome,
             shell: _,
+            interactive: _,
             output: _,
             elapsed: _,
             elision: _,
@@ -1080,6 +1091,7 @@ mod tests {
                     elapsed: Duration::from_millis(1),
                     elision: None,
                     shell: false,
+                    interactive: false,
                 }]
             )
             .failed(),
@@ -1441,6 +1453,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),

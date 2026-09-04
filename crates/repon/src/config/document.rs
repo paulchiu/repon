@@ -147,7 +147,12 @@ pub fn repo_overrides(document: &Document) -> Vec<repon_core::RepoOverride> {
 
 /// A `[[launcher]]` entry, per [config.md](../../../../docs/spec/config.md#launchers)'s
 /// full field table. `args` and `from_env` are mutually exclusive argv sources;
-/// [`crate::launcher::resolve`] is where a declared entry turns into something runnable.
+/// `interactive` runs `shell = true`'s own `$SHELL -c` as `$SHELL -ic` instead, sourcing
+/// the user's own rc file first; declaring it without `shell = true` is rejected at load
+/// by [`reject_interactive_without_shell`], the same failure grade
+/// [`reject_launchers_declaring_both_argv_forms`] already gives `args` and `from_env`
+/// together. [`crate::launcher::resolve`] is where a declared entry turns into something
+/// runnable.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LauncherConfig {
     pub name: toml::Spanned<String>,
@@ -157,6 +162,8 @@ pub struct LauncherConfig {
     pub from_env: Option<String>,
     #[serde(default)]
     pub shell: bool,
+    #[serde(default)]
+    pub interactive: bool,
     #[serde(default = "default_launcher_takes_terminal")]
     pub takes_terminal: bool,
     #[serde(default)]
@@ -177,15 +184,22 @@ fn default_launcher_takes_terminal() -> bool {
 /// One `[[action.steps]]` table, per [config.md](../../../../docs/spec/config.md#actions):
 /// `args` is the argv vector (with `shell = true`, one element holding the command
 /// string, the same convention [`LauncherConfig`] already uses), `env` is merged over
-/// the guaranteed environment contract rather than replacing it.
+/// the guaranteed environment contract rather than replacing it. `interactive` runs the
+/// shell through `$SHELL -ic` rather than `$SHELL -c`, sourcing the user's own rc file
+/// first; declaring it without `shell = true` is rejected at load by
+/// [`reject_interactive_without_shell`], the same failure grade
+/// [`reject_launchers_declaring_both_argv_forms`] already gives a Launcher's own
+/// mutually exclusive fields.
 /// [`crate::action_palette::to_action_spec`] turns this into a [`repon_core::Step`];
-/// `shell` and `env` cross over unresolved, the same way a Launcher's own `shell` and
-/// `env` do in [`crate::launcher`].
+/// `shell`, `interactive` and `env` cross over unresolved, the same way a Launcher's own
+/// `shell`, `interactive` and `env` do in [`crate::launcher`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct StepConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub shell: bool,
+    #[serde(default)]
+    pub interactive: bool,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -526,6 +540,7 @@ fn parse_with_term(text: &str, path: &Path, term: Option<&str>) -> Result<Loaded
     reject_duplicate_names(&document, text, path)?;
     reject_reserved_action_names(&document, text, path)?;
     reject_launchers_declaring_both_argv_forms(&document, text, path)?;
+    reject_interactive_without_shell(&document, text, path)?;
 
     // An explicit `glyphs` pins the value in both directions (docs/spec/config.md's `glyphs`
     // entry): only an absent key defers to the conditional default.
@@ -694,6 +709,45 @@ fn reject_launchers_declaring_both_argv_forms(
                 ),
                 Some(launcher.name.span()),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// `interactive` sources the user's own rc file by running through `$SHELL -ic` rather
+/// than `$SHELL -c`, so it only means anything alongside `shell = true`
+/// ([config.md](../../../../docs/spec/config.md#actions)'s `interactive` sentence): a
+/// `[[launcher]]` or `[[action.steps]]` entry declaring `interactive = true` without
+/// `shell = true` is rejected at load, naming both keys, rather than silently ignored.
+/// `StepConfig` carries no span of its own, so a step's error points at its own action's
+/// `name`, the nearest position this document keeps.
+fn reject_interactive_without_shell(document: &Document, input: &str, path: &Path) -> Result<()> {
+    for launcher in &document.launchers {
+        if launcher.interactive && !launcher.shell {
+            return Err(parse_error(
+                path,
+                input,
+                &format!(
+                    "launcher `{}` declares `interactive = true` without `shell = true`",
+                    launcher.name.get_ref()
+                ),
+                Some(launcher.name.span()),
+            ));
+        }
+    }
+    for action in &document.actions {
+        for step in &action.steps {
+            if step.interactive && !step.shell {
+                return Err(parse_error(
+                    path,
+                    input,
+                    &format!(
+                        "action `{}`'s step declares `interactive = true` without `shell = true`",
+                        action.name.get_ref()
+                    ),
+                    Some(action.name.span()),
+                ));
+            }
         }
     }
     Ok(())
@@ -1311,9 +1365,9 @@ mod tests {
         assert_eq!(names, vec!["zeta", "alpha"]);
     }
 
-    // [[launcher]]'s full field schema (name, args, from_env, shell, takes_terminal, env,
-    // disabled) parses with no unknown-key warnings, and each field's value lands where
-    // declared.
+    // [[launcher]]'s full field schema (name, args, from_env, shell, interactive,
+    // takes_terminal, env, disabled) parses with no unknown-key warnings, and each field's
+    // value lands where declared.
     #[test]
     fn a_launcher_entrys_full_field_schema_parses_with_no_unknown_keys() {
         let text = "[[launcher]]\n\
@@ -1452,6 +1506,7 @@ mod tests {
             };
             let actual = match field.as_str() {
                 "shell" => launcher.shell,
+                "interactive" => launcher.interactive,
                 "takes_terminal" => launcher.takes_terminal,
                 "disabled" => launcher.disabled,
                 other => panic!("no `LauncherConfig` field is wired to the spec's `{other}`"),
@@ -1464,7 +1519,7 @@ mod tests {
         }
         assert_eq!(
             checked,
-            vec!["shell", "takes_terminal", "disabled"],
+            vec!["shell", "interactive", "takes_terminal", "disabled"],
             "the Launchers table's bool rows, in its own order; a parse that stops finding \
              them would otherwise leave this test asserting nothing"
         );
@@ -1486,6 +1541,7 @@ mod tests {
             args: _,
             from_env: _,
             shell: _,
+            interactive: _,
             takes_terminal: _,
             env: _,
             disabled: _,
@@ -1516,6 +1572,51 @@ mod tests {
 
         let with_from_env = parse_ok("[[launcher]]\nname = \"editor\"\nfrom_env = \"EDITOR\"\n");
         assert_eq!(with_from_env.document.launchers[0].args, None);
+    }
+
+    /// `interactive` only means anything alongside `shell = true`: a `[[launcher]]` declaring
+    /// it without `shell = true` is a config error naming both keys, the same failure grade
+    /// `args` and `from_env` together already get, rather than silently ignored.
+    #[test]
+    fn a_launcher_declaring_interactive_without_shell_is_rejected_at_load() {
+        let message =
+            parse_err("[[launcher]]\nname = \"log\"\nargs = [\"true\"]\ninteractive = true\n");
+        assert!(
+            message.contains("log") && message.contains("interactive") && message.contains("shell"),
+            "expected an error naming both the launcher and both keys, got: {message}"
+        );
+    }
+
+    /// The identical rule over an `[[action.steps]]` entry, which carries no span of its
+    /// own, so the error points at its own action's `name` instead.
+    #[test]
+    fn an_action_step_declaring_interactive_without_shell_is_rejected_at_load() {
+        let message = parse_err(
+            "[[action]]\nname = \"deploy\"\n\n\
+             [[action.steps]]\nargs = [\"true\"]\ninteractive = true\n",
+        );
+        assert!(
+            message.contains("deploy")
+                && message.contains("interactive")
+                && message.contains("shell"),
+            "expected an error naming both the action and both keys, got: {message}"
+        );
+    }
+
+    /// `interactive = true` alongside `shell = true` is accepted, on both a Launcher and an
+    /// action step.
+    #[test]
+    fn interactive_alongside_shell_is_accepted_on_a_launcher_and_a_step() {
+        let launcher = parse_ok(
+            "[[launcher]]\nname = \"log\"\nargs = [\"true\"]\nshell = true\ninteractive = true\n",
+        );
+        assert!(launcher.document.launchers[0].interactive);
+
+        let step = parse_ok(
+            "[[action]]\nname = \"deploy\"\n\n\
+             [[action.steps]]\nargs = [\"true\"]\nshell = true\ninteractive = true\n",
+        );
+        assert!(step.document.actions[0].steps[0].interactive);
     }
 
     // `[[repo]]`'s real schema: `default_branch` and `exclude` parse as typed fields, with
@@ -2170,6 +2271,7 @@ mod tests {
             args: _,
             from_env: _,
             shell: _,
+            interactive: _,
             takes_terminal: _,
             env: _,
             disabled: _,
@@ -2179,6 +2281,7 @@ mod tests {
             "args",
             "from_env",
             "shell",
+            "interactive",
             "takes_terminal",
             "env",
             "disabled",
@@ -2205,9 +2308,10 @@ mod tests {
         let StepConfig {
             args: _,
             shell: _,
+            interactive: _,
             env: _,
         } = toml::from_str::<StepConfig>("args = []\n").expect("minimal StepConfig");
-        &["args", "shell", "env"]
+        &["args", "shell", "interactive", "env"]
     }
 
     /// Done when: "Every key in the schema appears in the template, proven by a test that

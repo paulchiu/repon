@@ -528,10 +528,16 @@ fn finished_step_line(index: usize, step: &StepResult) -> ContentLine {
 /// defaults to argv and stays unmarked, so this only draws attention to the case worth
 /// noticing, an ad hoc command's own default
 /// ([`docs/spec/actions.md`](https://github.com/paulchiu/repon/blob/main/docs/spec/actions.md)'s
-/// "The Selection and the gate"). One rendering path for both origins, since `StepResult`
-/// carries no field saying which one produced it.
-fn shell_tag(shell: bool) -> &'static str {
-    if shell { "[shell] " } else { "" }
+/// "The Selection and the gate"). `interactive` sharpens the tag to `[shell -ic]` rather than
+/// a second, separate mark, since it only ever means anything alongside `shell`. One
+/// rendering path for both origins, since `StepResult` carries no field saying which one
+/// produced it.
+fn shell_tag(shell: bool, interactive: bool) -> &'static str {
+    match (shell, interactive) {
+        (true, true) => "[shell -ic] ",
+        (true, false) => "[shell] ",
+        (false, _) => "",
+    }
 }
 
 /// A child process step's own header line: its number, its outcome, its label (marked
@@ -546,7 +552,7 @@ fn child_step_line(index: usize, step: &StepResult) -> ContentLine {
         (
             format!(
                 "   {}{}   {}",
-                shell_tag(step.shell),
+                shell_tag(step.shell, step.interactive),
                 step.label,
                 format_seconds_elapsed(step.elapsed)
             ),
@@ -597,7 +603,7 @@ fn running_step_line(
         (
             format!(
                 "   {}{}   {}",
-                shell_tag(running.shell),
+                shell_tag(running.shell, running.interactive),
                 running.label,
                 format_seconds_elapsed(elapsed)
             ),
@@ -1186,6 +1192,7 @@ mod tests {
                 elapsed: Duration::from_millis(1),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -1206,6 +1213,7 @@ mod tests {
             elapsed,
             elision: None,
             shell: false,
+            interactive: false,
         }
     }
 
@@ -2409,6 +2417,7 @@ mod tests {
                 elapsed: Duration::from_millis(3),
                 elision: None,
                 shell: false,
+                interactive: false,
             }]),
             skip: None,
             finished_at: Timestamp::now(),
@@ -3075,6 +3084,7 @@ mod tests {
                 label: Arc::from("pnpm install"),
                 started_at: Timestamp::now(),
                 shell: false,
+                interactive: false,
             }),
         ));
 
@@ -3165,6 +3175,33 @@ mod tests {
         );
     }
 
+    /// [`StepResult::interactive`] sharpens the mark to `[shell -ic]` rather than adding a
+    /// second, separate one.
+    #[test]
+    fn a_finished_step_that_ran_interactively_is_marked_shell_ic() {
+        let mut row = entity("a");
+        row.last_action = Some(action_receipt(
+            "deploy",
+            vec![StepResult {
+                shell: true,
+                interactive: true,
+                ..step_result("gff", StepOutcome::Ok, b"", Duration::from_millis(1))
+            }],
+            None,
+        ));
+
+        let lines = content_lines(&row, WIDE, full_glyphs()).join("\n");
+
+        let line = lines
+            .lines()
+            .find(|line| line.contains("gff"))
+            .expect("expected the interactive step's own line");
+        assert!(
+            line.contains("[shell -ic]"),
+            "an interactive step must carry the -ic mark, got: {line:?}"
+        );
+    }
+
     /// The same mark on a step still running, read off [`RunningStep::shell`] rather than
     /// waiting for the step to finish.
     #[test]
@@ -3177,6 +3214,7 @@ mod tests {
                 label: Arc::from("echo $(pwd)"),
                 started_at: Timestamp::now(),
                 shell: true,
+                interactive: false,
             }),
         ));
 
@@ -3217,6 +3255,7 @@ mod tests {
                 kept_head_lines: kept_head,
             }),
             shell: false,
+            interactive: false,
         }
     }
 
@@ -3394,6 +3433,7 @@ mod tests {
                 kept_head_lines: kept_head,
             }),
             shell: false,
+            interactive: false,
         }
     }
 
@@ -3843,6 +3883,7 @@ mod tests {
                 "i=1; while [ \"$i\" -le 3000 ]; do echo \"line $i\"; i=$((i+1)); done".to_string(),
             ],
             shell: false,
+            interactive: false,
             env: Vec::new(),
         }];
         let started = core.run_action(
