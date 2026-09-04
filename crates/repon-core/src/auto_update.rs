@@ -72,12 +72,12 @@ pub(crate) enum Outcome {
 pub(crate) fn attempt(path: &Path) -> Outcome {
     let repo = match gix::open(path) {
         Ok(repo) => repo,
-        Err(error) => return Outcome::Failed(error.to_string()),
+        Err(error) => return Outcome::Failed(render_error_chain(&error)),
     };
 
     let head = match git::head_shape(&repo) {
         Ok(head) => head,
-        Err(error) => return Outcome::Failed(error.to_string()),
+        Err(error) => return Outcome::Failed(render_error_chain(&error)),
     };
     let Head::Branch {
         name,
@@ -153,21 +153,23 @@ fn is_repo_clean_for_auto_update(
     head_commit: gix::ObjectId,
 ) -> Result<bool, String> {
     let cancel = Arc::new(AtomicBool::new(false));
-    let counts = git::dirty_counts(repo, cancel).map_err(|error| error.to_string())?;
+    let counts = git::dirty_counts(repo, cancel).map_err(|error| render_error_chain(&error))?;
     if counts.total() > 0 {
         return Ok(false);
     }
 
     let head_tree = repo
         .find_commit(head_commit)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| render_error_chain(&error))?
         .tree_id()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| render_error_chain(&error))?
         .detach();
     let expected_index = repo
         .index_from_tree(&head_tree)
-        .map_err(|error| error.to_string())?;
-    let actual_index = repo.open_index().map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
+    let actual_index = repo
+        .open_index()
+        .map_err(|error| render_error_chain(&error))?;
     Ok(index_snapshot(&expected_index) == index_snapshot(&actual_index))
 }
 
@@ -202,17 +204,23 @@ fn fast_forward(
 ) -> Result<(), String> {
     let from_tree = repo
         .find_commit(from)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| render_error_chain(&error))?
         .tree()
-        .map_err(|error| error.to_string())?;
-    let to_commit = repo.find_commit(to).map_err(|error| error.to_string())?;
-    let to_tree = to_commit.tree().map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
+    let to_commit = repo
+        .find_commit(to)
+        .map_err(|error| render_error_chain(&error))?;
+    let to_tree = to_commit
+        .tree()
+        .map_err(|error| render_error_chain(&error))?;
     let to_tree_id = to_commit
         .tree_id()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| render_error_chain(&error))?
         .detach();
 
-    let mut changes = from_tree.changes().map_err(|error| error.to_string())?;
+    let mut changes = from_tree
+        .changes()
+        .map_err(|error| render_error_chain(&error))?;
     changes.options(|options| {
         options.track_path();
         options.track_rewrites(None);
@@ -226,18 +234,18 @@ fn fast_forward(
 
     let mut new_index = repo
         .index_from_tree(&to_tree_id)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
     new_index
         .write(Default::default())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
 
     let full_ref = format!("refs/heads/{branch_name}");
     let mut reference = repo
         .find_reference(full_ref.as_str())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
     reference
         .set_target_id(to, "repon: fast-forward auto-update")
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
     Ok(())
 }
 
@@ -292,10 +300,12 @@ fn render_error_chain(error: &dyn std::error::Error) -> String {
 }
 
 fn relative_path(location: &BStr) -> Result<&Path, String> {
-    location
-        .to_str()
-        .map(Path::new)
-        .map_err(|error| format!("non-UTF-8 path in a tree diff: {error}"))
+    location.to_str().map(Path::new).map_err(|error| {
+        format!(
+            "non-UTF-8 path in a tree diff: {}",
+            render_error_chain(&error)
+        )
+    })
 }
 
 /// Writes or overwrites `location` under `work_dir` with `id`'s own object content,
@@ -310,30 +320,31 @@ fn write_entry(
 ) -> Result<(), String> {
     let full_path = work_dir.join(relative_path(location)?);
     if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::create_dir_all(parent).map_err(|error| render_error_chain(&error))?;
     }
-    let object = id.object().map_err(|error| error.to_string())?;
+    let object = id.object().map_err(|error| render_error_chain(&error))?;
     match entry_mode.kind() {
         EntryKind::Blob => {
-            fs::write(&full_path, &object.data).map_err(|error| error.to_string())?;
+            fs::write(&full_path, &object.data).map_err(|error| render_error_chain(&error))?;
             set_permissions(&full_path, 0o644)?;
         }
         EntryKind::BlobExecutable => {
-            fs::write(&full_path, &object.data).map_err(|error| error.to_string())?;
+            fs::write(&full_path, &object.data).map_err(|error| render_error_chain(&error))?;
             set_permissions(&full_path, 0o755)?;
         }
         EntryKind::Link => {
             let target = object
                 .data
                 .to_path()
-                .map_err(|error| error.to_string())?
+                .map_err(|error| render_error_chain(&error))?
                 .to_path_buf();
             match fs::remove_file(&full_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(render_error_chain(&error)),
             }
-            std::os::unix::fs::symlink(target, &full_path).map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink(target, &full_path)
+                .map_err(|error| render_error_chain(&error))?;
         }
         EntryKind::Tree => {
             return Err(format!(
@@ -352,7 +363,8 @@ fn write_entry(
 }
 
 fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| error.to_string())
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| render_error_chain(&error))
 }
 
 /// Removes `location` under `work_dir`, then prunes now-empty parent directories up to
@@ -364,7 +376,7 @@ fn remove_entry(work_dir: &Path, location: &BStr) -> Result<(), String> {
     match fs::remove_file(&full_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(render_error_chain(&error)),
     }
     let mut dir = full_path.parent();
     while let Some(candidate) = dir {
@@ -382,6 +394,30 @@ mod tests {
     use crate::test_support::{
         commit_file, current_branch, git, head_sha, push_new_commit, remote_and_clone,
     };
+
+    /// No production line in this module renders an error by `to_string()` alone: every
+    /// `map_err` must go through [`render_error_chain`], the shared helper, or a call
+    /// site added by hand goes on quietly collapsing its own chain the way `fast_forward`
+    /// did before this ticket. Scans this file's own source rather than trusting review,
+    /// since the whole point is that a lone `to_string()` compiles just as cleanly.
+    #[test]
+    fn no_production_line_in_this_module_renders_an_error_by_to_string_alone() {
+        let source = include_str!("auto_update.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("splitting on a literal always yields at least the part before it");
+
+        let offending: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(".to_string()"))
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "found `.to_string()` outside render_error_chain in production code: {offending:?}"
+        );
+    }
 
     fn read_file(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"))
@@ -453,7 +489,10 @@ mod tests {
             rendered,
             "fast-forward failed: the user-provided callback failed: permission denied"
         );
-        assert!(!rendered.contains('\n'), "the message must stay on one line");
+        assert!(
+            !rendered.contains('\n'),
+            "the message must stay on one line"
+        );
     }
 
     /// The happy path the risk brief warns a weak test looks like on its own: an eligible
