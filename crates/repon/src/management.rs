@@ -95,7 +95,10 @@ impl Operation {
     /// permanently removes working trees) keep the cursor-row fallback
     /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
     pub(crate) fn widens_to_every_visible_row_when_selection_is_empty(self) -> bool {
-        matches!(self, Operation::Sync)
+        match self {
+            Operation::Sync => true,
+            Operation::Ignore | Operation::Unignore | Operation::Delete => false,
+        }
     }
 
     /// Whether `entity` is operated on, or the reason it is not, per

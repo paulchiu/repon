@@ -2128,12 +2128,10 @@ impl App {
         }
     }
 
-    /// A management operation's own targets: [`Self::action_targets`] for `sync` alone,
-    /// which widens to every visible row on an empty Selection the way a declared Action
-    /// does, or [`Selection::targets`]'s cursor-row fallback for `ignore`, `unignore` and
-    /// `delete`, unchanged. `delete` shares this seam and permanently destroys working
-    /// trees, so its branch here is the one this function must never widen
-    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+    /// A management operation's own targets: [`Self::action_targets`] or
+    /// [`Selection::targets`]'s cursor-row fallback, chosen per
+    /// [`management::Operation::widens_to_every_visible_row_when_selection_is_empty`] (see
+    /// its doc for which operations widen, and why).
     fn management_targets(
         &self,
         operation: management::Operation,
