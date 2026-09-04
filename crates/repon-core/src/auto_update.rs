@@ -222,7 +222,7 @@ fn fast_forward(
             apply_change(change, work_dir)?;
             Ok(Action::Continue(()))
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| render_error_chain(&error))?;
 
     let mut new_index = repo
         .index_from_tree(&to_tree_id)
@@ -510,6 +510,57 @@ mod tests {
         assert!(
             !clone.path().join("doomed.txt").exists(),
             "the fast-forward must remove a file the new commit no longer has"
+        );
+    }
+
+    /// Pushes a commit that adds `dir/file` to `remote`, `dir` created fresh so the
+    /// commit always introduces that directory rather than assuming it already exists.
+    fn push_nested_file(remote: &Path, dir: &str, file: &str, contents: &str) {
+        let contributor = tempfile::tempdir().expect("temp dir");
+        let status = std::process::Command::new("git")
+            .arg("clone")
+            .arg(remote)
+            .arg(contributor.path())
+            .status()
+            .expect("run git clone");
+        assert!(status.success());
+        std::fs::create_dir(contributor.path().join(dir)).expect("mkdir");
+        std::fs::write(contributor.path().join(dir).join(file), contents)
+            .expect("write nested file");
+        git(contributor.path(), &["add", "."]);
+        git(contributor.path(), &["commit", "-m", "add a nested file"]);
+        git(contributor.path(), &["push", "origin", "main"]);
+    }
+
+    /// A callback failure ([`apply_change`] cannot write a path because the working tree
+    /// already has a plain file where the new commit needs a directory) must surface its
+    /// own message, not just gix's wrapper text, `The user-provided callback failed`, the
+    /// exact string this ticket was filed against.
+    #[test]
+    fn a_fast_forward_failure_from_a_callback_error_reports_the_callback_message() {
+        let (remote, clone) = remote_and_clone();
+        let from_sha = git_rev_parse(clone.path(), "refs/heads/main");
+        push_nested_file(remote.path(), "blocked", "inner.txt", "new content\n");
+        git(clone.path(), &["fetch", "origin"]);
+        let to_sha = git_rev_parse(clone.path(), "refs/remotes/origin/main");
+        // `blocked` already exists in the working tree as a plain file, so writing the
+        // new commit's `blocked/inner.txt` cannot create that directory.
+        std::fs::write(clone.path().join("blocked"), "not a directory\n")
+            .expect("write a blocking file");
+        let repo = gix::open(clone.path()).expect("open the clone");
+        let from = gix::ObjectId::from_hex(from_sha.as_bytes()).expect("parse from sha");
+        let to = gix::ObjectId::from_hex(to_sha.as_bytes()).expect("parse to sha");
+
+        let error = fast_forward(&repo, clone.path(), "main", from, to)
+            .expect_err("a file blocking the new directory must fail the fast-forward");
+
+        assert!(
+            error.starts_with("The user-provided callback failed: "),
+            "expected the wrapper's own message followed by its cause, got {error:?}"
+        );
+        assert_ne!(
+            error, "The user-provided callback failed",
+            "the callback's own message must not be dropped"
         );
     }
 
