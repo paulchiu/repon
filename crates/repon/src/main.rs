@@ -78,6 +78,16 @@ fn main() -> color_eyre::Result<()> {
     }
 
     #[cfg(debug_assertions)]
+    if args.redraw_marker_after_suspend_for_child {
+        return redraw_marker_after_suspend_for_child("true");
+    }
+
+    #[cfg(debug_assertions)]
+    if args.redraw_marker_after_unspawnable_child {
+        return redraw_marker_after_suspend_for_child("repon-no-such-program-on-any-PATH-anywhere");
+    }
+
+    #[cfg(debug_assertions)]
     if args.write_raw_stderr_after_tui_enter {
         return write_raw_stderr_after_tui_enter();
     }
@@ -235,6 +245,38 @@ fn unspawnable_launcher_after_tui_enter() -> color_eyre::Result<()> {
         env: Default::default(),
     };
     launcher::run(&mut tui, &synthetic_launcher, &synthetic_entity())?;
+    Ok(())
+}
+
+/// Claims the terminal, draws a marker paragraph filling the frame, hands off to a synthetic
+/// Launcher that exits immediately (`suspend_for_child`'s clean path, the same one
+/// [`launcher_marker_after_tui_enter`] exercises), then draws the identical marker again
+/// before exiting. Ratatui's diff-based draw skips a cell it thinks unchanged since the last
+/// frame, so the marker's text only reaches the pty a second time if `suspend_for_child`
+/// reclaimed the terminal in a way that also forced that diff to start over: a test attached
+/// to a real pty can then confirm the marker appears again after the reclaim, rather than
+/// trusting a description of it.
+#[cfg(debug_assertions)]
+fn redraw_marker_after_suspend_for_child(program: &str) -> color_eyre::Result<()> {
+    errors::init()?;
+    let mut tui = tui::Tui::new()?;
+    tui.enter()?;
+    let draw_marker = |tui: &mut tui::Tui| -> color_eyre::Result<()> {
+        tui.draw(|frame| {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new("REDRAW_MARKER_CONTENT"),
+                frame.area(),
+            );
+        })?;
+        Ok(())
+    };
+    draw_marker(&mut tui)?;
+    let mut command = std::process::Command::new(program);
+    // Discarded rather than propagated: reclaiming the screen is what this harness is here to
+    // show, and it must happen whether the child ran, failed, or could not be spawned at all.
+    let _ = tui.suspend_for_child(&mut command);
+    draw_marker(&mut tui)?;
+    tui.exit()?;
     Ok(())
 }
 

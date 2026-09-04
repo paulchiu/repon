@@ -1064,6 +1064,63 @@ fn a_launcher_that_cannot_be_spawned_still_reclaims_the_terminal() {
     );
 }
 
+/// The mechanism this file's own tests never exercised: ratatui diffs a draw against the
+/// buffer from before the handoff, so a second frame identical to the first writes nothing
+/// at all unless `suspend_for_child` forced that buffer stale on the way back in.
+/// `--redraw-marker-after-suspend-for-child` draws the same marker paragraph before and after
+/// a clean handoff; a build that reclaims the terminal without invalidating the buffer would
+/// print the marker only once, right after the first `EnterAlternateScreen`, and this asserts
+/// it appears a second time, after the reclaim's own `EnterAlternateScreen`, instead.
+#[test]
+fn suspend_for_child_forces_a_full_repaint_on_reclaim() {
+    let (status, output) = run_over_pty(&["--redraw-marker-after-suspend-for-child"], &[]);
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let enter_at = indices_of(&output, &enter_alt);
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen, the initial one and the \
+         handoff's reclaim: {output:?}"
+    );
+
+    const MARKER: &str = "REDRAW_MARKER_CONTENT";
+    let marker_at = indices_of(&output, MARKER);
+    assert!(
+        marker_at.iter().any(|&index| index > enter_at[1]),
+        "expected the marker to be redrawn after the reclaim's EnterAlternateScreen, but it \
+         only appeared before it (ratatui skipped every cell as unchanged): {output:?}"
+    );
+}
+
+/// The same property on the path most easily broken without anyone noticing: a child that
+/// could not be spawned at all. `Tui::suspend_for_child` promises `enter` runs regardless of
+/// the child's fate, so the repaint that reclaim now forces must not be reachable only when
+/// the child ran cleanly.
+#[test]
+fn a_child_that_cannot_be_spawned_still_forces_a_full_repaint_on_reclaim() {
+    let (status, output) = run_over_pty(&["--redraw-marker-after-unspawnable-child"], &[]);
+    assert_eq!(status.code(), Some(0), "got: {output:?}");
+
+    let enter_alt = ansi(crossterm::terminal::EnterAlternateScreen);
+    let enter_at = indices_of(&output, &enter_alt);
+    assert_eq!(
+        enter_at.len(),
+        2,
+        "expected exactly two claims of the alternate screen even though the child never \
+         ran, the initial one and the reclaim: {output:?}"
+    );
+
+    const MARKER: &str = "REDRAW_MARKER_CONTENT";
+    let marker_at = indices_of(&output, MARKER);
+    assert!(
+        marker_at.iter().any(|&index| index > enter_at[1]),
+        "expected the marker to be redrawn after the reclaim, but a spawn failure skipped \
+         the forced repaint: {output:?}"
+    );
+}
+
 /// config.md's shared warning slot reports every warning "twice: full detail to the log
 /// file... and one persistent on-screen slot", never through a raw `eprintln!`/`println!`
 /// once the terminal is claimed: `eprintln!` goes nowhere a user watching the alternate
