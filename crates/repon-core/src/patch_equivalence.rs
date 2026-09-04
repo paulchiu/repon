@@ -34,7 +34,7 @@ use gix::bstr::BString;
 
 use crate::cell::{Settled, Timestamp};
 use crate::entity::WorktreeState;
-use crate::git::{self, ProbeError};
+use crate::git::ProbeError;
 
 /// One changed path between two trees, kept at blob-identity granularity: an
 /// add or delete carries the one side's object id, a modification both. Mode
@@ -80,25 +80,24 @@ pub(crate) struct PatchIdentity(Vec<PatchEntry>);
 /// against; see [`scan_default_branch`].
 pub(crate) type PatchIdentitySet = HashSet<PatchIdentity>;
 
-/// Whether `entity_tip`'s work has landed in `default_tip` by content rather
-/// than ancestry: only reached once [`crate::landing::probe`] has already
-/// answered `Outstanding` for this entity, so `shared` (this common dir's
-/// [`scan_default_branch`] result) is assumed already computed. `Merged` when
-/// the branch's own diff since its merge base matches one of `shared`'s
-/// identities, `Active` when it does not (including when `entity_tip` and
-/// `default_tip` share no history at all, a real negative rather than a
-/// failure, the same discipline [`crate::landing::is_ancestor`] holds), and
-/// `Failed` only for a genuine read error.
+/// Whether `entity_tip`'s work has landed in the default branch by content
+/// rather than ancestry: only reached once [`crate::landing::probe`] has
+/// already answered `Outstanding` for this entity, so `merge_base` (the one
+/// that pass already computed for this commit pair) and `shared` (this common
+/// dir's [`scan_default_branch`] result) are both handed in rather than
+/// recomputed. `Merged` when the branch's own diff since `merge_base` matches
+/// one of `shared`'s identities, `Active` when it does not, and `Failed` only
+/// for a genuine read error. A `merge_base` of `None` means the two tips share
+/// no history at all, a real negative rather than a failure, the same
+/// discipline [`crate::landing::probe`] holds.
 pub(crate) fn probe(
     repo: &gix::Repository,
     entity_tip: gix::ObjectId,
-    default_tip: gix::ObjectId,
+    merge_base: Option<gix::ObjectId>,
     shared: &PatchIdentitySet,
 ) -> Settled<WorktreeState> {
-    let merge_base = match merge_base(repo, entity_tip, default_tip) {
-        Ok(Some(base)) => base,
-        Ok(None) => return settle(WorktreeState::Active),
-        Err(error) => return Settled::Failed(error),
+    let Some(merge_base) = merge_base else {
+        return settle(WorktreeState::Active);
     };
     match diff_identity(repo, Some(merge_base), entity_tip) {
         Ok(identity) if shared.contains(&identity) => settle(WorktreeState::Merged),
@@ -210,22 +209,6 @@ fn to_entry(change: gix::object::tree::diff::ChangeDetached) -> Option<PatchEntr
     }
 }
 
-/// `commit`'s ancestor common with `other`, via [`git::checked_merge_base`].
-/// `Ok(None)` is the real "no shared history at all" answer (two orphan
-/// roots), not a failure; `Err` is reserved for an actual read error.
-///
-/// `pub(crate)`: [`crate::core`] calls this directly to collect an Outstanding
-/// entity's own merge base before the shared scan runs, the same computation
-/// [`probe`] repeats afterwards to diff the entity's own range.
-pub(crate) fn merge_base(
-    repo: &gix::Repository,
-    commit: gix::ObjectId,
-    other: gix::ObjectId,
-) -> Result<Option<gix::ObjectId>, ProbeError> {
-    git::checked_merge_base(repo, commit, other)
-        .map_err(|error| ProbeError::PatchEquivalence(error.into()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -274,7 +257,7 @@ mod tests {
         let opened = open(&repo);
         let shared =
             scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
-        let outcome = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
+        let outcome = probe(&opened, id(&feature_sha), Some(id(&base_sha)), &shared);
 
         assert!(
             matches!(
@@ -286,6 +269,62 @@ mod tests {
                 }
             ),
             "expected a cleanly squash-merged branch to settle Merged, got {outcome:?}"
+        );
+    }
+
+    /// The entity's own range is measured from the merge base the caller hands
+    /// in, which is what lets [`crate::core`] pass the one it already computed
+    /// instead of a second walk of the same commit pair. `mid_sha` is a real
+    /// commit on `feature` but not its fork point, so a `probe` that ignored
+    /// the argument and recomputed would still answer `Merged`.
+    #[test]
+    fn probe_diffs_the_entitys_range_from_the_merge_base_it_is_handed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        init_repo_with_a_commit(&repo);
+        let base_sha = head_sha(&repo);
+        git(&repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("a.txt"), "one\n").expect("write a.txt");
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-m", "add a"]);
+        let mid_sha = head_sha(&repo);
+        fs::write(repo.join("b.txt"), "two\n").expect("write b.txt");
+        git(&repo, &["add", "b.txt"]);
+        git(&repo, &["commit", "-m", "add b"]);
+        let feature_sha = head_sha(&repo);
+        git(&repo, &["checkout", "-B", "main", &base_sha]);
+        git(&repo, &["merge", "--squash", "feature"]);
+        git(&repo, &["commit", "-m", "squashed feature"]);
+        let main_sha = head_sha(&repo);
+
+        let opened = open(&repo);
+        let shared =
+            scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
+
+        let from_the_fork_point = probe(&opened, id(&feature_sha), Some(id(&base_sha)), &shared);
+        let from_mid_branch = probe(&opened, id(&feature_sha), Some(id(&mid_sha)), &shared);
+
+        assert!(
+            matches!(
+                from_the_fork_point,
+                Settled::Known {
+                    value: WorktreeState::Merged,
+                    at: _,
+                    stale: _
+                }
+            ),
+            "expected the fork point to yield the whole squashed range, got              {from_the_fork_point:?}"
+        );
+        assert!(
+            matches!(
+                from_mid_branch,
+                Settled::Known {
+                    value: WorktreeState::Active,
+                    at: _,
+                    stale: _
+                }
+            ),
+            "expected a base halfway along the branch to yield only b.txt, which the              squash commit does not match, got {from_mid_branch:?}"
         );
     }
 
@@ -312,7 +351,7 @@ mod tests {
         let opened = open(&repo);
         let shared =
             scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
-        let outcome = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
+        let outcome = probe(&opened, id(&feature_sha), Some(id(&base_sha)), &shared);
 
         assert!(
             !matches!(
@@ -352,7 +391,7 @@ mod tests {
         let opened = open(&repo);
         let shared =
             scan_default_branch(&opened, id(&main_sha), None).expect("scan default branch");
-        let _ = probe(&opened, id(&feature_sha), id(&main_sha), &shared);
+        let _ = probe(&opened, id(&feature_sha), Some(id(&base_sha)), &shared);
         let after = loose_object_count(&repo);
 
         assert_eq!(
@@ -404,7 +443,7 @@ mod tests {
     }
 
     /// No shared history at all is a real negative, not a failure: mirrors
-    /// [`crate::landing::is_ancestor`]'s own `unrelated_histories_...` test.
+    /// [`crate::landing`]'s own `unrelated_histories_...` test.
     #[test]
     fn unrelated_histories_settle_active_not_failed() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -417,7 +456,7 @@ mod tests {
 
         let opened = open(&repo);
         let shared = scan_default_branch(&opened, id(&one), None).expect("scan default branch");
-        let outcome = probe(&opened, id(&two), id(&one), &shared);
+        let outcome = probe(&opened, id(&two), None, &shared);
 
         assert!(
             matches!(
@@ -434,7 +473,8 @@ mod tests {
 
     /// A commit object that is simply missing must be `Failed`, never folded
     /// into a confident `Active`: the same defect class the existence check in
-    /// `merge_base` exists to rule out.
+    /// [`crate::git::checked_merge_base`] rules out for the first pass, held
+    /// here by the diff instead.
     #[test]
     fn a_deleted_commit_object_settles_failed_not_a_confident_answer() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -457,7 +497,7 @@ mod tests {
 
         let opened = open(&repo);
         let shared = HashSet::new();
-        let outcome = probe(&opened, id(&tip_sha), id(&base_sha), &shared);
+        let outcome = probe(&opened, id(&tip_sha), Some(id(&base_sha)), &shared);
 
         assert!(
             matches!(outcome, Settled::Failed(ProbeError::PatchEquivalence(_))),

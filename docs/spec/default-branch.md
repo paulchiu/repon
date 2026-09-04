@@ -108,6 +108,8 @@ Ancestry resolves inside the cheap pass. Patch equivalence costs roughly 130ms p
 
 The pass is memoised per git common dir. Its expensive half, the patch-ids of the default branch since the merge base, depends only on the common dir and the deepest merge base under it, and the 123 detached entities sit in 14 distinct common dirs with 110 of them in three. Computing that half once per common dir takes the pass from 321 seconds to 20.7 seconds serial, 10.67 seconds over 14 shared scans plus 10.04 seconds over 123 per-entity diffs at 82ms each. The 130ms per branch above is unreachable without it. It is keyed the way the `origin/HEAD` read already is, per common dir per Generation.
 
+The first pass hands the second what it already established, rather than leaving it to look again: the entity's own tip, the commit the default branch resolves to, and their merge base. All three are read on the one repository handle the ancestry proof used, so the second pass starts at the diff rather than re-walking the same commit pair. A branch the first pass could not clear is therefore not just a verdict of "unresolved", it is that verdict plus the three facts the resolution needs.
+
 The state cell stays **blank and Loading** for any branch where ancestry says no, until the second pass answers. It never shows `Gone` and then flips to `Merged`. A cell that changes value under the reader is a screen contradicting itself, which is the defect [0001](../adr/0001-per-cell-provenance.md) exists to prevent, and the blank-cell contract already covers "no value here yet, the gutter says why".
 
 ## The two behind counts
