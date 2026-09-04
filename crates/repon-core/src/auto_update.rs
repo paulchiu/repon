@@ -276,6 +276,21 @@ fn apply_change(change: Change<'_, '_, '_>, work_dir: &Path) -> Result<(), Strin
     }
 }
 
+/// Renders `error` and its full `source()` chain, outermost first, joined on one line:
+/// every `map_err` in this module reports through this rather than `to_string()` alone,
+/// which keeps only a wrapper's own message and drops the cause underneath it (gix's
+/// `for_each::Error::ForEach`, "The user-provided callback failed", is the case that
+/// motivated this).
+fn render_error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = format!("{error}");
+    let mut source = error.source();
+    while let Some(current) = source {
+        message.push_str(&format!(": {current}"));
+        source = current.source();
+    }
+    message
+}
+
 fn relative_path(location: &BStr) -> Result<&Path, String> {
     location
         .to_str()
@@ -370,6 +385,75 @@ mod tests {
 
     fn read_file(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"))
+    }
+
+    /// A purpose-built error with no `source()`, standing in for a leaf failure
+    /// ([`render_error_chain`]'s tests never reuse a real gix or io error, so the chain
+    /// length is exactly what the test author put there, not whatever a library happens
+    /// to produce today).
+    #[derive(Debug)]
+    struct LeafError(&'static str);
+
+    impl std::fmt::Display for LeafError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for LeafError {}
+
+    /// An error whose `source()` is another error, for building a chain deeper than one
+    /// hop in [`render_error_chain`]'s own tests.
+    #[derive(Debug)]
+    struct WrapperError {
+        message: &'static str,
+        source: Box<dyn std::error::Error + 'static>,
+    }
+
+    impl std::fmt::Display for WrapperError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for WrapperError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    /// A single-layer error with no source renders exactly as it does today: its own
+    /// message, no trailing separator, no empty segment appended for the absent source.
+    #[test]
+    fn render_error_chain_of_a_sourceless_error_is_exactly_its_own_message() {
+        let error = LeafError("disk is full");
+
+        let rendered = render_error_chain(&error);
+
+        assert_eq!(rendered, "disk is full");
+    }
+
+    /// A cause nested two levels deep (a wrapper whose source is itself sourced) is still
+    /// visible in the rendered text, outermost first, on one line.
+    #[test]
+    fn render_error_chain_of_a_two_deep_source_includes_every_level_outermost_first() {
+        let root_cause = LeafError("permission denied");
+        let middle = WrapperError {
+            message: "the user-provided callback failed",
+            source: Box::new(root_cause),
+        };
+        let outer = WrapperError {
+            message: "fast-forward failed",
+            source: Box::new(middle),
+        };
+
+        let rendered = render_error_chain(&outer);
+
+        assert_eq!(
+            rendered,
+            "fast-forward failed: the user-provided callback failed: permission denied"
+        );
+        assert!(!rendered.contains('\n'), "the message must stay on one line");
     }
 
     /// The happy path the risk brief warns a weak test looks like on its own: an eligible
