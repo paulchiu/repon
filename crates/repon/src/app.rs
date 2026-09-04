@@ -1297,10 +1297,17 @@ impl App {
             // With an anchor already live, `v` commits the range instead of moving the
             // anchor: the rows it already covers stay selected and the anchor releases, so
             // the cursor can cross a gap before a later `v` starts a second range.
+            //
+            // The commit extends to the cursor first, so a range never moved off its own
+            // anchor still covers the anchored row rather than committing nothing. Both
+            // calls are no-ops with no anchor live, which is what leaves the `else` below to
+            // drop one.
             Some(Action::AnchorRange) => {
-                if self.selection.has_range_anchor() {
-                    self.selection.cancel_range_anchor();
-                } else if let Some(key) = self.cursor_key() {
+                let visible = self.visible_keys();
+                self.selection.extend_range(self.cursor, &visible);
+                if !self.selection.cancel_range_anchor()
+                    && let Some(key) = self.cursor_key()
+                {
                     self.selection.anchor_range(key);
                 }
                 None
@@ -7673,6 +7680,59 @@ mod tests {
 
     /// AC1: with no anchor live, `v` still just drops one at the cursor, extended by `j`/`k`
     /// exactly as before this ticket.
+    #[test]
+    fn committing_a_range_that_never_moved_selects_the_anchored_row_rather_than_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit it without ever moving");
+
+        let visible = app.visible_keys();
+        assert!(!app.selection.has_range_anchor(), "the anchor must release");
+        assert!(
+            app.selection.contains(&visible[0]),
+            "committing a one-row range must select that row: a gesture that reads as \
+             \"select this and release\" cannot commit nothing"
+        );
+        assert!(
+            !app.selection.contains(&visible[1]),
+            "and must not reach past the anchored row"
+        );
+    }
+
+    #[test]
+    fn committing_a_range_whose_anchor_is_no_longer_visible_selects_nothing_and_still_releases() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        // Named so the anchored row sorts first and the Filter below hides it.
+        init_repo(&root.join("aaa-hidden"));
+        init_repo(&root.join("keep-b"));
+        let mut app = test_app(&root);
+        app.set_cursor(0);
+        let anchored = app.visible_keys()[0].clone();
+
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("anchor a range");
+        // Hide the anchored row behind a Filter, then commit against what is left.
+        app.filter = Filter::parse("keep");
+        app.set_cursor(0);
+        app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("commit with the anchor filtered out");
+
+        assert!(!app.selection.has_range_anchor(), "the anchor must release");
+        assert!(
+            !app.selection.contains(&anchored),
+            "a row the Filter is hiding must never enter the Selection through a commit"
+        );
+    }
+
     #[test]
     fn v_with_no_anchor_live_drops_one_at_the_cursor() {
         let dir = tempfile::tempdir().expect("temp dir");

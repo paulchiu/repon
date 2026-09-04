@@ -48,6 +48,9 @@ A Filter that has been applied with Enter and is narrowing the list while the cu
 **Selection**:
 The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.
 
+**Range anchor**:
+The row `v` pins so that moving the cursor selects everything between that row and the cursor. Live until a second `v` commits the range and releases it, leaving the rows selected so the cursor can cross a gap and start another. Stored as the row's own key rather than its index, so a reorder cannot point it at a different row. Not a mark or a visual mode: only one is ever live, and releasing it keeps what it covered rather than discarding it.
+
 ## Lifecycle
 
 **Core**:
