@@ -1132,6 +1132,73 @@ mod tests {
         assert!(!run(&["true"], dir.path()).interactive);
     }
 
+    /// A throwaway rc file defining `alias_name` as `replacement`, in whichever
+    /// convention `shell` (a `$SHELL`-style path) actually reads for an interactive,
+    /// non-login shell: `ZDOTDIR` for zsh, `HOME` for bash (neither takes a file argument),
+    /// and `ENV` for everything else, which POSIX `sh`, `dash` and `ksh` all honour.
+    /// Returns the env override [`run_step`]'s own `env` parameter needs to point the
+    /// spawned shell at it, so this never touches the test process's own environment.
+    fn alias_rc(
+        shell: &str,
+        dir: &Path,
+        alias_name: &str,
+        replacement: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let name = Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let line = format!("alias {alias_name}='{replacement}'\n");
+        match name {
+            "zsh" => {
+                std::fs::write(dir.join(".zshrc"), line).expect("write .zshrc");
+                vec![("ZDOTDIR".to_string(), Some(dir.display().to_string()))]
+            }
+            "bash" => {
+                std::fs::write(dir.join(".bashrc"), line).expect("write .bashrc");
+                vec![("HOME".to_string(), Some(dir.display().to_string()))]
+            }
+            _ => {
+                let rc = dir.join("rc");
+                std::fs::write(&rc, line).expect("write rc");
+                vec![("ENV".to_string(), Some(rc.display().to_string()))]
+            }
+        }
+    }
+
+    /// The claim `interactive` exists to make good on, proven end to end rather than only
+    /// on the argv [`shell_argv`] constructs: a real shell, asked to run interactively,
+    /// actually sources a throwaway rc file and resolves an alias defined only there, and
+    /// the same shell asked non-interactively does not. A flag built correctly but never
+    /// honoured by the shell, or misplaced in the argv so it stops meaning `-i`, would pass
+    /// every other test in this module while failing this one.
+    #[test]
+    fn interactive_true_sources_the_users_rc_file_so_an_alias_resolves() {
+        let dir = tempdir();
+        let rc_dir = tempdir();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let env = alias_rc(&shell, rc_dir.path(), "gff", "echo alias-resolved");
+        let argv = vec!["gff".to_string()];
+
+        let interactive = run_step(&argv, true, true, dir.path(), &env, &RunControl::new());
+        let non_interactive = run_step(&argv, true, false, dir.path(), &env, &RunControl::new());
+
+        let interactive_output = String::from_utf8_lossy(&interactive.output).into_owned();
+        assert_eq!(
+            interactive.outcome,
+            StepOutcome::Ok,
+            "an interactive shell must source the rc file and resolve the alias, got: {interactive_output:?}"
+        );
+        assert!(
+            interactive_output.contains("alias-resolved"),
+            "expected the alias's own output, got: {interactive_output:?}"
+        );
+        assert!(
+            non_interactive.outcome.is_failure(),
+            "a non-interactive shell must not see an alias defined only in the rc file"
+        );
+    }
+
     /// The trap `docs/spec/config.md`'s `shell = true` sentence names: POSIX `sh -c`
     /// fills `$0` from the first argument after the command string, so a naive
     /// `$SHELL -c <string> <name>` call that appends a name expecting it to land in
