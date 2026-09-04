@@ -4237,6 +4237,41 @@ mod tests {
         );
     }
 
+    /// `pinned` overrides `filter.matches` alone, never `kind_is_visible`
+    /// ([docs/spec/repo-management.md](../../../../docs/spec/repo-management.md)'s "Once
+    /// accepted": pinning "does not override `show_worktrees` or `show_submodules`"). A
+    /// pinned Worktree with `show_worktrees` off must stay hidden exactly as an unpinned one
+    /// would.
+    #[test]
+    fn a_pinned_worktree_stays_hidden_while_show_worktrees_is_off() {
+        let entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("worktree-a", Kind::Worktree, "/repo-a"),
+        ];
+        let filter = Filter::default();
+        assert!(
+            !filter.requests_kind(Kind::Worktree),
+            "fixture's own filter must not itself request Worktrees, or this proves nothing \
+             about pinning bypassing show_worktrees"
+        );
+        let mut pinned = HashSet::new();
+        pinned.insert(entities[1].key.clone());
+
+        let visible =
+            visible_row_order(&entities, false, true, &filter, RowOrder::Natural, &pinned);
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&index| entities[index].name.as_ref())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["repo-a"],
+            "worktree-a is pinned but show_worktrees is off, so it must stay hidden: \
+             pinning overrides the Filter, never show_worktrees"
+        );
+    }
+
     fn worktree_add(parent: &Path, worktree: &Path, branch: &str) {
         let status = std::process::Command::new("git")
             .arg("-C")
