@@ -90,6 +90,11 @@ const NO_FAILED_ROWS_NOTICE: &str = "no row has failed";
 /// own successful case ([`App::dismiss_vanished_at_cursor`]) never raises one.
 const CURSOR_NOT_VANISHED_NOTICE: &str = "cursor row is not Vanished";
 
+/// The Notice [`Action::ClearFilter`] raises when no committed Filter is active to clear,
+/// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
+/// unavailable case again.
+const NO_FILTER_TO_CLEAR_NOTICE: &str = "no Filter to clear";
+
 /// The detail pane's sidebar width: the list collapsed to its gutter and name column only.
 /// `pub(crate)` so `list.rs`'s own sidebar tests render at this constant rather than a
 /// hardcoded literal, per [layout-and-provenance.md](../../../../docs/spec/layout-and-provenance.md)'s
@@ -1286,6 +1291,19 @@ impl App {
             }
             Some(Action::ClearSelection) => {
                 self.selection.clear();
+                None
+            }
+            // `Alt+/`: a direct route to the unwind stack's own last rung
+            // ([`ClearFilterOnUnwind`]), leaving the Selection, the detail pane and a
+            // running Action untouched. `follow_cursor` widens the viewport under a
+            // standing cursor the same way the unwind rung's own call does.
+            Some(Action::ClearFilter) => {
+                if self.filter.is_active() {
+                    self.filter = Filter::default();
+                    self.follow_cursor();
+                } else {
+                    self.set_notice(NO_FILTER_TO_CLEAR_NOTICE.to_string());
+                }
                 None
             }
             // Opening the pane never touches `cursor` or `visible_keys`' order: it is an
@@ -13532,6 +13550,160 @@ refresh_all = "z""#,
         assert!(
             !app.filter.is_active(),
             "a second Esc, with nothing left to unwind first, must clear the committed Filter"
+        );
+    }
+
+    // --- `Alt+/`: a direct route to the unwind stack's own last rung
+    // (docs/spec/keybindings.md's "Esc"), bound in `list` only ---
+
+    #[test]
+    fn alt_slash_clears_a_committed_filter_leaving_selection_pane_and_action_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document
+            .actions
+            .push(long_running_action_config("hold"));
+
+        // A running Action.
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(app.core.action_running(), "sanity: the fan-out is live");
+
+        // A checked row.
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("check the cursor row");
+        let checked = app.selection.checked();
+        assert!(!checked.is_empty(), "sanity: the Selection is live");
+
+        // An open detail pane, focus back on the list.
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open the detail pane");
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("return focus to the list, leaving the pane open");
+        let pane = app.pane.clone();
+        assert!(pane.is_some(), "sanity: the pane is open");
+        assert_eq!(app.focus, Context::List, "sanity: the list has focus");
+
+        // A committed Filter.
+        app.filter = Filter::parse("repo");
+        assert!(app.filter.is_active(), "sanity: the Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears the committed Filter");
+
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must clear the committed Filter in one press"
+        );
+        assert_eq!(
+            app.selection.checked(),
+            checked,
+            "Alt+/ must leave the Selection exactly as it was"
+        );
+        assert_eq!(
+            app.pane, pane,
+            "Alt+/ must leave the detail pane exactly as it was"
+        );
+        assert!(
+            app.core.action_running(),
+            "Alt+/ must leave a running Action untouched"
+        );
+
+        app.core.stop_action();
+        wait_for("the fixture's own fan-out to actually stop", || {
+            !app.core.action_running()
+        });
+    }
+
+    #[test]
+    fn alt_slash_with_no_committed_filter_is_inert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert!(!app.filter.is_active(), "sanity: no Filter is committed");
+        let cursor_before = app.cursor;
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ with nothing to clear");
+
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must not somehow activate a Filter out of nothing"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "an inert Alt+/ must not move the cursor"
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(NO_FILTER_TO_CLEAR_NOTICE),
+            "an inert Built binding answers the press with a Notice naming why \
+             (docs/adr/0023)"
+        );
+    }
+
+    #[test]
+    fn question_mark_still_opens_help_from_the_list_after_alt_slash_is_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        assert_eq!(app.focus, Context::List, "sanity: the list has focus");
+
+        app.handle_key_event(press(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("? still opens help from the list");
+
+        assert!(
+            app.help.is_some(),
+            "? must still reach Action::OpenHelp through the Global fallback"
+        );
+    }
+
+    /// Mirrors `the_viewport_stays_valid_when_a_filter_shrinks_the_table_under_a_standing_cursor`
+    /// in the opposite direction: clearing a Filter through `Alt+/` must widen the viewport
+    /// under a standing cursor exactly as the unwind rung's own call to `follow_cursor` does,
+    /// rather than leaving the window describing rows the cursor no longer sits near.
+    #[test]
+    fn alt_slash_widens_the_viewport_under_a_standing_cursor_the_way_the_unwind_rung_does() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for i in 0..20 {
+            init_repo(&root.join(format!("repo-{i:02}")));
+        }
+        let mut app = test_app(&root);
+        app.frame_size = Size::new(140, 10);
+        assert_eq!(app.list_viewport_rows(), 5);
+
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        assert_eq!(app.cursor, 19);
+        assert_eq!(app.list_offset, 15);
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("dispatch / to open the filter line");
+        for c in "repo-1".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("dispatch a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("dispatch Enter to commit the filter");
+        assert_eq!(app.visible_keys().len(), 10, "sanity: narrowed to 10 rows");
+        assert_eq!(app.list_offset, 5, "sanity: the offset clamped to fit");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears the committed Filter");
+
+        assert_eq!(app.visible_keys().len(), 20, "the full table is back");
+        assert_eq!(
+            app.list_offset, 15,
+            "the viewport must widen back to a window that actually contains the standing \
+             cursor (19), the same way the unwind rung's own follow_cursor call would"
         );
     }
 

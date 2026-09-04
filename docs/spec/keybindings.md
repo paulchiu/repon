@@ -61,6 +61,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `v` | Anchor a range at the cursor, extended with `j` and `k` |
 | `a` | Select every listed row, not just this screenful |
 | `A` | Clear the Selection |
+| `Alt+/` | Clear the committed Filter |
 | `Enter` | Open the detail pane |
 | `d` | Dismiss a Vanished row |
 | `n` | Next failed row |
@@ -175,6 +176,8 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 
 `t` for the worktrees toggle is free on the same terms: unbound in Global, List, Detail, Input, Overlay and Confirm, so no context-specific binding is left to shadow it while `list` or `detail` has focus. Its one other appearance in the whole table is `sort`'s own `t` (`Sort by state`), a context `global` never falls back into and that never falls back into `global` either ([The contexts](#the-contexts)), so the two cannot collide at dispatch. It is also the one column key `sort` binds that carried no meaning outside the menu before this ticket; giving it one here means every column letter now reads the same way in or out of the menu, the way `b`, `s`, `n`, `d` and `a` already did.
 
+`Alt+/` clears a committed Filter directly, the same physical key that opens one with a modifier rather than Shift. `?` was the natural pair, mirroring `/`, but it is already bound `Global` to `OpenHelp`: binding it in `list` too would shadow help on the main screen and leave `?` reachable only from the detail pane, which is a worse cost than an unfamiliar modifier. `Alt+/` is unbound in every context, and it does not touch the unwind stack's own last rung, which still clears a Filter as [Esc](#esc)'s slowest, innermost-first route to the same effect.
+
 `?` for help is contradicted by five of fifteen surveyed tools, and all five are the vim-flavoured ones (yazi, lf, vifm, tig, atuin's vim mode), which bind it to search-backward. That collision does not reach Repon: those tools have a directional search with `n` and `N`, while Repon's Filter is modal and narrows rather than jumping, so there is no backward to search. lazygit, the stated model, uses `?` for help.
 
 `space` toggles and `v` anchors a range. `v` is lazygit's. `space` is not: lazygit's `Universal.Select` is a per-context action key and lazygit has no point-toggle multi-select at all. The real precedents for space are k9s, ranger, nnn, yazi, gitui, lf and htop. Five of those, k9s, ranger, nnn, yazi and lf, also advance the cursor after the toggle; Repon departs from them and leaves the cursor put by default, since an advance means `space space` unchecks the row below rather than undoing the row just checked, a real way to lose track. `advance_on_toggle` ([config.md](config.md)) opts back into their behaviour.
@@ -199,7 +202,7 @@ Alt chords (macOS Option, Meta elsewhere) arrive the same way Ctrl chords do, as
 
 ## Esc
 
-Esc never quits, at any depth. It unwinds exactly one level per press. If an Action is fanning out, Esc cancels it. Otherwise, innermost first: cancel a range, then close the detail pane, then clear a committed Filter. That last step is why clearing a Filter has no key of its own.
+Esc never quits, at any depth. It unwinds exactly one level per press. If an Action is fanning out, Esc cancels it. Otherwise, innermost first: cancel a range, then close the detail pane, then clear a committed Filter. That last step is the slow route to clearing a Filter; `list`'s own `Alt+/` clears one directly, in one press, leaving the Selection, the detail pane and a running Action untouched, and does not remove the unwind rung, which still exists for a hand already reaching for Esc.
 
 Esc-twice gestures were measured safe against human typing: crossterm collapses two Esc bytes into one event only when both arrive in a single `read()`, and at a 0.5ms gap it is already two events. They are still not used, because that measurement stops holding over SSH.
 
