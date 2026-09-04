@@ -9769,6 +9769,80 @@ mod tests {
         );
     }
 
+    /// Decisions already made: the pin also covers an ordinary fan-out Action's own
+    /// in-flight rows, the identical `last_action.running.is_some()` signal
+    /// `Core::run_action` already writes per step, since [`Self::pinned_keys`] is the one
+    /// shared choke point and that signal already exists for free.
+    #[test]
+    fn a_row_with_an_ordinary_fan_out_actions_own_step_running_stays_visible_past_a_filter_it_never_matched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.document.actions.push(slow_action("slow"));
+        // Excludes repo-a alone, so the cursor still has repo-b to sit on: pressing `;` and
+        // `Enter` needs a real cursor row, and a Filter hiding every row would leave nothing
+        // for that key path to dispatch from at all.
+        app.filter = Filter::parse("name:repo-b");
+        let snapshot = app.core.snapshot();
+        let repo_a_key = snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-a")
+            .expect("repo-a must be in the table")
+            .key
+            .clone();
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "sanity: the Filter must exclude repo-a before any Action runs, or this proves \
+             nothing"
+        );
+        // Checked despite being hidden ([`Selection::targets`]'s own "must not change"
+        // criterion), which is what routes the fan-out at repo-a rather than the cursor's
+        // own row, repo-b.
+        app.selection.toggle(repo_a_key.clone());
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(
+            app.core.action_running(),
+            "sanity: the fan-out must be live"
+        );
+        // `action_running` flips before the step's own `RunningStep` is written, which
+        // happens once rayon's pool actually starts the step: waited out explicitly, the
+        // same race `Core::run_action`'s own tests take this wait for.
+        wait_for("repo-a's own step to actually start running", || {
+            app.core
+                .snapshot()
+                .entities
+                .iter()
+                .find(|entity| entity.key == repo_a_key)
+                .is_some_and(|entity| {
+                    entity
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.running.is_some())
+                })
+        });
+
+        assert!(
+            app.visible_keys().contains(&repo_a_key),
+            "repo-a's own step is running, so it must stay visible past a Filter it never \
+             matched, the same pin an in-flight management run's own rows get"
+        );
+
+        wait_for("the fan-out to finish", || !app.core.action_running());
+
+        assert!(
+            !app.visible_keys().contains(&repo_a_key),
+            "once the step finishes, repo-a must be judged by the Filter alone again"
+        );
+    }
+
     /// The first "Done when": `on_refresh = "sync"` runs that Action once after a Refresh
     /// started by `r`, over every row that Refresh covers. The entry declares
     /// `confirm = true`, so a build that put the hook behind the Action confirm gate would
