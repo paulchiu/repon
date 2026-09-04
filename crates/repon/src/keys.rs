@@ -214,7 +214,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::AnchorRange => "Anchor a range at the cursor, extended with `j` and `k`",
         Action::SelectAllVisible => "Select every listed row, not just this screenful",
         Action::ClearSelection => "Clear the Selection",
-        Action::ClearFilter => "Clear the committed Filter",
+        Action::ClearFilter => "Clear whatever is narrowing the list",
         Action::OpenDetail => "Open the detail pane",
         Action::DismissVanished => "Dismiss a Vanished row",
         Action::NextFailed => "Next failed row",

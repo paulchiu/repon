@@ -193,8 +193,10 @@ impl UnwindLevel for ClosePaneOnUnwind<'_> {
 
 /// Clearing a committed Filter is the unwind stack's fourth and last level
 /// ([keybindings.md](../../../../docs/spec/keybindings.md#esc)), tried only once every
-/// earlier level is already empty. `Action::ClearFilter` reuses this same rule as a direct
-/// route, live whenever `self.filter` is active rather than only at the end of an unwind.
+/// earlier level is already empty. `list`'s own `Action::ClearFilter` reuses this same rule
+/// as a direct route, live whenever `self.filter` is active rather than only at the end of
+/// an unwind; the Filter line's own `Action::ClearFilter` arm has a draft to reckon with too
+/// and clears `self.filter` directly instead of going through this struct.
 struct ClearFilterOnUnwind<'a> {
     filter: &'a mut Filter,
 }
@@ -1892,14 +1894,14 @@ impl App {
     fn handle_filter_line_key(&mut self, key: KeyEvent) {
         match self.bindings.dispatch(Context::Input, key) {
             Some(Action::Cancel) => self.filter_line = None,
-            // Closes the line the same way `Cancel` does, but clears the committed Filter it
-            // closes over instead of restoring it: unavailable with a Notice, and the line
-            // left open, when there is nothing committed to clear.
+            // Closes the line the same way `Cancel` does, but clears whatever is narrowing
+            // the list instead of restoring it: the live draft (`Self::active_filter`), the
+            // committed Filter underneath it, or both. Unavailable with a Notice, and the
+            // line left open, only when the draft is empty and nothing is committed either,
+            // since an empty draft narrows nothing.
             Some(Action::ClearFilter) => {
-                let mut clear_filter = ClearFilterOnUnwind {
-                    filter: &mut self.filter,
-                };
-                if clear_filter.unwind() {
+                if self.active_filter().is_active() {
+                    self.filter = Filter::default();
                     self.filter_line = None;
                     self.follow_cursor();
                 } else {
@@ -14533,8 +14535,93 @@ refresh_all = "z""#,
     }
 
     #[test]
-    fn alt_slash_from_the_filter_input_with_no_committed_filter_is_inert_and_leaves_the_line_open()
-    {
+    fn alt_slash_from_the_filter_input_with_a_draft_and_no_committed_filter_clears_the_draft() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        assert!(!app.filter.is_active(), "sanity: no Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter");
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("type a draft that narrows the list but was never committed");
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "sanity: the draft is narrowing the list"
+        );
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears whatever is narrowing the list, draft included");
+
+        assert!(
+            app.filter_line.is_none(),
+            "Alt+/ must close the Filter line the way Cancel does"
+        );
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must leave no committed Filter behind either"
+        );
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "the draft must no longer narrow the list"
+        );
+        assert_eq!(
+            app.notice, None,
+            "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
+        );
+    }
+
+    #[test]
+    fn alt_slash_from_the_filter_input_with_a_draft_over_a_committed_filter_clears_both() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        app.filter = Filter::parse("repo");
+        assert!(app.filter.is_active(), "sanity: a Filter is committed");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("enter a Filter, prefilled with the committed one");
+        app.handle_key_event(press(KeyCode::Char('-'), KeyModifiers::NONE))
+            .expect("type a draft that narrows further than the committed Filter did");
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("finish narrowing the draft to a single row");
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "sanity: the draft narrows past the committed Filter"
+        );
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
+            .expect("Alt+/ clears both the draft and the committed Filter underneath it");
+
+        assert!(
+            app.filter_line.is_none(),
+            "Alt+/ must close the Filter line the way Cancel does"
+        );
+        assert!(
+            !app.filter.is_active(),
+            "Alt+/ must clear the committed Filter, not just the draft over it"
+        );
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "neither the draft nor the committed Filter may narrow the list afterwards"
+        );
+        assert_eq!(
+            app.notice, None,
+            "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
+        );
+    }
+
+    /// An empty draft narrows nothing, so with no committed Filter underneath it there is
+    /// genuinely nothing for `Alt+/` to clear: the unavailable Notice and the open line stay
+    /// correct here, unlike a draft that is actually narrowing the list.
+    #[test]
+    fn alt_slash_from_the_filter_input_with_an_empty_draft_and_no_committed_filter_is_inert() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -14542,26 +14629,22 @@ refresh_all = "z""#,
         assert!(!app.filter.is_active(), "sanity: no Filter is committed");
 
         app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
-            .expect("enter a Filter");
-        app.handle_key_event(press(KeyCode::Char('x'), KeyModifiers::NONE))
-            .expect("type a draft that was never committed");
+            .expect("enter a Filter, leaving the draft empty");
         app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::ALT))
-            .expect("Alt+/ with nothing committed to clear");
+            .expect("Alt+/ with an empty draft and nothing committed to clear");
 
         assert!(
             app.filter_line.is_some(),
             "an unavailable Alt+/ must leave the line open"
         );
         assert_eq!(
-            format!(
-                "{:?}",
-                app.filter_line
-                    .as_ref()
-                    .expect("the Filter line is open")
-                    .live_filter()
-            ),
-            format!("{:?}", Filter::parse("x")),
-            "the draft the user was typing survives an unavailable Alt+/ untouched"
+            app.filter_line
+                .as_ref()
+                .expect("the Filter line is open")
+                .live_filter()
+                .as_str(),
+            "",
+            "the empty draft survives an unavailable Alt+/ untouched"
         );
         assert_eq!(
             app.notice.as_deref(),
