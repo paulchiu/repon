@@ -2625,29 +2625,35 @@ impl App {
         }
     }
 
-    /// Every currently shown Entity's key, in the same order
-    /// [`crate::components::list::List`] draws
-    /// ([`crate::components::list::visible_row_order`]): this crate's whole "visible list",
-    /// narrowed by [`Self::effective_show_worktrees`], the show-submodules preference,
-    /// [`Self::active_filter`] and [`Self::pinned_keys`], and what `extend_range` and the
-    /// cursor bounds all read. [`Self::matching_keys`] is the Filter's own narrower set,
-    /// for the one caller (`Action::SelectAllVisible`) that must never pick up a row the
-    /// Filter itself would drop.
-    fn visible_keys(&self) -> Vec<EntityKey> {
-        let snapshot = self.core.snapshot();
+    /// [`Self::visible_keys`] and [`Self::matching_keys`]'s shared pipeline: `snapshot`'s
+    /// entities narrowed by [`Self::effective_show_worktrees`], the show-submodules
+    /// preference, [`Self::active_filter`] and `pinned`, in [`Self::row_order`]
+    /// ([`crate::components::list::visible_row_order`]).
+    fn keys_for(&self, snapshot: &Snapshot, pinned: &HashSet<EntityKey>) -> Vec<EntityKey> {
         let filter = self.active_filter();
-        let pinned = self.pinned_keys(&snapshot);
         crate::components::list::visible_row_order(
             &snapshot.entities,
             self.effective_show_worktrees(),
             self.document.show_submodules,
             &filter,
             self.row_order,
-            &pinned,
+            pinned,
         )
         .into_iter()
         .map(|index| snapshot.entities[index].key.clone())
         .collect()
+    }
+
+    /// Every currently shown Entity's key, in the same order
+    /// [`crate::components::list::List`] draws: this crate's whole "visible list", narrowed
+    /// by [`Self::keys_for`]'s own pipeline plus [`Self::pinned_keys`], and what
+    /// `extend_range` and the cursor bounds all read. [`Self::matching_keys`] is the
+    /// Filter's own narrower set, for the one caller (`Action::SelectAllVisible`) that must
+    /// never pick up a row the Filter itself would drop.
+    fn visible_keys(&self) -> Vec<EntityKey> {
+        let snapshot = self.core.snapshot();
+        let pinned = self.pinned_keys(&snapshot);
+        self.keys_for(&snapshot, &pinned)
     }
 
     /// [`Self::visible_keys`] with no pinned key of its own: the rows `Self::active_filter`
@@ -2657,18 +2663,7 @@ impl App {
     /// the Filter, not claimed to satisfy it").
     fn matching_keys(&self) -> Vec<EntityKey> {
         let snapshot = self.core.snapshot();
-        let filter = self.active_filter();
-        crate::components::list::visible_row_order(
-            &snapshot.entities,
-            self.effective_show_worktrees(),
-            self.document.show_submodules,
-            &filter,
-            self.row_order,
-            &HashSet::new(),
-        )
-        .into_iter()
-        .map(|index| snapshot.entities[index].key.clone())
-        .collect()
+        self.keys_for(&snapshot, &HashSet::new())
     }
 
     /// The row the cursor sits on, if the table is non-empty.
@@ -9488,6 +9483,28 @@ mod tests {
         );
     }
 
+    /// A hand-built [`ManagementRun`] for a `Sync` operation over `targets`, pinned at
+    /// `position` of `total`: the shared fixture every sync-pinning test below needs to
+    /// drive `App`'s reaction to a known position without racing a background thread's own
+    /// timing, the same call
+    /// [`draw_frame_shows_the_management_runs_current_row_as_the_live_notice`]'s own doc
+    /// comment makes.
+    #[cfg(feature = "fetch")]
+    fn pinned_sync_run(targets: Vec<EntityKey>, position: usize, total: usize) -> ManagementRun {
+        let (_tx, rx) = mpsc::channel();
+        ManagementRun {
+            operation: management::Operation::Sync,
+            targets: Arc::from(targets),
+            progress: Arc::new(Mutex::new(RowProgress {
+                name: Arc::from(""),
+                position,
+                total,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            outcome: rx,
+        }
+    }
+
     /// The bug this issue fixes, reproduced against real state: `sync:behind` matches
     /// `repo-a` at discovery, a hand-built [`ManagementRun`] pins it as still pending
     /// (position 1 of 1, nothing yet past it), then the real fast-forward
@@ -9516,18 +9533,7 @@ mod tests {
             "sanity: repo-a must start inside sync:behind, or this proves nothing"
         );
 
-        let (_tx, rx) = mpsc::channel();
-        app.management_run = Some(ManagementRun {
-            operation: management::Operation::Sync,
-            targets: Arc::from(vec![repo_a_key.clone()]),
-            progress: Arc::new(Mutex::new(RowProgress {
-                name: Arc::from("repo-a"),
-                position: 1,
-                total: 1,
-            })),
-            cancel: Arc::new(AtomicBool::new(false)),
-            outcome: rx,
-        });
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
 
         assert_eq!(
             app.core
@@ -9599,18 +9605,11 @@ mod tests {
             "sanity: both repos must start inside sync:behind, or this proves nothing"
         );
 
-        let (_tx, rx) = mpsc::channel();
-        app.management_run = Some(ManagementRun {
-            operation: management::Operation::Sync,
-            targets: Arc::from(vec![repo_a_key.clone(), repo_b_key.clone()]),
-            progress: Arc::new(Mutex::new(RowProgress {
-                name: Arc::from("repo-b"),
-                position: 2,
-                total: 2,
-            })),
-            cancel: Arc::new(AtomicBool::new(false)),
-            outcome: rx,
-        });
+        app.management_run = Some(pinned_sync_run(
+            vec![repo_a_key.clone(), repo_b_key.clone()],
+            2,
+            2,
+        ));
 
         assert_eq!(
             app.core
@@ -9671,19 +9670,8 @@ mod tests {
         let repo_a_key = key_named("repo-a");
         let repo_b_key = key_named("repo-b");
 
-        let (_tx, rx) = mpsc::channel();
-        app.management_run = Some(ManagementRun {
-            operation: management::Operation::Sync,
-            // `repo-b` is deliberately absent: this run's own Selection is `repo-a` alone.
-            targets: Arc::from(vec![repo_a_key.clone()]),
-            progress: Arc::new(Mutex::new(RowProgress {
-                name: Arc::from("repo-a"),
-                position: 1,
-                total: 1,
-            })),
-            cancel: Arc::new(AtomicBool::new(false)),
-            outcome: rx,
-        });
+        // `repo-b` is deliberately absent: this run's own Selection is `repo-a` alone.
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
 
         assert_eq!(
             app.core
@@ -9731,18 +9719,7 @@ mod tests {
         app.filter = Filter::parse("sync:behind");
         let repo_a_key = app.core.snapshot().entities[0].key.clone();
 
-        let (_tx, rx) = mpsc::channel();
-        app.management_run = Some(ManagementRun {
-            operation: management::Operation::Sync,
-            targets: Arc::from(vec![repo_a_key.clone()]),
-            progress: Arc::new(Mutex::new(RowProgress {
-                name: Arc::from("repo-a"),
-                position: 1,
-                total: 1,
-            })),
-            cancel: Arc::new(AtomicBool::new(false)),
-            outcome: rx,
-        });
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
         assert_eq!(
             app.core
                 .management_handle()
@@ -9767,6 +9744,131 @@ mod tests {
             "the run is over, so repo-a must be judged by sync:behind alone and drop out \
              now that its branch has caught up"
         );
+    }
+
+    /// The four tests above drive [`App`]'s reaction to a hand-built [`ManagementRun`], the
+    /// same known-position technique
+    /// [`draw_frame_shows_the_management_runs_current_row_as_the_live_notice`] uses; this one
+    /// drives [`App::run_management`]'s own background thread for real instead, over two
+    /// behind repos with a `before_sync` hook slow enough to give the test a reliable window
+    /// (the same technique `esc_cancels_a_management_run_between_rows_never_mid_row` uses):
+    /// whichever repo the real thread names current in its own [`RowProgress`] stays pinned
+    /// once it is fast-forwarded and re-probed mid-turn, then drops out the instant the real
+    /// thread's own position moves past it, proving the actual publish-before-work sequencing
+    /// [`App::run_management`] documents, not just how `App` reacts to a position handed to
+    /// it.
+    #[test]
+    #[cfg(feature = "fetch")]
+    fn a_row_pinned_by_a_real_sync_run_drops_out_the_instant_the_runs_own_thread_moves_past_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.document.actions.push(hook_action_config(
+            "slow-before-sync",
+            &["sh", "-c", "sleep 1"],
+        ));
+        app.document.before_sync = Some("slow-before-sync".to_string());
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.filter = Filter::parse("sync:behind");
+        assert_eq!(
+            app.visible_keys().len(),
+            2,
+            "sanity: both repos must start inside sync:behind, or this proves nothing"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('a'), KeyModifiers::NONE))
+            .expect("select every visible row");
+        open_the_management_gate(&mut app, management::Operation::Sync);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        // The background thread publishes a row's own position before that row's own work
+        // starts, so waiting for it here turns the row's own one-second `before_sync` sleep
+        // into a reliable window rather than a race against thread scheduling.
+        wait_for("the first row to start", || {
+            app.management_run
+                .as_ref()
+                .is_some_and(|run| run.progress.lock().unwrap().position > 0)
+        });
+
+        let current_name = app
+            .management_run
+            .as_ref()
+            .expect("the run must still be outstanding while the first row's own hook sleeps")
+            .progress
+            .lock()
+            .unwrap()
+            .name
+            .to_string();
+        let snapshot = app.core.snapshot();
+        let key_named = |name: &str| {
+            snapshot
+                .entities
+                .iter()
+                .find(|entity| entity.name.as_ref() == name)
+                .expect("fixture repo must be in the table")
+                .key
+                .clone()
+        };
+        let current_key = key_named(&current_name);
+        let other_key = key_named(if current_name == "repo-a" {
+            "repo-b"
+        } else {
+            "repo-a"
+        });
+
+        assert_eq!(
+            app.core
+                .management_handle()
+                .attempt_auto_update(&current_key),
+            repon_core::AutoUpdateAttempt::Updated,
+            "sanity: the real fast-forward must have actually happened"
+        );
+        app.core.refresh(std::slice::from_ref(&current_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert!(
+            !app.filter.matches(
+                app.core
+                    .snapshot()
+                    .entities
+                    .iter()
+                    .find(|entity| entity.key == current_key)
+                    .expect("the row is still in the table")
+            ),
+            "sanity: the re-probe must have caught the Cell up with the real fast-forward"
+        );
+        assert!(
+            app.visible_keys().contains(&current_key),
+            "the real thread's own position still names this row current, so it must stay \
+             pinned even though its branch has caught up"
+        );
+
+        wait_for("the run's own thread to move past the current row", || {
+            app.management_run
+                .as_ref()
+                .is_some_and(|run| run.progress.lock().unwrap().position > 1)
+        });
+
+        assert!(
+            !app.visible_keys().contains(&current_key),
+            "the real thread's own progress marker moved past this row, so it must drop out \
+             of the filter at once rather than staying pinned"
+        );
+        assert!(
+            app.visible_keys().contains(&other_key),
+            "the other row is still behind and never touched by this test, so it must stay \
+             in the filter regardless of what the run just did to its sibling"
+        );
+
+        wait_for_management_run(&mut app);
     }
 
     /// Decisions already made: the pin also covers an ordinary fan-out Action's own
@@ -9866,18 +9968,7 @@ mod tests {
             "sanity: repo-a must start unchecked, or `a` proves nothing about pinning"
         );
 
-        let (_tx, rx) = mpsc::channel();
-        app.management_run = Some(ManagementRun {
-            operation: management::Operation::Sync,
-            targets: Arc::from(vec![repo_a_key.clone()]),
-            progress: Arc::new(Mutex::new(RowProgress {
-                name: Arc::from("repo-a"),
-                position: 1,
-                total: 1,
-            })),
-            cancel: Arc::new(AtomicBool::new(false)),
-            outcome: rx,
-        });
+        app.management_run = Some(pinned_sync_run(vec![repo_a_key.clone()], 1, 1));
         assert_eq!(
             app.core
                 .management_handle()
