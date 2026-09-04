@@ -11094,6 +11094,77 @@ mod tests {
         );
     }
 
+    /// The carry itself: [`probe_patch_equivalence`] diffs the entity's own
+    /// range from the merge base `landing::probe` handed over, rather than
+    /// walking the same commit pair a second time. `mid_sha` is a real commit
+    /// on `feature` but not its fork point, so the two answers differ: from the
+    /// fork point the range is the whole squashed change and settles `Merged`,
+    /// from `mid_sha` it is only `b.txt` and settles `Active`. A regression that
+    /// recomputed the base here would answer `Merged` and fail this test.
+    #[test]
+    fn probe_patch_equivalence_diffs_from_the_merge_base_it_was_handed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo_path = root_of(&dir).join("repo");
+        init_repo_with_a_commit(&repo_path);
+        let fork_point_hex = head_sha(&repo_path);
+        git(&repo_path, &["checkout", "-b", "feature"]);
+        fs::write(repo_path.join("a.txt"), "one\n").expect("write a.txt");
+        git(&repo_path, &["add", "a.txt"]);
+        git(&repo_path, &["commit", "-m", "add a"]);
+        let mid_sha = id(&head_sha(&repo_path));
+        fs::write(repo_path.join("b.txt"), "two\n").expect("write b.txt");
+        git(&repo_path, &["add", "b.txt"]);
+        git(&repo_path, &["commit", "-m", "add b"]);
+        let feature_sha = id(&head_sha(&repo_path));
+        git(&repo_path, &["checkout", "-B", "main", &fork_point_hex]);
+        git(&repo_path, &["merge", "--squash", "feature"]);
+        git(&repo_path, &["commit", "-m", "squashed feature"]);
+        let main_sha = id(&head_sha(&repo_path));
+
+        let repo = gix::open(&repo_path).expect("open repo");
+        // What `landing::probe` hands over, with a base halfway along the
+        // branch standing in for one only this pass could know.
+        let outstanding = landing::Outstanding {
+            entity_tip: feature_sha,
+            default_tip: main_sha,
+            merge_base: Some(mid_sha),
+        };
+        let common_dir: Arc<Path> = Arc::from(repo_path.join(".git"));
+        let cancel = AtomicBool::new(false);
+        let patch_cache: PatchIdentityCache = Mutex::new(HashMap::new());
+        let patch_reads = AtomicUsize::new(0);
+        let patch_scan_bounds: Mutex<Vec<Option<gix::ObjectId>>> = Mutex::new(Vec::new());
+        let memo = PatchEquivalenceMemo {
+            cache: &patch_cache,
+            reads: &patch_reads,
+            scan_bounds: &patch_scan_bounds,
+        };
+        let gate = BoundGate::new(1);
+        let mut report = GateReport::new(&gate);
+
+        let settled = probe_patch_equivalence(
+            &repo,
+            &outstanding,
+            &common_dir,
+            &cancel,
+            &memo,
+            &mut report,
+        );
+
+        assert!(
+            matches!(
+                settled,
+                Some(Settled::Known {
+                    value: WorktreeState::Active,
+                    at: _,
+                    stale: _
+                })
+            ),
+            "the range must be measured from the handed-in base ({mid_sha:?}), whose only \
+             change the squash commit does not match, got {settled:?}"
+        );
+    }
+
     /// The edge [`deepest_merge_base`] exists for: no entity sharing a common
     /// dir ever had a merge base to offer (every one settled by ancestry, was
     /// cancelled, or shared no history with the default branch at all), so the
