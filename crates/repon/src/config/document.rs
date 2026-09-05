@@ -3029,6 +3029,16 @@ mod tests {
         }
     }
 
+    /// `unignore` is not a built-in any more, so the name is the user's to take: `ignore`
+    /// covers both directions and nothing in the palette answers to the old name.
+    #[test]
+    fn a_config_action_may_take_the_name_unignore() {
+        let loaded =
+            parse_ok("[[action]]\nname = \"unignore\"\n\n[[action.steps]]\nargs = [\"true\"]\n");
+
+        assert_eq!(loaded.document.actions[0].name.get_ref(), "unignore");
+    }
+
     /// The negative control: a name that merely contains a reserved one is not reserved, so
     /// the check is an equality on the whole name rather than a substring test that would
     /// quietly forbid `ignore-vendored`.

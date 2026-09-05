@@ -5525,11 +5525,11 @@ mod tests {
     }
 
     /// A built-in counts its own eligible rows, never the Action gate's operable count, and
-    /// `unignore` is the case that proves it: its eligible set is exactly the excluded rows,
-    /// which [`repon_core::Core::operable_count`] subtracts to zero. Read from the palette's
-    /// own border title on a real frame, which is the number the user is shown.
+    /// `ignore` over an already-excluded row is the case that proves it: the row it will act
+    /// on is one [`repon_core::Core::operable_count`] subtracts to zero. Read from the
+    /// palette's own border title on a real frame, which is the number the user is shown.
     #[test]
-    fn unignore_over_an_excluded_row_counts_it_rather_than_subtracting_it() {
+    fn ignore_over_an_excluded_row_counts_it_rather_than_subtracting_it() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
@@ -5549,12 +5549,10 @@ mod tests {
 
         app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
             .expect("press m");
-        app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
-            .expect("highlight unignore");
         let choosing = render_to_lines(&mut app, 80, 24).join("\n");
         assert!(
             choosing.contains("run on 1 repos"),
-            "the border title counts the excluded row unignore would act on, got:\n{choosing}"
+            "the border title counts the excluded row `ignore` would act on, got:\n{choosing}"
         );
 
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
@@ -5566,7 +5564,7 @@ mod tests {
         );
         let confirming = render_to_lines(&mut app, 80, 24).join("\n");
         assert!(
-            confirming.contains("unignore on 1 repos?"),
+            confirming.contains("ignore on 1 repos?"),
             "and the gate itself counts it too, got:\n{confirming}"
         );
     }
@@ -5622,8 +5620,8 @@ mod tests {
         }
     }
 
-    /// The mirror of the above: `ignore` over a row that is already excluded is refused, and
-    /// the refusal is named and counted in the gate rather than collapsing into a bare "0
+    /// The mirror of the above: `sync` over a Worktree, which syncs through its Repo and is
+    /// refused, is named and counted in the gate rather than collapsing into a bare "0
     /// repos" ([repo-management.md](../../../docs/spec/repo-management.md): "A refusal is
     /// reported and counted in the confirm gate, never silent"). Every row of the Selection
     /// being ineligible is the case that used to close the palette with a count and no reason.
@@ -5633,24 +5631,28 @@ mod tests {
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         let repo = root.join("repo-a");
         init_repo(&repo);
-        let mut app = test_app_with_overrides(
-            &root,
-            vec![repon_core::RepoOverride {
-                path: repo.clone(),
-                default_branch: None,
-                excluded: true,
-            }],
-        );
+        let worktree = root.join("repo-a-tree");
+        worktree_add(&repo, &worktree, "side");
+        let mut app = test_app(&root);
+        let tree_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.kind == repon_core::Kind::Worktree)
+            .map(|entity| entity.key.clone())
+            .expect("the fixture must discover the worktree");
+        app.selection.toggle(tree_key);
 
-        open_the_management_gate(&mut app, management::Operation::Ignore);
+        open_the_management_gate(&mut app, management::Operation::Sync);
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("ignore on 0 repos, 1 refused?"),
+            frame.contains("sync on 0 repos, 1 refused?"),
             "the headline counts the refusal, got:\n{frame}"
         );
         assert!(
-            frame.contains("repo-a: refused, already ignored"),
+            frame.contains("repo-a-tree: refused, sync acts on a Repo"),
             "and the row is named with its reason, got:\n{frame}"
         );
     }
@@ -6357,12 +6359,12 @@ mod tests {
         );
     }
 
-    /// `unignore` immediately after, in the same session: the entry it wrote is the entry it
-    /// removes, and the row is operable again in the same frame. This is the half
-    /// [repo-management.md](../../../docs/spec/repo-management.md) says `ignore` alone cannot
+    /// `ignore` again immediately after, in the same session: the entry it wrote is the
+    /// entry it removes, and the row is operable again in the same frame. This is the half
+    /// [repo-management.md](../../../docs/spec/repo-management.md) says one run alone cannot
     /// prove, since a row that was never subtracted would also read as unsubtracted here.
     #[test]
-    fn unignore_in_the_same_session_returns_the_row_and_the_file_to_where_they_started() {
+    fn ignoring_twice_in_the_same_session_returns_the_row_and_the_file_to_where_they_started() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
@@ -6377,7 +6379,7 @@ mod tests {
             "the ignore took effect first"
         );
 
-        press_through_the_management_gate(&mut app, management::Operation::Unignore);
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
 
         assert_eq!(
             std::fs::read_to_string(&app.config_file).expect("read config.toml back"),
@@ -6393,7 +6395,7 @@ mod tests {
             1,
             "and is no longer subtracted"
         );
-        assert_eq!(app.notice(), Some("unignore: 1 done"));
+        assert_eq!(app.notice(), Some("ignore: 1 done"));
     }
 
     /// `delete`'s second half, which the operations table names and no test reached before:
@@ -12507,6 +12509,10 @@ refresh_all = "z""#,
             "the fixture must discover all three repos"
         );
         app.selection.select_all_visible(&visible);
+        // A config-defined entry, since the subtraction under test is the Action gate's: a
+        // built-in counts its own eligible rows instead
+        // ([`ignore_over_an_excluded_row_counts_it_rather_than_subtracting_it`]).
+        app.document.actions = vec![action_config("reinstall", true, &root.join("unused"))];
 
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
@@ -12801,18 +12807,14 @@ refresh_all = "z""#,
     }
 
     /// The deliberate exception, pinned so a later change cannot widen the destructive path
-    /// by accident: `ignore`, `unignore` and `delete`, with nothing checked, still gate the
+    /// by accident: `ignore` and `delete`, with nothing checked, still gate the
     /// cursor row alone and never name the other visible row. `delete` over every visible
     /// row behind a single confirm is the trade this refuses. `sync` is deliberately absent
     /// from this loop: it is the one operation this issue widens, and its own test is
     /// [`sync_with_an_empty_selection_plans_over_every_visible_row_not_the_cursor_row_alone`].
     #[test]
     fn every_management_operation_with_an_empty_selection_still_gates_the_cursor_row_alone() {
-        for operation in [
-            management::Operation::Ignore,
-            management::Operation::Unignore,
-            management::Operation::Delete,
-        ] {
+        for operation in [management::Operation::Ignore, management::Operation::Delete] {
             let dir = tempfile::tempdir().expect("temp dir");
             let root = dir.path().canonicalize().expect("canonicalize temp dir");
             init_repo(&root.join("repo-a"));

@@ -1259,14 +1259,7 @@ mod tests {
         );
         assert_eq!(
             names(&entries(&actions, Scope::Everything, "")),
-            vec![
-                "reinstall",
-                "deploy",
-                "ignore",
-                "unignore",
-                "delete",
-                "sync"
-            ],
+            vec!["reinstall", "deploy", "ignore", "delete", "sync"],
             "an empty query lists everything, config-defined first and the built-ins after"
         );
         assert!(entries(&actions, Scope::Everything, "nothing-named-this").is_empty());
@@ -2398,7 +2391,7 @@ mod tests {
         assert_eq!(palette.highlighted(&actions).unwrap().name(), "ignore");
 
         palette.move_highlight(1, &actions);
-        assert_eq!(palette.highlighted(&actions).unwrap().name(), "unignore");
+        assert_eq!(palette.highlighted(&actions).unwrap().name(), "delete");
 
         palette.move_highlight(3, &actions);
         assert_eq!(
