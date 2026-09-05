@@ -128,6 +128,7 @@ fn meaning_text(meaning: Meaning) -> &'static str {
         Meaning::ChildRow => "child row",
         Meaning::OrphanChildRow => "child with no visible parent",
         Meaning::Checked => "checked (the Selection's own marker)",
+        Meaning::Ignored => "ignored",
         Meaning::Truncated => "truncated name",
     }
 }

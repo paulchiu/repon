@@ -8,6 +8,7 @@
 //! two that grow into the frame's slack, so every column's position is a [`Columns`] computed
 //! per frame rather than a constant.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -998,11 +999,24 @@ fn draw_name_cell(
         y,
         name_width,
         TruncatingText {
-            text: &entity.name,
+            text: &ignore_marked(entity, glyphs),
             mark: glyphs.truncated,
         },
         name_style,
     );
+}
+
+/// The name as the row draws it: prefixed with `glyphs.ignored` when a `[[repo]]` entry
+/// excludes the entity, so the rows [`crate::keys::Action::ToggleIgnored`] brings back are
+/// distinguishable from the ones that were never hidden. The mark leads the name rather than
+/// taking a column of its own, because the marker column beside it is the Selection's and a
+/// row can be both ([theming.md](../../../../docs/spec/theming.md)).
+fn ignore_marked<'a>(entity: &'a EntityState, glyphs: &'static GlyphSet) -> Cow<'a, str> {
+    if entity.excluded {
+        Cow::Owned(format!("{} {}", glyphs.ignored, entity.name))
+    } else {
+        Cow::Borrowed(&entity.name)
+    }
 }
 
 /// Draws the header row: each column's label at that column's own start, the sorted column's

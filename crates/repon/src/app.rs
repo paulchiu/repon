@@ -6431,6 +6431,47 @@ mod tests {
         );
     }
 
+    /// An ignored row brought back into view is marked as one. Without a mark the toggle
+    /// shows a table whose ignored and listed rows read identically, which is the question
+    /// the toggle exists to answer.
+    #[test]
+    fn an_ignored_row_on_screen_is_marked_as_ignored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let hidden = root.join("repo-a");
+        init_repo(&hidden);
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: hidden,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        show_ignored_rows(&mut app);
+
+        let frame = render_to_lines(&mut app, 80, 24);
+        let ignored_row = frame
+            .iter()
+            .find(|line| line.contains("repo-a"))
+            .expect("the ignored row is on screen");
+        let listed_row = frame
+            .iter()
+            .find(|line| line.contains("repo-b"))
+            .expect("the listed row is on screen");
+
+        let mark = crate::glyphs::FULL.ignored;
+        assert!(
+            ignored_row.contains(mark),
+            "the ignored row carries {mark:?}, got: {ignored_row:?}"
+        );
+        assert!(
+            !listed_row.contains(mark),
+            "and a listed row does not, got: {listed_row:?}"
+        );
+    }
+
     /// The ignored toggle is how an ignored row is reached again, now that `ignore` hides
     /// it: on, the row is back in the table; off, it is gone again.
     #[test]
