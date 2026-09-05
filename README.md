@@ -74,6 +74,7 @@ superfile and lazygit are both MIT licensed.
 - [llms.txt](llms.txt): agent-friendly project index and configuration quickstart.
 - [AGENTS.md](AGENTS.md): how work moves through this repo, for agents and for people.
 - [GLOSSARY.md](GLOSSARY.md): the project glossary. Terms like Repo, Worktree, Set, Filter, Selection, Launcher and Action are used in their defined senses throughout this repo.
+- [docs/product.md](docs/product.md): what Repon is for and what it refuses to do.
 - [docs/adr/](docs/adr/): architecture decision records.
 - [docs/spec/](docs/spec/): the specifications those decisions point at.
 - [docs/research/](docs/research/): the research the decisions rest on.

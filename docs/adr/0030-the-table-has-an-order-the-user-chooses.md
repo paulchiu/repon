@@ -1,5 +1,9 @@
 # The table has an order the user chooses, it is modal, and it is session state
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [layout-and-provenance.md](../spec/layout-and-provenance.md). Nothing below is maintained.
+
 The table had exactly one order: grouped discovery order, a Repo followed by its own Worktrees and Submodules, fixed by [layout-and-provenance.md](../spec/layout-and-provenance.md#the-list). That order answers "what have I got" and nothing else. It cannot answer which Repo is dirtiest, which branch is furthest behind, or where the `gone` Worktrees are, which are the questions the outer loop is actually opened for ([0002](0002-repon-owns-the-outer-loop-only.md)). `o` now opens a sort menu, one column key puts the table in that column's order, and the same key again reverses it.
 
 The interaction model is not invented here. It is the one the author already built and uses in blubat (`src/tui/{app,view,render,columns}.rs`), reproduced rather than improved on: a mode key opens a menu, the table holds still underneath it in whatever order it was already in, only the footer's advertised keys change, and a second keypress picks the column and closes the menu. The state is a `(column, direction)` pair. Choosing the active column reverses the direction; choosing any other column opens it at that column's own natural direction and never inherits the previous column's, which is blubat's `View::choose_sort` transcribed into `RowOrder::choose`. Copying a model the author has lived with for months is worth more than a locally better one they have not.

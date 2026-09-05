@@ -1,5 +1,9 @@
 # `sync` is always built, and ineligible without `fetch`
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [repo-management.md](../spec/repo-management.md) and [config.md](../spec/config.md). Nothing below is maintained.
+
 > Superseded in part by [0015](0015-the-core-owns-the-table.md)'s amendment: fetch is
 > unconditional in both crates now, with no cargo feature gating it, so there is no build
 > left in which `sync` has nothing to call. `Eligibility::Refused(Refusal::FetchNotBuilt)`

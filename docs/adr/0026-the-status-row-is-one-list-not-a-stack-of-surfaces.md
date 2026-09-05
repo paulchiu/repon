@@ -1,5 +1,9 @@
 # The status row is one list, not a stack of surfaces
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [layout-and-provenance.md](../spec/layout-and-provenance.md). Nothing below is maintained.
+
 The status row holds one list of items, degraded by one drop table, rather than a stack of surfaces ranked against each other. A standing warning is an item in that list, not a rival to the header. Its **indicator**, a `!` and a count, is reserved out of the budget before anything is laid out and can never be dropped; its message text competes for what is left. `w` **acknowledges**: once the user has opened the expanded list, the row falls back to the indicator, and a newly-arrived warning expands it again. A Notice remains the one thing that takes the whole row, as [0023](0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md) already settled. This answers the question 0023 left open and ticketed.
 
 The two obvious answers are both bad, and they are bad because the framing was wrong. Ranking a warning above the header hides the entity count for a whole session, since a config warning is continuously true and, as this decision found, nothing dismissed one. Ranking it below drops a warning silently at 88 columns, which is the quiet lie [theming.md](../spec/theming.md) invokes [0001](0001-per-cell-provenance.md) to forbid. Both follow from treating two claimants as whole surfaces that win or lose the row outright. Neither survives the row being one budget with items in it.

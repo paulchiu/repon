@@ -1,18 +1,9 @@
 # Every displayed value carries per-cell provenance
 
-Progressive loading across hundreds of Repos means values arrive from different sources on different clocks, which is exactly the defect class behind nearly every UI complaint about a predecessor tool: the screen contradicted itself. Every displayed value therefore carries a provenance state, Unknown, Loading, Fresh(at), Stale(at) or Failed, and rendering is a total function of that state. The type system makes the bad states unrepresentable rather than relying on discipline.
+Every displayed value carries its whole provenance, and the only route to the value is a match, so an absent value can never be read as a default. A cell is four settled answers, `Unknown` with a reason, `Known` with a value and a timestamp, `Failed`, and `NotApplicable`, plus an orthogonal in-flight flag. Rendering is a total function of that state.
 
-## Consequences
+What must never happen is an uncomputed ahead/behind count rendering as `0`. Progressive loading across hundreds of entities means values arrive from different sources on different clocks, and a screen that contradicts itself is the defect class behind nearly every complaint about the predecessor tool. So there is no "just show the number" path, and no `Option` wrapped around a cell, because an `Option` reintroduces the bare default this type exists to close. Supersession is per cell against that cell's own recorded Generation, never against a global current, so a refresh scoped to the Selection cannot strand the rows it never spoke for, and a re-probe keeps the previous value rather than blanking it.
 
-- An absent value never renders as zero. An ahead/behind count that has not been computed shows as unknown, not 0.
-- Every widget must handle all five states; there is no "just show the number" path.
-- A slow Repo times out to Unknown rather than holding the table, and a newer refresh supersedes an older one rather than queueing.
-- This is the load-bearing architectural decision; the core's data model (see [0005](0005-rendering-agnostic-core.md)) is shaped around it.
+**Enforcement:** `Cell::settled` in `crates/repon-core/src/cell.rs` returns an `Option<&Settled<T>>`, so no value is reachable without a match. `a_lower_generation_write_does_not_overwrite_a_higher_one` and `re_probing_keeps_the_previous_value_instead_of_blanking`, in the same file, hold supersession and the re-probe rule; `unknown_reasons_match_this_documents_own_table` holds the reason set against the spec. `every_settled_known_destructure_names_every_field_it_does_not_use` in `crates/repon/src/test_support.rs` fails the build on any `Settled::Known` destructure that elides a field behind `..`.
 
-## Amended by 0013
-
-Two clarifications, both from measuring the refresh model. Unknown carries a reason, so that timed out, no upstream, no default branch and no remote are all Unknown and all render `?` while the detail pane says which; a sixth state was rejected rather than the distinction. And a slow Repo no longer times out on its own clock: the deadline belongs to the generation, which is cancelled at thirty seconds, and every cell still Loading in it becomes Unknown at that moment. Supersession is per entity rather than global, so a refresh over the Selection cannot strand the rows it never spoke for. See [0013](0013-no-filesystem-watching-a-refresh-is-a-cancellable-generation.md).
-
-## Amended by 0015
-
-Loading is no longer one of the five. A cell is four settled answers, Unknown with its reason, Known with its value and timestamp, Failed, and NotApplicable, plus an orthogonal in-flight flag. Two reasons: 0013 already stopped treating Loading as a peer when it made in-flight a row property outranking the least-settled-state summary, and a flat five-arm enum cannot hold a cell's previous value while a re-probe is in flight, which [layout-and-provenance.md](../spec/layout-and-provenance.md) requires. NotApplicable becomes a settled answer rather than an absent value, since an `Option` around the cell would reintroduce the bare default path this ADR exists to close. The five states a reader sees on screen are unchanged. The type also gains a requirement this ADR never stated: a cell must be `Clone`, because the consumer reads a cloned snapshot every frame. See [0015](0015-the-core-owns-the-table.md).
+Earlier revisions of this record, including its amendment history, are in the git history of this file.

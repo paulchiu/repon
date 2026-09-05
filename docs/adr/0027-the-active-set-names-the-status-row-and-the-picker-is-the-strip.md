@@ -1,5 +1,9 @@
 # The active Set names the status row, and the picker is the tab strip
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [layout-and-provenance.md](../spec/layout-and-provenance.md) and [config.md](../spec/config.md). Nothing below is maintained.
+
 The active Set's name replaces the program name in the status row's first item, so rank 1 reads `work 403 entities` where it read `repon 403 entities`. There is no tab strip: `s` draws the Set picker, one row per declared Set in file order with its `1` to `9` number beside it, and that is the strip. The name is never truncated: it renders whole, or its item drops whole under the one drop table [0026](0026-the-status-row-is-one-list-not-a-stack-of-surfaces.md) fixed for that row. Switching Set raises a Notice naming the Set switched to, and a digit past the last declared Set answers with one instead of doing nothing. This settles the question [0025](0025-a-name-that-bounds-the-work-is-never-substituted.md) raised and ticketed, that by the design of record the most consequential piece of session state Repon holds appeared on screen nowhere.
 
 A strip is refused on the vertical arithmetic, which nothing had done. The reference terminal is 24 rows. The status row, the frame's top border, the column header, the frame's bottom border and the footer are five rows of chrome, leaving 19 for the table at `88x24`. A tab strip makes it 18, permanently, and it spends that row on state that changes perhaps twice in a session. [0014](0014-config-is-read-only-and-a-set-bounds-the-work.md) said "Sets are the tab strip" while settling something else, the choice of array-of-tables over a map of tables, and what it needed from the phrase was that file order fixes the numbers. That is an ordering claim. The rendering claim rode along with it and is withdrawn here.

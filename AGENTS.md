@@ -20,4 +20,4 @@ The workspace is two crates. `crates/repon-core` computes state and knows nothin
 
 [GLOSSARY.md](GLOSSARY.md) defines the project's words, and they are used in those senses in the code as well as the docs. Some tests read it directly, so a term is a contract rather than a note.
 
-Decisions live in [docs/adr/](docs/adr/), the specifications they point at live in [docs/spec/](docs/spec/), and the research under them lives in [docs/research/](docs/research/). Check whether a decision already exists before making a new one.
+Product intent lives in [docs/product.md](docs/product.md), decisions live in [docs/adr/](docs/adr/), the specifications they point at live in [docs/spec/](docs/spec/), and the research under them lives in [docs/research/](docs/research/). Check whether a decision already exists before making a new one.

@@ -1,5 +1,9 @@
 # Provenance renders as a row gutter and blank cells
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [layout-and-provenance.md](../spec/layout-and-provenance.md) and [theming.md](../spec/theming.md). Nothing below is maintained.
+
 A throwaway ratatui prototype with 37 fake entities and fake arrival timings compared three structurally different renderings of per-cell provenance ([0001](0001-per-cell-provenance.md)): a glyph in the value's own cell for every state, which makes a table of hundreds of rows noisy; a trailing column reporting freshness as relative time; and a one-character gutter at the row start carrying the row's least-settled state, with any cell that has no value left blank. The gutter won.
 
 Blankness is safe here because of a contract: a blank cell means "there is no value here, and the gutter says why". That contract is what lets the table stay quiet without lying, and it holds only while no provenance mark shares a glyph with a real value. The prototype's first draft rendered Unknown as `·` and a clean Worktree as `·`, which is the exact defect per-cell provenance exists to prevent, arriving through the glyph set rather than through the type.

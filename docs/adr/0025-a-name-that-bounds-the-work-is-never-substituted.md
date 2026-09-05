@@ -1,5 +1,9 @@
 # A name that bounds the work is never substituted
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [config.md](../spec/config.md). Nothing below is maintained.
+
 When the user supplies a name Repon cannot resolve, Repon either substitutes something else and warns, or refuses to start. Which grade applies depends on what the name decides. A name that decides how things *look* may fall back, because the substitution announces itself and costs nothing to undo. A name that **bounds the work**, what exists, what is discovered, what a gesture acts on, is never substituted: Repon exits non-zero before the terminal is claimed. An unresolvable `--set`, `REPON_SET`, `--config` or `REPON_CONFIG` takes the second grade; a `theme` that names nothing keeps the first.
 
 A Set is the second kind by [config.md](../spec/config.md#sets)'s own definition: an entity excluded by a Set is never discovered and never probed, which is what separates it from a Filter, so it decides what exists rather than what is visible. Everything after it is scoped by it, including an Action fanning out across the Selection. The stake is measured rather than imagined, since `~/dev` holds 148 Repos and 161 Worktrees, so the gap between a named six-Repo Set and the implicit `all` is six rows against 309, and an Action touching six checkouts against one touching every checkout on the machine. This map's standing constraint is that anything automatic means the narrowest safe operation or none, and the rung the old behaviour fell through to, "the first declared Set", is not the narrowest. It is whichever Set happens to be first in the file. Arbitrariness is what disqualifies it: it is not a safe default but a coin toss wearing one's clothes.

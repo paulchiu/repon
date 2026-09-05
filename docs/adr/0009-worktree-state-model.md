@@ -1,5 +1,9 @@
 # Worktrees have four exclusive states plus Dirty, and rebase is report-only
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [core-api.md](../spec/core-api.md) and [head.md](../spec/head.md). Nothing below is maintained.
+
 Worktrees are the second-largest entity class (163 measured against 259 repos), so they are first class, with four mutually exclusive states, Merged, Gone, Local only and Active, plus the orthogonal Dirty flag (defined in [GLOSSARY.md](../../GLOSSARY.md)). Merged, Gone and Local only are three distinct states rather than one "stale" bucket because they imply different actions (Merged is safe to sweep, Gone probably landed via a squash merge, Local only was never pushed and is never safe to sweep); collapsing them is how you lose code. When Repon updates a default branch it reports which Worktrees are now behind but does not rebase them, per the narrowest-safe-operation rule ([0002](0002-repon-owns-the-outer-loop-only.md)): automatic action means the narrowest safe operation or none.
 
 ## Amended by 0012

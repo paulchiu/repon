@@ -1,5 +1,9 @@
 # Repon writes the Repo entries it owns, and deletion is confirmed rather than undoable
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [repo-management.md](../spec/repo-management.md) and [config.md](../spec/config.md). Nothing below is maintained.
+
 Repon writes `config.toml` for one bounded set of entries, `[[repo]]`, and deletes a Repo's working tree on an explicit confirmed gesture over the Selection. This supersedes the opening sentence of [0014](0014-config-is-read-only-and-a-set-bounds-the-work.md), "Repon never writes `config.toml`", and redraws the scope ruling that put removal beyond this effort. The rest of 0014 stands: there is still no config watcher, still no first-run materialisation of a default file, and `repon config --example` still prints to stdout for the user to redirect.
 
 The reason is the product's own definition. [0002](0002-repon-owns-the-outer-loop-only.md) says Repon owns acting on many Repos at once, and telling a tool which Repos to stop operating on is that kind of act: it is a fact about a set of entities, discovered while looking at the table, applied to several rows in one gesture. Sending the user to an editor to hand-write a `[[repo]]` block per row is the outer-loop cost the product exists to remove, and a management surface that only prints the commands for the user to run would be that same cost with an extra step. So management is a fan-out over the Selection, sharing the Action confirm gate's shape (a count, with ineligible entities subtracted and named) without its pty machinery, since nothing here runs a child process.

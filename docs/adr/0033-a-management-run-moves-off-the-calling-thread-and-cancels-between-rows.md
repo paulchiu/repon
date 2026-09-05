@@ -1,5 +1,9 @@
 # A management run moves off the calling thread and cancels between rows
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [repo-management.md](../spec/repo-management.md) and [core-api.md](../spec/core-api.md). Nothing below is maintained.
+
 `App::run_management`'s per-row work now runs on a background thread `y` over a built-in's confirm gate starts, rather than on the thread that draws frames and reads keys. This is the second half of #336, deliberately not attempted there: the first half made the run legible, painting a Notice naming each row and its position before that row's own work starts, but it still ran that work inline, so the whole draw-and-input loop sat still for however long `delete`'s own worktree walk and hooks took. Issue #342 is the rest.
 
 ## The seam

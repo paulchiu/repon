@@ -68,7 +68,7 @@ The abbreviation is nine characters, fixed, rather than git's own. `core.abbrev 
 
 ## The sync cell
 
-`-` on a detached row, which is what [discovery.md](discovery.md) already draws on all 16 Submodule rows. Record what this settles: [core-api.md](core-api.md) had `Unknown::NoUpstream`, "The branch tracks nothing", rendering blank with `?` in the gutter, while [default-branch.md](default-branch.md) renders the same fact as `-`, a value behind a blank gutter. `-` wins, because it is in the value glyph set [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) fixes and it is already on screen. `Unknown::NoUpstream` and `Unknown::NoRemote` leave the closed set, which shrinks to `TimedOut` and `NoDefaultBranch`.
+`-` on a detached row, which is what [discovery.md](discovery.md) already draws on all 16 Submodule rows. Record what this settles: [core-api.md](core-api.md) had `Unknown::NoUpstream`, "The branch tracks nothing", rendering blank with `?` in the gutter, while [default-branch.md](default-branch.md) renders the same fact as `-`, a value behind a blank gutter. `-` wins, because it is in the value glyph set [0010](../adr/0010-provenance-renders-as-a-row-gutter-and-blank-cells.md) fixes and it is already on screen. `Unknown::NoUpstream` and `Unknown::NoRemote` leave the closed set, which left `TimedOut` and `NoDefaultBranch` standing at the time. `SubmoduleUninitialized` joined them afterwards, for [discovery.md](discovery.md)'s uninitialised Submodule row, so the set is three today and [core-api.md](core-api.md) carries it in full; closed bounds how the set changes rather than how large it is.
 
 ## The gutter
 

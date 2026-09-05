@@ -1,18 +1,22 @@
-//! Guards the register cleanup this issue made: `README.md` and `docs/spec/*.md` are read
-//! back and checked for the specific AI-writing patterns the issue's acceptance criteria
-//! ban, so a later edit that reintroduces one of them fails here instead of drifting back in
-//! unnoticed. `docs/adr/**` is deliberately not scanned: an ADR is a point-in-time record and
-//! is out of scope for this register.
+//! Guards the register cleanup this issue made: `README.md`, `docs/product.md` and
+//! `docs/spec/*.md` are read back and checked for the specific AI-writing patterns the issue's
+//! acceptance criteria ban, so a later edit that reintroduces one of them fails here instead of
+//! drifting back in unnoticed. `docs/adr/**` is deliberately not scanned: an ADR is a
+//! point-in-time record and is out of scope for this register.
 
 use std::fs;
 use std::path::PathBuf;
 
-/// `README.md` plus every `docs/spec/*.md` file, each as `(display path, contents)`.
+/// `README.md` and `docs/product.md` plus every `docs/spec/*.md` file, each as
+/// `(display path, contents)`.
 fn corpus() -> Vec<(String, String)> {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.join("../..");
 
-    let mut paths = vec![repo_root.join("README.md")];
+    let mut paths = vec![
+        repo_root.join("README.md"),
+        repo_root.join("docs/product.md"),
+    ];
     let spec_dir = repo_root.join("docs/spec");
     let mut spec_files: Vec<PathBuf> = fs::read_dir(&spec_dir)
         .unwrap_or_else(|error| panic!("read {}: {error}", spec_dir.display()))

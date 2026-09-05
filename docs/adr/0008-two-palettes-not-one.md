@@ -1,5 +1,9 @@
 # Launchers and Actions get separate palettes on separate keys
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [keybindings.md](../spec/keybindings.md) and [actions.md](../spec/actions.md). Nothing below is maintained.
+
 `!` opens the Launcher palette (behaving like `:` in TUI apps, showing options rather than jumping straight to a shell); Actions get a separate key and palette. The split exists as a safety boundary. A Launcher acts on one Repo and hands over the terminal; an Action acts on N Repos unattended and can do damage.
 
 ## Consequences
