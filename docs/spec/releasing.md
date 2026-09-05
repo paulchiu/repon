@@ -19,11 +19,11 @@ So a new key, a new column behaviour or a new operation is a minor, and a defect
 | `cargo install --git` | live | none; it works against `main` today |
 | crates.io | live | a `vX.Y.Z` tag; the four blockers below are cleared |
 | prebuilt binaries | live | the same tag; macOS on both architectures and Linux x86_64 |
-| Homebrew | open | the same tag, which pushes a formula to `paulchiu/homebrew-tap`; that leg has not yet succeeded |
+| Homebrew | live | the same tag, which pushes a formula to `paulchiu/homebrew-tap` |
 
-Every channel but the first is fed by one tag, and the first tag is cut: `v0.29.0` put both crates on crates.io and created the GitHub release the prebuilt archives hang off. The Homebrew leg of that same tag has not succeeded, so `paulchiu/homebrew-tap` carries no formula and `brew install` is the one route below that does not work yet. Cutting a tag stays a separate act from opening a channel.
+Every channel but the first is fed by one tag. `v0.29.0` put both crates on crates.io, created the GitHub release the prebuilt archives hang off, and pushed the formula to `paulchiu/homebrew-tap`, so every route below works today. Cutting a tag stays a separate act from opening a channel.
 
-The Homebrew route, once a tag exists:
+The Homebrew route:
 
 ```sh
 brew install paulchiu/tap/repon
@@ -98,7 +98,7 @@ It packages and verifies both crates and exits 0, because `--workspace` resolves
 - `cargo publish -p repon` fails with "all dependencies must have a version requirement specified when publishing. dependency `repon-core` does not specify a version". A bare path dependency is legal inside a workspace and illegal in a published archive.
 - With the version requirement added but the library not yet on the index, the same command fails with "no matching package named `repon-core` found", because the verify step builds the packaged `repon` against the registry, where `repon-core` does not exist yet.
 
-So the workspace form is the only form that rehearses before the first publish, and it is also what the tag pipeline will run without `--dry-run`: cargo orders the publishes itself, library first, and waits for the index between them.
+So the workspace form is the only form that rehearses a publish, and it is also what the tag pipeline runs without `--dry-run`: cargo orders the publishes itself, library first, and waits for the index between them.
 
 The packaged artefacts, measured: `repon-core` is 28 files, 1.0 MiB, 254.0 KiB compressed; `repon` is 51 files, 1.5 MiB, 382.7 KiB compressed. Every count here has moved at least twice since the first measurement, because both archives grow with ordinary work: cargo packages `Cargo.lock`, every source file the crate gains ships, and the source itself carries its own tests. Re-measure with `cargo package --workspace --allow-dirty --no-verify` rather than trusting this line; nothing reads it at test time, and a figure in prose goes stale the moment a file is added. Both archives still sit far under crates.io's 10 MB limit, so archive size never enters the release checklist.
 
@@ -173,11 +173,11 @@ Three secrets make it run, and adding them is a manual step in the repository se
 | `CARGO_REGISTRY_TOKEN` | `publish-crates.yml` | a crates.io API token. Cargo's own conventional name for it. |
 | `HOMEBREW_TAP_TOKEN` | `publish-homebrew-formula` | a token with push access to `paulchiu/homebrew-tap`. |
 
-All three are set on `paulchiu/repon`. One fine-grained token with no expiry covers both `RELEASE_TOKEN` and `HOMEBREW_TAP_TOKEN`, since the two repositories it needs are this one and the tap. A token that does expire takes the release pipeline with it silently: `version-tag.yml` falls back to `GITHUB_TOKEN`, so the bump and the tag keep landing and only the release stops.
+All three are set on `paulchiu/repon`. One fine-grained token covers both `RELEASE_TOKEN` and `HOMEBREW_TAP_TOKEN`, since the two repositories it needs are this one and the tap. That token expires, so its renewal is a diary entry rather than a setting. An expired one takes the release pipeline with it quietly: `version-tag.yml` falls back to `GITHUB_TOKEN`, so the bump and the tag keep landing and only the release stops.
 
 crates.io trusted publishing (OIDC, no stored token) was unverifiable for a crate name that did not exist, so the pipeline uses a stored token and sidesteps the question. Both crates are on the index now, so the condition that deferral named is met and the switch is a change someone can make rather than one waiting on the registry.
 
-`v0.29.0` exercised the pipeline for the first time. The crates.io leg and the GitHub release both landed; `publish-homebrew-formula` did not succeed, which is why the Homebrew row above is the one channel still open. `just workflows` parses every workflow and checks that each local `uses:` resolves, which is what a change can prove before a tag runs the pipeline against it.
+`v0.29.0` exercised the pipeline for the first time and ran every job green, opening all four channels in the table above at once; `v0.29.1` repeated it. `just workflows` parses every workflow and checks that each local `uses:` resolves, which is what a change can prove before a tag runs the pipeline against it.
 
 ## What is deliberately not here
 

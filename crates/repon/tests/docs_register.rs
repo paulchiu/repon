@@ -126,3 +126,40 @@ fn no_is_what_antithesis() {
         }
     }
 }
+
+/// `X is the product's identity`, and the abstract-noun sentence subjects that travel with it.
+/// Matched against whitespace-normalised text, because the corpus is hard-wrapped and one of
+/// these once spanned a line break.
+#[test]
+fn no_portentous_abstraction_as_subject() {
+    let banned = [
+        "is the product's identity",
+        "the central decision",
+        "the founding promise",
+        "most consequential",
+    ];
+    for (path, text) in corpus() {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in banned {
+            assert!(
+                !flat.contains(phrase),
+                "{path} still hangs a sentence on {phrase:?}: {:?}",
+                sentence_around(&flat, phrase)
+            );
+        }
+    }
+}
+
+/// `The boundary between them exists so that Y`: a conceptual line given a purpose of its own,
+/// where saying what the split does is shorter. A boundary you could point at on disk is a real
+/// term here and stays, which is why the ban is on the construction rather than on the word.
+#[test]
+fn no_exists_so_that() {
+    for (path, text) in corpus() {
+        assert!(
+            !text.contains("exists so that"),
+            "{path} still contains an \"exists so that\" purpose clause: {:?}",
+            sentence_around(&text, "exists so that")
+        );
+    }
+}

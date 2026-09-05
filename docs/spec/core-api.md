@@ -1,6 +1,6 @@
 # The core API
 
-The workspace is two crates: `repon-core` computes state and knows nothing about rendering, and `repon` is one consumer of it, with the machine-readable mode as the second. This spec fixes the boundary between them: the public types, the entry points, the wire format and what the core is forbidden to know. The reasoning is in [0015](../adr/0015-the-core-owns-the-table.md).
+The workspace is two crates: `repon-core` computes state and knows nothing about rendering, and `repon` is one consumer of it, with the machine-readable mode as the second. This spec fixes what passes between them: the public types, the entry points, the wire format and what the core is forbidden to know. The reasoning is in [0015](../adr/0015-the-core-owns-the-table.md).
 
 ## What the core owns
 
