@@ -244,6 +244,10 @@ pub struct List {
     /// config fields independently, through [`visible_row_order`], so the two never disagree
     /// about which rows exist.
     show_submodules: bool,
+    /// Whether rows a `[[repo]]` entry excludes are drawn this frame, handed down fresh
+    /// every frame by [`Self::set_show_ignored`]: session state the ignored toggle sets, so
+    /// no config handshake carries it.
+    show_ignored: bool,
     /// The Filter currently narrowing this draw, handed in every frame by
     /// [`crate::app::App::render`] ([`Self::set_filter`]) rather than read from config: a
     /// Filter is per-frame session state, not a config field. `Filter::default()` (matches
@@ -286,6 +290,7 @@ impl Default for List {
             started_at: Instant::now(),
             show_worktrees: true,
             show_submodules: false,
+            show_ignored: false,
             filter: Filter::default(),
             pinned: HashSet::new(),
             cursor: 0,
@@ -327,8 +332,11 @@ impl List {
         // read the row count before the block is built, rather than after.
         let visible_rows = visible_row_order(
             &snapshot.entities,
-            self.show_worktrees,
-            self.show_submodules,
+            Visibility {
+                worktrees: self.show_worktrees,
+                submodules: self.show_submodules,
+                ignored: self.show_ignored,
+            },
             &self.filter,
             self.row_order,
             &self.pinned,
@@ -547,6 +555,12 @@ impl List {
     pub(crate) fn set_show_worktrees(&mut self, show_worktrees: bool) {
         self.show_worktrees = show_worktrees;
     }
+
+    /// The ignored toggle's own state for this frame, read fresh every frame the same way
+    /// [`Self::set_show_worktrees`] is: no config key backs it, so nothing else could.
+    pub(crate) fn set_show_ignored(&mut self, show_ignored: bool) {
+        self.show_ignored = show_ignored;
+    }
 }
 
 /// The clamp [`write_cell`] and [`write_truncating_cell`] share: `x` past `interior`'s own
@@ -714,9 +728,34 @@ pub(crate) fn kind_is_visible(
     }
 }
 
-/// The rows a consumer should draw or count as visible: `entities` narrowed by the
-/// show-worktrees and show-submodules preferences ([`kind_is_visible`]) and by `filter`
-/// ([`repon_core::Filter::matches`]), then grouped by parent ([`grouped_row_order`]).
+/// What the table draws beyond what the Filter decides: the two Kind preferences and the
+/// ignored toggle. One value rather than three parameters because every caller carries all
+/// three together, and three bare `bool`s in a row read as nothing at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Visibility {
+    pub(crate) worktrees: bool,
+    pub(crate) submodules: bool,
+    /// Rows a `[[repo]]` entry excludes. Off by default: `ignore` hides the row it names
+    /// ([repo-management.md](../../../../docs/spec/repo-management.md)).
+    pub(crate) ignored: bool,
+}
+
+impl Visibility {
+    /// Every row drawn, for a test with no hidden-row concern of its own.
+    #[cfg(test)]
+    pub(crate) fn everything() -> Self {
+        Visibility {
+            worktrees: true,
+            submodules: true,
+            ignored: true,
+        }
+    }
+}
+
+/// The rows a consumer should draw or count as visible: `entities` narrowed by
+/// [`Visibility`] (the two Kind preferences through [`kind_is_visible`], and the ignored
+/// rows) and by `filter` ([`repon_core::Filter::matches`]), then grouped by parent
+/// ([`grouped_row_order`]).
 /// Shared by [`List::render`] and `crate::app::App::visible_keys` so the two can never
 /// disagree about which rows exist or what order they come in.
 ///
@@ -740,8 +779,7 @@ pub(crate) fn kind_is_visible(
 /// (`crate::app::App`'s own pinned-key set). Empty for every caller with no such run.
 pub(crate) fn visible_row_order(
     entities: &[EntityState],
-    show_worktrees: bool,
-    show_submodules: bool,
+    visibility: Visibility,
     filter: &Filter,
     order: RowOrder,
     pinned: &HashSet<EntityKey>,
@@ -749,7 +787,12 @@ pub(crate) fn visible_row_order(
     let mut candidates: Vec<usize> = (0..entities.len())
         .filter(|&index| {
             let entity = &entities[index];
-            kind_is_visible(entity.kind, show_worktrees, show_submodules, filter)
+            kind_is_visible(
+                entity.kind,
+                visibility.worktrees,
+                visibility.submodules,
+                filter,
+            ) && (visibility.ignored || !entity.excluded)
                 && (filter.matches(entity) || pinned.contains(&entity.key))
         })
         .collect();
@@ -3917,11 +3960,16 @@ mod tests {
         for column in SortColumn::ALL {
             let natural = RowOrder::default().choose(column);
             for order in [natural, natural.choose(column)] {
-                let rows: Vec<&EntityState> =
-                    visible_row_order(&entities, true, true, &filter, order, &HashSet::new())
-                        .into_iter()
-                        .map(|index| &entities[index])
-                        .collect();
+                let rows: Vec<&EntityState> = visible_row_order(
+                    &entities,
+                    Visibility::everything(),
+                    &filter,
+                    order,
+                    &HashSet::new(),
+                )
+                .into_iter()
+                .map(|index| &entities[index])
+                .collect();
                 let names: Vec<&str> = rows.iter().map(|row| row.name.as_ref()).collect();
                 assert_eq!(
                     rows.len(),
@@ -3970,8 +4018,7 @@ mod tests {
         let order = RowOrder::default().choose(SortColumn::Name);
         let names: Vec<&str> = visible_row_order(
             &entities,
-            true,
-            true,
+            Visibility::everything(),
             &Filter::default(),
             order,
             &HashSet::new(),
@@ -4049,8 +4096,7 @@ mod tests {
 
         let visible = visible_row_order(
             &entities,
-            true,
-            true,
+            Visibility::everything(),
             &filter,
             RowOrder::Natural,
             &HashSet::new(),
@@ -4080,8 +4126,7 @@ mod tests {
 
         let visible = visible_row_order(
             &entities,
-            true,
-            true,
+            Visibility::everything(),
             &filter,
             RowOrder::Natural,
             &HashSet::new(),
@@ -4111,8 +4156,7 @@ mod tests {
 
         let visible = visible_row_order(
             &entities,
-            true,
-            true,
+            Visibility::everything(),
             &filter,
             RowOrder::Natural,
             &HashSet::new(),
@@ -4152,8 +4196,10 @@ mod tests {
 
         let visible = visible_row_order(
             &entities,
-            false,
-            true,
+            Visibility {
+                worktrees: false,
+                ..Visibility::everything()
+            },
             &filter,
             RowOrder::Natural,
             &HashSet::new(),
@@ -4185,7 +4231,13 @@ mod tests {
         let mut pinned = HashSet::new();
         pinned.insert(entities[0].key.clone());
 
-        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let visible = visible_row_order(
+            &entities,
+            Visibility::everything(),
+            &filter,
+            RowOrder::Natural,
+            &pinned,
+        );
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -4212,16 +4264,26 @@ mod tests {
         let mut pinned = HashSet::new();
         pinned.insert(entities[0].key.clone());
 
-        let while_pinned =
-            visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let while_pinned = visible_row_order(
+            &entities,
+            Visibility::everything(),
+            &filter,
+            RowOrder::Natural,
+            &pinned,
+        );
         assert!(
             while_pinned.contains(&0),
             "sanity: repo-a must still be a candidate while its key is in `pinned`"
         );
 
         pinned.remove(&entities[0].key);
-        let once_unpinned =
-            visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let once_unpinned = visible_row_order(
+            &entities,
+            Visibility::everything(),
+            &filter,
+            RowOrder::Natural,
+            &pinned,
+        );
 
         assert!(
             !once_unpinned.contains(&0),
@@ -4285,7 +4347,13 @@ mod tests {
         let mut pinned = HashSet::new();
         pinned.insert(entities[0].key.clone());
 
-        let visible = visible_row_order(&entities, true, true, &filter, RowOrder::Natural, &pinned);
+        let visible = visible_row_order(
+            &entities,
+            Visibility::everything(),
+            &filter,
+            RowOrder::Natural,
+            &pinned,
+        );
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -4319,8 +4387,16 @@ mod tests {
         let mut pinned = HashSet::new();
         pinned.insert(entities[1].key.clone());
 
-        let visible =
-            visible_row_order(&entities, false, true, &filter, RowOrder::Natural, &pinned);
+        let visible = visible_row_order(
+            &entities,
+            Visibility {
+                worktrees: false,
+                ..Visibility::everything()
+            },
+            &filter,
+            RowOrder::Natural,
+            &pinned,
+        );
         let names: Vec<&str> = visible
             .iter()
             .map(|&index| entities[index].name.as_ref())
@@ -5641,8 +5717,7 @@ mod tests {
 
         let visible = visible_row_order(
             &snapshot.entities,
-            true,
-            true,
+            Visibility::everything(),
             &filter,
             RowOrder::Natural,
             &HashSet::new(),

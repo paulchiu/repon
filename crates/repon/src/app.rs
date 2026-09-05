@@ -473,6 +473,12 @@ pub struct App {
     /// up the Nth declared Set without re-reading `config.toml` on every keypress. Replaced
     /// wholesale on `Action::ReloadConfig`, the same lifecycle `bindings` and `theme` have.
     document: Document,
+    /// This scope's own ignored-rows override, set by `Action::ToggleIgnored` (`i`) and read
+    /// through [`Self::effective_show_ignored`]. `None` until the toggle first fires in this
+    /// scope, which reads as hidden: no config key backs this one, so unlike
+    /// `worktrees_toggle` there is nothing underneath for it to defer to. Restored from
+    /// `state.toml` at startup and written back on quit.
+    ignored_toggle: Option<bool>,
     /// This scope's own override of `document.show_worktrees`, set by `Action::ToggleWorktrees`
     /// (`t`) and read through [`Self::effective_show_worktrees`] everywhere the config field
     /// used to be read directly. `None` until the toggle first fires in this scope, so the
@@ -681,6 +687,7 @@ impl App {
             active_set,
             document: config.document,
             worktrees_toggle: None,
+            ignored_toggle: None,
             data_dir: config.data_dir,
             config_dir: config::config_dir(),
             config_file: config::config_file(),
@@ -765,6 +772,7 @@ impl App {
         };
         self.row_order = scope_state.sort.unwrap_or_else(RowOrder::cold_start);
         self.worktrees_toggle = scope_state.show_worktrees;
+        self.ignored_toggle = scope_state.show_ignored;
         if self.filter.is_active() {
             let match_count = self.visible_keys().len();
             self.set_notice(restored_filter_notice(&self.filter, match_count));
@@ -792,6 +800,7 @@ impl App {
             filter: self.filter.as_str().to_string(),
             sort: Some(self.row_order),
             show_worktrees: self.worktrees_toggle,
+            show_ignored: self.ignored_toggle,
         };
         let mut file = state::load(&self.data_dir);
         file.set_scope(self.scope_key(), scope_state);
@@ -879,8 +888,7 @@ impl App {
         let worktrees_shown = self.effective_show_worktrees();
         let visible = crate::components::list::visible_row_order(
             &snapshot.entities,
-            worktrees_shown,
-            self.document.show_submodules,
+            self.visibility(),
             &filter,
             self.row_order,
             &HashSet::new(),
@@ -1423,6 +1431,10 @@ impl App {
             }
             Some(Action::ToggleWorktrees) => {
                 self.toggle_worktrees();
+                None
+            }
+            Some(Action::ToggleIgnored) => {
+                self.toggle_ignored();
                 None
             }
             Some(Action::SwitchToSet(nth)) => {
@@ -2705,6 +2717,24 @@ impl App {
             .unwrap_or(self.document.show_worktrees)
     }
 
+    /// Whether ignored rows are drawn this frame. Unlike the two `show_` preferences beside
+    /// it in [`Self::visibility`], no config key backs this one: `ignore` hides the row it
+    /// names, and `Action::ToggleIgnored` (`i`) is the only thing that shows it again.
+    fn effective_show_ignored(&self) -> bool {
+        self.ignored_toggle.unwrap_or(false)
+    }
+
+    /// What the table draws this frame, the one value
+    /// [`crate::components::list::visible_row_order`]'s three callers here share so none of
+    /// them can narrow differently from the frame the user is looking at.
+    fn visibility(&self) -> crate::components::list::Visibility {
+        crate::components::list::Visibility {
+            worktrees: self.effective_show_worktrees(),
+            submodules: self.document.show_submodules,
+            ignored: self.effective_show_ignored(),
+        }
+    }
+
     /// `Action::ToggleWorktrees`'s (`t`) whole effect: flips [`Self::effective_show_worktrees`]
     /// until a reload clears it, and re-clamps the cursor onto the table the visibility
     /// change may have just shrunk ([`Self::set_cursor`]), the identical re-clamp a dismissal
@@ -2714,6 +2744,14 @@ impl App {
     /// Launcher still reaches it and the palette's own border-title count still names it.
     fn toggle_worktrees(&mut self) {
         self.worktrees_toggle = Some(!self.effective_show_worktrees());
+        self.set_cursor(self.cursor);
+    }
+
+    /// `Action::ToggleIgnored`'s (`i`) whole effect, the same shape
+    /// [`Self::toggle_worktrees`] has and for the same reasons: the cursor is re-clamped
+    /// onto a table the change may have just shrunk, and the Selection is left alone.
+    fn toggle_ignored(&mut self) {
+        self.ignored_toggle = Some(!self.effective_show_ignored());
         self.set_cursor(self.cursor);
     }
 
@@ -2735,8 +2773,7 @@ impl App {
         let filter = self.active_filter();
         crate::components::list::visible_row_order(
             &snapshot.entities,
-            self.effective_show_worktrees(),
-            self.document.show_submodules,
+            self.visibility(),
             &filter,
             self.row_order,
             pinned,
@@ -2874,8 +2911,7 @@ impl App {
         let pinned = self.pinned_keys(&snapshot);
         crate::components::list::visible_row_order(
             &snapshot.entities,
-            self.effective_show_worktrees(),
-            self.document.show_submodules,
+            self.visibility(),
             &filter,
             self.row_order,
             &pinned,
@@ -3271,6 +3307,7 @@ impl App {
         // `filter` above is rather than through `register_config_handler`.
         self.list
             .set_show_worktrees(self.effective_show_worktrees());
+        self.list.set_show_ignored(self.effective_show_ignored());
         // The Selection's own checked rows ([`theme::Theme::checked_style`]), handed to
         // `self.list` the same per-frame way as the cursor and the Filter above.
         self.list.set_selection(self.selection.clone());
@@ -3799,6 +3836,7 @@ mod tests {
                 document
             },
             worktrees_toggle: None,
+            ignored_toggle: None,
             // `zero_config: false` means `scope_key` reads `active_set.name` alone, so an
             // empty, never-created `data_dir`/`cwd` are harmless placeholders here, the same
             // shape `themes_dir` above already takes; a test exercising `persist_state` or
@@ -5547,6 +5585,7 @@ mod tests {
             "sanity: the row starts excluded"
         );
 
+        show_ignored_rows(&mut app);
         app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
             .expect("press m");
         let choosing = render_to_lines(&mut app, 80, 24).join("\n");
@@ -5594,6 +5633,7 @@ mod tests {
                 excluded: true,
             }],
         );
+        show_ignored_rows(&mut app);
         let visible = app.visible_keys();
         assert_eq!(visible.len(), 2, "the fixture must discover both repos");
         app.selection.select_all_visible(&visible);
@@ -6096,6 +6136,12 @@ mod tests {
     /// wants this rather than [`open_the_management_gate`] alone: a test that instead needs
     /// to see the gate closed but the run still outstanding presses `y` itself and reads
     /// [`App::management_running`] before waiting.
+    /// Presses `i`, so a test can reach the rows `ignore` hides.
+    fn show_ignored_rows(app: &mut App) {
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("press i");
+    }
+
     fn press_through_the_management_gate(app: &mut App, operation: management::Operation) {
         open_the_management_gate(app, operation);
         app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -6359,6 +6405,72 @@ mod tests {
         );
     }
 
+    /// `ignore` hides the row it names rather than only stopping operations from reaching
+    /// it. A row that stayed on screen reading exactly as it did before is the defect this
+    /// closes: nothing about it said the run had done anything.
+    #[test]
+    fn ignore_takes_the_row_out_of_the_visible_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        assert_eq!(
+            visible_names(&app),
+            vec!["repo-a".to_string(), "repo-b".to_string()],
+            "the fixture must discover both repos, cursor on the first"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        assert_eq!(
+            visible_names(&app),
+            vec!["repo-b".to_string()],
+            "the ignored row is gone from the table, not merely unoperable"
+        );
+    }
+
+    /// The ignored toggle is how an ignored row is reached again, now that `ignore` hides
+    /// it: on, the row is back in the table; off, it is gone again.
+    #[test]
+    fn the_ignored_toggle_brings_a_hidden_row_back_and_hides_it_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let hidden = root.join("repo-a");
+        init_repo(&hidden);
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: hidden,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        assert_eq!(
+            visible_names(&app),
+            vec!["repo-b".to_string()],
+            "an ignored row starts hidden"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("press i");
+        assert_eq!(
+            visible_names(&app),
+            vec!["repo-a".to_string(), "repo-b".to_string()],
+            "the toggle brings it back"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("press i again");
+        assert_eq!(
+            visible_names(&app),
+            vec!["repo-b".to_string()],
+            "and hides it again"
+        );
+    }
+
     /// `ignore` again immediately after, in the same session: the entry it wrote is the
     /// entry it removes, and the row is operable again in the same frame. This is the half
     /// [repo-management.md](../../../docs/spec/repo-management.md) says one run alone cannot
@@ -6378,6 +6490,7 @@ mod tests {
             app.core.snapshot().entities[0].excluded,
             "the ignore took effect first"
         );
+        show_ignored_rows(&mut app);
 
         press_through_the_management_gate(&mut app, management::Operation::Ignore);
 
@@ -6578,6 +6691,7 @@ mod tests {
         );
 
         press_through_the_management_gate(&mut app, management::Operation::Ignore);
+        show_ignored_rows(&mut app);
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("open the detail pane on the row");
         let frame = render_to_lines(&mut app, 120, 40).join("\n");
@@ -12494,6 +12608,8 @@ refresh_all = "z""#,
         init_repo(&excluded_repo);
         init_repo(&root.join("kept-a"));
         init_repo(&root.join("kept-b"));
+        // The Action gate's subtraction is what this measures, so the excluded row has to be
+        // on screen to be subtracted from.
         let mut app = test_app_with_overrides(
             &root,
             vec![repon_core::RepoOverride {
@@ -12502,6 +12618,7 @@ refresh_all = "z""#,
                 excluded: true,
             }],
         );
+        show_ignored_rows(&mut app);
         let visible = app.visible_keys();
         assert_eq!(
             visible.len(),
@@ -15682,6 +15799,39 @@ refresh_all = "z""#,
                 column: SortColumn::Name,
                 direction: crate::sort::Direction::Ascending,
             }
+        );
+    }
+
+    /// The ignored toggle survives a restart, per scope: a session left showing ignored rows
+    /// reopens showing them, so the toggle is a preference rather than a keystroke that has
+    /// to be repeated every launch.
+    #[test]
+    fn the_ignored_toggle_round_trips_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let hidden = root.join("repo-a");
+        init_repo(&hidden);
+        init_repo(&root.join("repo-b"));
+        let state_dir = tempfile::tempdir().expect("state temp dir");
+        let overrides = vec![repon_core::RepoOverride {
+            path: hidden,
+            default_branch: None,
+            excluded: true,
+        }];
+
+        let mut app = test_app_with_overrides(&root, overrides.clone());
+        app.data_dir = state_dir.path().to_path_buf();
+        show_ignored_rows(&mut app);
+        app.persist_state();
+
+        let mut app_again = test_app_with_overrides(&root, overrides);
+        app_again.data_dir = state_dir.path().to_path_buf();
+        app_again.restore_session_state(None);
+
+        assert_eq!(
+            visible_names(&app_again),
+            vec!["repo-a".to_string(), "repo-b".to_string()],
+            "the next run reopens showing the ignored row"
         );
     }
 
