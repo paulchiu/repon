@@ -4,7 +4,7 @@ Repon is short for 'Repo-N', where N stands in for many. It is a terminal UI for
 
 ## What it is
 
-Repon owns the outer loop: the combined state of many Repos, and acting on many of them in one gesture. It does not own the inner loop (staging, committing, diffing, rebasing inside one Repo). That work belongs to [lazygit](https://github.com/jesseduffield/lazygit) or your editor, and Repon hands off to them rather than reimplementing what they already do. Repon complements lazygit; it does not replace it. This boundary is the product's identity, so it is recorded as [ADR 0002](docs/adr/0002-repon-owns-the-outer-loop-only.md) rather than left as a preference.
+Repon owns the outer loop: the combined state of many Repos, and acting on many of them in one gesture. It does not own the inner loop (staging, committing, diffing, rebasing inside one Repo). That work belongs to [lazygit](https://github.com/jesseduffield/lazygit) or your editor, and Repon hands off to them rather than reimplementing what they already do. Repon complements lazygit; it does not replace it. This boundary is the product's identity.
 
 ## Status
 
@@ -36,7 +36,7 @@ cargo install --git https://github.com/paulchiu/repon --locked repon
 
 That needs a Rust toolchain and takes about a minute. If your git configuration rewrites GitHub HTTPS URLs to SSH, cargo's own git client cannot authenticate against it; prefix the command with `CARGO_NET_GIT_FETCH_WITH_CLI=true` to fetch through the git CLI instead.
 
-What each channel is and what feeds it is [ADR 0021](docs/adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) and [docs/spec/releasing.md](docs/spec/releasing.md).
+What each channel is and what feeds it is [docs/spec/releasing.md](docs/spec/releasing.md).
 
 ## Building
 
@@ -47,11 +47,11 @@ cargo run -p repon
 just ci        # what the GitHub workflow runs: format, lint, test, docs, isolation, build
 ```
 
-The workspace is two crates. `crates/repon-core` computes state and knows nothing about rendering; `crates/repon` is the terminal interface and, for now, its only consumer. The boundary between them is [ADR 0005](docs/adr/0005-rendering-agnostic-core.md), and it exists so that a second consumer can never become a second interface stack.
+The workspace is two crates. `crates/repon-core` computes state and knows nothing about rendering; `crates/repon` is the terminal interface and, for now, its only consumer. The boundary between them exists so that a second consumer can never become a second interface stack.
 
 ## Design principles
 
-Every displayed value knows whether it is unknown, loading, fresh, stale, or failed, and rendering is a total function of that state. The screen never contradicts itself, and an absent value never renders as zero. This is the central decision of the project, recorded as [ADR 0001](docs/adr/0001-per-cell-provenance.md).
+Every displayed value knows whether it is unknown, loading, fresh, stale, or failed, and rendering is a total function of that state. The screen never contradicts itself, and an absent value never renders as zero. This is the central decision of the project.
 
 Anything automatic performs the narrowest operation that cannot lose work, or none at all. Anything ineligible is reported rather than fixed.
 
