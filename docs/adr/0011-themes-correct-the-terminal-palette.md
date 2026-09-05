@@ -1,5 +1,9 @@
 # Themes correct the terminal's palette rather than replace it
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [theming.md](../spec/theming.md). Nothing below is maintained.
+
 Two coherent theme models exist in the prior art. superfile and yazi treat a theme as a full visual identity: every colour is a fixed hex value, twenty-odd themes ship as ports of Catppuccin and Nord, and the app looks the same in every terminal because it overrides the terminal. gitui, helix's default palette and bat's `ansi` theme treat a theme as a correction layer: the app names ANSI slots and inherits whatever palette the user's terminal already has, and a theme file exists to fix the handful of choices that clash rather than to repaint the screen.
 
 Repon takes the correction layer. The default theme names only the sixteen ANSI colours and `reset`, so it tracks the user's own scheme, which is a considered choice they made once and which a git dashboard has not earned the right to override. A theme file may still name a hex value or a 256-colour index, because forbidding it would stop someone repairing a genuinely broken palette without stopping them ruining a working one.

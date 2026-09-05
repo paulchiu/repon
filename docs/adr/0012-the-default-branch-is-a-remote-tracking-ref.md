@@ -1,5 +1,9 @@
 # The default branch is a remote-tracking ref
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [default-branch.md](../spec/default-branch.md). Nothing below is maintained.
+
 A Repo's default branch resolves to a remote-tracking ref, never a local branch: an explicit per-Repo override from config (shape owned by the "Design the config schema" ticket), then `refs/remotes/<remote>/HEAD` read through the git common dir with its symbolic target validated to exist, then a name list over remote-tracking refs only (`origin/main`, `origin/master`, `origin/trunk`), then Unknown. The remote is gix's fetch-default: `origin` when present, the sole remote when there is exactly one, nothing when there are two or more and none is called `origin`; for a fork `origin` is right, because the user's branches merge into their own fork's default. `init.defaultBranch` is rejected as a source (it records what the machine that ran `git init` was configured with and says nothing about a clone), and `remote.origin.HEAD` is not a git config key at all.
 
 Remote-tracking wins over local `refs/heads/main` on an asymmetry: a local branch goes stale without bound and only the user pulling fixes it, so a branch that landed three weeks ago reads as unlanded and never self-corrects, while a remote-tracking ref goes stale only until the next fetch, which Repon controls. A tool whose pitch is the truth about many Repos without the user touching them cannot rest on a ref whose accuracy depends on the user having touched them. It also survives Worktrees: 163 of 409 measured entities are linked Worktrees, many with no local default branch checked out at all. Mechanics live in [the default branch spec](../spec/default-branch.md).

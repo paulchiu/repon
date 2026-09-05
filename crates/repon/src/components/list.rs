@@ -110,10 +110,10 @@ const CHILD_ROW_INDENT_WIDTH: u16 = 2;
 /// width every other column boundary uses.
 const CHILD_ROW_GAP_WIDTH: u16 = GAP;
 /// Every column the name field spends on a child row before its own name text starts: the
-/// indent, the marker and the gap. `child_name_budget_matches_the_adrs_own_arithmetic` reads
-/// ADR 0020's own "28 minus 4 = 24 ... 40 minus 4 = 36" sentence at test time and checks this
-/// figure against it, rather than restating "4" as a second literal the ADR's own number
-/// could drift from.
+/// indent, the marker and the gap. `child_name_budget_matches_the_specs_own_arithmetic` reads
+/// layout-and-provenance.md's own "28 minus 4 = 24 ... 40 minus 4 = 36" sentence at test time
+/// and checks this figure against it, rather than restating "4" as a second literal the spec's
+/// own number could drift from.
 const CHILD_ROW_PREFIX_WIDTH: u16 =
     CHILD_ROW_INDENT_WIDTH + CHILD_ROW_MARKER_WIDTH + CHILD_ROW_GAP_WIDTH;
 
@@ -5220,25 +5220,26 @@ mod tests {
             .collect()
     }
 
-    /// The name-column geometry ADR 0020 measures rather than this test restating: reads the
-    /// ADR's own "A child name gets ..." sentence straight out of the file and checks the
-    /// child budget this crate computes against both of the sentence's own sums, the one at
-    /// the name column's minimum and the one at its cap. A change to either side is what
-    /// this test catches, not a change to only one of two copies of the same figure.
+    /// The name-column geometry layout-and-provenance.md states rather than this test
+    /// restating: reads the spec's own "A child name gets ..." sentence straight out of the
+    /// file and checks the child budget this crate computes against both of the sentence's
+    /// own sums, the one at the name column's minimum and the one at its cap. A change to
+    /// either side is what this test catches, not a change to only one of two copies of the
+    /// same figure.
     #[test]
-    fn child_name_budget_matches_the_adrs_own_arithmetic() {
-        let adr_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/adr/0020-the-ascii-glyph-set-is-vetted-over-the-row-interior.md");
-        let adr = std::fs::read_to_string(&adr_path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", adr_path.display()));
+    fn child_name_budget_matches_the_specs_own_arithmetic() {
+        let spec_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/layout-and-provenance.md");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", spec_path.display()));
         let needle = "A child name gets ";
-        let start = adr
+        let start = spec
             .find(needle)
-            .expect("expected the ADR to still state the child-name-budget sentence")
+            .expect("expected the spec to still state the child-name-budget sentence")
             + needle.len();
-        let sentence = &adr[start
+        let sentence = &spec[start
             ..start
-                + adr[start..]
+                + spec[start..]
                     .find(". ")
                     .expect("the child-name-budget sentence must end")];
 
@@ -5248,38 +5249,38 @@ mod tests {
             [cap, cap_cost, cap_budget],
         ] = triples[..]
         else {
-            panic!("expected the ADR to state one sum per end of the rule, got {triples:?}");
+            panic!("expected the spec to state one sum per end of the rule, got {triples:?}");
         };
         assert_eq!(
             minimum - minimum_cost,
             minimum_budget,
-            "the ADR's own arithmetic must hold at the name column's minimum"
+            "the spec's own arithmetic must hold at the name column's minimum"
         );
         assert_eq!(
             cap - cap_cost,
             cap_budget,
-            "the ADR's own arithmetic must hold at the name column's cap"
+            "the spec's own arithmetic must hold at the name column's cap"
         );
         assert_eq!(
             (NAME_MIN_WIDTH, NAME_MAX_WIDTH),
             (minimum, cap),
-            "the name column's minimum and cap must match the ADR's own two figures"
+            "the name column's minimum and cap must match the spec's own two figures"
         );
         assert_eq!(
             (CHILD_ROW_PREFIX_WIDTH, CHILD_ROW_PREFIX_WIDTH),
             (minimum_cost, cap_cost),
-            "the reserved prefix (indent, marker, gap) must match the ADR's own figure, and \
+            "the reserved prefix (indent, marker, gap) must match the spec's own figure, and \
              must not change between the two ends of the rule"
         );
         assert_eq!(
             Columns::for_interior_width(PACKED_MIN_WIDTH).child_name_width(),
             minimum_budget,
-            "a child name on a frame with no slack must get the ADR's own minimum budget"
+            "a child name on a frame with no slack must get the spec's own minimum budget"
         );
         assert_eq!(
             Columns::for_interior_width(u16::MAX).child_name_width(),
             cap_budget,
-            "a child name on a frame past the cap must get the ADR's own capped budget"
+            "a child name on a frame past the cap must get the spec's own capped budget"
         );
     }
 

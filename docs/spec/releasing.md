@@ -17,11 +17,11 @@ So a new key, a new column behaviour or a new operation is a minor, and a defect
 | channel | status | trigger |
 | --- | --- | --- |
 | `cargo install --git` | live | none; it works against `main` today |
-| crates.io | open | a `vX.Y.Z` tag; the four blockers below are cleared |
-| prebuilt binaries | open | the same tag; macOS on both architectures and Linux x86_64 |
-| Homebrew | open | the same tag, which pushes a formula to `paulchiu/homebrew-tap` |
+| crates.io | live | a `vX.Y.Z` tag; the four blockers below are cleared |
+| prebuilt binaries | live | the same tag; macOS on both architectures and Linux x86_64 |
+| Homebrew | open | the same tag, which pushes a formula to `paulchiu/homebrew-tap`; that leg has not yet succeeded |
 
-Every channel but the first is fed by one tag, and no tag has been cut yet, so nothing is published today. Cutting the first one is a separate act from opening the channels.
+Every channel but the first is fed by one tag, and the first tag is cut: `v0.29.0` put both crates on crates.io and created the GitHub release the prebuilt archives hang off. The Homebrew leg of that same tag has not succeeded, so `paulchiu/homebrew-tap` carries no formula and `brew install` is the one route below that does not work yet. Cutting a tag stays a separate act from opening a channel.
 
 The Homebrew route, once a tag exists:
 
@@ -108,7 +108,7 @@ Every field lives in `[workspace.package]` and is inherited with `field.workspac
 
 | field | value | why it is there |
 | --- | --- | --- |
-| `version` | `0.1.0`, shared | [0015](../adr/0015-the-core-owns-the-table.md) already decided lockstep with "no separate versioning"; one number moves both crates |
+| `version` | one shared number, `0.29.0` at the time of writing | [0015](../adr/0015-the-core-owns-the-table.md) already decided lockstep with "no separate versioning"; one number moves both crates. It moves on a labelled merge rather than by hand ("A version move is not a release" above), so read `Cargo.toml` for the current figure rather than this row |
 | `rust-version` | `1.88` | the declared floor, per the section above |
 | `license` | `MIT` | matches the root `LICENSE` |
 | `authors` | `Paul Chiu` | attribution on the registry page |
@@ -117,7 +117,7 @@ Every field lives in `[workspace.package]` and is inherited with `field.workspac
 | `readme` | `README.md` | the crates.io page body, shipped in both archives |
 | `keywords` | `git`, `tui`, `worktree`, `monorepo`, `terminal` | crates.io search; 5 is the cap and all five are spent |
 | `categories` | `command-line-utilities`, `development-tools` | crates.io's controlled vocabulary, both slugs valid in it |
-| `version` on the `repon-core` path dependency | `0.1.0` | what makes the workspace publishable at all, per the section above |
+| `version` on the `repon-core` path dependency | the same shared number | what the workspace needs to be publishable at all, per the section above. `cargo set-version --workspace` rewrites it with the rest |
 
 Two mechanics were each got wrong once, and measured, so they are recorded:
 
@@ -126,16 +126,16 @@ Two mechanics were each got wrong once, and measured, so they are recorded:
 
 ## Before the first crates.io publish
 
-crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever 0.1.0 contains is carried forever, so the four items below are blockers rather than preferences.
+crates.io's own rule sets the stakes: "a publish is generally permanent. The version can never be overwritten, and the code cannot be deleted". Whatever the first published version contained is carried forever, so the four items below were blockers rather than preferences, and item 4 recurs before every publish rather than clearing once.
 
-This spec has always carried four items in this gate. [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s own Consequences section names only the first two, the surface demolition and the config move, because it was written before the tag pipeline and the README's registry-copy review existed as separate, checkable items. That gap is recorded here rather than resolved by editing the ADR, which is a point-in-time record of the decision as it stood; this spec is the living checklist, so it carries all four.
+This spec has always carried four items in this gate. [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md)'s original text, kept in that file's git history, named only the first two, the surface demolition and the config move, because it was written before the tag pipeline and the README's registry-copy review existed as separate, checkable items. This spec is the living checklist, so it carries all four.
 
 1. [0015](../adr/0015-the-core-owns-the-table.md)'s core API has landed. **Done.** `crates/repon-core/src/lib.rs` declares `mod fanout;` and `mod git;` with no `pub`, and no `Box<dyn std::error::Error>` remains anywhere in the crate; the git error is now a closed, cloneable enum. Verified against the tree at commit `c44a8fc`.
 2. [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md)'s config path has moved to `etcetera`. **Done.** `crates/repon/src/config/mod.rs` resolves `config_dir()` from `etcetera::choose_base_strategy`, not `directories::ProjectDirs`. `directories` is still a dependency, but only for `data_dir()`, which 0014's own Consequences section says explicitly stays on `directories`; the concern this item names, config read from the wrong platform path, is closed.
 3. The tag pipeline has a crates.io publish job, for the reason [0021](../adr/0021-a-release-is-what-the-tag-pipeline-publishes.md) records: a channel fed by hand is a channel that silently stops being fed. **Done.** `.github/workflows/publish-crates.yml` runs `cargo publish --workspace --locked` and is called by `release.yml` as one of its publish jobs; see below.
-4. The README's Influences section has been read as what it is: the crates.io page. `readme` ships in both archives, so every sentence in it becomes front matter on a public registry page rather than a repository aside. **Done**, as of this review: the section names mrx, superfile and lazygit as influences and links each of them. mrx's upstream is named because it is a public repository and naming one makes no licence claim, which [0003](../adr/0003-clean-room-from-mrx.md) records. What stays out is what is not the upstream author's to publish: no private-conversation quote, no local path, no description of mrx's internals or history, and no framing of mrx by a relationship to anyone rather than by what it is. This re-read has to happen again before the actual first publish; once here is not enough.
+4. The README's Influences section has been read as what it is: the crates.io page. `readme` ships in both archives, so every sentence in it becomes front matter on a public registry page rather than a repository aside. **Done**, as of this review: the section names mrx, superfile and lazygit as influences and links each of them. What stays out is what is not the upstream author's to publish: no private-conversation quote, no local path, no description of mrx's internals or history, and no framing of mrx by a relationship to anyone rather than by what it is. This re-read has to happen again before the actual first publish; once here is not enough.
 
-All four blockers are now cleared, but nothing has been published: no tag has been cut, and the tag pipeline's crates.io leg has never run. Cutting the first tag is a separate act from clearing the gate.
+All four blockers were cleared before the first tag, and that tag has since been cut: `v0.29.0` ran `publish-crates.yml` and both crates are on the index. Item 4 is the one that does not stay cleared, because the README ships in every archive of every version.
 
 Done already, proved by CI on every push:
 
@@ -175,9 +175,9 @@ Three secrets make it run, and adding them is a manual step in the repository se
 
 All three are set on `paulchiu/repon`. One fine-grained token with no expiry covers both `RELEASE_TOKEN` and `HOMEBREW_TAP_TOKEN`, since the two repositories it needs are this one and the tap. A token that does expire takes the release pipeline with it silently: `version-tag.yml` falls back to `GITHUB_TOKEN`, so the bump and the tag keep landing and only the release stops.
 
-crates.io trusted publishing (OIDC, no stored token) stays unverified for a crate name that does not exist yet, so the pipeline uses a stored token and sidesteps the question. It stays a candidate for after the first publish, once `repon` and `repon-core` are on the index to configure it against.
+crates.io trusted publishing (OIDC, no stored token) was unverifiable for a crate name that did not exist, so the pipeline uses a stored token and sidesteps the question. Both crates are on the index now, so the condition that deferral named is met and the switch is a change someone can make rather than one waiting on the registry.
 
-No job here has been exercised against a real tag. `just workflows` parses every workflow and checks that each local `uses:` resolves, which is what a change like this one can prove before the first real release cuts it.
+`v0.29.0` exercised the pipeline for the first time. The crates.io leg and the GitHub release both landed; `publish-homebrew-formula` did not succeed, which is why the Homebrew row above is the one channel still open. `just workflows` parses every workflow and checks that each local `uses:` resolves, which is what a change can prove before a tag runs the pipeline against it.
 
 ## What is deliberately not here
 
@@ -185,4 +185,4 @@ No job here has been exercised against a real tag. `just workflows` parses every
 - **A Windows target.** The library refuses to compile there, per "Platform support" above.
 - **release-plz.** Its value is coordinating a release-pull-request review cycle that does not exist with one maintainer.
 - **A support-window MSRV promise**, per the MSRV section.
-- **Reserving the crate name with a placeholder publish.** `repon`, `repon-core`, `repo-n` and `repo_n` are all unclaimed, and the neighbourhood is occupied: `reponest` 0.1.0-alpha ("A TUI/CLI tool for managing multiple git repositories written in Rust", published 2025-12-14) and `gitpane` ("Multi-repo Git workspace dashboard TUI", 1,638 downloads, released 2026-08-29) both sit one search away. The risk of losing the name is real and accepted, because a placeholder publish is itself a publish: permanent, and of nothing.
+- **Reserving the crate name with a placeholder publish.** `repon` and `repon-core` are claimed by a real publish rather than by a placeholder, and `repo-n` and `repo_n` remain unclaimed. The neighbourhood was occupied when this was written: `reponest` 0.1.0-alpha ("A TUI/CLI tool for managing multiple git repositories written in Rust", published 2025-12-14) and `gitpane` ("Multi-repo Git workspace dashboard TUI", 1,638 downloads, released 2026-08-29) both sit one search away. The risk of losing the name was real and was accepted, because a placeholder publish is itself a publish: permanent, and of nothing.

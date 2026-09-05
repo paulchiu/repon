@@ -1,5 +1,9 @@
 # Launchers are argv vectors, and context travels in the environment
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [config.md](../spec/config.md) and [keybindings.md](../spec/keybindings.md). Nothing below is maintained.
+
 A Launcher is stored as an argv vector, never a shell string, and Repo context (path, branch, name) reaches it through environment variables, never interpolated into a command. This deviates from the obvious template-string approach for a security reason: a branch name or path can contain shell metacharacters, and with argv plus environment it cannot break out of its word. A Launcher may opt into a real shell (pipes, `&&`, globs) via an explicit per-entry flag, making the risk visible in config rather than the default. Launchers suspend-and-exec in the same terminal, which must be left exactly as found after quit, panic or suspend.
 
 ## Amended by #351

@@ -1,5 +1,9 @@
 # Repon releases what it enables and holds mouse capture off
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [keybindings.md](../spec/keybindings.md). Nothing below is maintained.
+
 Repon claims five pieces of terminal state on entry: raw mode, the alternate screen, bracketed paste, focus reporting and mouse capture. Four of those are enables, and each is released on every exit from the screen. The fifth is a disable, and it is never released. The contract is therefore **no residue**, that nothing Repon turned on is left on, and not "the terminal is left exactly as found", which is the sentence this decision retires. Both documents carried the retired sentence, not one: [config.md](../spec/config.md) said five pieces are restored under `## Launchers`, and [keybindings.md](../spec/keybindings.md#terminal-state) repeated the claim four lines below the row of its own table saying mouse capture is off. The conflict was noticed across the two documents and was already inside one of them.
 
 The reason "as found" is the wrong promise is that mouse capture is not a durable terminal setting. A colour scheme, a font size or a scrollback limit persists across the programs that run in the terminal; DEC private modes 1000, 1002, 1003 and 1006 are set by a running program for its own lifetime and cleared by it on the way out. Nothing sets them on an idle shell and leaves them set. So a terminal found with capture on is, very nearly by definition, a terminal that something crashed or was killed out of, and the state that "as found" would have Repon preserve has no owner who chose it. The unconditional disable on entry repairs that terminal rather than damaging it. This is the argument that settles the ticket; the implementation difficulty below is a second reason, not the first one.

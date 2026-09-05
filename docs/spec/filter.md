@@ -166,12 +166,15 @@ Two properties fall out. The filter applies **after** `settle`, so the probe sti
 
 - [head.md](head.md) promises a `detached` Filter term. It is `head:detached`.
 - [actions.md](actions.md) promises a `failed` Filter term. It is `action:failed` for the receipt and `row:failed` for the gutter's fold, which are different sets.
-- [refresh.md](refresh.md) says Unknown's reasons are "timed out, no upstream, no default branch, no remote". [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote` and core-api.md records the set as closed at two.
+- [refresh.md](refresh.md) says Unknown's reasons are "timed out, no upstream, no default branch, no remote". [0019](../adr/0019-a-detached-head-is-a-shape-of-head-not-a-worktree-state.md) removed `NoUpstream` and `NoRemote`, and `SubmoduleUninitialized` was added after that, so core-api.md records the set as closed at three. The table above names the two that have a keyword.
 - [config.md](config.md)'s Worktrees-only Filter is `kind:worktree`.
 - [layout-and-provenance.md](layout-and-provenance.md) leaves open whether a Vanished row wants a Filter of its own. It does: `presence:vanished`. A Vanished row is all-Stale, but `row:stale` is not a substitute, because a Stale row is one Repon will refresh and a Vanished row is one it cannot. The gutter mark for a Vanished row is settled there too: it keeps `~`, and the condition is carried by a Warning rather than a fifth mark ([#171](https://github.com/paulchiu/repon/issues/171)).
 - [keybindings.md](keybindings.md)'s `Ctrl+J`/`Ctrl+K` are no longer "palettes only".
 
 ## Refused
+
+Each refusal below is a grammar decision. The product posture behind them, and the
+conditions that would reopen them, are in [product.md](../product.md).
 
 - **Fuzzy matching.** The list cannot reorder, so a fuzzy match cannot show why it matched, and it makes a contracted match count untrustworthy.
 - **Comparison operators** (`dirty:>5`). The threshold question is answered by `is:dirty` plus the column already on screen; `>` is a shell metacharacter, so every `--filter` would need quoting; and `dirty:>` is a legal prefix meaning nothing on the keystroke before you finish. `dirty:5` is not legal today, so comparisons remain addable later without changing what any existing Filter means.

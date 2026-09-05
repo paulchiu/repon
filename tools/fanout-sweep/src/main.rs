@@ -331,15 +331,6 @@ fn run_sweep(paths: &[PathBuf], args: &SweepArgs) {
     }
 }
 
-/// A directory name this walk refuses to enter, ever, regardless of `--roots`: ADR 0003 is
-/// a clean-room decision about the repository named `mrx`, and a read-only sweep is not an
-/// exception to it. Matched case-insensitively against every path component, not only a
-/// root's immediate children, since a clean-room boundary is not something a nested
-/// checkout gets to sit inside of either.
-fn is_forbidden_dir_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str().is_some_and(|s| s.eq_ignore_ascii_case("mrx"))
-}
-
 /// Walks `root` for repository boundaries, matching `crates/repon-core/src/discovery.rs`'s
 /// own `is_boundary` rule exactly: "a directory is a boundary when it holds a `.git`
 /// entry, file or directory form alike" (`dir.join(".git").exists()`), which is what
@@ -363,9 +354,6 @@ fn find_git_repos(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
             continue;
         };
         let name = entry.file_name();
-        if is_forbidden_dir_name(&name) {
-            continue;
-        }
         if name == ".git" {
             // A `.git` entry directly inside `root`, file or directory alike, means
             // `root` itself is a repository boundary: reached when a `--roots` entry
@@ -600,13 +588,6 @@ fn main() {
             }
             assert!(!roots.is_empty(), "real needs at least one --roots entry");
             for root in &roots {
-                assert!(
-                    !root
-                        .components()
-                        .any(|c| is_forbidden_dir_name(c.as_os_str())),
-                    "refusing a --roots entry that names or contains `mrx`: {}",
-                    root.display()
-                );
                 // Loud rather than silently dropped: `find_git_repos`'s own recursive
                 // `read_dir` failures are tolerated (a locked-down subdirectory is a
                 // normal thing to meet deep in a real tree), but a `--roots` entry
@@ -700,13 +681,6 @@ fn main() {
                 "landing needs at least one --roots entry"
             );
             for root in &roots {
-                assert!(
-                    !root
-                        .components()
-                        .any(|c| is_forbidden_dir_name(c.as_os_str())),
-                    "refusing a --roots entry that names or contains `mrx`: {}",
-                    root.display()
-                );
                 assert!(
                     root.is_dir(),
                     "--roots entry is not a readable directory: {}",

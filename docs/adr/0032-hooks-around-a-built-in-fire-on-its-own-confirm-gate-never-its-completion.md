@@ -1,5 +1,9 @@
 # Hooks around a built-in fire on its own confirm gate, never its completion
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [repo-management.md](../spec/repo-management.md) and [config.md](../spec/config.md). Nothing below is maintained.
+
 `sync` gains two hooks, `before_sync` and `after_sync`, each naming one declared `[[action]]` in the identical `Option<String>` shape and fire-time resolution `on_refresh` already uses: the active Set's own value, then the top-level key of the same name, then no hook, re-resolved fresh rather than cached. [config.md](../spec/config.md)'s "Sets" and [repo-management.md](../spec/repo-management.md)'s "Hooks around sync" carry the field table and the behaviour; this decision is about the one thing copying that shape does not settle by itself, which trigger fires them.
 
 [0029](0029-an-on-refresh-action-runs-on-the-refresh-key-alone.md) already decided this question once, for `on_refresh`, and restricted it to a keystroke the user aimed, never a timer and never a Generation starting. Its second reason is mechanical rather than a judgement call: an Action finishing already starts a fresh Generation, so a hook that itself fired on a Generation starting would retrigger on its own completion, forever, one child per Repo per cycle, with no debounce that makes the composition of those two settled rules safe. A built-in inherits that trap exactly as an Action does, because [refresh.md](../spec/refresh.md) fixes that a finished fetch starts a normal Generation the same way a finished Action does, and nothing about a built-in's own completion is structurally different: were `sync` finishing itself the signal a hook listened for, the identical loop would follow.

@@ -239,7 +239,7 @@ pub struct RepoOverride { pub path: PathBuf, pub default_branch: Option<String>,
 
 [config.md](config.md) keeps every key, every default and all four failure grades on the consumer's side, including `REPON_CONFIG`, `--config` and `~` expansion. repon-core gets no `toml` dependency, but it does resolve `path` to a git common dir itself: matching by common dir alone cannot express "a Worktree named by its own path beats the entry it inherits" from a common dir shared with its parent Repo, since both would carry the identical common dir, so `path` lets an exact match outrank one only reached through a shared common dir. This is jj's three-layer split reduced to two, since Repon has one config document rather than a stack.
 
-`crates/repon/src/config.rs` today is a single `Clone + Deserialize` struct handed to every widget through `Component::register_config_handler`, and [0014](../adr/0014-config-is-read-only-and-a-set-bounds-the-work.md) already records that its directory resolution has to move to `etcetera`. Both are implementation this spec records rather than performs.
+`crates/repon/src/config/` today is a single `Clone + Deserialize` document handed to every widget through `Component::register_config_handler`, and it resolves its directory through `etcetera`. Both are implementation this spec records rather than performs.
 
 ## The environment contract
 

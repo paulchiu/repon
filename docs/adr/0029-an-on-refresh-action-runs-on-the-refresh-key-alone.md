@@ -1,5 +1,9 @@
 # An `on_refresh` Action runs on the Refresh key alone, with no gate and no queue
 
+> **Retired.** This record is kept for its history. Its product intent now lives in
+> [product.md](../product.md) and its implementation detail in
+> [actions.md](../spec/actions.md) and [refresh.md](../spec/refresh.md). Nothing below is maintained.
+
 `on_refresh = "sync"` names one declared `[[action]]`, and Repon runs it after a Refresh the user asked for: `r` and `R`, and nothing else. This is a trigger for machinery that already exists, not a second way to run a command. The declared Action fans out one PTY-backed child per entity, in that entity's own working directory, with the environment contract, gated on exit code and bounded by `concurrency` ([0018](0018-an-action-is-a-fanout-of-pty-backed-steps.md), [actions.md](../spec/actions.md)); none of that is touched here. What was missing was any way for an Action to start without a keystroke aimed at it, which is what myrepos's `update = ~/bin/some-sync-script.sh` has and Repon did not.
 
 The restriction to `r` and `R` is the decision, and it has two independent reasons, either of which would be enough on its own.
