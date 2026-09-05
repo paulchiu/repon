@@ -417,6 +417,8 @@ An unbound printable key is ignored in silence and never beeps, because a split 
 
 No config key backs this toggle, which is the one way it differs from the worktrees toggle below. There is nothing underneath for it to defer to and nothing for a reload to restore it to, so a reload leaves it exactly as it stands. It is remembered per scope in `state.toml` under `show_ignored` ([config.md](config.md#state)) all the same, so a session left showing ignored rows reopens showing them.
 
+While the toggle is hiding rows the header says so, `ignored: 3 (i shows)`, so a table that shrank on an `ignore` never shrinks silently. It shares its rank in [layout-and-provenance.md](layout-and-provenance.md#the-status-row)'s drop ladder with the worktrees note, since the two answer the same question and a frame too narrow for both is better off with neither than with half an answer.
+
 Everything else it shares: discovery and probing are untouched, an ignored row is still refreshed and merely undrawn, hiding the row the cursor sits on re-clamps the cursor, and the Selection is left alone.
 
 ## The worktrees toggle

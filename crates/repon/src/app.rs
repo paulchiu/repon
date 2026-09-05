@@ -927,6 +927,11 @@ impl App {
                 running: self.core.refresh_running(),
             });
         let entity_count = self.kind_visible_entity_count(snapshot, worktrees_shown);
+        // Counted over every discovered row rather than over `visible` above, which has
+        // already dropped them: the note's whole job is to account for what is missing.
+        let ignored_note = (!self.effective_show_ignored())
+            .then(|| snapshot.entities.iter().filter(|e| e.excluded).count())
+            .filter(|count| *count > 0);
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
@@ -934,6 +939,7 @@ impl App {
                 run_progress,
                 filter_match_count,
                 worktrees_note,
+                ignored_note,
                 elapsed,
             },
             warnings,
@@ -4190,6 +4196,7 @@ mod tests {
                 run_progress: Some((7, 12)),
                 filter_match_count: Some(12),
                 worktrees_note: Some((161, header::WorktreesHiddenBy::Preference)),
+                ignored_note: None,
                 elapsed: Some(Duration::from_millis(12000)),
             },
             warnings,
@@ -6428,6 +6435,35 @@ mod tests {
             visible_names(&app),
             vec!["repo-b".to_string()],
             "the ignored row is gone from the table, not merely unoperable"
+        );
+    }
+
+    /// A row that vanished on an `ignore` is accounted for on the status row, so the table
+    /// never silently shrinks: the count and the key that brings it back are both named.
+    #[test]
+    fn the_status_row_counts_the_rows_the_ignored_toggle_is_hiding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let before = render_to_lines(&mut app, 120, 24).join("\n");
+        assert!(
+            !before.contains("ignored:"),
+            "nothing is hidden yet, so the row says nothing about it: {before:?}"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+        // Any press clears the run's own Notice, which takes the status row alone while it
+        // stands; Esc at the top level does nothing else.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("press Esc");
+
+        let after = render_to_lines(&mut app, 120, 24).join("\n");
+        assert!(
+            after.contains("ignored: 1 (i shows)"),
+            "the vanished row is accounted for, got:\n{after}"
         );
     }
 
