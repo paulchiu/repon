@@ -37,6 +37,7 @@ jobs:
         id: label
         env:
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
           GROUP: ${{ steps.metadata.outputs.dependency-group }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -54,6 +55,13 @@ jobs:
               label=patch
               if [ -n "$GROUP" ]; then automerge=true; else automerge=false; fi
               ;;
+          esac
+
+          # An Action version lives in a workflow file, which ships in neither
+          # crate, so the bump is a norelease however far its own semver moved.
+          # Whether it can merge unattended is still the case block's answer.
+          case "$ECOSYSTEM" in
+            github_actions | github-actions) label=norelease ;;
           esac
 
           # A rerun over a relabelled PR would otherwise leave two labels on it,
