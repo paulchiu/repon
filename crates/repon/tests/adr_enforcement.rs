@@ -181,16 +181,40 @@ fn every_enforcement_line_names_something_that_exists() {
     );
 }
 
+/// The retirement banner: the blockquote run opening with `> **Retired.`, joined into one line.
+fn retirement_banner(contents: &str) -> Option<String> {
+    let mut lines = contents
+        .lines()
+        .skip_while(|line| !line.starts_with("> **Retired."));
+    let first = lines.next()?;
+    let rest = lines.take_while(|line| line.starts_with('>'));
+    Some(
+        std::iter::once(first)
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 #[test]
-fn a_retired_record_is_marked_in_its_opening_lines() {
-    let retired_without_pointer: Vec<String> = records()
+fn a_retired_record_accounts_for_itself_in_its_banner() {
+    // A record leaves the live set one of two ways: its content moved, and the banner links
+    // where to, or the decision was withdrawn and the banner says so. Leaving silently is the
+    // third way, and the only one this rejects.
+    let unaccounted: Vec<String> = records()
         .into_iter()
         .filter(|(_, contents)| is_retired(contents))
-        .filter(|(_, contents)| !contents.contains("product.md"))
+        .filter(|(_, contents)| {
+            let banner = retirement_banner(contents).unwrap_or_default();
+            !(banner.contains("](../product.md)")
+                || banner.contains("](../spec/")
+                || banner.contains("Withdrawn"))
+        })
         .map(|(name, _)| name)
         .collect();
     assert!(
-        retired_without_pointer.is_empty(),
-        "a retired record must say where its content went: {retired_without_pointer:?}"
+        unaccounted.is_empty(),
+        "a retired record must say where its content went, or that it was withdrawn: \
+         {unaccounted:?}"
     );
 }
