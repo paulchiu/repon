@@ -8,10 +8,9 @@ trouble, and where do I go next".
 
 The inner loop, staging, committing, diffing and rebasing inside one repository, belongs to lazygit
 or to an editor. Repon never reimplements it, and success is measured by how quickly Repon gets the
-user into the right repository with the right tool already open. That boundary is the product's
-identity and most of what follows is downstream of it. This document records what Repon does for
-its user and what it refuses to do; how any of it is spelled on the keyboard belongs to the
-specifications.
+user into the right repository with the right tool already open. Most of what follows is
+downstream of that division of labour. This document records what Repon does for its user and what
+it refuses to do; how any of it is spelled on the keyboard belongs to the specifications.
 
 ## Discovery and the table
 
@@ -40,9 +39,9 @@ too long for its space is marked as cut, because a silent truncation reads as a 
 
 ## Provenance: the screen never contradicts itself
 
-This is the founding promise, and it comes from watching a predecessor fail. Across hundreds of
-repositories values arrive from different sources on different clocks, and a screen that assembles
-them carelessly ends up contradicting itself.
+It comes from watching a predecessor fail. Across hundreds of repositories values arrive from
+different sources on different clocks, and a screen that assembles them carelessly ends up
+contradicting itself.
 
 Every value therefore carries the story of where it came from, and an absent value never renders as
 zero. The user can always tell four situations apart: Repon has an answer and when it was read,
@@ -120,9 +119,8 @@ inferred from directory structure, since one per top-level directory yields hund
 single-repository Sets nobody would use, and with no configuration there is one implicit Set
 covering the working directory.
 
-The active Set is named on screen. It is the most consequential piece of state in the session, it
-decides what exists, and a user working in the wrong scope cannot notice unless the name is in
-front of them. It shows whole or drops whole, because two Sets can share a prefix and a truncated
+The active Set is named on screen. It decides what exists, and a user working in the wrong scope
+cannot notice unless the name is in front of them. It shows whole or drops whole, because two Sets can share a prefix and a truncated
 name identifies neither while looking like a name. Switching Set says which Set you switched to,
 since the table emptying and refilling tells the user something changed without telling them what.
 
@@ -269,9 +267,10 @@ blank cell be trusted to mean absence.
 A channel is a standing promise to publish every time, and the only mechanism that keeps such a
 promise is the pipeline that cuts the tag; a channel sitting outside it goes stale at the first
 release somebody forgets. Installation should not require a Rust toolchain, so the shortest route
-is a package manager. Publishing to a public registry is permanent, so the first publish waits
-until the public surface is settled and configuration lives at its final path, since moving a
-user-visible path after a release breaks people who have read nothing.
+is a package manager. Publishing to a public registry is permanent, so the first publish waited
+until the public surface had settled and configuration lived at its final path, since moving a
+user-visible path after a release breaks people who have read nothing. That publish has since
+happened.
 
 ## What Repon deliberately does not do
 
@@ -280,7 +279,7 @@ of the refusal.
 
 **No staging view, no commit editor, no diff viewer, no conflict resolution.** These are the inner
 loop, which belongs to lazygit and to editors that already do it well, and a request for any of
-them is answered with a handoff. This boundary is the product's identity, and nothing reopens it.
+them is answered with a handoff. Nothing reopens this refusal.
 
 **No rebasing on the user's behalf, and no worktree management beyond removing one.** Anything
 automatic is the narrowest safe operation or none, so Repon reports and leaves the decision where
