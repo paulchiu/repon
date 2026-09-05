@@ -97,11 +97,9 @@ impl Tui {
     /// event thread is the one reading it.
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
-        redirect_stderr_to_log()?;
-        // Before stdin goes non-blocking, so this write is made against a descriptor that has
-        // not yet been given the flag it shares with stdout ([`TerminalWriter`]).
-        write_enter_sequence(&mut TerminalWriter::stdout())?;
         set_stdin_nonblocking()?;
+        redirect_stderr_to_log()?;
+        write_enter_sequence(&mut TerminalWriter::stdout())?;
         self.start();
         Ok(())
     }
@@ -236,15 +234,32 @@ impl Drop for Tui {
 /// panic hook, which is why it takes nothing; `errors::init`'s hook calls this before its own
 /// `eprintln!`, so that report reaches the real terminal rather than the log file.
 pub fn restore() -> std::io::Result<()> {
-    // Every step is attempted regardless of an earlier one's outcome. A failed write must
-    // not skip disabling raw mode, which is the half the shell inherits.
-    //
-    // Clearing the flag comes first so the sequence below is written to a blocking descriptor:
-    // a restore write that reports `WouldBlock` is what leaves a pane in the alternate screen
-    // with the cursor hidden after Repon is gone.
-    let blocking = clear_stdin_nonblocking();
-    let left = write_restore_sequence(&mut TerminalWriter::stdout());
-    let raw = crossterm::terminal::disable_raw_mode();
+    restore_in_order(
+        clear_stdin_nonblocking,
+        || write_restore_sequence(&mut TerminalWriter::stdout()),
+        crossterm::terminal::disable_raw_mode,
+        restore_stderr,
+    )
+}
+
+/// The four steps [`restore`] is made of, in the order they have to run in and with every one
+/// of them attempted whatever the last one reported.
+///
+/// Giving the descriptor back comes before writing to it. [`TerminalWriter`] waits out a
+/// terminal that is behind rather than failing, so a write placed first could wait there while
+/// the shell still holds a stdin Repon made non-blocking and will now never hand back. A failed
+/// write must not skip disabling raw mode either, which is the half the shell inherits.
+///
+/// Takes its steps rather than calling them, so their order is a thing a test can read.
+fn restore_in_order(
+    clear_nonblocking: impl FnOnce() -> std::io::Result<()>,
+    write_sequence: impl FnOnce() -> std::io::Result<()>,
+    disable_raw_mode: impl FnOnce() -> std::io::Result<()>,
+    restore_stderr: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let blocking = clear_nonblocking();
+    let left = write_sequence();
+    let raw = disable_raw_mode();
     let stderr = restore_stderr();
     blocking.and(left).and(raw).and(stderr)
 }
@@ -287,11 +302,9 @@ fn set_fd_nonblocking(fd: RawFd, nonblocking: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How long a write waits for a terminal that is behind on reading before giving up, and how
-/// long it pauses between attempts. A terminal catches up in microseconds, so the pause is
-/// short and the deadline is only there to stop a wedged one holding a frame forever.
+/// How long a write pauses before trying a terminal that is behind on reading again. A terminal
+/// catches up in microseconds, so this is short.
 const WOULD_BLOCK_PAUSE: Duration = Duration::from_millis(1);
-const WOULD_BLOCK_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Every write Repon makes to the terminal, wrapped so that `WouldBlock` waits rather than
 /// ending the session.
@@ -306,7 +319,6 @@ const WOULD_BLOCK_DEADLINE: Duration = Duration::from_secs(2);
 /// ratatui draws all go through it by construction rather than by remembering to.
 pub struct TerminalWriter<W> {
     inner: W,
-    deadline: Duration,
 }
 
 impl TerminalWriter<Stdout> {
@@ -317,28 +329,25 @@ impl TerminalWriter<Stdout> {
 
 impl<W> TerminalWriter<W> {
     fn new(inner: W) -> Self {
-        Self::with_deadline(inner, WOULD_BLOCK_DEADLINE)
-    }
-
-    fn with_deadline(inner: W, deadline: Duration) -> Self {
-        Self { inner, deadline }
+        Self { inner }
     }
 }
 
 impl<W: std::io::Write> TerminalWriter<W> {
-    /// Runs `attempt` until it reports something other than `WouldBlock`, or until the deadline
-    /// passes and the last `WouldBlock` is returned as the error it is.
+    /// Runs `attempt` until it reports something other than `WouldBlock`.
+    ///
+    /// The wait is unbounded on purpose, because that is what the descriptor would have done on
+    /// its own. `EAGAIN` on a terminal means its buffer is full and the reader is behind, never
+    /// that the reader is gone: a terminal whose other end has closed answers `EIO`, which is an
+    /// error this returns like any other. Giving up after some number of seconds instead would
+    /// hand `main` the same `os error 35` this exists to prevent, just less often.
     fn until_the_terminal_catches_up<T>(
         &mut self,
         mut attempt: impl FnMut(&mut W) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
-        let start = Instant::now();
         loop {
             match attempt(&mut self.inner) {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && start.elapsed() < self.deadline =>
-                {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(WOULD_BLOCK_PAUSE);
                 }
                 outcome => return outcome,
@@ -509,7 +518,7 @@ fn translate(event: CrosstermEvent) -> Option<Event> {
 /// is the fifth piece and is not a write; it is a separate `termios` call the caller makes
 /// before this. Generic over the writer so a test can assert the exact byte sequence against
 /// a `Vec<u8>` without a real terminal.
-fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
+fn write_enter_sequence(w: &mut TerminalWriter<impl std::io::Write>) -> std::io::Result<()> {
     crossterm::execute!(
         w,
         EnterAlternateScreen,
@@ -533,7 +542,7 @@ fn write_enter_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
 /// [0024](../../../docs/adr/0024-repon-releases-what-it-enables-and-holds-mouse-capture-off.md)
 /// is why: the terminal cannot be asked what it was, and a terminal found with capture on is
 /// one some earlier program crashed out of rather than one anybody configured.
-fn write_restore_sequence(w: &mut impl std::io::Write) -> std::io::Result<()> {
+fn write_restore_sequence(w: &mut TerminalWriter<impl std::io::Write>) -> std::io::Result<()> {
     crossterm::execute!(
         w,
         DisableFocusChange,
@@ -573,9 +582,8 @@ mod tests {
         }
     }
 
-    /// `Tui::enter` makes stdin non-blocking, and a terminal hands one open file description to
-    /// stdin, stdout and stderr alike, so every write below can report `WouldBlock` whenever the
-    /// terminal is behind. Propagating it ends the session with `os error 35`.
+    /// The failure [`TerminalWriter`] exists for: a write that reports `WouldBlock` because the
+    /// terminal is behind, which ended the session with `os error 35`.
     #[test]
     fn a_stalled_terminal_does_not_end_the_enter_sequence() {
         let mut writer = TerminalWriter::new(StallingWriter {
@@ -592,30 +600,71 @@ mod tests {
         );
     }
 
-    /// The wait is bounded, so a terminal that never drains costs one deadline rather than the
-    /// session: the write reports the `WouldBlock` it kept getting and the caller decides.
+    /// An error that is not `WouldBlock` is the terminal saying something else, and travels
+    /// unchanged: `EIO` is how a terminal whose other end has closed answers, and waiting that
+    /// out would never end.
     #[test]
-    fn a_terminal_that_never_catches_up_gives_up_rather_than_spinning() {
-        let mut writer = TerminalWriter::with_deadline(
-            StallingWriter {
-                stalls: usize::MAX,
-                written: Vec::new(),
-            },
-            Duration::from_millis(20),
-        );
+    fn an_error_that_is_not_would_block_travels_unchanged() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
-        let error = writer
-            .write(b"never lands")
-            .expect_err("expected the deadline to end the wait");
+        let error = TerminalWriter::new(Broken)
+            .write(b"nowhere to go")
+            .expect_err("expected the error to travel rather than be waited out");
 
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
-    /// Why [`TerminalWriter`] has to exist at all: `O_NONBLOCK` belongs to the open file
-    /// description, so [`set_stdin_nonblocking`]'s call against fd 0 lands on every descriptor
-    /// sharing it. A terminal gives stdin, stdout and stderr one such description, which is how
-    /// a flag set for the event thread's reads ends up on Repon's own writes, and on the
-    /// invoking shell's, until [`restore`] clears it.
+    /// [`restore`]'s contract, read off the order its steps run in: the shell gets its
+    /// descriptor back before anything writes to it, and every step runs whatever the one
+    /// before it reported.
+    #[test]
+    fn restore_returns_the_descriptor_before_writing_and_runs_every_step_regardless() {
+        let ran = &std::cell::RefCell::new(Vec::new());
+        let step = move |name: &'static str, outcome: std::io::Result<()>| {
+            move || {
+                ran.borrow_mut().push(name);
+                outcome
+            }
+        };
+
+        let result = restore_in_order(
+            step(
+                "clear_nonblocking",
+                Err(std::io::Error::other("the flag would not clear")),
+            ),
+            step("write_sequence", Ok(())),
+            step("disable_raw_mode", Ok(())),
+            step("restore_stderr", Ok(())),
+        );
+
+        assert_eq!(
+            ran.take(),
+            vec![
+                "clear_nonblocking",
+                "write_sequence",
+                "disable_raw_mode",
+                "restore_stderr"
+            ],
+            "expected the descriptor to be handed back before the write, and every later step \
+             to run despite the first one failing"
+        );
+        assert!(
+            result.is_err(),
+            "expected the first step's failure to still be reported"
+        );
+    }
+
+    /// The premise [`TerminalWriter`] rests on, kept true rather than only written down:
+    /// `O_NONBLOCK` belongs to the open file description, so a call against one descriptor lands
+    /// on every descriptor sharing it.
     #[test]
     fn the_non_blocking_flag_is_visible_through_every_descriptor_sharing_one_open_file() {
         let mut fds = [0 as std::os::raw::c_int; 2];
@@ -779,7 +828,7 @@ mod tests {
 
     #[test]
     fn the_enter_sequence_claims_all_four_write_based_pieces_in_order() {
-        let mut out = Vec::new();
+        let mut out = TerminalWriter::new(Vec::new());
         write_enter_sequence(&mut out).expect("write enter sequence");
 
         let mut expected = Vec::new();
@@ -789,12 +838,12 @@ mod tests {
         expected.extend(ansi_bytes(EnableFocusChange));
         expected.extend(ansi_bytes(cursor::Hide));
 
-        assert_eq!(out, expected);
+        assert_eq!(out.inner, expected);
     }
 
     #[test]
     fn the_restore_sequence_releases_focus_paste_and_alt_screen_then_shows_the_cursor_last() {
-        let mut out = Vec::new();
+        let mut out = TerminalWriter::new(Vec::new());
         write_restore_sequence(&mut out).expect("write restore sequence");
 
         let mut expected = Vec::new();
@@ -803,7 +852,7 @@ mod tests {
         expected.extend(ansi_bytes(LeaveAlternateScreen));
         expected.extend(ansi_bytes(cursor::Show));
 
-        assert_eq!(out, expected);
+        assert_eq!(out.inner, expected);
     }
 
     /// Whether `needle` occurs anywhere in `haystack`, for asserting on the encoded ANSI
@@ -887,10 +936,11 @@ mod tests {
              below, not merely counted"
         );
 
-        let mut enter = Vec::new();
+        let mut enter = TerminalWriter::new(Vec::new());
         write_enter_sequence(&mut enter).expect("write enter sequence");
-        let mut restore = Vec::new();
+        let mut restore = TerminalWriter::new(Vec::new());
         write_restore_sequence(&mut restore).expect("write restore sequence");
+        let (enter, restore) = (enter.inner, restore.inner);
         let source = this_files_production_source();
 
         for (name, setting_on, released) in pieces {
