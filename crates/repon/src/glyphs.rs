@@ -201,6 +201,7 @@ glyph_set! {
         ChildRow: child_row,
         OrphanChildRow: orphan_child_row,
         Checked: checked,
+        Ignored: ignored,
         Truncated: truncated,
     },
 }
@@ -237,6 +238,10 @@ pub const FULL: GlyphSet = GlyphSet {
     // singled the braille spinner out as ADR 0020's one open defect. Not one glance from any
     // other value glyph in this table.
     checked: '✓',
+    // The circled slash is the standard "no entry" mark and is carried by 4 of the 5
+    // surveyed faces, the same tier as `checked` above. It reads against a name rather than
+    // as a value in a cell, so no other glyph in this table is one glance from it.
+    ignored: '⊘',
     // One of the 95 printable ASCII characters carried by all five surveyed faces, the same
     // universal tier every other glyph in this file occupies; proposed for both tables
     // rather than a full-only unicode mark, per ADR 0020's tenth value meaning. Cited from
@@ -297,6 +302,11 @@ pub const ASCII: GlyphSet = GlyphSet {
     // the row interior's disjointness rule, and a border is read as a region around the
     // panel rather than decoded character by character inside one row.
     checked: '+',
+    // The comment character of the very file an excluded `[[repo]]` entry lives in, so it
+    // reads as "commented out" rather than needing to be learned. It repeats the scrollbar
+    // thumb below on the same terms `checked` above repeats the border's corner: the frame
+    // is exempt from the row interior's disjointness rule.
+    ignored: '#',
     // The same character as `full`'s own `truncated` above, ADR 0020's tenth value meaning:
     // one truncation mark, unchanged by which table is live, rather than a second ascii-only
     // choice. Distinct from every other glyph in this table.
@@ -720,15 +730,51 @@ mod tests {
         }
     }
 
+    /// The ignored mark's own two characters, read out of
+    /// [theming.md](../../../docs/spec/theming.md)'s "The two sets" table at test time
+    /// rather than restated here, so neither set can drift from the specification and
+    /// neither can be changed without the spec changing with it. The row-state marks are
+    /// excluded from the in-cell value cross-check below, which is what leaves this one
+    /// otherwise unpinned in either set.
+    #[test]
+    fn the_ignored_mark_is_the_pair_theming_mds_own_two_sets_table_names() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read docs/spec/theming.md");
+
+        let row = spec
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("| ignored |"))
+            .expect("theming.md's \"The two sets\" table must name `ignored`");
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let [_, full, ascii] = cells.as_slice() else {
+            panic!("the ignored row does not have exactly three cells: {row:?}");
+        };
+        let one = |cell: &str| {
+            let mut chars = cell.trim_matches('`').chars();
+            let glyph = chars.next().expect("a glyph");
+            assert!(
+                chars.next().is_none(),
+                "expected one character, got {cell:?}"
+            );
+            glyph
+        };
+
+        assert_eq!(FULL.ignored, one(full));
+        assert_eq!(ASCII.ignored, one(ascii));
+    }
+
     /// Reads `docs/spec/layout-and-provenance.md`'s own "In-cell glyphs for real values"
     /// table at test time and compares it against the full glyph table in both directions:
     /// a meaning the spec names and the code does not implement fails here, as does a value
     /// meaning the code implements and the spec's table does not name, and a meaning both
     /// sides name but render with a different character also fails here. `ChildRow`,
-    /// `OrphanChildRow`, `Checked` and `Truncated` are excluded on the code side: each marks
-    /// a row's shape or state (a nested Worktree or Submodule line, whether that line's own
-    /// parent is the row above it, a row the Selection holds, a name cut to fit its column),
-    /// specified in its own paragraph, not an in-cell value this table covers.
+    /// `OrphanChildRow`, `Checked`, `Ignored` and `Truncated` are excluded on the code side:
+    /// each marks a row's shape or state (a nested Worktree or Submodule line, whether that
+    /// line's own parent is the row above it, a row the Selection holds, a row a `[[repo]]`
+    /// entry excludes, a name cut to fit its column), specified in its own paragraph, not an
+    /// in-cell value this table covers.
     ///
     /// If the spec gains a seventh glyph, this test fails two different ways depending on
     /// what the code does: an unrecognised meaning phrase panics inside
@@ -777,6 +823,7 @@ mod tests {
                         | Meaning::ChildRow
                         | Meaning::OrphanChildRow
                         | Meaning::Checked
+                        | Meaning::Ignored
                         | Meaning::Truncated
                 )
             })

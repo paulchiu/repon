@@ -37,6 +37,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
 | `t` | Toggle Worktree rows |
+| `i` | Toggle ignored rows |
 | `s`, `Tab` | Open the Set picker |
 | `o` | Open the sort menu |
 | `1` to `9` | Switch to the Nth declared Set |
@@ -226,7 +227,7 @@ When the Selection is empty, an Action fans out over every visible row, and a La
 
 The checked set itself is never bounded by visibility this way: a row checked once and later hidden, by a narrower Filter or by [the worktrees toggle](#the-worktrees-toggle), stays checked and still counts toward the next Action or Launcher's targets, and the palette's own border-title count still names it. A Selection made deliberately must not change what it reaches because of what the screen happens to be drawing at the moment the gesture fires.
 
-Three of the four management operations, `delete`, `ignore` and `unignore`, keep the cursor row when the Selection is empty. They share the Action confirm gate, but `delete` with nothing checked would put the whole visible list behind a single confirm, and that is not a trade worth making for consistency. `sync` is the exception: an empty Selection widens it to every visible row, the identical resolution an Action takes, so filtering to `sync:behind` and running the built-in `sync` reaches the filtered set rather than fast-forwarding the cursor row alone ([actions.md](actions.md)'s "The Selection and the gate"). GLOSSARY.md's "never empty at the point of acting" holds on both sides: with nothing visible an Action, or `sync`, has a count of zero, which does not run and says so.
+Two of the three management operations, `delete` and `ignore`, keep the cursor row when the Selection is empty. They share the Action confirm gate, but `delete` with nothing checked would put the whole visible list behind a single confirm, and that is not a trade worth making for consistency. `sync` is the exception: an empty Selection widens it to every visible row, the identical resolution an Action takes, so filtering to `sync:behind` and running the built-in `sync` reaches the filtered set rather than fast-forwarding the cursor row alone ([actions.md](actions.md)'s "The Selection and the gate"). GLOSSARY.md's "never empty at the point of acting" holds on both sides: with nothing visible an Action, or `sync`, has a count of zero, which does not run and says so.
 
 ### The range anchor
 
@@ -409,6 +410,16 @@ The picker is where the numbers are printed, and it is where they work: pressing
 `w` does two things with one press: it opens the expanded warning list, and opening it acknowledges every condition currently outstanding, which is what returns the status row to its indicator. The footer and the help overlay advertise the first, since that is what the user is reaching for; [layout-and-provenance.md](layout-and-provenance.md#the-status-row) owns the second. It is not a dismissal and no key dismisses a warning: a standing condition leaves the row by ceasing to be true.
 
 An unbound printable key is ignored in silence and never beeps, because a split escape sequence can leak a literal character through the parser and a beep would then fire on the terminal's own noise.
+
+## The ignored toggle
+
+`i` flips whether ignored rows are drawn, the rows a `[[repo]]` entry excludes ([config.md](config.md)). They start hidden, because `ignore` hides the row it names ([repo-management.md](repo-management.md)); this is how one is reached again, and running `ignore` over it there is what un-ignores it.
+
+No config key backs this toggle, which is the one way it differs from the worktrees toggle below. There is nothing underneath for it to defer to and nothing for a reload to restore it to, so a reload leaves it exactly as it stands. It is remembered per scope in `state.toml` under `show_ignored` ([config.md](config.md#state)) all the same, so a session left showing ignored rows reopens showing them.
+
+While the toggle is hiding rows the header says so, `ignored: 3 (i shows)`, so a table that shrank on an `ignore` never shrinks silently. It shares its rank in [layout-and-provenance.md](layout-and-provenance.md#the-status-row)'s drop ladder with the worktrees note, since the two answer the same question and a frame too narrow for both is better off with neither than with half an answer.
+
+Everything else it shares: discovery and probing are untouched, an ignored row is still refreshed and merely undrawn, hiding the row the cursor sits on re-clamps the cursor, and the Selection is left alone.
 
 ## The worktrees toggle
 

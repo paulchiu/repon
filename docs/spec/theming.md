@@ -52,6 +52,8 @@ The row `j`/`k` moves is not the Selection (the rows marked with space; see "The
 
 A row that [keybindings.md](keybindings.md#the-selection)'s Selection holds checked (marked with `Space`) carries a glyph in a marker column of its own, immediately left of the name and immediately right of the gutter: `✓` under `full`, `+` under `ascii` ("The two sets" above). Underline was tried first and dropped: it is invisible or near-invisible in several terminals and fights the cursor row's own reverse-video patch, which is a Selection you cannot see, the defect this section now closes. A marker column is not a gutter mark either, even though both are one character wide: the gutter summarises provenance a Probe settled, and Selection is state a keystroke sets, the same distinction [layout-and-provenance.md](layout-and-provenance.md#open) already draws for the Vanished mark it refused to add there.
 
+A row a `[[repo]]` entry excludes carries `⊘` under `full` and `#` under `ascii`, leading its name rather than taking a column of its own. It cannot use the marker column beside it: that one is the Selection's, and an ignored row can be checked too. `#` repeats the ascii scrollbar's own thumb character on the same terms this table's `+` already repeats the ascii border's corner, since the two are read in different regions of the panel, and it is the comment character of the file the excluded entry itself lives in, which is what the mark means. These rows are hidden by default and drawn only while [keybindings.md](keybindings.md#the-ignored-toggle)'s `i` is on, so the mark answers the question that toggle asks: which of these were the ignored ones.
+
 Unlike the cursor row's own highlight, the marker is a value the row draws into a fixed column rather than a style patched across the row's width, so the two treatments compose by construction instead of needing a rule to keep them from erasing one another: a checked row that is not the cursor shows the marker in plain text, the cursor row when it is not checked is reversed with no marker, and a row that is both shows the marker inside the reversed bar, unambiguous without a third colour or a third modifier. The marker carries no colour of its own, so it needs no tenth role, holds on a light terminal exactly as it holds on a dark one by construction, and keeps working under `NO_COLOR`, since crossterm strips colour escape codes and never a glyph.
 
 The sidebar shows the marker too, alongside the gutter and the name it already kept: a Selection is exactly what you need to see while the detail pane has your attention.
@@ -155,6 +157,7 @@ One switch, two vetted sets, no way to mix them:
 | child row | `└` | `` ` `` |
 | child with no visible parent | `┆` | `:` |
 | checked (the Selection's own marker) | `✓` | `+` |
+| ignored | `⊘` | `#` |
 | truncated name | `$` | `$` |
 | sort arrow (ascending, descending) | `↑↓` | `^v` |
 | panel border | `╭╮╰╯─│` | `+ + + + - |` |

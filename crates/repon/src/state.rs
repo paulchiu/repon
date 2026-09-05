@@ -19,7 +19,7 @@ const STATE_FILE: &str = "state.toml";
 const ACTIVE_SET_KEY: &str = "active_set";
 
 /// One scope's whole session state: the Selection as a list of display names, the committed
-/// Filter as its own expression string, the table's `RowOrder`, and the worktrees toggle.
+/// Filter as its own expression string, the table's `RowOrder`, and the two view toggles.
 /// Nothing computed from git is ever a field here, because session state is user input and
 /// can only be absent, never stale
 /// ([0006](../../../docs/adr/0006-no-git-state-cache-session-state-by-name.md)).
@@ -30,7 +30,8 @@ const ACTIVE_SET_KEY: &str = "active_set";
 /// amendment). `show_worktrees` is `None` for a scope nothing has ever toggled Worktrees in,
 /// which [`crate::app::App::restore_session_state`] reads the same way `t` never fired: as
 /// deferring to `config.toml`'s own `show_worktrees`
-/// ([config.md](../../../docs/spec/config.md#state)).
+/// ([config.md](../../../docs/spec/config.md#state)). `show_ignored` is `None` the same way,
+/// and reads as hidden: no config key backs it, so there is nothing underneath to defer to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScopeState {
     #[serde(default)]
@@ -41,6 +42,8 @@ pub(crate) struct ScopeState {
     pub(crate) sort: Option<RowOrder>,
     #[serde(default)]
     pub(crate) show_worktrees: Option<bool>,
+    #[serde(default)]
+    pub(crate) show_ignored: Option<bool>,
 }
 
 /// The whole file: the Set last viewed, then a map of scope key to its own [`ScopeState`],
@@ -145,6 +148,7 @@ mod tests {
                 filter: "kind:worktree".to_string(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
 
@@ -158,6 +162,7 @@ mod tests {
                 filter: "kind:worktree".to_string(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             }
         );
     }
@@ -168,7 +173,7 @@ mod tests {
     /// id) would fail this the moment it serialised, not only when some other test happened
     /// to read it back.
     #[test]
-    fn the_written_file_holds_only_selection_filter_sort_and_show_worktrees_nothing_else() {
+    fn the_written_file_holds_only_selection_filter_sort_and_the_two_toggles_nothing_else() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut file = StateFile::default();
         file.set_scope(
@@ -178,6 +183,7 @@ mod tests {
                 filter: "is:dirty".to_string(),
                 sort: Some(RowOrder::cold_start()),
                 show_worktrees: Some(false),
+                show_ignored: Some(true),
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -193,9 +199,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["filter", "selection", "show_worktrees", "sort"],
-            "a scope must hold exactly `selection`, `filter`, `sort` and `show_worktrees`, \
-             nothing git computed: {text:?}"
+            vec![
+                "filter",
+                "selection",
+                "show_ignored",
+                "show_worktrees",
+                "sort"
+            ],
+            "a scope must hold exactly `selection`, `filter`, `sort`, `show_worktrees` and \
+             `show_ignored`, nothing git computed: {text:?}"
         );
     }
 
@@ -220,6 +232,7 @@ mod tests {
                     direction: Direction::Descending,
                 }),
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         file.set_scope(
@@ -229,6 +242,7 @@ mod tests {
                 filter: String::new(),
                 sort: Some(RowOrder::Natural),
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -254,6 +268,7 @@ mod tests {
             "hidden".to_string(),
             ScopeState {
                 show_worktrees: Some(false),
+                show_ignored: None,
                 ..ScopeState::default()
             },
         );
@@ -261,6 +276,7 @@ mod tests {
             "shown".to_string(),
             ScopeState {
                 show_worktrees: Some(true),
+                show_ignored: None,
                 ..ScopeState::default()
             },
         );
@@ -269,6 +285,49 @@ mod tests {
         let reloaded = load(dir.path());
         assert_eq!(reloaded.scope("hidden").show_worktrees, Some(false));
         assert_eq!(reloaded.scope("shown").show_worktrees, Some(true));
+    }
+
+    /// The ignored toggle (`Action::ToggleIgnored`, `i`) round-trips the way the worktrees
+    /// one does, so a scope reopens showing what it was left showing.
+    #[test]
+    fn a_recorded_ignored_toggle_round_trips_through_state_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut file = StateFile::default();
+        file.set_scope(
+            "hidden".to_string(),
+            ScopeState {
+                show_ignored: Some(false),
+                ..ScopeState::default()
+            },
+        );
+        file.set_scope(
+            "shown".to_string(),
+            ScopeState {
+                show_ignored: Some(true),
+                ..ScopeState::default()
+            },
+        );
+        save(dir.path(), &file).expect("save state.toml");
+
+        let reloaded = load(dir.path());
+        assert_eq!(reloaded.scope("hidden").show_ignored, Some(false));
+        assert_eq!(reloaded.scope("shown").show_ignored, Some(true));
+    }
+
+    /// A scope nothing has ever toggled ignored rows in loads `show_ignored` as `None`, which
+    /// [`crate::app::App::restore_session_state`] reads as hidden: there is no config key
+    /// underneath for it to defer to, unlike the worktrees toggle.
+    #[test]
+    fn a_scope_with_no_show_ignored_key_loads_it_as_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(STATE_FILE),
+            "[work]\nselection = [\"repo-a\"]\nfilter = \"is:dirty\"\n",
+        )
+        .expect("write a pre-toggle state.toml");
+
+        let scope = load(dir.path()).scope("work");
+        assert_eq!(scope.show_ignored, None);
     }
 
     /// A scope nothing has ever toggled Worktrees in loads `show_worktrees` as `None`, which
@@ -319,6 +378,7 @@ mod tests {
                 filter: "is:dirty".to_string(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         file.set_active_set("work".to_string());
@@ -393,6 +453,7 @@ mod tests {
                 filter: "kind:worktree".to_string(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         file.set_scope(
@@ -402,6 +463,7 @@ mod tests {
                 filter: String::new(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");
@@ -482,6 +544,7 @@ mod tests {
                 filter: "is:dirty".to_string(),
                 sort: None,
                 show_worktrees: None,
+                show_ignored: None,
             },
         );
         save(dir.path(), &file).expect("save state.toml");

@@ -41,23 +41,29 @@ pub(crate) enum WorktreesHiddenBy {
     Toggle,
 }
 
-/// One value for each of the header's five items, already computed by whatever owns that
+/// One value for each of the header's six items, already computed by whatever owns that
 /// piece of state. `None` means the item has nothing to report this frame: no run in flight
-/// (`run_progress`, `elapsed`), no Filter committed (`filter_match_count`), or Worktree rows
-/// already shown (`worktrees_note`). `entity_count` alone is never absent.
+/// (`run_progress`, `elapsed`), no Filter committed (`filter_match_count`), Worktree rows
+/// already shown (`worktrees_note`), or no row hidden for being ignored (`ignored_note`).
+/// `entity_count` alone is never absent.
 pub(crate) struct HeaderContent {
     pub(crate) entity_count: usize,
     pub(crate) run_progress: Option<(usize, usize)>,
     pub(crate) filter_match_count: Option<usize>,
     pub(crate) worktrees_note: Option<(usize, WorktreesHiddenBy)>,
+    /// How many rows the ignored toggle is currently hiding, absent when it is hiding none.
+    /// Unlike `worktrees_note` this carries no reason: only the toggle can hide these, so
+    /// there is no second cause to tell it apart from.
+    pub(crate) ignored_note: Option<usize>,
     pub(crate) elapsed: Option<Duration>,
 }
 
 const SEPARATOR: &str = " · ";
 const ELLIPSIS: &str = " ...";
 
-/// The four items ranked below rank 1 (run progress, the Filter's match count, the
-/// worktrees note, then timing), present only where `content` carries a value:
+/// The five items ranked below rank 1 (run progress, the Filter's match count, the
+/// worktrees note, the ignored note, then timing), present only where `content` carries a
+/// value:
 /// [`degrade::budget`] drops from the low-priority end first, so an absent item costs the
 /// ladder nothing rather than leaving a hole in the middle of it. `pub(crate)` so
 /// [`crate::status_row`] can splice its own rank-1 item ahead of these instead of
@@ -86,6 +92,15 @@ pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<Strin
             priority: Priority::Drop(2),
         });
     }
+    if let Some(count) = content.ignored_note {
+        // Rank 2 is the worktrees note's, shared deliberately: [`degrade::budget`] drops a
+        // shared rank as one group, and the two answer the same question
+        // ([keybindings.md](../../../../docs/spec/keybindings.md#the-ignored-toggle)).
+        items.push(degrade::Item {
+            content: format!("ignored: {count} (i shows)"),
+            priority: Priority::Drop(2),
+        });
+    }
     if let Some(elapsed) = content.elapsed {
         items.push(degrade::Item {
             content: format_elapsed(elapsed),
@@ -99,7 +114,7 @@ pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<Strin
     items
 }
 
-/// `content`'s five items in priority order, highest first: [`render`]'s own entity-count
+/// `content`'s six items in priority order, highest first: [`render`]'s own entity-count
 /// rank 1 followed by [`trailing_items`].
 fn items(content: &HeaderContent) -> Vec<degrade::Item<String>> {
     let mut items = vec![degrade::Item {
@@ -123,14 +138,16 @@ pub(crate) fn render(content: &HeaderContent, width: u16) -> String {
 mod tests {
     use super::*;
 
-    /// [actions.md](../../../../docs/spec/actions.md#the-run-on-screen)'s own figures: every
-    /// item present, matching the documented ladder's widest rung.
+    /// [actions.md](../../../../docs/spec/actions.md#the-run-on-screen)'s own figures,
+    /// matching the documented ladder's widest rung, which that measurement predates the
+    /// ignored note by and so leaves absent.
     fn sample_content() -> HeaderContent {
         HeaderContent {
             entity_count: 242,
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
             worktrees_note: Some((161, WorktreesHiddenBy::Preference)),
+            ignored_note: None,
             elapsed: Some(Duration::from_millis(12000)),
         }
     }
@@ -147,6 +164,7 @@ mod tests {
             run_progress: None,
             filter_match_count: None,
             worktrees_note: None,
+            ignored_note: None,
             elapsed: None,
         };
         let rendered = render(&content, 5);
@@ -188,6 +206,7 @@ mod tests {
             run_progress: None,
             filter_match_count: None,
             worktrees_note: Some((161, WorktreesHiddenBy::Toggle)),
+            ignored_note: None,
             elapsed: None,
         };
         let rendered = render(&content, 200);
@@ -198,6 +217,25 @@ mod tests {
         assert!(
             !rendered.contains("preference off"),
             "must never claim config.toml said so when the toggle is why: {rendered:?}"
+        );
+    }
+
+    // --- criterion: rows hidden because they are ignored are counted, never silent ---
+
+    #[test]
+    fn the_ignored_note_names_how_many_rows_are_hidden_and_the_key_that_shows_them() {
+        let content = HeaderContent {
+            entity_count: 12,
+            run_progress: None,
+            filter_match_count: None,
+            worktrees_note: None,
+            ignored_note: Some(3),
+            elapsed: None,
+        };
+        let rendered = render(&content, 200);
+        assert!(
+            rendered.contains("ignored: 3 (i shows)"),
+            "a row that vanished on an ignore must be accounted for: {rendered:?}"
         );
     }
 
@@ -212,6 +250,7 @@ mod tests {
             run_progress: Some((7, 12)),
             filter_match_count: None,
             worktrees_note: None,
+            ignored_note: None,
             elapsed: None,
         };
         for width in 8u16..12 {
@@ -238,6 +277,7 @@ mod tests {
             run_progress: None,
             filter_match_count: None,
             worktrees_note: None,
+            ignored_note: None,
             elapsed: Some(elapsed),
         }
     }

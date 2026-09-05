@@ -1,21 +1,24 @@
 # Repo management
 
-Management operations change what Repon operates on, or remove a Repo from the machine. They are built-in entries in the Action palette, not a third palette: [0008](../adr/0008-two-palettes-not-one.md) splits the palettes by reach, one Repo against N Repos unattended, and management is on the N-Repos side of that split. They share the Action confirm gate, the Selection count and the ineligible-entity subtraction with config-defined Actions, and share none of the pty machinery in [actions.md](actions.md) for the operation itself, because no child process runs for it. What they do not share is how an empty Selection resolves: `ignore`, `unignore` and `delete` act on the cursor row where a config-defined Action fans out over every visible row ([keybindings.md](keybindings.md)'s "The Selection"). The reasoning for that cursor-row fallback is in [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md).
+Management operations change what Repon operates on, or remove a Repo from the machine. They are built-in entries in the Action palette, not a third palette: [0008](../adr/0008-two-palettes-not-one.md) splits the palettes by reach, one Repo against N Repos unattended, and management is on the N-Repos side of that split. They share the Action confirm gate, the Selection count and the ineligible-entity subtraction with config-defined Actions, and share none of the pty machinery in [actions.md](actions.md) for the operation itself, because no child process runs for it. What they do not share is how an empty Selection resolves: `ignore` and `delete` act on the cursor row where a config-defined Action fans out over every visible row ([keybindings.md](keybindings.md)'s "The Selection"). The reasoning for that cursor-row fallback is in [0028](../adr/0028-repon-writes-the-repo-entries-it-owns.md).
 
-`sync` is an exception twice over. It widens to every visible row on an empty Selection, the identical resolution a config-defined Action already uses, so filtering to `sync:behind` and running the built-in `sync` reaches the filtered set rather than one Repo. It is also the one built-in that may still spawn a child process, through the `before_sync` and `after_sync` hooks a Set may declare around it, "Hooks around sync" below. `delete` permanently removes working trees, and its own cursor-row fallback is exactly the property that stops an empty Selection reaching every visible one; `ignore` and `unignore` keep the fallback too, since neither was asked to widen and doing so is a larger blast radius than that would cover.
+`sync` is an exception twice over. It widens to every visible row on an empty Selection, the identical resolution a config-defined Action already uses, so filtering to `sync:behind` and running the built-in `sync` reaches the filtered set rather than one Repo. It is also the one built-in that may still spawn a child process, through the `before_sync` and `after_sync` hooks a Set may declare around it, "Hooks around sync" below. `delete` permanently removes working trees, and its own cursor-row fallback is exactly the property that stops an empty Selection reaching every visible one; `ignore` keeps the fallback too, since it was never asked to widen and doing so is a larger blast radius than that would cover.
 
 ## The operations
 
 | name | effect | eligible |
 | --- | --- | --- |
-| `ignore` | Writes `exclude = true` for the entity's path | A Repo or Worktree not already excluded |
-| `unignore` | Removes `exclude` for the entity's path | A Repo or Worktree currently excluded by a `[[repo]]` entry |
+| `ignore` | Writes `exclude = true` for the entity's path, or removes it if the entity is already excluded | A Repo or Worktree |
 | `delete` | Removes the working tree, then removes the entity's own `[[repo]]` entry if it has one and its path from every `[[set]]` array that names it, then drops its row | A Repo or Worktree |
 | `sync` | Fast-forwards the branch to its tracked upstream, reusing the periodic fetch's own auto-update rules | A Repo; whether it is behind, ahead, clean and tracking an upstream right now is read by attempting it, never a gate refusal |
 
-The four names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
+The three names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
 
-`ignore` writes `[[repo]] exclude = true`, never a Set `exclude` glob. `exclude = true` states a fact about one path that Repon knows exactly, and a glob states a class Repon would be guessing at; a glob also changes what exists for every Set sharing that root, where `exclude` leaves the row visible and only stops it being operated on ([config.md](config.md)). Hiding a row from view is the Filter's job ([filter.md](filter.md)), which is transient by design.
+`ignore` is one entry covering both directions rather than a pair. It reads the row's own state and writes whichever way that state is not, so the gesture that hides a Repo is the gesture that brings it back, and the palette lists one name instead of two. Which way a given row goes is read off the row itself: an ignored row carries its own mark ([theming.md](theming.md)), and a listed one does not.
+
+An ignored row is hidden as well as unoperated on. [keybindings.md](keybindings.md)'s ignored toggle is what shows it again, and until it does the row is absent from the table the way a hidden Worktree is: still discovered, still probed, merely undrawn. That is a change from the Filter doing the hiding: a Filter is transient by design and an ignore list is not, so an ignore that only stopped operations left no way to say "stop showing me this" that survived the session.
+
+`ignore` writes `[[repo]] exclude = true`, never a Set `exclude` glob. `exclude = true` states a fact about one path that Repon knows exactly, and a glob states a class Repon would be guessing at; a glob also changes what exists for every Set sharing that root. The two are not interchangeable in the other direction either: a Set's glob decides what is discovered at all, so a row it excludes could never be toggled back into view or marked as ignored, having never been discovered to mark ([config.md](config.md)).
 
 `path` in a `[[repo]]` entry resolves to a git common dir and applies to every entity sharing it, so `ignore` on a Repo row covers its linked Worktrees in one entry, and `ignore` on a Worktree row writes that Worktree's own path, which beats the entry it would otherwise inherit ([config.md](config.md)). That is existing config semantics, not a management rule.
 
@@ -95,7 +98,7 @@ A Repo with none of the three is listed plainly. There is no undo and no trash, 
 
 A Worktree row's own gate line discloses the same first two facts about its own working tree, uncommitted changes and unpushed commits, and never the third: deleting one Worktree never touches its siblings, so it names no linked-Worktree count of its own. A Worktree already selected alongside the parent Repo it is linked from is not shown as its own row at all, per "What `delete` does to a Worktree" above.
 
-`ignore` and `unignore` use the ordinary Action confirm gate with no additional lines, since neither destroys anything.
+`ignore` uses the ordinary Action confirm gate with no additional lines, since it destroys nothing.
 
 ## Once accepted
 
@@ -126,9 +129,9 @@ path = "~/dev/noisy"
 exclude = true
 ```
 
-An entry that already exists is modified in place rather than appended a second time, and keeps whatever other keys it carries: `unignore` on an entry holding `default_branch` removes the `exclude` key alone and leaves the table. An entry left with no keys but `path` is removed entirely, and an empty `[[repo]]` array of tables is removed with it, so a file that had none before an `ignore` and an `unignore` is byte-for-byte what it started as.
+An entry that already exists is modified in place rather than appended a second time, and keeps whatever other keys it carries: an `ignore` that clears the key from an entry holding `default_branch` removes `exclude` alone and leaves the table. An entry left with no keys but `path` is removed entirely, and an empty `[[repo]]` array of tables is removed with it, so a file that had none before two runs of `ignore` over the same row is byte-for-byte what it started as.
 
-`delete` reaches further than the `[[repo]]` entry it removes: the path it destroyed goes from every `[[set]]` `include` and `exclude` array naming it too, matched by the same resolved path a `[[repo]]` `path` is matched by, so an array that wrote it relative to home is found by the absolute path the row was known by. A glob that merely would have matched that path is left alone, since it also covers rows the deletion did not touch. An array whose last named path goes this way is removed with it rather than left as `[]`, which reads as "nothing" and means "everything"; that widens the Set, which [config.md](config.md)'s Sets section states as the trade. `ignore` and `unignore` never touch a `[[set]]` array at all.
+`delete` reaches further than the `[[repo]]` entry it removes: the path it destroyed goes from every `[[set]]` `include` and `exclude` array naming it too, matched by the same resolved path a `[[repo]]` `path` is matched by, so an array that wrote it relative to home is found by the absolute path the row was known by. A glob that merely would have matched that path is left alone, since it also covers rows the deletion did not touch. An array whose last named path goes this way is removed with it rather than left as `[]`, which reads as "nothing" and means "everything"; that widens the Set, which [config.md](config.md)'s Sets section states as the trade. `ignore` never touches a `[[set]]` array at all.
 
 After a successful write, Repon runs the same path `Action::ReloadConfig` runs. Nothing mutates the in-memory document directly, so config reaches the running app one way and a write cannot produce a state the file alone would not reproduce.
 
@@ -151,7 +154,7 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | row | outcome | what the pane says |
 | --- | --- | --- |
 | `ignore` wrote `exclude = true` | `Did` | ignored |
-| `unignore` removed the key | `Did` | no longer ignored |
+| `ignore` removed the key | `Did` | no longer ignored |
 | `delete` removed a Repo's tree and an entry of its own | `Did` | working tree removed, `[[repo]]` entry removed |
 | `delete` removed a Repo's tree and there was no entry | `Did` | working tree removed, no `[[repo]]` entry of its own |
 | `delete` removed a Worktree cleanly and an entry of its own | `Did` | worktree removed, `[[repo]]` entry removed |
@@ -160,7 +163,7 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
 | `sync` fast-forwarded the branch | `Did` | fast-forwarded to its upstream |
 | `sync` fast-forwarded the branch but `after_sync` failed | `Did` | fast-forwarded to its upstream; after_sync hook failed, then what went wrong |
-| `unignore` on a row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
+| `ignore` on an excluded row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |
 | `sync` found the Repo not eligible right now | `Refused` | not eligible to sync, then the reason the auto-update's own five rules give |
 | the gate already refused it | `Refused` | refused, then the reason its own "What it refuses" section gives |
 | the tree would not remove, or the file would not write | `CouldNotAct` | failed, then what went wrong |

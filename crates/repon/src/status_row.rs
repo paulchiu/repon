@@ -253,6 +253,7 @@ mod tests {
             run_progress: None,
             filter_match_count: None,
             worktrees_note: None,
+            ignored_note: None,
             elapsed: None,
         }
     }
@@ -263,6 +264,7 @@ mod tests {
             run_progress: Some((7, 12)),
             filter_match_count: Some(12),
             worktrees_note: Some((161, header::WorktreesHiddenBy::Preference)),
+            ignored_note: None,
             elapsed: Some(Duration::from_millis(12000)),
         }
     }
@@ -453,6 +455,7 @@ mod tests {
                 run_progress: None,
                 filter_match_count: None,
                 worktrees_note: None,
+                ignored_note: None,
                 elapsed: None,
             },
             warnings: &[],

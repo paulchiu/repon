@@ -1,4 +1,4 @@
-//! The four built-in management operations: `ignore`, `unignore`, `delete` and `sync`.
+//! The three built-in management operations: `ignore`, `delete` and `sync`.
 //!
 //! [repo-management.md](../../../docs/spec/repo-management.md) is the specification and
 //! [0028](../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) the reasoning for
@@ -36,13 +36,12 @@ use repon_core::{AutoUpdateAttempt, DeleteRisk, EntityKey, EntityState, Kind, Ow
 
 use crate::config::repo_entry::{self, Edit};
 
-/// One of the four built-in entries in the Action palette, in the order
+/// One of the three built-in entries in the Action palette, in the order
 /// [repo-management.md](../../../docs/spec/repo-management.md)'s own operations table lists
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
     Ignore,
-    Unignore,
     Delete,
     Sync,
 }
@@ -50,12 +49,8 @@ pub(crate) enum Operation {
 /// Every built-in operation, which is also the list `m` filters the palette down to and the
 /// set of names a config-defined `[[action]]` may not take
 /// ([`crate::config::document`]'s own load-time check reads this).
-pub(crate) const OPERATIONS: [Operation; 4] = [
-    Operation::Ignore,
-    Operation::Unignore,
-    Operation::Delete,
-    Operation::Sync,
-];
+pub(crate) const OPERATIONS: [Operation; 3] =
+    [Operation::Ignore, Operation::Delete, Operation::Sync];
 
 impl Operation {
     /// The name the palette lists it under, and the reserved name a config-defined
@@ -63,7 +58,6 @@ impl Operation {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Operation::Ignore => "ignore",
-            Operation::Unignore => "unignore",
             Operation::Delete => "delete",
             Operation::Sync => "sync",
         }
@@ -73,8 +67,7 @@ impl Operation {
     /// `description` occupies.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Operation::Ignore => "Stop operating on the selected entities",
-            Operation::Unignore => "Operate on the selected entities again",
+            Operation::Ignore => "Hide the selected entities, or show them again",
             Operation::Delete => "Remove the selected working trees, permanently",
             Operation::Sync => "Fast-forward the selected Repos to their tracked upstream",
         }
@@ -89,13 +82,13 @@ impl Operation {
 
     /// Whether this operation widens to every visible row on an empty Selection, the way a
     /// declared Action already does, rather than falling back to the cursor row alone.
-    /// `sync` alone widens; `ignore`, `unignore` and, safety-critically, `delete` (which
+    /// `sync` alone widens; `ignore` and, safety-critically, `delete` (which
     /// permanently removes working trees) keep the cursor-row fallback
     /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
     pub(crate) fn widens_to_every_visible_row_when_selection_is_empty(self) -> bool {
         match self {
             Operation::Sync => true,
-            Operation::Ignore | Operation::Unignore | Operation::Delete => false,
+            Operation::Ignore | Operation::Delete => false,
         }
     }
 
@@ -110,21 +103,8 @@ impl Operation {
     /// is never a gate refusal here; [`run`]'s own `sync_one` is where that surfaces.
     pub(crate) fn eligibility(self, entity: &EntityState) -> Eligibility {
         match (self, entity.kind) {
-            (Operation::Ignore, Kind::Repo | Kind::Worktree) => {
-                if entity.excluded {
-                    Eligibility::Refused(Refusal::AlreadyIgnored)
-                } else {
-                    Eligibility::Eligible
-                }
-            }
-            (Operation::Unignore, Kind::Repo | Kind::Worktree) => {
-                if entity.excluded {
-                    Eligibility::Eligible
-                } else {
-                    Eligibility::Refused(Refusal::NotIgnored)
-                }
-            }
-            (Operation::Ignore | Operation::Unignore, Kind::Submodule) => {
+            (Operation::Ignore, Kind::Repo | Kind::Worktree) => Eligibility::Eligible,
+            (Operation::Ignore, Kind::Submodule) => {
                 Eligibility::Refused(Refusal::SubmoduleHasNoEntryOfItsOwn)
             }
             (Operation::Delete, Kind::Repo | Kind::Worktree) => Eligibility::Eligible,
@@ -158,15 +138,11 @@ pub(crate) enum Refusal {
     /// than its own, so removing the directory corrupts the parent, whose `.gitmodules`
     /// still names it.
     SubmoduleCannotBeDeleted,
-    /// `ignore` or `unignore` on a Submodule: a `[[repo]]` entry's `path` resolves to a git
-    /// common dir, and a Submodule's is its parent's `.git/modules/<name>`, so one entry
-    /// cannot cover a parent and its Submodules together
+    /// `ignore` on a Submodule: a `[[repo]]` entry's `path` resolves to a git common dir,
+    /// and a Submodule's is its parent's `.git/modules/<name>`, so one entry cannot cover a
+    /// parent and its Submodules together
     /// ([config.md](../../../docs/spec/config.md)'s per-Repo entries).
     SubmoduleHasNoEntryOfItsOwn,
-    /// `ignore` on an entity a `[[repo]]` entry already excludes.
-    AlreadyIgnored,
-    /// `unignore` on an entity no `[[repo]]` entry excludes.
-    NotIgnored,
     /// `sync` on a Worktree: the auto-update it reuses acts on a Repo's own branch, and
     /// `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly
     /// that reason, so a Worktree sharing a common dir with a Repo is refused rather than
@@ -187,8 +163,6 @@ impl Refusal {
             Refusal::SubmoduleHasNoEntryOfItsOwn => {
                 "a Submodule shares its parent's `[[repo]]` entry and has none of its own"
             }
-            Refusal::AlreadyIgnored => "already ignored",
-            Refusal::NotIgnored => "not ignored",
             Refusal::WorktreeSyncsThroughItsRepo => {
                 "sync acts on a Repo's own branch; a Worktree shares it and is not itself \
                  the target"
@@ -213,6 +187,9 @@ pub(crate) struct Target {
     /// its parent Repo by, rather than by path.
     pub(crate) common_dir: Arc<Path>,
     pub(crate) eligibility: Eligibility,
+    /// Whether a `[[repo]]` entry already excludes this row, which is what `ignore` reads
+    /// to decide which way to run ([`run_one`]).
+    pub(crate) excluded: bool,
     /// `delete` only, and only on a row it will act on: `Ok` with the read, or `Err` with
     /// why it could not be read, never a zeroed stand-in.
     pub(crate) risk: Option<Result<DeleteRisk, String>>,
@@ -250,6 +227,7 @@ impl Plan {
                 kind: entity.kind,
                 common_dir: Arc::clone(&entity.common_dir),
                 eligibility: operation.eligibility(entity),
+                excluded: entity.excluded,
                 risk: None,
             })
             .collect();
@@ -264,7 +242,7 @@ impl Plan {
 
     /// Reads what accepting destroys, once, for every row a `delete` will act on. `read` is
     /// [`repon_core::Core::delete_risk`] at the one call site; taken as a parameter so this
-    /// module never needs a `Core` to be tested. A no-op for `ignore` and `unignore`, which
+    /// module never needs a `Core` to be tested. A no-op for `ignore`, which
     /// destroy nothing and so get the ordinary gate with no additional lines.
     pub(crate) fn with_risk(
         mut self,
@@ -300,7 +278,7 @@ impl Plan {
 
     /// The gate's own lines: the headline count with the refusals subtracted and counted,
     /// then one line per row, then the sentence saying in as many words that there is no undo
-    /// and no trash. `ignore` and `unignore` get the ordinary gate with no additional lines,
+    /// and no trash. `ignore` gets the ordinary gate with no additional lines,
     /// since neither destroys anything
     /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "The confirm gate").
     pub(crate) fn confirm_lines(&self) -> Vec<String> {
@@ -393,8 +371,7 @@ fn target_line(operation: Operation, target: &Target) -> String {
                     target.name
                 )
             }
-            (Operation::Delete, None)
-            | (Operation::Ignore | Operation::Unignore | Operation::Sync, _) => {
+            (Operation::Delete, None) | (Operation::Ignore | Operation::Sync, _) => {
                 target.name.to_string()
             }
         },
@@ -443,11 +420,12 @@ pub(crate) enum Outcome {
     Ignored,
     /// The `exclude` key is gone, and the entry with it if nothing else was left.
     Unignored,
-    /// `unignore` found no `[[repo]]` entry naming this entity's own path: its exclusion is
-    /// inherited from an entry naming the git common dir it shares, which covers every entity
-    /// sharing that dir ([config.md](../../../docs/spec/config.md)'s per-Repo entries).
-    /// Removing that entry would unignore all of them, which is not what this row asked for,
-    /// so nothing is written and the row says so.
+    /// An `ignore` over an excluded row found no `[[repo]]` entry naming that entity's own
+    /// path: its exclusion is inherited from an entry naming the git common dir it shares,
+    /// which covers every entity sharing that dir
+    /// ([config.md](../../../docs/spec/config.md)'s per-Repo entries). Removing that entry
+    /// would show all of them again, which is not what this row asked for, so nothing is
+    /// written and the row says so.
     ExcludedByAnInheritedEntry,
     /// A Repo's working tree is gone, along with every linked Worktree's own directory
     /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a Repo also
@@ -850,16 +828,16 @@ fn run_one(
     run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
 ) -> Result<Outcome> {
     match operation {
-        Operation::Ignore => {
-            repo_entry::write(config_file, target.key.path(), Edit::Exclude)?;
-            Ok(Outcome::Ignored)
-        }
-        Operation::Unignore => {
+        Operation::Ignore if target.excluded => {
             if repo_entry::write(config_file, target.key.path(), Edit::Unexclude)?.changed {
                 Ok(Outcome::Unignored)
             } else {
                 Ok(Outcome::ExcludedByAnInheritedEntry)
             }
+        }
+        Operation::Ignore => {
+            repo_entry::write(config_file, target.key.path(), Edit::Exclude)?;
+            Ok(Outcome::Ignored)
         }
         Operation::Delete => delete_one(
             target,
@@ -1108,7 +1086,7 @@ mod tests {
         )
     }
 
-    /// The four names, and their order, come from repo-management.md's own operations table
+    /// The three names, and their order, come from repo-management.md's own operations table
     /// read at test time, never restated here: the reserved-name check in
     /// [`crate::config::document`] and the palette's own built-in list are both this array,
     /// so a name that drifted from the specification would take both with it silently.
@@ -1826,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn the_delete_gate_says_there_is_no_undo_and_ignore_and_unignore_add_no_lines_at_all() {
+    fn the_delete_gate_says_there_is_no_undo_and_ignore_adds_no_lines_at_all() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
 
         let deleting = plan(Operation::Delete, &entities).confirm_lines();
@@ -1845,26 +1823,18 @@ mod tests {
     }
 
     // =====================================================================================
-    // The eligible column: `unignore`'s eligible set is exactly the rows the Action gate's
-    // own excluded-subtraction would remove, which is why management counts its own.
+    // The eligible column: `ignore` reaches an excluded row and a listed one alike, since
+    // the run reads the row's own state to decide which direction it goes.
     // =====================================================================================
 
     #[test]
-    fn ignore_and_unignore_are_eligible_on_opposite_halves_of_the_excluded_rows() {
+    fn ignore_is_eligible_on_an_excluded_row_and_a_listed_one_alike() {
         let plain = entity(Path::new("/tmp/x/a"), "a", Kind::Repo);
         let already = excluded(entity(Path::new("/tmp/x/b"), "b", Kind::Repo));
 
         assert_eq!(Operation::Ignore.eligibility(&plain), Eligibility::Eligible);
         assert_eq!(
             Operation::Ignore.eligibility(&already),
-            Eligibility::Refused(Refusal::AlreadyIgnored)
-        );
-        assert_eq!(
-            Operation::Unignore.eligibility(&plain),
-            Eligibility::Refused(Refusal::NotIgnored)
-        );
-        assert_eq!(
-            Operation::Unignore.eligibility(&already),
             Eligibility::Eligible
         );
     }
@@ -2208,16 +2178,16 @@ mod tests {
         );
     }
 
-    /// The whole write path end to end: `ignore` then `unignore` over the same row, through
-    /// [`run`], leaves a config file that had no `[[repo]]` array byte for byte what it was.
+    /// `ignore` covers both directions from one palette entry: run over a row an entry
+    /// already excludes, it removes what the first run wrote, so a config file that had no
+    /// `[[repo]]` array is byte for byte what it was.
     #[test]
-    fn running_ignore_then_unignore_returns_the_config_file_byte_for_byte() {
+    fn running_ignore_twice_returns_the_config_file_byte_for_byte() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config_file = dir.path().join("config.toml");
         let before = "# a comment worth keeping\ntheme = \"default\"\n";
         std::fs::write(&config_file, before).expect("write the config file");
-        let repo = dir.path().join("repo");
-        let plain = entity(&repo, "repo", Kind::Repo);
+        let plain = entity(&dir.path().join("repo"), "repo", Kind::Repo);
 
         run_plain(
             &plan(Operation::Ignore, std::slice::from_ref(&plain)),
@@ -2226,26 +2196,27 @@ mod tests {
         let ignored = std::fs::read_to_string(&config_file).expect("read it back");
         assert!(ignored.contains("exclude = true"), "got {ignored:?}");
 
-        run_plain(&plan(Operation::Unignore, &[excluded(plain)]), &config_file);
+        run_plain(&plan(Operation::Ignore, &[excluded(plain)]), &config_file);
 
         assert_eq!(
             std::fs::read_to_string(&config_file).expect("read it back"),
-            before
+            before,
+            "the second `ignore` removes the key the first one wrote"
         );
     }
 
     /// A Worktree excluded through the entry naming its Repo is not silently reported as
-    /// unignored: removing that entry would unignore every entity sharing the git common dir,
-    /// so nothing is written and the row says which it is.
+    /// no longer ignored: removing that entry would show every entity sharing the git common
+    /// dir again, so nothing is written and the row says which it is.
     #[test]
-    fn unignore_on_a_row_excluded_by_an_inherited_entry_writes_nothing_and_says_so() {
+    fn ignore_on_a_row_excluded_by_an_inherited_entry_writes_nothing_and_says_so() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config_file = dir.path().join("config.toml");
         let before = "[[repo]]\npath = \"/somewhere/else\"\nexclude = true\n";
         std::fs::write(&config_file, before).expect("write the config file");
         let inheriting = excluded(entity(&dir.path().join("tree"), "tree", Kind::Worktree));
 
-        let report = run_plain(&plan(Operation::Unignore, &[inheriting]), &config_file);
+        let report = run_plain(&plan(Operation::Ignore, &[inheriting]), &config_file);
 
         assert_eq!(
             report.records[0].outcome,
@@ -2338,7 +2309,10 @@ mod tests {
                 "Did",
             ),
             (Outcome::ExcludedByAnInheritedEntry, "Refused"),
-            (Outcome::Refused(Refusal::AlreadyIgnored), "Refused"),
+            (
+                Outcome::Refused(Refusal::SubmoduleHasNoEntryOfItsOwn),
+                "Refused",
+            ),
             (Outcome::Failed("boom".to_string()), "CouldNotAct"),
             (Outcome::Synced, "Did"),
             (
