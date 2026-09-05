@@ -4086,6 +4086,65 @@ mod tests {
     /// the same interleaved, multi-group list `grouped_row_order_places_each_repos_children_
     /// immediately_after_it_in_original_order` uses, which is what makes a flattened answer
     /// visibly different from a grouped one instead of coincidentally equal.
+    /// The ignored narrowing at its own seam: with `ignored` off an excluded row is not a
+    /// candidate at all, and with it on the row is back, so the toggle and the table cannot
+    /// disagree about which rows exist.
+    #[test]
+    fn an_excluded_row_is_a_candidate_only_while_ignored_is_on() {
+        let mut entities = vec![
+            entity_of_kind("repo-a", Kind::Repo, "/repo-a"),
+            entity_of_kind("repo-b", Kind::Repo, "/repo-b"),
+        ];
+        entities[0].excluded = true;
+        let names = |visibility| {
+            visible_row_order(
+                &entities,
+                visibility,
+                &Filter::default(),
+                RowOrder::Natural,
+                &HashSet::new(),
+            )
+            .into_iter()
+            .map(|index| entities[index].name.to_string())
+            .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            names(Visibility {
+                ignored: false,
+                ..Visibility::everything()
+            }),
+            vec!["repo-b".to_string()]
+        );
+        assert_eq!(
+            names(Visibility::everything()),
+            vec!["repo-a".to_string(), "repo-b".to_string()]
+        );
+    }
+
+    /// A pinned row is held past the Filter, never past the ignored toggle: the toggle
+    /// decides which rows exist for this frame the way the Kind preferences do, and an
+    /// in-flight run is not a reason to draw a row the user hid.
+    #[test]
+    fn a_pinned_row_is_still_hidden_while_it_is_ignored() {
+        let mut entities = vec![entity_of_kind("repo-a", Kind::Repo, "/repo-a")];
+        entities[0].excluded = true;
+        let pinned: HashSet<EntityKey> = std::iter::once(entities[0].key.clone()).collect();
+
+        let visible = visible_row_order(
+            &entities,
+            Visibility {
+                ignored: false,
+                ..Visibility::everything()
+            },
+            &Filter::default(),
+            RowOrder::Natural,
+            &pinned,
+        );
+
+        assert!(visible.is_empty(), "got {visible:?}");
+    }
+
     #[test]
     fn a_filter_matching_every_row_leaves_the_order_identical_to_unfiltered() {
         let entities = vec![

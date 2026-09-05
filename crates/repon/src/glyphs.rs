@@ -730,6 +730,41 @@ mod tests {
         }
     }
 
+    /// The ignored mark's own two characters, read out of
+    /// [theming.md](../../../docs/spec/theming.md)'s "The two sets" table at test time
+    /// rather than restated here, so neither set can drift from the specification and
+    /// neither can be changed without the spec changing with it. The row-state marks are
+    /// excluded from the in-cell value cross-check below, which is what leaves this one
+    /// otherwise unpinned in either set.
+    #[test]
+    fn the_ignored_mark_is_the_pair_theming_mds_own_two_sets_table_names() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let spec = std::fs::read_to_string(manifest_dir.join("../../docs/spec/theming.md"))
+            .expect("read docs/spec/theming.md");
+
+        let row = spec
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("| ignored |"))
+            .expect("theming.md's \"The two sets\" table must name `ignored`");
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let [_, full, ascii] = cells.as_slice() else {
+            panic!("the ignored row does not have exactly three cells: {row:?}");
+        };
+        let one = |cell: &str| {
+            let mut chars = cell.trim_matches('`').chars();
+            let glyph = chars.next().expect("a glyph");
+            assert!(
+                chars.next().is_none(),
+                "expected one character, got {cell:?}"
+            );
+            glyph
+        };
+
+        assert_eq!(FULL.ignored, one(full));
+        assert_eq!(ASCII.ignored, one(ascii));
+    }
+
     /// Reads `docs/spec/layout-and-provenance.md`'s own "In-cell glyphs for real values"
     /// table at test time and compares it against the full glyph table in both directions:
     /// a meaning the spec names and the code does not implement fails here, as does a value

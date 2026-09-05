@@ -14,7 +14,7 @@ Management operations change what Repon operates on, or remove a Repo from the m
 
 The three names are reserved. A config-defined `[[action]]` may not take one, and the load fails with the same message shape any other duplicate name produces, rather than one shadowing the other.
 
-`ignore` is one entry covering both directions rather than a pair. It reads the row's own state and writes whichever way that state is not, so the gesture that hides a Repo is the gesture that brings it back, and the palette lists one name instead of two. The confirm gate names the direction it is about to run.
+`ignore` is one entry covering both directions rather than a pair. It reads the row's own state and writes whichever way that state is not, so the gesture that hides a Repo is the gesture that brings it back, and the palette lists one name instead of two. Which way a given row goes is read off the row itself: an ignored row carries its own mark ([theming.md](theming.md)), and a listed one does not.
 
 An ignored row is hidden as well as unoperated on. [keybindings.md](keybindings.md)'s ignored toggle is what shows it again, and until it does the row is absent from the table the way a hidden Worktree is: still discovered, still probed, merely undrawn. That is a change from the Filter doing the hiding: a Filter is transient by design and an ignore list is not, so an ignore that only stopped operations left no way to say "stop showing me this" that survived the session.
 

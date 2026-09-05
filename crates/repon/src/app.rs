@@ -850,21 +850,25 @@ impl App {
         .into_warnings()
     }
 
-    /// `snapshot`'s entities that a kind preference (Worktrees off, Submodules off) does not
-    /// hide, via a Filter-free [`crate::components::list::kind_is_visible`] check. Shared by
-    /// the header's own entity count ([`Self::status_row_content`]) and `Action::RefreshAll`'s
-    /// reported count, so the two can never disagree.
-    fn kind_visible_entity_count(&self, snapshot: &Snapshot, worktrees_shown: bool) -> usize {
+    /// How many of `snapshot`'s entities `visibility` draws, before any Filter narrows them.
+    /// Shared by the header's own entity count ([`Self::status_row_content`]), the ignored
+    /// note it sits beside, and `Action::RefreshAll`'s reported count, so none of the three
+    /// can disagree about what the table is showing.
+    fn shown_entity_count(
+        &self,
+        snapshot: &Snapshot,
+        visibility: crate::components::list::Visibility,
+    ) -> usize {
         snapshot
             .entities
             .iter()
             .filter(|entity| {
                 crate::components::list::kind_is_visible(
                     entity.kind,
-                    worktrees_shown,
-                    self.document.show_submodules,
+                    visibility.worktrees,
+                    visibility.submodules,
                     &Filter::default(),
-                )
+                ) && (visibility.ignored || !entity.excluded)
             })
             .count()
     }
@@ -926,12 +930,20 @@ impl App {
                 entity_count: run.entity_count,
                 running: self.core.refresh_running(),
             });
-        let entity_count = self.kind_visible_entity_count(snapshot, worktrees_shown);
-        // Counted over every discovered row rather than over `visible` above, which has
-        // already dropped them: the note's whole job is to account for what is missing.
-        let ignored_note = (!self.effective_show_ignored())
-            .then(|| snapshot.entities.iter().filter(|e| e.excluded).count())
-            .filter(|count| *count > 0);
+        let visibility = self.visibility();
+        let entity_count = self.shown_entity_count(snapshot, visibility);
+        // The difference the toggle itself makes, rather than a count of excluded rows: an
+        // excluded row the Kind preferences already hide is not one `i` would bring back.
+        let ignored_note = self
+            .shown_entity_count(
+                snapshot,
+                crate::components::list::Visibility {
+                    ignored: true,
+                    ..visibility
+                },
+            )
+            .checked_sub(entity_count)
+            .filter(|hidden| *hidden > 0);
         StatusRowContent {
             set_name: &self.active_set.name,
             header: HeaderContent {
@@ -1478,10 +1490,8 @@ impl App {
             Some(Action::RefreshAll) => {
                 let order = self.refresh_everything_order();
                 self.core.refresh(&order);
-                let entity_count = self.kind_visible_entity_count(
-                    &self.core.snapshot(),
-                    self.effective_show_worktrees(),
-                );
+                let entity_count =
+                    self.shown_entity_count(&self.core.snapshot(), self.visibility());
                 self.refresh_run = Some(RefreshRun {
                     scope: status_row::RefreshScope::All,
                     entity_count,
@@ -2175,7 +2185,7 @@ impl App {
         };
         Some(match palette.highlighted(&self.document.actions) {
             // A built-in subtracts its own ineligible rows rather than the excluded ones
-            // `operable_count` subtracts: `unignore`'s eligible set is exactly the
+            // `operable_count` subtracts: `ignore`'s eligible set includes exactly the
             // excluded rows ([repo-management.md](../../../docs/spec/repo-management.md)'s
             // operations table), which the Action gate's own subtraction would zero. It
             // reads `management_targets`, `sync`'s own widening included, rather than the
@@ -2196,7 +2206,7 @@ impl App {
     /// The rows an Action fans out over: the checked rows, or every visible row when the
     /// Selection is empty ([actions.md](../../../docs/spec/actions.md)'s "The Selection and
     /// the gate"). A second resolution beside [`Selection::targets`] rather than a widening
-    /// of it, because three of the four management operations keep the cursor-row fallback
+    /// of it, because two of the three management operations keep the cursor-row fallback
     /// that seam gives them; `sync` is the exception and reads this resolution too, through
     /// [`Self::management_targets`]. Bounded by visibility, so a row a Filter hides is never
     /// reached, and the border title and the confirm gate both count from here so neither
@@ -2259,7 +2269,7 @@ impl App {
     /// computation [`Self::action_palette_count`]'s own border title and confirm dialog
     /// read, then hands it to [`ActionPalette::choose`]. A built-in reads
     /// [`Self::management_targets`] instead: the cursor-row fallback for `ignore`,
-    /// `unignore` and `delete`, or `sync`'s own widening. A missing cursor (an empty table)
+    /// `ignore` and `delete`, or `sync`'s own widening. A missing cursor (an empty table)
     /// leaves the palette untouched, the same as choosing with no match at all.
     fn choose_highlighted_action(&mut self) {
         let Some(cursor_key) = self.cursor_key() else {
@@ -6143,12 +6153,6 @@ mod tests {
     /// wants this rather than [`open_the_management_gate`] alone: a test that instead needs
     /// to see the gate closed but the run still outstanding presses `y` itself and reads
     /// [`App::management_running`] before waiting.
-    /// Presses `i`, so a test can reach the rows `ignore` hides.
-    fn show_ignored_rows(app: &mut App) {
-        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
-            .expect("press i");
-    }
-
     fn press_through_the_management_gate(app: &mut App, operation: management::Operation) {
         open_the_management_gate(app, operation);
         app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -6161,6 +6165,12 @@ mod tests {
     /// rather than reaching for `Core::action_running`'s own `wait_for` shape directly: unlike
     /// that one, nothing settles this run's own outstanding state but a poll from this
     /// thread, so the condition itself has to drive the drain rather than merely read a flag.
+    /// Presses `i`, so a test can reach the rows `ignore` hides.
+    fn show_ignored_rows(app: &mut App) {
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("press i");
+    }
+
     fn wait_for_management_run(app: &mut App) {
         wait_for("a management run to finish", || {
             app.poll_management_run();
@@ -6438,6 +6448,66 @@ mod tests {
         );
     }
 
+    /// The header's own count drops the rows the toggle hides, the way it already drops
+    /// Worktrees `t` hides, so the count and the table agree and the note explains the
+    /// difference rather than contradicting it.
+    #[test]
+    fn the_entity_count_drops_the_rows_the_ignored_toggle_hides() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let hidden = root.join("repo-a");
+        init_repo(&hidden);
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: hidden,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+
+        let frame = render_to_lines(&mut app, 120, 24).join("\n");
+
+        assert!(
+            frame.contains("1 entities"),
+            "one of the two repos is hidden, so the count says one, got:\n{frame}"
+        );
+    }
+
+    /// The note counts the rows the toggle would actually bring back, not every excluded
+    /// row: a Worktree `t` is already hiding is not one `i` shows, and counting it would
+    /// report it twice over and promise a key that does nothing for it. The fixture excludes
+    /// both entities in one entry, since a `[[repo]]` path resolves to the git common dir
+    /// they share ([config.md](../../docs/spec/config.md)), so the Repo is the one row left
+    /// for `i` to show.
+    #[test]
+    fn the_ignored_note_skips_an_excluded_row_the_worktrees_toggle_is_already_hiding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("repo-a-tree");
+        worktree_add(&repo, &worktree, "side");
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: worktree,
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        app.document.show_worktrees = false;
+
+        let frame = render_to_lines(&mut app, 120, 24).join("\n");
+
+        assert!(
+            frame.contains("ignored: 1 (i shows)"),
+            "only the Repo is a row `i` would show; the Worktree is `t`'s to hide, \
+             got:\n{frame}"
+        );
+    }
+
     /// A row that vanished on an `ignore` is accounted for on the status row, so the table
     /// never silently shrinks: the count and the key that brings it back are both named.
     #[test]
@@ -6497,13 +6567,16 @@ mod tests {
             .find(|line| line.contains("repo-b"))
             .expect("the listed row is on screen");
 
-        let mark = crate::glyphs::FULL.ignored;
+        // The literal rather than `FULL.ignored`, which is what the renderer prints: reading
+        // the mark out of the same constant would agree with any character at all.
+        // `the_ignored_mark_is_the_pair_theming_mds_own_two_sets_table_names` is what ties
+        // that constant to the specification.
         assert!(
-            ignored_row.contains(mark),
-            "the ignored row carries {mark:?}, got: {ignored_row:?}"
+            ignored_row.contains('⊘'),
+            "the ignored row carries the mark, got: {ignored_row:?}"
         );
         assert!(
-            !listed_row.contains(mark),
+            !listed_row.contains('⊘'),
             "and a listed row does not, got: {listed_row:?}"
         );
     }
@@ -6531,16 +6604,14 @@ mod tests {
             "an ignored row starts hidden"
         );
 
-        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
-            .expect("press i");
+        show_ignored_rows(&mut app);
         assert_eq!(
             visible_names(&app),
             vec!["repo-a".to_string(), "repo-b".to_string()],
             "the toggle brings it back"
         );
 
-        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
-            .expect("press i again");
+        show_ignored_rows(&mut app);
         assert_eq!(
             visible_names(&app),
             vec!["repo-b".to_string()],

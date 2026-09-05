@@ -1,4 +1,4 @@
-//! The four built-in management operations: `ignore`, `unignore`, `delete` and `sync`.
+//! The three built-in management operations: `ignore`, `delete` and `sync`.
 //!
 //! [repo-management.md](../../../docs/spec/repo-management.md) is the specification and
 //! [0028](../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md) the reasoning for
@@ -36,7 +36,7 @@ use repon_core::{AutoUpdateAttempt, DeleteRisk, EntityKey, EntityState, Kind, Ow
 
 use crate::config::repo_entry::{self, Edit};
 
-/// One of the four built-in entries in the Action palette, in the order
+/// One of the three built-in entries in the Action palette, in the order
 /// [repo-management.md](../../../docs/spec/repo-management.md)'s own operations table lists
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl Operation {
 
     /// Whether this operation widens to every visible row on an empty Selection, the way a
     /// declared Action already does, rather than falling back to the cursor row alone.
-    /// `sync` alone widens; `ignore`, `unignore` and, safety-critically, `delete` (which
+    /// `sync` alone widens; `ignore` and, safety-critically, `delete` (which
     /// permanently removes working trees) keep the cursor-row fallback
     /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
     pub(crate) fn widens_to_every_visible_row_when_selection_is_empty(self) -> bool {
@@ -187,8 +187,8 @@ pub(crate) struct Target {
     /// its parent Repo by, rather than by path.
     pub(crate) common_dir: Arc<Path>,
     pub(crate) eligibility: Eligibility,
-    /// Which direction `ignore` runs on this row: a `[[repo]]` entry already excludes it, so
-    /// the run removes the key rather than writing it.
+    /// Whether a `[[repo]]` entry already excludes this row, which is what `ignore` reads
+    /// to decide which way to run ([`run_one`]).
     pub(crate) excluded: bool,
     /// `delete` only, and only on a row it will act on: `Ok` with the read, or `Err` with
     /// why it could not be read, never a zeroed stand-in.
@@ -242,7 +242,7 @@ impl Plan {
 
     /// Reads what accepting destroys, once, for every row a `delete` will act on. `read` is
     /// [`repon_core::Core::delete_risk`] at the one call site; taken as a parameter so this
-    /// module never needs a `Core` to be tested. A no-op for `ignore` and `unignore`, which
+    /// module never needs a `Core` to be tested. A no-op for `ignore`, which
     /// destroy nothing and so get the ordinary gate with no additional lines.
     pub(crate) fn with_risk(
         mut self,
@@ -278,7 +278,7 @@ impl Plan {
 
     /// The gate's own lines: the headline count with the refusals subtracted and counted,
     /// then one line per row, then the sentence saying in as many words that there is no undo
-    /// and no trash. `ignore` and `unignore` get the ordinary gate with no additional lines,
+    /// and no trash. `ignore` gets the ordinary gate with no additional lines,
     /// since neither destroys anything
     /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "The confirm gate").
     pub(crate) fn confirm_lines(&self) -> Vec<String> {
@@ -420,11 +420,12 @@ pub(crate) enum Outcome {
     Ignored,
     /// The `exclude` key is gone, and the entry with it if nothing else was left.
     Unignored,
-    /// `unignore` found no `[[repo]]` entry naming this entity's own path: its exclusion is
-    /// inherited from an entry naming the git common dir it shares, which covers every entity
-    /// sharing that dir ([config.md](../../../docs/spec/config.md)'s per-Repo entries).
-    /// Removing that entry would unignore all of them, which is not what this row asked for,
-    /// so nothing is written and the row says so.
+    /// An `ignore` over an excluded row found no `[[repo]]` entry naming that entity's own
+    /// path: its exclusion is inherited from an entry naming the git common dir it shares,
+    /// which covers every entity sharing that dir
+    /// ([config.md](../../../docs/spec/config.md)'s per-Repo entries). Removing that entry
+    /// would show all of them again, which is not what this row asked for, so nothing is
+    /// written and the row says so.
     ExcludedByAnInheritedEntry,
     /// A Repo's working tree is gone, along with every linked Worktree's own directory
     /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a Repo also
@@ -1085,7 +1086,7 @@ mod tests {
         )
     }
 
-    /// The four names, and their order, come from repo-management.md's own operations table
+    /// The three names, and their order, come from repo-management.md's own operations table
     /// read at test time, never restated here: the reserved-name check in
     /// [`crate::config::document`] and the palette's own built-in list are both this array,
     /// so a name that drifted from the specification would take both with it silently.
@@ -1803,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn the_delete_gate_says_there_is_no_undo_and_ignore_and_unignore_add_no_lines_at_all() {
+    fn the_delete_gate_says_there_is_no_undo_and_ignore_adds_no_lines_at_all() {
         let entities = vec![entity(Path::new("/tmp/x/repo"), "repo", Kind::Repo)];
 
         let deleting = plan(Operation::Delete, &entities).confirm_lines();

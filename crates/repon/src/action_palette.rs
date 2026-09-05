@@ -784,7 +784,7 @@ impl ActionPalette {
     ) -> Option<Decision> {
         match self.highlighted(actions) {
             // A built-in always asks, and asks even at a count of zero: `delete` destroys
-            // work permanently, `ignore`/`unignore` use the ordinary gate, and every row the
+            // work permanently, `ignore` uses the ordinary gate, and every row the
             // operation will not act on is named with its reason inside that gate rather than
             // collapsed into a bare count out here
             // ([repo-management.md](../../../docs/spec/repo-management.md)'s "A refusal is

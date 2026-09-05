@@ -12533,8 +12533,8 @@ mod tests {
         );
     }
 
-    /// The other direction, which is `unignore`: dropping the entry clears the flag, so a row
-    /// ignored and unignored in one session ends where it started.
+    /// The other direction: dropping the entry clears the flag, so a row ignored and shown
+    /// again in one session ends where it started.
     #[test]
     fn set_exclusions_clears_the_flag_when_the_entry_is_gone() {
         let dir = tempfile::tempdir().expect("temp dir");

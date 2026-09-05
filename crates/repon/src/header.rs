@@ -93,11 +93,9 @@ pub(crate) fn trailing_items(content: &HeaderContent) -> Vec<degrade::Item<Strin
         });
     }
     if let Some(count) = content.ignored_note {
-        // The key is named because these rows leave no other trace: an Action's count drops
-        // and nothing on screen says why, where a Filter at least shows its own expression.
-        // Rank 2 is shared with the worktrees note deliberately: [`degrade::budget`] drops a
-        // shared rank as one group, and the two answer the same question, so a frame narrow
-        // enough to lose one should not keep a half-answer.
+        // Rank 2 is the worktrees note's, shared deliberately: [`degrade::budget`] drops a
+        // shared rank as one group, and the two answer the same question
+        // ([keybindings.md](../../../../docs/spec/keybindings.md#the-ignored-toggle)).
         items.push(degrade::Item {
             content: format!("ignored: {count} (i shows)"),
             priority: Priority::Drop(2),

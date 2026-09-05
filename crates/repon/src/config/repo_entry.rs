@@ -27,7 +27,7 @@ const REPO: &str = "repo";
 /// itself with.
 const SET: &str = "set";
 
-/// The one key an entry Repon appends carries besides `path`, and the one key `unignore`
+/// The one key an entry Repon appends carries besides `path`, and the one key `Unexclude`
 /// removes.
 const EXCLUDE: &str = "exclude";
 
@@ -44,7 +44,7 @@ pub(crate) enum Edit {
     /// `ignore`: `exclude = true`, on the entry the path already has or on one appended
     /// with its provenance comment.
     Exclude,
-    /// `unignore`: the `exclude` key alone, leaving whatever else the table carries. An
+    /// `Unexclude`: the `exclude` key alone, leaving whatever else the table carries. An
     /// entry left with nothing but `path` goes with it.
     Unexclude,
     /// `delete`: the whole entry, once the working tree is gone, and the path with it from
@@ -232,7 +232,7 @@ fn entries_mut(document: &mut DocumentMut) -> Option<&mut toml_edit::ArrayOfTabl
 ///
 /// Removing the last such entry is also what removes the array of tables: `toml_edit` renders
 /// an emptied `ArrayOfTables` as no text at all, so the array goes with its last entry with
-/// no separate step. Measured rather than assumed, and `ignore_then_unignore_on_a_file_with_no_repo_array_returns_it_byte_for_byte`
+/// no separate step. Measured rather than assumed, and `exclude_then_unexclude_on_a_file_with_no_repo_array_returns_it_byte_for_byte`
 /// is what holds it.
 fn carries_only_a_path(entry: &Table) -> bool {
     entry.len() == 1 && entry.contains_key(PATH)
@@ -405,10 +405,10 @@ mod tests {
         );
     }
 
-    /// Criterion 2: `ignore` then `unignore` on a file that had no `[[repo]]` array returns
+    /// Criterion 2: an `Exclude` then an `Unexclude` on a file that had no `[[repo]]` array returns
     /// it byte for byte, the array of tables going with the last entry in it.
     #[test]
-    fn ignore_then_unignore_on_a_file_with_no_repo_array_returns_it_byte_for_byte() {
+    fn exclude_then_unexclude_on_a_file_with_no_repo_array_returns_it_byte_for_byte() {
         let before = "# the whole file's value is its comments\ntheme = \"default\"\n\n\
                       [refresh]\npoll_interval = \"2s\"   # a trailing comment\n\n\
                       # a comment at the end of the file\n";
@@ -420,7 +420,7 @@ mod tests {
             "the ignore has to have written something for the round trip to prove anything: \
              {ignored:?}"
         );
-        let unignored = apply(
+        let unexcluded = apply(
             &ignored,
             &path("~/dev/noisy"),
             Edit::Unexclude,
@@ -428,7 +428,7 @@ mod tests {
         )
         .expect("the written document parses");
 
-        assert_eq!(unignored, before);
+        assert_eq!(unexcluded, before);
     }
 
     /// [0028](../../../../docs/adr/0028-repon-writes-the-repo-entries-it-owns.md)'s measured
@@ -486,10 +486,10 @@ mod tests {
         );
     }
 
-    /// Criterion 3: `unignore` on an entry carrying `default_branch` removes the `exclude`
+    /// Criterion 3: `Unexclude` on an entry carrying `default_branch` removes the `exclude`
     /// key alone and leaves the table, since the table still states a fact.
     #[test]
-    fn unignore_on_an_entry_carrying_default_branch_removes_exclude_alone() {
+    fn unexclude_on_an_entry_carrying_default_branch_removes_exclude_alone() {
         let before = "# pinned, and ignored for now\n[[repo]]\npath = \"~/dev/legacy-api\"\n\
                       default_branch = \"main\"\nexclude = true\n";
 
@@ -511,7 +511,7 @@ mod tests {
     /// Criterion 3's boundary: the same edit on an entry carrying nothing but `path` and
     /// `exclude` takes the whole table, and the array of tables with it.
     #[test]
-    fn unignore_on_an_entry_left_with_nothing_but_path_removes_the_table_and_the_array() {
+    fn unexclude_on_an_entry_left_with_nothing_but_path_removes_the_table_and_the_array() {
         let before = "theme = \"default\"\n\n[[repo]]\npath = \"~/dev/noisy\"\nexclude = true\n";
 
         let after = apply(before, &path("~/dev/noisy"), Edit::Unexclude, "2026-09-01")
@@ -574,7 +574,7 @@ mod tests {
 
     /// The entry Repon appends is matched again by the absolute path the entity is known by,
     /// not only by the `~`-relative string it was written as, which is what makes an
-    /// `unignore` after an `ignore` find its own entry at all.
+    /// an `Unexclude` after an `Exclude` find its own entry at all.
     #[test]
     fn an_appended_entry_is_found_again_by_the_absolute_path_it_was_written_for() {
         let absolute = expand_home("~/dev/noisy");
@@ -680,10 +680,10 @@ mod tests {
         assert!(!after.contains("gone"), "got {after:?}");
     }
 
-    /// `ignore` and `unignore` state a fact about one `[[repo]]` entry and never about a
+    /// `Exclude` and `Unexclude` state a fact about one `[[repo]]` entry and never about a
     /// Set: only the removal `delete` performs reaches a `[[set]]` array at all.
     #[test]
-    fn ignore_and_unignore_leave_every_set_array_untouched() {
+    fn exclude_and_unexclude_leave_every_set_array_untouched() {
         let before = "[[set]]\nname = \"one\"\nroots = [\"~/dev\"]\n\
                       include = [\"~/dev/noisy\"]\n";
 
