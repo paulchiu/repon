@@ -38,7 +38,7 @@ use crate::{
     management::{self, Plan},
     message::Message,
     notice,
-    selection::Selection,
+    selection::{RunScope, Selection, Targets},
     set_picker::SetPicker,
     sort::{RowOrder, SortColumn},
     state,
@@ -2178,10 +2178,10 @@ impl App {
         let palette = self.action_palette.as_ref()?;
         // A live gate's own count, so the border and the gate can never name two numbers.
         if let Some(plan) = &self.management_plan {
-            return Some(Count::selection(plan.eligible_count()));
+            return Some(Count::over(plan.scope, plan.eligible_count()));
         }
         let Some(cursor_key) = self.cursor_key() else {
-            return Some(Count::selection(0));
+            return Some(Count::over(RunScope::Selection, 0));
         };
         Some(match palette.highlighted(&self.document.actions) {
             // A built-in subtracts its own ineligible rows rather than the excluded ones
@@ -2190,13 +2190,13 @@ impl App {
             // operations table), which the Action gate's own subtraction would zero. It
             // reads `management_targets`, `sync`'s own widening included, rather than the
             // plain `action_targets` a configured entry and an ad hoc command read.
-            Some(Entry::Builtin(operation)) => Count::selection(
-                self.management_plan_for(
+            Some(Entry::Builtin(operation)) => {
+                let plan = self.management_plan_for(
                     operation,
-                    &self.management_targets(operation, &cursor_key),
-                )
-                .eligible_count(),
-            ),
+                    self.management_targets(operation, &cursor_key),
+                );
+                Count::over(plan.scope, plan.eligible_count())
+            }
             Some(Entry::Configured(_)) | None => {
                 self.narrowed_count(palette, &self.action_targets())
             }
@@ -2211,11 +2211,17 @@ impl App {
     /// [`Self::management_targets`]. Bounded by visibility, so a row a Filter hides is never
     /// reached, and the border title and the confirm gate both count from here so neither
     /// can name a number the run would not act on.
-    fn action_targets(&self) -> Vec<EntityKey> {
+    fn action_targets(&self) -> Targets {
         if self.selection.is_empty() {
-            self.visible_keys()
+            Targets {
+                keys: self.visible_keys(),
+                scope: RunScope::EveryVisibleRow,
+            }
         } else {
-            self.selection.checked()
+            Targets {
+                keys: self.selection.checked(),
+                scope: RunScope::Selection,
+            }
         }
     }
 
@@ -2227,7 +2233,7 @@ impl App {
         &self,
         operation: management::Operation,
         cursor_key: &EntityKey,
-    ) -> Vec<EntityKey> {
+    ) -> Targets {
         if operation.widens_to_every_visible_row_when_selection_is_empty() {
             self.action_targets()
         } else {
@@ -2241,16 +2247,17 @@ impl App {
     /// [`repon_core::Core::applicability`] runs the identical excluded-row partition
     /// `operable_count` does, so the total it reports is that same count and the predicate
     /// only ever narrows what is left of it.
-    fn narrowed_count(&self, palette: &ActionPalette, targets: &[EntityKey]) -> Count {
+    fn narrowed_count(&self, palette: &ActionPalette, targets: &Targets) -> Count {
         let when = palette
             .narrowing_entry(&self.document.actions)
             .and_then(|action| Some((action, action.when.as_deref()?)));
         let Some((action, when)) = when else {
-            return Count::selection(self.core.operable_count(targets));
+            return Count::over(targets.scope, self.core.operable_count(&targets.keys));
         };
-        let applicability = self.core.applicability(targets, &Filter::parse(when));
+        let applicability = self.core.applicability(&targets.keys, &Filter::parse(when));
         Count {
             operable: applicability.total(),
+            scope: targets.scope,
             narrowed: Some(Narrowed {
                 label: action.name.get_ref().clone(),
                 applicability,
@@ -2260,7 +2267,7 @@ impl App {
 
     /// The cheap half of a built-in's gate: eligibility read from the snapshot, with no risk
     /// read at all. [`Self::choose_highlighted_action`] is what adds the risk, once.
-    fn management_plan_for(&self, operation: management::Operation, targets: &[EntityKey]) -> Plan {
+    fn management_plan_for(&self, operation: management::Operation, targets: Targets) -> Plan {
         Plan::new(operation, &self.core.snapshot().entities, targets)
     }
 
@@ -2286,14 +2293,14 @@ impl App {
         // fills the rows the run would act on.
         let plan = chosen_builtin.map(|operation| {
             let targets = self.management_targets(operation, &cursor_key);
-            self.management_plan_for(operation, &targets)
+            self.management_plan_for(operation, targets)
                 .with_risk(|key| self.core.delete_risk(key).map_err(|err| err.to_string()))
         });
         // Read for a config-defined Action and an ad hoc command alone: those two are
         // refused at a count of zero, where a built-in enters its own gate instead and names
         // and counts each ineligible row there
         // ([repo-management.md](../../../docs/spec/repo-management.md)).
-        let operable_count = self.core.operable_count(&self.action_targets());
+        let operable_count = self.core.operable_count(&self.action_targets().keys);
         let Some(palette) = &mut self.action_palette else {
             return;
         };
@@ -2597,10 +2604,10 @@ impl App {
     /// blocked by this one.
     fn start_action(&mut self, spec: repon_core::ActionSpec) {
         let targets = self.action_targets();
-        if targets.is_empty() {
+        if targets.keys.is_empty() {
             return;
         }
-        self.start_action_over(spec, targets);
+        self.start_action_over(spec, targets.keys);
     }
 
     /// [`Self::start_action`]'s body with the rows named rather than resolved from the
@@ -3007,8 +3014,12 @@ impl App {
     /// default onto, which is what an empty table means.
     fn refresh_selection_order(&self) -> Option<Vec<EntityKey>> {
         let cursor_key = self.cursor_key()?;
-        let targets: std::collections::HashSet<EntityKey> =
-            self.selection.targets(&cursor_key).into_iter().collect();
+        let targets: std::collections::HashSet<EntityKey> = self
+            .selection
+            .targets(&cursor_key)
+            .keys
+            .into_iter()
+            .collect();
         let keys: Vec<EntityKey> = entity_keys(&self.core.snapshot())
             .into_iter()
             .filter(|key| targets.contains(key))
@@ -3293,7 +3304,8 @@ impl App {
                 &self.theme,
                 Run {
                     actions: &self.document.actions,
-                    count: action_palette_count.unwrap_or_else(|| Count::selection(0)),
+                    count: action_palette_count
+                        .unwrap_or_else(|| Count::over(RunScope::Selection, 0)),
                     management_lines: &management_lines,
                     bindings: &self.bindings,
                 },
@@ -4519,7 +4531,7 @@ mod tests {
                 &buf,
                 whole_frame,
                 glyphs.border,
-                &ActionPalette::border_title(&Count::selection(0)),
+                &ActionPalette::border_title(&Count::over(RunScope::Selection, 0)),
                 "the Action palette App drew",
             );
             app.action_palette = None;
@@ -5607,7 +5619,7 @@ mod tests {
             .expect("press m");
         let choosing = render_to_lines(&mut app, 80, 24).join("\n");
         assert!(
-            choosing.contains("run on 1 repos"),
+            choosing.contains("run on 1 at the cursor"),
             "the border title counts the excluded row `ignore` would act on, got:\n{choosing}"
         );
 
@@ -5620,7 +5632,7 @@ mod tests {
         );
         let confirming = render_to_lines(&mut app, 80, 24).join("\n");
         assert!(
-            confirming.contains("ignore on 1 repos?"),
+            confirming.contains("ignore on 1 at the cursor?"),
             "and the gate itself counts it too, got:\n{confirming}"
         );
     }
@@ -5661,7 +5673,7 @@ mod tests {
                 Some("kind:worktree"),
                 "run \"reinstall\" on 0 of 1 selected",
             ),
-            (None, "run on 1 repos"),
+            (None, "run on 1 selected"),
         ] {
             app.document.actions = vec![match predicate {
                 Some(predicate) => action_with_when("reinstall", predicate),
@@ -5705,7 +5717,7 @@ mod tests {
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("sync on 0 repos, 1 refused?"),
+            frame.contains("sync on 0 selected, 1 refused?"),
             "the headline counts the refusal, got:\n{frame}"
         );
         assert!(
@@ -6078,7 +6090,7 @@ mod tests {
                     &app.theme,
                     Run {
                         actions: &app.document.actions,
-                        count: Count::selection(1),
+                        count: Count::over(RunScope::Selection, 1),
                         management_lines: &[],
                         bindings: &app.bindings,
                     },
@@ -6183,16 +6195,35 @@ mod tests {
     fn open_the_management_gate(app: &mut App, operation: management::Operation) {
         app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
             .expect("press m");
-        let index = crate::management::OPERATIONS
+        move_the_action_highlight_onto(app, operation);
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("press Enter");
+    }
+
+    /// The Action palette's own border title, which is the top line of its frame: the count
+    /// and the scope it counted, read where a user reads them.
+    fn border_title_line(app: &mut App) -> String {
+        render_to_lines(app, 80, 24)
+            .first()
+            .expect("a drawn frame has a first line")
+            .clone()
+    }
+
+    /// Walks an already-open Action palette's highlight down onto `operation` with the same
+    /// key a user would, so a test naming a built-in never hard-codes its row number.
+    fn move_the_action_highlight_onto(app: &mut App, operation: management::Operation) {
+        let index = app
+            .action_palette
+            .as_ref()
+            .expect("the palette must already be open")
+            .matches(&app.document.actions)
             .iter()
-            .position(|candidate| *candidate == operation)
-            .expect("the operation is one of the built-ins");
+            .position(|entry| entry.name() == operation.name())
+            .expect("the operation is one of the entries on offer");
         for _ in 0..index {
             app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
                 .expect("move the highlight");
         }
-        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("press Enter");
     }
 
     /// One whole frame of `app` at `width` by `height`, rendered through
@@ -6946,7 +6977,7 @@ mod tests {
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("delete on 1 repos?"),
+            frame.contains("delete on 1 at the cursor?"),
             "the headline names the operation and the count, got:\n{frame}"
         );
         assert!(
@@ -6985,7 +7016,7 @@ mod tests {
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("delete on 1 repos, 1 refused?"),
+            frame.contains("delete on 1 selected, 1 refused?"),
             "the headline counts the refusal as well as the eligible rows, got:\n{frame}"
         );
         assert!(
@@ -7057,7 +7088,7 @@ mod tests {
         open_the_management_gate(&mut app, management::Operation::Delete);
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
         assert!(
-            frame.contains("delete on 1 repos?"),
+            frame.contains("delete on 1 selected?"),
             "the Worktree covered by its selected parent must not inflate the count, got:\n{frame}"
         );
         assert!(
@@ -13060,6 +13091,159 @@ refresh_all = "z""#,
         );
     }
 
+    /// The bare count on its own reads the same whether the Selection was honoured or
+    /// ignored, which over a table as long as the Selection is indistinguishable from "all
+    /// of them". So the title names the rows it counted, and names them the same way for a
+    /// built-in as for a configured entry.
+    #[test]
+    fn the_border_title_names_the_selection_as_the_scope_it_counted_for_every_entry_kind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+        let visible = app.visible_keys();
+        assert_eq!(
+            visible.len(),
+            3,
+            "the fixture must discover all three repos"
+        );
+        app.selection.toggle(visible[0].clone());
+        app.selection.toggle(visible[1].clone());
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        // Every entry the palette offers, walked with the same key a user would.
+        for entry in 0..4 {
+            let frame = render_to_lines(&mut app, 80, 24).join("\n");
+            assert!(
+                frame.contains("run on 2 selected"),
+                "entry {entry} must name the two checked rows as the Selection, got:\n{frame}"
+            );
+            app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
+                .expect("move the highlight");
+        }
+    }
+
+    /// The widened reading. An empty Selection is not a small Selection, and calling the
+    /// whole table "selected" is the same lie in the other direction.
+    #[test]
+    fn with_nothing_checked_the_border_title_calls_the_rows_visible_never_selected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        let configured = border_title_line(&mut app);
+        move_the_action_highlight_onto(&mut app, management::Operation::Sync);
+        let sync = border_title_line(&mut app);
+
+        for (entry, title) in [("reinstall", &configured), ("sync", &sync)] {
+            assert!(
+                title.contains("run on 3 visible"),
+                "{entry} widens to every visible row, so the title must say so, got: {title}"
+            );
+            assert!(
+                !title.contains("selected"),
+                "{entry} must not call an empty Selection selected, got: {title}"
+            );
+        }
+    }
+
+    /// The narrowest reading, and the one worth naming most: `delete` permanently removes
+    /// working trees, and with nothing checked it acts on the cursor row alone. A title
+    /// reading `run on 1 repos` cannot say that, so the fallback and a one-row table look
+    /// the same on screen.
+    #[test]
+    fn with_nothing_checked_ignore_and_delete_say_the_run_is_at_the_cursor() {
+        for operation in [management::Operation::Ignore, management::Operation::Delete] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().canonicalize().expect("canonicalize temp dir");
+            init_repo(&root.join("repo-a"));
+            init_repo(&root.join("repo-b"));
+            init_repo(&root.join("repo-c"));
+            let mut app = test_app(&root);
+            assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+            app.handle_key_event(press(KeyCode::Char('m'), KeyModifiers::NONE))
+                .expect("press m");
+            move_the_action_highlight_onto(&mut app, operation);
+            let frame = render_to_lines(&mut app, 80, 24).join("\n");
+
+            assert!(
+                frame.contains("run on 1 at the cursor"),
+                "{} falls back to the cursor row, so the title must say so rather than \
+                 leaving a bare count, got:\n{frame}",
+                operation.name()
+            );
+        }
+    }
+
+    /// The gate and the border title above it are on screen together, so a scope named in
+    /// one and not the other, or named differently, is a contradiction the user can see. A
+    /// built-in reads its scope off the plan the gate was built with and a configured entry
+    /// off the live count, which is exactly where the two could drift apart.
+    #[test]
+    fn the_confirm_gate_names_the_same_scope_as_the_border_title_above_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        init_repo(&root.join("repo-c"));
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+
+        // `delete` with nothing checked: the cursor-row fallback, the scope worth naming most.
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        let fallback = render_to_lines(&mut app, 80, 24);
+        assert!(
+            fallback[0].contains("at the cursor") && fallback[1].contains("at the cursor"),
+            "the border and the gate must both name the cursor-row fallback, got:\n{}\n{}",
+            fallback[0],
+            fallback[1]
+        );
+
+        // A configured Action over a Selection: the other half of the same rule.
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close the gate");
+        let visible = app.visible_keys();
+        app.selection.toggle(visible[0].clone());
+        app.selection.toggle(visible[1].clone());
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted entry");
+        let over_a_selection = render_to_lines(&mut app, 80, 24);
+        assert!(
+            over_a_selection[0].contains("on 2 selected")
+                && over_a_selection[1].contains("on 2 selected?"),
+            "the border and the gate must both name the Selection, got:\n{}\n{}",
+            over_a_selection[0],
+            over_a_selection[1]
+        );
+    }
+
     /// And the confirm gate's own question, which reads the identical count: the border
     /// title and the question can never disagree about what a run will reach.
     #[test]
@@ -13082,7 +13266,7 @@ refresh_all = "z""#,
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("run \"reinstall\" on 2 repos?"),
+            frame.contains("run \"reinstall\" on 2 visible?"),
             "the gate asks about every visible row, got:\n{frame}"
         );
     }
@@ -14784,7 +14968,7 @@ refresh_all = "z""#,
             "a checked row the toggle hides must stay checked, never silently dropped"
         );
         assert_eq!(
-            app.action_targets(),
+            app.action_targets().keys,
             vec![worktree_key],
             "the hidden but checked row must still be what an Action or Launcher reaches"
         );

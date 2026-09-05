@@ -22,6 +22,38 @@ pub(crate) struct Selection {
     range_anchor: Option<EntityKey>,
 }
 
+/// Which rows a gesture resolved to. The count on its own reads the same whether the
+/// Selection was honoured or widened past it, so every surface that shows a count shows this
+/// beside it ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunScope {
+    /// The checked rows.
+    Selection,
+    /// Every visible row, which is what an empty Selection widens an Action, and `sync`, to.
+    EveryVisibleRow,
+    /// The cursor row alone: `ignore` and `delete`'s own empty-Selection fallback.
+    CursorRow,
+}
+
+impl RunScope {
+    /// The word a count is read with, so `2` never has to stand alone.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            RunScope::Selection => "selected",
+            RunScope::EveryVisibleRow => "visible",
+            RunScope::CursorRow => "at the cursor",
+        }
+    }
+}
+
+/// The rows a gesture will act on and which rows those are, resolved in one step so no
+/// surface can name a scope the run itself would not take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Targets {
+    pub(crate) keys: Vec<EntityKey>,
+    pub(crate) scope: RunScope,
+}
+
 impl Selection {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -122,11 +154,17 @@ impl Selection {
     /// [`crate::app::App::action_targets`] rather than here
     /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-selection)).
     ///
-    pub(crate) fn targets(&self, cursor: &EntityKey) -> Vec<EntityKey> {
+    pub(crate) fn targets(&self, cursor: &EntityKey) -> Targets {
         if self.selected.is_empty() {
-            vec![cursor.clone()]
+            Targets {
+                keys: vec![cursor.clone()],
+                scope: RunScope::CursorRow,
+            }
         } else {
-            self.selected.iter().cloned().collect()
+            Targets {
+                keys: self.selected.iter().cloned().collect(),
+                scope: RunScope::Selection,
+            }
         }
     }
 
@@ -265,7 +303,10 @@ mod tests {
         let selection = Selection::new();
         let cursor = key("cursor-row");
 
-        assert_eq!(selection.targets(&cursor), vec![cursor]);
+        let targets = selection.targets(&cursor);
+
+        assert_eq!(targets.keys, vec![cursor]);
+        assert_eq!(targets.scope, RunScope::CursorRow);
     }
 
     /// Distinguishes "the cursor row" from "the first row": the cursor here is not the first
@@ -278,8 +319,8 @@ mod tests {
 
         let targets = selection.targets(&cursor_row);
 
-        assert_eq!(targets, vec![cursor_row]);
-        assert!(!targets.contains(&first_row));
+        assert_eq!(targets.keys, vec![cursor_row]);
+        assert!(!targets.keys.contains(&first_row));
     }
 
     #[test]
@@ -289,7 +330,10 @@ mod tests {
         let cursor = key("cursor-row");
         selection.toggle(checked.clone());
 
-        assert_eq!(selection.targets(&cursor), vec![checked]);
+        let targets = selection.targets(&cursor);
+
+        assert_eq!(targets.keys, vec![checked]);
+        assert_eq!(targets.scope, RunScope::Selection);
     }
 
     /// [`Selection::checked`] is the half with no default at all: the caller that reads it
@@ -356,7 +400,7 @@ mod tests {
         selection.select_all_visible(&under_filter);
         let cursor = key("repo-a");
 
-        let targets: HashSet<EntityKey> = selection.targets(&cursor).into_iter().collect();
+        let targets: HashSet<EntityKey> = selection.targets(&cursor).keys.into_iter().collect();
 
         assert_eq!(targets, under_filter.iter().cloned().collect());
     }
