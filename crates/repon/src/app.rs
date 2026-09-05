@@ -6434,17 +6434,25 @@ mod tests {
         let config_dir = tempfile::tempdir().expect("config temp dir");
         let mut app = test_app_with_config(&root, config_dir.path());
         assert_eq!(
-            visible_names(&app),
+            visible_names_sorted(&app),
             vec!["repo-a".to_string(), "repo-b".to_string()],
-            "the fixture must discover both repos, cursor on the first"
+            "the fixture must discover both repos"
         );
+        // The gate acts on the cursor row with nothing checked, and which row that is comes
+        // from the walk, so the survivor is named against it rather than assumed.
+        let cursor = row_name(&app.visible_keys()[0]);
 
         press_through_the_management_gate(&mut app, management::Operation::Ignore);
 
+        let left = visible_names(&app);
         assert_eq!(
-            visible_names(&app),
-            vec!["repo-b".to_string()],
-            "the ignored row is gone from the table, not merely unoperable"
+            left.len(),
+            1,
+            "one row is gone from the table, got {left:?}"
+        );
+        assert_ne!(
+            left[0], cursor,
+            "the row that went is the one the gate named, not merely unoperable"
         );
     }
 
@@ -6606,7 +6614,7 @@ mod tests {
 
         show_ignored_rows(&mut app);
         assert_eq!(
-            visible_names(&app),
+            visible_names_sorted(&app),
             vec!["repo-a".to_string(), "repo-b".to_string()],
             "the toggle brings it back"
         );
@@ -8922,6 +8930,14 @@ mod tests {
         press_keys(&mut app, "o\u{1b}");
         assert!(!app.sort_menu_open, "esc closes the menu");
         assert_eq!(app.row_order, sorted, "and changes nothing about the order");
+    }
+
+    /// [`visible_names`] sorted, for a test about which rows are visible rather than the
+    /// order they come in: discovery order is the filesystem walk's and differs by platform.
+    fn visible_names_sorted(app: &App) -> Vec<String> {
+        let mut names = visible_names(app);
+        names.sort();
+        names
     }
 
     /// The display names of every visible row, in the order the table lists them.
@@ -15977,7 +15993,7 @@ refresh_all = "z""#,
         app_again.restore_session_state(None);
 
         assert_eq!(
-            visible_names(&app_again),
+            visible_names_sorted(&app_again),
             vec!["repo-a".to_string(), "repo-b".to_string()],
             "the next run reopens showing the ignored row"
         );
