@@ -26,4 +26,4 @@ formula = "repon"
 # Keep the generated workflow on the same checkout major as the hand-written
 # ones; dist 0.32.0 still emits v5 on its own
 [dist.github-action-commits]
-"actions/checkout" = "v5"
+"actions/checkout" = "v7"

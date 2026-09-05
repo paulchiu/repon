@@ -37,6 +37,7 @@ jobs:
         id: label
         env:
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
           GROUP: ${{ steps.metadata.outputs.dependency-group }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -56,6 +57,13 @@ jobs:
               ;;
           esac
 
+          # An Action version lives in a workflow file, which ships in neither
+          # crate, so the bump is a norelease however far its own semver moved.
+          # Whether it can merge unattended is still the case block's answer.
+          case "$ECOSYSTEM" in
+            github_actions | github-actions) label=norelease ;;
+          esac
+
           # A rerun over a relabelled PR would otherwise leave two labels on it,
           # which check-labels.yml fails just as hard as none.
           for stale in major minor patch norelease; do
@@ -68,9 +76,14 @@ jobs:
       # Gated on what the step above decided rather than on the metadata a
       # second time, so the label and the merge cannot drift apart. A major and
       # an unreadable lone bump both wait for a human.
+      #
+      # Enabled with the same PAT version-tag.yml pushes the tag with, because
+      # GitHub starts no workflow from an event the default GITHUB_TOKEN caused:
+      # a merge attributed to the Actions bot leaves version-tag.yml unfired and
+      # the bump sitting on main with no version and no tag.
       - name: Enable auto-merge
         if: steps.label.outputs.automerge == 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
         run: gh pr merge --auto --squash "$PR_URL"
