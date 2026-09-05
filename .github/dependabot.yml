@@ -1,0 +1,50 @@
+# The root workspace only. tools/fanout-sweep declares a workspace of its own
+# that `just ci` deliberately never builds, so a bump there would merge on a
+# green pipeline that never compiled it.
+#
+# Every PR raised here is labelled and merged by dependabot-auto-merge.yml, and
+# the groups below are capped at minor and patch so a major always arrives on
+# its own, where a human still sees it.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    versioning-strategy: auto
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+      - automerge
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+      - automerge
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
