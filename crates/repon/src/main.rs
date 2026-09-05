@@ -493,6 +493,12 @@ mod tests {
                 "wait_within",
                 "`liveness::wait_within`, the one polling wait every other wait goes through",
             ),
+            (
+                format!("&& start{}{} self.deadline =>", WALL_CLOCK_READS[0], " <"),
+                "repon/src/tui.rs",
+                "until_the_terminal_catches_up",
+                "production: a write waiting on a terminal that is behind on reading",
+            ),
         ]
     }
 
