@@ -1,0 +1,76 @@
+# Dependabot's PRs have to satisfy check-labels.yml like everyone else's, so the
+# version label has to be applied by machine or every bump sits blocked waiting
+# for a human to do it. See dependabot.yml for what is grouped and what is not.
+
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# A Dependabot-triggered run is handed a read-only token unless the workflow
+# asks for more.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot-auto-merge:
+    name: Label and auto-merge
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # A dependency bump never breaks repon's own public API, so the release
+      # label is one step gentler than the dependency's own semver jump. The
+      # action reports no update type at all for some PRs, so the last arm
+      # labels anyway: unlabelled fails check-labels.yml and blocks forever.
+      # Only a grouped PR is safe to merge on that guess, since dependabot.yml
+      # caps a group at minor and patch and so bounds what it can contain.
+      - name: Map the bump onto a version label
+        id: label
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          GROUP: ${{ steps.metadata.outputs.dependency-group }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          case "$UPDATE_TYPE" in
+            version-update:semver-major)
+              label=minor
+              automerge=false
+              ;;
+            version-update:semver-minor | version-update:semver-patch)
+              label=patch
+              automerge=true
+              ;;
+            *)
+              label=patch
+              if [ -n "$GROUP" ]; then automerge=true; else automerge=false; fi
+              ;;
+          esac
+
+          # A rerun over a relabelled PR would otherwise leave two labels on it,
+          # which check-labels.yml fails just as hard as none.
+          for stale in major minor patch norelease; do
+            [ "$stale" = "$label" ] || gh pr edit "$PR_URL" --remove-label "$stale" || true
+          done
+          gh pr edit "$PR_URL" --add-label "$label"
+
+          echo "automerge=$automerge" >> "$GITHUB_OUTPUT"
+
+      # Gated on what the step above decided rather than on the metadata a
+      # second time, so the label and the merge cannot drift apart. A major and
+      # an unreadable lone bump both wait for a human.
+      - name: Enable auto-merge
+        if: steps.label.outputs.automerge == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
