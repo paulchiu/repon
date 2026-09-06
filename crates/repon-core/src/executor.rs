@@ -2330,6 +2330,61 @@ print(1 if inherited else 0)"
         );
     }
 
+    /// Full byte equality, where the tests above walk `.lines()`: a newline lost or added at
+    /// the join between the kept head and the kept tail reads identically through `.lines()`.
+    /// The longer fixture's own last line is unterminated, which nothing else pins.
+    #[test]
+    fn short_exactly_bounded_and_longer_output_all_keep_the_literal_bytes_specified() {
+        let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
+        let numbered = |total: usize, terminate_last: bool| {
+            let mut text = String::new();
+            for n in 0..total {
+                text.push_str(&format!("line {n}"));
+                if n + 1 < total || terminate_last {
+                    text.push('\n');
+                }
+            }
+            text.into_bytes()
+        };
+
+        // Compared as text rather than as a byte vector: the equality is the same one,
+        // and a failing byte vector of this size prints as unreadable decimal.
+        let kept_text = |input: &[u8]| {
+            let (kept, elision) = bound_head_and_tail(input);
+            (String::from_utf8(kept).expect("valid utf8"), elision)
+        };
+
+        assert_eq!(
+            kept_text(&numbered(3, true)),
+            ("line 0\nline 1\nline 2\n".to_string(), None)
+        );
+
+        let exact = numbered(bound, true);
+        let (kept, elision) = kept_text(&exact);
+        assert_eq!(kept.into_bytes(), exact);
+        assert_eq!(elision, None);
+
+        let mut expected = String::new();
+        for n in 0..CAPTURE_HEAD_LINES {
+            expected.push_str(&format!("line {n}\n"));
+        }
+        for n in CAPTURE_HEAD_LINES + 1..bound {
+            expected.push_str(&format!("line {n}\n"));
+        }
+        expected.push_str(&format!("line {bound}"));
+
+        assert_eq!(
+            kept_text(&numbered(bound + 1, false)),
+            (
+                expected,
+                Some(CaptureElision {
+                    dropped_lines: 1,
+                    kept_head_lines: CAPTURE_HEAD_LINES,
+                })
+            )
+        );
+    }
+
     /// The wiring between the bound and the receipt, which nothing else exercises: every
     /// render-side test builds a `CaptureElision` by hand, so `run_step` could drop the one
     /// the bound computed and the mark would silently vanish from every real long run. A
