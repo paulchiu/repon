@@ -15196,6 +15196,35 @@ refresh_all = "z""#,
         );
     }
 
+    /// `ignore` and `delete` are the two built-ins whose reports do rewrite `config.toml`,
+    /// unlike `sync`. The write must still reach the running app the moment the report is
+    /// applied (`set_exclusions`, inside the same `reload_config` call), while the worktrees
+    /// toggle rides across that same reload exactly as [`Self::apply_management_report`]'s
+    /// own save-and-restore leaves it.
+    #[test]
+    fn an_ignore_run_excludes_the_row_at_once_while_leaving_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        assert!(
+            app.core.snapshot().entities[0].excluded,
+            "the ignore must still take effect the instant its report is applied"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "config.toml's own rewrite must not be read as the reload that clears the toggle"
+        );
+    }
+
     // --- criterion 5: the header shows the match count whenever a Filter is active,
     // including the zero-match case, and never when no Filter is active ---
 
