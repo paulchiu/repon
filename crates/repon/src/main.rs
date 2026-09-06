@@ -464,12 +464,6 @@ mod tests {
         let elapsed_ge = format!("{}{}", WALL_CLOCK_READS[0], " >=");
         vec![
             (
-                format!("if set_at{elapsed_ge} self.document.notice_timeout {{"),
-                "repon/src/app.rs",
-                "notice",
-                "production: a Notice expiring on screen",
-            ),
-            (
                 format!("&& at{elapsed_ge} threshold"),
                 "repon-core/src/cell.rs",
                 "age_into_stale",

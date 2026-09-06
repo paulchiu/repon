@@ -37,7 +37,7 @@ use crate::{
     list_viewport::{half_page_cursor, offset_following_cursor},
     management::{self, Plan},
     message::Message,
-    notice,
+    notice::{self, Notice},
     selection::{RunScope, Selection, Targets},
     set_picker::SetPicker,
     sort::{RowOrder, SortColumn},
@@ -407,12 +407,9 @@ pub struct App {
     /// fanning out. Cleared by [`Self::notice`]'s own timeout read,
     /// by a replacement (any later call to [`Self::set_notice`]), or by the next keypress,
     /// whichever comes first ([theming.md](../../../docs/spec/theming.md)'s "Warnings and
-    /// Notices").
-    notice: Option<String>,
-    /// When [`Self::set_notice`] last replaced `notice`: paired with `document.notice_timeout`
-    /// by [`Self::notice`] to decide whether the live Notice has aged out. `None` exactly
-    /// when `notice` is `None`.
-    notice_set_at: Option<std::time::Instant>,
+    /// Notices"). Text and the moment it was raised are one value ([`Notice`]), so neither
+    /// can be present without the other.
+    notice: Option<Notice>,
     /// Theme warnings raised at the last load: fixed at construction, replaced wholesale on
     /// `Action::ReloadConfig`. One of the sources [`Self::current_warnings`] folds into
     /// the shared warning slot ([`warnings::WarningSources`]).
@@ -674,7 +671,6 @@ impl App {
             pending_config_editor_handoff: false,
             set_picker: None,
             notice: None,
-            notice_set_at: None,
             theme_warnings,
             config_warnings,
             discovery_warning_logged: false,
@@ -711,33 +707,22 @@ impl App {
         Ok(app)
     }
 
-    /// Replaces the live Notice: read by every raiser
+    /// Raises a Notice now, replacing whichever one was live: read by every raiser
     /// ([`Self::switch_to_set`], `reload.rs`'s reload fallback, and the four fan-out-inert
     /// bindings) so the moment a Notice was raised is recorded in exactly one place, the
-    /// timestamp [`Self::notice`] measures its timeout from.
+    /// timestamp [`Notice::visible_at`] measures its timeout from.
     pub(crate) fn set_notice(&mut self, text: String) {
-        self.notice = Some(text);
-        self.notice_set_at = Some(std::time::Instant::now());
+        self.notice = Some(Notice::raised(text, std::time::Instant::now()));
     }
 
-    /// The live Notice, if any: read by [`Self::render`] to draw it, and by tests in place of
-    /// reaching into the private field directly. `None` once `document.notice_timeout` has
-    /// elapsed since it was raised, `"0s"` ([config.md](../../../docs/spec/config.md)) meaning the
-    /// timer never runs, which leaves the next keypress and a replacement as the only ways to
-    /// clear it ([theming.md](../../../docs/spec/theming.md)'s "Warnings and Notices").
+    /// The Notice on screen this instant, if any: read by [`Self::render`] to draw it, and by
+    /// tests in place of reaching into the private field directly. Samples the clock and asks
+    /// the value itself, against `document.notice_timeout` as it currently stands, so a
+    /// reloaded timeout applies to a Notice already raised ([`Notice::visible_at`]).
     fn notice(&self) -> Option<&str> {
-        let text = self.notice.as_deref()?;
-        if self.document.notice_timeout.is_zero() {
-            return Some(text);
-        }
-        let set_at = self
-            .notice_set_at
-            .expect("notice_set_at is Some whenever notice is Some");
-        if set_at.elapsed() >= self.document.notice_timeout {
-            None
-        } else {
-            Some(text)
-        }
+        self.notice
+            .as_ref()?
+            .visible_at(std::time::Instant::now(), self.document.notice_timeout)
     }
 
     /// `state.toml`'s own scope key for this run: the active Set's name when a config was
@@ -1134,7 +1119,6 @@ impl App {
         // A Notice takes the status row from the warning slot, so one that outlives the press
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
-        self.notice_set_at = None;
         if self.quit_confirm {
             self.handle_quit_confirm_key(key);
             return Ok(());
@@ -3837,7 +3821,6 @@ mod tests {
             pending_config_editor_handoff: false,
             set_picker: None,
             notice: None,
-            notice_set_at: None,
             theme_warnings: Vec::new(),
             config_warnings: Vec::new(),
             discovery_warning_logged: false,
@@ -7820,12 +7803,21 @@ mod tests {
 
     // =====================================================================================
     // Criterion 8: `notice_timeout` clears a live Notice once elapsed, and `"0s"` turns the
-    // timer off rather than turning Notices off. Driven through `notice_set_at` directly
-    // rather than a real sleep, the same seam `components::list`'s own spinner tests already
-    // use for elapsed time (backdating a stored `Instant` rather than waiting on the clock).
+    // timer off rather than turning Notices off. What `App` owes the value here is the wiring:
+    // that `notice()` reads `document.notice_timeout` at all. The timeout's own boundary is
+    // pinned against fabricated instants in `crate::notice`.
     // `notice_timeout`'s reload-re-applies half lives in reload.rs, beside the rest of
     // `apply_reloaded_config`'s own tests.
     // =====================================================================================
+
+    /// Raises `text` on `app` as though the press that raised it landed `age` ago: the seam
+    /// every timeout test drives, in place of waiting on the wall clock.
+    pub(crate) fn raise_notice_aged(app: &mut App, text: &str, age: Duration) {
+        app.notice = Some(Notice::raised(
+            text.to_string(),
+            std::time::Instant::now() - age,
+        ));
+    }
 
     #[test]
     fn a_notice_stays_live_until_its_timeout_elapses_then_reads_as_gone() {
@@ -7838,16 +7830,22 @@ mod tests {
             Duration::from_secs(3),
             "sanity: the default this test's two elapsed times straddle"
         );
-        app.set_notice("switched to `second`".to_string());
-
-        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_millis(2_900));
+        raise_notice_aged(
+            &mut app,
+            "switched to `second`",
+            Duration::from_millis(2_900),
+        );
         assert_eq!(
             app.notice(),
             Some("switched to `second`"),
             "must still read as live just under the timeout"
         );
 
-        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_millis(3_100));
+        raise_notice_aged(
+            &mut app,
+            "switched to `second`",
+            Duration::from_millis(3_100),
+        );
         assert_eq!(
             app.notice(),
             None,
@@ -7865,8 +7863,7 @@ mod tests {
         init_repo(&root.join("repo-a"));
         let mut app = test_app(&root);
         app.document.notice_timeout = Duration::ZERO;
-        app.set_notice("switched to `second`".to_string());
-        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_secs(3600));
+        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(3600));
 
         assert_eq!(
             app.notice(),
@@ -11366,7 +11363,7 @@ mod tests {
             generation_before,
             "the Refresh itself must still happen; only the hook is missing"
         );
-        assert!(app.notice.is_none());
+        assert!(app.notice().is_none());
     }
 
     // --- Issue #250: a `[[set]].on_refresh` scopes the hook to the Set rather than the whole
@@ -15643,7 +15640,8 @@ refresh_all = "z""#,
         );
         assert_eq!(app.visible_keys().len(), 2, "no Filter is left active");
         assert_eq!(
-            app.notice, None,
+            app.notice(),
+            None,
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15683,7 +15681,8 @@ refresh_all = "z""#,
             "the draft must no longer narrow the list"
         );
         assert_eq!(
-            app.notice, None,
+            app.notice(),
+            None,
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15726,7 +15725,8 @@ refresh_all = "z""#,
             "neither the draft nor the committed Filter may narrow the list afterwards"
         );
         assert_eq!(
-            app.notice, None,
+            app.notice(),
+            None,
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15778,7 +15778,8 @@ refresh_all = "z""#,
             "Alt+/ must clear the committed Filter even when the draft over it is empty"
         );
         assert_eq!(
-            app.notice, None,
+            app.notice(),
+            None,
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15813,7 +15814,7 @@ refresh_all = "z""#,
             "the empty draft survives an unavailable Alt+/ untouched"
         );
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some(NO_FILTER_TO_CLEAR_NOTICE),
             "an inert Built binding answers the press with a Notice naming why \
              (docs/adr/0023)"
@@ -15908,7 +15909,8 @@ refresh_all = "z""#,
             "Alt+/ must leave a running Action untouched"
         );
         assert_eq!(
-            app.notice, None,
+            app.notice(),
+            None,
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
 
@@ -15939,7 +15941,7 @@ refresh_all = "z""#,
             "an inert Alt+/ must not move the cursor"
         );
         assert_eq!(
-            app.notice.as_deref(),
+            app.notice(),
             Some(NO_FILTER_TO_CLEAR_NOTICE),
             "an inert Built binding answers the press with a Notice naming why \
              (docs/adr/0023)"

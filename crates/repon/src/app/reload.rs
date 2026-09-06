@@ -426,7 +426,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::tests::{init_repo, press, render_app_frame, test_app, write_gitmodules},
+        app::tests::{
+            init_repo, press, raise_notice_aged, render_app_frame, test_app, write_gitmodules,
+        },
         keys::Context,
         test_support::capture_tracing,
     };
@@ -1402,8 +1404,7 @@ mod tests {
         init_repo(&root.join("repo-a"));
         let mut app = test_app(&root);
         app.document.notice_timeout = Duration::from_secs(3600);
-        app.set_notice("switched to `second`".to_string());
-        app.notice_set_at = Some(std::time::Instant::now() - Duration::from_secs(10));
+        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(10));
         assert_eq!(
             app.notice(),
             Some("switched to `second`"),
