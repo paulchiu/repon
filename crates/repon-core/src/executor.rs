@@ -901,10 +901,11 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 /// before a real line ending survives; a CSI erase-in-line (`ESC [ K`, with or without a
 /// `0`/`1`/`2` parameter) or cursor-to-column-1 (`ESC [ G`, `ESC [ 1 G`) sequence resets
 /// a frame the same way, since a writer that redraws with CSI rather than a bare `\r`
-/// means the same thing by it. Every other CSI sequence, SGR (`ESC [ ... m`) included,
-/// passes through untouched: this is not a terminal emulator, so a sequence it does not
-/// know resets a frame (cursor-up, `ESC [ A`, among them) is left for the pane to render
-/// literally rather than guessed at. `\n` bytes never appear as a UTF-8 continuation
+/// means the same thing by it. Every other CSI sequence, SGR (`ESC [ ... m`) included, is
+/// never a separator and is never rewritten, though one written into a frame a later
+/// separator discards goes with that frame: this is not a terminal emulator, so a sequence
+/// it does not know resets a frame (cursor-up, `ESC [ A`, among them) is left for the pane
+/// to render literally rather than guessed at. `\n` bytes never appear as a UTF-8 continuation
 /// byte, so this never risks splitting a multi-byte character.
 fn normalize_carriage_returns(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
