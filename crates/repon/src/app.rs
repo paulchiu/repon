@@ -15212,16 +15212,106 @@ refresh_all = "z""#,
         let mut app = test_app_with_config(&root, config_dir.path());
         app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
             .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
 
         press_through_the_management_gate(&mut app, management::Operation::Ignore);
 
+        let target = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key == target_key)
+            .expect("the ignored row must still be in the table")
+            .clone();
         assert!(
-            app.core.snapshot().entities[0].excluded,
+            target.excluded,
             "the ignore must still take effect the instant its report is applied"
         );
         assert!(
             !app.effective_show_worktrees(),
             "config.toml's own rewrite must not be read as the reload that clears the toggle"
+        );
+    }
+
+    /// AC3's `delete` half: the same save-and-restore covers `delete` too, since
+    /// [`App::apply_management_report`]'s fix does not branch on which operation ran.
+    #[test]
+    fn a_delete_run_removes_the_row_at_once_while_leaving_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(
+            !app.core
+                .snapshot()
+                .entities
+                .iter()
+                .any(|entity| entity.key == target_key),
+            "the delete must still take effect the instant its report is applied"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "config.toml's own rewrite must not be read as the reload that clears the toggle"
+        );
+    }
+
+    /// AC2: the save-and-restore is unconditional on the report itself, so it must hold just
+    /// as well when every row fails to do what it was asked, not only on the happy path the
+    /// other tests here drive. `repo-a` carries no remote, so `sync` can never succeed on it.
+    #[test]
+    fn a_sync_run_whose_only_row_is_refused_still_leaves_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        let target = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key == target_key)
+            .expect("the row must still be in the table")
+            .clone();
+        assert!(
+            target
+                .last_action
+                .as_ref()
+                .is_some_and(|receipt| receipt.refused()),
+            "sanity: the row must not have succeeded, or this proves nothing about the \
+             outcome-agnostic save-restore"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "a run whose rows all fail must not hand the view back to config.toml either"
         );
     }
 
@@ -15250,6 +15340,44 @@ refresh_all = "z""#,
         let ignored_toggle_before = app.ignored_toggle;
 
         press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert_eq!(
+            app.filter, filter_before,
+            "the committed Filter must survive the run"
+        );
+        assert_eq!(
+            app.row_order, row_order_before,
+            "the row order must survive the run"
+        );
+        assert_eq!(
+            app.ignored_toggle, ignored_toggle_before,
+            "the ignored toggle must survive the run"
+        );
+    }
+
+    /// The same invariance as its `sync` sibling above, but for `ignore`, whose report does
+    /// rewrite `config.toml` inside the same reload: the write must not disturb the Filter,
+    /// the row order or the ignored toggle either.
+    #[test]
+    fn an_ignore_run_also_leaves_the_filter_the_row_order_and_the_ignored_toggle_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.filter = repon_core::Filter::parse("zed");
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("dispatch i");
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("open the sort menu");
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("sort by name");
+        let filter_before = app.filter.clone();
+        let row_order_before = app.row_order;
+        let ignored_toggle_before = app.ignored_toggle;
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
 
         assert_eq!(
             app.filter, filter_before,
