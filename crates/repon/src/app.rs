@@ -483,9 +483,12 @@ pub struct App {
     /// (`t`) and read through [`Self::effective_show_worktrees`] everywhere the config field
     /// used to be read directly. `None` until the toggle first fires in this scope, so the
     /// config file keeps deciding the starting state; `apply_reloaded_config` resets this to
-    /// `None` too, so a reload always hands the keyboard back to whatever the file currently
-    /// says ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees toggle").
-    /// Restored from `state.toml` at startup and written back on quit
+    /// `None` too, so `Ctrl+R` and `e` always hand the keyboard back to whatever the file
+    /// currently says ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees
+    /// toggle"). [`Self::apply_management_report`] calls that same reload but saves and
+    /// restores this field around the call, since a `sync`/`ignore`/`delete` run is not that
+    /// gesture ([config.md](../../../docs/spec/config.md#reload)). Restored from `state.toml`
+    /// at startup and written back on quit
     /// ([`Self::restore_session_state`], [`Self::persist_state`]), so a value the toggle set
     /// survives a restart the way the Selection and Filter beside it do; a reload's own clear
     /// is still what a save right after this records, so a reload (not a restart) is what
@@ -2491,7 +2494,10 @@ impl App {
     /// is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs, so config
     /// reaches the running app one way and this call touches no in-memory document of its
     /// own; an `ignore` still takes effect the moment this runs, through the same
-    /// `set_exclusions` reload already gives `Action::ReloadConfig`.
+    /// `set_exclusions` reload already gives `Action::ReloadConfig`. Unlike `Ctrl+R` and `e`,
+    /// this reload does not clear `self.worktrees_toggle`: the user asked for `sync`, not for
+    /// the file to decide the view again, so the override is saved and restored around the
+    /// call ([config.md](../../../docs/spec/config.md#reload)'s "the gestures that clear it").
     fn apply_management_report(&mut self, report: &management::Report) {
         // scan: management_report_apply begin -- criterion 8's second half: everything
         // between this pair is what a management write does once its report is ready, and
@@ -2504,7 +2510,10 @@ impl App {
             self.core.dismiss(&key);
             self.selection.remove(&key);
         }
+        // `t`'s override rides across this reload, for the reason above.
+        let worktrees_toggle = self.worktrees_toggle;
         self.reload_config();
+        self.worktrees_toggle = worktrees_toggle;
         // scan: management_report_apply end
         // The rows just dropped shortened the table under a standing cursor, the same
         // re-clamp [`Self::dismiss_vanished_at_cursor`] does after its own removal.
@@ -15150,6 +15159,235 @@ refresh_all = "z""#,
         assert!(
             !text.contains("preference off"),
             "must never credit config.toml with the toggle's own override: {text:?}"
+        );
+    }
+
+    /// A management run is not `Ctrl+R` or `e`: the user asked for `sync`, not for the file
+    /// to decide the view again, so its own `reload_config` call must leave `t`'s override
+    /// standing exactly as it did before the run, header wording included.
+    #[test]
+    fn a_completed_sync_run_leaves_worktrees_hidden_and_the_header_still_says_toggled_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert!(
+            !app.effective_show_worktrees(),
+            "a completed management run must not hand the view back to config.toml"
+        );
+        let text = status_row_text_with_active_filter(&mut app, "kind:worktree", 200);
+        assert!(
+            text.contains("worktrees: 1 (toggled off)"),
+            "the header must still credit the toggle, not the file, after the run: {text:?}"
+        );
+    }
+
+    /// `ignore` and `delete` are the two built-ins whose reports do rewrite `config.toml`,
+    /// unlike `sync`. The write must still reach the running app the moment the report is
+    /// applied (`set_exclusions`, inside the same `reload_config` call), while the worktrees
+    /// toggle rides across that same reload exactly as [`Self::apply_management_report`]'s
+    /// own save-and-restore leaves it.
+    #[test]
+    fn an_ignore_run_excludes_the_row_at_once_while_leaving_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        let target = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key == target_key)
+            .expect("the ignored row must still be in the table")
+            .clone();
+        assert!(
+            target.excluded,
+            "the ignore must still take effect the instant its report is applied"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "config.toml's own rewrite must not be read as the reload that clears the toggle"
+        );
+    }
+
+    /// AC3's `delete` half: the same save-and-restore covers `delete` too, since
+    /// [`App::apply_management_report`]'s fix does not branch on which operation ran.
+    #[test]
+    fn a_delete_run_removes_the_row_at_once_while_leaving_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(
+            !app.core
+                .snapshot()
+                .entities
+                .iter()
+                .any(|entity| entity.key == target_key),
+            "the delete must still take effect the instant its report is applied"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "config.toml's own rewrite must not be read as the reload that clears the toggle"
+        );
+    }
+
+    /// AC2: the save-and-restore is unconditional on the report itself, so it must hold just
+    /// as well when every row fails to do what it was asked, not only on the happy path the
+    /// other tests here drive. `repo-a` carries no remote, so `sync` can never succeed on it.
+    #[test]
+    fn a_sync_run_whose_only_row_is_refused_still_leaves_the_worktrees_toggle_standing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+        let target_key = app.cursor_key().expect("a cursor row exists");
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        let target = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key == target_key)
+            .expect("the row must still be in the table")
+            .clone();
+        assert!(
+            target
+                .last_action
+                .as_ref()
+                .is_some_and(|receipt| receipt.refused()),
+            "sanity: the row must not have succeeded, or this proves nothing about the \
+             outcome-agnostic save-restore"
+        );
+        assert!(
+            !app.effective_show_worktrees(),
+            "a run whose rows all fail must not hand the view back to config.toml either"
+        );
+    }
+
+    /// WAIVER (already held before this issue's fix; no code path here ever assigned any of
+    /// the three): the committed Filter, the row order and the ignored toggle are none of
+    /// them touched by `reload_config` or `apply_management_report`, unlike `worktrees_toggle`
+    /// which this issue's fix now saves and restores around the same call. Pinned here as a
+    /// characterisation so a later change that does start touching one of them fails loudly.
+    #[test]
+    fn a_completed_sync_run_leaves_the_filter_the_row_order_and_the_ignored_toggle_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.filter = repon_core::Filter::parse("zed");
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("dispatch i");
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("open the sort menu");
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("sort by name");
+        let filter_before = app.filter.clone();
+        let row_order_before = app.row_order;
+        let ignored_toggle_before = app.ignored_toggle;
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert_eq!(
+            app.filter, filter_before,
+            "the committed Filter must survive the run"
+        );
+        assert_eq!(
+            app.row_order, row_order_before,
+            "the row order must survive the run"
+        );
+        assert_eq!(
+            app.ignored_toggle, ignored_toggle_before,
+            "the ignored toggle must survive the run"
+        );
+    }
+
+    /// The same invariance as its `sync` sibling above, but for `ignore`, whose report does
+    /// rewrite `config.toml` inside the same reload: the write must not disturb the Filter,
+    /// the row order or the ignored toggle either.
+    #[test]
+    fn an_ignore_run_also_leaves_the_filter_the_row_order_and_the_ignored_toggle_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.filter = repon_core::Filter::parse("zed");
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("dispatch i");
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("open the sort menu");
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("sort by name");
+        let filter_before = app.filter.clone();
+        let row_order_before = app.row_order;
+        let ignored_toggle_before = app.ignored_toggle;
+
+        press_through_the_management_gate(&mut app, management::Operation::Ignore);
+
+        assert_eq!(
+            app.filter, filter_before,
+            "the committed Filter must survive the run"
+        );
+        assert_eq!(
+            app.row_order, row_order_before,
+            "the row order must survive the run"
+        );
+        assert_eq!(
+            app.ignored_toggle, ignored_toggle_before,
+            "the ignored toggle must survive the run"
         );
     }
 
