@@ -18,9 +18,8 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -202,8 +201,16 @@ pub(crate) fn run_step(
     let label: Arc<str> = Arc::from(argv.join(" "));
     let start = Instant::now();
 
-    let (master, slave) = match open_pty(PTY_WIDTH) {
-        Ok(fds) => fds,
+    let prepared = match injected_setup_failure(env) {
+        Some(injected) => Err(injected),
+        None => prepare_step_resources(PTY_WIDTH),
+    };
+    let StepResources {
+        slave,
+        slave_dup,
+        drain,
+    } = match prepared {
+        Ok(resources) => resources,
         Err(failure) => {
             return step_failure(
                 label,
@@ -214,24 +221,6 @@ pub(crate) fn run_step(
                 failure.detail(),
                 start.elapsed(),
             );
-        }
-    };
-    // The child's own copy for stderr, dup2'd onto its 2 during exec setup; marked
-    // close-on-exec so this, the pre-dup2 descriptor, does not also survive into the
-    // child's own program (see `duplicate_cloexec`).
-    let slave_dup = match duplicate_cloexec(&slave) {
-        Ok(fd) => fd,
-        Err(error) => {
-            return spawn_failure(label, shell, interactive, cwd, &error, start.elapsed());
-        }
-    };
-    // The parent's own reference onto the slave, held for as long as draining takes
-    // (see `drain_until_exit`) so the pty's slave side never sees its last close while
-    // there might still be output to read.
-    let keepalive = match duplicate_cloexec(&slave) {
-        Ok(fd) => fd,
-        Err(error) => {
-            return spawn_failure(label, shell, interactive, cwd, &error, start.elapsed());
         }
     };
 
@@ -249,14 +238,14 @@ pub(crate) fn run_step(
     };
     // The child's own slave-side descriptors (dup2'd onto its 1 and 2 during exec setup)
     // now live only in the child; this process's copies, passed in above, are closed by
-    // dropping `command`. `keepalive` is deliberately not touched here.
+    // dropping `command`. `drain` is deliberately not touched here.
     drop(command);
 
     // `setsid` in `pre_exec` already made this child its own session and process-group
     // leader, so its pid doubles as the pgid `control` signals.
     let pgid = child.id() as libc::pid_t;
     control.register(pgid);
-    let (raw, status) = drain_until_exit(master, keepalive, child);
+    let (raw, status) = drain_until_exit(drain, child);
     control.deregister(pgid);
 
     let outcome = match status {
@@ -278,6 +267,140 @@ pub(crate) fn run_step(
         shell,
         interactive,
     }
+}
+
+/// Everything one step needs from the OS, created whole before its child exists.
+///
+/// Prepared up front rather than as the run reaches each one, so a failure at any of them
+/// is a failed receipt rather than a half-built setup the drain would have to survive
+/// (see [`set_nonblocking`] for what a drain missing one of these waits on). Each field is
+/// an [`OwnedFd`], so a failure part way through closes whatever was created before it on
+/// the way out.
+struct StepResources {
+    /// The child's own stdout, dup2'd onto its 1 during exec setup.
+    slave: OwnedFd,
+    /// The child's own copy for stderr, dup2'd onto its 2 during exec setup; marked
+    /// close-on-exec so this, the pre-dup2 descriptor, does not also survive into the
+    /// child's own program (see [`duplicate_cloexec`]).
+    slave_dup: OwnedFd,
+    drain: DrainResources,
+}
+
+/// The half of [`StepResources`] this process keeps once the child is running, which is
+/// everything [`drain_until_exit`] reads, waits on and finally closes.
+struct DrainResources {
+    master: OwnedFd,
+    /// The parent's own reference onto the slave, held for as long as draining takes (see
+    /// [`drain_until_exit`]) so the pty's slave side never sees its last close while there
+    /// might still be output to read.
+    keepalive: OwnedFd,
+    /// The end of [`self_pipe`] the drain loop polls.
+    notify_read: OwnedFd,
+    /// Its write end, moved into the waiter thread and written to the moment `wait`
+    /// returns (see [`notify_exit`]), which is what makes `notify_read` readable at
+    /// exactly that moment.
+    notify_write: OwnedFd,
+}
+
+/// Why a step's own resources could not be prepared, and therefore why it never reached
+/// exec: [`PtyOpenFailure`] keeps its own words for the two ENXIO cases, while every other
+/// descriptor call carries the resource's name so the receipt says which one failed.
+#[derive(Debug)]
+enum SetupFailure {
+    Pty(PtyOpenFailure),
+    Resource {
+        what: &'static str,
+        error: io::Error,
+    },
+}
+
+impl SetupFailure {
+    /// The code `run_step` puts into `StepOutcome::Failed`, matching [`spawn_failure`]'s
+    /// own `raw_os_error().unwrap_or(-1)` fallback.
+    fn code(&self) -> i32 {
+        match self {
+            SetupFailure::Pty(failure) => failure.code(),
+            SetupFailure::Resource { error, .. } => error.raw_os_error().unwrap_or(-1),
+        }
+    }
+
+    /// The words a user sees in the step's captured output.
+    fn detail(&self) -> String {
+        match self {
+            SetupFailure::Pty(failure) => failure.detail(),
+            SetupFailure::Resource { what, error } => {
+                format!("could not prepare {what}: {error}")
+            }
+        }
+    }
+}
+
+/// The four resources [`prepare_step_resources`] creates, in the words a receipt reports
+/// them by. Named once so a test build's [`injected_setup_failure`] fails a step
+/// with the same words the real call would.
+const NON_BLOCKING_FLAG: &str = "the pty master's own non-blocking flag";
+const STDERR_DESCRIPTOR: &str = "the child's own stderr descriptor";
+const KEEPALIVE_DESCRIPTOR: &str = "the drain's keepalive descriptor";
+const NOTIFY_PIPE: &str = "the pipe that notices this step's own exit";
+
+/// Creates every resource one step needs, before its child is spawned; [`StepResources`]
+/// carries why they are all made here rather than as the run reaches each one.
+fn prepare_step_resources(width: u16) -> Result<StepResources, SetupFailure> {
+    let named = |what: &'static str| move |error| SetupFailure::Resource { what, error };
+
+    let (master, slave) = open_pty(width).map_err(SetupFailure::Pty)?;
+    set_nonblocking(master.as_raw_fd()).map_err(named(NON_BLOCKING_FLAG))?;
+    let slave_dup = duplicate_cloexec(&slave).map_err(named(STDERR_DESCRIPTOR))?;
+    let keepalive = duplicate_cloexec(&slave).map_err(named(KEEPALIVE_DESCRIPTOR))?;
+    let (notify_read, notify_write) = self_pipe().map_err(named(NOTIFY_PIPE))?;
+
+    Ok(StepResources {
+        slave,
+        slave_dup,
+        drain: DrainResources {
+            master,
+            keepalive,
+            notify_read,
+            notify_write,
+        },
+    })
+}
+
+/// The environment name a test build reads an injected setup failure from, its
+/// value naming which of the four resources above to fail at. A step carries it in its
+/// own `env` table, so a test reaches a resource error the OS will not produce on request
+/// at exactly one step of one entity, leaving every other step of the same run alone.
+#[cfg(test)]
+pub(crate) const SETUP_FAILURE_VARIABLE: &str = "REPON_TEST_SETUP_FAILURE";
+
+/// The failure `env` asks this step to report instead of preparing its own resources.
+/// Absent from every build but this crate's own tests, which is what keeps injection out
+/// of a published build entirely.
+#[cfg(test)]
+fn injected_setup_failure(env: &[(String, Option<String>)]) -> Option<SetupFailure> {
+    let asked = env
+        .iter()
+        .find(|(name, _)| name == SETUP_FAILURE_VARIABLE)
+        .and_then(|(_, value)| value.as_deref())?;
+    let what = match asked {
+        "nonblocking" => NON_BLOCKING_FLAG,
+        "stderr" => STDERR_DESCRIPTOR,
+        "keepalive" => KEEPALIVE_DESCRIPTOR,
+        "notify-pipe" => NOTIFY_PIPE,
+        // Louder than injecting nothing, which would leave a test passing against a step
+        // that simply ran.
+        other => panic!("{SETUP_FAILURE_VARIABLE} names no resource a step prepares: {other:?}"),
+    };
+    Some(SetupFailure::Resource {
+        what,
+        error: io::Error::from_raw_os_error(libc::EBADF),
+    })
+}
+
+/// See the `cfg(test)` counterpart: production never injects anything.
+#[cfg(not(test))]
+fn injected_setup_failure(_env: &[(String, Option<String>)]) -> Option<SetupFailure> {
+    None
 }
 
 /// Attempts `open_pty` allows itself before giving up on the ENXIO race documented on
@@ -438,10 +561,9 @@ fn open_pty_once(width: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
-/// Marks `fd` close-on-exec, failing loudly on error: unlike [`set_cloexec`]'s
-/// best-effort use on the self-pipe, a step's own program inheriting `master` or the
-/// pre-`dup2` `slave` past `exec` is exactly the leak `open_pty` exists to prevent, so a
-/// failed `fcntl` here must fail the step rather than pass silently.
+/// Marks `fd` close-on-exec, failing loudly on error: a step's own program inheriting a
+/// descriptor this process meant to keep is the leak the whole setup exists to prevent,
+/// so a failed `fcntl` here fails the step rather than passing silently.
 fn set_cloexec_or_fail(fd: &OwnedFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
     let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -471,11 +593,11 @@ fn shell_argv(argv: &[String], interactive: bool) -> Vec<String> {
 
 /// A second descriptor onto the same open slave, marked close-on-exec at creation
 /// (`F_DUPFD_CLOEXEC`) so the step's own program never inherits it past its `exec`.
-/// [`run_step`] calls this twice, for different purposes: once for `slave_dup`, the
-/// child's own copy for stderr (dup2'd onto its 2 during exec setup, so only that copy,
-/// not this pre-`dup2` one, should reach the child), and once for `keepalive`, held only
-/// by this process for as long as [`drain_until_exit`] is draining and never handed to
-/// the child at all.
+/// [`prepare_step_resources`] calls this twice, for different purposes: once for
+/// `slave_dup`, the child's own copy for stderr (dup2'd onto its 2 during exec setup, so
+/// only that copy, not this pre-`dup2` one, should reach the child), and once for
+/// `keepalive`, held only by this process for as long as [`drain_until_exit`] is draining
+/// and never handed to the child at all.
 fn duplicate_cloexec(fd: &OwnedFd) -> io::Result<OwnedFd> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
     let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -546,24 +668,20 @@ fn build_command(
 /// <https://github.com/pexpect/pexpect/issues/662>, though this module's own claim rests
 /// on the standalone reproduction, not that report). `keepalive` exists to make that
 /// close never happen while this function might still read more: it is held open for the
-/// whole call and dropped only once draining is done. Blocks on `master` while the child
-/// may still be writing, so output larger than the pty's own buffer is still captured in
-/// full rather than only whatever was left after the child exited.
-fn drain_until_exit(
-    master: OwnedFd,
-    keepalive: OwnedFd,
-    mut child: Child,
-) -> (Vec<u8>, Option<ExitStatus>) {
-    let Ok((notify_read, notify_write)) = self_pipe() else {
-        // No pipe to wake the poll loop with: fall back to draining to EOF, the one race
-        // this function exists to remove, rather than never reading anything at all.
-        let raw = read_to_end_best_effort(master);
-        drop(keepalive);
-        return (raw, child.wait().ok());
-    };
+/// whole call and dropped only once draining is done. Reads throughout the child's life
+/// rather than only after it exits, so output larger than the pty's own buffer is still
+/// captured in full rather than only whatever was left at the end.
+fn drain_until_exit(resources: DrainResources, mut child: Child) -> (Vec<u8>, Option<ExitStatus>) {
+    let DrainResources {
+        master,
+        keepalive,
+        notify_read,
+        notify_write,
+    } = resources;
 
     let waiter = thread::spawn(move || {
         let status = child.wait();
+        notify_exit(&notify_write);
         drop(notify_write);
         status
     });
@@ -574,20 +692,11 @@ fn drain_until_exit(
     (raw, status)
 }
 
-/// The fallback [`drain_until_exit`] takes when it cannot even open a pipe to wait on:
-/// the same read-to-EOF this module used before, kept only so a descriptor shortage
-/// degrades to the old race rather than to capturing nothing.
-fn read_to_end_best_effort(master: OwnedFd) -> Vec<u8> {
-    let mut file = File::from(master);
-    let mut raw = Vec::new();
-    let _ = file.read_to_end(&mut raw);
-    raw
-}
-
 /// A pipe used only to wake [`drain_with_poll`]'s `poll` the moment the waiter thread's
-/// `child.wait()` returns: `write_end` moves into that thread and is dropped there, which
-/// is what makes `read_end` go readable at exactly that moment. Close-on-exec so neither
-/// end can reach a program this process later execs into.
+/// `child.wait()` returns: `write_end` moves into that thread and [`notify_exit`] writes
+/// to it there, which is what makes `read_end` go readable at exactly that moment.
+/// Close-on-exec, failing the step if that cannot be set, since both ends exist before
+/// this step's own child is forked and neither may reach the program it execs into.
 fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `fds` is a valid two-element out-param for the duration of this call.
@@ -598,38 +707,53 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: `pipe` just handed back two freshly opened, uniquely owned descriptors.
     let (read_end, write_end) =
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    set_cloexec(&read_end);
-    set_cloexec(&write_end);
+    set_cloexec_or_fail(&read_end)?;
+    set_cloexec_or_fail(&write_end)?;
     Ok((read_end, write_end))
 }
 
-/// Marks `fd` close-on-exec. Best-effort: a failure here leaves a descriptor that would
-/// otherwise have been closed a little earlier, not one that leaks past this process.
-fn set_cloexec(fd: &OwnedFd) {
-    // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
-    unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+/// Wakes [`drain_with_poll`]'s `poll` with a byte rather than by closing the pipe's write
+/// end: a copy of that end which reached another process would keep any close from being
+/// the last one, and the drain would then wait forever on a master `keepalive` is holding
+/// open. Best-effort, since the close that follows it is still the older wake-up for
+/// every case where nothing else holds the pipe.
+fn notify_exit(write_end: &OwnedFd) {
+    let byte = [0u8];
+    loop {
+        // SAFETY: `write_end` is open for the duration of this call, and `byte` is a live
+        // one-byte buffer.
+        let written = unsafe { libc::write(write_end.as_raw_fd(), byte.as_ptr().cast(), 1) };
+        if written < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return;
     }
 }
 
-/// Sets `O_NONBLOCK` on `fd`. Best-effort, for the same reason as [`set_cloexec`]: called
-/// only once the child has already exited, where a failed read afterwards just means the
-/// drain stops a little earlier rather than losing anything already captured.
-fn set_nonblocking(fd: &OwnedFd) {
-    // SAFETY: `fd` is a valid, open descriptor for the duration of both calls.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+/// Sets `O_NONBLOCK` on `fd`, failing loudly on error, and set before the child exists so
+/// the flag can never be missing once the drain depends on it: [`drain_with_poll`] ends on
+/// a read that finds nothing left, and against a blocking descriptor that read waits
+/// instead on a slave side `keepalive` is still deliberately holding open.
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: both calls only read and write `fd`'s own flags and touch no memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: as above.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The drain loop itself: blocks on `poll` over `master` and `notify_read` while the
 /// child may still be running, reading whatever `master` offers each time it wakes, until
 /// `notify_read` reports the child has exited. From there `master` can never become ready
-/// again on its own (`keepalive` sees to that), so the stopping condition switches to a
-/// non-blocking read that comes back empty, a kernel fact rather than an elapsed time.
+/// again on its own (`keepalive` sees to that), so the stopping condition becomes a read
+/// that comes back empty, a kernel fact rather than an elapsed time. Every read here is
+/// non-blocking ([`set_nonblocking`]); the waiting is `poll`'s alone.
 fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -658,8 +782,10 @@ fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
             }
             break;
         }
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            read_blocking(master, &mut buf, &mut raw);
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0
+            && let Some(read) = read_available(master, &mut buf)
+        {
+            raw.extend_from_slice(&buf[..read]);
         }
         if fds[1].revents != 0 {
             break;
@@ -667,48 +793,21 @@ fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
     }
 
     // The child has exited. Nothing can make `master` newly readable from here, so the
-    // remaining, already-buffered bytes (if any) are drained without blocking, stopping
-    // the instant a read finds none: that emptiness, not a clock, is what ends the drain.
-    set_nonblocking(master);
+    // remaining, already-buffered bytes (if any) are drained, stopping the instant a read
+    // finds none: that emptiness, not a clock, is what ends the drain.
     loop {
-        match nonblocking_read(master, &mut buf) {
-            Some(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+        match read_available(master, &mut buf) {
+            Some(read) if read > 0 => raw.extend_from_slice(&buf[..read]),
             _ => break,
         }
     }
     raw
 }
 
-/// One blocking `read(2)` from `fd`, appending whatever came back into `raw`, retried
-/// across `EINTR`. Called only once `poll` has reported `fd` readable, so a `0` return or
-/// any other error means there was nothing left this round rather than something lost.
-fn read_blocking(fd: &OwnedFd, buf: &mut [u8], raw: &mut Vec<u8>) {
-    loop {
-        // SAFETY: `buf` is a valid, appropriately sized buffer for the duration of this call.
-        let n = unsafe {
-            libc::read(
-                fd.as_raw_fd(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
-        if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return;
-        }
-        if n > 0 {
-            raw.extend_from_slice(&buf[..n as usize]);
-        }
-        return;
-    }
-}
-
-/// One non-blocking `read(2)` from `fd`: `Some(n)` for `n` bytes read (`Some(0)` is a real
-/// EOF), `None` when nothing is available right now (`EAGAIN`/`EWOULDBLOCK`) or on any
-/// other error, retried across `EINTR`.
-fn nonblocking_read(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
+/// One `read(2)` from `fd`, which every caller here has already set non-blocking: `Some(n)`
+/// for `n` bytes read (`Some(0)` is a real EOF), `None` when nothing is available right now
+/// (`EAGAIN`/`EWOULDBLOCK`) or on any other error, retried across `EINTR`.
+fn read_available(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
     loop {
         // SAFETY: `buf` is a valid, appropriately sized buffer for the duration of this call.
         let n = unsafe {
@@ -1001,6 +1100,30 @@ mod tests {
         tempfile::tempdir().expect("create a temp dir")
     }
 
+    /// `run_step`'s own resource setup, for the tests that replicate the rest of its
+    /// sequence by hand rather than going through it.
+    fn prepared() -> StepResources {
+        prepare_step_resources(PTY_WIDTH).expect("prepare a step's own resources")
+    }
+
+    /// Waits for `master` to have something, then appends it: the master is non-blocking
+    /// from the moment it is created, so a test that needs the child's next line waits on
+    /// `poll` the way [`drain_with_poll`] does rather than spinning on `read`.
+    fn read_when_ready(master: &OwnedFd, collected: &mut Vec<u8>) {
+        let mut fds = [libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: `master` is open for the duration of this call, and `fds` lives on this
+        // stack frame until `poll` returns.
+        unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+        let mut buf = [0u8; 64];
+        if let Some(read) = read_available(master, &mut buf) {
+            collected.extend_from_slice(&buf[..read]);
+        }
+    }
+
     // --- Criterion 2: stdin is the null device unconditionally ---
 
     /// A worthless version of this test asserts a field was set; this one runs a child
@@ -1275,16 +1398,18 @@ mod tests {
     /// Spawns `argv` under a real PTY and `setsid`, exactly as [`run_step`] would, but
     /// returns the raw pieces rather than blocking to completion, so a test can act on the
     /// live child before it exits.
-    fn spawn_controlled(argv: &[&str], cwd: &Path) -> (OwnedFd, OwnedFd, Child, libc::pid_t) {
+    fn spawn_controlled(argv: &[&str], cwd: &Path) -> (DrainResources, Child, libc::pid_t) {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
-        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = prepared();
         let mut command = build_command(&argv, cwd, &[], slave, slave_dup);
         let child = command.spawn().expect("spawn a controlled child");
         drop(command);
         let pgid = child.id() as libc::pid_t;
-        (master, keepalive, child, pgid)
+        (drain, child, pgid)
     }
 
     /// The whole reason [`RunControl::cancel`] sends two signals rather than one: a child
@@ -1307,7 +1432,7 @@ mod tests {
                 "trap '' TERM; echo ready; sleep {}",
                 FIXTURE_LIFETIME.as_secs()
             );
-            let (master, keepalive, child, pgid) =
+            let (drain, child, pgid) =
                 spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
             let control = RunControl::new();
             control.register(pgid);
@@ -1317,15 +1442,14 @@ mod tests {
             // yet in place. Without this a SIGTERM that happens to arrive first would
             // kill the child outright and this test would still pass, never having
             // exercised the SIGKILL follow-up at all.
-            let mut buf = [0u8; 64];
             let mut collected = Vec::new();
             while !collected.windows(5).any(|window| window == b"ready") {
-                read_blocking(&master, &mut buf, &mut collected);
+                read_when_ready(&drain.master, &mut collected);
             }
 
             control.cancel();
 
-            let (_raw, status) = drain_until_exit(master, keepalive, child);
+            let (_raw, status) = drain_until_exit(drain, child);
             let _ = tx.send(status);
         });
 
@@ -1351,13 +1475,13 @@ mod tests {
         control.cancel();
 
         let sleep_past_the_backstop = format!("sleep {}", FIXTURE_LIFETIME.as_secs());
-        let (master, keepalive, child, pgid) =
+        let (drain, child, pgid) =
             spawn_controlled(&["sh", "-c", &sleep_past_the_backstop], dir.path());
         control.register(pgid);
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let (_raw, status) = drain_until_exit(master, keepalive, child);
+            let (_raw, status) = drain_until_exit(drain, child);
             let _ = tx.send(status);
         });
 
@@ -1378,7 +1502,7 @@ mod tests {
     #[test]
     fn hold_sigstops_a_live_group_and_continue_run_sigconts_it_back() {
         let dir = tempdir();
-        let (master, keepalive, child, pgid) = spawn_controlled(&["sleep", "2"], dir.path());
+        let (drain, child, pgid) = spawn_controlled(&["sleep", "2"], dir.path());
         let control = RunControl::new();
         control.register(pgid);
 
@@ -1399,7 +1523,7 @@ mod tests {
         );
 
         control.deregister(pgid);
-        let (_raw, status) = drain_until_exit(master, keepalive, child);
+        let (_raw, status) = drain_until_exit(drain, child);
         assert!(status.is_some_and(|status| status.success()));
     }
 
@@ -1507,9 +1631,11 @@ mod tests {
         let dir = tempdir();
         let argv = vec!["echo".to_string(), "quick output".to_string()];
 
-        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
-        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = prepared();
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
         let child = command.spawn().expect("spawn the child");
         drop(command);
@@ -1518,13 +1644,157 @@ mod tests {
         // time this returns; `drain_until_exit` is not called until well after.
         thread::sleep(Duration::from_millis(600));
 
-        let (raw, status) = drain_until_exit(master, keepalive, child);
+        let (raw, status) = drain_until_exit(drain, child);
 
         assert!(status.is_some_and(|status| status.success()));
         // Raw, pre-normalisation bytes off the pty: ONLCR turns the child's `\n` into
         // `\r\n`, which `run_step`'s own `normalize_carriage_returns` is what collapses
         // in the real path; this test reads `drain_until_exit` directly, below that step.
         assert_eq!(&raw, b"quick output\r\n");
+    }
+
+    /// A descriptor number this process can never have open: its own soft limit, which
+    /// the kernel will not allocate past, so a call against it fails with `EBADF` rather
+    /// than reaching a descriptor a concurrent test happens to hold.
+    fn unusable_descriptor() -> RawFd {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes one `libc::rlimit` through the pointer.
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        assert_eq!(read, 0, "read this process's own descriptor limit");
+        RawFd::try_from(limit.rlim_cur).unwrap_or(RawFd::MAX)
+    }
+
+    /// The flag the drain's own stopping condition rests on is on the master before the
+    /// child that writes to it exists, so nothing can reach [`drain_with_poll`] without it.
+    #[test]
+    fn a_prepared_master_is_already_non_blocking_before_its_child_exists() {
+        let resources = prepared();
+
+        // SAFETY: `F_GETFL` only reads the descriptor's own flags and touches no memory.
+        let flags = unsafe { libc::fcntl(resources.drain.master.as_raw_fd(), libc::F_GETFL) };
+
+        assert!(flags >= 0, "read the prepared master's own flags");
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "expected the prepared master to be non-blocking, got flags {flags:#o}"
+        );
+    }
+
+    /// The failure that call can hit is reported rather than swallowed, so a step that
+    /// cannot have the flag fails instead of reaching the drain (see [`set_nonblocking`]
+    /// for what a drain without it waits on).
+    #[test]
+    fn a_descriptor_that_cannot_be_made_non_blocking_reports_the_failure() {
+        let error = set_nonblocking(unusable_descriptor())
+            .expect_err("a descriptor number the kernel never allocates cannot take a flag");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// A child that outlives this test's own wait while holding its own copy of `fd`,
+    /// standing in for another process that inherited one: `dup2` in the child clears
+    /// close-on-exec, so the copy survives its `exec`.
+    fn a_child_holding(fd: &OwnedFd) -> Child {
+        let held = fd.as_raw_fd();
+        let mut command = Command::new("sleep");
+        command
+            .arg(FIXTURE_LIFETIME.as_secs().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: `dup2` is async-signal-safe, which is all a `pre_exec` closure may call.
+        // Descriptor 3 is the first number past the three streams `Command` has already
+        // wired, so nothing this child needs is clobbered.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(held, 3) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+            .spawn()
+            .expect("spawn a child holding the descriptor")
+    }
+
+    /// The drain's own wake-up is a byte the waiter writes, never its end of the pipe
+    /// closing: a copy of that end which reached another process would otherwise hold the
+    /// pipe open and leave the drain waiting (see [`notify_exit`]). Collected off this
+    /// thread through the liveness backstop, so a drain that never returns fails this test
+    /// instead of wedging the suite.
+    #[test]
+    fn a_notification_write_end_another_process_holds_open_still_ends_the_drain() {
+        let dir = tempdir();
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = prepared();
+        let mut holder = a_child_holding(&drain.notify_write);
+        let argv = vec!["echo".to_string(), "hello".to_string()];
+        let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
+        let child = command.spawn().expect("spawn the child");
+        drop(command);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(drain_until_exit(drain, child));
+        });
+        let drained = rx.recv_timeout(BACKSTOP);
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        let (raw, status) = drained
+            .expect("a drain whose notification pipe is held open elsewhere must still finish");
+        assert!(status.is_some_and(|status| status.success()));
+        assert_eq!(&raw, b"hello\r\n");
+    }
+
+    /// A step whose own resources cannot be prepared comes back as a failed receipt that
+    /// names the resource and carries its errno, and the next step with nothing injected
+    /// still runs: the fault is the step's own data, so it neither lingers nor reaches a
+    /// child. One case per resource [`prepare_step_resources`] creates. Both calls run off
+    /// this thread and are collected through the liveness backstop, so a step that never
+    /// returns fails this test instead of wedging the suite.
+    #[test]
+    fn a_step_whose_own_resources_cannot_be_prepared_comes_back_as_a_failed_receipt() {
+        for (injected, named) in [
+            ("nonblocking", "non-blocking flag"),
+            ("stderr", "stderr descriptor"),
+            ("keepalive", "keepalive descriptor"),
+            ("notify-pipe", "pipe that notices"),
+        ] {
+            let dir = tempdir();
+            let cwd = dir.path().to_path_buf();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let argv = vec!["echo".to_string(), "hello".to_string()];
+                let env = vec![(
+                    SETUP_FAILURE_VARIABLE.to_string(),
+                    Some(injected.to_string()),
+                )];
+                let control = RunControl::new();
+                let failed = run_step(&argv, false, false, &cwd, &env, &control);
+                let recovered = run_step(&argv, false, false, &cwd, &[], &control);
+                let _ = tx.send((failed, recovered));
+            });
+            let (failed, recovered) = rx.recv_timeout(BACKSTOP).unwrap_or_else(|_| {
+                panic!("a step that cannot prepare {injected} must still hand back a receipt")
+            });
+
+            assert_eq!(failed.outcome, StepOutcome::Failed(libc::EBADF));
+            let detail = String::from_utf8_lossy(&failed.output).to_string();
+            assert!(
+                detail.contains(named),
+                "expected the receipt to name {named}, got {detail:?}"
+            );
+            assert_eq!(recovered.outcome, StepOutcome::Ok);
+            assert_eq!(&*recovered.output, b"hello\n");
+        }
     }
 
     /// A child that writes more than the pty's own kernel buffer holds must not lose the
@@ -1587,17 +1857,8 @@ mod tests {
     // default parallelism this process's descriptor count is shared with every other test
     // running at the same time, so a threshold loose enough to absorb that noise (as an
     // earlier version of this test did) is also loose enough to pass with a real, smaller
-    // leak still inside it. Checked instead by asking the kernel about `keepalive`'s own
-    // descriptor number directly, which no unrelated concurrent test can perturb.
-
-    /// Whether `fd` is still an open descriptor in this process, via `fcntl(F_GETFD)`
-    /// rather than a whole-process count: this asks about one specific number, so it is
-    /// unaffected by whatever other descriptors concurrent tests happen to hold at the
-    /// same moment.
-    fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
-        // SAFETY: `F_GETFD` only reads `fd`'s flags and touches no memory.
-        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
-    }
+    // leak still inside it. Checked instead by asking the kernel what `keepalive`'s own
+    // descriptor number still refers to, which no unrelated concurrent test can perturb.
 
     /// The device `fd` refers to, or `None` if it is closed. A descriptor *number* says
     /// nothing on its own once freed, since a concurrent test can be handed the same one
@@ -1622,16 +1883,18 @@ mod tests {
         let dir = tempdir();
         let argv = vec!["true".to_string()];
 
-        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
-        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
-        let keepalive_fd = keepalive.as_raw_fd();
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = prepared();
+        let keepalive_fd = drain.keepalive.as_raw_fd();
         let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the drain");
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
         let child = command.spawn().expect("spawn the child");
         drop(command);
 
-        let (_raw, status) = drain_until_exit(master, keepalive, child);
+        let (_raw, status) = drain_until_exit(drain, child);
 
         assert!(status.is_some_and(|status| status.success()));
         // The claim is that no descriptor onto *this pty* survives, not that this number
@@ -1654,23 +1917,29 @@ mod tests {
         let dir = tempdir();
         let argv = vec!["definitely-not-a-real-repon-command".to_string()];
 
-        let (_master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
-        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
-        let keepalive_fd = keepalive.as_raw_fd();
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = prepared();
+        let keepalive_fd = drain.keepalive.as_raw_fd();
+        let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the spawn");
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
 
         let spawn_result = command.spawn();
 
         assert!(spawn_result.is_err(), "expected this argv to fail to spawn");
-        // Mirrors `run_step`'s own early return: neither `command` nor `keepalive` is
+        // Mirrors `run_step`'s own early return: neither `command` nor `drain` is
         // touched beyond this, both closing as ordinary locals going out of scope.
         drop(command);
-        drop(keepalive);
+        drop(drain);
 
-        assert!(
-            !fd_is_open(keepalive_fd),
-            "expected keepalive's descriptor {keepalive_fd} to be closed after a spawn failure"
+        // By device rather than by open-ness, for the reason the drained twin above gives.
+        assert_ne!(
+            fd_device(keepalive_fd),
+            Some(pty_device),
+            "expected no descriptor onto this pty to survive a spawn failure; number \
+             {keepalive_fd} still refers to it"
         );
     }
 
@@ -1729,58 +1998,96 @@ print(len(extra))";
         );
     }
 
-    /// `master` is never dup2'd onto any of the child's own stdio streams, so the
-    /// device-matching probe above, which only matches the child's own stdout, cannot see
-    /// a leaked `master`: the master and slave sides of a pty are two distinct character
-    /// devices. Proved directly instead: `master`'s own raw number and device are
-    /// recorded in the parent before spawning (replicating `run_step`'s own sequence, as
-    /// the `keepalive`-closing tests above do, since `run_step` does not hand this number
-    /// out), and the child is asked whether that exact descriptor number is still open
-    /// and still refers to that same device. A number closed by `exec` and later reused
-    /// by the interpreter's own startup would report a different device, not a false
-    /// match.
-    #[test]
-    fn a_steps_own_program_never_inherits_the_ptys_master_side() {
-        let dir = tempdir();
+    /// The file `fd` is open on, or `None` if it is closed: `(st_dev, st_ino)` rather
+    /// than [`fd_device`]'s `st_rdev`, so the same question can be asked of a pipe, which
+    /// is no device at all.
+    fn fd_open_file(fd: std::os::fd::RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes one `libc::stat` through the pointer and reads nothing else.
+        let ok = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0;
+        // SAFETY: `fstat` returning 0 means it initialised the whole struct.
+        ok.then(|| unsafe { stat.assume_init() })
+            .map(|stat| (stat.st_dev, stat.st_ino))
+    }
 
-        let (master, slave) = open_pty(PTY_WIDTH).expect("open a pty");
-        let master_fd = master.as_raw_fd();
-        let master_device = fd_device(master_fd).expect("master is open before spawning");
-        let slave_dup = duplicate_cloexec(&slave).expect("duplicate the slave for stderr");
-        let keepalive = duplicate_cloexec(&slave).expect("duplicate the slave for keepalive");
+    /// Whether `fd` is still open in the step's own program, and still on the same file,
+    /// once `exec` has replaced it. `run_step` hands these numbers out to nobody, so the
+    /// parent records the file's identity before spawning `resources`' own child
+    /// (replicating `run_step`'s own sequence, as the `keepalive`-closing tests above do)
+    /// and the child is asked about it: a number closed by `exec` and later reused by the
+    /// interpreter's own startup reports a different file, not a false match.
+    fn survives_exec_in_the_childs_own_program(
+        resources: StepResources,
+        fd: std::os::fd::RawFd,
+        cwd: &Path,
+    ) -> bool {
+        let StepResources {
+            slave,
+            slave_dup,
+            drain,
+        } = resources;
+        let (device, inode) = fd_open_file(fd).expect("the descriptor is open before spawning");
         let probe = format!(
             "\
 import os
-fd = {master_fd}
-expected_device = {master_device}
 try:
-    inherited = os.fstat(fd).st_rdev == expected_device
+    stat = os.fstat({fd})
+    inherited = (stat.st_dev, stat.st_ino) == ({device}, {inode})
 except OSError:
     inherited = False
 print(1 if inherited else 0)"
         );
         let argv = vec!["python3".to_string(), "-c".to_string(), probe];
-        let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
+        let mut command = build_command(&argv, cwd, &[], slave, slave_dup);
         let child = match command.spawn() {
             Ok(child) => child,
-            // Names the interpreter, since this is the one test here that depends on
+            // Names the interpreter, since these are the tests here that depend on
             // something outside the repository and a bare spawn failure would not say so.
             Err(error) => panic!("expected `python3` on PATH to spawn the probe: {error}"),
         };
         drop(command);
 
-        let (raw, status) = drain_until_exit(master, keepalive, child);
-
+        let (raw, status) = drain_until_exit(drain, child);
         assert!(
             status.is_some_and(|status| status.success()),
             "the probe step failed; it needs `python3` on PATH. output: {}",
             String::from_utf8_lossy(&raw)
         );
-        let inherited = String::from_utf8_lossy(&raw).trim() == "1";
+        String::from_utf8_lossy(&raw).trim() == "1"
+    }
+
+    /// `master` is never dup2'd onto any of the child's own stdio streams, so the
+    /// device-matching probe above, which only matches the child's own stdout, cannot see
+    /// a leaked `master`: the master and slave sides of a pty are two distinct character
+    /// devices. Proved directly instead, by asking the child itself.
+    #[test]
+    fn a_steps_own_program_never_inherits_the_ptys_master_side() {
+        let dir = tempdir();
+
+        let resources = prepared();
+        let master_fd = resources.drain.master.as_raw_fd();
+
         assert!(
-            !inherited,
+            !survives_exec_in_the_childs_own_program(resources, master_fd, dir.path()),
             "expected the pty's master side not to be inherited by the child, but fd \
              {master_fd} was still open there and still pointed at it"
+        );
+    }
+
+    /// The same claim for the pipe that tells the drain the child has exited: it is
+    /// created before the child is forked, so only its close-on-exec flag keeps it out of
+    /// the program that child execs into.
+    #[test]
+    fn a_steps_own_program_never_inherits_the_exit_notification_pipe() {
+        let dir = tempdir();
+
+        let resources = prepared();
+        let notify_fd = resources.drain.notify_write.as_raw_fd();
+
+        assert!(
+            !survives_exec_in_the_childs_own_program(resources, notify_fd, dir.path()),
+            "expected the exit-notification pipe not to be inherited by the child, but fd \
+             {notify_fd} was still open there and still pointed at it"
         );
     }
 

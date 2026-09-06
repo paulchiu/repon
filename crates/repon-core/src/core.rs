@@ -4814,6 +4814,7 @@ pub(crate) fn run_while_not_cancelled(
 mod tests {
     use std::fs;
     use std::process::Command;
+    use std::sync::mpsc;
 
     use super::*;
     use crate::entity::{AheadBehind, DefaultBranchStopped, WorktreeState};
@@ -6600,6 +6601,88 @@ mod tests {
         );
         assert_eq!(receipt.steps.len(), 1);
         assert_eq!(receipt.steps[0].outcome, StepOutcome::Ok);
+    }
+
+    /// [`step`], plus the one environment entry a `test-util` build reads an injected PTY
+    /// setup failure from: the step reports that resource's own failure instead of ever
+    /// spawning a child.
+    fn step_that_cannot_prepare(argv: &[&str], resource: &str) -> Step {
+        Step {
+            env: vec![(
+                executor::SETUP_FAILURE_VARIABLE.to_string(),
+                resource.to_string(),
+            )],
+            ..step(argv)
+        }
+    }
+
+    /// A step whose own PTY setup fails is a failed receipt the run hands back, not a step
+    /// that never returns: the failure names the resource, the rest of the run reports
+    /// `NotRun`, and a later Action against the same row still succeeds. Run off this
+    /// thread and collected through the liveness backstop, since the claim under test is
+    /// that these calls return at all.
+    #[test]
+    fn a_step_whose_pty_setup_fails_finishes_the_run_and_leaves_a_later_action_working() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start_discovered(spec_with_overrides(vec![root], Vec::new()));
+        let key = core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.key.path() == repo)
+            .expect("the repo is discovered")
+            .key
+            .clone();
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let faulted = core.run_action_for_entity_blocking(
+                &action(
+                    "hook",
+                    vec![
+                        step_that_cannot_prepare(&["touch", "first-ran"], "notify-pipe"),
+                        step(&["touch", "second-ran"]),
+                    ],
+                ),
+                &key,
+            );
+            let later = core.run_action_for_entity_blocking(
+                &action("hook", vec![step(&["touch", "later-ran"])]),
+                &key,
+            );
+            let _ = tx.send((faulted, later));
+        });
+        let (faulted, later) = rx
+            .recv_timeout(BACKSTOP)
+            .expect("a run whose first step cannot prepare its pty must still hand back receipts");
+
+        let faulted = faulted.expect("the entity is known");
+        assert!(
+            matches!(faulted.steps[0].outcome, StepOutcome::Failed(code) if code != 0),
+            "expected the first step to fail, got {:?}",
+            faulted.steps[0].outcome
+        );
+        let detail = String::from_utf8_lossy(&faulted.steps[0].output).to_string();
+        assert!(
+            detail.contains("pipe that notices"),
+            "expected the receipt to name the resource that failed, got {detail:?}"
+        );
+        assert_eq!(faulted.steps[1].outcome, StepOutcome::NotRun);
+        assert!(
+            !repo.join("first-ran").exists() && !repo.join("second-ran").exists(),
+            "a step that never prepared its pty must never have run its command"
+        );
+
+        let later = later.expect("the entity is known");
+        assert_eq!(later.steps[0].outcome, StepOutcome::Ok);
+        assert!(
+            repo.join("later-ran").exists(),
+            "a later Action must still run its own command"
+        );
     }
 
     /// `None` rather than a receipt for a key the table does not know: the same fallback
