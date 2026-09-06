@@ -114,9 +114,11 @@ The trigger, after stripping any leading `-`:
 | --- | --- |
 | empty (an empty line, or just after a space) | every key |
 | `:` alone, the empty key | every key |
-| a known key up to or past its `:` | that key's values |
+| a known key up to or past its `:` | that key's values, narrowed by whatever of a value is already typed |
 | a colon-less prefix of one or more keys | those keys' own entries |
 | anything else | nothing |
+
+A value narrows on the same rule as a key: the text after the `:`, or after the last `,` where alternatives are being joined, is a prefix the key's values are matched against case-insensitively, and the list vanishes once no value starts with it. Without it `Tab` on `sync:be` writes `ahead`, the first candidate rather than the one being typed, which makes the key half and the value half of the table above disagree one keystroke apart.
 
 A colon-less term that is a prefix of one or more keys offers each of their own entries (`key:`), narrowing as more of it is typed and vanishing once no key's name starts with it. This makes the keyed namespace discoverable before the user commits to a colon, at the accepted cost that a repository named `state` or `sync` sees its own name suggested back as a key while it is still being typed: accepting a completion always needs `Tab`, so the live filter keeps treating the typed text as a name search regardless, and the suggestion costs nothing beyond the screen space it occupies. Since `/` prefills, the line is rarely empty, so this prefix behaviour actually carries discoverability of the keyed namespace day to day, more than the empty-line and bare-colon rows above it.
 
@@ -132,7 +134,7 @@ Moving the caret re-reads the trigger against wherever it landed, and clears the
 
 Enter never accepts, because a key whose effect depends on a widget the user is not looking at is a key whose effect they cannot predict; and because the list narrows live, so you can see the answer before you finish typing, and Enter must always mean "done". This widens keybindings.md's `Ctrl+J`/`Ctrl+K` from "palettes only" to the whole `input` context.
 
-Completion is static: it offers the vocabulary, never the data. `branch:ma` does not offer the `main` and `master` actually present. Live-data completion was refused for v1 because it needs a per-keystroke scan over a snapshot a refresh can replace underneath it, so the list would reorder for reasons unrelated to typing, and because the values it would complete are already on screen in the column beside you. It adds no syntax, so it remains a clean later addition.
+Completion is static: it offers the vocabulary, never the data. Narrowing does not change that, since what it narrows is the fixed vocabulary. `branch:ma` does not offer the `main` and `master` actually present. Live-data completion was refused for v1 because it needs a per-keystroke scan over a snapshot a refresh can replace underneath it, so the list would reorder for reasons unrelated to typing, and because the values it would complete are already on screen in the column beside you. It adds no syntax, so it remains a clean later addition.
 
 ## Screen placement
 

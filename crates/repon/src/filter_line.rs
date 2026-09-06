@@ -30,7 +30,7 @@ pub(crate) const COMPLETION_MAX_ROWS: usize = 8;
 
 /// What the term under the cursor offers, per
 /// [filter.md](../../../docs/spec/filter.md#completion)'s trigger table: nothing, every key,
-/// or one recognised key's own values. `Keys` and `Values` both carry the literal text
+/// or one recognised key's own values, each list narrowed by what is already typed of it. `Keys` and `Values` both carry the literal text
 /// [`FilterLine::accept_highlighted_completion`] inserts, already formatted (a key's own
 /// entry carries its trailing `:`; a value's does not).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +178,10 @@ impl FilterLine {
     /// keys offers those keys' own entries, anything else offers nothing. Matched
     /// case-insensitively, the same as the parser itself
     /// ([filter.md](../../../docs/spec/filter.md#the-grammar)).
+    ///
+    /// Both lists narrow by prefix against what is already typed of an entry, so `Tab` takes
+    /// what the user is spelling rather than the vocabulary's first candidate, and a list
+    /// nothing matches empties out and takes the overlay with it.
     fn trigger(&self) -> (Trigger, usize) {
         // Everything below reads the text up to the caret alone, so a term is what has been
         // typed into it so far and never what happens to follow the caret.
@@ -222,7 +226,13 @@ impl FilterLine {
 
         let value_text = &body[colon + 1..];
         let fragment_offset = colon + 1 + value_text.rfind(',').map_or(0, |comma| comma + 1);
-        let values = entry.values.iter().map(|value| value.to_string()).collect();
+        let fragment = body[fragment_offset..].to_ascii_lowercase();
+        let values = entry
+            .values
+            .iter()
+            .filter(|value| value.starts_with(fragment.as_str()))
+            .map(|value| value.to_string())
+            .collect();
         (Trigger::Values(values), body_start + fragment_offset)
     }
 
@@ -789,9 +799,9 @@ mod tests {
     }
 
     /// Row 3: a known key up to or past its `:` offers that key's own values, matched
-    /// case-insensitively like the parser itself, and unaffected by a leading `-` or by text
-    /// already typed after the colon: completion is static, "it offers the vocabulary, never
-    /// the data" (`docs/spec/filter.md#completion`), so it does not narrow by what follows.
+    /// case-insensitively like the parser itself and unaffected by a leading `-`. What
+    /// narrowing an already-typed value fragment does to that list is
+    /// [`a_typed_value_fragment_narrows_the_keys_values_to_it`]'s.
     #[test]
     fn a_known_key_up_to_or_past_its_colon_offers_that_keys_own_values() {
         let kind_values: Vec<String> = repon_core::vocabulary()
@@ -806,7 +816,47 @@ mod tests {
         assert_eq!(typed("kind:").completions(), kind_values);
         assert_eq!(typed("KIND:").completions(), kind_values);
         assert_eq!(typed("-kind:").completions(), kind_values);
-        assert_eq!(typed("kind:wor").completions(), kind_values);
+    }
+
+    /// A typed value fragment narrows the key's own values the way a colon-less prefix
+    /// narrows the keys, so `Tab` takes what was being typed rather than the first candidate.
+    #[test]
+    fn a_typed_value_fragment_narrows_the_keys_values_to_it() {
+        assert_eq!(typed("sync:be").completions(), vec!["behind"]);
+
+        let mut line = typed("sync:be");
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "sync:behind");
+    }
+
+    /// A value fragment matches case-insensitively, like every other half of the grammar,
+    /// and what survives keeps the vocabulary's own order rather than the order it matched in.
+    #[test]
+    fn a_value_fragment_matches_case_insensitively_and_keeps_vocabulary_order() {
+        assert_eq!(
+            typed("sync:NO-").completions(),
+            vec!["no-upstream", "no-remote"]
+        );
+    }
+
+    /// A fragment no value starts with offers nothing, so the overlay vanishes exactly as it
+    /// does for a colon-less prefix no key starts with.
+    #[test]
+    fn a_value_fragment_no_value_starts_with_offers_nothing() {
+        let line = typed("sync:zz");
+        assert!(line.completions().is_empty());
+        assert!(line.completion_area(Rect::new(0, 0, 40, 20)).is_none());
+    }
+
+    /// Narrowing reads the fragment after the last comma, the same span accepting overwrites,
+    /// so a comma-joined alternative narrows and lands without touching the earlier ones.
+    #[test]
+    fn a_comma_joined_alternative_narrows_on_its_own_fragment() {
+        assert_eq!(typed("sync:ahead,be").completions(), vec!["behind"]);
+
+        let mut line = typed("sync:ahead,be");
+        line.accept_highlighted_completion();
+        assert_eq!(line.live_filter().as_str(), "sync:ahead,behind");
     }
 
     /// Row 4: a colon whose key half is not recognised offers nothing, and neither does a
@@ -1035,20 +1085,26 @@ mod tests {
     }
 
     /// Typing after a completion context is chosen must not carry the old highlight forward:
-    /// the candidate set underneath it can be a whole different list, and here it stays the
-    /// same list (`kind:`'s three values) but the highlight still has to reset, or accepting
-    /// afterwards would silently keep pointing at "submodule".
+    /// the candidate set underneath it is a different list, and even where the keystroke
+    /// leaves several rows standing the highlight still has to reset, or accepting
+    /// afterwards would silently keep pointing at "no-remote".
     #[test]
     fn a_further_keystroke_resets_the_highlight() {
-        let mut line = typed("kind:");
-        line.move_completion_highlight(2); // "submodule", the last of three
-        line.type_char('w');
+        let mut line = typed("sync:");
+        line.move_completion_highlight(4); // "no-remote", the last of five
+        line.type_char('n');
+        assert_eq!(
+            line.completions(),
+            vec!["no-upstream", "no-remote"],
+            "the keystroke must leave more than one row, or a reset and a collapsed list \
+             would be indistinguishable"
+        );
         line.accept_highlighted_completion();
         assert_eq!(
             line.live_filter().as_str(),
-            "kind:repo",
-            "the highlight must reset to the first row rather than keep pointing at \
-             \"submodule\", and accepting overwrites the \"w\" just typed along with it"
+            "sync:no-upstream",
+            "the highlight must reset to the first row of the narrowed list rather than \
+             keep pointing at \"no-remote\""
         );
     }
 
