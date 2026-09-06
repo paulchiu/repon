@@ -389,6 +389,13 @@ enum ClockControl {
     Pause,
     Resume,
     Shutdown,
+    /// Start a periodic-fetch cycle now rather than on the next `fetch.interval` tick, which
+    /// is how the first discovery asks for the immediate cycle enabling the fetch owes
+    /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
+    /// periodic fetch"). Sent rather than run there, so every cycle has the one owner. Asked
+    /// for once and never again, so the clock holds it until it can start it rather than
+    /// dropping it.
+    FetchNow,
 }
 
 /// A running core: its own table, its own dedicated thread, and the rayon pool it
@@ -554,6 +561,10 @@ pub struct Core {
     /// default build entirely.
     #[cfg(test)]
     action_completion_boundary: Arc<ActionCompletionBoundary>,
+    /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
+    /// entirely.
+    #[cfg(test)]
+    fetch_boundary: Arc<FetchBoundary>,
 }
 
 /// One entity's phase C test gate state, guarded by the paired [`Condvar`] stored
@@ -726,6 +737,118 @@ impl ArmedBoundary {
 
 #[cfg(test)]
 impl Drop for ArmedBoundary {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.released = true;
+        self.0.changed.notify_all();
+    }
+}
+
+/// A park inside one periodic-fetch cycle's own per-repository work, for a test.
+///
+/// A fetch against a real remote finishes when the remote says so, which is no moment a test
+/// can hold anything at. This is that moment: the cycle signals it has entered a fetch and
+/// stays there until the test that armed this lets it go, so the clock's own tick, pause and
+/// shutdown handling can be observed against a fetch that provably has not finished. A
+/// cancellation is recorded here rather than acted on, which is the bound
+/// [`crate::fetch::fetch_and_prune`] documents for a real fetch before its receive stage.
+/// One per `Core` and disarmed until a test arms it, so a cycle nobody is watching reads one
+/// bool and carries on, and the whole affordance is gated off the default build.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FetchBoundary {
+    state: Mutex<FetchBoundaryState>,
+    changed: Condvar,
+}
+
+/// [`FetchBoundary`]'s own state, guarded by its `Condvar`.
+#[cfg(test)]
+#[derive(Default)]
+struct FetchBoundaryState {
+    /// Set by a test before the cycle it wants held.
+    armed: bool,
+    /// Set by the first fetch that parked at an armed boundary.
+    reached: bool,
+    /// Set when the [`ArmedFetchBoundary`] drops.
+    released: bool,
+    /// Set when the cycle holding a fetch here is cancelled.
+    cancelled: bool,
+}
+
+#[cfg(test)]
+impl FetchBoundary {
+    /// Holds every fetch that reaches this boundary until the returned value drops. For a
+    /// test, before the cycle it wants held. Every flag resets here, so a second armed cycle
+    /// on the same `Core` parks rather than walking through what the first one left set.
+    pub(crate) fn arm(self: &Arc<Self>) -> ArmedFetchBoundary {
+        *self.state.lock().unwrap() = FetchBoundaryState {
+            armed: true,
+            ..FetchBoundaryState::default()
+        };
+        ArmedFetchBoundary(Arc::clone(self))
+    }
+
+    /// Parks a fetch here until the test that armed this lets it go.
+    ///
+    /// No deadline of its own, deliberately: a clock too wedged to reach the release would
+    /// otherwise be let through by a timeout here, and the test that was watching it would
+    /// pass a couple of minutes late rather than fail.
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.reached = true;
+        self.changed.notify_all();
+        drop(
+            self.changed
+                .wait_while(state, |state| !state.released)
+                .unwrap(),
+        );
+    }
+
+    /// Records that the cycle holding a fetch here was cancelled. Evidence for the test
+    /// rather than a release, since a real fetch before its receive stage reads no flag.
+    fn cancelled(&self) {
+        self.state.lock().unwrap().cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
+/// One armed [`FetchBoundary`], released when this drops so an assertion failing inside the
+/// window reports itself rather than leaving a fetch parked for the rest of the run.
+#[cfg(test)]
+pub(crate) struct ArmedFetchBoundary(Arc<FetchBoundary>);
+
+#[cfg(test)]
+impl ArmedFetchBoundary {
+    /// Blocks until a fetch has parked at this boundary. For a test.
+    pub(crate) fn wait_until_reached(&self) {
+        self.wait_until("a fetch to reach the fetch boundary", |state| state.reached);
+    }
+
+    /// Blocks until the cycle whose fetch is parked here has been cancelled. For a test.
+    pub(crate) fn wait_until_cancelled(&self) {
+        self.wait_until("the held cycle's own cancellation", |state| state.cancelled);
+    }
+
+    fn wait_until(&self, property: &str, held: impl Fn(&FetchBoundaryState) -> bool) {
+        let (state, expiry) = self
+            .0
+            .changed
+            .wait_timeout_while(self.0.state.lock().unwrap(), liveness::BACKSTOP, |state| {
+                !held(state)
+            })
+            .unwrap();
+        drop(state);
+        if expiry.timed_out() {
+            liveness::expired(liveness::BACKSTOP, property, "");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ArmedFetchBoundary {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap();
         state.released = true;
@@ -1660,8 +1783,9 @@ impl Core {
         let _ = self.control.send(ClockControl::Pause);
     }
 
-    /// Restarts the dedicated thread's ticking. Nothing is queued to fire on
-    /// resume; a normal Generation is the consumer's decision, not this call's.
+    /// Restarts the dedicated thread's ticking. No Generation is queued to fire on resume;
+    /// one is the consumer's decision, not this call's. The single cycle enabling the
+    /// periodic fetch owes does fire here, if a pause landed before it.
     pub fn resume(&self) {
         let _ = self.control.send(ClockControl::Resume);
     }
@@ -2362,6 +2486,12 @@ pub(crate) struct StartForTest {
     /// poll anywhere in the wait.
     #[allow(dead_code)] // read only by tests; the plain lib target never builds them
     pub initial_discovery: Option<JoinHandle<()>>,
+    /// How many periodic-fetch cycles the clock has taken back and joined, cancelled ones
+    /// included, which a test keeps a handle on across `Core::drop` the same way it keeps
+    /// `clock_alive`: a cycle shutdown joined is only observable once the `Core` that owned
+    /// it is gone.
+    #[allow(dead_code)] // read only by tests; the plain lib target never builds them
+    pub fetch_cycles_taken_back: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -2511,6 +2641,12 @@ impl Core {
         Arc::clone(&self.action_completion_boundary)
     }
 
+    /// This `Core`'s own [`FetchBoundary`], to arm before the fetch cycle a test wants held.
+    #[cfg(test)]
+    pub(crate) fn fetch_boundary(&self) -> Arc<FetchBoundary> {
+        Arc::clone(&self.fetch_boundary)
+    }
+
     /// Registers a closed phase C/D gate for `key`, so the next `refresh` that
     /// dispatches it will land its cheap outcomes, then block before touching
     /// phase C or D until [`Core::release_phase_c_for_test`] opens the gate.
@@ -2658,6 +2794,19 @@ impl Core {
         ticks: Receiver<Instant>,
         fetch_ticks: Receiver<Instant>,
     ) -> StartForTest {
+        Self::start_for_test_with_fetch_gated(spec, warn_after, ticks, fetch_ticks, None)
+    }
+
+    /// [`Self::start_for_test_with_fetch`], with the discovery gate injected too: a closed
+    /// gate holds the first walk, which is what puts a call made on this `Core` provably
+    /// before the immediate cycle that walk asks for.
+    pub(crate) fn start_for_test_with_fetch_gated(
+        spec: CoreSpec,
+        warn_after: Duration,
+        ticks: Receiver<Instant>,
+        fetch_ticks: Receiver<Instant>,
+        discovery_gate: Option<DiscoveryGate>,
+    ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
         let fetch_start = FetchStart {
             enabled: spec.fetch.enabled,
@@ -2671,7 +2820,7 @@ impl Core {
             ticks,
             fetch_start,
             alive,
-            None,
+            discovery_gate,
         )
     }
 
@@ -3014,6 +3163,10 @@ fn start_internal(
     let phase_c_gates = Arc::new(Mutex::new(HashMap::new()));
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
     let fetch_failures = Arc::new(Mutex::new(FetchFailures::default()));
+    let fetch_cycles_taken_back = Arc::new(AtomicUsize::new(0));
+    let (fetch_finished_tx, fetch_finished_rx) = crossbeam_channel::unbounded();
+    #[cfg(test)]
+    let fetch_boundary = Arc::new(FetchBoundary::default());
     let turnstile = Arc::new(DispatchTurnstile::default());
 
     let fetch_refresh_handles = RefreshHandles {
@@ -3044,6 +3197,11 @@ fn start_internal(
         cycle_count: Arc::clone(&fetch_cycle_count),
         failures: Arc::clone(&fetch_failures),
         auto_update_enabled,
+        finished: fetch_finished_rx,
+        finished_tx: fetch_finished_tx,
+        taken_back_count: Arc::clone(&fetch_cycles_taken_back),
+        #[cfg(test)]
+        boundary: Arc::clone(&fetch_boundary),
     };
 
     let clock_thread = spawn_clock_thread(
@@ -3080,8 +3238,7 @@ fn start_internal(
         let table = Arc::clone(&table);
         let settle_gate = Arc::clone(&settle_gate);
         let fetch_refresh_handles = fetch_refresh_handles.clone();
-        let fetch_cycle_count = Arc::clone(&fetch_cycle_count);
-        let fetch_failures = Arc::clone(&fetch_failures);
+        let control = control.clone();
         let discovery_gate = discovery_gate.clone();
         move || {
             let turn = fetch_refresh_handles.turnstile.take(startup_ticket);
@@ -3128,24 +3285,13 @@ fn start_internal(
             // "Fires immediately on being enabled rather than waiting for the first
             // tick" ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
             // "The periodic fetch"): the recurring cadence only ever fires after a full
-            // `fetch.interval` has elapsed, so the first cycle is dispatched here, once,
-            // on its own plain thread rather than on the dedicated clock thread, which
-            // must stay free to keep polling and sweeping deadlines while this cycle
-            // runs. From inside this thread rather than beside it, because a cycle reads
-            // the table to know what to fetch and the walk above is what puts anything
-            // in it.
+            // `fetch.interval` has elapsed, so the first cycle is asked for here, once.
+            // Asked for rather than run, so the clock owns this cycle exactly as it owns
+            // every later one. From inside this thread rather than beside it, because a
+            // cycle reads the table to know what to fetch and the walk above is what puts
+            // anything in it.
             if fetch_enabled {
-                let table = Arc::clone(&table);
-                thread::spawn(move || {
-                    run_fetch_cycle(
-                        &table,
-                        fetch_concurrency,
-                        &fetch_refresh_handles,
-                        &fetch_cycle_count,
-                        &fetch_failures,
-                        auto_update_enabled,
-                    );
-                });
+                let _ = control.send(ClockControl::FetchNow);
             }
         }
     });
@@ -3180,10 +3326,13 @@ fn start_internal(
             discovery_gate,
             #[cfg(test)]
             action_completion_boundary: Arc::new(ActionCompletionBoundary::default()),
+            #[cfg(test)]
+            fetch_boundary: Arc::clone(&fetch_boundary),
         },
         clock_alive: alive,
         discovery_watcher,
         initial_discovery: Some(initial_discovery),
+        fetch_cycles_taken_back,
     }
 }
 
@@ -3226,6 +3375,19 @@ struct FetchSchedule {
     /// other field on [`FetchSchedule`]: the fast-forward-only update carries no
     /// interval of its own, so there is no separate tick to gate it on, only this.
     auto_update_enabled: bool,
+    /// A cycle's own worker sends `()` here as its last act; the clock's arm on `finished` is
+    /// what takes that cycle back, joins its worker and dispatches the Generation it owes.
+    /// The clock holds `finished_tx` as well, so this arm only ever fires on a real
+    /// completion.
+    finished: Receiver<()>,
+    finished_tx: Sender<()>,
+    /// How many cycles the clock has taken back and joined, which is what lets a test
+    /// observe a cycle's own end rather than infer it.
+    taken_back_count: Arc<AtomicUsize>,
+    /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
+    /// entirely.
+    #[cfg(test)]
+    boundary: Arc<FetchBoundary>,
 }
 
 /// The dedicated thread's own control-plane wiring, bundled into one argument so
@@ -3246,9 +3408,17 @@ struct ClockChannels {
 /// none of it. Driven by `ticks` and `fetch.ticks` rather than a bare
 /// `thread::sleep`, which is what a test replaces to make the cadence
 /// deterministic. The poll and deadline sweep run first on every `ticks` tick,
-/// both while `!paused`; a fetch cycle runs on every `fetch.ticks` tick, also only
+/// both while `!paused`; a fetch cycle starts on every `fetch.ticks` tick, also only
 /// while `!paused`, so a suspended Repon neither sweeps nor fetches while the user
 /// is in a Launcher.
+///
+/// A cycle runs on a worker of its own rather than here, so a fetch waiting on a remote
+/// stalls none of the above. This loop is the cycle's owner for as long as it runs: it starts
+/// at most one at a time, holds the immediate cycle enabling the fetch owes until it can
+/// start it, cancels the live one on pause and on the way out, and takes it back on the
+/// completion message the worker sends. Everything a cycle owes the table beyond its
+/// own fetches, the Generation above all, is dispatched from here rather than from the
+/// worker, so a cancelled cycle cannot land anything the lifecycle has already moved past.
 fn spawn_clock_thread(
     table: Arc<RwLock<Table>>,
     poll: PollHandles,
@@ -3264,14 +3434,20 @@ fn spawn_clock_thread(
     } = channels;
     thread::spawn(move || {
         let mut paused = false;
+        let mut cycle: Option<FetchCycle> = None;
+        let mut immediate_cycle_owed = false;
         loop {
             select! {
                 recv(control) -> message => match message {
                     Ok(ClockControl::Pause) => {
                         paused = true;
                         cancel_in_flight(&table, &settle_gate);
+                        if let Some(cycle) = &cycle {
+                            cycle.cancel();
+                        }
                     }
                     Ok(ClockControl::Resume) => paused = false,
+                    Ok(ClockControl::FetchNow) => immediate_cycle_owed = true,
                     Ok(ClockControl::Shutdown) | Err(_) => break,
                 },
                 recv(ticks) -> tick => {
@@ -3294,29 +3470,157 @@ fn spawn_clock_thread(
                     if tick.is_err() {
                         break;
                     }
-                    if !paused {
-                        run_fetch_cycle(
-                            &table,
-                            fetch.concurrency,
-                            &fetch.refresh,
-                            &fetch.cycle_count,
-                            &fetch.failures,
-                            fetch.auto_update_enabled,
-                        );
+                    // Refused rather than queued while one is live, the same choice
+                    // `Core::run_action` already makes for a second fan-out: two cycles over
+                    // the same population would fetch and auto-update the same repositories
+                    // at once.
+                    if !paused && cycle.is_none() {
+                        cycle = Some(start_fetch_cycle(&table, &fetch));
+                    }
+                }
+                recv(fetch.finished) -> _ => {
+                    if let Some(finished) = cycle.take() {
+                        let cancelled = finished.cancelled();
+                        finished.join();
+                        if !cancelled {
+                            dispatch_fetch_completion(&table, &fetch.refresh);
+                        }
+                        fetch.taken_back_count.fetch_add(1, Ordering::Release);
                     }
                 }
             }
+            // Started here rather than in the arm that asked for it, so a pause or a live
+            // cycle delays the immediate cycle rather than losing it.
+            if immediate_cycle_owed && !paused && cycle.is_none() {
+                immediate_cycle_owed = false;
+                cycle = Some(start_fetch_cycle(&table, &fetch));
+            }
+        }
+        // Shutdown waits the cycle out rather than detaching it, so no worker is still
+        // fetching or fast-forwarding once `Core::drop` returns; the wait is only as short as
+        // [`FetchCycle::cancel`] can make it. The Generation it would have owed is not
+        // dispatched, since the table it would write to is going away with this `Core`.
+        if let Some(cycle) = cycle.take() {
+            cycle.cancel();
+            cycle.join();
+            fetch.taken_back_count.fetch_add(1, Ordering::Release);
         }
         alive.store(false, Ordering::Release);
     })
 }
 
+/// The periodic-fetch cycle running right now, owned by the clock for as long as it runs:
+/// the worker doing the fetching, and the one flag every fetch in that cycle was handed.
+///
+/// Owned rather than detached so the clock can end a cycle it has moved past and know that it
+/// has: [`Self::cancel`] is what pause and shutdown reach for, and [`Self::join`] is what
+/// makes shutdown's own answer honest.
+struct FetchCycle {
+    cancel: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
+    /// See [`FetchBoundary`].
+    #[cfg(test)]
+    boundary: Arc<FetchBoundary>,
+}
+
+impl FetchCycle {
+    /// Ends this cycle: no further repository is fetched, one already in its receive stage
+    /// unwinds, and neither the auto-update nor the completion Generation runs.
+    ///
+    /// It is not a bound on a fetch already connecting or preparing: gix takes a cancellation
+    /// flag at [`gix::remote::fetch::Prepare::receive`] and nowhere earlier, which
+    /// [`crate::fetch::fetch_and_prune`]'s own doc comment records in full.
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.boundary.cancelled();
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    /// Waits for this cycle's own worker to stop.
+    fn join(self) {
+        let _ = self.worker.join();
+    }
+}
+
+/// Starts one cycle on a worker of its own, which sends `()` on `fetch.finished` as its last
+/// act however the cycle itself ended.
+///
+/// The send is what the clock waits for before joining that worker, so it happens past a
+/// panicked cycle too, caught here for the reason `Core::run_action`'s own fan-out catches
+/// one: without it a poisoned lock from an unrelated earlier panic would leave this `Core`
+/// unable to ever start another cycle.
+fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycle {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let work = FetchCycleWork {
+        table: Arc::clone(table),
+        concurrency: fetch.concurrency,
+        cancel: Arc::clone(&cancel),
+        network_default_branch: Arc::clone(&fetch.refresh.network_default_branch),
+        cycle_count: Arc::clone(&fetch.cycle_count),
+        failures: Arc::clone(&fetch.failures),
+        auto_update_enabled: fetch.auto_update_enabled,
+        #[cfg(test)]
+        boundary: Arc::clone(&fetch.boundary),
+    };
+    #[cfg(test)]
+    let boundary = Arc::clone(&work.boundary);
+    let finished = fetch.finished_tx.clone();
+    let worker = thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_fetch_cycle(&work);
+        }));
+        let _ = finished.send(());
+    });
+    FetchCycle {
+        cancel,
+        worker,
+        #[cfg(test)]
+        boundary,
+    }
+}
+
+/// The one normal Generation a finished cycle owes
+/// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
+/// periodic fetch": "a finished fetch starts a normal generation"), over every entity the
+/// table now knows rather than only the ones that cycle fetched.
+fn dispatch_fetch_completion(table: &Arc<RwLock<Table>>, refresh: &RefreshHandles) {
+    let all_keys: Vec<EntityKey> = table
+        .read()
+        .unwrap()
+        .entities
+        .iter()
+        .map(|entity| entity.key.clone())
+        .collect();
+    refresh.dispatch(&all_keys);
+}
+
+/// One periodic-fetch cycle's own inputs, cloned out of [`FetchSchedule`] when a cycle
+/// starts: `cancel` is the one flag every fetch in this cycle is handed, so whoever owns the
+/// cycle can end all of them at once. Carries the network default branch map alone and never
+/// the whole [`RefreshHandles`], since dispatching the Generation is the clock's to fence.
+struct FetchCycleWork {
+    table: Arc<RwLock<Table>>,
+    concurrency: usize,
+    cancel: Arc<AtomicBool>,
+    network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
+    cycle_count: Arc<AtomicUsize>,
+    failures: Arc<Mutex<FetchFailures>>,
+    auto_update_enabled: bool,
+    /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
+    /// entirely.
+    #[cfg(test)]
+    boundary: Arc<FetchBoundary>,
+}
+
 /// One periodic-fetch cycle: every distinct git common dir this table currently
-/// knows, not excluded, fetched with pruning, bounded to `concurrency` at once,
-/// then one normal Generation over every entity the table now knows
-/// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
-/// "The periodic fetch": "a finished fetch starts a normal generation"), the exact
-/// completion path [`Core::run_action`] already uses. `cycle_count` counts every
+/// knows, not excluded, fetched with pruning, bounded to `concurrency` at once, then the
+/// fast-forward-only auto-update over what that fetch just learned. The Generation a
+/// finished cycle owes is [`dispatch_fetch_completion`]'s, back on the clock, so a cancelled
+/// cycle cannot land one. `cycle_count` counts every
 /// call, whether or not any repository had a remote to fetch, so a test driving
 /// the dedicated thread's own tick channel can prove a tick reached this function
 /// at all, the same proof [`Core::poll_sweep_count_for_test`] gives the poll.
@@ -3331,26 +3635,38 @@ fn spawn_clock_thread(
 /// minutes is [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// stated number, not one this crate has measured against a real population the
 /// way the poll interval and the generation deadline were.
-fn run_fetch_cycle(
-    table: &Arc<RwLock<Table>>,
-    concurrency: usize,
-    refresh: &RefreshHandles,
-    cycle_count: &Arc<AtomicUsize>,
-    failures: &Arc<Mutex<FetchFailures>>,
-    auto_update_enabled: bool,
-) {
+fn run_fetch_cycle(work: &FetchCycleWork) {
+    let FetchCycleWork {
+        table,
+        concurrency,
+        cancel,
+        network_default_branch,
+        cycle_count,
+        failures,
+        auto_update_enabled,
+        #[cfg(test)]
+        boundary,
+    } = work;
+    let auto_update_enabled = *auto_update_enabled;
     cycle_count.fetch_add(1, Ordering::Release);
 
     let common_dirs = distinct_fetchable_common_dirs(table);
     let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
-    crate::fetch::run_bounded(common_dirs, concurrency.max(1), |common_dir| {
-        let cancel = AtomicBool::new(false);
+    crate::fetch::run_bounded(common_dirs, (*concurrency).max(1), |common_dir| {
+        // Nothing parks here unless a test armed this boundary.
+        #[cfg(test)]
+        boundary.hold();
+        // A cancelled cycle starts no more work: the repositories this pool has not reached
+        // yet are simply not fetched.
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
         // Every repository's own fetch result is independent: one credential
         // failure or one unreachable remote must never stop the rest of the
         // cycle from running, so a per-repository error is swallowed here
         // rather than aborting the whole cycle. It is still counted below,
         // which is the count this cycle's own [`FetchFailures`] carries.
-        match crate::fetch::fetch_and_prune(&common_dir, &cancel) {
+        match crate::fetch::fetch_and_prune(&common_dir, cancel) {
             Ok(outcome) => {
                 // The handshake this fetch already paid for is what
                 // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
@@ -3363,8 +3679,7 @@ fn run_fetch_cycle(
                 if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
                     outcome.advertised_default_branch
                 {
-                    refresh
-                        .network_default_branch
+                    network_default_branch
                         .lock()
                         .unwrap()
                         .insert(common_dir.clone(), Arc::from(name));
@@ -3378,34 +3693,36 @@ fn run_fetch_cycle(
             }
         }
     });
-    *failures.lock().unwrap() = FetchFailures {
-        failed: failed.into_inner().unwrap(),
-    };
+    // A cancelled cycle never completed, so what it reached is not
+    // [`FetchFailures`]'s "most recently completed cycle": the previous cycle's own
+    // count stands rather than being replaced by a partial one.
+    if !cancel.load(Ordering::Acquire) {
+        *failures.lock().unwrap() = FetchFailures {
+            failed: failed.into_inner().unwrap(),
+        };
+    }
 
     // The fast-forward-only auto-update rides this cycle rather than a timer of its
     // own, per `docs/spec/config.md`'s "Refresh, fetch and auto-update": it can only
     // ever act on what the fetch just above learned, so it runs here, after every
-    // fetch has settled and before the one Generation below reports the result.
-    // Sequential rather than `fetch::run_bounded`'s own concurrency, since this is a
-    // mutating pass over a Repo's own working tree and index, not a read against a
+    // fetch has settled and before the Generation the clock dispatches reports the
+    // result. Sequential rather than `fetch::run_bounded`'s own concurrency, since this
+    // is a mutating pass over a Repo's own working tree and index, not a read against a
     // remote: ADR 0002's narrowest-safe-operation rule favours a simple, serial pass
     // over throughput a mutation has no need of.
     if auto_update_enabled {
         for repo_path in repos_eligible_for_auto_update_attempt(table) {
+            // Re-read per Repo, not once: this is the mutating half of the cycle, so a
+            // cancellation arriving partway through it stops the next Repo from being
+            // written to at all.
+            if cancel.load(Ordering::Acquire) {
+                break;
+            }
             // One Repo's ineligibility or failure never stops another's: the same
             // independence the fetch loop above already gives each repository.
             let _ = crate::auto_update::attempt(&repo_path);
         }
     }
-
-    let all_keys: Vec<EntityKey> = table
-        .read()
-        .unwrap()
-        .entities
-        .iter()
-        .map(|entity| entity.key.clone())
-        .collect();
-    refresh.dispatch(&all_keys);
 }
 
 /// Every non-excluded Repo's own working directory, one per distinct common dir the
@@ -12272,6 +12589,9 @@ mod tests {
         /// A tick on the periodic fetch's own channel runs a second cycle, proving the
         /// recurring cadence is wired to the same dedicated thread the immediate cycle
         /// used, not merely a one-shot dispatched at start.
+        ///
+        /// The tick is sent only once the immediate cycle has been taken back, since a tick
+        /// arriving while a cycle is live is refused rather than queued.
         #[test]
         fn a_tick_on_the_fetch_channel_runs_another_cycle() {
             let remote = seeded_remote();
@@ -12289,9 +12609,10 @@ mod tests {
             .discovered();
             let core = started.core;
 
-            wait_for("the immediate cycle to have run first", || {
-                core.fetch_cycle_count_for_test() >= 1
-            });
+            wait_for(
+                "the immediate cycle to have run and been taken back first",
+                || started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1,
+            );
 
             fetch_tick_tx
                 .send(Instant::now())
@@ -12300,6 +12621,336 @@ mod tests {
             wait_for("a tick on the fetch channel to run a second cycle", || {
                 core.fetch_cycle_count_for_test() >= 2
             });
+        }
+
+        /// The clock is a coordinator, never a fetch's own caller: a cycle held at
+        /// [`FetchBoundary`] must leave the Generation deadline sweep on the same thread free
+        /// to settle a probe that has run out of time. `fetch.enabled` is false and the cycle
+        /// under test comes from a tick alone, so the only fetch in flight is the one this
+        /// test is holding.
+        #[test]
+        fn a_deadline_tick_still_times_out_a_pending_probe_while_a_fetch_is_held() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (tick_tx, tick_rx) = crossbeam_channel::unbounded::<Instant>();
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded::<Instant>();
+            let mut spec = fetch_spec(false, root_path);
+            spec.generation_deadline = Duration::ZERO;
+            let started = Core::start_for_test_with_fetch(
+                spec,
+                Duration::from_secs(3600),
+                tick_rx,
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+            let key = core.settle().entities[0].key.clone();
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+
+            core.begin_untracked_probe_for_test(&key);
+            tick_tx.send(Instant::now()).expect("send one tick");
+            let after = core.settle();
+
+            assert!(
+                matches!(
+                    after.entities[0].branch.settled(),
+                    Some(Settled::Unknown(Unknown::TimedOut))
+                ),
+                "the deadline sweep must still run while a fetch is held, got: {:?}",
+                after.entities[0].branch.settled()
+            );
+        }
+
+        /// Pause is the lifecycle owner ending the live cycle where it stands, not only
+        /// stopping the next one: the cancellation reaches a fetch that is provably still
+        /// running, no further repository is fetched, the mutating half of that cycle never
+        /// runs, and the Generation a finished cycle owes is never dispatched once the held
+        /// fetch is let go. Both fences have something to hold: `parent` is left genuinely
+        /// eligible (clean, behind, tracking an upstream) by a fetch this test performs
+        /// itself, and `stale` is left a commit behind its remote, so a cycle that carried on
+        /// would move each of them.
+        #[test]
+        fn pause_cancels_a_held_cycle_so_it_neither_auto_updates_nor_dispatches_its_generation() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            let stale = root_path.join("stale");
+            clone_into(remote.path(), &parent);
+            clone_into(remote.path(), &stale);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            git(&parent, &["fetch", "origin"]);
+            let before_tip = rev_parse(&parent, "refs/heads/main");
+            let stale_before = rev_parse(&stale, "refs/remotes/origin/main");
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+            let before = core.settle().generation;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+
+            core.pause();
+            held.wait_until_cancelled();
+            drop(held);
+            wait_for("the cancelled cycle to be taken back by the clock", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before_tip,
+                "a cancelled cycle must not fast-forward a Repo its auto-update would \
+                 otherwise have moved"
+            );
+            assert_eq!(
+                rev_parse(&stale, "refs/remotes/origin/main"),
+                stale_before,
+                "a cancelled cycle must land no fetch beyond the one it was holding"
+            );
+            assert_eq!(
+                core.snapshot().generation,
+                before,
+                "releasing a cancelled fetch must not dispatch the completion Generation \
+                 its cycle would otherwise have owed"
+            );
+        }
+
+        /// A tick arriving while a cycle is live is refused, not queued and not run beside
+        /// it: two cycles over the same population would fetch and fast-forward the same
+        /// repositories at once. The clock takes both further ticks off the channel while the
+        /// first cycle is provably still held, which is what makes the refusal the reading
+        /// here rather than a scheduling delay.
+        #[test]
+        fn a_fetch_tick_taken_while_a_cycle_is_live_starts_no_second_cycle() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            // A second handle on the same queue, read but never received from: the clock
+            // emptying it is what says both further ticks have been taken.
+            let pending_ticks = fetch_tick_rx.clone();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send the tick that starts the cycle");
+            held.wait_until_reached();
+
+            for _ in 0..2 {
+                fetch_tick_tx
+                    .send(Instant::now())
+                    .expect("send a tick while the cycle is live");
+            }
+            wait_for("the clock to take both further ticks", || {
+                pending_ticks.is_empty()
+            });
+
+            drop(held);
+            wait_for("the released cycle to be taken back by the clock", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+
+            assert_eq!(
+                core.fetch_cycle_count_for_test(),
+                1,
+                "two ticks taken while a cycle was held must have started no cycle of their \
+                 own"
+            );
+        }
+
+        /// [`FetchFailures`] is the most recently *completed* cycle's own count
+        /// (GLOSSARY.md), so a cancelled one never replaces it: what that cycle reached
+        /// before it was ended is not a count of what could not be fetched. The immediate
+        /// cycle here completes and counts its one broken remote; the second is cancelled
+        /// while its fetch is held, and the count standing afterwards is still the first
+        /// cycle's.
+        #[test]
+        fn a_cancelled_cycle_leaves_the_completed_cycles_failures_standing() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let broken = root_path.join("broken");
+            clone_into(remote.path(), &broken);
+            break_remote(&broken);
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            wait_for("the immediate cycle to complete and be taken back", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+            assert_eq!(
+                core.fetch_failures().failed.len(),
+                1,
+                "the completed cycle must have counted its one broken remote, got: {:?}",
+                core.fetch_failures().failed
+            );
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+            core.pause();
+            held.wait_until_cancelled();
+            drop(held);
+            wait_for("the cancelled cycle to be taken back by the clock", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 2
+            });
+
+            assert_eq!(
+                core.fetch_failures().failed.len(),
+                1,
+                "a cancelled cycle must leave the completed cycle's own count standing, \
+                 got: {:?}",
+                core.fetch_failures().failed
+            );
+        }
+
+        /// The one cycle enabling the periodic fetch owes
+        /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+        /// "fires immediately on being enabled") is held by a pause rather than lost to it:
+        /// the first walk asks for it once and nothing asks again, so a Launcher handoff
+        /// landing during that walk would otherwise cost the user a whole `fetch.interval`.
+        /// The walk is held closed until the pause has been sent, which is what orders the
+        /// two rather than racing them.
+        #[test]
+        fn a_pause_landing_before_the_immediate_cycle_holds_it_until_resume() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (gate, walk_may_run, opener) = gate_opened_on_signal(false);
+            let started = Core::start_for_test_with_fetch_gated(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+                Some(gate),
+            );
+            started.core.pause();
+            walk_may_run.send(()).expect("the opener is listening");
+            opener.join().expect("the opener thread should not panic");
+            let core = started.discovered().core;
+
+            core.resume();
+
+            wait_for(
+                "the held immediate cycle to run once the clock resumes",
+                || core.fetch_cycle_count_for_test() >= 1,
+            );
+        }
+
+        /// Teardown signals the cycle's own cancellation and waits for the worker to stop,
+        /// rather than abandoning a thread that is still fetching and fast-forwarding
+        /// repositories. Both halves are read against a fetch this test is still holding:
+        /// the cancellation is observed at the boundary, and teardown is still waiting while
+        /// that fetch has not returned, which a teardown that merely signalled and detached
+        /// could not be. It runs on a thread of its own, so a teardown that never returns
+        /// fails this test rather than wedging the run. The Repo is left eligible for the
+        /// auto-update by a fetch this test performs itself, so the branch standing still
+        /// afterwards is a worker that stopped rather than one with nothing to do.
+        #[test]
+        fn dropping_the_core_cancels_and_joins_a_held_fetch_cycle_before_returning() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            git(&parent, &["fetch", "origin"]);
+            let before_tip = rev_parse(&parent, "refs/heads/main");
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+
+            let (returned_tx, returned_rx) = crossbeam_channel::bounded::<()>(1);
+            let teardown = thread::spawn(move || {
+                drop(core);
+                let _ = returned_tx.send(());
+            });
+
+            held.wait_until_cancelled();
+            // A safety claim rather than a liveness one, so no deadline can prove it and
+            // load only ever weakens it: teardown is inside its own join for as long as the
+            // fetch below has not returned.
+            assert!(
+                returned_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "teardown must still be waiting on the worker it cancelled, not have \
+                 detached it"
+            );
+
+            drop(held);
+            returned_rx
+                .recv_timeout(liveness::BACKSTOP)
+                .expect("teardown returns once the worker it joined has stopped");
+            teardown
+                .join()
+                .expect("the teardown thread should not panic");
+
+            assert_eq!(
+                started.fetch_cycles_taken_back.load(Ordering::Acquire),
+                1,
+                "teardown must have taken its own cycle back rather than left it running"
+            );
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before_tip,
+                "no worker may still be fast-forwarding a repository once teardown has \
+                 returned"
+            );
         }
 
         /// Points `repo`'s `origin` at a path nothing lives at, breaking `fetch_and_prune`
