@@ -80,6 +80,8 @@ It is dropped rather than left to become Vanished. [core-api.md](core-api.md) gi
 
 Only the rows the report names as removed leave. A refused row still has a working tree, and so may a failed one, so both stay listed with the receipt saying why.
 
+What a run removed and what it reports on are counted separately. One selected parent is one receipt, and that one row's own `delete` confirms as many removals as it made: the Repo's own working tree and each linked Worktree the cascade took with it. Every one of those rows leaves the table and the Selection on the frame the run completes, so no row is left pointing at a directory that is gone. A directory the run could not remove is never counted among them.
+
 A removed row's own receipt goes with it, since a receipt says what happened to a row a user can still look at. What that row got is still said twice: in the one-line Notice's counts and in the log line "Receipts" below reads its words from.
 
 ## The confirm gate

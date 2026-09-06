@@ -598,12 +598,19 @@ pub(crate) fn describe(outcome: &Outcome) -> String {
     own_work(outcome).said().to_string()
 }
 
-/// One row: which Entity, its name, what happened to it, and how long that took.
+/// One row: which Entity, its name, what happened to it, what its work confirmed gone, and
+/// how long that took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Record {
     pub(crate) key: EntityKey,
     pub(crate) name: Arc<str>,
     pub(crate) outcome: Outcome,
+    /// Every Entity whose working directory this row's own work confirmed gone: the row
+    /// itself for a `delete` that removed it, plus each linked Worktree the cascade took
+    /// with it. Separate from `outcome` because a confirmed removal is a fact about the
+    /// filesystem and an outcome is a verdict on the selected row, so one row may carry
+    /// several removals or, having failed after removing nothing, none.
+    pub(crate) removed: Vec<EntityKey>,
     /// What the act itself took. Real rather than nominal: `delete` walks a whole working
     /// tree, which is the one management operation that can visibly stall.
     pub(crate) elapsed: Duration,
@@ -633,23 +640,17 @@ impl Report {
             .collect()
     }
 
-    /// The rows whose working tree this run removed, for the caller to drop from the table
-    /// itself ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete`
-    /// leaves behind"). Repon caused these absences, so they never become Vanished, which
-    /// asks the user to acknowledge one it did not cause. A refused or failed row is not
-    /// here: its working tree is, or may still be, on disk.
+    /// Every Entity this run confirmed gone, for the caller to drop from the table itself
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind"). Repon caused these absences, so they never become Vanished, which asks the
+    /// user to acknowledge one it did not cause. Read off each row's own confirmed removals
+    /// rather than off its outcome, so a Repo's row brings the linked Worktrees its cascade
+    /// took with it and a row whose working tree is, or may still be, on disk brings
+    /// nothing.
     pub(crate) fn removed_keys(&self) -> Vec<EntityKey> {
         self.records
             .iter()
-            .filter(|record| {
-                matches!(
-                    record.outcome,
-                    Outcome::Deleted { .. }
-                        | Outcome::WorktreeRemoved { .. }
-                        | Outcome::DirectoryRemoved { .. }
-                )
-            })
-            .map(|record| record.key.clone())
+            .flat_map(|record| record.removed.iter().cloned())
             .collect()
     }
 
@@ -757,8 +758,8 @@ pub(crate) fn run_one_record(
     run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
 ) -> Record {
     let started = Instant::now();
-    let outcome = match target.eligibility {
-        Eligibility::Refused(refusal) => Outcome::Refused(refusal),
+    let (outcome, removed) = match target.eligibility {
+        Eligibility::Refused(refusal) => (Outcome::Refused(refusal), Vec::new()),
         Eligibility::Eligible => run_one(
             plan.operation,
             target,
@@ -770,12 +771,13 @@ pub(crate) fn run_one_record(
             &run_before_sync_hook,
             &run_after_sync_hook,
         )
-        .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
+        .unwrap_or_else(|err| (Outcome::Failed(format!("{err:#}")), Vec::new())),
     };
     Record {
         key: target.key.clone(),
         name: Arc::clone(&target.name),
         outcome,
+        removed,
         elapsed: started.elapsed(),
     }
 }
@@ -835,18 +837,18 @@ fn run_one(
     attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
     run_before_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
     run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
-) -> Result<Outcome> {
+) -> Result<(Outcome, Vec<EntityKey>)> {
     match operation {
         Operation::Ignore if target.excluded => {
             if repo_entry::write(config_file, target.key.path(), Edit::Unexclude)?.changed {
-                Ok(Outcome::Unignored)
+                Ok((Outcome::Unignored, Vec::new()))
             } else {
-                Ok(Outcome::ExcludedByAnInheritedEntry)
+                Ok((Outcome::ExcludedByAnInheritedEntry, Vec::new()))
             }
         }
         Operation::Ignore => {
             repo_entry::write(config_file, target.key.path(), Edit::Exclude)?;
-            Ok(Outcome::Ignored)
+            Ok((Outcome::Ignored, Vec::new()))
         }
         Operation::Delete => delete_one(
             target,
@@ -855,11 +857,14 @@ fn run_one(
             linked_worktree_paths,
             ignored_directories_for_deletion,
         ),
-        Operation::Sync => Ok(sync_one(
-            target,
-            attempt_sync,
-            run_before_sync_hook,
-            run_after_sync_hook,
+        Operation::Sync => Ok((
+            sync_one(
+                target,
+                attempt_sync,
+                run_before_sync_hook,
+                run_after_sync_hook,
+            ),
+            Vec::new(),
         )),
     }
 }
@@ -953,22 +958,31 @@ fn delete_one(
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
     ignored_directories_for_deletion: &impl Fn(&Path) -> Vec<PathBuf>,
-) -> Result<Outcome> {
+) -> Result<(Outcome, Vec<EntityKey>)> {
     match target.kind {
         Kind::Repo => {
+            let mut removed = Vec::new();
             for worktree in linked_worktree_paths(&target.key) {
                 delete_ignored_directories(ignored_directories_for_deletion(&worktree));
                 // Best effort: a sibling Worktree that will not remove is not this row's own
-                // outcome, and the Repo's own removal below is what the report names.
-                let _ = remove_working_tree(&worktree);
+                // outcome, and the Repo's own removal below is what the report names. Only
+                // the ones that did go are staged, so the report never claims a directory
+                // still on disk.
+                if remove_working_tree(&worktree).is_ok() {
+                    removed.push(EntityKey::new(Arc::from(worktree.as_path())));
+                }
             }
             delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
             remove_working_tree(target.key.path())?;
+            removed.push(target.key.clone());
             let config_entry_removed =
                 repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
-            Ok(Outcome::Deleted {
-                config_entry_removed,
-            })
+            Ok((
+                Outcome::Deleted {
+                    config_entry_removed,
+                },
+                removed,
+            ))
         }
         Kind::Worktree => {
             // Read before either removal runs: once the working tree is gone, its own
@@ -987,7 +1001,7 @@ fn delete_one(
             }
             let config_entry_removed =
                 repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
-            Ok(if admin_dir.is_some() {
+            let outcome = if admin_dir.is_some() {
                 Outcome::WorktreeRemoved {
                     config_entry_removed,
                 }
@@ -995,7 +1009,8 @@ fn delete_one(
                 Outcome::DirectoryRemoved {
                     config_entry_removed,
                 }
-            })
+            };
+            Ok((outcome, vec![target.key.clone()]))
         }
         Kind::Submodule => {
             unreachable!("a Submodule is always refused before `delete` reaches a row")

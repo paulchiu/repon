@@ -7097,7 +7097,11 @@ mod tests {
 
     /// Criterion "one removal, reported once": a Worktree selected alongside the parent Repo
     /// it is linked from is not named as its own row in the gate or the report, since the
-    /// Repo's own `delete` already takes it with it.
+    /// Repo's own `delete` already takes it with it. Both directories go, so both rows leave
+    /// the table and the Selection the moment the run completes, while the gate and the
+    /// completion still count the one selected parent
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
     #[test]
     fn deleting_a_worktree_and_its_parent_repo_together_is_one_removal_reported_once() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7130,6 +7134,20 @@ mod tests {
         assert!(
             !worktree.exists(),
             "the Repo's own delete must take its linked Worktree with it"
+        );
+        assert_eq!(
+            visible_names_sorted(&app),
+            Vec::<String>::new(),
+            "both removed rows leave the rendered list, with no refresh"
+        );
+        assert!(
+            app.selection.is_empty(),
+            "and neither is left in the Selection pointing at a directory that is gone"
+        );
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            frame.contains("delete: 1 done"),
+            "the completion still counts the one selected parent, got:\n{frame}"
         );
     }
 
