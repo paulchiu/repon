@@ -90,6 +90,8 @@ Every other cleanup a `delete` runs behind a removal reads the same way. What di
 
 What a run removed and what it reports on are counted separately. One selected parent is one receipt, and that one row's own `delete` confirms as many removals as it made: the Repo's own working tree and each linked Worktree the cascade took with it. Every one of those rows leaves the table and the Selection on the frame the run completes, so no row is left pointing at a directory that is gone. A directory the run could not remove is never counted among them.
 
+That holds when the receipt itself is a failure. A Repo whose own working tree would not remove after its cascade had already taken a linked Worktree still reports what went: the row that failed stays listed, since its directory is still there, and the rows over the directories that are gone leave with the run.
+
 A removed row's own receipt goes with it, since a receipt says what happened to a row a user can still look at. What that row got is still said twice: in the one-line Notice's counts and in the log line "Receipts" below reads its words from.
 
 ## The confirm gate

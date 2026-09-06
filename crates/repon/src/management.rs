@@ -481,9 +481,9 @@ pub(crate) enum Outcome {
     Removed {
         removal: Removal,
         config: ConfigCleanup,
-        /// What would not finish behind the removal, in the order it was attempted: a
-        /// linked Worktree the cascade could not take, or an administrative entry that
-        /// would not clear. Empty on a removal that left nothing.
+        /// What would not finish behind the removal: a linked Worktree the cascade could
+        /// not take, or an administrative entry that would not clear. Empty on a removal
+        /// that left nothing.
         problems: Vec<String>,
     },
     /// `sync` fast-forwarded the Repo's branch to its upstream.
@@ -610,7 +610,7 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
 /// it, then whatever would not finish behind it. Anything that failed is named after the
 /// removal rather than instead of it.
 fn removed_words(removal: Removal, config: &ConfigCleanup, problems: &[String]) -> String {
-    let mut said = match config {
+    let said = match config {
         ConfigCleanup::EntryRemoved => format!("{}, `[[repo]]` entry removed", removal.said()),
         ConfigCleanup::NoEntryOfItsOwn => {
             format!("{}, no `[[repo]]` entry of its own", removal.said())
@@ -620,6 +620,12 @@ fn removed_words(removal: Removal, config: &ConfigCleanup, problems: &[String]) 
             removal.said()
         ),
     };
+    with_problems(said, problems)
+}
+
+/// `said` with each thing that would not finish named after it, the one place a receipt
+/// appends them so a removal and a failure read the same way.
+fn with_problems(mut said: String, problems: &[String]) -> String {
     for problem in problems {
         said.push_str("; ");
         said.push_str(problem);
@@ -644,8 +650,9 @@ pub(crate) struct Record {
     /// Every Entity whose working directory this row's own work confirmed gone: the row
     /// itself for a `delete` that removed it, plus each linked Worktree the cascade took
     /// with it. Separate from `outcome` because a confirmed removal is a fact about the
-    /// filesystem and an outcome is a verdict on the selected row, so one row may carry
-    /// several removals or, having failed after removing nothing, none.
+    /// filesystem and an outcome is a verdict on the selected row, so a row that failed
+    /// still carries whatever its cascade had already taken, and a row that removed
+    /// nothing carries none.
     pub(crate) removed: Vec<EntityKey>,
     /// What the act itself took. Real rather than nominal: `delete` walks a whole working
     /// tree, which is the one management operation that can visibly stall.
@@ -1010,7 +1017,15 @@ fn delete_one(
                 }
             }
             delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
-            remove_working_tree(target.key.path())?;
+            if let Err(err) = remove_working_tree(target.key.path()) {
+                // What the cascade already took is a fact whatever becomes of the Repo's
+                // own tree, so it is reported rather than thrown away with the error: a
+                // directory that is gone must not be left with a row pointing at it.
+                return Ok((
+                    Outcome::Failed(with_problems(format!("{err:#}"), &problems)),
+                    removed,
+                ));
+            }
             removed.push(target.key.clone());
             let config = clean_up_config(config_file, target.key.path());
             Ok((
@@ -1541,6 +1556,56 @@ mod tests {
         assert_eq!(
             report.records[0].outcome,
             removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
+        );
+    }
+
+    /// A Repo whose own working tree would not remove after its cascade already took a
+    /// linked Worktree: what went is still reported, so the rows over those directories
+    /// leave the table rather than being left to become Vanished
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_repo_whose_own_removal_fails_still_reports_what_its_cascade_took() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temp dir");
+        let config_file = root.join("config.toml");
+        // No `.git` in it, so `remove_working_tree`'s own guard refuses the Repo once the
+        // cascade has already run.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create the repo fixture");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(sibling.join(".git")).expect("create the linked Worktree");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+        let siblings = [sibling.clone()];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| siblings.to_vec(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!sibling.exists(), "the cascade's own removal is a fact");
+        assert!(
+            repo.exists(),
+            "and the Repo's own working tree is still on disk"
+        );
+        assert!(
+            matches!(report.records[0].outcome, Outcome::Failed(_)),
+            "the selected row itself failed, got {:?}",
+            report.records[0].outcome
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![EntityKey::new(Arc::from(sibling.as_path()))],
+            "and the directory that did go is still what the run dismisses"
         );
     }
 
