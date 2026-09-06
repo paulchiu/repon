@@ -1052,8 +1052,11 @@ fn delete_one(
             // file now dangles, which `git worktree repair` cannot fix.
             remove_working_tree(target.key.path())?;
             let mut problems = Vec::new();
+            // An entry the parent Repo has already pruned is nothing to clear, so only an
+            // entry that is there and refuses is named.
             if let Some(admin_dir) = &admin_dir
                 && let Err(err) = fs::remove_dir_all(admin_dir)
+                && err.kind() != std::io::ErrorKind::NotFound
             {
                 problems.push(format!(
                     "its administrative entry under its parent Repo would not clear: {err}"
@@ -1431,9 +1434,10 @@ mod tests {
         let config_file = dir.path().join("config.toml");
         let tree = dir.path().join("tree");
         std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
-        // Named but never created, so `remove_dir_all` refuses it every time rather than
-        // racing a permission bit.
-        let admin_dir = dir.path().join("admin-that-was-never-there");
+        // A file where the entry should be, so `remove_dir_all` refuses it every time
+        // rather than racing a permission bit.
+        let admin_dir = dir.path().join("admin-that-is-a-file");
+        std::fs::write(&admin_dir, "not a directory").expect("create the admin fixture");
         let entities = vec![entity(&tree, "tree", Kind::Worktree)];
 
         let report = run(
@@ -1448,10 +1452,15 @@ mod tests {
         );
 
         assert!(!tree.exists(), "the Worktree's own directory is still gone");
-        assert_ne!(
-            report.records[0].outcome,
-            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
-            "a removal whose administrative entry would not clear must not read as a clean one"
+        assert!(
+            matches!(
+                &report.records[0].outcome,
+                Outcome::Removed { removal, problems, .. }
+                    if *removal == Removal::Worktree && problems.len() == 1
+            ),
+            "a removal whose administrative entry would not clear carries what it left, got \
+             {:?}",
+            report.records[0].outcome
         );
         let said = describe(&report.records[0].outcome);
         assert!(
@@ -1462,6 +1471,45 @@ mod tests {
             report.removed_keys(),
             vec![entities[0].key.clone()],
             "the directory went, so the row still leaves the table"
+        );
+    }
+
+    /// An administrative entry that is already gone is nothing to clear rather than a
+    /// cleanup that failed: the removal reads clean, and the completion does not count a
+    /// row against work no one has left to do
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_worktree_whose_admin_entry_was_already_pruned_reads_as_a_clean_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        // What a dangling `.git` file names: an entry the parent Repo has already pruned.
+        let admin_dir = dir.path().join("admin-that-was-never-there");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is gone");
+        assert_eq!(
+            report.records[0].outcome,
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
+            "nothing was left behind, so nothing is named"
+        );
+        assert_eq!(
+            report.summary(),
+            "delete: 1 done",
+            "and the completion counts one plain removal"
         );
     }
 
