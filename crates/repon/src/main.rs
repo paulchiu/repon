@@ -385,8 +385,12 @@ mod tests {
 
     /// A wall clock read, as it reads in source. One half of a deadline: the other is the
     /// comparison that turns a reading into a decision, which is why this line can spell
-    /// both reads out without being a match for the scan it feeds.
-    const WALL_CLOCK_READS: [&str; 2] = [".elapsed()", "Instant::now()"];
+    /// all three reads out without being a match for the scan it feeds.
+    ///
+    /// `duration_since(` is spelled without its leading dot so that the saturating form
+    /// counts too: both take the elapsed time between two instants, one of which came off
+    /// the clock, which is the same half of a deadline `.elapsed()` is.
+    const WALL_CLOCK_READS: [&str; 3] = [".elapsed()", "Instant::now()", "duration_since("];
 
     /// Every ordering comparison Rust spells.
     ///
@@ -462,13 +466,8 @@ mod tests {
     /// scan quietly stops checking.
     fn non_wait_deadlines() -> Vec<NonWaitDeadline> {
         let elapsed_ge = format!("{}{}", WALL_CLOCK_READS[0], " >=");
+        let duration_since = WALL_CLOCK_READS[2];
         vec![
-            (
-                format!("if set_at{elapsed_ge} self.document.notice_timeout {{"),
-                "repon/src/app.rs",
-                "notice",
-                "production: a Notice expiring on screen",
-            ),
             (
                 format!("&& at{elapsed_ge} threshold"),
                 "repon-core/src/cell.rs",
@@ -480,6 +479,21 @@ mod tests {
                 "repon-core/src/discovery.rs",
                 "walk",
                 "production: discovery abandoning a walk that will not finish",
+            ),
+            (
+                format!(
+                    "if !timeout.is_zero() && now.saturating_{duration_since}self.raised_at) \
+                     >= timeout {{"
+                ),
+                "repon/src/notice.rs",
+                "visible_at",
+                "production: a Notice expiring on screen",
+            ),
+            (
+                format!("if now.{duration_since}started) >= deadline {{"),
+                "repon-core/src/core.rs",
+                "sweep_deadline",
+                "production: a Generation's in-flight cells timing out",
             ),
             (
                 format!("assert!(past{elapsed_ge} Duration::from_secs(90));"),
