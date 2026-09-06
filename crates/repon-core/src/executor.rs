@@ -45,16 +45,6 @@ const PTY_WIDTH: u16 = 120;
 /// SIGKILL is not (`docs/spec/actions.md`'s "Cancellation and quit").
 const CANCEL_GRACE: Duration = Duration::from_millis(350);
 
-/// One of the OS resource-creation calls a step makes before its child exists, named so a
-/// test can arm a failure at exactly one of them through [`RunControl::fail_next_setup_at`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SetupBoundary {
-    /// The pipe that tells the drain loop the child has exited.
-    NotifyPipe,
-    /// The pty master's own non-blocking flag.
-    Nonblocking,
-}
-
 /// One Action run's own reach into its steps' children, from outside the call stack that
 /// runs them: which process groups are currently live, so [`Self::hold`],
 /// [`Self::continue_run`] and [`Self::cancel`] know who to signal, and whether the run has
@@ -76,12 +66,6 @@ pub(crate) enum SetupBoundary {
 pub(crate) struct RunControl {
     cancelled: AtomicBool,
     live_groups: Mutex<HashSet<libc::pid_t>>,
-    /// The one injected setup failure this run still owes a step, armed by
-    /// [`Self::fail_next_setup_at`] and consumed by [`Self::take_injected`]. Held per run
-    /// rather than in a static, so a step in another run happening at the same moment
-    /// prepares its own resources normally.
-    #[cfg(feature = "test-util")]
-    setup_fault: Mutex<Option<SetupBoundary>>,
 }
 
 impl RunControl {
@@ -89,40 +73,7 @@ impl RunControl {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             live_groups: Mutex::new(HashSet::new()),
-            #[cfg(feature = "test-util")]
-            setup_fault: Mutex::new(None),
         })
-    }
-
-    /// Arms one failure at `boundary` for the next step this run prepares, so a test can
-    /// reach a resource-creation error no fixture can provoke on demand. One-shot: the
-    /// step that hits it clears it, and every later step of this run, like every step of
-    /// any other run, prepares normally.
-    // Reached only from this module's own tests: the feature also builds for a consumer's
-    // test targets, where nothing can call a `pub(crate)` item at all.
-    #[cfg(feature = "test-util")]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn fail_next_setup_at(&self, boundary: SetupBoundary) {
-        *self.setup_fault.lock().unwrap() = Some(boundary);
-    }
-
-    /// The error [`prepare_step_resources`] must report at `boundary`, consuming the arming.
-    /// Always `None` without `test-util`, which is what keeps injection out of a published
-    /// build entirely.
-    #[cfg(feature = "test-util")]
-    fn take_injected(&self, boundary: SetupBoundary) -> Option<io::Error> {
-        let mut armed = self.setup_fault.lock().unwrap();
-        if *armed != Some(boundary) {
-            return None;
-        }
-        *armed = None;
-        Some(io::Error::from_raw_os_error(libc::EBADF))
-    }
-
-    /// See the `test-util` counterpart: production never injects anything.
-    #[cfg(not(feature = "test-util"))]
-    fn take_injected(&self, _boundary: SetupBoundary) -> Option<io::Error> {
-        None
     }
 
     /// Whether [`Self::cancel`] has been called: checked by the fan-out's own per-entity
@@ -250,11 +201,15 @@ pub(crate) fn run_step(
     let label: Arc<str> = Arc::from(argv.join(" "));
     let start = Instant::now();
 
+    let prepared = match injected_setup_failure(env) {
+        Some(injected) => Err(injected),
+        None => prepare_step_resources(PTY_WIDTH),
+    };
     let StepResources {
         slave,
         slave_dup,
         drain,
-    } = match prepare_step_resources(PTY_WIDTH, control) {
+    } = match prepared {
         Ok(resources) => resources,
         Err(failure) => {
             return step_failure(
@@ -380,24 +335,24 @@ impl SetupFailure {
     }
 }
 
+/// The four resources [`prepare_step_resources`] creates, in the words a receipt reports
+/// them by. Named once so a `test-util` build's [`injected_setup_failure`] fails a step
+/// with the same words the real call would.
+const NON_BLOCKING_FLAG: &str = "the pty master's own non-blocking flag";
+const STDERR_DESCRIPTOR: &str = "the child's own stderr descriptor";
+const KEEPALIVE_DESCRIPTOR: &str = "the drain's keepalive descriptor";
+const NOTIFY_PIPE: &str = "the pipe that notices this step's own exit";
+
 /// Creates every resource one step needs, before its child is spawned; [`StepResources`]
 /// carries why they are all made here rather than as the run reaches each one.
-fn prepare_step_resources(
-    width: u16,
-    control: &Arc<RunControl>,
-) -> Result<StepResources, SetupFailure> {
+fn prepare_step_resources(width: u16) -> Result<StepResources, SetupFailure> {
     let named = |what: &'static str| move |error| SetupFailure::Resource { what, error };
 
     let (master, slave) = open_pty(width).map_err(SetupFailure::Pty)?;
-    injected_or(control, SetupBoundary::Nonblocking, || {
-        set_nonblocking(master.as_raw_fd())
-    })
-    .map_err(named("the pty master's own non-blocking flag"))?;
-    let slave_dup =
-        duplicate_cloexec(&slave).map_err(named("the child's own stderr descriptor"))?;
-    let keepalive = duplicate_cloexec(&slave).map_err(named("the drain's keepalive descriptor"))?;
-    let (notify_read, notify_write) = injected_or(control, SetupBoundary::NotifyPipe, self_pipe)
-        .map_err(named("the pipe that notices this step's own exit"))?;
+    set_nonblocking(master.as_raw_fd()).map_err(named(NON_BLOCKING_FLAG))?;
+    let slave_dup = duplicate_cloexec(&slave).map_err(named(STDERR_DESCRIPTOR))?;
+    let keepalive = duplicate_cloexec(&slave).map_err(named(KEEPALIVE_DESCRIPTOR))?;
+    let (notify_read, notify_write) = self_pipe().map_err(named(NOTIFY_PIPE))?;
 
     Ok(StepResources {
         slave,
@@ -411,18 +366,45 @@ fn prepare_step_resources(
     })
 }
 
-/// `create`'s own result, unless this run has a failure armed at `boundary`, which is a
-/// test's one way to reach an error the OS will not produce on request. Never armed
-/// without `test-util` (see [`RunControl::take_injected`]).
-fn injected_or<T>(
-    control: &Arc<RunControl>,
-    boundary: SetupBoundary,
-    create: impl FnOnce() -> io::Result<T>,
-) -> io::Result<T> {
-    match control.take_injected(boundary) {
-        Some(error) => Err(error),
-        None => create(),
-    }
+/// The environment name a `test-util` build reads an injected setup failure from, its
+/// value naming which of the four resources above to fail at. A step carries it in its
+/// own `env` table, so a test reaches a resource error the OS will not produce on request
+/// at exactly one step of one entity, leaving every other step of the same run alone.
+// Read from this module's own tests and `core`'s; the feature also builds for a
+// consumer's test targets, where nothing can name a `pub(crate)` item at all.
+#[cfg(feature = "test-util")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SETUP_FAILURE_VARIABLE: &str = "REPON_TEST_SETUP_FAILURE";
+
+/// The failure `env` asks this step to report instead of preparing its own resources.
+/// Always `None` without `test-util`, which is what keeps injection out of a published
+/// build entirely.
+#[cfg(feature = "test-util")]
+fn injected_setup_failure(env: &[(String, Option<String>)]) -> Option<SetupFailure> {
+    let asked = env.iter().find_map(|(name, value)| {
+        (name == SETUP_FAILURE_VARIABLE)
+            .then_some(value.as_deref())
+            .flatten()
+    })?;
+    let what = match asked {
+        "nonblocking" => NON_BLOCKING_FLAG,
+        "stderr" => STDERR_DESCRIPTOR,
+        "keepalive" => KEEPALIVE_DESCRIPTOR,
+        "notify-pipe" => NOTIFY_PIPE,
+        // Louder than injecting nothing, which would leave a test passing against a step
+        // that simply ran.
+        other => panic!("{SETUP_FAILURE_VARIABLE} names no resource a step prepares: {other:?}"),
+    };
+    Some(SetupFailure::Resource {
+        what,
+        error: io::Error::from_raw_os_error(libc::EBADF),
+    })
+}
+
+/// See the `test-util` counterpart: production never injects anything.
+#[cfg(not(feature = "test-util"))]
+fn injected_setup_failure(_env: &[(String, Option<String>)]) -> Option<SetupFailure> {
+    None
 }
 
 /// Attempts `open_pty` allows itself before giving up on the ENXIO race documented on
@@ -1125,8 +1107,7 @@ mod tests {
     /// `run_step`'s own resource setup, for the tests that replicate the rest of its
     /// sequence by hand rather than going through it.
     fn prepared() -> StepResources {
-        prepare_step_resources(PTY_WIDTH, &RunControl::new())
-            .expect("prepare a step's own resources")
+        prepare_step_resources(PTY_WIDTH).expect("prepare a step's own resources")
     }
 
     /// Waits for `master` to have something, then appends it: the master is non-blocking
@@ -1777,86 +1758,47 @@ mod tests {
         assert_eq!(&raw, b"hello\r\n");
     }
 
-    /// A step whose exit-notification pipe cannot be opened must come back as a failed
-    /// receipt naming what went wrong, rather than reaching a read that never returns
-    /// while the pty's slave side is still held open. Run off this thread and collected
-    /// through the liveness backstop, so a step that blocks fails this test instead of
-    /// wedging the suite. The fault is armed once on this run's own `RunControl`, so the
-    /// second call proves nothing lingers: a later Action, which gets a control of its
-    /// own, is further from the fault still.
+    /// A step whose own resources cannot be prepared comes back as a failed receipt that
+    /// names the resource and carries its errno, and the next step with nothing injected
+    /// still runs: the fault is the step's own data, so it neither lingers nor reaches a
+    /// child. One case per resource [`prepare_step_resources`] creates. Both calls run off
+    /// this thread and are collected through the liveness backstop, so a step that never
+    /// returns fails this test instead of wedging the suite.
     #[test]
-    fn a_notification_pipe_that_cannot_be_opened_fails_the_step_rather_than_blocking() {
-        let dir = tempdir();
-        let control = RunControl::new();
-        control.fail_next_setup_at(SetupBoundary::NotifyPipe);
+    fn a_step_whose_own_resources_cannot_be_prepared_comes_back_as_a_failed_receipt() {
+        for (injected, named) in [
+            ("nonblocking", "non-blocking flag"),
+            ("stderr", "stderr descriptor"),
+            ("keepalive", "keepalive descriptor"),
+            ("notify-pipe", "pipe that notices"),
+        ] {
+            let dir = tempdir();
+            let cwd = dir.path().to_path_buf();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let argv = vec!["echo".to_string(), "hello".to_string()];
+                let env = vec![(
+                    SETUP_FAILURE_VARIABLE.to_string(),
+                    Some(injected.to_string()),
+                )];
+                let control = RunControl::new();
+                let failed = run_step(&argv, false, false, &cwd, &env, &control);
+                let recovered = run_step(&argv, false, false, &cwd, &[], &control);
+                let _ = tx.send((failed, recovered));
+            });
+            let (failed, recovered) = rx.recv_timeout(BACKSTOP).unwrap_or_else(|_| {
+                panic!("a step that cannot prepare {injected} must still hand back a receipt")
+            });
 
-        let (tx, rx) = mpsc::channel();
-        let faulted = Arc::clone(&control);
-        let cwd = dir.path().to_path_buf();
-        thread::spawn(move || {
-            let argv = vec!["echo".to_string(), "hello".to_string()];
-            let _ = tx.send(run_step(&argv, false, false, &cwd, &[], &faulted));
-        });
-        let failed = rx
-            .recv_timeout(BACKSTOP)
-            .expect("a step whose notification pipe fails must still hand back a receipt");
-
-        assert!(
-            failed.outcome.is_failure(),
-            "expected a failed receipt, got {:?}",
-            failed.outcome
-        );
-        let detail = String::from_utf8_lossy(&failed.output).to_string();
-        assert!(
-            detail.contains("pipe"),
-            "expected the receipt to name the resource that failed, got {detail:?}"
-        );
-
-        let recovered = run_step(
-            &["echo".to_string(), "hello".to_string()],
-            false,
-            false,
-            dir.path(),
-            &[],
-            &control,
-        );
-
-        assert_eq!(recovered.outcome, StepOutcome::Ok);
-        assert_eq!(&*recovered.output, b"hello\n");
-    }
-
-    /// The same claim at the other boundary a step's own setup crosses: the pty master's
-    /// non-blocking flag, without which the drain's last, stopping read waits on a slave
-    /// side the keepalive is still deliberately holding open. Collected off this thread
-    /// through the liveness backstop, so a step that blocks fails this test rather than
-    /// wedging the suite.
-    #[test]
-    fn a_master_that_cannot_be_made_non_blocking_fails_the_step_rather_than_blocking() {
-        let dir = tempdir();
-        let control = RunControl::new();
-        control.fail_next_setup_at(SetupBoundary::Nonblocking);
-
-        let (tx, rx) = mpsc::channel();
-        let faulted = Arc::clone(&control);
-        let cwd = dir.path().to_path_buf();
-        thread::spawn(move || {
-            let argv = vec!["echo".to_string(), "hello".to_string()];
-            let _ = tx.send(run_step(&argv, false, false, &cwd, &[], &faulted));
-        });
-        let failed = rx.recv_timeout(BACKSTOP).expect(
-            "a step whose master cannot be made non-blocking must still hand back a receipt",
-        );
-
-        assert!(
-            failed.outcome.is_failure(),
-            "expected a failed receipt, got {:?}",
-            failed.outcome
-        );
-        let detail = String::from_utf8_lossy(&failed.output).to_string();
-        assert!(
-            detail.contains("non-blocking"),
-            "expected the receipt to name the resource that failed, got {detail:?}"
-        );
+            assert_eq!(failed.outcome, StepOutcome::Failed(libc::EBADF));
+            let detail = String::from_utf8_lossy(&failed.output).to_string();
+            assert!(
+                detail.contains(named),
+                "expected the receipt to name {named}, got {detail:?}"
+            );
+            assert_eq!(recovered.outcome, StepOutcome::Ok);
+            assert_eq!(&*recovered.output, b"hello\n");
+        }
     }
 
     /// A child that writes more than the pty's own kernel buffer holds must not lose the
