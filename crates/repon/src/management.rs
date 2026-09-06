@@ -35,6 +35,7 @@ use color_eyre::eyre::{Result, eyre};
 use repon_core::{AutoUpdateAttempt, DeleteRisk, EntityKey, EntityState, Kind, OwnWork};
 
 use crate::config::repo_entry::{self, Edit};
+use crate::selection::{RunScope, Targets};
 
 /// One of the three built-in entries in the Action palette, in the order
 /// [repo-management.md](../../../docs/spec/repo-management.md)'s own operations table lists
@@ -202,6 +203,9 @@ pub(crate) struct Target {
 pub(crate) struct Plan {
     pub(crate) operation: Operation,
     pub(crate) targets: Vec<Target>,
+    /// Which rows [`Plan::new`] was handed, carried through so the gate's headline names the
+    /// same scope the palette's border title above it does.
+    pub(crate) scope: RunScope,
 }
 
 impl Plan {
@@ -213,12 +217,9 @@ impl Plan {
     /// Cheap: it reads the snapshot and nothing else, so the palette's border count can be
     /// rebuilt every frame. [`Plan::with_risk`] is the expensive half, run once when the gate
     /// opens.
-    pub(crate) fn new(
-        operation: Operation,
-        entities: &[EntityState],
-        targets: &[EntityKey],
-    ) -> Self {
+    pub(crate) fn new(operation: Operation, entities: &[EntityState], targets: Targets) -> Self {
         let mut plan_targets: Vec<Target> = targets
+            .keys
             .iter()
             .filter_map(|key| entities.iter().find(|entity| &entity.key == key))
             .map(|entity| Target {
@@ -237,6 +238,7 @@ impl Plan {
         Plan {
             operation,
             targets: plan_targets,
+            scope: targets.scope,
         }
     }
 
@@ -284,6 +286,7 @@ impl Plan {
     pub(crate) fn confirm_lines(&self) -> Vec<String> {
         let mut lines = vec![headline(
             self.operation,
+            self.scope,
             self.eligible_count(),
             self.refused_count(),
         )];
@@ -323,9 +326,13 @@ pub(crate) const NO_UNDO: &str = "there is no undo and no trash";
 /// the gate itself before any of the operation's blocking work starts: [`Report::summary`]
 /// replaces it once that work finishes. Named after `eligible_count`, the same row count the
 /// gate's own [`headline`] showed, since the gate and the run must agree on how many rows this
-/// is about.
-pub(crate) fn running_notice(operation: Operation, eligible: usize) -> String {
-    format!("{}: running on {eligible} repos", operation.name())
+/// is about, and on which rows they were.
+pub(crate) fn running_notice(operation: Operation, scope: RunScope, eligible: usize) -> String {
+    format!(
+        "{}: running on {eligible} {}",
+        operation.name(),
+        scope.word()
+    )
 }
 
 /// The Notice `App::run_management` paints before each row's own work starts, replacing
@@ -343,12 +350,14 @@ pub(crate) fn row_notice(
     format!("{}: {name} ({position}/{total})", operation.name())
 }
 
-fn headline(operation: Operation, eligible: usize, refused: usize) -> String {
+fn headline(operation: Operation, scope: RunScope, eligible: usize, refused: usize) -> String {
     let name = operation.name();
+    let scope = scope.word();
     if refused == 0 {
-        format!("{name} on {eligible} repos?")
+        format!("{name} on {eligible} {scope}?")
     } else {
-        format!("{name} on {eligible} repos, {refused} refused?")
+        let total = eligible + refused;
+        format!("{name} on {eligible} of {total} {scope}, {refused} refused?")
     }
 }
 
@@ -1049,12 +1058,17 @@ mod tests {
         entity
     }
 
-    fn keys(entities: &[EntityState]) -> Vec<EntityKey> {
-        entities.iter().map(|entity| entity.key.clone()).collect()
+    /// Every entity as a checked Selection, which is what a plan built over all of them
+    /// means in these tests.
+    fn checked(entities: &[EntityState]) -> Targets {
+        Targets {
+            keys: entities.iter().map(|entity| entity.key.clone()).collect(),
+            scope: RunScope::CheckedRows,
+        }
     }
 
     fn plan(operation: Operation, entities: &[EntityState]) -> Plan {
-        Plan::new(operation, entities, &keys(entities))
+        Plan::new(operation, entities, checked(entities))
     }
 
     /// A Worktree sharing `parent`'s own path as its `common_dir`, the fixture's stand-in
@@ -1165,7 +1179,7 @@ mod tests {
         let tree = worktree_of(&repo, Path::new("/tmp/x/tree"), "tree");
 
         let entities = [tree];
-        let plan = Plan::new(Operation::Delete, &entities, &keys(&entities));
+        let plan = Plan::new(Operation::Delete, &entities, checked(&entities));
 
         assert_eq!(
             plan.eligible_count(),
@@ -1662,7 +1676,7 @@ mod tests {
         let tree = worktree_of(&repo, Path::new("/tmp/x/tree"), "tree");
         let entities = vec![tree.clone()];
 
-        let plan = Plan::new(Operation::Delete, &entities, &keys(&entities));
+        let plan = Plan::new(Operation::Delete, &entities, checked(&entities));
 
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].name.as_ref(), "tree");
@@ -1817,7 +1831,7 @@ mod tests {
         let ignoring = plan(Operation::Ignore, &entities).confirm_lines();
         assert_eq!(
             ignoring,
-            vec!["ignore on 1 repos?".to_string(), "repo".to_string()],
+            vec!["ignore on 1 selected?".to_string(), "repo".to_string()],
             "neither destroys anything, so neither gets an additional line"
         );
     }

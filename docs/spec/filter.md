@@ -88,7 +88,7 @@ The cost, stated plainly: while a Filter is active a child row whose own Repo di
 
 A Filter never reorders. There is no ranking and no fuzzy matching: rows keep discovery order, minus the ones that did not match. Fuzzy was refused because a list that cannot reorder cannot show why a row matched, and because it makes the header's match count untrustworthy while [actions.md](actions.md) puts that count on screen under a contract.
 
-A Filter never mutates the Selection ([GLOSSARY.md](../../GLOSSARY.md)), so a selected row hidden by a Filter is still acted on. Where that makes the confirm gate's count unverifiable against the screen, the gate names the difference: `run "reinstall" on 12 repos? (3 not visible)`, and the parenthetical is absent when nothing is hidden. This is [config.md](config.md)'s `worktrees: 161 (preference off)` pattern: where an explicit gesture produces a count that disagrees with what is on screen, the disagreement is named rather than hidden.
+A Filter never mutates the Selection ([GLOSSARY.md](../../GLOSSARY.md)), so a selected row hidden by a Filter is still acted on. Where that makes the confirm gate's count unverifiable against the screen, the gate names the difference: `run "reinstall" on 12 selected? (3 not visible)`, and the parenthetical is absent when nothing is hidden. This is [config.md](config.md)'s `worktrees: 161 (preference off)` pattern: where an explicit gesture produces a count that disagrees with what is on screen, the disagreement is named rather than hidden.
 
 ## The input line
 

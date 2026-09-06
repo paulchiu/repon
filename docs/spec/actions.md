@@ -88,9 +88,11 @@ The default of 4 is separately confirmed as the plateau: the same git Action ove
 
 An Action acts on the Selection, or on every visible row when the Selection is empty, as [keybindings.md](keybindings.md) fixes. A management operation is the exception and acts on the cursor row when nothing is checked, so the empty case is resolved once for an Action and separately for the built-ins rather than through one shared seam.
 
+Which of those resolutions produced the rows is named on screen beside the count, because the number alone cannot say it. The trailing word is `selected` for the Selection, `visible` for every visible row and `at the cursor` for the cursor-row fallback, so the border title reads `run on 2 selected`, `run on 3 visible` or `run on 1 at the cursor`, and the confirm gate repeats the same word (`delete on 1 at the cursor?`). A count with no word after it reads identically whether the two are the rows the user checked or the whole table, and over a table no longer than the Selection there is nothing on screen to tell those apart. The word separates them. It is kind-neutral too, where `repos` was wrong over a Worktree, and a count of one no longer reads `1 repos`.
+
 `sync` is the exception to that exception. An empty Selection widens it to every visible row too, the identical resolution a declared Action already uses, so filtering to `sync:behind` and running the built-in `sync` reaches the filtered set rather than fast-forwarding the cursor row alone. `ignore` and `delete` keep the cursor-row fallback unchanged: `delete` permanently removes working trees, and the fallback is exactly what stops an empty Selection from reaching every visible one; `ignore` was simply never asked for and widening it is a larger blast radius than this decision covers. [repo-management.md](repo-management.md)'s own operations table and [`Operation::widens_to_every_visible_row_when_selection_is_empty`] in `crates/repon/src/management.rs` are where the one-operation carve-out lives; both the border title and the confirm gate read it, so neither can name a number the run itself would not act on.
 
-The confirm gate counts the entities that will actually be operated on. A `[[repo]]` entry with `exclude = true` is never operated on, and while [keybindings.md](keybindings.md#the-ignored-toggle)'s `i` is showing such a row it is still selectable with Space, swept in by `a`, and can be the cursor row, so excluded rows are subtracted from the count before it renders: `run "reinstall" on 12 repos?` reads the truth. [theming.md](theming.md) puts the same count in the Action palette's border title before anything is typed, so a wrong count would lie twice. A count of zero does not run and says so, rather than fanning out over nothing.
+The confirm gate counts the entities that will actually be operated on. A `[[repo]]` entry with `exclude = true` is never operated on, and while [keybindings.md](keybindings.md#the-ignored-toggle)'s `i` is showing such a row it is still selectable with Space, swept in by `a`, and can be the cursor row, so excluded rows are subtracted from the count before it renders: `run "reinstall" on 12 selected?` reads the truth. [theming.md](theming.md) puts the same count in the Action palette's border title before anything is typed, so a wrong count would lie twice. A count of zero does not run and says so, rather than fanning out over nothing.
 
 After a run, an excluded row that was in the Selection shows Not applicable. This is the one legitimate producer of a not-applicable Action outcome, and it is where the word the earlier specs wanted for "skipped" actually belongs: nothing failed and nothing was blocked, the row is simply never operated on. A row `when` skips is a different fact again, once the rest of this section reverses what `when` used to mean, and earns its own words rather than reusing this one: see below.
 
@@ -108,9 +110,11 @@ The border title is where that count lands, in three readings. The `12` is the s
 
 | what the palette has in hand | the border title reads |
 | --- | --- |
-| nothing chosen yet, or an entry declaring no `when` | `run on 12 repos` |
+| nothing chosen yet, or an entry declaring no `when` | `run on 12 selected` |
 | `reinstall`, whose `when` settles on every one of the 12 | `run "reinstall" on 8 of 12 selected` |
 | `reinstall`, with three of the 12 not settled yet | `run "reinstall" on 8 of 12 selected, 3 unresolved` |
+
+Every reading ends in the scope word above, so the same three appear with `visible` or `at the cursor` in place of `selected` as the Selection resolves the other two ways.
 
 [theming.md](theming.md) owns that border's colour and quotes the first reading, which is the one it was written against; the three readings themselves are this document's.
 

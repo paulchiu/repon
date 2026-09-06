@@ -46,7 +46,7 @@ One key's own text and the fixed values it accepts, closed the same way the Filt
 A Filter that has been applied with Enter and is narrowing the list while the cursor is back on it. Distinct from the text still being typed into the Filter line, which narrows live but is abandoned by Esc. Only a committed Filter persists, and only a committed Filter is what Esc clears at the last rung of its unwind. Not an active or saved Filter, since a Set is the saved one.
 
 **Selection**:
-The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject.
+The Repos an operation will act on, resolved before anything acts on them. Never empty at the point of acting, so an operation always has a subject. Resolving it has three answers, and the palette and the confirm gate name which one they got: the rows checked with Space, every visible row, or the cursor row alone.
 
 **Range anchor**:
 The row `v` pins so that moving the cursor selects everything between that row and the cursor. Live until a second `v` commits the range and releases it, leaving the rows selected so the cursor can cross a gap and start another. Stored as the row's own key rather than its index, so a reorder cannot point it at a different row. Not a mark or a visual mode: only one is ever live, and releasing it keeps what it covered rather than discarding it.
@@ -73,7 +73,7 @@ Two halves returning one Entity list. The boundary-stop walk turns a Set's roots
 A configured handoff target (lazygit, tuicr, an editor, a shell), stored as an argv vector rather than a shell string. Repo context reaches it through the environment, never interpolated into a command. Each one declares whether it takes over the terminal; one that does not is run with the screen still held and with no terminal of its own on any of its three streams. Not a Handoff, which names the act rather than the thing.
 
 **Action**:
-A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many Repos it will run on before it runs.
+A command fanned out across the Selection, either named in config or typed into the palette at the moment. Discoverable through a palette that shows how many rows it will run on, and which rows those are, before it runs.
 
 **Action spec**:
 An Action's bounding specification as the core receives it: its label, its optional name (unset for a typed command), its ordered Steps, its concurrency and its optional `when` predicate, plain data with no TOML type and no confirm gate. Not an ActionConfig, which names the consumer's parsed TOML shape rather than the core's.

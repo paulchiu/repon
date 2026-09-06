@@ -100,6 +100,8 @@ A Worktree row's own gate line discloses the same first two facts about its own 
 
 `ignore` uses the ordinary Action confirm gate with no additional lines, since it destroys nothing.
 
+Every headline names the scope its rows came from, in the same words [actions.md](actions.md) fixes for the border title above it: `delete on 2 selected?` over a Selection, `sync on 12 visible?` where an empty one widened, and `delete on 1 at the cursor?` where the cursor-row fallback applied. The three read alike without it, and the fallback is exactly the one a user must not mistake for the whole table.
+
 ## Once accepted
 
 `y` closes the gate immediately, replaces it with a Notice naming the operation and how many rows it covers, and starts the run itself on a background thread rather than the one that draws frames and reads keys ([0033](../adr/0033-a-management-run-moves-off-the-calling-thread-and-cancels-between-rows.md)). `delete`'s own worktree walk and its hooks can take several seconds on a large working tree, and that thread is never the one a keypress or the next frame is waiting on while they run.

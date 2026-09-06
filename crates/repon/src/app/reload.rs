@@ -1358,7 +1358,7 @@ mod tests {
         app.apply_reloaded_config(config_with_document(reloaded));
 
         let ascii = crate::glyphs::ASCII.border;
-        let picker = crate::set_picker::SetPicker::new();
+        let picker = crate::set_picker::SetPicker::default();
         let popup = picker.popup_area(
             ratatui::layout::Rect::new(0, 0, width, height),
             &app.document.sets,

@@ -1,5 +1,6 @@
 //! The Set picker overlay ([keybindings.md](../../../docs/spec/keybindings.md)'s
-//! `Action::OpenSetPicker`, bound to `s` and `Tab`): lists every declared Set in file order and
+//! `Action::OpenSetPicker`, bound to `s` and `Tab`): lists every declared Set in file order,
+//! opens on the active one ([`SetPicker::opened_on`]) and
 //! switches to whichever is highlighted through
 //! [`crate::app::App::switch_to_set`], the exact path the positional `1`-`9` keys already
 //! take, never a second implementation of the same switch. It lives in `keybindings.md`'s
@@ -38,14 +39,25 @@ pub(crate) const BORDER_TITLE: &str = " sets ";
 /// themselves: [`crate::app::App`] hands [`Self::apply`] and [`Self::draw`] the live
 /// `document.sets` on every call, the same pattern
 /// [`crate::action_palette::ActionPalette`] uses for `document.actions`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct SetPicker {
     cursor: usize,
 }
 
 impl SetPicker {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    /// Opens on the Set already being viewed, so `Enter` without moving the cursor confirms
+    /// it rather than switching away, and the cursor and the `(active)` marker
+    /// [`Self::draw`] writes never point at two different Sets. A name matching no declared
+    /// Set opens on the first row; the active Set is always one of them, so that is a floor
+    /// rather than a case.
+    pub(crate) fn opened_on(sets: &[SetConfig], active_set_name: &str) -> Self {
+        Self {
+            cursor: sets
+                .iter()
+                .position(|set| set.name.get_ref() == active_set_name)
+                .unwrap_or(0),
+        }
     }
 
     /// The cursor's current row, the zero-indexed position `App`'s own `Action::Choose`
@@ -227,6 +239,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn opened_on_puts_the_cursor_on_the_active_set_wherever_it_sits_in_file_order() {
+        let sets = [set("alpha"), set("beta"), set("gamma")];
+
+        for (name, expected) in [("alpha", 0), ("beta", 1), ("gamma", 2)] {
+            assert_eq!(SetPicker::opened_on(&sets, name).cursor(), expected);
+        }
+    }
+
+    /// The floor rather than a case: the active Set is always one of the declared ones, so
+    /// this only fires if that stops being true, and opening on row 0 beats not opening.
+    #[test]
+    fn opened_on_a_name_matching_no_declared_set_falls_back_to_the_first_row() {
+        let sets = [set("alpha"), set("beta")];
+
+        assert_eq!(
+            SetPicker::opened_on(&sets, "deleted-from-config").cursor(),
+            0
+        );
+    }
+
+    #[test]
+    fn opened_on_no_declared_sets_at_all_leaves_the_cursor_at_the_top() {
+        assert_eq!(SetPicker::opened_on(&[], "alpha").cursor(), 0);
+    }
+
     /// The `TestBackend` area every test below draws into: named once so a test computing
     /// where the popup landed (via [`SetPicker::popup_area`]) uses the exact same frame the
     /// real draw ran against.
@@ -282,7 +320,7 @@ mod tests {
     fn draw_frames_the_picker_with_the_active_glyph_tables_own_border() {
         for glyphs in [&crate::glyphs::FULL, &crate::glyphs::ASCII] {
             let sets = vec![set("alpha")];
-            let picker = SetPicker::new();
+            let picker = SetPicker::default();
             let buf = draw_to_buffer(&picker, &sets, "alpha", glyphs);
             let popup = picker.popup_area(frame_area(), &sets, "alpha");
 
@@ -328,7 +366,7 @@ mod tests {
             "the name has to be wider than the whole frame for this to test anything"
         );
         let sets = vec![set(long)];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
 
         let buf = draw_to_buffer(&picker, &sets, long, &crate::glyphs::FULL);
         let popup = picker.popup_area(frame_area(), &sets, long);
@@ -357,7 +395,7 @@ mod tests {
     #[test]
     fn draw_lists_every_declared_set_in_file_order_with_none_dropped_or_duplicated() {
         let sets = vec![set("alpha"), set("beta"), set("gamma"), set("delta")];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
         let interior = popup_interior(&picker, &sets, "alpha");
 
@@ -390,7 +428,7 @@ mod tests {
     #[test]
     fn draw_marks_only_the_cursor_row() {
         let sets = vec![set("alpha"), set("beta"), set("gamma")];
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         picker.apply(Action::ScrollDown, sets.len());
         picker.apply(Action::ScrollDown, sets.len());
         assert_eq!(
@@ -416,7 +454,7 @@ mod tests {
     #[test]
     fn draw_shows_each_rows_one_indexed_number_beside_its_own_name() {
         let sets = vec![set("alpha"), set("beta"), set("gamma")];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
         let interior = popup_interior(&picker, &sets, "alpha");
 
@@ -432,7 +470,7 @@ mod tests {
     fn draw_gives_the_tenth_row_a_name_and_no_number() {
         let names: Vec<String> = (1..=10).map(|n| format!("set{n}")).collect();
         let sets: Vec<SetConfig> = names.iter().map(|name| set(name)).collect();
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
 
         let buf = draw_to_buffer(&picker, &sets, "set1", &crate::glyphs::FULL);
         let interior = popup_interior(&picker, &sets, "set1");
@@ -450,7 +488,7 @@ mod tests {
 
     #[test]
     fn scroll_up_from_the_top_and_scroll_down_from_the_bottom_both_clamp_rather_than_wrap() {
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         picker.apply(Action::ScrollUp, 3);
         assert_eq!(
             picker.cursor(),
@@ -470,7 +508,7 @@ mod tests {
 
     #[test]
     fn top_and_bottom_jump_to_the_clamped_ends() {
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         picker.apply(Action::Bottom, 5);
         assert_eq!(picker.cursor(), 4);
         picker.apply(Action::Top, 5);
@@ -481,7 +519,7 @@ mod tests {
 
     #[test]
     fn an_empty_document_leaves_the_cursor_at_zero_and_draws_nothing_for_every_movement_action() {
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         for action in [
             Action::ScrollDown,
             Action::ScrollUp,
@@ -510,7 +548,7 @@ mod tests {
     #[test]
     fn a_single_set_document_never_moves_the_cursor_off_its_only_row() {
         let sets = vec![set("only")];
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         for action in [
             Action::ScrollDown,
             Action::Bottom,
@@ -542,7 +580,7 @@ mod tests {
     #[test]
     fn the_cursor_rows_highlight_covers_every_cell_of_its_full_interior_width_and_no_other_row() {
         let sets = vec![set("alpha"), set("beta"), set("gamma")];
-        let mut picker = SetPicker::new();
+        let mut picker = SetPicker::default();
         picker.apply(Action::ScrollDown, sets.len());
 
         let buf = draw_to_buffer(&picker, &sets, "alpha", &crate::glyphs::FULL);
@@ -584,7 +622,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let sets = vec![set("alpha")];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let backend = TestBackend::new(frame_area().width, frame_area().height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
 
@@ -643,7 +681,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let sets = vec![set("alpha")];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let area = frame_area();
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
@@ -688,7 +726,7 @@ mod tests {
     #[test]
     fn the_popup_is_clamped_to_fit_and_read_at_the_88_column_narrow_screen() {
         let sets = vec![set("a-fairly-long-set-name-for-this-fixture")];
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let narrow_frame = Rect::new(0, 0, 88, 24);
 
         let popup = picker.popup_area(
@@ -714,7 +752,7 @@ mod tests {
     #[test]
     fn a_table_taller_than_the_popup_does_not_make_the_popup_taller_than_the_frame() {
         let sets: Vec<SetConfig> = (0..200).map(|i| set(&format!("set-{i}"))).collect();
-        let picker = SetPicker::new();
+        let picker = SetPicker::default();
         let frame = frame_area();
 
         let popup = picker.popup_area(frame, &sets, "set-0");
