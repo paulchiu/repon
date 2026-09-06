@@ -6559,6 +6559,67 @@ mod tests {
         );
     }
 
+    /// Refusing a submission must leave the live run exactly as it was: the refused call
+    /// registers no control of its own, so the run already in flight is still the one
+    /// `stop_action` reaches.
+    ///
+    /// Neither sleep outlives [`BACKSTOP`], because the discrimination here is the outcome
+    /// rather than the wait: a step that ended on its own reads `Ok`, which fails the
+    /// assertion, and every child this fixture spawns is gone within seconds however the
+    /// test ends.
+    #[test]
+    fn a_refused_second_submission_leaves_the_first_action_still_stoppable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let core = Core::start_discovered(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let live = action(
+            "live",
+            vec![
+                step(&["sh", "-c", "sleep 5"]),
+                step(&["sh", "-c", "sleep 5"]),
+            ],
+        );
+
+        assert!(core.run_action(live, std::slice::from_ref(&key)));
+        wait_for("the live run's own first step to start", || {
+            core.snapshot().entities[0]
+                .last_action
+                .as_ref()
+                .is_some_and(|receipt| receipt.running.is_some())
+        });
+
+        assert!(
+            !core.run_action(
+                action("refused", vec![step(&["true"])]),
+                std::slice::from_ref(&key)
+            ),
+            "a second submission must be refused while one run is still live"
+        );
+
+        core.stop_action();
+
+        wait_for("the still-controllable run to come down", || {
+            !core.action_running()
+        });
+        let receipt = core.snapshot().entities[0].last_action.clone().unwrap();
+        assert_eq!(&*receipt.label, "live");
+        assert_eq!(
+            receipt.steps[0].outcome,
+            StepOutcome::Cancelled,
+            "the refused submission must leave the live run's own control in place, so \
+             stop_action still reaches the step it was running"
+        );
+        assert_eq!(
+            receipt.steps[1].outcome,
+            StepOutcome::Cancelled,
+            "a step that had not started when the run was cancelled must read Cancelled too"
+        );
+    }
+
     // =====================================================================================
     // Criteria 3 and 4: `Core::hold_action`/`Core::continue_action` are their own verbs on
     // the core, kept apart from the generic `pause`/`resume` the probes use, and suspending
