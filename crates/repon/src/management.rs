@@ -481,6 +481,10 @@ pub(crate) enum Outcome {
     Removed {
         removal: Removal,
         config: ConfigCleanup,
+        /// What would not finish behind the removal, in the order it was attempted: a
+        /// linked Worktree the cascade could not take, or an administrative entry that
+        /// would not clear. Empty on a removal that left nothing.
+        problems: Vec<String>,
     },
     /// `sync` fast-forwarded the Repo's branch to its upstream.
     Synced,
@@ -576,9 +580,11 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
     match outcome {
         Outcome::Ignored => OwnWork::Did(Arc::from("ignored")),
         Outcome::Unignored => OwnWork::Did(Arc::from("no longer ignored")),
-        Outcome::Removed { removal, config } => {
-            OwnWork::Did(Arc::from(removed_words(*removal, config)))
-        }
+        Outcome::Removed {
+            removal,
+            config,
+            problems,
+        } => OwnWork::Did(Arc::from(removed_words(*removal, config, problems))),
         Outcome::ExcludedByAnInheritedEntry => OwnWork::Refused(Arc::from(
             "still ignored: the `[[repo]]` entry excluding it names another path",
         )),
@@ -601,9 +607,10 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
 }
 
 /// One removal's own sentence: what went, then what became of the `[[repo]]` entry naming
-/// it. A write that failed is named after the removal rather than instead of it.
-fn removed_words(removal: Removal, config: &ConfigCleanup) -> String {
-    match config {
+/// it, then whatever would not finish behind it. Anything that failed is named after the
+/// removal rather than instead of it.
+fn removed_words(removal: Removal, config: &ConfigCleanup, problems: &[String]) -> String {
+    let mut said = match config {
         ConfigCleanup::EntryRemoved => format!("{}, `[[repo]]` entry removed", removal.said()),
         ConfigCleanup::NoEntryOfItsOwn => {
             format!("{}, no `[[repo]]` entry of its own", removal.said())
@@ -612,7 +619,12 @@ fn removed_words(removal: Removal, config: &ConfigCleanup) -> String {
             "{}; its `[[repo]]` entry could not be removed: {error}",
             removal.said()
         ),
+    };
+    for problem in problems {
+        said.push_str("; ");
+        said.push_str(problem);
     }
+    said
 }
 
 /// One outcome as a sentence, for the log line each row gets after a run. Read out of
@@ -696,9 +708,11 @@ impl Report {
                 | Outcome::Unignored
                 | Outcome::Synced
                 | Outcome::SyncedAfterHookFailed(_) => done += 1,
-                Outcome::Removed { config, .. } => {
+                Outcome::Removed {
+                    config, problems, ..
+                } => {
                     done += 1;
-                    if matches!(config, ConfigCleanup::Failed(_)) {
+                    if matches!(config, ConfigCleanup::Failed(_)) || !problems.is_empty() {
                         cleanup_unfinished += 1;
                     }
                 }
@@ -980,14 +994,19 @@ fn delete_one(
     match target.kind {
         Kind::Repo => {
             let mut removed = Vec::new();
+            let mut problems = Vec::new();
             for worktree in linked_worktree_paths(&target.key) {
                 delete_ignored_directories(ignored_directories_for_deletion(&worktree));
-                // Best effort: a sibling Worktree that will not remove is not this row's own
-                // outcome, and the Repo's own removal below is what the report names. Only
-                // the ones that did go are staged, so the report never claims a directory
+                // Best effort: a sibling Worktree that will not remove never stops the
+                // Repo's own removal below. Only the ones that did go are staged, and the
+                // ones that did not are named, so the report claims no directory that is
                 // still on disk.
-                if remove_working_tree(&worktree).is_ok() {
-                    removed.push(EntityKey::new(Arc::from(worktree.as_path())));
+                match remove_working_tree(&worktree) {
+                    Ok(()) => removed.push(EntityKey::new(Arc::from(worktree.as_path()))),
+                    Err(err) => problems.push(format!(
+                        "its linked Worktree at {} would not remove: {err:#}",
+                        worktree.display()
+                    )),
                 }
             }
             delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
@@ -998,6 +1017,7 @@ fn delete_one(
                 Outcome::Removed {
                     removal: Removal::WorkingTree,
                     config,
+                    problems,
                 },
                 removed,
             ))
@@ -1024,7 +1044,11 @@ fn delete_one(
                 Removal::Directory
             };
             Ok((
-                Outcome::Removed { removal, config },
+                Outcome::Removed {
+                    removal,
+                    config,
+                    problems: Vec::new(),
+                },
                 vec![target.key.clone()],
             ))
         }
@@ -1142,6 +1166,16 @@ mod tests {
             |_| panic!("run_plain declares no before_sync hook"),
             |_| panic!("run_plain declares no after_sync hook"),
         )
+    }
+
+    /// [`Outcome::Removed`] with nothing left behind, the shape every fixture that is not
+    /// itself about an unfinished cleanup produces.
+    fn removed(removal: Removal, config: ConfigCleanup) -> Outcome {
+        Outcome::Removed {
+            removal,
+            config,
+            problems: Vec::new(),
+        }
     }
 
     /// The three names, and their order, come from repo-management.md's own operations table
@@ -1266,10 +1300,7 @@ mod tests {
             vec![
                 (
                     "repo".to_string(),
-                    Outcome::Removed {
-                        removal: Removal::WorkingTree,
-                        config: ConfigCleanup::NoEntryOfItsOwn
-                    }
+                    removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
                 ),
                 (
                     "sub".to_string(),
@@ -1310,10 +1341,7 @@ mod tests {
 
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::WorkingTree,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            },
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
             "the Set naming it is not a `[[repo]]` entry of its own"
         );
         let written = std::fs::read_to_string(&config_file).expect("read config.toml back");
@@ -1356,10 +1384,7 @@ mod tests {
         assert!(!admin_dir.exists(), "its administrative entry is gone too");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::Worktree,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1428,10 +1453,7 @@ mod tests {
         assert!(!tree.exists(), "the Worktree's own directory is still gone");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1468,10 +1490,7 @@ mod tests {
         assert!(!sibling_two.exists(), "the second linked Worktree is gone");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::WorkingTree,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1560,10 +1579,7 @@ mod tests {
         assert_eq!(asked.into_inner(), vec![tree.clone()]);
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1603,10 +1619,7 @@ mod tests {
         assert_eq!(asked, expected);
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::WorkingTree,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1643,10 +1656,7 @@ mod tests {
         );
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1691,10 +1701,7 @@ mod tests {
         );
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::NoEntryOfItsOwn
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -2340,45 +2347,27 @@ mod tests {
             (Outcome::Ignored, "Did"),
             (Outcome::Unignored, "Did"),
             (
-                Outcome::Removed {
-                    removal: Removal::WorkingTree,
-                    config: ConfigCleanup::EntryRemoved,
-                },
+                removed(Removal::WorkingTree, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::Removed {
-                    removal: Removal::WorkingTree,
-                    config: ConfigCleanup::NoEntryOfItsOwn,
-                },
+                removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (
-                Outcome::Removed {
-                    removal: Removal::Worktree,
-                    config: ConfigCleanup::EntryRemoved,
-                },
+                removed(Removal::Worktree, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::Removed {
-                    removal: Removal::Worktree,
-                    config: ConfigCleanup::NoEntryOfItsOwn,
-                },
+                removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (
-                Outcome::Removed {
-                    removal: Removal::Directory,
-                    config: ConfigCleanup::EntryRemoved,
-                },
+                removed(Removal::Directory, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::Removed {
-                    removal: Removal::Directory,
-                    config: ConfigCleanup::NoEntryOfItsOwn,
-                },
+                removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (Outcome::ExcludedByAnInheritedEntry, "Refused"),
@@ -2429,30 +2418,12 @@ mod tests {
         for outcome in [
             Outcome::Ignored,
             Outcome::Unignored,
-            Outcome::Removed {
-                removal: Removal::WorkingTree,
-                config: ConfigCleanup::EntryRemoved,
-            },
-            Outcome::Removed {
-                removal: Removal::WorkingTree,
-                config: ConfigCleanup::NoEntryOfItsOwn,
-            },
-            Outcome::Removed {
-                removal: Removal::Worktree,
-                config: ConfigCleanup::EntryRemoved,
-            },
-            Outcome::Removed {
-                removal: Removal::Worktree,
-                config: ConfigCleanup::NoEntryOfItsOwn,
-            },
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::EntryRemoved,
-            },
-            Outcome::Removed {
-                removal: Removal::Directory,
-                config: ConfigCleanup::NoEntryOfItsOwn,
-            },
+            removed(Removal::WorkingTree, ConfigCleanup::EntryRemoved),
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
+            removed(Removal::Worktree, ConfigCleanup::EntryRemoved),
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
+            removed(Removal::Directory, ConfigCleanup::EntryRemoved),
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn),
             Outcome::ExcludedByAnInheritedEntry,
         ] {
             let said = describe(&outcome);

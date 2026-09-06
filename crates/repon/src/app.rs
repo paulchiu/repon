@@ -7190,6 +7190,54 @@ mod tests {
         );
     }
 
+    /// A linked Worktree the cascade could not remove is still on disk, so its row stays
+    /// listed and stays out of the dismissal set, and the run says so rather than reporting
+    /// a clean removal over a directory it left behind
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_linked_worktree_the_cascade_could_not_remove_is_reported_and_stays_listed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("sidecar");
+        worktree_add(&repo, &worktree, "sidecar");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let repo_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-a")
+            .expect("the Repo row is discovered")
+            .key
+            .clone();
+        app.selection.toggle(repo_key);
+        // `remove_working_tree`'s own guard refuses a directory with no `.git` in it, which
+        // is a deterministic refusal where a permission bit would be a race.
+        std::fs::remove_file(worktree.join(".git")).expect("remove the Worktree's .git file");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(!repo.exists(), "the Repo's own working tree is gone");
+        assert!(
+            worktree.exists(),
+            "the linked Worktree the cascade refused is still on disk"
+        );
+        assert_eq!(
+            visible_names_sorted(&app),
+            vec!["sidecar".to_string()],
+            "so its row stays listed rather than being dismissed with the parent"
+        );
+        let notice = app.notice().unwrap_or_default().to_string();
+        assert!(
+            notice.contains("1 removed with cleanup unfinished"),
+            "the completion must say the run left something behind, got {notice:?}"
+        );
+    }
+
     /// Criterion 6's "computed, not stubbed" half at the call site: the gate's risk comes
     /// from [`repon_core::Core::delete_risk`], the real git read, and not from a literal this
     /// crate could hand [`crate::management::Plan::with_risk`] instead. What that read
