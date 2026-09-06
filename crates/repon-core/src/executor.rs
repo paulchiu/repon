@@ -2192,6 +2192,16 @@ print(1 if inherited else 0)"
         (head, tail)
     }
 
+    /// The spec's own "Capture" section alone, so a phrase found under some other heading
+    /// cannot stand in for one this section has to carry.
+    fn spec_capture_section(spec: &str) -> &str {
+        let after = spec
+            .split("\n## Capture\n")
+            .nth(1)
+            .expect("the Capture section is present");
+        after.split("\n## ").next().expect("a section body")
+    }
+
     fn spec_pty_width_columns(spec: &str) -> u16 {
         let anchor = "The PTY is a fixed ";
         let after = spec
@@ -2487,6 +2497,34 @@ print(1 if inherited else 0)"
             );
             assert_eq!(elision, None, "split at byte {split}");
         }
+    }
+
+    /// The bound counts lines, so it bounds nothing until a line ends and an unfinished one
+    /// is kept whole however long it runs. Read the spec of record for the same claim in the
+    /// same breath: a byte cap would pass the behavioural half of this test by cutting the
+    /// line, and the contract it would be breaking is only visible in the prose.
+    #[test]
+    fn an_unfinished_line_is_kept_whole_and_the_spec_of_record_says_it_is_unbounded() {
+        // 20 times the whole kept capture, and 600 times the longest real line the spec
+        // measured, with no line ending anywhere in it.
+        let unfinished = vec![b'x'; 1024 * 1024];
+
+        let (kept, elision) = bound_head_and_tail(&unfinished);
+
+        assert!(
+            kept == unfinished,
+            "an unfinished line must be kept whole: kept {} of {} bytes",
+            kept.len(),
+            unfinished.len()
+        );
+        assert_eq!(elision, None, "one line, finished or not, loses nothing");
+
+        let spec = spec_actions_md();
+        assert!(
+            spec_capture_section(&spec).contains("arbitrary memory use"),
+            "the capture contract must say an unfinished line still permits arbitrary memory \
+             use, since nothing in the code bounds it"
+        );
     }
 
     #[test]

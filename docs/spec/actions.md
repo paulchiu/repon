@@ -38,6 +38,10 @@ Three rules govern a redrawn line, because under a PTY ONLCR means every newline
 
 The bound is a defence against the pathological case, not a normal-path cost. Measured: `git status --short --branch` across all 403 entities produces 15,279 bytes total (14.9 KiB), mean 38 B per entity, max 546 B. A cold `cargo build` of Repon is 7,190 B; `cargo build -v` is 10,034 B with a longest single line of 1,653 characters; `cargo tree` is 25,598 B. A head-plus-tail bound over a 10 MiB stream costs 0.4ms and keeps 16 KiB.
 
+The bound counts lines, not bytes, so nothing is bounded until a line ends. A step that writes one arbitrarily long line and never terminates it is held whole, and capture therefore still permits arbitrary memory use. That is recorded rather than fixed: a byte cap would bound the case, and would also cut ordinary output where no line ending asked for a cut, so it is a decision of its own rather than a detail of this one.
+
+Transient capture is larger than the receipt it produces, because the whole raw stream is held while the child runs, normalisation allocates a second copy of it, and only then are the head and the tail cut. Measured in release, at a fixed 119-character line (121 bytes on the wire once ONLCR has been applied): 1,000 lines (121 KB) peaks 0.4 MB above an idle process and spends 0.3ms normalising and bounding, 100,000 lines (12.1 MB) peaks 26 MB and 19ms, and 1,000,000 lines (121 MB) peaks 259 MB and 191ms, so the peak runs at about 2.2 times what the child emitted. Both costs track the line count rather than the byte count, since the bound holds one slice per line. Against the real outputs above, the largest of them 25,598 bytes, that is under 60 KB of transient and under a tenth of a millisecond, which is why the stream is held whole rather than normalised as it arrives.
+
 ## Step outcomes
 
 A closed set of five.
