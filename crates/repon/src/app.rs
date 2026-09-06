@@ -15251,8 +15251,14 @@ refresh_all = "z""#,
 
         press_through_the_management_gate(&mut app, management::Operation::Sync);
 
-        assert_eq!(app.filter, filter_before, "the committed Filter must survive the run");
-        assert_eq!(app.row_order, row_order_before, "the row order must survive the run");
+        assert_eq!(
+            app.filter, filter_before,
+            "the committed Filter must survive the run"
+        );
+        assert_eq!(
+            app.row_order, row_order_before,
+            "the row order must survive the run"
+        );
         assert_eq!(
             app.ignored_toggle, ignored_toggle_before,
             "the ignored toggle must survive the run"
