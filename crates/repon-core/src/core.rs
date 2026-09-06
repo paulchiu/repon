@@ -1308,7 +1308,7 @@ impl Core {
     /// off this thread can give in time. Reuses `run_action_for_entity`, the identical
     /// per-step execution `run_action`'s fan-out gives every entity, so a hook and a
     /// configured `[[action]]` never diverge in what a step means; writes nothing to the
-    /// table and touches none of `run_action`'s own state (its [`ActionLifecycle`]),
+    /// table and touches none of `run_action`'s own state (its `ActionLifecycle`),
     /// since a hook is a distinct concern from the one fan-out the palette tracks.
     ///
     /// `None` when `key` names no Entity this table currently knows.
@@ -1416,7 +1416,7 @@ impl Core {
     }
 
     /// `true` while one Action fan-out's steps are still running, the consumer-facing read
-    /// of [`ActionLifecycle`] ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// of its `ActionLifecycle` ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
     /// "One Action runs at a time"): what a TUI gates `;`, `s`, `1` to `9` and `Ctrl+R`
     /// against while a run is in flight
     /// ([ADR 0023](https://github.com/paulchiu/repon/blob/main/docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
@@ -1799,7 +1799,7 @@ impl Core {
 /// [`Core::management_handle`] rather than borrowed from a live `Core`: `Send + 'static`, so
 /// a caller can move it onto a background thread the way [`Core::run_action`]'s own fan-out
 /// thread already moves its `Arc<RwLock<Table>>` clone there. Grants none of `Core`'s other
-/// state (its [`ActionLifecycle`], the clock thread): a management run is a
+/// state (its `ActionLifecycle`, the clock thread): a management run is a
 /// distinct concern from the one fan-out those track, and this handle's own methods touch
 /// only the table, exactly as [`Core::run_action_for_entity_blocking`] already does.
 #[derive(Clone)]
