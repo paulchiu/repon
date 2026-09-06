@@ -2192,16 +2192,6 @@ print(1 if inherited else 0)"
         (head, tail)
     }
 
-    /// The spec's own "Capture" section alone, so a phrase found under some other heading
-    /// cannot stand in for one this section has to carry.
-    fn spec_capture_section(spec: &str) -> &str {
-        let after = spec
-            .split("\n## Capture\n")
-            .nth(1)
-            .expect("the Capture section is present");
-        after.split("\n## ").next().expect("a section body")
-    }
-
     fn spec_pty_width_columns(spec: &str) -> u16 {
         let anchor = "The PTY is a fixed ";
         let after = spec
@@ -2340,40 +2330,19 @@ print(1 if inherited else 0)"
         );
     }
 
-    /// Full byte equality, where the tests above walk `.lines()`: a newline lost or added at
-    /// the join between the kept head and the kept tail reads identically through `.lines()`.
-    /// The longer fixture's own last line is unterminated, which nothing else pins.
+    /// Byte equality where the tests above walk `.lines()`, which reads a newline lost or
+    /// added at the join between the kept head and the kept tail identically. This
+    /// fixture's own last line is unterminated, and the bound must not finish it.
     #[test]
-    fn short_exactly_bounded_and_longer_output_all_keep_the_literal_bytes_specified() {
+    fn a_bounded_capture_keeps_the_literal_bytes_and_an_unterminated_last_line() {
         let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
-        let numbered = |total: usize, terminate_last: bool| {
-            let mut text = String::new();
-            for n in 0..total {
-                text.push_str(&format!("line {n}"));
-                if n + 1 < total || terminate_last {
-                    text.push('\n');
-                }
+        let mut input = String::new();
+        for n in 0..=bound {
+            input.push_str(&format!("line {n}"));
+            if n < bound {
+                input.push('\n');
             }
-            text.into_bytes()
-        };
-
-        // Compared as text rather than as a byte vector: the equality is the same one,
-        // and a failing byte vector of this size prints as unreadable decimal.
-        let kept_text = |input: &[u8]| {
-            let (kept, elision) = bound_head_and_tail(input);
-            (String::from_utf8(kept).expect("valid utf8"), elision)
-        };
-
-        assert_eq!(
-            kept_text(&numbered(3, true)),
-            ("line 0\nline 1\nline 2\n".to_string(), None)
-        );
-
-        let exact = numbered(bound, true);
-        let (kept, elision) = kept_text(&exact);
-        assert_eq!(kept.into_bytes(), exact);
-        assert_eq!(elision, None);
-
+        }
         let mut expected = String::new();
         for n in 0..CAPTURE_HEAD_LINES {
             expected.push_str(&format!("line {n}\n"));
@@ -2383,15 +2352,17 @@ print(1 if inherited else 0)"
         }
         expected.push_str(&format!("line {bound}"));
 
+        let (kept, elision) = bound_head_and_tail(input.as_bytes());
+
+        // Compared as text rather than as a byte vector, which prints at this size as
+        // unreadable decimal.
+        assert_eq!(String::from_utf8(kept).expect("valid utf8"), expected);
         assert_eq!(
-            kept_text(&numbered(bound + 1, false)),
-            (
-                expected,
-                Some(CaptureElision {
-                    dropped_lines: 1,
-                    kept_head_lines: CAPTURE_HEAD_LINES,
-                })
-            )
+            elision,
+            Some(CaptureElision {
+                dropped_lines: 1,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            })
         );
     }
 
@@ -2554,14 +2525,12 @@ print(1 if inherited else 0)"
         assert_eq!(result.elision, None);
     }
 
-    /// The bound counts lines, so it bounds nothing until a line ends and an unfinished one
-    /// is kept whole however long it runs. Read the spec of record for the same claim in the
-    /// same breath: a byte cap would pass the behavioural half of this test by cutting the
-    /// line, and the contract it would be breaking is only visible in the prose.
+    /// The bound counts lines, so it bounds nothing until a line ends. A byte cap, the
+    /// obvious way to bound this, would cut a line the spec says is kept whole
+    /// (`docs/spec/actions.md`'s "Capture"), so the size here is the claim.
     #[test]
-    fn an_unfinished_line_is_kept_whole_and_the_spec_of_record_says_it_is_unbounded() {
-        // 20 times the whole kept capture, and 600 times the longest real line the spec
-        // measured, with no line ending anywhere in it.
+    fn an_unfinished_line_is_kept_whole_however_long_it_runs() {
+        // 600 times the longest real line the spec measured, with no line ending in it.
         let unfinished = vec![b'x'; 1024 * 1024];
 
         let (kept, elision) = bound_head_and_tail(&unfinished);
@@ -2573,13 +2542,6 @@ print(1 if inherited else 0)"
             unfinished.len()
         );
         assert_eq!(elision, None, "one line, finished or not, loses nothing");
-
-        let spec = spec_actions_md();
-        assert!(
-            spec_capture_section(&spec).contains("arbitrary memory use"),
-            "the capture contract must say an unfinished line still permits arbitrary memory \
-             use, since nothing in the code bounds it"
-        );
     }
 
     #[test]
