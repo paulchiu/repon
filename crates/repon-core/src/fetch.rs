@@ -187,32 +187,14 @@ pub(crate) fn probe_remote_head(
 /// "Cancellation"): one `Arc<AtomicBool>` per in-flight fetch, never
 /// `gix::interrupt::IS_INTERRUPTED`.
 ///
-/// # What `cancel` actually bounds
-///
-/// The receive stage alone. The pinned gix takes a cancellation flag at
-/// [`gix::remote::fetch::Prepare::receive`] and nowhere else: [`gix::Remote::connect`],
-/// [`gix::remote::Connection::ref_map`] and [`gix::remote::Connection::prepare_fetch`] each
-/// take none, so a fetch still resolving, connecting or handshaking carries on however long
-/// its remote takes, whatever this flag says.
-/// `a_fetch_stalled_before_its_receive_stage_is_not_ended_by_its_cancel_flag` holds that
-/// still against a local stalled transport.
-///
-/// What bounds those earlier stages instead is the transport's own, and only one of them
-/// carries a bound worth the name:
-///
-/// - `https://` and `http://`: the reqwest client this crate compiles in is built with a
-///   20 second connect timeout, which covers name resolution, TCP and the TLS handshake and
-///   nothing after them. No request or read timeout is set, so a remote that accepts a
-///   connection and then says nothing holds the handshake open indefinitely.
-/// - `git://`: a 5 second TCP connect timeout, and no bound at all on the reads after it.
-/// - `ssh://`, a local path and `file://`: a child process (`ssh`, `git upload-pack`) with no
-///   timeout of any kind.
-///
-/// So connect and preparation have no finite bound in general, and a caller that has
-/// cancelled a fetch can only wait for it. Giving them one is a product decision nobody has
-/// made: it needs a number, a place to configure it, and an answer for what a timed-out
-/// repository reports, and none of the three exists. Recorded here as unresolved rather than
-/// guessed at, the same way [`crate::core`]'s own fetch cadence is.
+/// The receive stage is all `cancel` bounds: the pinned gix takes the flag at
+/// [`gix::remote::fetch::Prepare::receive`] and nowhere else, so a fetch still resolving,
+/// connecting or handshaking runs for as long as its transport does. Those transports bound
+/// themselves barely or not at all (a 20 second connect timeout for `https://`, 5 seconds
+/// for `git://`, none for `ssh://`, a local path or `file://`, and no read timeout anywhere),
+/// so a cancelled fetch that has not reached its receive stage can only be waited out.
+/// Giving one a finite bound is an unresolved product decision, recorded rather than guessed
+/// at, the same way this crate's own fetch cadence is.
 ///
 /// Fails closed on a credential prompt: [`refuse_credentials`] reports no credentials
 /// are available rather than asking a terminal Repon has taken the alternate screen of,
@@ -561,18 +543,34 @@ mod tests {
         );
     }
 
-    /// Writes an executable `ssh` into `dir` that waits until `release` exists, with a
-    /// ceiling of its own so a failing run leaves nothing behind. Named `ssh` so gix takes it
-    /// for the standard client and spawns it once, rather than probing it first.
-    fn stalling_ssh(dir: &std::path::Path, release: &std::path::Path) -> std::path::PathBuf {
+    /// Writes an executable `ssh` into `dir` that records having been run at `started` and
+    /// then waits for `release` to appear. Named `ssh` so gix takes it for the standard
+    /// client and spawns it once, rather than probing it first. Its own ceiling is
+    /// [`crate::liveness::FIXTURE_LIFETIME`], the length a fixture waits when the point of it
+    /// is to still be running once the wait watching it has given up.
+    fn stalling_ssh(
+        dir: &std::path::Path,
+        started: &std::path::Path,
+        release: &std::path::Path,
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let program = dir.join("ssh");
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 600 ]; do\n  i=$((i+1))\n                   sleep 0.05\ndone\n",
-                release.display()
+                concat!(
+                    "#!/bin/sh\n",
+                    ": > '{started}'\n",
+                    "i=0\n",
+                    "while [ ! -e '{release}' ] && [ $i -lt {ticks} ]; do\n",
+                    "  i=$((i+1))\n",
+                    "  sleep 0.05\n",
+                    "done\n",
+                ),
+                started = started.display(),
+                release = release.display(),
+                ticks = crate::liveness::FIXTURE_LIFETIME.as_secs() * 20,
             ),
         )
         .expect("write the stalling ssh program");
@@ -589,8 +587,9 @@ mod tests {
     ///
     /// Stalled with no socket at all: `core.sshCommand` in the repository's own config names
     /// a program that waits, so gix spawns that instead of `ssh` and the handshake never
-    /// answers. Both sides of the wait are bounded, by that program's own ceiling and by the
-    /// release file below, so nothing is left running either way.
+    /// answers. That program writes a marker first, which is what says the stall under test
+    /// is the fixture's and not gix ignoring the config, and the release file is written
+    /// before either assertion below, so no failing assertion leaves it waiting.
     #[test]
     fn a_fetch_stalled_before_its_receive_stage_is_not_ended_by_its_cancel_flag() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -606,7 +605,8 @@ mod tests {
             ],
         );
         let release = dir.path().join("release");
-        let program = stalling_ssh(dir.path(), &release);
+        let spawned = dir.path().join("spawned");
+        let program = stalling_ssh(dir.path(), &spawned, &release);
         git(
             dir.path(),
             &[
@@ -625,13 +625,14 @@ mod tests {
             let _ = tx.send(fetch_and_prune(&path, &cancel));
         });
 
+        crate::liveness::wait_for("gix to spawn the stalling ssh program", || spawned.exists());
+        let still_handshaking = rx.recv_timeout(Duration::from_millis(500)).is_err();
+        std::fs::write(&release, b"go").expect("release the stalled transport");
         assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            still_handshaking,
             "an already-cancelled fetch must still be sitting in its handshake: nothing \
              before the receive stage reads that flag"
         );
-
-        std::fs::write(&release, b"go").expect("release the stalled transport");
         let result = rx
             .recv_timeout(crate::liveness::BACKSTOP)
             .expect("releasing the stalled transport is what ends this fetch, not the flag");
