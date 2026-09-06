@@ -12760,6 +12760,56 @@ mod tests {
             );
         }
 
+        /// Teardown signals the cycle's own cancellation and waits for the worker to stop,
+        /// rather than abandoning a thread that is still fetching and fast-forwarding
+        /// repositories. The boundary stays armed across the drop, so the only thing that can
+        /// have let that worker go is the cancellation shutdown sends; the Repo is left
+        /// eligible for the auto-update by a fetch this test performs itself, so the branch
+        /// standing still afterwards is a worker that stopped rather than one with nothing to
+        /// do.
+        #[test]
+        fn dropping_the_core_cancels_and_joins_a_held_fetch_cycle_before_returning() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            git(&parent, &["fetch", "origin"]);
+            let before_tip = rev_parse(&parent, "refs/heads/main");
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+
+            drop(core);
+
+            assert_eq!(
+                started.fetch_cycles_finished.load(Ordering::Acquire),
+                1,
+                "teardown must have joined the cycle's own worker before returning, not \
+                 merely signalled it"
+            );
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before_tip,
+                "no worker may still be fast-forwarding a repository once teardown has \
+                 returned"
+            );
+        }
+
         /// Points `repo`'s `origin` at a path nothing lives at, breaking `fetch_and_prune`
         /// alone: discovery has already found `repo` as a real Repo before this runs, so
         /// only the fetch itself fails, never the walk. A local path rather than a loopback
