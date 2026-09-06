@@ -80,6 +80,8 @@ It is dropped rather than left to become Vanished. [core-api.md](core-api.md) gi
 
 Only the rows the report names as removed leave. A refused row still has a working tree, and so may a failed one, so both stay listed with the receipt saying why.
 
+Config is written after the directory has gone, so a write that fails leaves a removal that already happened. The row still goes: it is dismissed on the removal, never on the write, and the receipt names the write that did not finish beside the removal that did. The completion counts it too, as removed with cleanup unfinished, so the run never reads as a plain failure over a directory that is genuinely gone.
+
 What a run removed and what it reports on are counted separately. One selected parent is one receipt, and that one row's own `delete` confirms as many removals as it made: the Repo's own working tree and each linked Worktree the cascade took with it. Every one of those rows leaves the table and the Selection on the frame the run completes, so no row is left pointing at a directory that is gone. A directory the run could not remove is never counted among them.
 
 A removed row's own receipt goes with it, since a receipt says what happened to a row a user can still look at. What that row got is still said twice: in the one-line Notice's counts and in the log line "Receipts" below reads its words from.
@@ -165,6 +167,7 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | `delete` removed a Worktree cleanly and there was no entry | `Did` | worktree removed, no `[[repo]]` entry of its own |
 | `delete` fell back to a directory removal and an entry of its own | `Did` | directory removed, its parent Repo was unreadable, `[[repo]]` entry removed |
 | `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
+| `delete` removed a tree and the config write failed | `Did` | the removal's own words above; its `[[repo]]` entry could not be removed, then what went wrong |
 | `sync` fast-forwarded the branch | `Did` | fast-forwarded to its upstream |
 | `sync` fast-forwarded the branch but `after_sync` failed | `Did` | fast-forwarded to its upstream; after_sync hook failed, then what went wrong |
 | `ignore` on an excluded row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |

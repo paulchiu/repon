@@ -7151,6 +7151,45 @@ mod tests {
         );
     }
 
+    /// A working tree that went and a `config.toml` write that did not are two facts, and
+    /// the run reports both: the row leaves the table, since its directory is genuinely
+    /// gone, and the completion names the removal alongside the cleanup that did not finish
+    /// rather than one undifferentiated failure
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_delete_whose_config_write_fails_still_drops_the_row_and_reports_both_halves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        // A directory where the file was: every read of the config path now fails on its
+        // first byte, which is deterministic where a permission bit would be a race.
+        let config_file = app.config_file.clone();
+        std::fs::remove_file(&config_file).expect("remove the config file");
+        std::fs::create_dir(&config_file).expect("put a directory in its place");
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        wait_for_management_run(&mut app);
+
+        assert!(!repo.exists(), "the working tree is genuinely gone");
+        assert_eq!(
+            visible_names_sorted(&app),
+            Vec::<String>::new(),
+            "so the removed row leaves the table rather than pointing at nothing"
+        );
+        let notice = app.notice().unwrap_or_default().to_string();
+        assert!(
+            notice.contains("1 removed with cleanup unfinished"),
+            "the completion must name the removal and the cleanup that did not finish, got \
+             {notice:?}"
+        );
+    }
+
     /// Criterion 6's "computed, not stubbed" half at the call site: the gate's risk comes
     /// from [`repon_core::Core::delete_risk`], the real git read, and not from a literal this
     /// crate could hand [`crate::management::Plan::with_risk`] instead. What that read
