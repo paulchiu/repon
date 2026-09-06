@@ -7872,6 +7872,69 @@ mod tests {
         );
     }
 
+    /// The status row of a whole frame `app` would draw, trailing blanks trimmed: row 0, the
+    /// row a live Notice takes alone. `pub(crate)` for `reload.rs`'s own reload test.
+    pub(crate) fn rendered_status_row(app: &mut App) -> String {
+        const WIDTH: u16 = 80;
+        let buf = render_app_frame(app, WIDTH, 24);
+        (0..WIDTH)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// A replacement is a Notice of its own, so the age of the one it displaced buys it
+    /// nothing: driven from a Notice already past the timeout, since a replacement that
+    /// inherited the displaced timestamp would never reach the row at all.
+    #[test]
+    fn replacing_a_notice_restarts_its_age_and_the_replacement_reaches_the_status_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(10));
+        assert!(
+            !rendered_status_row(&mut app).contains("switched to"),
+            "sanity: the displaced Notice is already past the default three seconds"
+        );
+
+        app.set_notice("switched to `third`".to_string());
+
+        let row = rendered_status_row(&mut app);
+        assert!(
+            row.contains("switched to `third`"),
+            "the replacement must start its own timeout rather than inherit a spent one, \
+             got {row:?}"
+        );
+    }
+
+    /// The other half of the same rule: a Notice answers one press and is gone by the next,
+    /// well inside a timeout long enough that only the press can be what cleared it.
+    #[test]
+    fn the_next_press_clears_the_notice_from_the_status_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.document.notice_timeout = Duration::from_secs(3600);
+        app.set_notice("switched to `second`".to_string());
+        let raised = rendered_status_row(&mut app);
+        assert!(
+            raised.contains("switched to `second`"),
+            "sanity: the Notice must reach the row before a press can clear it, got {raised:?}"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("move the cursor");
+
+        let after = rendered_status_row(&mut app);
+        assert!(
+            !after.contains("switched to"),
+            "the next press must clear the Notice however long its timeout, got {after:?}"
+        );
+    }
+
     // --- criterion 1: three layout states, cursor and row order kept across opening ---
 
     #[test]
