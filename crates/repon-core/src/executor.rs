@@ -1857,17 +1857,8 @@ mod tests {
     // default parallelism this process's descriptor count is shared with every other test
     // running at the same time, so a threshold loose enough to absorb that noise (as an
     // earlier version of this test did) is also loose enough to pass with a real, smaller
-    // leak still inside it. Checked instead by asking the kernel about `keepalive`'s own
-    // descriptor number directly, which no unrelated concurrent test can perturb.
-
-    /// Whether `fd` is still an open descriptor in this process, via `fcntl(F_GETFD)`
-    /// rather than a whole-process count: this asks about one specific number, so it is
-    /// unaffected by whatever other descriptors concurrent tests happen to hold at the
-    /// same moment.
-    fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
-        // SAFETY: `F_GETFD` only reads `fd`'s flags and touches no memory.
-        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
-    }
+    // leak still inside it. Checked instead by asking the kernel what `keepalive`'s own
+    // descriptor number still refers to, which no unrelated concurrent test can perturb.
 
     /// The device `fd` refers to, or `None` if it is closed. A descriptor *number* says
     /// nothing on its own once freed, since a concurrent test can be handed the same one
@@ -1932,6 +1923,7 @@ mod tests {
             drain,
         } = prepared();
         let keepalive_fd = drain.keepalive.as_raw_fd();
+        let pty_device = fd_device(keepalive_fd).expect("the keepalive is open before the spawn");
         let mut command = build_command(&argv, dir.path(), &[], slave, slave_dup);
 
         let spawn_result = command.spawn();
@@ -1942,9 +1934,12 @@ mod tests {
         drop(command);
         drop(drain);
 
-        assert!(
-            !fd_is_open(keepalive_fd),
-            "expected keepalive's descriptor {keepalive_fd} to be closed after a spawn failure"
+        // By device rather than by open-ness, for the reason the drained twin above gives.
+        assert_ne!(
+            fd_device(keepalive_fd),
+            Some(pty_device),
+            "expected no descriptor onto this pty to survive a spawn failure; number \
+             {keepalive_fd} still refers to it"
         );
     }
 
