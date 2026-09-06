@@ -1463,7 +1463,10 @@ impl App {
                 if self.any_run_outstanding() {
                     self.set_notice(action_running_notice("Set picker"));
                 } else {
-                    self.set_picker = Some(SetPicker::new());
+                    self.set_picker = Some(SetPicker::opened_on(
+                        &self.document.sets,
+                        &self.active_set.name,
+                    ));
                 }
                 None
             }
@@ -4536,7 +4539,7 @@ mod tests {
             );
             app.action_palette = None;
 
-            let picker = SetPicker::new();
+            let picker = SetPicker::opened_on(&app.document.sets, &app.active_set.name);
             let popup = picker.popup_area(whole_frame, &app.document.sets, &app.active_set.name);
             app.set_picker = Some(picker);
             let buf = render_app_frame(&mut app, width, height);
@@ -14172,6 +14175,41 @@ refresh_all = "z""#,
             "the digit must raise the same Notice the picker's own Enter and the positional \
              digit from `list` both raise"
         );
+    }
+
+    /// The picker opens where the user already is. Starting the cursor at row 1 puts the
+    /// highlight and the `(active)` marker on different Sets, so `Enter` without moving
+    /// switches away from the Set being viewed rather than confirming it.
+    #[test]
+    fn the_picker_opens_with_the_active_set_highlighted_not_the_first_one() {
+        let names = ["alpha", "beta", "gamma"];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in names {
+            init_repo(&root.join(format!("repo-{name}")));
+        }
+
+        for (digit, expected) in [('1', "alpha"), ('2', "beta"), ('3', "gamma")] {
+            let mut app = test_app(&root);
+            app.document.sets = names
+                .iter()
+                .map(|name| set_config(name, &root))
+                .collect::<Vec<_>>();
+            app.switch_to_set(digit.to_digit(10).expect("a decimal digit") as u8);
+
+            app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+                .expect("open the picker");
+            let highlighted = render_to_lines(&mut app, 80, 24)
+                .into_iter()
+                .find(|line| line.contains("> "))
+                .expect("the picker always marks one row with its cursor");
+
+            assert!(
+                highlighted.contains(expected) && highlighted.contains("(active)"),
+                "the picker must open on {expected:?}, the Set being viewed, got: \
+                 {highlighted}"
+            );
+        }
     }
 
     /// Criterion 2: each digit names its own Set number, not the one before or after it.
