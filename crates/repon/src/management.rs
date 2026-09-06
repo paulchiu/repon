@@ -1034,8 +1034,13 @@ fn delete_one(
             // a directory on disk the parent has already forgotten and whose `.git`
             // file now dangles, which `git worktree repair` cannot fix.
             remove_working_tree(target.key.path())?;
-            if let Some(admin_dir) = &admin_dir {
-                let _ = fs::remove_dir_all(admin_dir);
+            let mut problems = Vec::new();
+            if let Some(admin_dir) = &admin_dir
+                && let Err(err) = fs::remove_dir_all(admin_dir)
+            {
+                problems.push(format!(
+                    "its administrative entry under its parent Repo would not clear: {err}"
+                ));
             }
             let config = clean_up_config(config_file, target.key.path());
             let removal = if admin_dir.is_some() {
@@ -1047,7 +1052,7 @@ fn delete_one(
                 Outcome::Removed {
                     removal,
                     config,
-                    problems: Vec::new(),
+                    problems,
                 },
                 vec![target.key.clone()],
             ))
@@ -1385,6 +1390,51 @@ mod tests {
         assert_eq!(
             report.records[0].outcome,
             removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn)
+        );
+    }
+
+    /// A Worktree whose own directory went but whose administrative entry under the parent
+    /// would not clear: still a removal, and one the result tells apart from the clean
+    /// `git worktree remove` it was not
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_worktree_whose_admin_entry_would_not_clear_is_told_apart_from_a_clean_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        // Named but never created, so `remove_dir_all` refuses it every time rather than
+        // racing a permission bit.
+        let admin_dir = dir.path().join("admin-that-was-never-there");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is still gone");
+        assert_ne!(
+            report.records[0].outcome,
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
+            "a removal whose administrative entry would not clear must not read as a clean one"
+        );
+        let said = describe(&report.records[0].outcome);
+        assert!(
+            said.contains("its administrative entry under its parent Repo would not clear"),
+            "and the receipt says what was left behind, got {said:?}"
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![entities[0].key.clone()],
+            "the directory went, so the row still leaves the table"
         );
     }
 

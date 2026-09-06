@@ -70,6 +70,8 @@ Worktree removal was ruled out of scope when this document first refused a linke
 
 A Worktree whose parent Repo cannot be opened, gone or otherwise unreadable, falls back to removing its working directory alone, with no administrative entry to clean up. That is reported as a directory removal rather than a clean worktree removal, never silently upgraded to one.
 
+An administrative entry that was found and would not clear is a third answer again. The working directory went, so the row leaves, and the receipt names the entry left under the parent rather than reading as the clean removal it was not.
+
 Deleting a Repo takes its linked Worktrees with it. Each one's own working directory sits outside the Repo's own and is not touched by removing that alone, so `delete` removes every linked Worktree's directory too, in the same run. A Worktree already in the same Selection as its parent Repo is not named or run as its own row: the Repo's own `delete` already destroys it, and naming it twice would report one removal as two.
 
 A linked Worktree that would not remove never stops the Repo's own removal, and it is named rather than dropped. Its directory is still on disk, so its row stays listed and stays out of what the run dismisses, and the Repo's own receipt says which one was left and why.
