@@ -70,7 +70,11 @@ Worktree removal was ruled out of scope when this document first refused a linke
 
 A Worktree whose parent Repo cannot be opened, gone or otherwise unreadable, falls back to removing its working directory alone, with no administrative entry to clean up. That is reported as a directory removal rather than a clean worktree removal, never silently upgraded to one.
 
+An administrative entry that was found and would not clear is a third answer again. The working directory went, so the row leaves, and the receipt names the entry left under the parent rather than reading as the clean removal it was not.
+
 Deleting a Repo takes its linked Worktrees with it. Each one's own working directory sits outside the Repo's own and is not touched by removing that alone, so `delete` removes every linked Worktree's directory too, in the same run. A Worktree already in the same Selection as its parent Repo is not named or run as its own row: the Repo's own `delete` already destroys it, and naming it twice would report one removal as two.
+
+A linked Worktree that would not remove never stops the Repo's own removal, and it is named rather than dropped. Its directory is still on disk, so its row stays listed and stays out of what the run dismisses, and the Repo's own receipt says which one was left and why.
 
 ## What `delete` leaves behind
 
@@ -79,6 +83,14 @@ Nothing in the list. A row whose working tree `delete` removed leaves the table 
 It is dropped rather than left to become Vanished. [core-api.md](core-api.md) gives `Vanished` to an entity a Generation found gone and says it leaves only when it is dismissed, which is the right rule for a disappearance behind Repon's back and the wrong one for a disappearance Repon caused: the user would be asked to acknowledge an absence they just asked for. Repon knows which it is, so `delete` dismisses the rows its own report names as removed, and `Vanished` keeps its meaning for the rest.
 
 Only the rows the report names as removed leave. A refused row still has a working tree, and so may a failed one, so both stay listed with the receipt saying why.
+
+Config is written after the directory has gone, so a write that fails leaves a removal that already happened. The row still goes: it is dismissed on the removal, never on the write, and the receipt names the write that did not finish beside the removal that did. The completion counts it too, as removed with cleanup unfinished, so the run never reads as a plain failure over a directory that is genuinely gone.
+
+Every other cleanup a `delete` runs behind a removal reads the same way. What did not finish is named in the receipt after the removal that did, and counted in the same completion, and it never moves a row: a directory still on disk keeps its row listed and stays out of what the run dismisses.
+
+What a run removed and what it reports on are counted separately. One selected parent is one receipt, and that one row's own `delete` confirms as many removals as it made: the Repo's own working tree and each linked Worktree the cascade took with it. Every one of those rows leaves the table and the Selection on the frame the run completes, so no row is left pointing at a directory that is gone. A directory the run could not remove is never counted among them.
+
+That holds when the receipt itself is a failure. A Repo whose own working tree would not remove after its cascade had already taken a linked Worktree still reports what went: the row that failed stays listed, since its directory is still there, and the rows over the directories that are gone leave with the run.
 
 A removed row's own receipt goes with it, since a receipt says what happened to a row a user can still look at. What that row got is still said twice: in the one-line Notice's counts and in the log line "Receipts" below reads its words from.
 
@@ -163,6 +175,7 @@ The run leaves one receipt per Selection row, labelled with the operation, carry
 | `delete` removed a Worktree cleanly and there was no entry | `Did` | worktree removed, no `[[repo]]` entry of its own |
 | `delete` fell back to a directory removal and an entry of its own | `Did` | directory removed, its parent Repo was unreadable, `[[repo]]` entry removed |
 | `delete` fell back to a directory removal and there was no entry | `Did` | directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own |
+| `delete` removed a tree and a cleanup behind it did not finish | `Did` | the removal's own words above, then each thing that would not finish and what went wrong |
 | `sync` fast-forwarded the branch | `Did` | fast-forwarded to its upstream |
 | `sync` fast-forwarded the branch but `after_sync` failed | `Did` | fast-forwarded to its upstream; after_sync hook failed, then what went wrong |
 | `ignore` on an excluded row an entry naming another path excludes | `Refused` | still ignored: the `[[repo]]` entry excluding it names another path |

@@ -422,6 +422,43 @@ fn plural(count: u32, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
 }
 
+/// Which of `delete`'s three removals one row confirmed, which is its receipt's own first
+/// clause ([repo-management.md](../../../docs/spec/repo-management.md)'s "Receipts").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// A Repo's working tree, along with every linked Worktree's own directory
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    WorkingTree,
+    /// A Worktree removed the way `git worktree remove` does: its own administrative entry
+    /// under the Repo it was linked from, then its own working directory.
+    Worktree,
+    /// A Worktree whose parent Repo could not be opened, so its own working directory alone
+    /// went, with no administrative entry to clean up.
+    Directory,
+}
+
+impl Removal {
+    /// The receipt's own first clause for this removal.
+    fn said(self) -> &'static str {
+        match self {
+            Removal::WorkingTree => "working tree removed",
+            Removal::Worktree => "worktree removed",
+            Removal::Directory => "directory removed, its parent Repo was unreadable",
+        }
+    }
+}
+
+/// What `delete` did about the `[[repo]]` entry naming the path it removed. Three answers
+/// rather than a flag: the write runs after the directory has gone, so it can fail with the
+/// removal it describes already a fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigCleanup {
+    EntryRemoved,
+    NoEntryOfItsOwn,
+    Failed(String),
+}
+
 /// What running the operation did to one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -436,20 +473,19 @@ pub(crate) enum Outcome {
     /// would show all of them again, which is not what this row asked for, so nothing is
     /// written and the row says so.
     ExcludedByAnInheritedEntry,
-    /// A Repo's working tree is gone, along with every linked Worktree's own directory
-    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Deleting a Repo also
-    /// takes its linked Worktrees with it"), and `config_entry_removed` says whether an
-    /// entry of the Repo's own went with it.
-    Deleted { config_entry_removed: bool },
-    /// A Worktree was removed the way `git worktree remove` does: its own administrative
-    /// entry under the Repo it was linked from, then its own working directory.
-    /// `config_entry_removed` says whether an entry of its own went with it.
-    WorktreeRemoved { config_entry_removed: bool },
-    /// A Worktree's parent Repo could not be opened, so only its own working directory was
-    /// removed, with no administrative entry cleaned up: a bare directory removal rather
-    /// than a clean `git worktree remove`. `config_entry_removed` says whether an entry of
-    /// its own went with it.
-    DirectoryRemoved { config_entry_removed: bool },
+    /// A working tree `delete` confirmed gone, and what it then did about the `[[repo]]`
+    /// entry naming the path. The removal is a fact by the time `config` is read, so a
+    /// failing write is reported beside it rather than in place of it
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    Removed {
+        removal: Removal,
+        config: ConfigCleanup,
+        /// What would not finish behind the removal: a linked Worktree the cascade could
+        /// not take, or an administrative entry that would not clear. Empty on a removal
+        /// that left nothing.
+        problems: Vec<String>,
+    },
     /// `sync` fast-forwarded the Repo's branch to its upstream.
     Synced,
     /// `sync` attempted the Repo and the auto-update's own five rules found it not eligible
@@ -544,32 +580,11 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
     match outcome {
         Outcome::Ignored => OwnWork::Did(Arc::from("ignored")),
         Outcome::Unignored => OwnWork::Did(Arc::from("no longer ignored")),
-        Outcome::Deleted {
-            config_entry_removed: true,
-        } => OwnWork::Did(Arc::from("working tree removed, `[[repo]]` entry removed")),
-        Outcome::Deleted {
-            config_entry_removed: false,
-        } => OwnWork::Did(Arc::from(
-            "working tree removed, no `[[repo]]` entry of its own",
-        )),
-        Outcome::WorktreeRemoved {
-            config_entry_removed: true,
-        } => OwnWork::Did(Arc::from("worktree removed, `[[repo]]` entry removed")),
-        Outcome::WorktreeRemoved {
-            config_entry_removed: false,
-        } => OwnWork::Did(Arc::from(
-            "worktree removed, no `[[repo]]` entry of its own",
-        )),
-        Outcome::DirectoryRemoved {
-            config_entry_removed: true,
-        } => OwnWork::Did(Arc::from(
-            "directory removed, its parent Repo was unreadable, `[[repo]]` entry removed",
-        )),
-        Outcome::DirectoryRemoved {
-            config_entry_removed: false,
-        } => OwnWork::Did(Arc::from(
-            "directory removed, its parent Repo was unreadable, no `[[repo]]` entry of its own",
-        )),
+        Outcome::Removed {
+            removal,
+            config,
+            problems,
+        } => OwnWork::Did(Arc::from(removed_words(*removal, config, problems))),
         Outcome::ExcludedByAnInheritedEntry => OwnWork::Refused(Arc::from(
             "still ignored: the `[[repo]]` entry excluding it names another path",
         )),
@@ -591,6 +606,33 @@ pub(crate) fn own_work(outcome: &Outcome) -> OwnWork {
     }
 }
 
+/// One removal's own sentence: what went, then what became of the `[[repo]]` entry naming
+/// it, then whatever would not finish behind it. Anything that failed is named after the
+/// removal rather than instead of it.
+fn removed_words(removal: Removal, config: &ConfigCleanup, problems: &[String]) -> String {
+    let said = match config {
+        ConfigCleanup::EntryRemoved => format!("{}, `[[repo]]` entry removed", removal.said()),
+        ConfigCleanup::NoEntryOfItsOwn => {
+            format!("{}, no `[[repo]]` entry of its own", removal.said())
+        }
+        ConfigCleanup::Failed(error) => format!(
+            "{}; its `[[repo]]` entry could not be removed: {error}",
+            removal.said()
+        ),
+    };
+    with_problems(said, problems)
+}
+
+/// `said` with each thing that would not finish named after it, the one place a receipt
+/// appends them so a removal and a failure read the same way.
+fn with_problems(mut said: String, problems: &[String]) -> String {
+    for problem in problems {
+        said.push_str("; ");
+        said.push_str(problem);
+    }
+    said
+}
+
 /// One outcome as a sentence, for the log line each row gets after a run. Read out of
 /// [`own_work`] rather than written a second time, so the log and the detail pane always say
 /// the same thing about the same row.
@@ -598,12 +640,20 @@ pub(crate) fn describe(outcome: &Outcome) -> String {
     own_work(outcome).said().to_string()
 }
 
-/// One row: which Entity, its name, what happened to it, and how long that took.
+/// One row: which Entity, its name, what happened to it, what its work confirmed gone, and
+/// how long that took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Record {
     pub(crate) key: EntityKey,
     pub(crate) name: Arc<str>,
     pub(crate) outcome: Outcome,
+    /// Every Entity whose working directory this row's own work confirmed gone: the row
+    /// itself for a `delete` that removed it, plus each linked Worktree the cascade took
+    /// with it. Separate from `outcome` because a confirmed removal is a fact about the
+    /// filesystem and an outcome is a verdict on the selected row, so a row that failed
+    /// still carries whatever its cascade had already taken, and a row that removed
+    /// nothing carries none.
+    pub(crate) removed: Vec<EntityKey>,
     /// What the act itself took. Real rather than nominal: `delete` walks a whole working
     /// tree, which is the one management operation that can visibly stall.
     pub(crate) elapsed: Duration,
@@ -633,23 +683,17 @@ impl Report {
             .collect()
     }
 
-    /// The rows whose working tree this run removed, for the caller to drop from the table
-    /// itself ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete`
-    /// leaves behind"). Repon caused these absences, so they never become Vanished, which
-    /// asks the user to acknowledge one it did not cause. A refused or failed row is not
-    /// here: its working tree is, or may still be, on disk.
+    /// Every Entity this run confirmed gone, for the caller to drop from the table itself
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind"). Repon caused these absences, so they never become Vanished, which asks the
+    /// user to acknowledge one it did not cause. Read off each row's own confirmed removals
+    /// rather than off its outcome, so a Repo's row brings the linked Worktrees its cascade
+    /// took with it and a row whose working tree is, or may still be, on disk brings
+    /// nothing.
     pub(crate) fn removed_keys(&self) -> Vec<EntityKey> {
         self.records
             .iter()
-            .filter(|record| {
-                matches!(
-                    record.outcome,
-                    Outcome::Deleted { .. }
-                        | Outcome::WorktreeRemoved { .. }
-                        | Outcome::DirectoryRemoved { .. }
-                )
-            })
-            .map(|record| record.key.clone())
+            .flat_map(|record| record.removed.iter().cloned())
             .collect()
     }
 
@@ -661,33 +705,24 @@ impl Report {
         let mut not_eligible = 0usize;
         let mut failed = 0usize;
         let mut after_hook_failed = 0usize;
+        let mut cleanup_unfinished = 0usize;
         for record in &self.records {
             if matches!(record.outcome, Outcome::SyncedAfterHookFailed(_)) {
                 after_hook_failed += 1;
             }
-            match record.outcome {
+            match &record.outcome {
                 Outcome::Ignored
                 | Outcome::Unignored
                 | Outcome::Synced
-                | Outcome::SyncedAfterHookFailed(_)
-                | Outcome::Deleted {
-                    config_entry_removed: true,
+                | Outcome::SyncedAfterHookFailed(_) => done += 1,
+                Outcome::Removed {
+                    config, problems, ..
+                } => {
+                    done += 1;
+                    if matches!(config, ConfigCleanup::Failed(_)) || !problems.is_empty() {
+                        cleanup_unfinished += 1;
+                    }
                 }
-                | Outcome::Deleted {
-                    config_entry_removed: false,
-                }
-                | Outcome::WorktreeRemoved {
-                    config_entry_removed: true,
-                }
-                | Outcome::WorktreeRemoved {
-                    config_entry_removed: false,
-                }
-                | Outcome::DirectoryRemoved {
-                    config_entry_removed: true,
-                }
-                | Outcome::DirectoryRemoved {
-                    config_entry_removed: false,
-                } => done += 1,
                 Outcome::ExcludedByAnInheritedEntry => unchanged += 1,
                 Outcome::NotEligibleToSync(_) => not_eligible += 1,
                 Outcome::Refused(_) => refused += 1,
@@ -709,6 +744,11 @@ impl Report {
         }
         if after_hook_failed > 0 {
             parts.push(format!("{after_hook_failed} after_sync hook failed"));
+        }
+        if cleanup_unfinished > 0 {
+            parts.push(format!(
+                "{cleanup_unfinished} removed with cleanup unfinished"
+            ));
         }
         format!("{}: {}", self.operation.name(), parts.join(", "))
     }
@@ -757,8 +797,8 @@ pub(crate) fn run_one_record(
     run_after_sync_hook: impl Fn(&EntityKey) -> Option<HookOutcome>,
 ) -> Record {
     let started = Instant::now();
-    let outcome = match target.eligibility {
-        Eligibility::Refused(refusal) => Outcome::Refused(refusal),
+    let (outcome, removed) = match target.eligibility {
+        Eligibility::Refused(refusal) => (Outcome::Refused(refusal), Vec::new()),
         Eligibility::Eligible => run_one(
             plan.operation,
             target,
@@ -770,12 +810,13 @@ pub(crate) fn run_one_record(
             &run_before_sync_hook,
             &run_after_sync_hook,
         )
-        .unwrap_or_else(|err| Outcome::Failed(format!("{err:#}"))),
+        .unwrap_or_else(|err| (Outcome::Failed(format!("{err:#}")), Vec::new())),
     };
     Record {
         key: target.key.clone(),
         name: Arc::clone(&target.name),
         outcome,
+        removed,
         elapsed: started.elapsed(),
     }
 }
@@ -835,18 +876,18 @@ fn run_one(
     attempt_sync: &impl Fn(&EntityKey) -> AutoUpdateAttempt,
     run_before_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
     run_after_sync_hook: &impl Fn(&EntityKey) -> Option<HookOutcome>,
-) -> Result<Outcome> {
+) -> Result<(Outcome, Vec<EntityKey>)> {
     match operation {
         Operation::Ignore if target.excluded => {
             if repo_entry::write(config_file, target.key.path(), Edit::Unexclude)?.changed {
-                Ok(Outcome::Unignored)
+                Ok((Outcome::Unignored, Vec::new()))
             } else {
-                Ok(Outcome::ExcludedByAnInheritedEntry)
+                Ok((Outcome::ExcludedByAnInheritedEntry, Vec::new()))
             }
         }
         Operation::Ignore => {
             repo_entry::write(config_file, target.key.path(), Edit::Exclude)?;
-            Ok(Outcome::Ignored)
+            Ok((Outcome::Ignored, Vec::new()))
         }
         Operation::Delete => delete_one(
             target,
@@ -855,11 +896,14 @@ fn run_one(
             linked_worktree_paths,
             ignored_directories_for_deletion,
         ),
-        Operation::Sync => Ok(sync_one(
-            target,
-            attempt_sync,
-            run_before_sync_hook,
-            run_after_sync_hook,
+        Operation::Sync => Ok((
+            sync_one(
+                target,
+                attempt_sync,
+                run_before_sync_hook,
+                run_after_sync_hook,
+            ),
+            Vec::new(),
         )),
     }
 }
@@ -953,22 +997,47 @@ fn delete_one(
     worktree_admin_dir: &impl Fn(&EntityKey) -> Option<PathBuf>,
     linked_worktree_paths: &impl Fn(&EntityKey) -> Vec<PathBuf>,
     ignored_directories_for_deletion: &impl Fn(&Path) -> Vec<PathBuf>,
-) -> Result<Outcome> {
+) -> Result<(Outcome, Vec<EntityKey>)> {
     match target.kind {
         Kind::Repo => {
+            let mut removed = Vec::new();
+            let mut problems = Vec::new();
             for worktree in linked_worktree_paths(&target.key) {
+                // Read before the directory goes, since resolving needs it on disk.
+                let key = worktree_key(&worktree);
                 delete_ignored_directories(ignored_directories_for_deletion(&worktree));
-                // Best effort: a sibling Worktree that will not remove is not this row's own
-                // outcome, and the Repo's own removal below is what the report names.
-                let _ = remove_working_tree(&worktree);
+                // Best effort: a sibling Worktree that will not remove never stops the
+                // Repo's own removal below. Only the ones that did go are staged, and the
+                // ones that did not are named, so the report claims no directory that is
+                // still on disk.
+                match remove_working_tree(&worktree) {
+                    Ok(()) => removed.push(key),
+                    Err(err) => problems.push(format!(
+                        "its linked Worktree at {} would not remove: {err:#}",
+                        worktree.display()
+                    )),
+                }
             }
             delete_ignored_directories(ignored_directories_for_deletion(target.key.path()));
-            remove_working_tree(target.key.path())?;
-            let config_entry_removed =
-                repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
-            Ok(Outcome::Deleted {
-                config_entry_removed,
-            })
+            if let Err(err) = remove_working_tree(target.key.path()) {
+                // What the cascade already took is a fact whatever becomes of the Repo's
+                // own tree, so it is reported rather than thrown away with the error: a
+                // directory that is gone must not be left with a row pointing at it.
+                return Ok((
+                    Outcome::Failed(with_problems(format!("{err:#}"), &problems)),
+                    removed,
+                ));
+            }
+            removed.push(target.key.clone());
+            let config = clean_up_config(config_file, target.key.path());
+            Ok((
+                Outcome::Removed {
+                    removal: Removal::WorkingTree,
+                    config,
+                    problems,
+                },
+                removed,
+            ))
         }
         Kind::Worktree => {
             // Read before either removal runs: once the working tree is gone, its own
@@ -982,24 +1051,57 @@ fn delete_one(
             // a directory on disk the parent has already forgotten and whose `.git`
             // file now dangles, which `git worktree repair` cannot fix.
             remove_working_tree(target.key.path())?;
-            if let Some(admin_dir) = &admin_dir {
-                let _ = fs::remove_dir_all(admin_dir);
+            let mut problems = Vec::new();
+            // An entry the parent Repo has already pruned is nothing to clear, so only an
+            // entry that is there and refuses is named.
+            if let Some(admin_dir) = &admin_dir
+                && let Err(err) = fs::remove_dir_all(admin_dir)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                problems.push(format!(
+                    "its administrative entry under its parent Repo would not clear: {err}"
+                ));
             }
-            let config_entry_removed =
-                repo_entry::write(config_file, target.key.path(), Edit::Remove)?.removed_repo_entry;
-            Ok(if admin_dir.is_some() {
-                Outcome::WorktreeRemoved {
-                    config_entry_removed,
-                }
+            let config = clean_up_config(config_file, target.key.path());
+            let removal = if admin_dir.is_some() {
+                Removal::Worktree
             } else {
-                Outcome::DirectoryRemoved {
-                    config_entry_removed,
-                }
-            })
+                Removal::Directory
+            };
+            Ok((
+                Outcome::Removed {
+                    removal,
+                    config,
+                    problems,
+                },
+                vec![target.key.clone()],
+            ))
         }
         Kind::Submodule => {
             unreachable!("a Submodule is always refused before `delete` reaches a row")
         }
+    }
+}
+
+/// The key naming the linked Worktree at `path`, resolved the way discovery resolves every
+/// key it makes: git's own register need not spell the directory that way, and a key that
+/// matches no row is a row nothing drops. Falls back to the register's own spelling when the
+/// path will not resolve, which is the best guess left.
+fn worktree_key(path: &Path) -> EntityKey {
+    let resolved = path.canonicalize();
+    EntityKey::new(Arc::from(resolved.as_deref().unwrap_or(path)))
+}
+
+/// `delete`'s config half, run once the working tree is gone: the `[[repo]]` entry naming
+/// the removed path, and that path from every `[[set]]` array naming it
+/// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config"). A write
+/// that fails is reported rather than propagated, since the directory it describes has
+/// already gone and the row it belongs to is removed either way.
+fn clean_up_config(config_file: &Path, path: &Path) -> ConfigCleanup {
+    match repo_entry::write(config_file, path, Edit::Remove) {
+        Ok(written) if written.removed_repo_entry => ConfigCleanup::EntryRemoved,
+        Ok(_) => ConfigCleanup::NoEntryOfItsOwn,
+        Err(err) => ConfigCleanup::Failed(format!("{err:#}")),
     }
 }
 
@@ -1008,8 +1110,9 @@ fn delete_one(
 /// The path comes from the key discovery resolved, or from git's own worktree register for
 /// a cascading Repo delete, never from config, an environment variable or the working
 /// directory. The two guards below can only refuse: a relative path is one neither source
-/// ever produces (an [`EntityKey`] is a resolved absolute working directory, and git's own
-/// register writes absolute paths), and a directory with no `.git` in it is not the Repo or
+/// ever produces (an [`EntityKey`] is a resolved absolute working directory, and the path
+/// git's own register hands back is absolute however the register itself spelled it), and a
+/// directory with no `.git` in it is not the Repo or
 /// Worktree this call named, so either means something other than the intended one is about
 /// to be removed permanently.
 fn remove_working_tree(path: &Path) -> Result<()> {
@@ -1098,6 +1201,16 @@ mod tests {
             |_| panic!("run_plain declares no before_sync hook"),
             |_| panic!("run_plain declares no after_sync hook"),
         )
+    }
+
+    /// [`Outcome::Removed`] with nothing left behind, the shape every fixture that is not
+    /// itself about an unfinished cleanup produces.
+    fn removed(removal: Removal, config: ConfigCleanup) -> Outcome {
+        Outcome::Removed {
+            removal,
+            config,
+            problems: Vec::new(),
+        }
     }
 
     /// The three names, and their order, come from repo-management.md's own operations table
@@ -1222,9 +1335,7 @@ mod tests {
             vec![
                 (
                     "repo".to_string(),
-                    Outcome::Deleted {
-                        config_entry_removed: false
-                    }
+                    removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
                 ),
                 (
                     "sub".to_string(),
@@ -1265,9 +1376,7 @@ mod tests {
 
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Deleted {
-                config_entry_removed: false
-            },
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
             "the Set naming it is not a `[[repo]]` entry of its own"
         );
         let written = std::fs::read_to_string(&config_file).expect("read config.toml back");
@@ -1310,9 +1419,133 @@ mod tests {
         assert!(!admin_dir.exists(), "its administrative entry is gone too");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::WorktreeRemoved {
-                config_entry_removed: false
-            }
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn)
+        );
+    }
+
+    /// A Worktree whose own directory went but whose administrative entry under the parent
+    /// would not clear: still a removal, and one the result tells apart from the clean
+    /// `git worktree remove` it was not
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_worktree_whose_admin_entry_would_not_clear_is_told_apart_from_a_clean_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        // A file where the entry should be, so `remove_dir_all` refuses it every time
+        // rather than racing a permission bit.
+        let admin_dir = dir.path().join("admin-that-is-a-file");
+        std::fs::write(&admin_dir, "not a directory").expect("create the admin fixture");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is still gone");
+        assert!(
+            matches!(
+                &report.records[0].outcome,
+                Outcome::Removed { removal, problems, .. }
+                    if *removal == Removal::Worktree && problems.len() == 1
+            ),
+            "a removal whose administrative entry would not clear carries what it left, got \
+             {:?}",
+            report.records[0].outcome
+        );
+        let said = describe(&report.records[0].outcome);
+        assert!(
+            said.contains("its administrative entry under its parent Repo would not clear"),
+            "and the receipt says what was left behind, got {said:?}"
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![entities[0].key.clone()],
+            "the directory went, so the row still leaves the table"
+        );
+    }
+
+    /// A working tree that went and a `config.toml` write that did not are two facts, and
+    /// the receipt carries both: the removal first, then the write that failed behind it,
+    /// so the row never reads as the clean removal it was not
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_removal_whose_config_write_failed_names_the_write_after_the_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A directory where the file goes, so every read of the config path fails on its
+        // first byte rather than racing a permission bit.
+        let config_file = dir.path().join("config.toml");
+        std::fs::create_dir(&config_file).expect("put a directory where the config file goes");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+
+        let report = run_plain(&plan(Operation::Delete, &entities), &config_file);
+
+        assert!(!repo.exists(), "the working tree is genuinely gone");
+        let said = describe(&report.records[0].outcome);
+        assert!(
+            said.starts_with("working tree removed; its `[[repo]]` entry could not be removed: "),
+            "the receipt names the removal, then the write that did not finish, got {said:?}"
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![entities[0].key.clone()],
+            "the row leaves on the removal, never on the write"
+        );
+        assert_eq!(
+            report.summary(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "and the completion carries both halves"
+        );
+    }
+
+    /// An administrative entry that is already gone is nothing to clear rather than a
+    /// cleanup that failed: the removal reads clean, and the completion does not count a
+    /// row against work no one has left to do
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_worktree_whose_admin_entry_was_already_pruned_reads_as_a_clean_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_file = dir.path().join("config.toml");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("create the worktree fixture");
+        // What a dangling `.git` file names: an entry the parent Repo has already pruned.
+        let admin_dir = dir.path().join("admin-that-was-never-there");
+        let entities = vec![entity(&tree, "tree", Kind::Worktree)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| Some(admin_dir.clone()),
+            |_| Vec::new(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!tree.exists(), "the Worktree's own directory is gone");
+        assert_eq!(
+            report.records[0].outcome,
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
+            "nothing was left behind, so nothing is named"
+        );
+        assert_eq!(
+            report.summary(),
+            "delete: 1 done",
+            "and the completion counts one plain removal"
         );
     }
 
@@ -1381,9 +1614,7 @@ mod tests {
         assert!(!tree.exists(), "the Worktree's own directory is still gone");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::DirectoryRemoved {
-                config_entry_removed: false
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1420,9 +1651,99 @@ mod tests {
         assert!(!sibling_two.exists(), "the second linked Worktree is gone");
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Deleted {
-                config_entry_removed: false
-            }
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
+        );
+    }
+
+    /// A Repo whose own working tree would not remove after its cascade already took a
+    /// linked Worktree: what went is still reported, so the rows over those directories
+    /// leave the table rather than being left to become Vanished
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_repo_whose_own_removal_fails_still_reports_what_its_cascade_took() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temp dir");
+        let config_file = root.join("config.toml");
+        // No `.git` in it, so `remove_working_tree`'s own guard refuses the Repo once the
+        // cascade has already run.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create the repo fixture");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(sibling.join(".git")).expect("create the linked Worktree");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+        let siblings = [sibling.clone()];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| siblings.to_vec(),
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!sibling.exists(), "the cascade's own removal is a fact");
+        assert!(
+            repo.exists(),
+            "and the Repo's own working tree is still on disk"
+        );
+        assert!(
+            matches!(report.records[0].outcome, Outcome::Failed(_)),
+            "the selected row itself failed, got {:?}",
+            report.records[0].outcome
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![EntityKey::new(Arc::from(sibling.as_path()))],
+            "and the directory that did go is still what the run dismisses"
+        );
+    }
+
+    /// The key a cascade reports is the resolved path, never git's own register entry
+    /// verbatim: discovery keys every row by a resolved absolute directory, and a key that
+    /// misses one is a row nothing drops.
+    #[test]
+    fn a_cascade_reports_the_resolved_key_for_a_worktree_git_records_unresolved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temp dir");
+        let config_file = root.join("config.toml");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(sibling.join(".git")).expect("create the linked Worktree");
+        // The shape git's own register hands back for an entry it recorded relative to the
+        // Repo: the right directory, spelled a way no discovered key is.
+        let as_recorded = repo.join("..").join("sibling");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| vec![as_recorded.clone()],
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!sibling.exists(), "the linked Worktree is gone");
+        assert_eq!(
+            report.removed_keys(),
+            vec![
+                EntityKey::new(Arc::from(sibling.as_path())),
+                entities[0].key.clone(),
+            ],
+            "each key names the directory discovery would have keyed the row by"
         );
     }
 
@@ -1511,9 +1832,7 @@ mod tests {
         assert_eq!(asked.into_inner(), vec![tree.clone()]);
         assert_eq!(
             report.records[0].outcome,
-            Outcome::DirectoryRemoved {
-                config_entry_removed: false
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1553,9 +1872,7 @@ mod tests {
         assert_eq!(asked, expected);
         assert_eq!(
             report.records[0].outcome,
-            Outcome::Deleted {
-                config_entry_removed: false
-            }
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1592,9 +1909,7 @@ mod tests {
         );
         assert_eq!(
             report.records[0].outcome,
-            Outcome::DirectoryRemoved {
-                config_entry_removed: false
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -1639,9 +1954,7 @@ mod tests {
         );
         assert_eq!(
             report.records[0].outcome,
-            Outcome::DirectoryRemoved {
-                config_entry_removed: false
-            }
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn)
         );
     }
 
@@ -2287,39 +2600,27 @@ mod tests {
             (Outcome::Ignored, "Did"),
             (Outcome::Unignored, "Did"),
             (
-                Outcome::Deleted {
-                    config_entry_removed: true,
-                },
+                removed(Removal::WorkingTree, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::Deleted {
-                    config_entry_removed: false,
-                },
+                removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (
-                Outcome::WorktreeRemoved {
-                    config_entry_removed: true,
-                },
+                removed(Removal::Worktree, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::WorktreeRemoved {
-                    config_entry_removed: false,
-                },
+                removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (
-                Outcome::DirectoryRemoved {
-                    config_entry_removed: true,
-                },
+                removed(Removal::Directory, ConfigCleanup::EntryRemoved),
                 "Did",
             ),
             (
-                Outcome::DirectoryRemoved {
-                    config_entry_removed: false,
-                },
+                removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn),
                 "Did",
             ),
             (Outcome::ExcludedByAnInheritedEntry, "Refused"),
@@ -2370,24 +2671,12 @@ mod tests {
         for outcome in [
             Outcome::Ignored,
             Outcome::Unignored,
-            Outcome::Deleted {
-                config_entry_removed: true,
-            },
-            Outcome::Deleted {
-                config_entry_removed: false,
-            },
-            Outcome::WorktreeRemoved {
-                config_entry_removed: true,
-            },
-            Outcome::WorktreeRemoved {
-                config_entry_removed: false,
-            },
-            Outcome::DirectoryRemoved {
-                config_entry_removed: true,
-            },
-            Outcome::DirectoryRemoved {
-                config_entry_removed: false,
-            },
+            removed(Removal::WorkingTree, ConfigCleanup::EntryRemoved),
+            removed(Removal::WorkingTree, ConfigCleanup::NoEntryOfItsOwn),
+            removed(Removal::Worktree, ConfigCleanup::EntryRemoved),
+            removed(Removal::Worktree, ConfigCleanup::NoEntryOfItsOwn),
+            removed(Removal::Directory, ConfigCleanup::EntryRemoved),
+            removed(Removal::Directory, ConfigCleanup::NoEntryOfItsOwn),
             Outcome::ExcludedByAnInheritedEntry,
         ] {
             let said = describe(&outcome);

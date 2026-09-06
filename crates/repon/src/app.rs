@@ -6767,7 +6767,7 @@ mod tests {
 
     /// `delete` on a Repo with no `[[repo]]` entry of its own: the working tree still goes,
     /// and the report says there was no entry rather than claiming one was removed. The
-    /// negative half of the test above, so neither branch of `config_entry_removed` can be
+    /// negative half of the test above, so neither answer the config cleanup can give is
     /// hard-coded.
     #[test]
     fn delete_on_a_repo_with_no_entry_of_its_own_removes_the_tree_and_says_there_was_no_entry() {
@@ -7097,7 +7097,11 @@ mod tests {
 
     /// Criterion "one removal, reported once": a Worktree selected alongside the parent Repo
     /// it is linked from is not named as its own row in the gate or the report, since the
-    /// Repo's own `delete` already takes it with it.
+    /// Repo's own `delete` already takes it with it. Both directories go, so both rows leave
+    /// the table and the Selection the moment the run completes, while the gate and the
+    /// completion still count the one selected parent
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
     #[test]
     fn deleting_a_worktree_and_its_parent_repo_together_is_one_removal_reported_once() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7130,6 +7134,106 @@ mod tests {
         assert!(
             !worktree.exists(),
             "the Repo's own delete must take its linked Worktree with it"
+        );
+        assert_eq!(
+            visible_names_sorted(&app),
+            Vec::<String>::new(),
+            "both removed rows leave the rendered list, with no refresh"
+        );
+        assert!(
+            app.selection.is_empty(),
+            "and neither is left in the Selection pointing at a directory that is gone"
+        );
+        let frame = render_to_lines(&mut app, 80, 24).join("\n");
+        assert!(
+            frame.contains("delete: 1 done"),
+            "the completion still counts the one selected parent, got:\n{frame}"
+        );
+    }
+
+    /// A working tree that went and a `config.toml` write that did not are two facts, and
+    /// the run reports both: the row leaves the table, since its directory is genuinely
+    /// gone, and the completion names the removal alongside the cleanup that did not finish
+    /// rather than one undifferentiated failure
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_delete_whose_config_write_fails_still_drops_the_row_and_reports_both_halves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        // A directory where the file was: every read of the config path now fails on its
+        // first byte, which is deterministic where a permission bit would be a race.
+        let config_file = app.config_file.clone();
+        std::fs::remove_file(&config_file).expect("remove the config file");
+        std::fs::create_dir(&config_file).expect("put a directory in its place");
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        wait_for_management_run(&mut app);
+
+        assert!(!repo.exists(), "the working tree is genuinely gone");
+        assert_eq!(
+            visible_names_sorted(&app),
+            Vec::<String>::new(),
+            "so the removed row leaves the table rather than pointing at nothing"
+        );
+        assert_eq!(
+            app.notice().unwrap_or_default(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "the completion names the removal and the cleanup that did not finish, both"
+        );
+    }
+
+    /// A linked Worktree the cascade could not remove is still on disk, so its row stays
+    /// listed and stays out of the dismissal set, and the run says so rather than reporting
+    /// a clean removal over a directory it left behind
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` does to
+    /// a Worktree").
+    #[test]
+    fn a_linked_worktree_the_cascade_could_not_remove_is_reported_and_stays_listed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let worktree = root.join("sidecar");
+        worktree_add(&repo, &worktree, "sidecar");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        let repo_key = app
+            .core
+            .snapshot()
+            .entities
+            .iter()
+            .find(|entity| entity.name.as_ref() == "repo-a")
+            .expect("the Repo row is discovered")
+            .key
+            .clone();
+        app.selection.toggle(repo_key);
+        // `remove_working_tree`'s own guard refuses a directory with no `.git` in it, which
+        // is a deterministic refusal where a permission bit would be a race.
+        std::fs::remove_file(worktree.join(".git")).expect("remove the Worktree's .git file");
+
+        press_through_the_management_gate(&mut app, management::Operation::Delete);
+
+        assert!(!repo.exists(), "the Repo's own working tree is gone");
+        assert!(
+            worktree.exists(),
+            "the linked Worktree the cascade refused is still on disk"
+        );
+        assert_eq!(
+            visible_names_sorted(&app),
+            vec!["sidecar".to_string()],
+            "so its row stays listed rather than being dismissed with the parent"
+        );
+        assert_eq!(
+            app.notice().unwrap_or_default(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "and the completion says the run left something behind"
         );
     }
 
