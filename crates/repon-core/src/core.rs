@@ -12707,6 +12707,59 @@ mod tests {
             );
         }
 
+        /// A tick arriving while a cycle is live is refused, not queued and not run beside
+        /// it: two cycles over the same population would fetch and fast-forward the same
+        /// repositories at once. The clock takes both further ticks off the channel while the
+        /// first cycle is provably still held, which is what makes the refusal the reading
+        /// here rather than a scheduling delay.
+        #[test]
+        fn a_fetch_tick_taken_while_a_cycle_is_live_starts_no_second_cycle() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            // A second handle on the same queue, read but never received from: the clock
+            // emptying it is what says both further ticks have been taken.
+            let pending_ticks = fetch_tick_rx.clone();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send the tick that starts the cycle");
+            held.wait_until_reached();
+
+            for _ in 0..2 {
+                fetch_tick_tx
+                    .send(Instant::now())
+                    .expect("send a tick while the cycle is live");
+            }
+            wait_for("the clock to take both further ticks", || {
+                pending_ticks.is_empty()
+            });
+
+            drop(held);
+            wait_for("the released cycle to be taken back by the clock", || {
+                started.fetch_cycles_finished.load(Ordering::Acquire) >= 1
+            });
+
+            assert_eq!(
+                core.fetch_cycle_count_for_test(),
+                1,
+                "two ticks taken while a cycle was held must have started no cycle of their \
+                 own"
+            );
+        }
+
         /// Points `repo`'s `origin` at a path nothing lives at, breaking `fetch_and_prune`
         /// alone: discovery has already found `repo` as a real Repo before this runs, so
         /// only the fetch itself fails, never the walk. A local path rather than a loopback
