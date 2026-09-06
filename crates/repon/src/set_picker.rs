@@ -39,7 +39,8 @@ pub(crate) const BORDER_TITLE: &str = " sets ";
 /// themselves: [`crate::app::App`] hands [`Self::apply`] and [`Self::draw`] the live
 /// `document.sets` on every call, the same pattern
 /// [`crate::action_palette::ActionPalette`] uses for `document.actions`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct SetPicker {
     cursor: usize,
 }
@@ -236,6 +237,32 @@ mod tests {
             before_sync: None,
             after_sync: None,
         }
+    }
+
+    #[test]
+    fn opened_on_puts_the_cursor_on_the_active_set_wherever_it_sits_in_file_order() {
+        let sets = [set("alpha"), set("beta"), set("gamma")];
+
+        for (name, expected) in [("alpha", 0), ("beta", 1), ("gamma", 2)] {
+            assert_eq!(SetPicker::opened_on(&sets, name).cursor(), expected);
+        }
+    }
+
+    /// The floor rather than a case: the active Set is always one of the declared ones, so
+    /// this only fires if that stops being true, and opening on row 0 beats not opening.
+    #[test]
+    fn opened_on_a_name_matching_no_declared_set_falls_back_to_the_first_row() {
+        let sets = [set("alpha"), set("beta")];
+
+        assert_eq!(
+            SetPicker::opened_on(&sets, "deleted-from-config").cursor(),
+            0
+        );
+    }
+
+    #[test]
+    fn opened_on_no_declared_sets_at_all_leaves_the_cursor_at_the_top() {
+        assert_eq!(SetPicker::opened_on(&[], "alpha").cursor(), 0);
     }
 
     /// The `TestBackend` area every test below draws into: named once so a test computing

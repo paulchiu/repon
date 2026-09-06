@@ -2181,10 +2181,10 @@ impl App {
         let palette = self.action_palette.as_ref()?;
         // A live gate's own count, so the border and the gate can never name two numbers.
         if let Some(plan) = &self.management_plan {
-            return Some(Count::over(plan.scope, plan.eligible_count()));
+            return Some(Count::unnarrowed(plan.scope, plan.eligible_count()));
         }
         let Some(cursor_key) = self.cursor_key() else {
-            return Some(Count::over(RunScope::Selection, 0));
+            return Some(Count::unnarrowed(RunScope::EveryVisibleRow, 0));
         };
         Some(match palette.highlighted(&self.document.actions) {
             // A built-in subtracts its own ineligible rows rather than the excluded ones
@@ -2198,7 +2198,7 @@ impl App {
                     operation,
                     self.management_targets(operation, &cursor_key),
                 );
-                Count::over(plan.scope, plan.eligible_count())
+                Count::unnarrowed(plan.scope, plan.eligible_count())
             }
             Some(Entry::Configured(_)) | None => {
                 self.narrowed_count(palette, &self.action_targets())
@@ -2215,17 +2215,10 @@ impl App {
     /// reached, and the border title and the confirm gate both count from here so neither
     /// can name a number the run would not act on.
     fn action_targets(&self) -> Targets {
-        if self.selection.is_empty() {
-            Targets {
-                keys: self.visible_keys(),
-                scope: RunScope::EveryVisibleRow,
-            }
-        } else {
-            Targets {
-                keys: self.selection.checked(),
-                scope: RunScope::Selection,
-            }
-        }
+        self.selection.resolve(|| Targets {
+            keys: self.visible_keys(),
+            scope: RunScope::EveryVisibleRow,
+        })
     }
 
     /// A management operation's own targets: [`Self::action_targets`] or
@@ -2255,7 +2248,7 @@ impl App {
             .narrowing_entry(&self.document.actions)
             .and_then(|action| Some((action, action.when.as_deref()?)));
         let Some((action, when)) = when else {
-            return Count::over(targets.scope, self.core.operable_count(&targets.keys));
+            return Count::unnarrowed(targets.scope, self.core.operable_count(&targets.keys));
         };
         let applicability = self.core.applicability(&targets.keys, &Filter::parse(when));
         Count {
@@ -2367,7 +2360,11 @@ impl App {
             return;
         }
         self.action_palette = None;
-        self.set_notice(management::running_notice(operation, plan.eligible_count()));
+        self.set_notice(management::running_notice(
+            operation,
+            plan.scope,
+            plan.eligible_count(),
+        ));
         // scan: management_run_start begin -- criterion 8's first half: everything between
         // this pair is what a management run reads and does before its own report reaches
         // the main thread, and the test over this region asserts the sync hooks and the
@@ -3308,7 +3305,7 @@ impl App {
                 Run {
                     actions: &self.document.actions,
                     count: action_palette_count
-                        .unwrap_or_else(|| Count::over(RunScope::Selection, 0)),
+                        .unwrap_or_else(|| Count::unnarrowed(RunScope::EveryVisibleRow, 0)),
                     management_lines: &management_lines,
                     bindings: &self.bindings,
                 },
@@ -4534,7 +4531,7 @@ mod tests {
                 &buf,
                 whole_frame,
                 glyphs.border,
-                &ActionPalette::border_title(&Count::over(RunScope::Selection, 0)),
+                &ActionPalette::border_title(&Count::unnarrowed(RunScope::EveryVisibleRow, 0)),
                 "the Action palette App drew",
             );
             app.action_palette = None;
@@ -5720,7 +5717,7 @@ mod tests {
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("sync on 0 selected, 1 refused?"),
+            frame.contains("sync on 0 of 1 selected, 1 refused?"),
             "the headline counts the refusal, got:\n{frame}"
         );
         assert!(
@@ -6093,7 +6090,7 @@ mod tests {
                     &app.theme,
                     Run {
                         actions: &app.document.actions,
-                        count: Count::over(RunScope::Selection, 1),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 1),
                         management_lines: &[],
                         bindings: &app.bindings,
                     },
@@ -6203,6 +6200,23 @@ mod tests {
             .expect("press Enter");
     }
 
+    /// `Space` over the row the cursor is on, which is how a user builds a Selection.
+    fn check_the_cursor_row(app: &mut App) {
+        app.handle_key_event(press(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("check the cursor row");
+    }
+
+    /// The name of the entry the open Action palette currently has in hand.
+    fn highlighted_action_name(app: &App) -> Option<String> {
+        Some(
+            app.action_palette
+                .as_ref()?
+                .highlighted(&app.document.actions)?
+                .name()
+                .to_string(),
+        )
+    }
+
     /// The Action palette's own border title, which is the top line of its frame: the count
     /// and the scope it counted, read where a user reads them.
     fn border_title_line(app: &mut App) -> String {
@@ -6221,7 +6235,7 @@ mod tests {
             .expect("the palette must already be open")
             .matches(&app.document.actions)
             .iter()
-            .position(|entry| entry.name() == operation.name())
+            .position(|entry| matches!(entry, Entry::Builtin(candidate) if *candidate == operation))
             .expect("the operation is one of the entries on offer");
         for _ in 0..index {
             app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
@@ -6296,7 +6310,7 @@ mod tests {
         );
         assert_eq!(
             app.notice(),
-            Some("delete: running on 1 repos"),
+            Some("delete: running on 1 at the cursor"),
             "the running Notice is set synchronously, before the thread starts"
         );
 
@@ -7019,7 +7033,7 @@ mod tests {
         let frame = render_to_lines(&mut app, 80, 24).join("\n");
 
         assert!(
-            frame.contains("delete on 1 selected, 1 refused?"),
+            frame.contains("delete on 1 of 2 selected, 1 refused?"),
             "the headline counts the refusal as well as the eligible rows, got:\n{frame}"
         );
         assert!(
@@ -13111,24 +13125,32 @@ refresh_all = "z""#,
             true,
             std::path::Path::new("marker"),
         ));
-        let visible = app.visible_keys();
         assert_eq!(
-            visible.len(),
+            app.visible_keys().len(),
             3,
             "the fixture must discover all three repos"
         );
-        app.selection.toggle(visible[0].clone());
-        app.selection.toggle(visible[1].clone());
+        check_the_cursor_row(&mut app);
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("step onto the second row");
+        check_the_cursor_row(&mut app);
+        assert_eq!(app.selection.count(), 2, "Space must have checked two rows");
 
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
 
-        // Every entry the palette offers, walked with the same key a user would.
-        for entry in 0..4 {
-            let frame = render_to_lines(&mut app, 80, 24).join("\n");
+        // Every entry the palette offers, walked with the same key a user would. Naming
+        // each keeps a highlight that stopped moving from passing as four identical reads.
+        for expected in ["reinstall", "ignore", "delete", "sync"] {
+            assert_eq!(
+                highlighted_action_name(&app).as_deref(),
+                Some(expected),
+                "the walk must reach every entry the palette offers, in order"
+            );
+            let title = border_title_line(&mut app);
             assert!(
-                frame.contains("run on 2 selected"),
-                "entry {entry} must name the two checked rows as the Selection, got:\n{frame}"
+                title.contains("run on 2 selected"),
+                "{expected} must name the two checked rows as the Selection, got: {title}"
             );
             app.handle_key_event(press(KeyCode::Down, KeyModifiers::NONE))
                 .expect("move the highlight");
@@ -13221,18 +13243,27 @@ refresh_all = "z""#,
         open_the_management_gate(&mut app, management::Operation::Delete);
         let fallback = render_to_lines(&mut app, 80, 24);
         assert!(
-            fallback[0].contains("at the cursor") && fallback[1].contains("at the cursor"),
-            "the border and the gate must both name the cursor-row fallback, got:\n{}\n{}",
+            fallback[0].contains("run on 1 at the cursor")
+                && fallback[1].contains("delete on 1 at the cursor?"),
+            "the border and the gate must name the same rows, count and word alike, \
+             got:\n{}\n{}",
             fallback[0],
             fallback[1]
         );
 
         // A configured Action over a Selection: the other half of the same rule.
         app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
-            .expect("close the gate");
-        let visible = app.visible_keys();
-        app.selection.toggle(visible[0].clone());
-        app.selection.toggle(visible[1].clone());
+            .expect("leave the gate");
+        app.handle_key_event(press(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close the palette");
+        assert!(
+            app.action_palette.is_none(),
+            "the palette must be closed before the second half types anything"
+        );
+        check_the_cursor_row(&mut app);
+        app.handle_key_event(press(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("step onto the second row");
+        check_the_cursor_row(&mut app);
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
@@ -13244,6 +13275,58 @@ refresh_all = "z""#,
             "the border and the gate must both name the Selection, got:\n{}\n{}",
             over_a_selection[0],
             over_a_selection[1]
+        );
+    }
+
+    /// The widened built-in's own gate, which
+    /// [repo-management.md](../../../docs/spec/repo-management.md) quotes: `sync` is the
+    /// one operation an empty Selection widens, so its gate is the one that must say
+    /// `visible` where the other two say `at the cursor`.
+    #[test]
+    fn syncs_gate_headline_names_the_visible_rows_an_empty_selection_widened_it_to() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+        assert!(app.selection.is_empty(), "the fixture checks no row at all");
+
+        open_the_management_gate(&mut app, management::Operation::Sync);
+        let frame = render_to_lines(&mut app, 80, 24);
+
+        assert!(
+            frame[1].contains("sync on 2 visible?"),
+            "sync widens to every visible row, so its gate must say so, got: {}",
+            frame[1]
+        );
+    }
+
+    /// The ad hoc field's own gate, the one
+    /// [keybindings.md](../../../docs/spec/keybindings.md) quotes with the shell mode beside
+    /// the count: a typed command reaches the same rows a named entry does and must name
+    /// them the same way.
+    #[test]
+    fn an_ad_hoc_commands_gate_names_the_scope_beside_its_shell_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        init_repo(&root.join("repo-b"));
+        let mut app = test_app(&root);
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        for c in "echo hi".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("type the command");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the typed command");
+        let frame = render_to_lines(&mut app, 80, 24);
+
+        assert!(
+            frame[1].contains("run \"echo hi\" (shell on) on 2 visible?"),
+            "a typed command's gate must name the mode and the scope alike, got: {}",
+            frame[1]
         );
     }
 
@@ -14210,6 +14293,41 @@ refresh_all = "z""#,
                  {highlighted}"
             );
         }
+    }
+
+    /// What the highlighted row is for: `Enter` runs the row under the cursor, so a picker
+    /// opening on row 1 from Set 3 switches away from the Set being viewed. Pressing nothing
+    /// but `Tab` and `Enter` must be a no-op on the active Set.
+    #[test]
+    fn enter_without_moving_the_pickers_cursor_keeps_the_set_already_being_viewed() {
+        let names = ["alpha", "beta", "gamma"];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in names {
+            init_repo(&root.join(format!("repo-{name}")));
+        }
+        let mut app = test_app(&root);
+        app.document.sets = names
+            .iter()
+            .map(|name| set_config(name, &root))
+            .collect::<Vec<_>>();
+        app.handle_key_event(press(KeyCode::Char('3'), KeyModifiers::NONE))
+            .expect("switch to the third declared Set");
+        assert_eq!(
+            app.active_set.name, "gamma",
+            "sanity: the fixture is on gamma"
+        );
+
+        app.handle_key_event(press(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("open the picker");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("choose the highlighted row without moving it");
+
+        assert_eq!(
+            app.active_set.name, "gamma",
+            "Enter on an unmoved cursor must keep the Set being viewed, never switch to the \
+             first declared one"
+        );
     }
 
     /// Criterion 2: each digit names its own Set number, not the one before or after it.

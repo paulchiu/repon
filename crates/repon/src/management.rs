@@ -326,9 +326,13 @@ pub(crate) const NO_UNDO: &str = "there is no undo and no trash";
 /// the gate itself before any of the operation's blocking work starts: [`Report::summary`]
 /// replaces it once that work finishes. Named after `eligible_count`, the same row count the
 /// gate's own [`headline`] showed, since the gate and the run must agree on how many rows this
-/// is about.
-pub(crate) fn running_notice(operation: Operation, eligible: usize) -> String {
-    format!("{}: running on {eligible} repos", operation.name())
+/// is about, and on which rows they were.
+pub(crate) fn running_notice(operation: Operation, scope: RunScope, eligible: usize) -> String {
+    format!(
+        "{}: running on {eligible} {}",
+        operation.name(),
+        scope.word()
+    )
 }
 
 /// The Notice `App::run_management` paints before each row's own work starts, replacing
@@ -352,7 +356,8 @@ fn headline(operation: Operation, scope: RunScope, eligible: usize, refused: usi
     if refused == 0 {
         format!("{name} on {eligible} {scope}?")
     } else {
-        format!("{name} on {eligible} {scope}, {refused} refused?")
+        let total = eligible + refused;
+        format!("{name} on {eligible} of {total} {scope}, {refused} refused?")
     }
 }
 
@@ -1058,7 +1063,7 @@ mod tests {
     fn checked(entities: &[EntityState]) -> Targets {
         Targets {
             keys: entities.iter().map(|entity| entity.key.clone()).collect(),
-            scope: RunScope::Selection,
+            scope: RunScope::CheckedRows,
         }
     }
 

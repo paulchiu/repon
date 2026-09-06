@@ -27,8 +27,10 @@ pub(crate) struct Selection {
 /// beside it ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunScope {
-    /// The checked rows.
-    Selection,
+    /// The rows checked with Space, which [keybindings.md](../../../docs/spec/keybindings.md)
+    /// calls the checked set. Not GLOSSARY.md's Selection, which is the resolved subject an
+    /// operation ends up with and so covers all three of these.
+    CheckedRows,
     /// Every visible row, which is what an empty Selection widens an Action, and `sync`, to.
     EveryVisibleRow,
     /// The cursor row alone: `ignore` and `delete`'s own empty-Selection fallback.
@@ -39,7 +41,7 @@ impl RunScope {
     /// The word a count is read with, so `2` never has to stand alone.
     pub(crate) fn word(self) -> &'static str {
         match self {
-            RunScope::Selection => "selected",
+            RunScope::CheckedRows => "selected",
             RunScope::EveryVisibleRow => "visible",
             RunScope::CursorRow => "at the cursor",
         }
@@ -66,8 +68,9 @@ impl Selection {
         self.selected.len()
     }
 
-    /// Whether nothing is checked, which is the case an Action and a management operation
-    /// answer differently: see [`Self::targets`].
+    /// Whether nothing is checked. [`Self::resolve`] is what production reads that through,
+    /// so this is left for the tests that state a fixture's starting point.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.selected.is_empty()
     }
@@ -86,7 +89,7 @@ impl Selection {
     /// Drops `key` from the checked set, called at every seam that removes a row from the
     /// table ([`crate::app::App::dismiss_vanished_at_cursor`] and the management report's
     /// own removed keys) so a Selection can never outlive the row it names. Without this a
-    /// stale key keeps [`Self::is_empty`] false, which stops the empty-Selection widening
+    /// stale key keeps the checked set non-empty, which stops the empty-Selection widening
     /// [`crate::app::App::action_targets`] relies on and leaves [`Self::count`] overstating
     /// what is actually checked.
     pub(crate) fn remove(&mut self, key: &EntityKey) {
@@ -155,15 +158,23 @@ impl Selection {
     /// ([keybindings.md](../../../../docs/spec/keybindings.md#the-selection)).
     ///
     pub(crate) fn targets(&self, cursor: &EntityKey) -> Targets {
+        self.resolve(|| Targets {
+            keys: vec![cursor.clone()],
+            scope: RunScope::CursorRow,
+        })
+    }
+
+    /// The checked rows, or `empty_case` when none are checked. The one place that answers
+    /// what a checked set resolves to, so the two callers differ only in the answer they
+    /// give the empty case: the cursor row here, every visible row in
+    /// [`crate::app::App::action_targets`].
+    pub(crate) fn resolve(&self, empty_case: impl FnOnce() -> Targets) -> Targets {
         if self.selected.is_empty() {
-            Targets {
-                keys: vec![cursor.clone()],
-                scope: RunScope::CursorRow,
-            }
+            empty_case()
         } else {
             Targets {
-                keys: self.selected.iter().cloned().collect(),
-                scope: RunScope::Selection,
+                keys: self.checked(),
+                scope: RunScope::CheckedRows,
             }
         }
     }
@@ -211,6 +222,46 @@ impl Selection {
 impl UnwindLevel for Selection {
     fn unwind(&mut self) -> bool {
         self.cancel_range_anchor()
+    }
+}
+
+#[cfg(test)]
+mod scope_words {
+    use std::collections::BTreeSet;
+
+    use super::RunScope;
+
+    /// The three words are a user-facing contract, so
+    /// [actions.md](../../../docs/spec/actions.md) states them and this reads them back,
+    /// in both directions: a word changed here and not there fails, and so does a fourth
+    /// title quoted there that names no scope here.
+    #[test]
+    fn the_scope_words_are_exactly_the_ones_actions_md_quotes_in_its_own_titles() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let actions_md = std::fs::read_to_string(manifest_dir.join("../../docs/spec/actions.md"))
+            .expect("read docs/spec/actions.md");
+
+        let quoted: BTreeSet<&str> = actions_md
+            .split("`run on ")
+            .skip(1)
+            .filter_map(|rest| rest.split('`').next())
+            .filter_map(|title| title.split_once(' '))
+            .map(|(_count, word)| word)
+            .collect();
+        let words: BTreeSet<&str> = [
+            RunScope::CheckedRows,
+            RunScope::EveryVisibleRow,
+            RunScope::CursorRow,
+        ]
+        .into_iter()
+        .map(RunScope::word)
+        .collect();
+
+        assert_eq!(
+            quoted, words,
+            "the words actions.md quotes and the ones the code puts on screen must be the \
+             same set"
+        );
     }
 }
 
@@ -333,7 +384,7 @@ mod tests {
         let targets = selection.targets(&cursor);
 
         assert_eq!(targets.keys, vec![checked]);
-        assert_eq!(targets.scope, RunScope::Selection);
+        assert_eq!(targets.scope, RunScope::CheckedRows);
     }
 
     /// [`Selection::checked`] is the half with no default at all: the caller that reads it

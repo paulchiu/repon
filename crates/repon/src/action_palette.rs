@@ -586,9 +586,9 @@ pub(crate) struct Narrowed {
 }
 
 impl Count {
-    /// The count alone, which is what the title reads with nothing to narrow it: nothing
-    /// chosen, a built-in, or an entry declaring no `when`.
-    pub(crate) fn over(scope: RunScope, operable: usize) -> Self {
+    /// A count with no `when` narrowing it: nothing chosen, a built-in, or an entry
+    /// declaring none.
+    pub(crate) fn unnarrowed(scope: RunScope, operable: usize) -> Self {
         Count {
             operable,
             scope,
@@ -596,16 +596,17 @@ impl Count {
         }
     }
 
-    /// How many rows a choice made right now would actually run against: the applicable
-    /// count once a `when` narrows it, and the operable count otherwise. The confirm gate's
-    /// own question reads this, the same number [`ActionPalette::border_title`] already
-    /// puts in the border above it, so the two can never name two different totals
-    /// ([actions.md](../../../docs/spec/actions.md)'s "The Selection and the gate": "`when`
-    /// decides what runs").
-    pub(crate) fn run_count(&self) -> usize {
+    /// How many rows, and which rows, in one phrase: `12 selected`, or `8 of 12 selected`
+    /// once a `when` narrows it. The narrowed form keeps the scope word on the total, since
+    /// `8 selected` over a Selection of 12 would be false.
+    pub(crate) fn phrase(&self) -> String {
+        let scope = self.scope.word();
         match &self.narrowed {
-            Some(narrowed) => narrowed.applicability.applicable,
-            None => self.operable,
+            Some(narrowed) => {
+                let applicable = narrowed.applicability.applicable;
+                format!("{applicable} of {} {scope}", self.operable)
+            }
+            None => format!("{} {scope}", self.operable),
         }
     }
 }
@@ -896,29 +897,19 @@ impl ActionPalette {
     /// could not settle. The tail is absent rather than written as zero, since a zero tail is
     /// nothing to report.
     pub(crate) fn border_title(count: &Count) -> String {
-        let Count {
-            operable,
-            scope,
-            narrowed,
-        } = count;
-        let scope = scope.word();
-        match narrowed {
-            None => format!(" run on {operable} {scope} "),
+        let phrase = count.phrase();
+        match &count.narrowed {
+            None => format!(" run on {phrase} "),
             Some(Narrowed {
                 label,
                 applicability,
             }) => {
-                let Applicability {
-                    applicable,
-                    inapplicable: _,
-                    unresolved,
-                } = *applicability;
-                let tail = if unresolved == 0 {
+                let tail = if applicability.unresolved == 0 {
                     String::new()
                 } else {
-                    format!(", {unresolved} unresolved")
+                    format!(", {} unresolved", applicability.unresolved)
                 };
-                format!(" run \"{label}\" on {applicable} of {operable} {scope}{tail} ")
+                format!(" run \"{label}\" on {phrase}{tail} ")
             }
         }
     }
@@ -1002,8 +993,7 @@ impl ActionPalette {
             management_lines,
             bindings,
         } = run;
-        let run_count = count.run_count();
-        let run_scope = count.scope.word();
+        let run_phrase = count.phrase();
         let mut scratch = BorderScratch::new();
         let mut block = glyphs
             .bordered_block(&mut scratch)
@@ -1026,15 +1016,14 @@ impl ActionPalette {
         match &self.stage {
             Stage::Confirming(chosen) => {
                 let rows: Vec<String> = match chosen {
-                    Chosen::Configured(entry) => vec![format!(
-                        "run \"{}\" on {run_count} {run_scope}?",
-                        entry.name.get_ref()
-                    )],
+                    Chosen::Configured(entry) => {
+                        vec![format!("run \"{}\" on {run_phrase}?", entry.name.get_ref())]
+                    }
                     // The one place besides the receipt an ad hoc command's own shell mode is
                     // named beside the string about to reach `run_count` rows, the last
                     // screen before it does.
                     Chosen::AdHoc { spec, mode } => vec![format!(
-                        "run \"{}\" ({}) on {run_count} {run_scope}?",
+                        "run \"{}\" ({}) on {run_phrase}?",
                         one_line(&spec.label),
                         shell_mode_word(*mode)
                     )],
@@ -1295,7 +1284,7 @@ mod tests {
             .expect("theming.md still carries the quoted `run on 12 selected` example");
 
         assert_eq!(
-            ActionPalette::border_title(&Count::over(RunScope::Selection, 12)).trim(),
+            ActionPalette::border_title(&Count::unnarrowed(RunScope::CheckedRows, 12)).trim(),
             quoted
         );
     }
@@ -1338,7 +1327,7 @@ mod tests {
     fn narrowed(applicable: usize, inapplicable: usize, unresolved: usize) -> Count {
         Count {
             operable: applicable + inapplicable + unresolved,
-            scope: RunScope::Selection,
+            scope: RunScope::CheckedRows,
             narrowed: Some(Narrowed {
                 label: "reinstall".to_string(),
                 applicability: Applicability {
@@ -1359,7 +1348,7 @@ mod tests {
         let readings = border_title_readings_actions_md_fixes();
 
         assert_eq!(
-            ActionPalette::border_title(&Count::over(RunScope::Selection, 12)).trim(),
+            ActionPalette::border_title(&Count::unnarrowed(RunScope::CheckedRows, 12)).trim(),
             readings[0]
         );
         assert_eq!(
@@ -2142,7 +2131,7 @@ mod tests {
             &palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             row_text(&one_line, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE),
@@ -2158,7 +2147,7 @@ mod tests {
             &palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         assert!(
@@ -2504,7 +2493,7 @@ mod tests {
                         &Theme::default(),
                         Run {
                             actions: &actions,
-                            count: Count::over(RunScope::Selection, 3),
+                            count: Count::unnarrowed(RunScope::CheckedRows, 3),
                             management_lines: &[],
                             bindings: &BINDINGS_FOR_TESTS,
                         },
@@ -2517,7 +2506,7 @@ mod tests {
                 terminal.backend().buffer(),
                 Rect::new(0, 0, 40, 10),
                 glyphs.border,
-                &ActionPalette::border_title(&Count::over(RunScope::Selection, 3)),
+                &ActionPalette::border_title(&Count::unnarrowed(RunScope::CheckedRows, 3)),
                 "the Action palette's frame",
             );
         }
@@ -2550,7 +2539,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 3),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 3),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2585,7 +2574,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 2),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 2),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2643,7 +2632,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 3),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 3),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2672,7 +2661,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 3),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 3),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2711,7 +2700,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 3),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 3),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2761,7 +2750,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 3),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 3),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2832,7 +2821,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 12),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 12),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2873,7 +2862,7 @@ mod tests {
                     &Theme::default(),
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 2),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 2),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2931,7 +2920,7 @@ mod tests {
                     &theme,
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 12),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 12),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -2987,13 +2976,15 @@ mod tests {
         let row_text =
             |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect() };
         assert!(
-            row_text(1).contains("run \"reinstall\" on 8 selected?"),
-            "expected the confirm gate to name the applicable count alone, got: {:?}",
+            row_text(1).contains("run \"reinstall\" on 8 of 12 selected?"),
+            "expected the confirm gate to name the applicable count against the total it \
+             was narrowed from, got: {:?}",
             row_text(1)
         );
         assert!(
-            !row_text(1).contains("12 selected?"),
-            "the operable total must never be what the gate asks to run, got: {:?}",
+            !row_text(1).contains("on 12 selected?"),
+            "the operable total must never be what the gate asks to run, only what it \
+             narrowed from, got: {:?}",
             row_text(1)
         );
     }
@@ -3064,7 +3055,7 @@ mod tests {
                     &crate::theme::DEFAULT,
                     Run {
                         actions: &[],
-                        count: Count::over(RunScope::Selection, 25),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 25),
                         management_lines: &lines,
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -3158,7 +3149,7 @@ mod tests {
                     &crate::theme::DEFAULT,
                     Run {
                         actions: &[],
-                        count: Count::over(RunScope::Selection, 1),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 1),
                         management_lines: &lines,
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -3216,7 +3207,7 @@ mod tests {
                     &monochrome,
                     Run {
                         actions: &actions,
-                        count: Count::over(RunScope::Selection, 2),
+                        count: Count::unnarrowed(RunScope::CheckedRows, 2),
                         management_lines: &[],
                         bindings: &BINDINGS_FOR_TESTS,
                     },
@@ -3367,7 +3358,7 @@ mod tests {
             palette,
             actions,
             theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
             width,
             height,
         )
@@ -3432,7 +3423,7 @@ mod tests {
             &palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             !row_text(&empty, 1, 40).contains("zzq"),
@@ -3456,7 +3447,7 @@ mod tests {
             &palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             row_text(&typed, 1, 40).contains("zzq"),
@@ -3479,7 +3470,7 @@ mod tests {
             &palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             !row_text(&cleared, 1, 40).contains("zzq"),
@@ -3525,7 +3516,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
             NARROW_SCREEN_WIDTH,
             10,
         );
@@ -3553,7 +3544,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         assert!(
@@ -3577,7 +3568,7 @@ mod tests {
             &palette,
             &[],
             &Theme::default(),
-            Count::over(RunScope::Selection, 0),
+            Count::unnarrowed(RunScope::CheckedRows, 0),
         );
 
         // Below the built-ins rather than in place of them: the list is never empty
@@ -3605,13 +3596,13 @@ mod tests {
             &no_match,
             &some_actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         let nothing_configured_buf = draw_to_buffer(
             &nothing_configured,
             &[],
             &theme,
-            Count::over(RunScope::Selection, 0),
+            Count::unnarrowed(RunScope::CheckedRows, 0),
         );
 
         assert_ne!(
@@ -3633,7 +3624,7 @@ mod tests {
             &ActionPalette::new(),
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         let mut no_match = ActionPalette::new();
         no_match.type_char(' ', &actions);
@@ -3642,13 +3633,13 @@ mod tests {
             &no_match,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         let nothing_configured_state = draw_to_buffer(
             &ActionPalette::new(),
             &[],
             &theme,
-            Count::over(RunScope::Selection, 0),
+            Count::unnarrowed(RunScope::CheckedRows, 0),
         );
 
         // Read over the whole render rather than one row: the built-ins are listed in every
@@ -3685,7 +3676,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         assert!(
@@ -3712,7 +3703,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         assert!(
@@ -3737,7 +3728,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         assert!(
@@ -3767,7 +3758,7 @@ mod tests {
             &runs_as_command,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         let mut no_match = ActionPalette::new();
@@ -3777,14 +3768,14 @@ mod tests {
             &no_match,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
 
         let nothing_configured_state = draw_to_buffer(
             &ActionPalette::new(),
             &[],
             &theme,
-            Count::over(RunScope::Selection, 0),
+            Count::unnarrowed(RunScope::CheckedRows, 0),
         );
 
         assert!(all_rows(&runs_as_command_state).contains(RUNS_AS_COMMAND_MESSAGE));
@@ -3818,7 +3809,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(row_text(&buf, 2, 40).contains(RUNS_AS_COMMAND_MESSAGE));
 
@@ -3847,7 +3838,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
 
@@ -3875,7 +3866,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(row_text(&buf, 2, 40).contains(NO_MATCHES_MESSAGE));
 
@@ -3901,7 +3892,7 @@ mod tests {
             &matches_action,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             !all_rows(&matches_action_buf).contains(RUNS_AS_COMMAND_MESSAGE),
@@ -3916,7 +3907,7 @@ mod tests {
             &matches_builtin,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(
             !all_rows(&matches_builtin_buf).contains(RUNS_AS_COMMAND_MESSAGE),
@@ -3935,7 +3926,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(!row_text(&narrowed, 2, 40).contains("deploy"));
 
@@ -3945,7 +3936,7 @@ mod tests {
             &palette,
             &actions,
             &Theme::default(),
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         assert!(row_text(&restored, 2, 40).contains("reinstall"));
         assert!(row_text(&restored, 3, 40).contains("deploy"));
@@ -4013,7 +4004,7 @@ mod tests {
             &action_palette,
             &actions,
             &theme,
-            Count::over(RunScope::Selection, 3),
+            Count::unnarrowed(RunScope::CheckedRows, 3),
         );
         let action_message_row = 2; // the Action palette's border sits at row 0 in this branch
 
