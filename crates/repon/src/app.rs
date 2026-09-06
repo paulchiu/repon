@@ -483,9 +483,12 @@ pub struct App {
     /// (`t`) and read through [`Self::effective_show_worktrees`] everywhere the config field
     /// used to be read directly. `None` until the toggle first fires in this scope, so the
     /// config file keeps deciding the starting state; `apply_reloaded_config` resets this to
-    /// `None` too, so a reload always hands the keyboard back to whatever the file currently
-    /// says ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees toggle").
-    /// Restored from `state.toml` at startup and written back on quit
+    /// `None` too, so `Ctrl+R` and `e` always hand the keyboard back to whatever the file
+    /// currently says ([keybindings.md](../../docs/spec/keybindings.md)'s "The worktrees
+    /// toggle"). [`Self::apply_management_report`] calls that same reload but saves and
+    /// restores this field around the call, since a `sync`/`ignore`/`delete` run is not that
+    /// gesture ([config.md](../../../docs/spec/config.md#reload)). Restored from `state.toml`
+    /// at startup and written back on quit
     /// ([`Self::restore_session_state`], [`Self::persist_state`]), so a value the toggle set
     /// survives a restart the way the Selection and Filter beside it do; a reload's own clear
     /// is still what a save right after this records, so a reload (not a restart) is what
@@ -2491,7 +2494,10 @@ impl App {
     /// is [`Self::reload_config`], the identical path `Action::ReloadConfig` runs, so config
     /// reaches the running app one way and this call touches no in-memory document of its
     /// own; an `ignore` still takes effect the moment this runs, through the same
-    /// `set_exclusions` reload already gives `Action::ReloadConfig`.
+    /// `set_exclusions` reload already gives `Action::ReloadConfig`. Unlike `Ctrl+R` and `e`,
+    /// this reload does not clear `self.worktrees_toggle`: the user asked for `sync`, not for
+    /// the file to decide the view again, so the override is saved and restored around the
+    /// call ([config.md](../../../docs/spec/config.md#reload)'s "the gestures that clear it").
     fn apply_management_report(&mut self, report: &management::Report) {
         // scan: management_report_apply begin -- criterion 8's second half: everything
         // between this pair is what a management write does once its report is ready, and
@@ -2504,7 +2510,12 @@ impl App {
             self.core.dismiss(&key);
             self.selection.remove(&key);
         }
+        // A management run is not `Ctrl+R` or `e`: the user asked for `sync`/`ignore`/
+        // `delete`, not for the file to decide the view again, so `t`'s override rides
+        // across this reload untouched even though the reload itself is unconditional.
+        let worktrees_toggle = self.worktrees_toggle;
         self.reload_config();
+        self.worktrees_toggle = worktrees_toggle;
         // scan: management_report_apply end
         // The rows just dropped shortened the table under a standing cursor, the same
         // re-clamp [`Self::dismiss_vanished_at_cursor`] does after its own removal.
@@ -15150,6 +15161,38 @@ refresh_all = "z""#,
         assert!(
             !text.contains("preference off"),
             "must never credit config.toml with the toggle's own override: {text:?}"
+        );
+    }
+
+    /// A management run is not `Ctrl+R` or `e`: the user asked for `sync`, not for the file
+    /// to decide the view again, so its own `reload_config` call must leave `t`'s override
+    /// standing exactly as it did before the run, header wording included.
+    #[test]
+    fn a_completed_sync_run_leaves_worktrees_hidden_and_the_header_still_says_toggled_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        worktree_add(&repo, &root.join("repo-a-wt"), "feature");
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("dispatch t");
+        assert!(
+            !app.effective_show_worktrees(),
+            "the toggle must have hidden Worktrees before the run starts"
+        );
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert!(
+            !app.effective_show_worktrees(),
+            "a completed management run must not hand the view back to config.toml"
+        );
+        let text = status_row_text_with_active_filter(&mut app, "kind:worktree", 200);
+        assert!(
+            text.contains("worktrees: 1 (toggled off)"),
+            "the header must still credit the toggle, not the file, after the run: {text:?}"
         );
     }
 
