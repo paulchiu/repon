@@ -3554,8 +3554,18 @@ impl FetchCycle {
 /// one: without it a poisoned lock from an unrelated earlier panic would leave this `Core`
 /// unable to ever start another cycle.
 fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycle {
-    let work = fetch_cycle_work(table, fetch);
-    let cancel = Arc::clone(&work.cancel);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let work = FetchCycleWork {
+        table: Arc::clone(table),
+        concurrency: fetch.concurrency,
+        cancel: Arc::clone(&cancel),
+        network_default_branch: Arc::clone(&fetch.refresh.network_default_branch),
+        cycle_count: Arc::clone(&fetch.cycle_count),
+        failures: Arc::clone(&fetch.failures),
+        auto_update_enabled: fetch.auto_update_enabled,
+        #[cfg(test)]
+        boundary: Arc::clone(&fetch.boundary),
+    };
     #[cfg(test)]
     let boundary = Arc::clone(&work.boundary);
     let finished = fetch.finished_tx.clone();
@@ -3606,28 +3616,11 @@ struct FetchCycleWork {
     boundary: Arc<FetchBoundary>,
 }
 
-/// One cycle's own [`FetchCycleWork`], taken from the schedule the clock was started with
-/// and a cancellation flag minted for this cycle alone.
-fn fetch_cycle_work(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycleWork {
-    FetchCycleWork {
-        table: Arc::clone(table),
-        concurrency: fetch.concurrency,
-        cancel: Arc::new(AtomicBool::new(false)),
-        network_default_branch: Arc::clone(&fetch.refresh.network_default_branch),
-        cycle_count: Arc::clone(&fetch.cycle_count),
-        failures: Arc::clone(&fetch.failures),
-        auto_update_enabled: fetch.auto_update_enabled,
-        #[cfg(test)]
-        boundary: Arc::clone(&fetch.boundary),
-    }
-}
-
 /// One periodic-fetch cycle: every distinct git common dir this table currently
-/// knows, not excluded, fetched with pruning, bounded to `concurrency` at once,
-/// then one normal Generation over every entity the table now knows
-/// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
-/// "The periodic fetch": "a finished fetch starts a normal generation"), the exact
-/// completion path [`Core::run_action`] already uses. `cycle_count` counts every
+/// knows, not excluded, fetched with pruning, bounded to `concurrency` at once, then the
+/// fast-forward-only auto-update over what that fetch just learned. The Generation a
+/// finished cycle owes is [`dispatch_fetch_completion`]'s, back on the clock, so a cancelled
+/// cycle cannot land one. `cycle_count` counts every
 /// call, whether or not any repository had a remote to fetch, so a test driving
 /// the dedicated thread's own tick channel can prove a tick reached this function
 /// at all, the same proof [`Core::poll_sweep_count_for_test`] gives the poll.
@@ -3663,7 +3656,6 @@ fn run_fetch_cycle(work: &FetchCycleWork) {
         // Nothing parks here unless a test armed this boundary.
         #[cfg(test)]
         boundary.hold();
-        let cancel: &AtomicBool = cancel;
         // A cancelled cycle starts no more work: the repositories this pool has not reached
         // yet are simply not fetched.
         if cancel.load(Ordering::Acquire) {
