@@ -6767,7 +6767,7 @@ mod tests {
 
     /// `delete` on a Repo with no `[[repo]]` entry of its own: the working tree still goes,
     /// and the report says there was no entry rather than claiming one was removed. The
-    /// negative half of the test above, so neither branch of `config_entry_removed` can be
+    /// negative half of the test above, so neither answer the config cleanup can give is
     /// hard-coded.
     #[test]
     fn delete_on_a_repo_with_no_entry_of_its_own_removes_the_tree_and_says_there_was_no_entry() {
