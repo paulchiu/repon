@@ -11869,11 +11869,9 @@ refresh_all = "z""#,
         // The postcondition every caller actually reads, waited on directly rather than
         // through a proxy: a row whose cells hold nothing yet folds to InFlight ahead of the
         // receipt's own failure, so "the fan-out finished" is not yet "this row reads
-        // Failed". `Core::settle` cannot stand in for it either, at any bound, because
-        // `run_action`'s completion clears `action_running` before it dispatches the
-        // Generation that raises the settle gate, so a settle called in that window finds
-        // the gate at zero and returns at once. Once a row does read Failed it stays that
-        // way: a later Generation marks its cells in flight without discarding their values.
+        // Failed", and neither is the completion Generation settling. Once a row does read
+        // Failed it stays that way: a later Generation marks its cells in flight without
+        // discarding their values.
         wait_for(
             &format!("row {index} to read Failed once its failing Action has finished"),
             || !app.core.action_running() && app.visible_failed().get(index) == Some(&true),

@@ -53,12 +53,14 @@
 //!   through [`expired`], so there is no number left at a call site to guess and no expiry
 //!   left to mistake for an answer. `Core::try_settle` is where a deadline that is itself
 //!   the claim goes, and it hands back an expiry rather than panicking on one.
-//! - **`Core::settle` awaiting an Action's completion Generation**: at risk, and *not* on
-//!   the deadline. `run_action`'s completion clears `action_running` before it dispatches
-//!   that Generation, so a settle called in the window between the two finds the gate at
-//!   zero and returns at once however large its deadline is. A bigger number widens the
-//!   race rather than removing it; the caller has to wait on what it actually needs, which
-//!   is what `run_failing_action_on` in `app.rs` now does.
+//! - **`Core::settle` awaiting an Action's completion Generation**: was at risk, and *not*
+//!   on the deadline. `run_action`'s completion cleared `action_running` before it
+//!   dispatched that Generation, so a settle called in the window between the two found the
+//!   gate at zero and returned at once however large its deadline was, and a bigger number
+//!   widened the race rather than removing it. The completion now dispatches that
+//!   Generation while its run is still admitted, so `action_running` going false already
+//!   means the gate is raised. `run_failing_action_on` in `app.rs` still waits on the row it
+//!   actually reads, which is a stronger property than the gate either way.
 //! - **Deliberately short settles proving a negative** (`app.rs`'s 200ms focus gate,
 //!   `core.rs`'s 50ms empty-order settle, and the 500ms bound on a Launcher handoff
 //!   returning promptly): not raised, on purpose. Their number is the claim, not a

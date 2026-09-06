@@ -574,32 +574,25 @@ struct PhaseCGate {
 /// that register, wait on and release it.
 type PhaseCGateHandle = Arc<(Mutex<PhaseCGate>, Condvar)>;
 
-/// The Action lifecycle's one owned value: which run is admitted, if any, and the reach
-/// into that run's steps' children that goes with it.
+/// The Action lifecycle's one owned value: the run admitted right now, if any, together
+/// with the reach into that run's steps' children.
 ///
-/// Admission, control registration and completion are each one transition under this
-/// value's own lock, so a run that is finishing can never take away a control belonging to
-/// a run admitted after it. The lock covers these few field writes and nothing else: never
-/// a wait on a child process, and never git.
+/// Admission and completion are each one transition on this one value, so a run's control
+/// arrives and leaves with its admission rather than through a second write a later run can
+/// land between. Every critical section here is a read or a single field write, so the lock
+/// is never held across a wait on a child process, across git, or across anything that can
+/// panic and poison it.
 #[derive(Default)]
 struct ActionLifecycle {
-    /// The run admitted right now, `None` between runs.
-    live: Option<LiveAction>,
-    /// The identity of the last run admitted, so a completion can tell its own run from a
-    /// later one.
-    last_admitted: u64,
-}
-
-/// One admitted run: its identity, and the reach [`Core::hold_action`],
-/// [`Core::continue_action`] and [`Core::stop_action`] each look up before doing anything,
-/// so all three are no-ops with no fan-out live. Deliberately its own value rather than
-/// folded into `pause`/`resume`'s machinery, per
-/// [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
-/// own hold and stop verbs: the core is contractually not told why background work stopped,
-/// and a step's child needs SIGSTOP/SIGTERM/SIGKILL, information `pause` must never carry.
-struct LiveAction {
-    id: u64,
-    control: Arc<executor::RunControl>,
+    /// The admitted run's own reach into its steps' children, `None` between runs: what
+    /// [`Core::hold_action`], [`Core::continue_action`] and [`Core::stop_action`] each look
+    /// up before doing anything, so all three are no-ops with no fan-out live. Deliberately
+    /// its own value rather than folded into `pause`/`resume`'s machinery, per
+    /// [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// own hold and stop verbs: the core is contractually not told why background work
+    /// stopped, and a step's child needs SIGSTOP/SIGTERM/SIGKILL, information `pause` must
+    /// never carry.
+    live: Option<Arc<executor::RunControl>>,
 }
 
 impl ActionLifecycle {
@@ -607,40 +600,51 @@ impl ActionLifecycle {
     /// live: only one fan-out runs at a time, per
     /// [ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
     /// "One Action runs at a time".
-    fn admit(&mut self, control: Arc<executor::RunControl>) -> Option<u64> {
+    fn admit(&mut self, control: Arc<executor::RunControl>) -> bool {
         if self.live.is_some() {
-            return None;
+            return false;
         }
-        self.last_admitted += 1;
-        self.live = Some(LiveAction {
-            id: self.last_admitted,
-            control,
-        });
-        Some(self.last_admitted)
+        self.live = Some(control);
+        true
     }
 
-    /// Ends run `id`, and only run `id`: a completion arriving after a later run was
-    /// admitted leaves that newer run's own control exactly where it is.
-    fn complete(&mut self, id: u64) {
-        if self.live.as_ref().is_some_and(|live| live.id == id) {
-            self.live = None;
-        }
-    }
-
-    /// Whether a run has been admitted since run `id` was.
-    fn superseded(&self, id: u64) -> bool {
-        self.last_admitted != id
+    /// Releases the admitted run, the last thing [`RunCompletion`] does.
+    fn complete(&mut self) {
+        self.live = None;
     }
 }
 
-/// A park in an Action's completion boundary, for a test.
+/// Releases a finished run's admission however its fan-out thread ends, so a panic past the
+/// fan-out can never leave a `Core` reading that run as live for the rest of its life.
 ///
-/// The boundary is the window a finished fan-out passes through between releasing its
-/// admission, from which point [`Core::run_action`] accepts a second run, and finishing
-/// the completion work that follows. It is a few instructions wide, so a test that needs a
-/// run admitted inside it holds the completion there instead of racing it. One per `Core`
-/// and disarmed until a test arms it, so a run nobody is watching reads one bool and
-/// carries on, and the whole affordance is gated off the default build.
+/// Dropped after the completion Generation has been dispatched, which is what orders the
+/// two: the next run is refused until this one has started the Generation it owes, so what
+/// that run cancels on the way in can never be a Generation the run it replaced has yet to
+/// dispatch.
+struct RunCompletion {
+    lifecycle: Arc<Mutex<ActionLifecycle>>,
+    /// See [`ActionCompletionBoundary`].
+    #[cfg(any(test, feature = "test-util"))]
+    boundary: Arc<ActionCompletionBoundary>,
+}
+
+impl Drop for RunCompletion {
+    fn drop(&mut self) {
+        // Nothing parks here unless a test armed this boundary.
+        #[cfg(any(test, feature = "test-util"))]
+        self.boundary.hold();
+        self.lifecycle.lock().unwrap().complete();
+    }
+}
+
+/// A park in the one statement between a completion dispatching its Generation and
+/// [`RunCompletion`] releasing the run, for a test.
+///
+/// Neither half of that ordering is observable from outside without holding the completion
+/// there: the two are adjacent statements, and a test racing them reads whichever it
+/// happened to catch. One per `Core` and disarmed until a test arms it, so a run nobody is
+/// watching reads one bool and carries on, and the whole affordance is gated off the
+/// default build.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Default)]
 pub(crate) struct ActionCompletionBoundary {
@@ -656,96 +660,81 @@ struct BoundaryState {
     armed: bool,
     /// Set by the completion that parked at an armed boundary.
     reached: bool,
-    /// Set by the test once it is done with the window.
+    /// Set when the [`ArmedBoundary`] drops.
     released: bool,
-    /// Set once the released completion has finished everything past the boundary.
-    passed: bool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
-// The verbs below `hold` are a test's alone, so the feature on without `cfg(test)` (what a
-// consumer's own test build resolves) has no caller for them.
-#[allow(dead_code)]
 impl ActionCompletionBoundary {
-    /// Holds the next completion to reach this boundary. For a test, before the run whose
-    /// completion it wants held.
-    pub(crate) fn arm(&self) {
+    /// Holds the next completion to reach this boundary until the returned value drops. For
+    /// a test, before the run whose completion it wants held.
+    // A test's alone, so the feature on without `cfg(test)`, what a consumer's own test
+    // build resolves, has no caller for it.
+    #[allow(dead_code)]
+    pub(crate) fn arm(self: &Arc<Self>) -> ArmedBoundary {
         self.state.lock().unwrap().armed = true;
+        ArmedBoundary(Arc::clone(self))
     }
 
-    /// Blocks until a completion has parked here. For a test.
-    pub(crate) fn wait_until_reached(&self) {
-        self.wait_for_state(
-            "a completion to reach the Action completion boundary",
-            |state| state.reached,
-        );
-    }
-
-    /// Lets the parked completion go. For a test.
-    pub(crate) fn release(&self) {
+    /// Parks a completion here while an armed boundary holds it.
+    fn hold(&self) {
         let mut state = self.state.lock().unwrap();
-        state.released = true;
-        self.changed.notify_all();
-    }
-
-    /// Blocks until the released completion has finished everything it does past the
-    /// boundary, so a test reads what that completion did rather than racing it. For a test.
-    pub(crate) fn wait_until_passed(&self) {
-        self.wait_for_state("the released completion to finish", |state| state.passed);
-    }
-
-    /// Parks a completion here while an armed boundary holds it, and hands back the guard
-    /// that reports the rest of that completion done however it ends.
-    fn hold(&self) -> BoundaryPass<'_> {
-        let mut state = self.state.lock().unwrap();
-        if state.armed {
-            state.reached = true;
-            self.changed.notify_all();
-            let (state, expiry) = self
-                .changed
-                .wait_timeout_while(state, liveness::BACKSTOP, |state| !state.released)
-                .unwrap();
-            drop(state);
-            if expiry.timed_out() {
-                liveness::expired(
-                    liveness::BACKSTOP,
-                    "a test to release the Action completion boundary",
-                    "",
-                );
-            }
-        } else {
-            drop(state);
+        if !state.armed {
+            return;
         }
-        BoundaryPass { boundary: self }
-    }
-
-    fn wait_for_state(&self, property: &str, held: impl Fn(&BoundaryState) -> bool) {
+        state.reached = true;
+        self.changed.notify_all();
         let (state, expiry) = self
             .changed
-            .wait_timeout_while(self.state.lock().unwrap(), liveness::BACKSTOP, |state| {
-                !held(state)
+            .wait_timeout_while(state, liveness::BACKSTOP, |state| !state.released)
+            .unwrap();
+        drop(state);
+        if expiry.timed_out() {
+            liveness::expired(
+                liveness::BACKSTOP,
+                "a test to release the Action completion boundary",
+                "",
+            );
+        }
+    }
+}
+
+/// One armed [`ActionCompletionBoundary`], released when this drops so an assertion failing
+/// inside the window reports itself rather than leaving a completion parked for
+/// [`liveness::BACKSTOP`].
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) struct ArmedBoundary(Arc<ActionCompletionBoundary>);
+
+#[cfg(any(test, feature = "test-util"))]
+impl ArmedBoundary {
+    /// Blocks until a completion has parked at this boundary. For a test.
+    // A test's alone, on the same terms as [`ActionCompletionBoundary::arm`].
+    #[allow(dead_code)]
+    pub(crate) fn wait_until_reached(&self) {
+        let (state, expiry) = self
+            .0
+            .changed
+            .wait_timeout_while(self.0.state.lock().unwrap(), liveness::BACKSTOP, |state| {
+                !state.reached
             })
             .unwrap();
         drop(state);
         if expiry.timed_out() {
-            liveness::expired(liveness::BACKSTOP, property, "");
+            liveness::expired(
+                liveness::BACKSTOP,
+                "a completion to reach the Action completion boundary",
+                "",
+            );
         }
     }
 }
 
-/// Reports its own boundary passed once the completion holding it is done, however that
-/// completion ends.
 #[cfg(any(test, feature = "test-util"))]
-struct BoundaryPass<'a> {
-    boundary: &'a ActionCompletionBoundary,
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl Drop for BoundaryPass<'_> {
+impl Drop for ArmedBoundary {
     fn drop(&mut self) {
-        let mut state = self.boundary.state.lock().unwrap();
-        state.passed = true;
-        self.boundary.changed.notify_all();
+        let mut state = self.0.state.lock().unwrap();
+        state.released = true;
+        self.0.changed.notify_all();
     }
 }
 
@@ -1308,8 +1297,9 @@ impl Core {
     /// off this thread can give in time. Reuses `run_action_for_entity`, the identical
     /// per-step execution `run_action`'s fan-out gives every entity, so a hook and a
     /// configured `[[action]]` never diverge in what a step means; writes nothing to the
-    /// table and touches none of `run_action`'s own state (its `ActionLifecycle`),
-    /// since a hook is a distinct concern from the one fan-out the palette tracks.
+    /// table and touches none of `run_action`'s own state (the one admitted run and its
+    /// controls), since a hook is a distinct concern from the one fan-out the palette
+    /// tracks.
     ///
     /// `None` when `key` names no Entity this table currently knows.
     pub fn run_action_for_entity_blocking(
@@ -1415,8 +1405,9 @@ impl Core {
         when.applicability(self.partition_operable(order).0.iter())
     }
 
-    /// `true` while one Action fan-out's steps are still running, the consumer-facing read
-    /// of its `ActionLifecycle` ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
+    /// `true` from an Action run's admission until its completion has dispatched the
+    /// Generation it owes, the consumer-facing read of the one admitted run
+    /// ([ADR 0018](https://github.com/paulchiu/repon/blob/main/docs/adr/0018-an-action-is-a-fanout-of-pty-backed-steps.md)'s
     /// "One Action runs at a time"): what a TUI gates `;`, `s`, `1` to `9` and `Ctrl+R`
     /// against while a run is in flight
     /// ([ADR 0023](https://github.com/paulchiu/repon/blob/main/docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)).
@@ -1491,14 +1482,14 @@ impl Core {
         // `stop_action` the instant this returns `true` can never find no control, and a
         // completion racing in can never find someone else's.
         let control = executor::RunControl::new();
-        let Some(run_id) = self
+        if !self
             .action_lifecycle
             .lock()
             .unwrap()
             .admit(Arc::clone(&control))
-        else {
+        {
             return false;
-        };
+        }
 
         // Criterion 3's first half: starting a run cancels any in-flight Generation
         // outright, never sharing the machine with it.
@@ -1568,8 +1559,8 @@ impl Core {
             // Caught rather than left to unwind straight out of this thread: a poisoned
             // `RwLock` from an unrelated earlier panic is enough to panic the
             // `table_handle.write().unwrap()` below, and without `catch_unwind` that
-            // would skip the completion transition just past it, leaving this `Core`
-            // reading its run as live for the rest of its life.
+            // would unwind past the `RunCompletion` just beyond it before that guard
+            // exists, leaving this `Core` reading its run as live for the rest of its life.
             let fan_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pool.install(|| {
                     included.into_par_iter().for_each(|entity| {
@@ -1591,35 +1582,24 @@ impl Core {
             // way a Launcher return does with `probe_now`; scoped this narrowly (rather
             // than a whole-crate scan) because a legitimate Launcher-return caller lives
             // in an unrelated call site the same absence claim must not forbid.
-            // Criterion 6: the fan-out itself ends the moment every entity's own steps
-            // have finished, panic or not; a second `run_action` racing in from here on
-            // is racing the completion Generation below, never another fan-out.
-
-            // One transition: admission released and this run's own `RunControl` dropped
-            // together, and only while the live run is still this one. `hold_action`,
-            // `continue_action` and `stop_action` are no-ops again from here until the next
-            // `run_action` admits a run of its own.
-            action_lifecycle.lock().unwrap().complete(run_id);
-            // Nothing parks here unless a test armed this boundary; see
-            // `ActionCompletionBoundary`.
-            #[cfg(any(test, feature = "test-util"))]
-            let _boundary = completion_boundary.hold();
+            // Criterion 6: the fan-out's own steps are over here, panic or not, and this
+            // run stays admitted only until `completion` drops one statement past the
+            // Generation below. `hold_action`, `continue_action` and `stop_action` are
+            // no-ops again from that point, and a second `run_action` before it is refused
+            // rather than left to race the Generation this run still owes.
+            let completion = RunCompletion {
+                lifecycle: action_lifecycle,
+                #[cfg(any(test, feature = "test-util"))]
+                boundary: completion_boundary,
+            };
 
             // A panicked fan-out never finished cleanly, so it earns no completion
-            // Generation once the run above has safely ended. Swallowed rather than
-            // resumed: the default panic hook already printed it to stderr before
-            // `catch_unwind` returned, and this crate carries no logger to hand it to
-            // instead.
+            // Generation. Swallowed rather than resumed: the default panic hook already
+            // printed it to stderr before `catch_unwind` returned, and this crate carries
+            // no logger to hand it to instead.
             let Ok(()) = fan_out else {
                 return;
             };
-
-            // A run admitted since this one was is the live run now, and its own admission
-            // already cancelled what was in flight: a Generation started here would run
-            // beside that fan-out, which is what starting a run refuses.
-            if action_lifecycle.lock().unwrap().superseded(run_id) {
-                return;
-            }
 
             // Criterion 3's second half: completion starts one normal Generation over
             // every entity currently known, not only the ones this run acted on.
@@ -1631,6 +1611,7 @@ impl Core {
                 .map(|entity| entity.key.clone())
                 .collect();
             refresh_handles.dispatch(&all_keys);
+            drop(completion);
             // scan: action-completion-path end
         });
 
@@ -1675,12 +1656,7 @@ impl Core {
     /// signal a process group with [`Core::action_lifecycle`]'s lock already released.
     /// `None` with no fan-out live, which is what makes each of them a no-op then.
     fn live_action_control(&self) -> Option<Arc<executor::RunControl>> {
-        self.action_lifecycle
-            .lock()
-            .unwrap()
-            .live
-            .as_ref()
-            .map(|live| Arc::clone(&live.control))
+        self.action_lifecycle.lock().unwrap().live.clone()
     }
 
     /// Stops all background work: the dedicated thread stops ticking and every
@@ -1800,8 +1776,8 @@ impl Core {
 /// [`Core::management_handle`] rather than borrowed from a live `Core`: `Send + 'static`, so
 /// a caller can move it onto a background thread the way [`Core::run_action`]'s own fan-out
 /// thread already moves its `Arc<RwLock<Table>>` clone there. Grants none of `Core`'s other
-/// state (its `ActionLifecycle`, the clock thread): a management run is a
-/// distinct concern from the one fan-out those track, and this handle's own methods touch
+/// state (the one admitted Action run and its controls, the clock thread): a management run
+/// is a distinct concern from the one fan-out those track, and this handle's own methods touch
 /// only the table, exactly as [`Core::run_action_for_entity_blocking`] already does.
 #[derive(Clone)]
 pub struct ManagementHandle {
@@ -6390,54 +6366,51 @@ mod tests {
         );
     }
 
-    /// A completion overtaken by a newly admitted run starts no Generation of its own: that
-    /// run's admission already cancelled what was in flight, and a Generation started here
-    /// would run beside its fan-out, which is exactly what starting a run refuses.
+    /// A completion dispatches its Generation while its own run is still admitted, and a
+    /// submission arriving before that release is refused. Together those are what keeps a
+    /// completion from dispatching over a run that replaced it: the next run's admission,
+    /// and the cancellation it performs on the way in, can only ever follow a Generation
+    /// this one has already started.
     ///
-    /// The Generation number is what discriminates: counting settled entities cannot tell a
-    /// suppressed refresh from one that ran, since both leave every row settled. The second
-    /// run's own completion still starts exactly one, so what is dropped here is the
-    /// duplicate rather than the refresh.
+    /// [`Core::action_completion_boundary`] holds the completion between the two, the one
+    /// place either half is observable: they are adjacent statements, so a test racing them
+    /// reads whichever it happened to catch.
     #[test]
-    fn a_completion_overtaken_by_a_newly_admitted_run_starts_no_generation_of_its_own() {
+    fn a_completion_dispatches_its_generation_before_releasing_its_run() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let repo = root.join("repo");
         init_repo_with_a_commit(&repo);
 
-        let (core, _launched) = started_and_settled(spec(vec![root]));
-        let key = core.snapshot().entities[0].key.clone();
-        let boundary = core.action_completion_boundary();
-        boundary.arm();
+        let (core, before) = started_and_settled(spec(vec![root]));
+        let key = before.entities[0].key.clone();
+        let armed = core.action_completion_boundary().arm();
 
         assert!(core.run_action(
-            action("overtaken", vec![step(&["true"])]),
+            action("finishing", vec![step(&["true"])]),
             std::slice::from_ref(&key)
         ));
-        boundary.wait_until_reached();
-        let before = core.snapshot().generation;
-
-        assert!(core.run_action(
-            action("overtaking", vec![step(&["sh", "-c", "sleep 5"])]),
-            std::slice::from_ref(&key)
-        ));
-
-        boundary.release();
-        boundary.wait_until_passed();
+        armed.wait_until_reached();
 
         assert_eq!(
             core.snapshot().generation,
-            before,
-            "the overtaken completion must start no Generation beside the overtaking run's \
-             fan-out, whose own admission just cancelled the one in flight"
+            before.generation.successor(),
+            "the completion Generation must be dispatched before the run releases its \
+             admission"
+        );
+        assert!(
+            !core.run_action(
+                action("racing", vec![step(&["true"])]),
+                std::slice::from_ref(&key)
+            ),
+            "a submission before that release must be refused, so what a run cancels on the \
+             way in is never a Generation the run it replaced has yet to dispatch"
         );
 
-        wait_for("the overtaking run to finish", || !core.action_running());
-        assert_eq!(
-            core.settle().generation,
-            before.successor(),
-            "the overtaking run's own completion must still start exactly one Generation"
-        );
+        drop(armed);
+        wait_for("the finished run to release its admission", || {
+            !core.action_running()
+        });
     }
 
     /// Criterion 5. The excluded row gets the one legitimate `not_applicable` receipt
@@ -6830,10 +6803,10 @@ mod tests {
     /// registers no control of its own, so the run already in flight is still the one
     /// `stop_action` reaches.
     ///
-    /// Neither sleep outlives [`BACKSTOP`], because the discrimination here is the outcome
-    /// rather than the wait: a step that ended on its own reads `Ok`, which fails the
-    /// assertion, and every child this fixture spawns is gone within seconds however the
-    /// test ends.
+    /// A guard on the refusal path rather than a reproduction of anything: refusing has
+    /// always returned before touching a control, and this pins that it still does. Both
+    /// steps sleep [`FIXTURE_LIFETIME`], since the outcomes below cannot tell a cancelled
+    /// step from one that reached its own end inside the wait watching it.
     #[test]
     fn a_refused_second_submission_leaves_the_first_action_still_stoppable() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -6843,11 +6816,12 @@ mod tests {
 
         let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
+        let sleep_past_the_backstop = format!("sleep {}", FIXTURE_LIFETIME.as_secs());
         let live = action(
             "live",
             vec![
-                step(&["sh", "-c", "sleep 5"]),
-                step(&["sh", "-c", "sleep 5"]),
+                step(&["sh", "-c", &sleep_past_the_backstop]),
+                step(&["sh", "-c", &sleep_past_the_backstop]),
             ],
         );
 
@@ -6887,19 +6861,18 @@ mod tests {
         );
     }
 
-    /// A run admitted inside the previous run's completion boundary owns the controls for
-    /// the rest of its life: the completion it raced must not take a control registered
-    /// after it away.
+    /// A run accepted the moment a completion releases its admission owns the controls for
+    /// the rest of its life: that completion has nothing left to register by then, so
+    /// `stop_action` still reaches this run's own steps.
     ///
-    /// [`Core::action_completion_boundary`] holds the first run's completion in that window
-    /// rather than racing it, which is the only way the interleaving is reachable at all:
-    /// admission is released a few instructions before the completion is done with the
-    /// state a new run has by then written. The five-second sleeps are bounded rather than
-    /// [`FIXTURE_LIFETIME`]-long because what discriminates here is the outcome, not a wait:
-    /// a step that ran to its own end reads `Ok`, which fails the assertion below, and every
-    /// child this fixture spawns is gone within seconds however the test ends.
+    /// [`Core::action_completion_boundary`] pins "the moment" rather than approximating it:
+    /// the submission made while the completion is parked must be refused, and the one made
+    /// once it is released must be accepted, so what is stopped below is a run accepted at
+    /// the earliest point one can be. Both of its steps sleep [`FIXTURE_LIFETIME`], since
+    /// the outcomes asserted cannot tell a cancelled step from one that reached its own end
+    /// inside the wait watching it.
     #[test]
-    fn a_run_admitted_inside_the_previous_ones_completion_boundary_is_still_stoppable() {
+    fn a_run_accepted_once_a_completion_releases_its_admission_is_still_stoppable() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = root_of(&dir);
         let repo = root.join("repo");
@@ -6907,58 +6880,54 @@ mod tests {
 
         let core = Core::start_discovered(spec(vec![root]));
         let key = core.snapshot().entities[0].key.clone();
-        let boundary = core.action_completion_boundary();
-        boundary.arm();
+        let armed = core.action_completion_boundary().arm();
 
         assert!(core.run_action(
             action("finishing", vec![step(&["true"])]),
             std::slice::from_ref(&key)
         ));
-        boundary.wait_until_reached();
+        armed.wait_until_reached();
+        assert!(
+            !core.run_action(
+                action("early", vec![step(&["true"])]),
+                std::slice::from_ref(&key)
+            ),
+            "a submission made before the completion releases its admission must be refused"
+        );
+        drop(armed);
+        wait_for("the finished run to release its admission", || {
+            !core.action_running()
+        });
 
-        let admitted = action(
-            "admitted",
+        let sleep_past_the_backstop = format!("sleep {}", FIXTURE_LIFETIME.as_secs());
+        let following = action(
+            "following",
             vec![
-                step(&["sh", "-c", "sleep 5"]),
-                step(&["sh", "-c", "sleep 5"]),
+                step(&["sh", "-c", &sleep_past_the_backstop]),
+                step(&["sh", "-c", &sleep_past_the_backstop]),
             ],
         );
         assert!(
-            core.run_action(admitted, std::slice::from_ref(&key)),
-            "the boundary is past the point admission is released, so a run submitted here \
-             must be accepted"
+            core.run_action(following, std::slice::from_ref(&key)),
+            "a submission made once that release has happened must be accepted"
         );
-        wait_for("the admitted run's own first step to start", || {
-            receipt_labelled(&core, &key, "admitted")
+        wait_for("the following run's own first step to start", || {
+            receipt_labelled(&core, &key, "following")
                 .is_some_and(|receipt| receipt.running.is_some())
         });
 
-        boundary.release();
-        boundary.wait_until_passed();
-
         core.stop_action();
 
-        wait_for(
-            "the admitted run's own first step to land an outcome",
-            || {
-                receipt_labelled(&core, &key, "admitted")
-                    .is_some_and(|receipt| !receipt.steps.is_empty())
-            },
-        );
-        let running_step =
-            receipt_labelled(&core, &key, "admitted").expect("the admitted run's receipt");
-        assert_eq!(
-            running_step.steps[0].outcome,
-            StepOutcome::Cancelled,
-            "the completion this run was admitted inside must leave stop_action still \
-             reaching it"
-        );
-
         wait_for("the cancelled run to come down", || !core.action_running());
-        let settled =
-            receipt_labelled(&core, &key, "admitted").expect("the admitted run's receipt");
+        let receipt =
+            receipt_labelled(&core, &key, "following").expect("the following run's receipt");
         assert_eq!(
-            settled.steps[1].outcome,
+            receipt.steps[0].outcome,
+            StepOutcome::Cancelled,
+            "the completion this run followed must leave stop_action still reaching it"
+        );
+        assert_eq!(
+            receipt.steps[1].outcome,
             StepOutcome::Cancelled,
             "a cancelled run's remaining step must never start, so it reads Cancelled"
         );
@@ -9947,7 +9916,7 @@ mod tests {
         let opener = thread::spawn({
             let gate = Arc::clone(&gate);
             move || {
-                let _ = returned_rx.recv_timeout(liveness::BACKSTOP);
+                let _ = returned_rx.recv_timeout(crate::liveness::BACKSTOP);
                 set_discovery_gate(&gate, true);
             }
         });
