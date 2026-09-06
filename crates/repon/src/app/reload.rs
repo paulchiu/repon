@@ -1007,7 +1007,8 @@ mod tests {
 
     /// A Notice takes the status row from the warning slot, so one that outlives the press it
     /// answered hides every warning behind it for the rest of the run. It lasts until the next
-    /// press and no longer; the timeout that would also end it is not built yet.
+    /// press and no longer, read under a timeout long enough that only the press can be what
+    /// cleared it.
     #[test]
     fn a_notice_lasts_until_the_next_press_so_it_cannot_hide_the_warning_slot_for_the_run() {
         let dir_a = tempfile::tempdir().expect("temp dir a");
@@ -1025,6 +1026,7 @@ mod tests {
         init_repo(&root_b.join("repo-b"));
 
         let mut app = test_app(&root_a);
+        app.document.notice_timeout = Duration::from_secs(3600);
         app.document.sets = vec![
             matching_set_config(&root_a),
             document::SetConfig {
@@ -1399,6 +1401,10 @@ mod tests {
     /// assigning `app.document` directly, so this proves the wiring, not only that the value
     /// reads whatever `document.notice_timeout` happens to hold. Read off the rendered status
     /// row, since what "re-applies immediately" promises is a change on screen.
+    ///
+    /// Reloaded a second time, to a timeout longer than the Notice's age, so the row is read
+    /// empty and full again from the one Notice: a reload that simply discarded the field
+    /// would satisfy the empty read alone.
     #[test]
     fn notice_timeout_re_applies_immediately_on_reload_with_no_new_press() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1422,6 +1428,17 @@ mod tests {
             !after.contains("switched to"),
             "the shorter reloaded timeout must age out the Notice already on screen, with no \
              new press, got {after:?}"
+        );
+
+        let mut lengthened_document = app.document.clone();
+        lengthened_document.notice_timeout = Duration::from_secs(3600);
+        app.apply_reloaded_config(config_with_document(lengthened_document));
+
+        let restored = rendered_status_row(&mut app);
+        assert!(
+            restored.contains("switched to `second`"),
+            "the timeout, not the reload, must be what emptied the row: the same Notice is \
+             back under a longer one, got {restored:?}"
         );
     }
 

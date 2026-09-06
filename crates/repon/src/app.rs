@@ -7811,7 +7811,9 @@ mod tests {
     // =====================================================================================
 
     /// Raises `text` on `app` as though the press that raised it landed `age` ago: the seam
-    /// every timeout test drives, in place of waiting on the wall clock.
+    /// every timeout test drives, in place of waiting on the wall clock. Keep `age` to
+    /// seconds: an `Instant` runs from boot, so subtracting more than the machine's own
+    /// uptime panics.
     pub(crate) fn raise_notice_aged(app: &mut App, text: &str, age: Duration) {
         app.notice = Some(Notice::raised(
             text.to_string(),
@@ -7819,43 +7821,38 @@ mod tests {
         ));
     }
 
+    /// The wiring, the whole of what `App` owes the value: one Notice, read twice, answers
+    /// opposite ways as the configured timeout moves either side of its age. The second read
+    /// disagrees with the three-second default, so a `notice()` measuring against a figure of
+    /// its own fails it.
     #[test]
-    fn a_notice_stays_live_until_its_timeout_elapses_then_reads_as_gone() {
+    fn a_notice_reads_as_live_or_gone_against_the_configured_timeout() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
         init_repo(&root.join("repo-a"));
         let mut app = test_app(&root);
-        assert_eq!(
-            app.document.notice_timeout,
-            Duration::from_secs(3),
-            "sanity: the default this test's two elapsed times straddle"
-        );
-        raise_notice_aged(
-            &mut app,
-            "switched to `second`",
-            Duration::from_millis(2_900),
-        );
+        app.document.notice_timeout = Duration::from_secs(3600);
+        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(2));
         assert_eq!(
             app.notice(),
             Some("switched to `second`"),
-            "must still read as live just under the timeout"
+            "two seconds is nothing against an hour"
         );
 
-        raise_notice_aged(
-            &mut app,
-            "switched to `second`",
-            Duration::from_millis(3_100),
-        );
+        app.document.notice_timeout = Duration::from_secs(1);
+
         assert_eq!(
             app.notice(),
             None,
-            "must read as gone once the timeout has elapsed"
+            "the same Notice, two seconds old, has aged out of a one-second timeout"
         );
     }
 
     /// The trap the criterion states by name: `"0s"` must not mean "no Notices", only "no
-    /// timer". An hour of elapsed time would clear any real timeout many times over; this
-    /// Notice must still be live regardless.
+    /// timer". Ten seconds would clear the three-second default several times over; read
+    /// against the configured zero, this Notice is still live. How far past a timeout a
+    /// Notice can be and still read live is `crate::notice`'s own test, on instants that
+    /// need no clock at all.
     #[test]
     fn a_zero_second_notice_timeout_turns_the_timer_off_rather_than_notices_off() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7863,7 +7860,7 @@ mod tests {
         init_repo(&root.join("repo-a"));
         let mut app = test_app(&root);
         app.document.notice_timeout = Duration::ZERO;
-        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(3600));
+        raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(10));
 
         assert_eq!(
             app.notice(),
@@ -7874,6 +7871,10 @@ mod tests {
 
     /// The status row of a whole frame `app` would draw, trailing blanks trimmed: row 0, the
     /// row a live Notice takes alone. `pub(crate)` for `reload.rs`'s own reload test.
+    ///
+    /// The one of this module's three status row readers that can see a Notice at all, which
+    /// is what a Notice test needs: `status_row_text` enters below `draw_status_row`'s own
+    /// match, and `render_status_row` is handed a Notice rather than reading `app`.
     pub(crate) fn rendered_status_row(app: &mut App) -> String {
         const WIDTH: u16 = 80;
         let buf = render_app_frame(app, WIDTH, 24);
@@ -11426,7 +11427,7 @@ mod tests {
             generation_before,
             "the Refresh itself must still happen; only the hook is missing"
         );
-        assert!(app.notice().is_none());
+        assert!(app.notice.is_none());
     }
 
     // --- Issue #250: a `[[set]].on_refresh` scopes the hook to the Set rather than the whole
@@ -15702,9 +15703,8 @@ refresh_all = "z""#,
             "Alt+/ must clear the committed Filter rather than restore it"
         );
         assert_eq!(app.visible_keys().len(), 2, "no Filter is left active");
-        assert_eq!(
-            app.notice(),
-            None,
+        assert!(
+            app.notice.is_none(),
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15743,9 +15743,8 @@ refresh_all = "z""#,
             2,
             "the draft must no longer narrow the list"
         );
-        assert_eq!(
-            app.notice(),
-            None,
+        assert!(
+            app.notice.is_none(),
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15787,9 +15786,8 @@ refresh_all = "z""#,
             2,
             "neither the draft nor the committed Filter may narrow the list afterwards"
         );
-        assert_eq!(
-            app.notice(),
-            None,
+        assert!(
+            app.notice.is_none(),
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15840,9 +15838,8 @@ refresh_all = "z""#,
             !app.filter.is_active(),
             "Alt+/ must clear the committed Filter even when the draft over it is empty"
         );
-        assert_eq!(
-            app.notice(),
-            None,
+        assert!(
+            app.notice.is_none(),
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
     }
@@ -15971,9 +15968,8 @@ refresh_all = "z""#,
             app.core.action_running(),
             "Alt+/ must leave a running Action untouched"
         );
-        assert_eq!(
-            app.notice(),
-            None,
+        assert!(
+            app.notice.is_none(),
             "a successful Alt+/ clear must not also raise the 'no Filter to clear' Notice"
         );
 
