@@ -1474,6 +1474,42 @@ mod tests {
         );
     }
 
+    /// A working tree that went and a `config.toml` write that did not are two facts, and
+    /// the receipt carries both: the removal first, then the write that failed behind it,
+    /// so the row never reads as the clean removal it was not
+    /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "What `delete` leaves
+    /// behind").
+    #[test]
+    fn a_removal_whose_config_write_failed_names_the_write_after_the_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A directory where the file goes, so every read of the config path fails on its
+        // first byte rather than racing a permission bit.
+        let config_file = dir.path().join("config.toml");
+        std::fs::create_dir(&config_file).expect("put a directory where the config file goes");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+
+        let report = run_plain(&plan(Operation::Delete, &entities), &config_file);
+
+        assert!(!repo.exists(), "the working tree is genuinely gone");
+        let said = describe(&report.records[0].outcome);
+        assert!(
+            said.starts_with("working tree removed; its `[[repo]]` entry could not be removed: "),
+            "the receipt names the removal, then the write that did not finish, got {said:?}"
+        );
+        assert_eq!(
+            report.removed_keys(),
+            vec![entities[0].key.clone()],
+            "the row leaves on the removal, never on the write"
+        );
+        assert_eq!(
+            report.summary(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "and the completion carries both halves"
+        );
+    }
+
     /// An administrative entry that is already gone is nothing to clear rather than a
     /// cleanup that failed: the removal reads clean, and the completion does not count a
     /// row against work no one has left to do

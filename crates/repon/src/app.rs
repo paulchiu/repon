@@ -7182,11 +7182,10 @@ mod tests {
             Vec::<String>::new(),
             "so the removed row leaves the table rather than pointing at nothing"
         );
-        let notice = app.notice().unwrap_or_default().to_string();
-        assert!(
-            notice.contains("1 removed with cleanup unfinished"),
-            "the completion must name the removal and the cleanup that did not finish, got \
-             {notice:?}"
+        assert_eq!(
+            app.notice().unwrap_or_default(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "the completion names the removal and the cleanup that did not finish, both"
         );
     }
 
@@ -7231,10 +7230,10 @@ mod tests {
             vec!["sidecar".to_string()],
             "so its row stays listed rather than being dismissed with the parent"
         );
-        let notice = app.notice().unwrap_or_default().to_string();
-        assert!(
-            notice.contains("1 removed with cleanup unfinished"),
-            "the completion must say the run left something behind, got {notice:?}"
+        assert_eq!(
+            app.notice().unwrap_or_default(),
+            "delete: 1 done, 1 removed with cleanup unfinished",
+            "and the completion says the run left something behind"
         );
     }
 
