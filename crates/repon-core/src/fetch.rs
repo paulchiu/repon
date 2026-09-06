@@ -187,6 +187,33 @@ pub(crate) fn probe_remote_head(
 /// "Cancellation"): one `Arc<AtomicBool>` per in-flight fetch, never
 /// `gix::interrupt::IS_INTERRUPTED`.
 ///
+/// # What `cancel` actually bounds
+///
+/// The receive stage alone. The pinned gix takes a cancellation flag at
+/// [`gix::remote::fetch::Prepare::receive`] and nowhere else: [`gix::Remote::connect`],
+/// [`gix::remote::Connection::ref_map`] and [`gix::remote::Connection::prepare_fetch`] each
+/// take none, so a fetch still resolving, connecting or handshaking carries on however long
+/// its remote takes, whatever this flag says.
+/// `a_fetch_stalled_before_its_receive_stage_is_not_ended_by_its_cancel_flag` holds that
+/// still against a local stalled transport.
+///
+/// What bounds those earlier stages instead is the transport's own, and only one of them
+/// carries a bound worth the name:
+///
+/// - `https://` and `http://`: the reqwest client this crate compiles in is built with a
+///   20 second connect timeout, which covers name resolution, TCP and the TLS handshake and
+///   nothing after them. No request or read timeout is set, so a remote that accepts a
+///   connection and then says nothing holds the handshake open indefinitely.
+/// - `git://`: a 5 second TCP connect timeout, and no bound at all on the reads after it.
+/// - `ssh://`, a local path and `file://`: a child process (`ssh`, `git upload-pack`) with no
+///   timeout of any kind.
+///
+/// So connect and preparation have no finite bound in general, and a caller that has
+/// cancelled a fetch can only wait for it. Giving them one is a product decision nobody has
+/// made: it needs a number, a place to configure it, and an answer for what a timed-out
+/// repository reports, and none of the three exists. Recorded here as unresolved rather than
+/// guessed at, the same way [`crate::core`]'s own fetch cadence is.
+///
 /// Fails closed on a credential prompt: [`refuse_credentials`] reports no credentials
 /// are available rather than asking a terminal Repon has taken the alternate screen of,
 /// so a repository that would otherwise prompt errs instead of hanging. Touches only
@@ -532,6 +559,89 @@ mod tests {
             result.is_err(),
             "a remote this sandbox cannot reach must fail rather than succeed"
         );
+    }
+
+    /// Writes an executable `ssh` into `dir` that waits until `release` exists, with a
+    /// ceiling of its own so a failing run leaves nothing behind. Named `ssh` so gix takes it
+    /// for the standard client and spawns it once, rather than probing it first.
+    fn stalling_ssh(dir: &std::path::Path, release: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("ssh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 600 ]; do\n  i=$((i+1))\n                   sleep 0.05\ndone\n",
+                release.display()
+            ),
+        )
+        .expect("write the stalling ssh program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stalling ssh program executable");
+        program
+    }
+
+    /// What [`fetch_and_prune`]'s `cancel` flag actually buys, pinned rather than assumed:
+    /// the pinned gix takes it at [`gix::remote::fetch::Prepare::receive`] and nowhere
+    /// earlier, so a fetch still connecting or handshaking is not ended by setting it. The
+    /// doc comment on [`fetch_and_prune`] records the whole bound; this is the half of it a
+    /// test can hold still.
+    ///
+    /// Stalled with no socket at all: `core.sshCommand` in the repository's own config names
+    /// a program that waits, so gix spawns that instead of `ssh` and the handshake never
+    /// answers. Both sides of the wait are bounded, by that program's own ceiling and by the
+    /// release file below, so nothing is left running either way.
+    #[test]
+    fn a_fetch_stalled_before_its_receive_stage_is_not_ended_by_its_cancel_flag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        git(dir.path(), &["init", "--initial-branch=main"]);
+        commit_file(dir.path(), "README.md", "seed\n");
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://stalled.invalid/example.git",
+            ],
+        );
+        let release = dir.path().join("release");
+        let program = stalling_ssh(dir.path(), &release);
+        git(
+            dir.path(),
+            &[
+                "config",
+                "core.sshCommand",
+                program.to_str().expect("utf8 path"),
+            ],
+        );
+
+        // Set before the call even begins: which stages ever read the flag is what this test
+        // turns on, never the timing of setting it.
+        let (tx, rx) = mpsc::channel();
+        let path = dir.path().to_path_buf();
+        let fetching = std::thread::spawn(move || {
+            let cancel = AtomicBool::new(true);
+            let _ = tx.send(fetch_and_prune(&path, &cancel));
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "an already-cancelled fetch must still be sitting in its handshake: nothing \
+             before the receive stage reads that flag"
+        );
+
+        std::fs::write(&release, b"go").expect("release the stalled transport");
+        let result = rx
+            .recv_timeout(crate::liveness::BACKSTOP)
+            .expect("releasing the stalled transport is what ends this fetch, not the flag");
+        assert!(
+            result.is_err(),
+            "a transport that answers nothing must fail rather than succeed, got: {result:?}"
+        );
+        fetching
+            .join()
+            .expect("the fetching thread should not panic");
     }
 
     /// [`run_bounded`]'s own contract, exercised with a synthetic slow job rather

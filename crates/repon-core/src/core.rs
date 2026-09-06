@@ -3472,10 +3472,10 @@ fn spawn_clock_thread(
                 }
             }
         }
-        // Shutdown signals the cycle and waits for it here, so no worker is still fetching or
-        // fast-forwarding a repository once `Core::drop`'s own join of this thread returns.
-        // The Generation such a cycle would have owed is deliberately not dispatched: the
-        // table it would write to is going away with this `Core`.
+        // Shutdown waits the cycle out rather than detaching it, so no worker is still
+        // fetching or fast-forwarding once `Core::drop` returns; the wait is only as short as
+        // [`FetchCycle::cancel`] can make it. The Generation it would have owed is not
+        // dispatched, since the table it would write to is going away with this `Core`.
         if let Some(cycle) = cycle.take() {
             cycle.cancel();
             cycle.join();
