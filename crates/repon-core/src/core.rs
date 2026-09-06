@@ -1568,8 +1568,8 @@ impl Core {
             // Caught rather than left to unwind straight out of this thread: a poisoned
             // `RwLock` from an unrelated earlier panic is enough to panic the
             // `table_handle.write().unwrap()` below, and without `catch_unwind` that
-            // would skip the flag reset just past it, leaving `action_running` stuck
-            // true for the life of this `Core`.
+            // would skip the completion transition just past it, leaving this `Core`
+            // reading its run as live for the rest of its life.
             let fan_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pool.install(|| {
                     included.into_par_iter().for_each(|entity| {
@@ -1594,8 +1594,9 @@ impl Core {
             // Criterion 6: the fan-out itself ends the moment every entity's own steps
             // have finished, panic or not; a second `run_action` racing in from here on
             // is racing the completion Generation below, never another fan-out.
+
             // One transition: admission released and this run's own `RunControl` dropped
-            // together, and only if the live run is still this one. `hold_action`,
+            // together, and only while the live run is still this one. `hold_action`,
             // `continue_action` and `stop_action` are no-ops again from here until the next
             // `run_action` admits a run of its own.
             action_lifecycle.lock().unwrap().complete(run_id);
@@ -1605,7 +1606,7 @@ impl Core {
             let _boundary = completion_boundary.hold();
 
             // A panicked fan-out never finished cleanly, so it earns no completion
-            // Generation once the flag above is safely reset. Swallowed rather than
+            // Generation once the run above has safely ended. Swallowed rather than
             // resumed: the default panic hook already printed it to stderr before
             // `catch_unwind` returned, and this crate carries no logger to hand it to
             // instead.
