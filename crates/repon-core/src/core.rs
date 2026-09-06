@@ -12679,21 +12679,25 @@ mod tests {
 
         /// Pause is the lifecycle owner ending the live cycle where it stands, not only
         /// stopping the next one: the cancellation reaches a fetch that is provably still
-        /// running, the mutating half of that cycle never runs, and the Generation a
-        /// finished cycle owes is never dispatched once the held fetch is let go. The Repo is
-        /// left genuinely eligible (clean, behind, tracking an upstream) by a fetch this test
-        /// performs itself, so "the branch did not move" is a fence holding rather than
-        /// nothing to move it.
+        /// running, no further repository is fetched, the mutating half of that cycle never
+        /// runs, and the Generation a finished cycle owes is never dispatched once the held
+        /// fetch is let go. Both fences have something to hold: `parent` is left genuinely
+        /// eligible (clean, behind, tracking an upstream) by a fetch this test performs
+        /// itself, and `stale` is left a commit behind its remote, so a cycle that carried on
+        /// would move each of them.
         #[test]
         fn pause_cancels_a_held_cycle_so_it_neither_auto_updates_nor_dispatches_its_generation() {
             let remote = seeded_remote();
             let root = tempfile::tempdir().expect("temp dir");
             let root_path = root_of(&root);
             let parent = root_path.join("parent");
+            let stale = root_path.join("stale");
             clone_into(remote.path(), &parent);
+            clone_into(remote.path(), &stale);
             crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
             git(&parent, &["fetch", "origin"]);
             let before_tip = rev_parse(&parent, "refs/heads/main");
+            let stale_before = rev_parse(&stale, "refs/remotes/origin/main");
 
             let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
             let started = Core::start_for_test_with_fetch(
@@ -12724,6 +12728,11 @@ mod tests {
                 before_tip,
                 "a cancelled cycle must not fast-forward a Repo its auto-update would \
                  otherwise have moved"
+            );
+            assert_eq!(
+                rev_parse(&stale, "refs/remotes/origin/main"),
+                stale_before,
+                "a cancelled cycle must land no fetch beyond the one it was holding"
             );
             assert_eq!(
                 core.snapshot().generation,
@@ -12783,6 +12792,62 @@ mod tests {
                 1,
                 "two ticks taken while a cycle was held must have started no cycle of their \
                  own"
+            );
+        }
+
+        /// [`FetchFailures`] is the most recently *completed* cycle's own count
+        /// (GLOSSARY.md), so a cancelled one never replaces it: what that cycle reached
+        /// before it was ended is not a count of what could not be fetched. The immediate
+        /// cycle here completes and counts its one broken remote; the second is cancelled
+        /// while its fetch is held, and the count standing afterwards is still the first
+        /// cycle's.
+        #[test]
+        fn a_cancelled_cycle_leaves_the_completed_cycles_failures_standing() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let broken = root_path.join("broken");
+            clone_into(remote.path(), &broken);
+            break_remote(&broken);
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            wait_for("the immediate cycle to complete and be taken back", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+            assert_eq!(
+                core.fetch_failures().failed.len(),
+                1,
+                "the completed cycle must have counted its one broken remote, got: {:?}",
+                core.fetch_failures().failed
+            );
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+            core.pause();
+            held.wait_until_cancelled();
+            drop(held);
+            wait_for("the cancelled cycle to be taken back by the clock", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 2
+            });
+
+            assert_eq!(
+                core.fetch_failures().failed.len(),
+                1,
+                "a cancelled cycle must leave the completed cycle's own count standing, \
+                 got: {:?}",
+                core.fetch_failures().failed
             );
         }
 
