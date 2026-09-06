@@ -2510,9 +2510,7 @@ impl App {
             self.core.dismiss(&key);
             self.selection.remove(&key);
         }
-        // A management run is not `Ctrl+R` or `e`: the user asked for `sync`/`ignore`/
-        // `delete`, not for the file to decide the view again, so `t`'s override rides
-        // across this reload untouched even though the reload itself is unconditional.
+        // `t`'s override rides across this reload, for the reason above.
         let worktrees_toggle = self.worktrees_toggle;
         self.reload_config();
         self.worktrees_toggle = worktrees_toggle;
