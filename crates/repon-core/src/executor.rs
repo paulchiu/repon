@@ -2462,41 +2462,96 @@ print(1 if inherited else 0)"
         assert!(decoded.contains("\u{4e2d}\u{6587}"));
     }
 
-    /// Every one of `docs/spec/actions.md`'s "Capture" rules in one fixture, checked against
-    /// bytes written out from that spec rather than from the normaliser, so the two can
-    /// disagree: the tests around this one each take a rule alone and would not catch the
-    /// rules interacting, an SGR the following frame reset has to drop among them. Reassembled
-    /// at every byte offset the way [`drain_with_poll`] concatenates its reads, since capture
-    /// runs over the whole stream and no read boundary may reach it.
-    #[test]
-    fn splitting_the_fixture_at_any_read_boundary_produces_the_same_specified_capture() {
-        let raw: &[u8] = b"repon\r\n\
-            \x1b[31mProgress: 10%\r\
-            Progress: 55%\x1b[K\
-            Progress: 78%\x1b[1G\
-            Progress: 100%\r\n\
-            \x1b[32mdone\x1b[m \xe4\xb8\xad\xe6\x96\x87\r\n\
-            tail with no newline";
-        let expected: Vec<u8> = [
-            "repon\n".as_bytes(),
-            "Progress: 100%\n".as_bytes(),
-            "\x1b[32mdone\x1b[m \u{4e2d}\u{6587}\n".as_bytes(),
-            "tail with no newline".as_bytes(),
+    /// Every "Capture" rule of `docs/spec/actions.md` at once, as the pieces a child writes
+    /// it in and the capture the spec says it produces. The pieces end inside a CRLF, a CSI
+    /// introducer, a CSI parameter and a multi-byte character, so a read boundary can land
+    /// in each; the expected bytes are written out from the spec rather than from the
+    /// normaliser, so the two can disagree.
+    fn capture_rule_fixture() -> (Vec<&'static [u8]>, Vec<u8>) {
+        let written: Vec<&'static [u8]> = vec![
+            b"repon\r\n",
+            b"\x1b",
+            b"[31mProgress: 10%",
+            b"\r",
+            b"Progress: 55%\x1b[",
+            b"K",
+            b"Progress: 78%\x1b[1",
+            b"G",
+            b"Progress: 100%\r",
+            b"\n",
+            b"\x1b[32mdone\x1b[m \xe4\xb8",
+            b"\xad\xe6\x96\x87\r\n",
+            b"tail with no newline",
+        ];
+        let kept = [
+            "repon\n",
+            "Progress: 100%\n",
+            "\x1b[32mdone\x1b[m \u{4e2d}\u{6587}\n",
+            "tail with no newline",
         ]
-        .concat();
+        .concat()
+        .into_bytes();
+        (written, kept)
+    }
 
-        for split in 0..=raw.len() {
-            let reassembled = [&raw[..split], &raw[split..]].concat();
-            let (kept, elision) = bound_head_and_tail(&normalize_carriage_returns(&reassembled));
-            assert_eq!(
-                kept,
-                expected,
-                "split at byte {split}: {:?} against {:?}",
-                String::from_utf8_lossy(&kept),
-                String::from_utf8_lossy(&expected)
-            );
-            assert_eq!(elision, None, "split at byte {split}");
-        }
+    /// The rules interacting, which the tests around this one take one rule at a time and
+    /// would not catch: an SGR the following frame reset has to drop among them.
+    #[test]
+    fn every_capture_rule_at_once_produces_the_bytes_the_spec_specifies() {
+        let (written, expected) = capture_rule_fixture();
+
+        let (kept, elision) = bound_head_and_tail(&normalize_carriage_returns(&written.concat()));
+
+        assert_eq!(
+            String::from_utf8_lossy(&kept),
+            String::from_utf8_lossy(&expected)
+        );
+        assert_eq!(elision, None);
+    }
+
+    /// The same fixture through a real child that writes it a piece at a time, so the
+    /// drain's reads really do split it: capture normalises the whole stream, so where
+    /// those boundaries fell must not reach the bytes. ONLCR is turned off in the child so
+    /// the fixture arrives as written, a line ending's `\r` and `\n` in separate reads
+    /// included, rather than expanded by the kernel a whole pair at a time.
+    #[test]
+    fn a_fixture_split_across_a_childs_own_reads_captures_the_same_bytes() {
+        let (written, expected) = capture_rule_fixture();
+        let literals: Vec<String> = written
+            .iter()
+            .map(|piece| {
+                let escaped: String = piece.iter().map(|byte| format!("\\x{byte:02x}")).collect();
+                format!("b\"{escaped}\"")
+            })
+            .collect();
+        // The flush and the pause per piece are what put a read boundary between them.
+        let program = [
+            "import sys, termios, time".to_string(),
+            "mode = termios.tcgetattr(1)".to_string(),
+            "mode[1] &= ~termios.ONLCR".to_string(),
+            "termios.tcsetattr(1, termios.TCSANOW, mode)".to_string(),
+            format!(
+                "for piece in [{}]: sys.stdout.buffer.write(piece); \
+                 sys.stdout.buffer.flush(); time.sleep(0.005)",
+                literals.join(", ")
+            ),
+        ]
+        .join("\n");
+        let dir = tempdir();
+
+        let result = run(&["python3", "-c", &program], dir.path());
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Ok,
+            "the fixture step failed; it needs `python3` on PATH. output: {}",
+            String::from_utf8_lossy(&result.output)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.output),
+            String::from_utf8_lossy(&expected)
+        );
+        assert_eq!(result.elision, None);
     }
 
     /// The bound counts lines, so it bounds nothing until a line ends and an unfinished one
