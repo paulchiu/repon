@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -317,10 +317,10 @@ pub(crate) fn run_step(
 /// Everything one step needs from the OS, created whole before its child exists.
 ///
 /// Prepared up front rather than as the run reaches each one, so a failure at any of them
-/// is a failed receipt rather than a half-built setup the drain would have to survive:
-/// with the slave side already held, a drain that cannot wait on the child's exit reaches
-/// a read the pty can never end. Each field is an [`OwnedFd`], so a failure part way
-/// through closes whatever was created before it on the way out.
+/// is a failed receipt rather than a half-built setup the drain would have to survive
+/// (see [`set_nonblocking`] for what a drain missing one of these waits on). Each field is
+/// an [`OwnedFd`], so a failure part way through closes whatever was created before it on
+/// the way out.
 struct StepResources {
     /// The child's own stdout, dup2'd onto its 1 during exec setup.
     slave: OwnedFd,
@@ -390,7 +390,7 @@ fn prepare_step_resources(
 
     let (master, slave) = open_pty(width).map_err(SetupFailure::Pty)?;
     injected_or(control, SetupBoundary::Nonblocking, || {
-        set_nonblocking(&master)
+        set_nonblocking(master.as_raw_fd())
     })
     .map_err(named("the pty master's own non-blocking flag"))?;
     let slave_dup =
@@ -752,19 +752,18 @@ fn notify_exit(write_end: &OwnedFd) {
     }
 }
 
-/// Sets `O_NONBLOCK` on `fd`, failing loudly on error: [`drain_with_poll`] ends on a read
-/// that finds nothing left, and against a blocking descriptor that read waits instead on a
-/// slave side `keepalive` is still deliberately holding open. Set before the child exists,
-/// with every other resource, so the flag can never be missing by the time the drain
-/// depends on it.
-fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    // SAFETY: `fd` is a valid, open descriptor for the duration of both calls.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+/// Sets `O_NONBLOCK` on `fd`, failing loudly on error, and set before the child exists so
+/// the flag can never be missing once the drain depends on it: [`drain_with_poll`] ends on
+/// a read that finds nothing left, and against a blocking descriptor that read waits
+/// instead on a slave side `keepalive` is still deliberately holding open.
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: both calls only read and write `fd`'s own flags and touch no memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: as above.
-    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
     if result == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -776,8 +775,7 @@ fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
 /// `notify_read` reports the child has exited. From there `master` can never become ready
 /// again on its own (`keepalive` sees to that), so the stopping condition becomes a read
 /// that comes back empty, a kernel fact rather than an elapsed time. Every read here is
-/// non-blocking, which is [`set_nonblocking`]'s doing in the setup this loop's own
-/// resources came from; the waiting is `poll`'s alone.
+/// non-blocking ([`set_nonblocking`]); the waiting is `poll`'s alone.
 fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -1676,6 +1674,47 @@ mod tests {
         // `\r\n`, which `run_step`'s own `normalize_carriage_returns` is what collapses
         // in the real path; this test reads `drain_until_exit` directly, below that step.
         assert_eq!(&raw, b"quick output\r\n");
+    }
+
+    /// A descriptor number this process can never have open: its own soft limit, which
+    /// the kernel will not allocate past, so a call against it fails with `EBADF` rather
+    /// than reaching a descriptor a concurrent test happens to hold.
+    fn unusable_descriptor() -> RawFd {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes one `libc::rlimit` through the pointer.
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        assert_eq!(read, 0, "read this process's own descriptor limit");
+        RawFd::try_from(limit.rlim_cur).unwrap_or(RawFd::MAX)
+    }
+
+    /// The flag the drain's own stopping condition rests on is on the master before the
+    /// child that writes to it exists, so nothing can reach [`drain_with_poll`] without it.
+    #[test]
+    fn a_prepared_master_is_already_non_blocking_before_its_child_exists() {
+        let resources = prepared();
+
+        // SAFETY: `F_GETFL` only reads the descriptor's own flags and touches no memory.
+        let flags = unsafe { libc::fcntl(resources.drain.master.as_raw_fd(), libc::F_GETFL) };
+
+        assert!(flags >= 0, "read the prepared master's own flags");
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "expected the prepared master to be non-blocking, got flags {flags:#o}"
+        );
+    }
+
+    /// The failure that flag's own call can hit is reported rather than swallowed: a
+    /// master left blocking is what sends the drain's last read into a wait `keepalive`
+    /// never ends, so a step that cannot have the flag must fail instead of running.
+    #[test]
+    fn a_descriptor_that_cannot_be_made_non_blocking_reports_the_failure() {
+        let error = set_nonblocking(unusable_descriptor())
+            .expect_err("a descriptor number the kernel never allocates cannot take a flag");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     /// A child that outlives this test's own wait while holding its own copy of `fd`,
