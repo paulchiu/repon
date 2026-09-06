@@ -12654,6 +12654,59 @@ mod tests {
             );
         }
 
+        /// Pause is the lifecycle owner ending the live cycle where it stands, not only
+        /// stopping the next one: the mutating half of that cycle never runs, and the
+        /// Generation a finished cycle owes is never dispatched once the held fetch is let
+        /// go. The Repo is left genuinely eligible (clean, behind, tracking an upstream) by a
+        /// fetch this test performs itself, so "the branch did not move" is a fence holding
+        /// rather than nothing to move it.
+        #[test]
+        fn pause_cancels_a_held_cycle_so_it_neither_auto_updates_nor_dispatches_its_generation() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            git(&parent, &["fetch", "origin"]);
+            let before_tip = rev_parse(&parent, "refs/heads/main");
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+            let before = core.settle().generation;
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+
+            core.pause();
+            wait_for("the cancelled cycle to be taken back by the clock", || {
+                started.fetch_cycles_finished.load(Ordering::Acquire) >= 1
+            });
+
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before_tip,
+                "a cancelled cycle must not fast-forward a Repo its auto-update would \
+                 otherwise have moved"
+            );
+            assert_eq!(
+                core.snapshot().generation,
+                before,
+                "releasing a cancelled fetch must not dispatch the completion Generation \
+                 its cycle would otherwise have owed"
+            );
+        }
+
         /// Points `repo`'s `origin` at a path nothing lives at, breaking `fetch_and_prune`
         /// alone: discovery has already found `repo` as a real Repo before this runs, so
         /// only the fetch itself fails, never the walk. A local path rather than a loopback
