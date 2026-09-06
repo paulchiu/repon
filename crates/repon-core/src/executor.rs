@@ -381,11 +381,10 @@ pub(crate) const SETUP_FAILURE_VARIABLE: &str = "REPON_TEST_SETUP_FAILURE";
 /// build entirely.
 #[cfg(feature = "test-util")]
 fn injected_setup_failure(env: &[(String, Option<String>)]) -> Option<SetupFailure> {
-    let asked = env.iter().find_map(|(name, value)| {
-        (name == SETUP_FAILURE_VARIABLE)
-            .then_some(value.as_deref())
-            .flatten()
-    })?;
+    let asked = env
+        .iter()
+        .find(|(name, _)| name == SETUP_FAILURE_VARIABLE)
+        .and_then(|(_, value)| value.as_deref())?;
     let what = match asked {
         "nonblocking" => NON_BLOCKING_FLAG,
         "stderr" => STDERR_DESCRIPTOR,
@@ -1687,9 +1686,9 @@ mod tests {
         );
     }
 
-    /// The failure that flag's own call can hit is reported rather than swallowed: a
-    /// master left blocking is what sends the drain's last read into a wait `keepalive`
-    /// never ends, so a step that cannot have the flag must fail instead of running.
+    /// The failure that call can hit is reported rather than swallowed, so a step that
+    /// cannot have the flag fails instead of reaching the drain (see [`set_nonblocking`]
+    /// for what a drain without it waits on).
     #[test]
     fn a_descriptor_that_cannot_be_made_non_blocking_reports_the_failure() {
         let error = set_nonblocking(unusable_descriptor())
@@ -1727,9 +1726,9 @@ mod tests {
 
     /// The drain's own wake-up is a byte the waiter writes, never its end of the pipe
     /// closing: a copy of that end which reached another process would otherwise hold the
-    /// pipe open and leave `poll` waiting on a master `keepalive` keeps from ever
-    /// reporting hangup. Collected off this thread through the liveness backstop, so a
-    /// drain that never returns fails this test instead of wedging the suite.
+    /// pipe open and leave the drain waiting (see [`notify_exit`]). Collected off this
+    /// thread through the liveness backstop, so a drain that never returns fails this test
+    /// instead of wedging the suite.
     #[test]
     fn a_notification_write_end_another_process_holds_open_still_ends_the_drain() {
         let dir = tempdir();
