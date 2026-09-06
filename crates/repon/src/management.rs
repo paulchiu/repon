@@ -1003,13 +1003,15 @@ fn delete_one(
             let mut removed = Vec::new();
             let mut problems = Vec::new();
             for worktree in linked_worktree_paths(&target.key) {
+                // Read before the directory goes, since resolving needs it on disk.
+                let key = worktree_key(&worktree);
                 delete_ignored_directories(ignored_directories_for_deletion(&worktree));
                 // Best effort: a sibling Worktree that will not remove never stops the
                 // Repo's own removal below. Only the ones that did go are staged, and the
                 // ones that did not are named, so the report claims no directory that is
                 // still on disk.
                 match remove_working_tree(&worktree) {
-                    Ok(()) => removed.push(EntityKey::new(Arc::from(worktree.as_path()))),
+                    Ok(()) => removed.push(key),
                     Err(err) => problems.push(format!(
                         "its linked Worktree at {} would not remove: {err:#}",
                         worktree.display()
@@ -1078,6 +1080,15 @@ fn delete_one(
     }
 }
 
+/// The key naming the linked Worktree at `path`, resolved the way discovery resolves every
+/// key it makes: git's own register need not spell the directory that way, and a key that
+/// matches no row is a row nothing drops. Falls back to the register's own spelling when the
+/// path will not resolve, which is the best guess left.
+fn worktree_key(path: &Path) -> EntityKey {
+    let resolved = path.canonicalize();
+    EntityKey::new(Arc::from(resolved.as_deref().unwrap_or(path)))
+}
+
 /// `delete`'s config half, run once the working tree is gone: the `[[repo]]` entry naming
 /// the removed path, and that path from every `[[set]]` array naming it
 /// ([repo-management.md](../../../docs/spec/repo-management.md)'s "Writing config"). A write
@@ -1096,8 +1107,9 @@ fn clean_up_config(config_file: &Path, path: &Path) -> ConfigCleanup {
 /// The path comes from the key discovery resolved, or from git's own worktree register for
 /// a cascading Repo delete, never from config, an environment variable or the working
 /// directory. The two guards below can only refuse: a relative path is one neither source
-/// ever produces (an [`EntityKey`] is a resolved absolute working directory, and git's own
-/// register writes absolute paths), and a directory with no `.git` in it is not the Repo or
+/// ever produces (an [`EntityKey`] is a resolved absolute working directory, and the path
+/// git's own register hands back is absolute however the register itself spelled it), and a
+/// directory with no `.git` in it is not the Repo or
 /// Worktree this call named, so either means something other than the intended one is about
 /// to be removed permanently.
 fn remove_working_tree(path: &Path) -> Result<()> {
@@ -1606,6 +1618,48 @@ mod tests {
             report.removed_keys(),
             vec![EntityKey::new(Arc::from(sibling.as_path()))],
             "and the directory that did go is still what the run dismisses"
+        );
+    }
+
+    /// The key a cascade reports is the resolved path, never git's own register entry
+    /// verbatim: discovery keys every row by a resolved absolute directory, and a key that
+    /// misses one is a row nothing drops.
+    #[test]
+    fn a_cascade_reports_the_resolved_key_for_a_worktree_git_records_unresolved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temp dir");
+        let config_file = root.join("config.toml");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create the repo fixture");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(sibling.join(".git")).expect("create the linked Worktree");
+        // The shape git's own register hands back for an entry it recorded relative to the
+        // Repo: the right directory, spelled a way no discovered key is.
+        let as_recorded = repo.join("..").join("sibling");
+        let entities = vec![entity(&repo, "repo", Kind::Repo)];
+
+        let report = run(
+            &plan(Operation::Delete, &entities),
+            &config_file,
+            |_| None,
+            |_| vec![as_recorded.clone()],
+            |_| Vec::new(),
+            |_| panic!("this test does not exercise sync"),
+            |_| panic!("this test declares no before_sync hook"),
+            |_| panic!("this test declares no after_sync hook"),
+        );
+
+        assert!(!sibling.exists(), "the linked Worktree is gone");
+        assert_eq!(
+            report.removed_keys(),
+            vec![
+                EntityKey::new(Arc::from(sibling.as_path())),
+                entities[0].key.clone(),
+            ],
+            "each key names the directory discovery would have keyed the row by"
         );
     }
 
