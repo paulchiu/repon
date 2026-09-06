@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::io::{self};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
@@ -51,6 +51,8 @@ const CANCEL_GRACE: Duration = Duration::from_millis(350);
 pub(crate) enum SetupBoundary {
     /// The pipe that tells the drain loop the child has exited.
     NotifyPipe,
+    /// The pty master's own non-blocking flag.
+    Nonblocking,
 }
 
 /// One Action run's own reach into its steps' children, from outside the call stack that
@@ -370,13 +372,15 @@ impl SetupFailure {
     fn detail(&self) -> String {
         match self {
             SetupFailure::Pty(failure) => failure.detail(),
-            SetupFailure::Resource { what, error } => format!("could not open {what}: {error}"),
+            SetupFailure::Resource { what, error } => {
+                format!("could not prepare {what}: {error}")
+            }
         }
     }
 }
 
-/// Creates every resource one step needs, in the order [`StepResources`] documents, before
-/// its child is spawned.
+/// Creates every resource one step needs, before its child is spawned; [`StepResources`]
+/// carries why they are all made here rather than as the run reaches each one.
 fn prepare_step_resources(
     width: u16,
     control: &Arc<RunControl>,
@@ -384,6 +388,10 @@ fn prepare_step_resources(
     let named = |what: &'static str| move |error| SetupFailure::Resource { what, error };
 
     let (master, slave) = open_pty(width).map_err(SetupFailure::Pty)?;
+    injected_or(control, SetupBoundary::Nonblocking, || {
+        set_nonblocking(&master)
+    })
+    .map_err(named("the pty master's own non-blocking flag"))?;
     let slave_dup =
         duplicate_cloexec(&slave).map_err(named("the child's own stderr descriptor"))?;
     let keepalive = duplicate_cloexec(&slave).map_err(named("the drain's keepalive descriptor"))?;
@@ -607,11 +615,11 @@ fn shell_argv(argv: &[String], interactive: bool) -> Vec<String> {
 
 /// A second descriptor onto the same open slave, marked close-on-exec at creation
 /// (`F_DUPFD_CLOEXEC`) so the step's own program never inherits it past its `exec`.
-/// [`prepare_step_resources`] calls this twice, for different purposes: once for `slave_dup`, the
-/// child's own copy for stderr (dup2'd onto its 2 during exec setup, so only that copy,
-/// not this pre-`dup2` one, should reach the child), and once for `keepalive`, held only
-/// by this process for as long as [`drain_until_exit`] is draining and never handed to
-/// the child at all.
+/// [`prepare_step_resources`] calls this twice, for different purposes: once for
+/// `slave_dup`, the child's own copy for stderr (dup2'd onto its 2 during exec setup, so
+/// only that copy, not this pre-`dup2` one, should reach the child), and once for
+/// `keepalive`, held only by this process for as long as [`drain_until_exit`] is draining
+/// and never handed to the child at all.
 fn duplicate_cloexec(fd: &OwnedFd) -> io::Result<OwnedFd> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this call.
     let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -682,9 +690,9 @@ fn build_command(
 /// <https://github.com/pexpect/pexpect/issues/662>, though this module's own claim rests
 /// on the standalone reproduction, not that report). `keepalive` exists to make that
 /// close never happen while this function might still read more: it is held open for the
-/// whole call and dropped only once draining is done. Blocks on `master` while the child
-/// may still be writing, so output larger than the pty's own buffer is still captured in
-/// full rather than only whatever was left after the child exited.
+/// whole call and dropped only once draining is done. Reads throughout the child's life
+/// rather than only after it exits, so output larger than the pty's own buffer is still
+/// captured in full rather than only whatever was left at the end.
 fn drain_until_exit(resources: DrainResources, mut child: Child) -> (Vec<u8>, Option<ExitStatus>) {
     let DrainResources {
         master,
@@ -733,24 +741,32 @@ fn set_cloexec(fd: &OwnedFd) {
     }
 }
 
-/// Sets `O_NONBLOCK` on `fd`. Best-effort, for the same reason as [`set_cloexec`]: called
-/// only once the child has already exited, where a failed read afterwards just means the
-/// drain stops a little earlier rather than losing anything already captured.
-fn set_nonblocking(fd: &OwnedFd) {
+/// Sets `O_NONBLOCK` on `fd`, failing loudly on error: [`drain_with_poll`] ends on a read
+/// that finds nothing left, and against a blocking descriptor that read waits instead on a
+/// slave side `keepalive` is still deliberately holding open. Set before the child exists,
+/// with every other resource, so the flag can never be missing by the time the drain
+/// depends on it.
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of both calls.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: as above.
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The drain loop itself: blocks on `poll` over `master` and `notify_read` while the
 /// child may still be running, reading whatever `master` offers each time it wakes, until
 /// `notify_read` reports the child has exited. From there `master` can never become ready
-/// again on its own (`keepalive` sees to that), so the stopping condition switches to a
-/// non-blocking read that comes back empty, a kernel fact rather than an elapsed time.
+/// again on its own (`keepalive` sees to that), so the stopping condition becomes a read
+/// that comes back empty, a kernel fact rather than an elapsed time. Every read here is
+/// non-blocking, which is [`set_nonblocking`]'s doing in the setup this loop's own
+/// resources came from; the waiting is `poll`'s alone.
 fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
@@ -779,8 +795,10 @@ fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
             }
             break;
         }
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            read_blocking(master, &mut buf, &mut raw);
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0
+            && let Some(read) = read_available(master, &mut buf)
+        {
+            raw.extend_from_slice(&buf[..read]);
         }
         if fds[1].revents != 0 {
             break;
@@ -788,48 +806,21 @@ fn drain_with_poll(master: &OwnedFd, notify_read: &OwnedFd) -> Vec<u8> {
     }
 
     // The child has exited. Nothing can make `master` newly readable from here, so the
-    // remaining, already-buffered bytes (if any) are drained without blocking, stopping
-    // the instant a read finds none: that emptiness, not a clock, is what ends the drain.
-    set_nonblocking(master);
+    // remaining, already-buffered bytes (if any) are drained, stopping the instant a read
+    // finds none: that emptiness, not a clock, is what ends the drain.
     loop {
-        match nonblocking_read(master, &mut buf) {
-            Some(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+        match read_available(master, &mut buf) {
+            Some(read) if read > 0 => raw.extend_from_slice(&buf[..read]),
             _ => break,
         }
     }
     raw
 }
 
-/// One blocking `read(2)` from `fd`, appending whatever came back into `raw`, retried
-/// across `EINTR`. Called only once `poll` has reported `fd` readable, so a `0` return or
-/// any other error means there was nothing left this round rather than something lost.
-fn read_blocking(fd: &OwnedFd, buf: &mut [u8], raw: &mut Vec<u8>) {
-    loop {
-        // SAFETY: `buf` is a valid, appropriately sized buffer for the duration of this call.
-        let n = unsafe {
-            libc::read(
-                fd.as_raw_fd(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
-        if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return;
-        }
-        if n > 0 {
-            raw.extend_from_slice(&buf[..n as usize]);
-        }
-        return;
-    }
-}
-
-/// One non-blocking `read(2)` from `fd`: `Some(n)` for `n` bytes read (`Some(0)` is a real
-/// EOF), `None` when nothing is available right now (`EAGAIN`/`EWOULDBLOCK`) or on any
-/// other error, retried across `EINTR`.
-fn nonblocking_read(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
+/// One `read(2)` from `fd`, which every caller here has already set non-blocking: `Some(n)`
+/// for `n` bytes read (`Some(0)` is a real EOF), `None` when nothing is available right now
+/// (`EAGAIN`/`EWOULDBLOCK`) or on any other error, retried across `EINTR`.
+fn read_available(fd: &OwnedFd, buf: &mut [u8]) -> Option<usize> {
     loop {
         // SAFETY: `buf` is a valid, appropriately sized buffer for the duration of this call.
         let n = unsafe {
@@ -1127,6 +1118,24 @@ mod tests {
     fn prepared() -> StepResources {
         prepare_step_resources(PTY_WIDTH, &RunControl::new())
             .expect("prepare a step's own resources")
+    }
+
+    /// Waits for `master` to have something, then appends it: the master is non-blocking
+    /// from the moment it is created, so a test that needs the child's next line waits on
+    /// `poll` the way [`drain_with_poll`] does rather than spinning on `read`.
+    fn read_when_ready(master: &OwnedFd, collected: &mut Vec<u8>) {
+        let mut fds = [libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: `master` is open for the duration of this call, and `fds` lives on this
+        // stack frame until `poll` returns.
+        unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+        let mut buf = [0u8; 64];
+        if let Some(read) = read_available(master, &mut buf) {
+            collected.extend_from_slice(&buf[..read]);
+        }
     }
 
     // --- Criterion 2: stdin is the null device unconditionally ---
@@ -1447,10 +1456,9 @@ mod tests {
             // yet in place. Without this a SIGTERM that happens to arrive first would
             // kill the child outright and this test would still pass, never having
             // exercised the SIGKILL follow-up at all.
-            let mut buf = [0u8; 64];
             let mut collected = Vec::new();
             while !collected.windows(5).any(|window| window == b"ready") {
-                read_blocking(&drain.master, &mut buf, &mut collected);
+                read_when_ready(&drain.master, &mut collected);
             }
 
             control.cancel();
@@ -1705,6 +1713,40 @@ mod tests {
 
         assert_eq!(recovered.outcome, StepOutcome::Ok);
         assert_eq!(&*recovered.output, b"hello\n");
+    }
+
+    /// The same claim at the other boundary a step's own setup crosses: the pty master's
+    /// non-blocking flag, without which the drain's last, stopping read waits on a slave
+    /// side the keepalive is still deliberately holding open. Collected off this thread
+    /// through the liveness backstop, so a step that blocks fails this test rather than
+    /// wedging the suite.
+    #[test]
+    fn a_master_that_cannot_be_made_non_blocking_fails_the_step_rather_than_blocking() {
+        let dir = tempdir();
+        let control = RunControl::new();
+        control.fail_next_setup_at(SetupBoundary::Nonblocking);
+
+        let (tx, rx) = mpsc::channel();
+        let faulted = Arc::clone(&control);
+        let cwd = dir.path().to_path_buf();
+        thread::spawn(move || {
+            let argv = vec!["echo".to_string(), "hello".to_string()];
+            let _ = tx.send(run_step(&argv, false, false, &cwd, &[], &faulted));
+        });
+        let failed = rx.recv_timeout(BACKSTOP).expect(
+            "a step whose master cannot be made non-blocking must still hand back a receipt",
+        );
+
+        assert!(
+            failed.outcome.is_failure(),
+            "expected a failed receipt, got {:?}",
+            failed.outcome
+        );
+        let detail = String::from_utf8_lossy(&failed.output).to_string();
+        assert!(
+            detail.contains("non-blocking"),
+            "expected the receipt to name the resource that failed, got {detail:?}"
+        );
     }
 
     /// A child that writes more than the pty's own kernel buffer holds must not lose the
