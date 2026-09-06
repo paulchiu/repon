@@ -427,7 +427,8 @@ mod tests {
     use super::*;
     use crate::{
         app::tests::{
-            init_repo, press, raise_notice_aged, render_app_frame, test_app, write_gitmodules,
+            init_repo, press, raise_notice_aged, render_app_frame, rendered_status_row, test_app,
+            write_gitmodules,
         },
         keys::Context,
         test_support::capture_tracing,
@@ -1395,8 +1396,9 @@ mod tests {
     /// screen with no new keypress, exactly as `theme`, `glyphs` and the other keys that
     /// list names already do for their own state. Goes through the real
     /// `apply_reloaded_config`, the same path `Action::ReloadConfig` takes, rather than
-    /// assigning `app.document` directly, so this proves the wiring, not only that `notice()`
-    /// reads whatever `document.notice_timeout` happens to hold.
+    /// assigning `app.document` directly, so this proves the wiring, not only that the value
+    /// reads whatever `document.notice_timeout` happens to hold. Read off the rendered status
+    /// row, since what "re-applies immediately" promises is a change on screen.
     #[test]
     fn notice_timeout_re_applies_immediately_on_reload_with_no_new_press() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1405,21 +1407,21 @@ mod tests {
         let mut app = test_app(&root);
         app.document.notice_timeout = Duration::from_secs(3600);
         raise_notice_aged(&mut app, "switched to `second`", Duration::from_secs(10));
-        assert_eq!(
-            app.notice(),
-            Some("switched to `second`"),
-            "sanity: still live under the long timeout ten seconds in"
+        let before = rendered_status_row(&mut app);
+        assert!(
+            before.contains("switched to `second`"),
+            "sanity: still on the row under the long timeout ten seconds in, got {before:?}"
         );
 
         let mut reloaded_document = app.document.clone();
         reloaded_document.notice_timeout = Duration::from_secs(1);
         app.apply_reloaded_config(config_with_document(reloaded_document));
 
-        assert_eq!(
-            app.notice(),
-            None,
+        let after = rendered_status_row(&mut app);
+        assert!(
+            !after.contains("switched to"),
             "the shorter reloaded timeout must age out the Notice already on screen, with no \
-             new press"
+             new press, got {after:?}"
         );
     }
 
