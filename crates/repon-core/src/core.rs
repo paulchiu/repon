@@ -552,7 +552,7 @@ pub struct Core {
     discovery_gate: Option<DiscoveryGate>,
     /// See [`ActionCompletionBoundary`]. Disarmed unless a test arms it, and off the
     /// default build entirely.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     action_completion_boundary: Arc<ActionCompletionBoundary>,
 }
 
@@ -624,14 +624,14 @@ impl ActionLifecycle {
 struct RunCompletion {
     lifecycle: Arc<Mutex<ActionLifecycle>>,
     /// See [`ActionCompletionBoundary`].
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     boundary: Arc<ActionCompletionBoundary>,
 }
 
 impl Drop for RunCompletion {
     fn drop(&mut self) {
         // Nothing parks here unless a test armed this boundary.
-        #[cfg(any(test, feature = "test-util"))]
+        #[cfg(test)]
         self.boundary.hold();
         self.lifecycle.lock().unwrap().complete();
     }
@@ -645,7 +645,7 @@ impl Drop for RunCompletion {
 /// happened to catch. One per `Core` and disarmed until a test arms it, so a run nobody is
 /// watching reads one bool and carries on, and the whole affordance is gated off the
 /// default build.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ActionCompletionBoundary {
     state: Mutex<BoundaryState>,
@@ -653,7 +653,7 @@ pub(crate) struct ActionCompletionBoundary {
 }
 
 /// [`ActionCompletionBoundary`]'s own state, guarded by its `Condvar`.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Default)]
 struct BoundaryState {
     /// Set by a test before the run whose completion it wants held.
@@ -664,13 +664,10 @@ struct BoundaryState {
     released: bool,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl ActionCompletionBoundary {
     /// Holds the next completion to reach this boundary until the returned value drops. For
     /// a test, before the run whose completion it wants held.
-    // A test's alone, so the feature on without `cfg(test)`, what a consumer's own test
-    // build resolves, has no caller for it.
-    #[allow(dead_code)]
     pub(crate) fn arm(self: &Arc<Self>) -> ArmedBoundary {
         self.state.lock().unwrap().armed = true;
         ArmedBoundary(Arc::clone(self))
@@ -702,14 +699,12 @@ impl ActionCompletionBoundary {
 /// One armed [`ActionCompletionBoundary`], released when this drops so an assertion failing
 /// inside the window reports itself rather than leaving a completion parked for
 /// [`liveness::BACKSTOP`].
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 pub(crate) struct ArmedBoundary(Arc<ActionCompletionBoundary>);
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl ArmedBoundary {
     /// Blocks until a completion has parked at this boundary. For a test.
-    // A test's alone, on the same terms as [`ActionCompletionBoundary::arm`].
-    #[allow(dead_code)]
     pub(crate) fn wait_until_reached(&self) {
         let (state, expiry) = self
             .0
@@ -729,7 +724,7 @@ impl ArmedBoundary {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl Drop for ArmedBoundary {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap();
@@ -1535,7 +1530,7 @@ impl Core {
         let table_handle = Arc::clone(&self.table);
         let refresh_handles = self.refresh_handles();
         let action_lifecycle = Arc::clone(&self.action_lifecycle);
-        #[cfg(any(test, feature = "test-util"))]
+        #[cfg(test)]
         let completion_boundary = Arc::clone(&self.action_completion_boundary);
         // At least one worker regardless of what `action.concurrency` says: 0 has no
         // sensible reading as "run nothing" here (the schema has no floor, only an
@@ -1589,7 +1584,7 @@ impl Core {
             // rather than left to race the Generation this run still owes.
             let completion = RunCompletion {
                 lifecycle: action_lifecycle,
-                #[cfg(any(test, feature = "test-util"))]
+                #[cfg(test)]
                 boundary: completion_boundary,
             };
 
@@ -2511,7 +2506,7 @@ impl Core {
 
     /// This `Core`'s own [`ActionCompletionBoundary`], to arm before the run whose
     /// completion a test wants held open. For a test.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     pub(crate) fn action_completion_boundary(&self) -> Arc<ActionCompletionBoundary> {
         Arc::clone(&self.action_completion_boundary)
     }
@@ -3183,7 +3178,7 @@ fn start_internal(
             fetch_failures,
             turnstile,
             discovery_gate,
-            #[cfg(any(test, feature = "test-util"))]
+            #[cfg(test)]
             action_completion_boundary: Arc::new(ActionCompletionBoundary::default()),
         },
         clock_alive: alive,
