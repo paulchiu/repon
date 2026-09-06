@@ -746,11 +746,12 @@ impl Drop for ArmedBoundary {
 ///
 /// A fetch against a real remote finishes when the remote says so, which is no moment a test
 /// can hold anything at. This is that moment: the cycle signals it has entered a fetch and
-/// waits there until the test releases it, or until the cycle it belongs to is cancelled, so
-/// the clock's own tick, pause and shutdown handling can be observed against a fetch that
-/// provably has not finished. One per `Core` and disarmed until a test arms it, so a cycle
-/// nobody is watching reads one bool and carries on, and the whole affordance is gated off
-/// the default build.
+/// stays there until the test that armed this lets it go, so the clock's own tick, pause and
+/// shutdown handling can be observed against a fetch that provably has not finished. A
+/// cancellation is recorded here rather than acted on, which is the bound
+/// [`crate::fetch::fetch_and_prune`] documents for a real fetch before its receive stage.
+/// One per `Core` and disarmed until a test arms it, so a cycle nobody is watching reads one
+/// bool and carries on, and the whole affordance is gated off the default build.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FetchBoundary {
@@ -768,21 +769,28 @@ struct FetchBoundaryState {
     reached: bool,
     /// Set when the [`ArmedFetchBoundary`] drops.
     released: bool,
-    /// Set when the cycle holding a fetch here is cancelled, which is what a real transport
-    /// honouring its cancellation flag would answer with.
+    /// Set when the cycle holding a fetch here is cancelled.
     cancelled: bool,
 }
 
 #[cfg(test)]
 impl FetchBoundary {
-    /// Holds every fetch that reaches this boundary until the returned value drops or the
-    /// cycle is cancelled. For a test, before the cycle it wants held.
+    /// Holds every fetch that reaches this boundary until the returned value drops. For a
+    /// test, before the cycle it wants held. Every flag resets here, so a second armed cycle
+    /// on the same `Core` parks rather than walking through what the first one left set.
     pub(crate) fn arm(self: &Arc<Self>) -> ArmedFetchBoundary {
-        self.state.lock().unwrap().armed = true;
+        *self.state.lock().unwrap() = FetchBoundaryState {
+            armed: true,
+            ..FetchBoundaryState::default()
+        };
         ArmedFetchBoundary(Arc::clone(self))
     }
 
-    /// Parks a fetch here while an armed boundary holds it.
+    /// Parks a fetch here until the test that armed this lets it go.
+    ///
+    /// No deadline of its own, deliberately: a clock too wedged to reach the release would
+    /// otherwise be let through by a timeout here, and the test that was watching it would
+    /// pass a couple of minutes late rather than fail.
     fn hold(&self) {
         let mut state = self.state.lock().unwrap();
         if !state.armed {
@@ -790,24 +798,15 @@ impl FetchBoundary {
         }
         state.reached = true;
         self.changed.notify_all();
-        let (state, expiry) = self
-            .changed
-            .wait_timeout_while(state, liveness::BACKSTOP, |state| {
-                !state.released && !state.cancelled
-            })
-            .unwrap();
-        drop(state);
-        if expiry.timed_out() {
-            liveness::expired(
-                liveness::BACKSTOP,
-                "a test to release the held fetch, or its cycle to be cancelled",
-                "",
-            );
-        }
+        drop(
+            self.changed
+                .wait_while(state, |state| !state.released)
+                .unwrap(),
+        );
     }
 
-    /// Answers a held fetch the way a cancellable transport would, so a cancelled cycle
-    /// unwinds rather than waiting out the test that armed this.
+    /// Records that the cycle holding a fetch here was cancelled. Evidence for the test
+    /// rather than a release, since a real fetch before its receive stage reads no flag.
     fn cancelled(&self) {
         self.state.lock().unwrap().cancelled = true;
         self.changed.notify_all();
@@ -815,7 +814,7 @@ impl FetchBoundary {
 }
 
 /// One armed [`FetchBoundary`], released when this drops so an assertion failing inside the
-/// window reports itself rather than leaving a fetch parked for [`liveness::BACKSTOP`].
+/// window reports itself rather than leaving a fetch parked for the rest of the run.
 #[cfg(test)]
 pub(crate) struct ArmedFetchBoundary(Arc<FetchBoundary>);
 
@@ -823,20 +822,25 @@ pub(crate) struct ArmedFetchBoundary(Arc<FetchBoundary>);
 impl ArmedFetchBoundary {
     /// Blocks until a fetch has parked at this boundary. For a test.
     pub(crate) fn wait_until_reached(&self) {
+        self.wait_until("a fetch to reach the fetch boundary", |state| state.reached);
+    }
+
+    /// Blocks until the cycle whose fetch is parked here has been cancelled. For a test.
+    pub(crate) fn wait_until_cancelled(&self) {
+        self.wait_until("the held cycle's own cancellation", |state| state.cancelled);
+    }
+
+    fn wait_until(&self, property: &str, held: impl Fn(&FetchBoundaryState) -> bool) {
         let (state, expiry) = self
             .0
             .changed
             .wait_timeout_while(self.0.state.lock().unwrap(), liveness::BACKSTOP, |state| {
-                !state.reached
+                !held(state)
             })
             .unwrap();
         drop(state);
         if expiry.timed_out() {
-            liveness::expired(
-                liveness::BACKSTOP,
-                "a fetch to reach the fetch boundary",
-                "",
-            );
+            liveness::expired(liveness::BACKSTOP, property, "");
         }
     }
 }
@@ -2479,11 +2483,12 @@ pub(crate) struct StartForTest {
     /// poll anywhere in the wait.
     #[allow(dead_code)] // read only by tests; the plain lib target never builds them
     pub initial_discovery: Option<JoinHandle<()>>,
-    /// How many periodic-fetch cycles the clock has taken back and joined, which a test
-    /// keeps a handle on across `Core::drop` the same way it keeps `clock_alive`: a cycle
-    /// shutdown joined is only observable once the `Core` that owned it is gone.
+    /// How many periodic-fetch cycles the clock has taken back and joined, cancelled ones
+    /// included, which a test keeps a handle on across `Core::drop` the same way it keeps
+    /// `clock_alive`: a cycle shutdown joined is only observable once the `Core` that owned
+    /// it is gone.
     #[allow(dead_code)] // read only by tests; the plain lib target never builds them
-    pub fetch_cycles_finished: Arc<AtomicUsize>,
+    pub fetch_cycles_taken_back: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -3142,7 +3147,7 @@ fn start_internal(
     let phase_c_gates = Arc::new(Mutex::new(HashMap::new()));
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
     let fetch_failures = Arc::new(Mutex::new(FetchFailures::default()));
-    let fetch_cycles_finished = Arc::new(AtomicUsize::new(0));
+    let fetch_cycles_taken_back = Arc::new(AtomicUsize::new(0));
     let (fetch_finished_tx, fetch_finished_rx) = crossbeam_channel::unbounded();
     #[cfg(test)]
     let fetch_boundary = Arc::new(FetchBoundary::default());
@@ -3178,7 +3183,7 @@ fn start_internal(
         auto_update_enabled,
         finished: fetch_finished_rx,
         finished_tx: fetch_finished_tx,
-        finished_count: Arc::clone(&fetch_cycles_finished),
+        taken_back_count: Arc::clone(&fetch_cycles_taken_back),
         #[cfg(test)]
         boundary: Arc::clone(&fetch_boundary),
     };
@@ -3311,7 +3316,7 @@ fn start_internal(
         clock_alive: alive,
         discovery_watcher,
         initial_discovery: Some(initial_discovery),
-        fetch_cycles_finished,
+        fetch_cycles_taken_back,
     }
 }
 
@@ -3360,10 +3365,9 @@ struct FetchSchedule {
     /// completion.
     finished: Receiver<()>,
     finished_tx: Sender<()>,
-    /// How many cycles the clock has taken back and joined. Read only by
-    /// `fetch_cycles_finished_for_test`, which is what lets a test observe a cycle's own end
-    /// rather than infer it.
-    finished_count: Arc<AtomicUsize>,
+    /// How many cycles the clock has taken back and joined, which is what lets a test
+    /// observe a cycle's own end rather than infer it.
+    taken_back_count: Arc<AtomicUsize>,
     /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
     /// entirely.
     #[cfg(test)]
@@ -3467,7 +3471,7 @@ fn spawn_clock_thread(
                         if !cancelled {
                             dispatch_fetch_completion(&table, &fetch.refresh);
                         }
-                        fetch.finished_count.fetch_add(1, Ordering::Release);
+                        fetch.taken_back_count.fetch_add(1, Ordering::Release);
                     }
                 }
             }
@@ -3479,7 +3483,7 @@ fn spawn_clock_thread(
         if let Some(cycle) = cycle.take() {
             cycle.cancel();
             cycle.join();
-            fetch.finished_count.fetch_add(1, Ordering::Release);
+            fetch.taken_back_count.fetch_add(1, Ordering::Release);
         }
         alive.store(false, Ordering::Release);
     })
@@ -3508,7 +3512,6 @@ impl FetchCycle {
     /// [`crate::fetch::fetch_and_prune`]'s own doc comment records in full.
     fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
-        // Answers a fetch a test is holding the way a transport honouring its flag would.
         #[cfg(test)]
         self.boundary.cancelled();
     }
@@ -12596,7 +12599,7 @@ mod tests {
 
             wait_for(
                 "the immediate cycle to have run and been taken back first",
-                || started.fetch_cycles_finished.load(Ordering::Acquire) >= 1,
+                || started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1,
             );
 
             fetch_tick_tx
@@ -12655,11 +12658,12 @@ mod tests {
         }
 
         /// Pause is the lifecycle owner ending the live cycle where it stands, not only
-        /// stopping the next one: the mutating half of that cycle never runs, and the
-        /// Generation a finished cycle owes is never dispatched once the held fetch is let
-        /// go. The Repo is left genuinely eligible (clean, behind, tracking an upstream) by a
-        /// fetch this test performs itself, so "the branch did not move" is a fence holding
-        /// rather than nothing to move it.
+        /// stopping the next one: the cancellation reaches a fetch that is provably still
+        /// running, the mutating half of that cycle never runs, and the Generation a
+        /// finished cycle owes is never dispatched once the held fetch is let go. The Repo is
+        /// left genuinely eligible (clean, behind, tracking an upstream) by a fetch this test
+        /// performs itself, so "the branch did not move" is a fence holding rather than
+        /// nothing to move it.
         #[test]
         fn pause_cancels_a_held_cycle_so_it_neither_auto_updates_nor_dispatches_its_generation() {
             let remote = seeded_remote();
@@ -12689,8 +12693,10 @@ mod tests {
             held.wait_until_reached();
 
             core.pause();
+            held.wait_until_cancelled();
+            drop(held);
             wait_for("the cancelled cycle to be taken back by the clock", || {
-                started.fetch_cycles_finished.load(Ordering::Acquire) >= 1
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
             });
 
             assert_eq!(
@@ -12749,7 +12755,7 @@ mod tests {
 
             drop(held);
             wait_for("the released cycle to be taken back by the clock", || {
-                started.fetch_cycles_finished.load(Ordering::Acquire) >= 1
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
             });
 
             assert_eq!(
@@ -12762,11 +12768,13 @@ mod tests {
 
         /// Teardown signals the cycle's own cancellation and waits for the worker to stop,
         /// rather than abandoning a thread that is still fetching and fast-forwarding
-        /// repositories. The boundary stays armed across the drop, so the only thing that can
-        /// have let that worker go is the cancellation shutdown sends; the Repo is left
-        /// eligible for the auto-update by a fetch this test performs itself, so the branch
-        /// standing still afterwards is a worker that stopped rather than one with nothing to
-        /// do.
+        /// repositories. Both halves are read against a fetch this test is still holding:
+        /// the cancellation is observed at the boundary, and teardown is still waiting while
+        /// that fetch has not returned, which a teardown that merely signalled and detached
+        /// could not be. It runs on a thread of its own, so a teardown that never returns
+        /// fails this test rather than wedging the run. The Repo is left eligible for the
+        /// auto-update by a fetch this test performs itself, so the branch standing still
+        /// afterwards is a worker that stopped rather than one with nothing to do.
         #[test]
         fn dropping_the_core_cancels_and_joins_a_held_fetch_cycle_before_returning() {
             let remote = seeded_remote();
@@ -12794,13 +12802,36 @@ mod tests {
                 .expect("send a fetch tick");
             held.wait_until_reached();
 
-            drop(core);
+            let (returned_tx, returned_rx) = crossbeam_channel::bounded::<()>(1);
+            let teardown = thread::spawn(move || {
+                drop(core);
+                let _ = returned_tx.send(());
+            });
+
+            held.wait_until_cancelled();
+            // A safety claim rather than a liveness one, so no deadline can prove it and
+            // load only ever weakens it: teardown is inside its own join for as long as the
+            // fetch below has not returned.
+            assert!(
+                returned_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "teardown must still be waiting on the worker it cancelled, not have \
+                 detached it"
+            );
+
+            drop(held);
+            returned_rx
+                .recv_timeout(liveness::BACKSTOP)
+                .expect("teardown returns once the worker it joined has stopped");
+            teardown
+                .join()
+                .expect("the teardown thread should not panic");
 
             assert_eq!(
-                started.fetch_cycles_finished.load(Ordering::Acquire),
+                started.fetch_cycles_taken_back.load(Ordering::Acquire),
                 1,
-                "teardown must have joined the cycle's own worker before returning, not \
-                 merely signalled it"
+                "teardown must have taken its own cycle back rather than left it running"
             );
             assert_eq!(
                 rev_parse(&parent, "refs/heads/main"),
