@@ -336,7 +336,7 @@ impl SetupFailure {
 }
 
 /// The four resources [`prepare_step_resources`] creates, in the words a receipt reports
-/// them by. Named once so a `test-util` build's [`injected_setup_failure`] fails a step
+/// them by. Named once so a test build's [`injected_setup_failure`] fails a step
 /// with the same words the real call would.
 const NON_BLOCKING_FLAG: &str = "the pty master's own non-blocking flag";
 const STDERR_DESCRIPTOR: &str = "the child's own stderr descriptor";
@@ -366,20 +366,17 @@ fn prepare_step_resources(width: u16) -> Result<StepResources, SetupFailure> {
     })
 }
 
-/// The environment name a `test-util` build reads an injected setup failure from, its
+/// The environment name a test build reads an injected setup failure from, its
 /// value naming which of the four resources above to fail at. A step carries it in its
 /// own `env` table, so a test reaches a resource error the OS will not produce on request
 /// at exactly one step of one entity, leaving every other step of the same run alone.
-// Read from this module's own tests and `core`'s; the feature also builds for a
-// consumer's test targets, where nothing can name a `pub(crate)` item at all.
-#[cfg(feature = "test-util")]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) const SETUP_FAILURE_VARIABLE: &str = "REPON_TEST_SETUP_FAILURE";
 
 /// The failure `env` asks this step to report instead of preparing its own resources.
-/// Always `None` without `test-util`, which is what keeps injection out of a published
-/// build entirely.
-#[cfg(feature = "test-util")]
+/// Absent from every build but this crate's own tests, which is what keeps injection out
+/// of a published build entirely.
+#[cfg(test)]
 fn injected_setup_failure(env: &[(String, Option<String>)]) -> Option<SetupFailure> {
     let asked = env
         .iter()
@@ -400,8 +397,8 @@ fn injected_setup_failure(env: &[(String, Option<String>)]) -> Option<SetupFailu
     })
 }
 
-/// See the `test-util` counterpart: production never injects anything.
-#[cfg(not(feature = "test-util"))]
+/// See the `cfg(test)` counterpart: production never injects anything.
+#[cfg(not(test))]
 fn injected_setup_failure(_env: &[(String, Option<String>)]) -> Option<SetupFailure> {
     None
 }
