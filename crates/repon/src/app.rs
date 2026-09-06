@@ -15225,6 +15225,40 @@ refresh_all = "z""#,
         );
     }
 
+    /// WAIVER (already held before this issue's fix; no code path here ever assigned any of
+    /// the three): the committed Filter, the row order and the ignored toggle are none of
+    /// them touched by `reload_config` or `apply_management_report`, unlike `worktrees_toggle`
+    /// which this issue's fix now saves and restores around the same call. Pinned here as a
+    /// characterisation so a later change that does start touching one of them fails loudly.
+    #[test]
+    fn a_completed_sync_run_leaves_the_filter_the_row_order_and_the_ignored_toggle_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("zed"));
+        init_repo(&root.join("apex"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.filter = repon_core::Filter::parse("zed");
+        app.handle_key_event(press(KeyCode::Char('i'), KeyModifiers::NONE))
+            .expect("dispatch i");
+        app.handle_key_event(press(KeyCode::Char('o'), KeyModifiers::NONE))
+            .expect("open the sort menu");
+        app.handle_key_event(press(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("sort by name");
+        let filter_before = app.filter.clone();
+        let row_order_before = app.row_order;
+        let ignored_toggle_before = app.ignored_toggle;
+
+        press_through_the_management_gate(&mut app, management::Operation::Sync);
+
+        assert_eq!(app.filter, filter_before, "the committed Filter must survive the run");
+        assert_eq!(app.row_order, row_order_before, "the row order must survive the run");
+        assert_eq!(
+            app.ignored_toggle, ignored_toggle_before,
+            "the ignored toggle must survive the run"
+        );
+    }
+
     // --- criterion 5: the header shows the match count whenever a Filter is active,
     // including the zero-match case, and never when no Filter is active ---
 
