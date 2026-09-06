@@ -626,6 +626,11 @@ impl ActionLifecycle {
             self.live = None;
         }
     }
+
+    /// Whether a run has been admitted since run `id` was.
+    fn superseded(&self, id: u64) -> bool {
+        self.last_admitted != id
+    }
 }
 
 /// A park in an Action's completion boundary, for a test.
@@ -1607,6 +1612,13 @@ impl Core {
             let Ok(()) = fan_out else {
                 return;
             };
+
+            // A run admitted since this one was is the live run now, and its own admission
+            // already cancelled what was in flight: a Generation started here would run
+            // beside that fan-out, which is what starting a run refuses.
+            if action_lifecycle.lock().unwrap().superseded(run_id) {
+                return;
+            }
 
             // Criterion 3's second half: completion starts one normal Generation over
             // every entity currently known, not only the ones this run acted on.
@@ -6374,6 +6386,56 @@ mod tests {
             before.generation.successor(),
             "completion must start exactly one Generation: not zero (no refresh at all) and \
              not two (a double refresh)"
+        );
+    }
+
+    /// A completion overtaken by a newly admitted run starts no Generation of its own: that
+    /// run's admission already cancelled what was in flight, and a Generation started here
+    /// would run beside its fan-out, which is exactly what starting a run refuses.
+    ///
+    /// The Generation number is what discriminates: counting settled entities cannot tell a
+    /// suppressed refresh from one that ran, since both leave every row settled. The second
+    /// run's own completion still starts exactly one, so what is dropped here is the
+    /// duplicate rather than the refresh.
+    #[test]
+    fn a_completion_overtaken_by_a_newly_admitted_run_starts_no_generation_of_its_own() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = root_of(&dir);
+        let repo = root.join("repo");
+        init_repo_with_a_commit(&repo);
+
+        let (core, _launched) = started_and_settled(spec(vec![root]));
+        let key = core.snapshot().entities[0].key.clone();
+        let boundary = core.action_completion_boundary();
+        boundary.arm();
+
+        assert!(core.run_action(
+            action("overtaken", vec![step(&["true"])]),
+            std::slice::from_ref(&key)
+        ));
+        boundary.wait_until_reached();
+        let before = core.snapshot().generation;
+
+        assert!(core.run_action(
+            action("overtaking", vec![step(&["sh", "-c", "sleep 5"])]),
+            std::slice::from_ref(&key)
+        ));
+
+        boundary.release();
+        boundary.wait_until_passed();
+
+        assert_eq!(
+            core.snapshot().generation,
+            before,
+            "the overtaken completion must start no Generation beside the overtaking run's \
+             fan-out, whose own admission just cancelled the one in flight"
+        );
+
+        wait_for("the overtaking run to finish", || !core.action_running());
+        assert_eq!(
+            core.settle().generation,
+            before.successor(),
+            "the overtaking run's own completion must still start exactly one Generation"
         );
     }
 
