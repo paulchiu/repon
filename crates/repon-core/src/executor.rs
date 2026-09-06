@@ -2452,6 +2452,43 @@ print(1 if inherited else 0)"
         assert!(decoded.contains("\u{4e2d}\u{6587}"));
     }
 
+    /// Every one of `docs/spec/actions.md`'s "Capture" rules in one fixture, checked against
+    /// bytes written out from that spec rather than from the normaliser, so the two can
+    /// disagree: the tests around this one each take a rule alone and would not catch the
+    /// rules interacting, an SGR the following frame reset has to drop among them. Reassembled
+    /// at every byte offset the way [`drain_with_poll`] concatenates its reads, since capture
+    /// runs over the whole stream and no read boundary may reach it.
+    #[test]
+    fn splitting_the_fixture_at_any_read_boundary_produces_the_same_specified_capture() {
+        let raw: &[u8] = b"repon\r\n\
+            \x1b[31mProgress: 10%\r\
+            Progress: 55%\x1b[K\
+            Progress: 78%\x1b[1G\
+            Progress: 100%\r\n\
+            \x1b[32mdone\x1b[m \xe4\xb8\xad\xe6\x96\x87\r\n\
+            tail with no newline";
+        let expected: Vec<u8> = [
+            "repon\n".as_bytes(),
+            "Progress: 100%\n".as_bytes(),
+            "\x1b[32mdone\x1b[m \u{4e2d}\u{6587}\n".as_bytes(),
+            "tail with no newline".as_bytes(),
+        ]
+        .concat();
+
+        for split in 0..=raw.len() {
+            let reassembled = [&raw[..split], &raw[split..]].concat();
+            let (kept, elision) = bound_head_and_tail(&normalize_carriage_returns(&reassembled));
+            assert_eq!(
+                kept,
+                expected,
+                "split at byte {split}: {:?} against {:?}",
+                String::from_utf8_lossy(&kept),
+                String::from_utf8_lossy(&expected)
+            );
+            assert_eq!(elision, None, "split at byte {split}");
+        }
+    }
+
     #[test]
     fn normalize_carriage_returns_leaves_plain_output_with_no_carriage_returns_untouched() {
         assert_eq!(normalize_carriage_returns(b"a\nb\nc"), b"a\nb\nc");
