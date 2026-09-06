@@ -392,7 +392,9 @@ enum ClockControl {
     /// Start a periodic-fetch cycle now rather than on the next `fetch.interval` tick, which
     /// is how the first discovery asks for the immediate cycle enabling the fetch owes
     /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s "The
-    /// periodic fetch"). Sent rather than run there, so every cycle has the one owner.
+    /// periodic fetch"). Sent rather than run there, so every cycle has the one owner. Asked
+    /// for once and never again, so the clock holds it until it can start it rather than
+    /// dropping it.
     FetchNow,
 }
 
@@ -1781,8 +1783,9 @@ impl Core {
         let _ = self.control.send(ClockControl::Pause);
     }
 
-    /// Restarts the dedicated thread's ticking. Nothing is queued to fire on
-    /// resume; a normal Generation is the consumer's decision, not this call's.
+    /// Restarts the dedicated thread's ticking. No Generation is queued to fire on resume;
+    /// one is the consumer's decision, not this call's. The single cycle enabling the
+    /// periodic fetch owes does fire here, if a pause landed before it.
     pub fn resume(&self) {
         let _ = self.control.send(ClockControl::Resume);
     }
@@ -2791,6 +2794,19 @@ impl Core {
         ticks: Receiver<Instant>,
         fetch_ticks: Receiver<Instant>,
     ) -> StartForTest {
+        Self::start_for_test_with_fetch_gated(spec, warn_after, ticks, fetch_ticks, None)
+    }
+
+    /// [`Self::start_for_test_with_fetch`], with the discovery gate injected too: a closed
+    /// gate holds the first walk, which is what puts a call made on this `Core` provably
+    /// before the immediate cycle that walk asks for.
+    pub(crate) fn start_for_test_with_fetch_gated(
+        spec: CoreSpec,
+        warn_after: Duration,
+        ticks: Receiver<Instant>,
+        fetch_ticks: Receiver<Instant>,
+        discovery_gate: Option<DiscoveryGate>,
+    ) -> StartForTest {
         let alive = Arc::new(AtomicBool::new(true));
         let fetch_start = FetchStart {
             enabled: spec.fetch.enabled,
@@ -2804,7 +2820,7 @@ impl Core {
             ticks,
             fetch_start,
             alive,
-            None,
+            discovery_gate,
         )
     }
 
@@ -3398,8 +3414,9 @@ struct ClockChannels {
 ///
 /// A cycle runs on a worker of its own rather than here, so a fetch waiting on a remote
 /// stalls none of the above. This loop is the cycle's owner for as long as it runs: it starts
-/// at most one at a time, cancels the live one on pause and on the way out, and takes it back
-/// on the completion message the worker sends. Everything a cycle owes the table beyond its
+/// at most one at a time, holds the immediate cycle enabling the fetch owes until it can
+/// start it, cancels the live one on pause and on the way out, and takes it back on the
+/// completion message the worker sends. Everything a cycle owes the table beyond its
 /// own fetches, the Generation above all, is dispatched from here rather than from the
 /// worker, so a cancelled cycle cannot land anything the lifecycle has already moved past.
 fn spawn_clock_thread(
@@ -3418,6 +3435,7 @@ fn spawn_clock_thread(
     thread::spawn(move || {
         let mut paused = false;
         let mut cycle: Option<FetchCycle> = None;
+        let mut immediate_cycle_owed = false;
         loop {
             select! {
                 recv(control) -> message => match message {
@@ -3429,11 +3447,7 @@ fn spawn_clock_thread(
                         }
                     }
                     Ok(ClockControl::Resume) => paused = false,
-                    Ok(ClockControl::FetchNow) => {
-                        if !paused && cycle.is_none() {
-                            cycle = Some(start_fetch_cycle(&table, &fetch));
-                        }
-                    }
+                    Ok(ClockControl::FetchNow) => immediate_cycle_owed = true,
                     Ok(ClockControl::Shutdown) | Err(_) => break,
                 },
                 recv(ticks) -> tick => {
@@ -3474,6 +3488,12 @@ fn spawn_clock_thread(
                         fetch.taken_back_count.fetch_add(1, Ordering::Release);
                     }
                 }
+            }
+            // Started here rather than in the arm that asked for it, so a pause or a live
+            // cycle delays the immediate cycle rather than losing it.
+            if immediate_cycle_owed && !paused && cycle.is_none() {
+                immediate_cycle_owed = false;
+                cycle = Some(start_fetch_cycle(&table, &fetch));
             }
         }
         // Shutdown waits the cycle out rather than detaching it, so no worker is still
@@ -12763,6 +12783,41 @@ mod tests {
                 1,
                 "two ticks taken while a cycle was held must have started no cycle of their \
                  own"
+            );
+        }
+
+        /// The one cycle enabling the periodic fetch owes
+        /// ([refresh.md](https://github.com/paulchiu/repon/blob/main/docs/spec/refresh.md)'s
+        /// "fires immediately on being enabled") is held by a pause rather than lost to it:
+        /// the first walk asks for it once and nothing asks again, so a Launcher handoff
+        /// landing during that walk would otherwise cost the user a whole `fetch.interval`.
+        /// The walk is held closed until the pause has been sent, which is what orders the
+        /// two rather than racing them.
+        #[test]
+        fn a_pause_landing_before_the_immediate_cycle_holds_it_until_resume() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let (gate, walk_may_run, opener) = gate_opened_on_signal(false);
+            let started = Core::start_for_test_with_fetch_gated(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+                Some(gate),
+            );
+            started.core.pause();
+            walk_may_run.send(()).expect("the opener is listening");
+            opener.join().expect("the opener thread should not panic");
+            let core = started.discovered().core;
+
+            core.resume();
+
+            wait_for(
+                "the held immediate cycle to run once the clock resumes",
+                || core.fetch_cycle_count_for_test() >= 1,
             );
         }
 
