@@ -901,10 +901,11 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 /// before a real line ending survives; a CSI erase-in-line (`ESC [ K`, with or without a
 /// `0`/`1`/`2` parameter) or cursor-to-column-1 (`ESC [ G`, `ESC [ 1 G`) sequence resets
 /// a frame the same way, since a writer that redraws with CSI rather than a bare `\r`
-/// means the same thing by it. Every other CSI sequence, SGR (`ESC [ ... m`) included,
-/// passes through untouched: this is not a terminal emulator, so a sequence it does not
-/// know resets a frame (cursor-up, `ESC [ A`, among them) is left for the pane to render
-/// literally rather than guessed at. `\n` bytes never appear as a UTF-8 continuation
+/// means the same thing by it. Every other CSI sequence, SGR (`ESC [ ... m`) included, is
+/// never a separator and is never rewritten, though one written into a frame a later
+/// separator discards goes with that frame: this is not a terminal emulator, so a sequence
+/// it does not know resets a frame (cursor-up, `ESC [ A`, among them) is left for the pane
+/// to render literally rather than guessed at. `\n` bytes never appear as a UTF-8 continuation
 /// byte, so this never risks splitting a multi-byte character.
 fn normalize_carriage_returns(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
@@ -2330,6 +2331,42 @@ print(1 if inherited else 0)"
         );
     }
 
+    /// Byte equality where the tests above walk `.lines()`, which reads a newline lost or
+    /// added at the join between the kept head and the kept tail identically. This
+    /// fixture's own last line is unterminated, and the bound must not finish it.
+    #[test]
+    fn a_bounded_capture_keeps_the_literal_bytes_and_an_unterminated_last_line() {
+        let bound = CAPTURE_HEAD_LINES + CAPTURE_TAIL_LINES;
+        let mut input = String::new();
+        for n in 0..=bound {
+            input.push_str(&format!("line {n}"));
+            if n < bound {
+                input.push('\n');
+            }
+        }
+        let mut expected = String::new();
+        for n in 0..CAPTURE_HEAD_LINES {
+            expected.push_str(&format!("line {n}\n"));
+        }
+        for n in CAPTURE_HEAD_LINES + 1..bound {
+            expected.push_str(&format!("line {n}\n"));
+        }
+        expected.push_str(&format!("line {bound}"));
+
+        let (kept, elision) = bound_head_and_tail(input.as_bytes());
+
+        // Compared as text rather than as a byte vector, which prints at this size as
+        // unreadable decimal.
+        assert_eq!(String::from_utf8(kept).expect("valid utf8"), expected);
+        assert_eq!(
+            elision,
+            Some(CaptureElision {
+                dropped_lines: 1,
+                kept_head_lines: CAPTURE_HEAD_LINES,
+            })
+        );
+    }
+
     /// The wiring between the bound and the receipt, which nothing else exercises: every
     /// render-side test builds a `CaptureElision` by hand, so `run_step` could drop the one
     /// the bound computed and the mark would silently vanish from every real long run. A
@@ -2395,6 +2432,117 @@ print(1 if inherited else 0)"
         assert_eq!(elision.expect("an elision past the bound").dropped_lines, 5);
         let decoded = String::from_utf8(bounded).expect("bounded output must stay valid UTF-8");
         assert!(decoded.contains("\u{4e2d}\u{6587}"));
+    }
+
+    /// Every "Capture" rule of `docs/spec/actions.md` at once, as the pieces a child writes
+    /// it in and the capture the spec says it produces. The pieces end inside a CRLF, a CSI
+    /// introducer, a CSI parameter and a multi-byte character, so a read boundary can land
+    /// in each; the expected bytes are written out from the spec rather than from the
+    /// normaliser, so the two can disagree.
+    fn capture_rule_fixture() -> (Vec<&'static [u8]>, Vec<u8>) {
+        let written: Vec<&'static [u8]> = vec![
+            b"repon\r\n",
+            b"\x1b",
+            b"[31mProgress: 10%",
+            b"\r",
+            b"Progress: 55%\x1b[",
+            b"K",
+            b"Progress: 78%\x1b[1",
+            b"G",
+            b"Progress: 100%\r",
+            b"\n",
+            b"\x1b[32mdone\x1b[m \xe4\xb8",
+            b"\xad\xe6\x96\x87\r\n",
+            b"tail with no newline",
+        ];
+        let kept = [
+            "repon\n",
+            "Progress: 100%\n",
+            "\x1b[32mdone\x1b[m \u{4e2d}\u{6587}\n",
+            "tail with no newline",
+        ]
+        .concat()
+        .into_bytes();
+        (written, kept)
+    }
+
+    /// The rules interacting, which the tests around this one take one rule at a time and
+    /// would not catch: an SGR the following frame reset has to drop among them.
+    #[test]
+    fn every_capture_rule_at_once_produces_the_bytes_the_spec_specifies() {
+        let (written, expected) = capture_rule_fixture();
+
+        let (kept, elision) = bound_head_and_tail(&normalize_carriage_returns(&written.concat()));
+
+        assert_eq!(
+            String::from_utf8_lossy(&kept),
+            String::from_utf8_lossy(&expected)
+        );
+        assert_eq!(elision, None);
+    }
+
+    /// The same fixture through a real child that writes it a piece at a time, so the
+    /// drain's reads really do split it: capture normalises the whole stream, so where
+    /// those boundaries fell must not reach the bytes. ONLCR is turned off in the child so
+    /// the fixture arrives as written, a line ending's `\r` and `\n` in separate reads
+    /// included, rather than expanded by the kernel a whole pair at a time.
+    #[test]
+    fn a_fixture_split_across_a_childs_own_reads_captures_the_same_bytes() {
+        let (written, expected) = capture_rule_fixture();
+        let literals: Vec<String> = written
+            .iter()
+            .map(|piece| {
+                let escaped: String = piece.iter().map(|byte| format!("\\x{byte:02x}")).collect();
+                format!("b\"{escaped}\"")
+            })
+            .collect();
+        // The flush and the pause per piece are what put a read boundary between them.
+        let program = [
+            "import sys, termios, time".to_string(),
+            "mode = termios.tcgetattr(1)".to_string(),
+            "mode[1] &= ~termios.ONLCR".to_string(),
+            "termios.tcsetattr(1, termios.TCSANOW, mode)".to_string(),
+            format!(
+                "for piece in [{}]: sys.stdout.buffer.write(piece); \
+                 sys.stdout.buffer.flush(); time.sleep(0.005)",
+                literals.join(", ")
+            ),
+        ]
+        .join("\n");
+        let dir = tempdir();
+
+        let result = run(&["python3", "-c", &program], dir.path());
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Ok,
+            "the fixture step failed; it needs `python3` on PATH. output: {}",
+            String::from_utf8_lossy(&result.output)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.output),
+            String::from_utf8_lossy(&expected)
+        );
+        assert_eq!(result.elision, None);
+    }
+
+    /// The bound counts lines, so it bounds nothing until a line ends. A byte cap, the
+    /// obvious way to bound this, would cut a line the spec says is kept whole
+    /// (`docs/spec/actions.md`'s "Capture"), so the size here is the claim.
+    #[test]
+    fn an_unfinished_line_is_kept_whole_however_long_it_runs() {
+        // 600 times the longest real line the spec measured, with no line ending in it.
+        let unfinished = vec![b'x'; 1024 * 1024];
+
+        let (kept, elision) = bound_head_and_tail(&unfinished);
+
+        assert!(
+            kept == unfinished,
+            "an unfinished line must be kept whole: kept {} of {} bytes",
+            kept.len(),
+            unfinished.len()
+        );
+        assert_eq!(elision, None, "one line, finished or not, loses nothing");
     }
 
     #[test]
