@@ -286,11 +286,12 @@ struct ManagementRun {
 /// One gesture rank 3 of the status row reports on: a Refresh the refresh key dispatched,
 /// `Action::RefreshAll` (`r`, `F5`) or `Action::RefreshSelection` (`R`) with how many
 /// entities it covers, or the cycle the fetch key (`f`) asked for.
-/// `status_row_content` reads `Core::refresh_running` fresh every frame to decide whether to
-/// show "refreshing" or "refreshed"; this struct only remembers which Refresh dispatched it
-/// and its size, and persists on `App` until a later refresh key press replaces it, which is
-/// what keeps the result legible even when the Refresh settles inside the frame that started
-/// it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B timings).
+/// `status_row_content` reads `Core::refresh_running` and `Core::fetch_running` fresh every
+/// frame to pick the live or the settled verb; this type only remembers which gesture fired
+/// and, for a Refresh, its size, and persists on `App` until a later press of either key
+/// replaces it, which is what keeps the result legible even when the gesture settles inside
+/// the frame that started it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B
+/// timings).
 enum GestureRun {
     Refresh {
         scope: status_row::RefreshScope,
@@ -555,10 +556,11 @@ pub struct App {
     /// while `Core::action_running` is true; a stale value between runs costs nothing since
     /// nothing reads it then.
     action_run: Option<ActionRun>,
-    /// The refresh key's most recent dispatch, read by `status_row_content` every frame
-    /// alongside `Core::refresh_running`. `None` until the refresh key fires once this
-    /// session, then never cleared: a later refresh key press replaces it rather than
-    /// leaving a gap.
+    /// The most recent gesture the refresh or fetch key dispatched, read by
+    /// `status_row_content` every frame alongside whichever of `Core::refresh_running` and
+    /// `Core::fetch_running` that gesture answers to. `None` until either key fires once
+    /// this session, then never cleared: a later press replaces it rather than leaving a
+    /// gap.
     gesture_run: Option<GestureRun>,
     /// The order the table is listed in. Session state, restored at startup and persisted to
     /// `state.toml` on quit beside the Selection and the Filter
