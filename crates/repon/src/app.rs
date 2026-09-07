@@ -10140,9 +10140,17 @@ mod tests {
         let clone = root.join("clone");
 
         std::fs::create_dir_all(&remote).expect("create remote dir");
+        // Pinned rather than left to `init.defaultBranch`: the clone tracks whatever the bare
+        // repository's HEAD names, and a runner defaulting to `master` would check out nothing.
         run_git(
             &root,
-            &["init", "--quiet", "--bare", remote.to_str().expect("utf8")],
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().expect("utf8"),
+            ],
         );
         init_repo(&seed);
         run_git(
