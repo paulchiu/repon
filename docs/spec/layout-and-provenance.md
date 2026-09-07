@@ -160,7 +160,7 @@ A row the Selection holds checked carries a glyph in this marker column, `✓` u
 
 ### An empty list
 
-A list with no rows to draw says which of the two reasons it has rather than leaving a bordered box a reader cannot tell from a hang: `no repos` when nothing was discovered, `no matches` when a Filter narrowed the view to zero, since [filter.md](filter.md) holds that zero matches is legal and not an error. The wording is the same word the two palettes already use for their own empty state ([keybindings.md](keybindings.md)'s "An empty result says so rather than rendering blank").
+A list with no rows to draw says why rather than leaving a bordered box a reader cannot tell from a hang: `no repos` when nothing was discovered, `no matches` when a Filter narrowed the view to zero, which [filter.md](filter.md) holds is legal and not an error. `no matches` is the wording the two palettes and the help overlay's own search already use for their own empty state ([keybindings.md](keybindings.md)).
 
 **That message is centred on both axes of the rows the entities would have filled**, so it reads as the panel's own answer rather than as a stray value in the first cell of an empty table. Horizontally it is centred in the panel interior, and vertically in the interior less the header row, which the sidebar does not draw and so does not subtract. A message wider than the interior starts at the interior's left edge and is cut at the right, on the same terms as any other value too long for the width it is given; a panel with no row below its header has nowhere to say it and says nothing.
 
