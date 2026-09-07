@@ -14,7 +14,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::{Position, Rect},
+    style::Style,
+};
 use repon_core::{
     Cell, DirtyCounts, EntityKey, EntityState, Filter, Head, Kind, RowSummary, Settled, Snapshot,
     SyncState, WorktreeState, summary,
@@ -384,14 +389,19 @@ impl List {
             } else {
                 NO_REPOS_MESSAGE
             };
-            let y = interior.y + first_row;
-            if y < interior.bottom() {
+            let rows_area = Rect {
+                x: interior.x,
+                y: interior.y.saturating_add(first_row),
+                width: interior.width,
+                height: interior.height.saturating_sub(first_row),
+            };
+            if let Some(origin) = centred_message_origin(rows_area, message) {
                 write_cell(
                     buf,
                     interior,
-                    interior.x,
-                    y,
-                    interior.width,
+                    origin.x,
+                    origin.y,
+                    interior.right().saturating_sub(origin.x),
                     message,
                     self.theme.style_for(theme::Role::Dim),
                 );
@@ -574,6 +584,23 @@ fn clipped_cell_width(interior: Rect, x: u16, width: u16) -> Option<u16> {
     } else {
         Some(width.min(interior.right() - x))
     }
+}
+
+/// Where a one-line `message` starts when it is centred on both axes of `rows`, or `None`
+/// when `rows` has no line to draw it on. Odd slack settles the message left of centre and
+/// above it, and a message wider than `rows` starts at its left edge rather than a column
+/// left of it, leaving the cut to [`write_cell`]. Measured in display columns, since a
+/// message is centred by what it occupies on screen rather than by how it is encoded.
+fn centred_message_origin(rows: Rect, message: &str) -> Option<Position> {
+    if rows.height == 0 {
+        return None;
+    }
+    let width = u16::try_from(ratatui::text::Span::raw(message).width()).unwrap_or(u16::MAX);
+    Position {
+        x: rows.x + rows.width.saturating_sub(width) / 2,
+        y: rows.y + (rows.height - 1) / 2,
+    }
+    .into()
 }
 
 /// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge.
@@ -2432,6 +2459,14 @@ mod tests {
         );
     }
 
+    /// Whether `text` appears anywhere on the panel, for a test that cares what it says
+    /// rather than where it says it.
+    fn panel_says(buf: &Buffer, text: &str) -> bool {
+        (0..buf.area.height)
+            .map(|y| cell_text(buf, 0, y, buf.area.width))
+            .any(|row| row.contains(text))
+    }
+
     fn cell_text(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
         (0..len)
             .map(|offset| buf[(x + offset, y)].symbol().to_string())
@@ -2970,15 +3005,9 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(0),
-                entity_row_y(0),
-                NO_REPOS_MESSAGE.len() as u16
-            ),
-            NO_REPOS_MESSAGE,
-            "an empty snapshot with no Filter must say so on the first row below the header"
+        assert!(
+            panel_says(buf, NO_REPOS_MESSAGE),
+            "an empty snapshot with no Filter must say so somewhere in the panel"
         );
     }
 
@@ -2993,29 +3022,149 @@ mod tests {
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
 
-        assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(0),
-                entity_row_y(0),
-                NO_MATCHES_MESSAGE.len() as u16
-            ),
-            NO_MATCHES_MESSAGE,
-            "a Filter matching zero rows must say so, distinctly from the no-filter empty state"
+        assert!(
+            panel_says(buf, NO_MATCHES_MESSAGE),
+            "a Filter matching zero rows must say so"
+        );
+        assert!(
+            !panel_says(buf, NO_REPOS_MESSAGE),
+            "a Filter matching zero rows must not borrow the no-Filter state's wording"
         );
     }
 
-    /// The sidebar shares the same empty-state draw as the full list: proven separately since
-    /// the sidebar has no header row, so its own first row sits one line higher.
+    /// The empty state's own placement, at literal buffer coordinates hand-summed from the
+    /// 140x24 frame rather than from the production geometry: a one-column border leaves an
+    /// interior 138 wide starting at column 1 and 22 tall starting at row 1, the header
+    /// takes the first of those rows, and the 21 rows left are the ones an entity would
+    /// have been drawn on. So `no repos`, eight columns wide, starts at 1 + (138 - 8) / 2
+    /// and sits on row 2 + (21 - 1) / 2.
     #[test]
-    fn the_sidebar_also_says_so_when_nothing_is_discovered() {
+    fn the_empty_state_message_is_centred_in_the_rows_the_entities_would_have_filled() {
+        let terminal = render(140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 66, 12, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// The Filter's own message centres by its own width, not by the other message's: ten
+    /// columns rather than eight, so it starts two columns left of where `no repos` does on
+    /// the same frame, on the same row.
+    #[test]
+    fn the_no_matches_message_centres_on_its_own_width() {
+        let mut list = List::default();
+        list.set_filter(Filter::parse("name:does-not-exist-anywhere"));
+        let snap = snapshot(vec![entity("alpha")]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 65, 12, NO_MATCHES_MESSAGE.len() as u16),
+            NO_MATCHES_MESSAGE
+        );
+    }
+
+    /// The sidebar says the same thing the full list does, and centres in the whole of its
+    /// own interior rather than in a rows area one line short: it draws no header, so every
+    /// interior row is one an entity could have taken.
+    /// A 34-column, 24-row frame leaves an interior 32 wide at column 1 and 22 tall at row
+    /// 1, so `no repos` starts at 1 + (32 - 8) / 2 and sits on row 1 + (22 - 1) / 2.
+    #[test]
+    fn the_sidebar_centres_in_the_whole_interior_since_it_has_no_header_row() {
+        const {
+            assert!(
+                SIDEBAR_WIDTH == 34,
+                "the arithmetic in this test's own doc comment is written for a 34-column \
+                 sidebar"
+            );
+        }
         let terminal = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
         assert_eq!(
-            cell_text(buf, 1, 1, NO_REPOS_MESSAGE.len() as u16),
-            NO_REPOS_MESSAGE,
-            "the sidebar must show the same empty-state message, one row higher (no header)"
+            cell_text(buf, 13, 11, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// An interior narrower than the message starts it at the interior's left edge and cuts
+    /// it at the right, rather than centring it onto the panel's own frame at either end. A
+    /// nine-column frame leaves seven columns of interior at column 1, one short of the
+    /// message. The right border is read against a row the message never reaches, so the
+    /// assertion holds whichever glyph set drew it.
+    #[test]
+    fn a_message_wider_than_the_interior_is_cut_at_the_right_rather_than_painted_over_the_frame() {
+        let terminal = render(9, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(cell_text(buf, 1, 12, 7), &NO_REPOS_MESSAGE[..7]);
+        assert_eq!(
+            cell_text(buf, 8, 12, 1),
+            cell_text(buf, 8, 3, 1),
+            "the message's own row must keep the right border every other row has"
+        );
+        assert_eq!(
+            cell_text(buf, 0, 12, 1),
+            cell_text(buf, 0, 3, 1),
+            "and the left border too"
+        );
+    }
+
+    /// Slack that will not halve evenly settles the message left of centre and above it,
+    /// rather than right and below. A 141x23 frame leaves an interior 139 wide at column 1
+    /// and 21 tall at row 1, so the rows below the header are 20, and both halvings have a
+    /// remainder: the message starts at 1 + (139 - 8) / 2 and sits on row 2 + (20 - 1) / 2,
+    /// which is the upper of the two middle rows.
+    #[test]
+    fn odd_slack_settles_the_message_left_of_centre_and_above_it() {
+        let terminal = render(141, 23, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 66, 11, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// Centring is by display columns rather than by `char` count, so a message of
+    /// double-width characters is centred by the space it takes on screen. Neither message
+    /// this list draws is wide today, so the rule is proven against the function itself.
+    #[test]
+    fn a_message_is_centred_by_the_columns_it_occupies_not_by_its_character_count() {
+        let rows = Rect::new(0, 0, 10, 1);
+
+        assert_eq!(
+            centred_message_origin(rows, "\u{5b57}\u{5b57}"),
+            Some(Position { x: 3, y: 0 }),
+            "two double-width characters occupy four columns, not two"
+        );
+    }
+
+    /// A rows area one line tall still draws on that line: a four-row frame leaves two rows
+    /// of interior, the header takes the first, and the one left is row 2.
+    #[test]
+    fn a_rows_area_one_line_tall_still_draws_the_message_on_that_line() {
+        let terminal = render(140, 4, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 66, 2, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// A frame with no rows area at all, its whole interior spent on the header: nothing is
+    /// drawn, and nothing panics reaching for a centre line that does not exist.
+    #[test]
+    fn a_frame_with_no_room_below_the_header_draws_no_message() {
+        let terminal = render(140, 3, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            !panel_says(buf, NO_REPOS_MESSAGE),
+            "a frame with no row below the header has nowhere to say it"
         );
     }
 
