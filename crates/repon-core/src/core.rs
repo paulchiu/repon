@@ -12698,6 +12698,93 @@ mod tests {
             );
         }
 
+        /// [`Core::fetch_running`] is what the status row reads every frame, so it must be
+        /// true for exactly as long as a cycle is in flight. Holding the cycle at
+        /// [`FetchBoundary`] makes "in flight" a moment to assert at rather than a race to
+        /// catch; the clearing half is a wait, since it lands on the clock thread a moment
+        /// after the fetch itself returns.
+        #[test]
+        fn fetch_running_holds_while_a_cycle_is_in_flight_and_clears_once_it_is_taken_back() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            assert!(
+                !core.fetch_running(),
+                "sanity: no cycle has been asked for yet"
+            );
+
+            let held = core.fetch_boundary().arm();
+            core.fetch_now();
+            held.wait_until_reached();
+            assert!(
+                core.fetch_running(),
+                "a cycle parked mid-fetch is still in flight"
+            );
+
+            drop(held);
+            wait_for(
+                "the cycle to be taken back and fetch_running to clear",
+                || !core.fetch_running(),
+            );
+        }
+
+        /// The failure counting an on-demand cycle owes is the periodic one's, unchanged: one
+        /// unreachable repository is counted and named, and its sibling still fetches. The
+        /// periodic fetch is off and no tick ever fires, so the cycle under test is the one
+        /// `fetch_now` asked for.
+        #[test]
+        fn an_on_demand_cycle_counts_a_repository_it_could_not_reach_and_fetches_the_rest() {
+            let good_remote = seeded_remote();
+            let bad_remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let good = root_path.join("good");
+            let bad = root_path.join("bad");
+            clone_into(good_remote.path(), &good);
+            clone_into(bad_remote.path(), &bad);
+            break_remote(&bad);
+
+            crate::test_support::push_new_commit(good_remote.path(), "second.txt", "second\n");
+            let good_remote_tip = rev_parse(good_remote.path(), "refs/heads/main");
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for(
+                "the on-demand cycle to count the one repository it could not fetch",
+                || core.fetch_failures().failed.len() == 1,
+            );
+            let failures = core.fetch_failures();
+            assert!(
+                failures.failed[0].0.to_string_lossy().contains("bad"),
+                "the counted failure must name the repository that actually failed, got: {:?}",
+                failures.failed
+            );
+
+            wait_for(
+                "the sibling repository to still fetch despite the other one failing",
+                || rev_parse(&good, "refs/remotes/origin/main") == good_remote_tip,
+            );
+        }
+
         /// A tick on the periodic fetch's own channel runs a second cycle, proving the
         /// recurring cadence is wired to the same dedicated thread the immediate cycle
         /// used, not merely a one-shot dispatched at start.
