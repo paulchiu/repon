@@ -34,6 +34,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `/` | Enter a Filter |
 | `r`, `F5` | Refresh everything |
 | `R` | Refresh the Selection |
+| `f` | Fetch every remote now |
 | `b` | Re-derive default branches over the Selection |
 | `w` | Expand the warning slot |
 | `t` | Toggle Worktree rows |

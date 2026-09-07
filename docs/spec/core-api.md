@@ -186,6 +186,8 @@ impl Core {
     pub fn dismiss(&self, key: &EntityKey);
     pub fn pause(&self);
     pub fn resume(&self);
+    pub fn fetch_now(&self);
+    pub fn fetch_running(&self) -> bool;
 }
 
 pub fn count(spec: &SetSpec) -> Result<usize, DiscoveryError>;
@@ -195,7 +197,7 @@ They group into four concerns.
 
 | concern | signature | purpose |
 | --- | --- | --- |
-| Lifecycle | `start`, `pause`, `resume`, `Drop` | Spawn the threads and Generation 1, stop them for a suspension, cancel what is in flight and join them at the end |
+| Lifecycle | `start`, `pause`, `resume`, `fetch_now`, `fetch_running`, `Drop` | Spawn the threads and Generation 1, stop them for a suspension, start the periodic fetch's own cycle early and read whether one is in flight, cancel what is in flight and join them at the end |
 | Refreshing | `refresh`, `refresh_all`, `probe_now`, `dismiss` | Start a Generation over an order the caller computed or over everything discovery finds, re-probe one entity synchronously, drop a Vanished row |
 | Reading | `snapshot`, `try_settle` | Clone the table now, or block until it settles |
 | Counting | `count` | Match a `SetSpec` with no probing and no provenance |
@@ -204,6 +206,7 @@ They group into four concerns.
 - `refresh_all` is the same Generation with its order resolved after that Generation's own discovery rather than by the caller. It exists for the Set switch, whose consumer has just discarded the old Set's rows and has no key to name; nothing is lost to it, because it has no cursor or viewport yet either. Launch and `repon status` need it no more, since `start`'s own walk is that `Core`'s Generation 1. Every other trigger has a cursor and a viewport, and takes `refresh`.
 - `probe_now` is the Launcher return: [refresh.md](refresh.md) requires the handed-off entity to be re-probed first and synchronously before a normal Generation starts.
 - `pause` and `resume` exist because all background work stops while the terminal interface is suspended. The core is not told why.
+- `fetch_now` starts [refresh.md](refresh.md)'s own periodic-fetch cycle immediately rather than at the next `fetch.interval` tick. It is that cycle unchanged, auto-update included, and it is ungated by `FetchSpec::enabled`, which governs only what this `Core` does unbidden on a timer. It is refused rather than queued while a cycle is in flight, which is why it returns nothing: a `Generation` would be a claim about work that may not have started, where the cycle's own completion already dispatches one through the ordinary path. `fetch_running` is the counterpart read, for a consumer that reports the cycle's state.
 - `try_settle` is the machine-readable consumer's whole loop: it blocks until nothing is in flight or the deadline passes, then returns. The two outcomes are separate arms rather than one return value, because they are separate facts. `Ok` is a table that settled; `Err` is the wait giving up, carrying the same snapshot so a consumer that means to degrade still has something to degrade with. A single return value made an expiry indistinguishable from an answer, and a half-populated table read as a settled one is a wrong answer rather than a late one: it surfaces as a defect several steps downstream with nothing left naming the wait. `repon status` takes the `Err` arm deliberately, because the Generation deadline's own sweep has by then converted anything still outstanding to `Unknown::TimedOut`, which is what its exit code reads.
 - `settle` is the same wait with no deadline to pass and no expiry to handle: it waits on `liveness::BACKSTOP` and panics naming the wait if that expires. It is gated behind `test-util` and off a published build, because a wait a caller cannot bound is only ever honest inside a test, where every deadline it used to take was a number guessed against whichever machine its author had. A wait whose *number* is the claim ("nothing arrives within 200ms") is a different wait and takes `try_settle`.
 - `count` is a free function taking a `SetSpec` and returning a match count, with no probing and no provenance, because `repon sets` in [config.md](config.md) prints a count for every declared Set rather than for the active one. That makes `repon sets` a real second consumer rather than a special case.

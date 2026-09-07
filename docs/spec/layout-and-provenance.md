@@ -37,13 +37,15 @@ Priority, after the indicator is reserved:
 | --- | --- | --- |
 | 1 | the active Set's name and the entity count | [config.md](config.md), [core-api.md](core-api.md) |
 | 2 | the most severe warning's message, plus `(+N more, w to expand)` while more stand | [theming.md](theming.md) |
-| 3 | the current Refresh's own state | [refresh.md](refresh.md) |
+| 3 | the current Refresh's own state, or the fetch key's | [refresh.md](refresh.md) |
 | 4 | the sort, while the table is in one | [0030](../adr/0030-the-table-has-an-order-the-user-chooses.md) |
 | 5 | run progress | [actions.md](actions.md) |
 | 6 | the Filter's match count | [filter.md](filter.md) |
 | 7 | the worktrees note | [config.md](config.md) |
 | 8 | timing | [actions.md](actions.md) |
 | 9 | the range anchor, while `v`'s own anchor is live | [keybindings.md](keybindings.md#the-range-anchor) |
+
+Rank 3 holds one gesture, the most recent of the two: `refreshing all 403` or `refreshed all 403` for a Refresh, and `fetching` or `fetched` for the fetch key, which carries no count beside it because a cycle decides for itself which Repos have a remote to reach. One slot rather than two, because the row reports what the user last asked for rather than everything that has run, and a later gesture replaces the earlier one exactly as a second Refresh already replaces the first.
 
 The warning's message ranks above run progress because it puts the table itself in doubt: an abandoned discovery means rows may be missing, and a run reported against a table that may be missing rows is the more misleading of the two. It ranks below the entity count because the count is what the message is a caveat on.
 

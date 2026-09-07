@@ -30,13 +30,13 @@ const ELLIPSIS: &str = " ...";
 /// Everything the status row needs once a live Notice does not pre-empt it: the active Set's
 /// name, the header's own five items (its entity count folds into rank 1 below rather than
 /// standing alone), every outstanding warning, which of them `w` has already acknowledged,
-/// and the refresh key's own most recent Refresh, if one has fired this session.
+/// and the most recent gesture rank 3 reports on, if one has fired this session.
 pub(crate) struct StatusRowContent<'a> {
     pub(crate) set_name: &'a str,
     pub(crate) header: HeaderContent,
     pub(crate) warnings: &'a [Warning],
     pub(crate) acknowledged: &'a [Warning],
-    pub(crate) refresh: Option<RefreshRowContent>,
+    pub(crate) gesture: Option<Gesture>,
     /// How the table is ordered, already rendered
     /// ([`crate::sort::RowOrder::label`]), or `None` in the natural grouped order, which is
     /// the absence of a sort rather than a sort with nothing to say.
@@ -55,12 +55,21 @@ pub(crate) enum RefreshScope {
     Selection,
 }
 
-/// Rank 3's own content: which Refresh the refresh key most recently dispatched, how many
-/// entities it covers, and whether `Core::refresh_running` still reads true for it.
-pub(crate) struct RefreshRowContent {
-    pub(crate) scope: RefreshScope,
-    pub(crate) entity_count: usize,
-    pub(crate) running: bool,
+/// Rank 3's own content: the most recent gesture the user aimed at the table and whether it
+/// is still running. Only ever one of the two, since the row reports what was last asked for
+/// rather than everything that has run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gesture {
+    /// A Refresh, with the scope it covers and how many entities that is.
+    Refresh {
+        scope: RefreshScope,
+        entity_count: usize,
+        running: bool,
+    },
+    /// The fetch cycle `Action::FetchNow` asked for. It carries no count: a cycle decides
+    /// for itself which repositories have a remote to reach, so there is no number this row
+    /// could stand behind.
+    Fetch { running: bool },
 }
 
 /// Rank 1: the active Set's name and the entity count it bounds, one item so the two can
@@ -103,29 +112,34 @@ fn message_item(
     })
 }
 
-/// Rank 3, present from the moment the refresh key dispatches a Refresh until a later one
-/// replaces it: `refreshing` while [`RefreshRowContent::running`] holds, `refreshed` once it
-/// settles. Two states rather than a fraction of entities settled, because phases A and B
-/// cover the whole population in about 0.15 seconds
+/// Rank 3, present from the moment the refresh or fetch key fires until a later one replaces
+/// it: `refreshing`/`refreshed` for a Refresh and `fetching`/`fetched` for a cycle, the live
+/// half of each while that gesture is still running. Two states rather than a fraction of
+/// entities settled, because phases A and B cover the whole population in about 0.15 seconds
 /// ([refresh.md](../../../../docs/spec/refresh.md)'s "The phases"), so a live count would
 /// jump straight from nothing landed to everything landed with no readable state between,
 /// the same defect refresh.md already recorded once for a static per-row spinner. Persists
 /// past settling, unlike [`header::trailing_items`]'s run progress, which is the point: a
 /// Refresh that finishes inside the frame that started it must still leave something to
 /// read.
-fn refresh_item(refresh: Option<&RefreshRowContent>) -> Option<degrade::Item<String>> {
-    let refresh = refresh?;
-    let verb = if refresh.running {
-        "refreshing"
-    } else {
-        "refreshed"
-    };
-    let scope = match refresh.scope {
-        RefreshScope::All => "all",
-        RefreshScope::Selection => "selection",
+fn gesture_item(gesture: Option<&Gesture>) -> Option<degrade::Item<String>> {
+    let content = match gesture? {
+        Gesture::Refresh {
+            scope,
+            entity_count,
+            running,
+        } => {
+            let verb = if *running { "refreshing" } else { "refreshed" };
+            let scope = match scope {
+                RefreshScope::All => "all",
+                RefreshScope::Selection => "selection",
+            };
+            format!("{verb} {scope} {entity_count}")
+        }
+        Gesture::Fetch { running } => if *running { "fetching" } else { "fetched" }.to_string(),
     };
     Some(degrade::Item {
-        content: format!("{verb} {scope} {}", refresh.entity_count),
+        content,
         priority: Priority::Drop(6),
     })
 }
@@ -200,7 +214,7 @@ pub(crate) fn render(
         content.acknowledged,
         bindings,
     ));
-    items.extend(refresh_item(content.refresh.as_ref()));
+    items.extend(gesture_item(content.gesture.as_ref()));
     items.extend(sort_item(content.sort.as_ref()));
     items.extend(header::trailing_items(&content.header));
     items.extend(range_anchor_item(content.range_anchor_active));
@@ -289,7 +303,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -315,7 +329,7 @@ mod tests {
                 header: empty_header(),
                 warnings: &no_warnings,
                 acknowledged: &[],
-                refresh: None,
+                gesture: None,
                 sort: None,
                 range_anchor_active: false,
             },
@@ -334,7 +348,7 @@ mod tests {
                 header: empty_header(),
                 warnings: &one_warning,
                 acknowledged: &one_warning,
-                refresh: None,
+                gesture: None,
                 sort: None,
                 range_anchor_active: false,
             },
@@ -365,7 +379,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -374,7 +388,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &warnings,
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -408,7 +422,7 @@ mod tests {
             header: empty_header(),
             warnings: &seen,
             acknowledged: &seen,
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -417,7 +431,7 @@ mod tests {
             header: empty_header(),
             warnings: &now_outstanding,
             acknowledged: &seen,
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -460,7 +474,7 @@ mod tests {
             },
             warnings: &[],
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -485,7 +499,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -586,7 +600,7 @@ mod tests {
             header: empty_header(),
             warnings: &[],
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: Some("sort dirty \u{2193}".to_string()),
             range_anchor_active: false,
         };
@@ -627,7 +641,7 @@ mod tests {
             header: full_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -663,7 +677,7 @@ mod tests {
             header: full_header(),
             warnings: &warnings,
             acknowledged: &warnings,
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -690,6 +704,41 @@ mod tests {
     /// by whichever arrived first: the sort drops before the Refresh's state, because a
     /// Refresh has no other surface on the screen and a sort still has its own header arrow.
     /// A renumbering that swapped them fails here.
+    /// The fetch key's own report, in the slot the Refresh already uses: `fetching` while
+    /// the cycle runs and `fetched` once it settles, and no count beside either, since a
+    /// cycle decides for itself which repositories have a remote to reach.
+    #[test]
+    fn the_fetch_gesture_reads_fetching_then_fetched_with_no_count() {
+        let bindings = bindings();
+        let row = |running| {
+            render(
+                &StatusRowContent {
+                    set_name: "work",
+                    header: empty_header(),
+                    warnings: &[],
+                    acknowledged: &[],
+                    gesture: Some(Gesture::Fetch { running }),
+                    sort: None,
+                    range_anchor_active: false,
+                },
+                &bindings,
+                999,
+            )
+            .to_string()
+        };
+
+        let running = row(true);
+        assert!(
+            running.contains("fetching") && !running.contains("fetched"),
+            "a live cycle must read as fetching, got {running:?}"
+        );
+        let settled = row(false);
+        assert!(
+            settled.contains("fetched") && !settled.contains("fetching"),
+            "a settled cycle must read as fetched, got {settled:?}"
+        );
+    }
+
     #[test]
     fn the_sort_drops_before_the_refreshes_own_state() {
         let content = StatusRowContent {
@@ -697,7 +746,7 @@ mod tests {
             header: empty_header(),
             warnings: &[],
             acknowledged: &[],
-            refresh: Some(RefreshRowContent {
+            gesture: Some(Gesture::Refresh {
                 scope: RefreshScope::All,
                 entity_count: 403,
                 running: true,
@@ -734,7 +783,7 @@ mod tests {
         assert!(!rows.is_empty(), "expected at least one documented width");
 
         let warnings = vec![named_theme_missing("solarized-dark")];
-        let refresh = RefreshRowContent {
+        let refresh = Gesture::Refresh {
             scope: RefreshScope::All,
             entity_count: 403,
             running: true,
@@ -744,7 +793,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: Some(refresh),
+            gesture: Some(refresh),
             sort: None,
             range_anchor_active: false,
         };
@@ -765,7 +814,7 @@ mod tests {
     #[test]
     fn the_refresh_item_drops_before_the_warning_message_when_both_compete_for_the_same_room() {
         let warnings = vec![named_theme_missing("solarized-dark")];
-        let refresh = RefreshRowContent {
+        let refresh = Gesture::Refresh {
             scope: RefreshScope::All,
             entity_count: 403,
             running: true,
@@ -775,7 +824,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: Some(refresh),
+            gesture: Some(refresh),
             sort: None,
             range_anchor_active: false,
         };
@@ -806,7 +855,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -832,7 +881,7 @@ mod tests {
             header: empty_header(),
             warnings: &warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         };
@@ -877,7 +926,7 @@ mod tests {
             header: empty_header(),
             warnings: &[],
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active,
         };
@@ -908,7 +957,7 @@ mod tests {
             header: full_header(),
             warnings: &[],
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: true,
         };

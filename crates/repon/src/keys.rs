@@ -39,6 +39,11 @@ pub(crate) enum Action {
     EnterFilter,
     RefreshAll,
     RefreshSelection,
+    /// `f`: starts a fetch-and-prune cycle now rather than at the next `fetch.interval`
+    /// tick. The identical cycle the timer runs, so auto-update rides it exactly as it
+    /// rides that one, and it is ungated by `fetch.enabled` because the user aimed it
+    /// ([refresh.md](../../../../docs/spec/refresh.md)'s "The periodic fetch").
+    FetchNow,
     RederiveDefaultBranches,
     ExpandWarning,
     /// `t`: flips the session's own show-Worktrees state, leaving `show_worktrees` in
@@ -197,6 +202,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::EnterFilter => "Enter a Filter",
         Action::RefreshAll => "Refresh everything",
         Action::RefreshSelection => "Refresh the Selection",
+        Action::FetchNow => "Fetch every remote now",
         Action::RederiveDefaultBranches => "Re-derive default branches over the Selection",
         Action::ExpandWarning => "Expand the warning slot",
         Action::ToggleWorktrees => "Toggle Worktree rows",
@@ -399,6 +405,9 @@ const BINDINGS: &[Binding] = &[
         SHIFT,
         Action::RefreshSelection,
     ),
+    // No `F` beside it: a cycle reads the whole table to decide what to fetch, so there is
+    // no per-row fetch for a Selection variant to scope to.
+    binding(Context::Global, KeyCode::Char('f'), NONE, Action::FetchNow),
     binding(
         Context::Global,
         KeyCode::Char('b'),
@@ -1057,6 +1066,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::EnterFilter => "enter_filter",
         Action::RefreshAll => "refresh_all",
         Action::RefreshSelection => "refresh_selection",
+        Action::FetchNow => "fetch_now",
         Action::RederiveDefaultBranches => "rederive_default_branches",
         Action::ExpandWarning => "expand_warning",
         Action::ToggleWorktrees => "toggle_worktrees",
@@ -2725,6 +2735,38 @@ mod tests {
         assert_eq!(
             bindings.dispatch(Context::Global, press(KeyCode::Char('q'), NONE)),
             Some(Action::Quit)
+        );
+    }
+
+    /// The on-demand fetch's own chord. `f` was free in `global`, and the only other `f`
+    /// in the table is `input`'s `Alt+f`, which this must not disturb.
+    #[test]
+    fn f_asks_for_a_fetch_now_and_leaves_inputs_own_alt_f_alone() {
+        let bindings = BindingTable::compiled_default();
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('f'), NONE)),
+            Some(Action::FetchNow)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Input, press(KeyCode::Char('f'), ALT)),
+            Some(Action::MoveCursorWordRight)
+        );
+    }
+
+    /// `fetch_now` is a rebindable id like every other named action, so a `[keys]` block
+    /// moves the on-demand fetch off `f` and the old chord stops dispatching.
+    #[test]
+    fn fetch_now_rebinds_through_a_keys_block_like_any_other_action() {
+        let (bindings, warnings) = merge_ok(&[("global", &[("fetch_now", "ctrl-f")])]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('f'), CTRL)),
+            Some(Action::FetchNow)
+        );
+        assert_eq!(
+            bindings.dispatch(Context::Global, press(KeyCode::Char('f'), NONE)),
+            None,
+            "fetch_now's old key must be gone now it has moved to Ctrl+F"
         );
     }
 
