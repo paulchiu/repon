@@ -30,7 +30,8 @@ pub(crate) const COMPLETION_MAX_ROWS: usize = 8;
 
 /// What the term under the cursor offers, per
 /// [filter.md](../../../docs/spec/filter.md#completion)'s trigger table: nothing, every key,
-/// or one recognised key's own values, each list narrowed by what is already typed of it. `Keys` and `Values` both carry the literal text
+/// or one recognised key's own values. Each list is narrowed by what is already typed of an
+/// entry. `Keys` and `Values` both carry the literal text
 /// [`FilterLine::accept_highlighted_completion`] inserts, already formatted (a key's own
 /// entry carries its trailing `:`; a value's does not).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -823,6 +824,7 @@ mod tests {
     #[test]
     fn a_typed_value_fragment_narrows_the_keys_values_to_it() {
         assert_eq!(typed("sync:be").completions(), vec!["behind"]);
+        assert_eq!(typed("kind:wor").completions(), vec!["worktree"]);
 
         let mut line = typed("sync:be");
         line.accept_highlighted_completion();
