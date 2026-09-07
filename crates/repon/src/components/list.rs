@@ -384,12 +384,17 @@ impl List {
             } else {
                 NO_REPOS_MESSAGE
             };
-            let y = interior.y + first_row;
-            if y < interior.bottom() {
+            let rows = Rect {
+                x: interior.x,
+                y: interior.y.saturating_add(first_row),
+                width: interior.width,
+                height: interior.height.saturating_sub(first_row),
+            };
+            if let Some((x, y)) = centred_message_origin(rows, message) {
                 write_cell(
                     buf,
                     interior,
-                    interior.x,
+                    x,
                     y,
                     interior.width,
                     message,
@@ -574,6 +579,21 @@ fn clipped_cell_width(interior: Rect, x: u16, width: u16) -> Option<u16> {
     } else {
         Some(width.min(interior.right() - x))
     }
+}
+
+/// Where a one-line `message` starts when it is centred on both axes of `rows`, or `None`
+/// when `rows` has no line to draw it on. A message wider than `rows` starts at the left edge
+/// instead of a column left of it, so [`write_cell`]'s own clip cuts the tail rather than the
+/// arithmetic pushing the text off the panel. Measured with
+/// [`ratatui::text::Span::width`], the same function the renderer budgets a write with.
+fn centred_message_origin(rows: Rect, message: &str) -> Option<(u16, u16)> {
+    if rows.height == 0 {
+        return None;
+    }
+    let width = u16::try_from(ratatui::text::Span::raw(message).width()).unwrap_or(u16::MAX);
+    let x = rows.x + rows.width.saturating_sub(width) / 2;
+    let y = rows.y + (rows.height - 1) / 2;
+    Some((x, y))
 }
 
 /// Writes `text` at `(x, y)`, clipped to `width` and to `interior`'s own right edge.
@@ -2432,6 +2452,14 @@ mod tests {
         );
     }
 
+    /// Every row of `buf` as its own string, for a test that cares what the panel says
+    /// rather than where it says it.
+    fn panel_rows(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| cell_text(buf, 0, y, buf.area.width))
+            .collect()
+    }
+
     fn cell_text(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
         (0..len)
             .map(|offset| buf[(x + offset, y)].symbol().to_string())
@@ -2970,15 +2998,11 @@ mod tests {
         let terminal = render(140, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
-        assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(0),
-                entity_row_y(0),
-                NO_REPOS_MESSAGE.len() as u16
-            ),
-            NO_REPOS_MESSAGE,
-            "an empty snapshot with no Filter must say so on the first row below the header"
+        assert!(
+            panel_rows(buf)
+                .iter()
+                .any(|row| row.contains(NO_REPOS_MESSAGE)),
+            "an empty snapshot with no Filter must say so somewhere in the panel"
         );
     }
 
@@ -2993,15 +3017,14 @@ mod tests {
         let terminal = render_with_list(&mut list, 140, 24, &snap);
         let buf = terminal.backend().buffer();
 
-        assert_eq!(
-            cell_text(
-                buf,
-                absolute_x(0),
-                entity_row_y(0),
-                NO_MATCHES_MESSAGE.len() as u16
-            ),
-            NO_MATCHES_MESSAGE,
-            "a Filter matching zero rows must say so, distinctly from the no-filter empty state"
+        let rows = panel_rows(buf);
+        assert!(
+            rows.iter().any(|row| row.contains(NO_MATCHES_MESSAGE)),
+            "a Filter matching zero rows must say so"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(NO_REPOS_MESSAGE)),
+            "a Filter matching zero rows must not borrow the no-Filter state's wording"
         );
     }
 
@@ -3012,10 +3035,107 @@ mod tests {
         let terminal = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot(vec![]));
         let buf = terminal.backend().buffer();
 
+        assert!(
+            panel_rows(buf)
+                .iter()
+                .any(|row| row.contains(NO_REPOS_MESSAGE)),
+            "the sidebar must show the same empty-state message"
+        );
+    }
+
+    /// The empty state's own placement, at literal buffer coordinates hand-summed from the
+    /// 140x24 frame rather than from the production geometry: a one-column border leaves an
+    /// interior 138 wide starting at column 1 and 22 tall starting at row 1, the header
+    /// takes the first of those rows, and the 21 rows left are the ones an entity would
+    /// have been drawn on. So `no repos`, eight columns wide, starts at 1 + (138 - 8) / 2
+    /// and sits on row 2 + (21 - 1) / 2.
+    #[test]
+    fn the_empty_state_message_is_centred_in_the_rows_the_entities_would_have_filled() {
+        let terminal = render(140, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
         assert_eq!(
-            cell_text(buf, 1, 1, NO_REPOS_MESSAGE.len() as u16),
-            NO_REPOS_MESSAGE,
-            "the sidebar must show the same empty-state message, one row higher (no header)"
+            cell_text(buf, 66, 12, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// The Filter's own message centres by its own width, not by the other message's: ten
+    /// columns rather than eight, so it starts two columns left of where `no repos` does on
+    /// the same frame, on the same row.
+    #[test]
+    fn the_no_matches_message_centres_on_its_own_width() {
+        let mut list = List::default();
+        list.set_filter(Filter::parse("name:does-not-exist-anywhere"));
+        let snap = snapshot(vec![entity("alpha")]);
+        let terminal = render_with_list(&mut list, 140, 24, &snap);
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 65, 12, NO_MATCHES_MESSAGE.len() as u16),
+            NO_MATCHES_MESSAGE
+        );
+    }
+
+    /// The sidebar centres in the whole of its own interior, not in a rows area one line
+    /// short: it draws no header, so every interior row is one an entity could have taken.
+    /// A 34-column, 24-row frame leaves an interior 32 wide at column 1 and 22 tall at row
+    /// 1, so `no repos` starts at 1 + (32 - 8) / 2 and sits on row 1 + (22 - 1) / 2.
+    #[test]
+    fn the_sidebar_centres_in_the_whole_interior_since_it_has_no_header_row() {
+        const {
+            assert!(
+                SIDEBAR_WIDTH == 34,
+                "the arithmetic in this test's own doc comment is written for a 34-column \
+                 sidebar"
+            );
+        }
+        let terminal = render_sidebar(SIDEBAR_WIDTH, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 13, 11, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// An interior narrower than the message: centring must not compute a column left of the
+    /// interior's own left edge and push the text off the panel. A six-column frame leaves
+    /// four columns of interior at column 1, so the message starts there and the write's own
+    /// clip cuts it to what fits.
+    #[test]
+    fn a_message_wider_than_the_interior_starts_at_its_left_edge_rather_than_left_of_it() {
+        let terminal = render(6, 24, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(cell_text(buf, 1, 12, 4), &NO_REPOS_MESSAGE[..4]);
+    }
+
+    /// A rows area one line tall still draws on that line: a four-row frame leaves two rows
+    /// of interior, the header takes the first, and the one left is row 2.
+    #[test]
+    fn a_rows_area_one_line_tall_still_draws_the_message_on_that_line() {
+        let terminal = render(140, 4, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(
+            cell_text(buf, 66, 2, NO_REPOS_MESSAGE.len() as u16),
+            NO_REPOS_MESSAGE
+        );
+    }
+
+    /// A frame with no rows area at all, its whole interior spent on the header: nothing is
+    /// drawn, and nothing panics reaching for a centre line that does not exist.
+    #[test]
+    fn a_frame_with_no_room_below_the_header_draws_no_message() {
+        let terminal = render(140, 3, &snapshot(vec![]));
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            !panel_rows(buf)
+                .iter()
+                .any(|row| row.contains(NO_REPOS_MESSAGE)),
+            "a frame with no row below the header has nowhere to say it"
         );
     }
 
