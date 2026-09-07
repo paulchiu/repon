@@ -1693,6 +1693,35 @@ mod tests {
     /// own heading with a blank row above every heading but the first. `Context::List` gets a
     /// `global` section ([keybindings.md](../../../../docs/spec/keybindings.md#the-contexts)),
     /// so all three sections are exercised at once.
+    /// Discoverability for the on-demand fetch: the chord and its description sit in the
+    /// overlay's own `global` section, beside the two Refreshes, rather than being a key a
+    /// user could only find by reading the spec. Nothing wires it there by hand: the section
+    /// is drawn from the binding table
+    /// ([0016](../../../docs/adr/0016-one-binding-table-feeds-every-surface.md)), so this
+    /// pins that the row actually arrives.
+    #[test]
+    fn the_help_overlay_lists_the_fetch_key_in_its_global_section() {
+        let table = default_table();
+        let lines = HelpOverlay::lines(&table, Context::List, full_glyphs());
+        let global_heading = lines
+            .iter()
+            .position(|line| matches!(line, HelpLine::Heading(text) if *text == GLOBAL_HEADING))
+            .expect("expected a `global` section");
+
+        let row = lines[global_heading..].iter().find_map(|line| match line {
+            HelpLine::Binding { keys, description } if *description == "Fetch every remote now" => {
+                Some(keys.clone())
+            }
+            _ => None,
+        });
+
+        assert_eq!(
+            row.as_deref(),
+            Some("f"),
+            "expected the fetch key advertised in the overlay's `global` section, got {lines:?}"
+        );
+    }
+
     #[test]
     fn the_three_sections_appear_in_order_each_under_its_own_heading_with_a_blank_row_between() {
         let table = default_table();

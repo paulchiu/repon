@@ -76,7 +76,7 @@ The six keys from [refresh.md](refresh.md), with their nesting and the duration 
 
 Every duration in the file is a humantime string via `humantime-serde`: `"2s"`, `"5m"`, `"1h 30m"`. The disabled poll is `"0s"`, not `0`. Measured, humantime-serde rejects a bare TOML integer with `invalid type: integer 2, expected a duration`, which amends [refresh.md](refresh.md)'s table, where the disabling value was written as `0`. One representation for every duration, and both authoring mistakes (a missing unit, a bare integer) fail with a line number rather than being read as some other unit.
 
-`[auto_update]` has one key, `enabled = false`. It rides the fetch cycle rather than carrying its own interval or concurrency, because it can only act on what a fetch just learned, and a second timer would drift out of phase with the only thing that feeds it. It is fast-forward only, and acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, not fixed. The built-in `sync` action ([repo-management.md](repo-management.md)) reuses this same eligibility rule and the same fast-forward on demand, independent of both `[auto_update].enabled` and `fetch.enabled`, since it is a gesture the user asked for rather than something this section's own automatic cycle decided unbidden.
+`[auto_update]` has one key, `enabled = false`. It rides the fetch cycle rather than carrying its own interval or concurrency, because it can only act on what a fetch just learned, and a second timer would drift out of phase with the only thing that feeds it. It is fast-forward only, and acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, not fixed. The built-in `sync` action ([repo-management.md](repo-management.md)) reuses this same eligibility rule and the same fast-forward on demand, independent of both `[auto_update].enabled` and `fetch.enabled`, since it is a gesture the user asked for rather than something this section's own automatic cycle decided unbidden. The fetch key ([refresh.md](refresh.md)'s "The periodic fetch") sits on the same line for the same reason, and stops there: it is ungated by `fetch.enabled`, and the auto-update still rides its cycle exactly as it rides a tick's, because `auto_update.enabled` is a standing instruction from the file that a request for a fetch does not revoke. Someone who wants a fetch that moves no ref turns that key off and reaches for `sync` when they want the fast-forward.
 
 ## Sets
 
@@ -225,7 +225,7 @@ Across all 403 boundary-stopped entities in the two measured roots, zero names c
 | `--theme <name>` | `theme` | A missing theme here exits, unlike the config key |
 | `--config <path>` | none | Beats `REPON_CONFIG`. A path that does not exist exits, unlike the default path being absent |
 | `--filter <text>` | none | Transient, beats stored state |
-| `--no-fetch` | `fetch.enabled` | Forces off |
+| `--no-fetch` | `fetch.enabled` | Forces off. It has no meaning beyond that key, so the fetch key ([refresh.md](refresh.md)'s "The periodic fetch") still fetches under it, exactly as it does with `fetch.enabled = false` in the file |
 | `--tick-rate`, `--frame-rate` | none | Hidden; render-loop debug knobs, not preferences |
 | `repon sets` | | Lists Sets with roots and match counts |
 | `repon config` | | Prints resolved paths and whether each file exists |

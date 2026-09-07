@@ -395,6 +395,11 @@ enum ClockControl {
     /// periodic fetch"). Sent rather than run there, so every cycle has the one owner. Asked
     /// for once and never again, so the clock holds it until it can start it rather than
     /// dropping it.
+    FetchOwed,
+    /// [`Core::fetch_now`]: a cycle the caller asked for. Refused rather than held while one
+    /// is already in flight, which is the whole difference from [`ClockControl::FetchOwed`]:
+    /// an obligation owed once must survive until it can be met, where a repeated gesture
+    /// against a fetch that is already running has nothing left to ask for.
     FetchNow,
 }
 
@@ -552,6 +557,11 @@ pub struct Core {
     /// wholesale by [`run_fetch_cycle`] every time it runs. Read through
     /// [`Core::fetch_failures`].
     fetch_failures: Arc<Mutex<FetchFailures>>,
+    /// Whether a fetch cycle is in flight right now: set as the clock starts one and
+    /// cleared as it takes it back, so the one thread that owns a cycle is the only writer.
+    /// Read through [`Core::fetch_running`] the same way `settle_gate` is read through
+    /// [`Core::refresh_running`], for the status row's own rank 3.
+    fetch_running: Arc<AtomicBool>,
     /// Orders every spawned dispatch body this `Core` starts; see
     /// [`DispatchTurnstile`].
     turnstile: Arc<DispatchTurnstile>,
@@ -1547,6 +1557,13 @@ impl Core {
         !lock.lock().unwrap().is_settled()
     }
 
+    /// Whether a fetch cycle is in flight, whichever asked for it: the periodic one, the
+    /// immediate one enabling the fetch owes, or [`Core::fetch_now`]. Read fresh every frame
+    /// by the status row, the same way [`Self::refresh_running`] is.
+    pub fn fetch_running(&self) -> bool {
+        self.fetch_running.load(Ordering::Acquire)
+    }
+
     /// Runs `action` across every key in `order` that the table currently knows: each
     /// entity's own steps run in order and stop at that entity's first failure, exactly
     /// as [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
@@ -1788,6 +1805,19 @@ impl Core {
     /// periodic fetch owes does fire here, if a pause landed before it.
     pub fn resume(&self) {
         let _ = self.control.send(ClockControl::Resume);
+    }
+
+    /// Starts a fetch-and-prune cycle now rather than at the next `fetch.interval` tick:
+    /// the identical cycle the timer runs, so it always prunes, honours
+    /// `fetch.concurrency`, counts its own failures into [`Core::fetch_failures`] and
+    /// dispatches one normal Generation on completion, and the auto-update rides it exactly
+    /// as it rides a tick's.
+    ///
+    /// Ungated by `FetchSpec::enabled`, which governs only the cycle this `Core` runs
+    /// unbidden on a timer; this one is asked for. Refused rather than queued while a cycle
+    /// is already in flight, the same choice a tick arriving mid-cycle already makes.
+    pub fn fetch_now(&self) {
+        let _ = self.control.send(ClockControl::FetchNow);
     }
 
     /// The persistent warning a re-run discovery walk leaves behind once it abandons, or
@@ -3164,6 +3194,7 @@ fn start_internal(
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
     let fetch_failures = Arc::new(Mutex::new(FetchFailures::default()));
     let fetch_cycles_taken_back = Arc::new(AtomicUsize::new(0));
+    let fetch_running = Arc::new(AtomicBool::new(false));
     let (fetch_finished_tx, fetch_finished_rx) = crossbeam_channel::unbounded();
     #[cfg(test)]
     let fetch_boundary = Arc::new(FetchBoundary::default());
@@ -3200,6 +3231,7 @@ fn start_internal(
         finished: fetch_finished_rx,
         finished_tx: fetch_finished_tx,
         taken_back_count: Arc::clone(&fetch_cycles_taken_back),
+        running: Arc::clone(&fetch_running),
         #[cfg(test)]
         boundary: Arc::clone(&fetch_boundary),
     };
@@ -3291,7 +3323,7 @@ fn start_internal(
             // cycle reads the table to know what to fetch and the walk above is what puts
             // anything in it.
             if fetch_enabled {
-                let _ = control.send(ClockControl::FetchNow);
+                let _ = control.send(ClockControl::FetchOwed);
             }
         }
     });
@@ -3322,6 +3354,7 @@ fn start_internal(
             fetch_cycle_count,
             network_default_branch,
             fetch_failures,
+            fetch_running,
             turnstile,
             discovery_gate,
             #[cfg(test)]
@@ -3384,6 +3417,8 @@ struct FetchSchedule {
     /// How many cycles the clock has taken back and joined, which is what lets a test
     /// observe a cycle's own end rather than infer it.
     taken_back_count: Arc<AtomicUsize>,
+    /// See [`Core::fetch_running`].
+    running: Arc<AtomicBool>,
     /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
     /// entirely.
     #[cfg(test)]
@@ -3447,7 +3482,12 @@ fn spawn_clock_thread(
                         }
                     }
                     Ok(ClockControl::Resume) => paused = false,
-                    Ok(ClockControl::FetchNow) => immediate_cycle_owed = true,
+                    Ok(ClockControl::FetchOwed) => immediate_cycle_owed = true,
+                    Ok(ClockControl::FetchNow) => {
+                        if !paused && cycle.is_none() {
+                            cycle = Some(start_fetch_cycle(&table, &fetch));
+                        }
+                    }
                     Ok(ClockControl::Shutdown) | Err(_) => break,
                 },
                 recv(ticks) -> tick => {
@@ -3486,6 +3526,7 @@ fn spawn_clock_thread(
                             dispatch_fetch_completion(&table, &fetch.refresh);
                         }
                         fetch.taken_back_count.fetch_add(1, Ordering::Release);
+                        fetch.running.store(false, Ordering::Release);
                     }
                 }
             }
@@ -3504,6 +3545,7 @@ fn spawn_clock_thread(
             cycle.cancel();
             cycle.join();
             fetch.taken_back_count.fetch_add(1, Ordering::Release);
+            fetch.running.store(false, Ordering::Release);
         }
         alive.store(false, Ordering::Release);
     })
@@ -3554,6 +3596,7 @@ impl FetchCycle {
 /// one: without it a poisoned lock from an unrelated earlier panic would leave this `Core`
 /// unable to ever start another cycle.
 fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycle {
+    fetch.running.store(true, Ordering::Release);
     let cancel = Arc::new(AtomicBool::new(false));
     let work = FetchCycleWork {
         table: Arc::clone(table),
@@ -12586,6 +12629,162 @@ mod tests {
             );
         }
 
+        /// `Core::fetch_now` runs a cycle on demand, and does so with `fetch.enabled`
+        /// false: that flag governs the cycle this `Core` runs unbidden on a timer, never a
+        /// cycle the caller asked for. `fetch_ticks` is `crossbeam_channel::never()` and the
+        /// periodic fetch is off, so nothing but this call can move the cycle count.
+        #[test]
+        fn fetch_now_runs_a_cycle_even_though_the_periodic_fetch_is_disabled() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for("the on-demand fetch to run a cycle", || {
+                core.fetch_cycle_count_for_test() >= 1
+            });
+        }
+
+        /// An on-demand fetch asked for while one is already in flight is refused rather
+        /// than queued, the same choice a tick arriving mid-cycle already makes. The first
+        /// cycle is provably still running when the second call lands, since it is parked at
+        /// [`FetchBoundary`]. `fetch_cycles_taken_back` is read after the `Core` is dropped,
+        /// which joins the clock thread and takes back whatever cycle it still held: a
+        /// queued second cycle would have started at the foot of the same loop iteration
+        /// that took the first one back, so it would be counted here.
+        #[test]
+        fn a_second_fetch_now_while_one_is_in_flight_is_refused_rather_than_queued() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            let taken_back = Arc::clone(&started.fetch_cycles_taken_back);
+
+            let held = core.fetch_boundary().arm();
+            core.fetch_now();
+            held.wait_until_reached();
+            core.fetch_now();
+            drop(held);
+
+            wait_for("the first cycle to be taken back", || {
+                taken_back.load(Ordering::Acquire) >= 1
+            });
+            drop(core);
+
+            assert_eq!(
+                taken_back.load(Ordering::Acquire),
+                1,
+                "the second press must have started no cycle of its own"
+            );
+        }
+
+        /// [`Core::fetch_running`] is what the status row reads every frame, so it must be
+        /// true for exactly as long as a cycle is in flight. Holding the cycle at
+        /// [`FetchBoundary`] makes "in flight" a moment to assert at rather than a race to
+        /// catch; the clearing half is a wait, since it lands on the clock thread a moment
+        /// after the fetch itself returns.
+        #[test]
+        fn fetch_running_holds_while_a_cycle_is_in_flight_and_clears_once_it_is_taken_back() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("parent"));
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            assert!(
+                !core.fetch_running(),
+                "sanity: no cycle has been asked for yet"
+            );
+
+            let held = core.fetch_boundary().arm();
+            core.fetch_now();
+            held.wait_until_reached();
+            assert!(
+                core.fetch_running(),
+                "a cycle parked mid-fetch is still in flight"
+            );
+
+            drop(held);
+            wait_for(
+                "the cycle to be taken back and fetch_running to clear",
+                || !core.fetch_running(),
+            );
+        }
+
+        /// The failure counting an on-demand cycle owes is the periodic one's, unchanged: one
+        /// unreachable repository is counted and named, and its sibling still fetches. The
+        /// periodic fetch is off and no tick ever fires, so the cycle under test is the one
+        /// `fetch_now` asked for.
+        #[test]
+        fn an_on_demand_cycle_counts_a_repository_it_could_not_reach_and_fetches_the_rest() {
+            let good_remote = seeded_remote();
+            let bad_remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let good = root_path.join("good");
+            let bad = root_path.join("bad");
+            clone_into(good_remote.path(), &good);
+            clone_into(bad_remote.path(), &bad);
+            break_remote(&bad);
+
+            crate::test_support::push_new_commit(good_remote.path(), "second.txt", "second\n");
+            let good_remote_tip = rev_parse(good_remote.path(), "refs/heads/main");
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for(
+                "the on-demand cycle to count the one repository it could not fetch",
+                || core.fetch_failures().failed.len() == 1,
+            );
+            let failures = core.fetch_failures();
+            assert!(
+                failures.failed[0].0.to_string_lossy().contains("bad"),
+                "the counted failure must name the repository that actually failed, got: {:?}",
+                failures.failed
+            );
+
+            wait_for(
+                "the sibling repository to still fetch despite the other one failing",
+                || rev_parse(&good, "refs/remotes/origin/main") == good_remote_tip,
+            );
+        }
+
         /// A tick on the periodic fetch's own channel runs a second cycle, proving the
         /// recurring cadence is wired to the same dedicated thread the immediate cycle
         /// used, not merely a one-shot dispatched at start.
@@ -13153,6 +13352,114 @@ mod tests {
                             .collect::<Vec<_>>()
                     )
                 },
+            );
+        }
+
+        /// The whole chain an on-demand fetch owes the screen, at the one place a user
+        /// reads it: `parent` is a commit behind a remote it has never fetched from, so its
+        /// `sync` cell says level. One `fetch_now` must fetch, then dispatch the completion
+        /// Generation that re-probes, and leave the cell reading one behind. `fetch_ticks`
+        /// never fires and the periodic fetch is off, so nothing else could have moved it.
+        #[test]
+        fn an_on_demand_fetch_lands_a_new_behind_count_through_the_generation_it_dispatches() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for("the on-demand fetch to land a behind count of 1", || {
+                matches!(
+                    sync_of(&core.snapshot(), &parent),
+                    Some(Settled::Known {
+                        value: SyncState::Tracking(AheadBehind {
+                            ahead: 0,
+                            behind: 1
+                        }),
+                        at: _,
+                        stale: _,
+                    })
+                )
+            });
+        }
+
+        /// The auto-update rides an on-demand cycle exactly as it rides a tick's, because it
+        /// is the same cycle started early rather than a narrower one of its own. The remote
+        /// is ahead before `Core::start`, no tick ever fires and the periodic fetch is off,
+        /// so `fetch_now` is the only thing that could have moved the branch.
+        #[test]
+        fn auto_update_rides_an_on_demand_cycle_the_same_way_it_rides_a_tick() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+            let remote_tip = rev_parse(remote.path(), "refs/heads/main");
+
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for(
+                "the eligible branch to fast-forward on the on-demand cycle",
+                || rev_parse(&parent, "refs/heads/main") == remote_tip,
+            );
+        }
+
+        /// The other half: `auto_update.enabled` still decides. An on-demand fetch with it
+        /// off fetches and leaves the eligible branch exactly where it was, so the key is a
+        /// request for a fetch and never a fast-forward in its own right.
+        #[test]
+        fn an_on_demand_fetch_moves_no_branch_while_auto_update_is_disabled() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let parent = root_path.join("parent");
+            clone_into(remote.path(), &parent);
+            let before = rev_parse(&parent, "refs/heads/main");
+
+            crate::test_support::push_new_commit(remote.path(), "second.txt", "second\n");
+
+            let started = Core::start_for_test_with_fetch(
+                spec_with_auto_update(false, false, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            core.fetch_now();
+
+            wait_for("the on-demand cycle to have run", || {
+                core.fetch_cycle_count_for_test() >= 1
+            });
+            assert_eq!(
+                rev_parse(&parent, "refs/heads/main"),
+                before,
+                "an on-demand fetch must move no branch while auto_update.enabled is false"
             );
         }
 

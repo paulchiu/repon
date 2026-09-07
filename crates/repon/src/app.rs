@@ -283,16 +283,21 @@ struct ManagementRun {
     outcome: mpsc::Receiver<ManagementRunOutcome>,
 }
 
-/// One dispatch the refresh key made: `Action::RefreshAll` (`r`, `F5`) or
-/// `Action::RefreshSelection` (`R`), and how many entities it covers.
-/// `status_row_content` reads `Core::refresh_running` fresh every frame to decide whether to
-/// show "refreshing" or "refreshed"; this struct only remembers which Refresh dispatched it
-/// and its size, and persists on `App` until a later refresh key press replaces it, which is
-/// what keeps the result legible even when the Refresh settles inside the frame that started
-/// it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B timings).
-struct RefreshRun {
-    scope: status_row::RefreshScope,
-    entity_count: usize,
+/// One gesture rank 3 of the status row reports on: a Refresh the refresh key dispatched,
+/// `Action::RefreshAll` (`r`, `F5`) or `Action::RefreshSelection` (`R`) with how many
+/// entities it covers, or the cycle the fetch key (`f`) asked for.
+/// `status_row_content` reads `Core::refresh_running` and `Core::fetch_running` fresh every
+/// frame to pick the live or the settled verb; this type only remembers which gesture fired
+/// and, for a Refresh, its size, and persists on `App` until a later press of either key
+/// replaces it, which is what keeps the result legible even when the gesture settles inside
+/// the frame that started it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B
+/// timings).
+enum GestureRun {
+    Refresh {
+        scope: status_row::RefreshScope,
+        entity_count: usize,
+    },
+    Fetch,
 }
 
 pub struct App {
@@ -551,11 +556,12 @@ pub struct App {
     /// while `Core::action_running` is true; a stale value between runs costs nothing since
     /// nothing reads it then.
     action_run: Option<ActionRun>,
-    /// The refresh key's most recent dispatch, read by `status_row_content` every frame
-    /// alongside `Core::refresh_running`. `None` until the refresh key fires once this
-    /// session, then never cleared: a later refresh key press replaces it rather than
-    /// leaving a gap.
-    refresh_run: Option<RefreshRun>,
+    /// The most recent gesture the refresh or fetch key dispatched, read by
+    /// `status_row_content` every frame alongside whichever of `Core::refresh_running` and
+    /// `Core::fetch_running` that gesture answers to. `None` until either key fires once
+    /// this session, then never cleared: a later press replaces it rather than leaving a
+    /// gap.
+    gesture_run: Option<GestureRun>,
     /// The order the table is listed in. Session state, restored at startup and persisted to
     /// `state.toml` on quit beside the Selection and the Filter
     /// ([`Self::restore_session_state`], [`Self::persist_state`]); never read from config. A
@@ -699,7 +705,7 @@ impl App {
             quit_confirm: false,
             action_run: None,
             management_run: None,
-            refresh_run: None,
+            gesture_run: None,
             row_order: RowOrder::default(),
             sort_menu_open: false,
         };
@@ -910,14 +916,19 @@ impl App {
             ),
             _ => (None, None),
         };
-        let refresh = self
-            .refresh_run
-            .as_ref()
-            .map(|run| status_row::RefreshRowContent {
-                scope: run.scope,
-                entity_count: run.entity_count,
+        let gesture = self.gesture_run.as_ref().map(|run| match run {
+            GestureRun::Refresh {
+                scope,
+                entity_count,
+            } => status_row::Gesture::Refresh {
+                scope: *scope,
+                entity_count: *entity_count,
                 running: self.core.refresh_running(),
-            });
+            },
+            GestureRun::Fetch => status_row::Gesture::Fetch {
+                running: self.core.fetch_running(),
+            },
+        });
         let visibility = self.visibility();
         let entity_count = self.shown_entity_count(snapshot, visibility);
         // The difference the toggle itself makes, rather than a count of excluded rows: an
@@ -944,7 +955,7 @@ impl App {
             },
             warnings,
             acknowledged: &self.acknowledged_warnings,
-            refresh,
+            gesture,
             sort: self.row_order.label(self.glyphs),
             range_anchor_active: self.selection.has_range_anchor(),
         }
@@ -1482,7 +1493,7 @@ impl App {
                 self.core.refresh(&order);
                 let entity_count =
                     self.shown_entity_count(&self.core.snapshot(), self.visibility());
-                self.refresh_run = Some(RefreshRun {
+                self.gesture_run = Some(GestureRun::Refresh {
                     scope: status_row::RefreshScope::All,
                     entity_count,
                 });
@@ -1492,7 +1503,7 @@ impl App {
             Some(Action::RefreshSelection) => {
                 if let Some(order) = self.refresh_selection_order() {
                     self.core.refresh(&order);
-                    self.refresh_run = Some(RefreshRun {
+                    self.gesture_run = Some(GestureRun::Refresh {
                         scope: status_row::RefreshScope::Selection,
                         entity_count: order.len(),
                     });
@@ -1501,6 +1512,13 @@ impl App {
                 None
             }
             // scan: on_refresh_trigger end
+            // Outside the region above deliberately: ADR 0029 fixes `on_refresh` to `r` and
+            // `R` alone, and a fetch is not a Refresh the hook fires on.
+            Some(Action::FetchNow) => {
+                self.core.fetch_now();
+                self.gesture_run = Some(GestureRun::Fetch);
+                None
+            }
             Some(Action::RederiveDefaultBranches) => {
                 if let Some(order) = self.refresh_selection_order() {
                     self.core.rederive_default_branches(&order);
@@ -3764,6 +3782,21 @@ mod tests {
         assert!(status.success());
     }
 
+    /// The Refresh rank 3 of the status row is reporting on. Every caller below aimed a
+    /// Refresh, so anything else there is a failure rather than a case to handle.
+    fn refresh_gesture(
+        content: &status_row::StatusRowContent<'_>,
+    ) -> (status_row::RefreshScope, usize, bool) {
+        match content.gesture {
+            Some(status_row::Gesture::Refresh {
+                scope,
+                entity_count,
+                running,
+            }) => (scope, entity_count, running),
+            other => panic!("expected rank 3 to report a Refresh, got {other:?}"),
+        }
+    }
+
     /// An `App` wired to a real `Core` over `root`, bypassing `App::new`'s config and
     /// discovery-dispatch side effects, which a cursor and Selection test has no need of.
     pub(crate) fn test_app(root: &std::path::Path) -> App {
@@ -3878,7 +3911,7 @@ mod tests {
             quit_confirm: false,
             action_run: None,
             management_run: None,
-            refresh_run: None,
+            gesture_run: None,
             row_order: RowOrder::default(),
             sort_menu_open: false,
         }
@@ -4215,7 +4248,7 @@ mod tests {
             },
             warnings,
             acknowledged: &[],
-            refresh: None,
+            gesture: None,
             sort: None,
             range_anchor_active: false,
         }
@@ -5334,7 +5367,7 @@ mod tests {
         let mut app = test_app(&root);
         let before = app.status_row_content(&app.core.snapshot(), &[]);
         assert!(
-            before.refresh.is_none(),
+            before.gesture.is_none(),
             "sanity: nothing to show before the refresh key has ever fired"
         );
 
@@ -5342,11 +5375,9 @@ mod tests {
             .expect("handle RefreshAll");
 
         let after = app.status_row_content(&app.core.snapshot(), &[]);
-        let refresh = after
-            .refresh
-            .expect("the refresh item must be populated the instant the key is handled");
-        assert_eq!(refresh.scope, status_row::RefreshScope::All);
-        assert_eq!(refresh.entity_count, 2);
+        let (scope, entity_count, _) = refresh_gesture(&after);
+        assert_eq!(scope, status_row::RefreshScope::All);
+        assert_eq!(entity_count, 2);
     }
 
     // --- Issue #413: `Action::RefreshAll`'s reported count follows the header's own
@@ -5377,12 +5408,10 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
             .expect("handle RefreshAll");
 
-        let refresh = app
-            .status_row_content(&app.core.snapshot(), &[])
-            .refresh
-            .expect("RefreshAll must populate the refresh item");
+        let (_, entity_count, _) =
+            refresh_gesture(&app.status_row_content(&app.core.snapshot(), &[]));
         assert_eq!(
-            refresh.entity_count, header_count,
+            entity_count, header_count,
             "the refresh count must equal the header's own kind-visible count, not the raw \
              total of 2"
         );
@@ -5407,12 +5436,10 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
             .expect("handle RefreshAll");
 
-        let refresh = app
-            .status_row_content(&app.core.snapshot(), &[])
-            .refresh
-            .expect("RefreshAll must populate the refresh item");
+        let (_, entity_count, _) =
+            refresh_gesture(&app.status_row_content(&app.core.snapshot(), &[]));
         assert_eq!(
-            refresh.entity_count, 2,
+            entity_count, 2,
             "with Worktrees shown the reported count still names every known Entity"
         );
     }
@@ -5439,12 +5466,10 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('r'), KeyModifiers::NONE))
             .expect("handle RefreshAll");
 
-        let refresh = app
-            .status_row_content(&app.core.snapshot(), &[])
-            .refresh
-            .expect("RefreshAll must populate the refresh item");
+        let (_, entity_count, _) =
+            refresh_gesture(&app.status_row_content(&app.core.snapshot(), &[]));
         assert_eq!(
-            refresh.entity_count, 1,
+            entity_count, 1,
             "a committed Filter overriding the kind preference must not move the reported \
              count"
         );
@@ -5498,23 +5523,19 @@ mod tests {
         wait_for("the Refresh to settle", || !app.core.refresh_running());
 
         let settled = app.status_row_content(&app.core.snapshot(), &[]);
-        let refresh = settled
-            .refresh
-            .expect("the refresh item must still be present once settled");
+        let (_, entity_count, running) = refresh_gesture(&settled);
         assert!(
-            !refresh.running,
+            !running,
             "the Refresh has settled, so running must read false"
         );
-        assert_eq!(refresh.entity_count, 2);
+        assert_eq!(entity_count, 2);
 
         // A later, unrelated frame (no new refresh key press in between) must still carry
         // the same settled result rather than the item quietly disappearing.
         let later = app.status_row_content(&app.core.snapshot(), &[]);
-        let refresh_later = later
-            .refresh
-            .expect("the settled refresh item must persist across frames until replaced");
-        assert!(!refresh_later.running);
-        assert_eq!(refresh_later.entity_count, 2);
+        let (_, entity_count_later, running_later) = refresh_gesture(&later);
+        assert!(!running_later);
+        assert_eq!(entity_count_later, 2);
     }
 
     /// `R` scopes the item to the Selection's own size, not the whole population, which is
@@ -5537,12 +5558,10 @@ mod tests {
             .expect("handle RefreshSelection");
 
         let content = app.status_row_content(&app.core.snapshot(), &[]);
-        let refresh = content
-            .refresh
-            .expect("RefreshSelection must populate the refresh item too");
-        assert_eq!(refresh.scope, status_row::RefreshScope::Selection);
+        let (scope, entity_count, _) = refresh_gesture(&content);
+        assert_eq!(scope, status_row::RefreshScope::Selection);
         assert_eq!(
-            refresh.entity_count, 1,
+            entity_count, 1,
             "the item must report the Selection's own size, not the whole population's"
         );
     }
@@ -5567,14 +5586,9 @@ mod tests {
         });
 
         let content = app.status_row_content(&app.core.snapshot(), &[]);
-        {
-            let refresh = content
-                .refresh
-                .as_ref()
-                .expect("a Refresh finishing fast must still leave a settled item behind");
-            assert!(!refresh.running);
-            assert_eq!(refresh.entity_count, 1);
-        }
+        let (_, entity_count, running) = refresh_gesture(&content);
+        assert!(!running);
+        assert_eq!(entity_count, 1);
         let bindings = crate::keys::BindingTable::compiled_default();
         let rendered = status_row::render(&content, &bindings, 200).to_string();
         assert!(
@@ -10110,6 +10124,82 @@ mod tests {
             Some("after-refresh-all-b"),
             "RefreshAll must cover every known Entity, not only the cursor row"
         );
+    }
+
+    /// The on-demand fetch, end to end at the key: `test_app` starts its `Core` with the
+    /// periodic fetch off and a one-hour interval, so no timer can reach the network, and the
+    /// clone has never fetched since its remote moved. Pressing `f` must reach it, and the
+    /// completion Generation must land the new `behind` count on the cell that reads it.
+    /// `r` in the same place could never do this: it re-reads local refs alone.
+    #[test]
+    fn f_fetches_now_so_a_behind_count_moves_without_waiting_for_the_interval() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let clone = root.join("clone");
+
+        std::fs::create_dir_all(&remote).expect("create remote dir");
+        // Pinned rather than left to `init.defaultBranch`: the clone tracks whatever the bare
+        // repository's HEAD names, and a runner defaulting to `master` would check out nothing.
+        run_git(
+            &root,
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().expect("utf8"),
+            ],
+        );
+        init_repo(&seed);
+        run_git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().expect("utf8")],
+        );
+        run_git(
+            &seed,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        run_git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().expect("utf8"),
+                clone.to_str().expect("utf8"),
+            ],
+        );
+        set_test_identity(&clone);
+        run_git(&seed, &["commit", "--allow-empty", "-m", "upstream work"]);
+        run_git(
+            &seed,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+
+        // `seed` is a repository too and would be discovered; only `clone` is asserted on.
+        let mut app = test_app(&clone);
+        app.core.settle();
+
+        app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("handle FetchNow");
+
+        repon_core::liveness::wait_for("the fetch key to land a behind count of 1", || {
+            behind_count(&app.core.snapshot(), &clone) == Some(1)
+        });
+    }
+
+    /// The `behind` half of a Repo's `sync` cell, or `None` while it has not settled a
+    /// tracking count at all.
+    fn behind_count(snapshot: &repon_core::Snapshot, path: &std::path::Path) -> Option<u32> {
+        match entity_for(snapshot, path).sync.settled() {
+            Some(repon_core::Settled::Known {
+                value: repon_core::SyncState::Tracking(counts),
+                at: _,
+                stale: _,
+            }) => Some(counts.behind),
+            _ => None,
+        }
     }
 
     /// Criterion 5's own discriminator, and criterion 2's second half (the Selection key
