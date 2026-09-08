@@ -286,8 +286,9 @@ struct ManagementRun {
 /// One gesture rank 3 of the status row reports on: a Refresh the refresh key dispatched,
 /// `Action::RefreshAll` (`r`, `F5`) or `Action::RefreshSelection` (`R`) with how many
 /// entities it covers, or the cycle the fetch key (`f`) asked for.
-/// `status_row_content` reads `Core::refresh_running` and `Core::fetch_running` fresh every
-/// frame to pick the live or the settled verb; this type only remembers which gesture fired
+/// `status_row_content` reads `Core::refresh_running` and `Core::fetch_progress` fresh every
+/// frame to pick the live or the settled verb, and for a fetch the count that goes with it;
+/// this type only remembers which gesture fired
 /// and, for a Refresh, its size, and persists on `App` until a later press of either key
 /// replaces it, which is what keeps the result legible even when the gesture settles inside
 /// the frame that started it ([refresh.md](../../../docs/spec/refresh.md)'s phase A/B
@@ -558,7 +559,7 @@ pub struct App {
     action_run: Option<ActionRun>,
     /// The most recent gesture the refresh or fetch key dispatched, read by
     /// `status_row_content` every frame alongside whichever of `Core::refresh_running` and
-    /// `Core::fetch_running` that gesture answers to. `None` until either key fires once
+    /// `Core::fetch_progress` that gesture answers to. `None` until either key fires once
     /// this session, then never cleared: a later press replaces it rather than leaving a
     /// gap.
     gesture_run: Option<GestureRun>,
@@ -926,7 +927,10 @@ impl App {
                 running: self.core.refresh_running(),
             },
             GestureRun::Fetch => status_row::Gesture::Fetch {
-                running: self.core.fetch_running(),
+                progress: self
+                    .core
+                    .fetch_progress()
+                    .map(|progress| (progress.done, progress.total)),
             },
         });
         let visibility = self.visibility();
@@ -10135,15 +10139,81 @@ mod tests {
     fn f_fetches_now_so_a_behind_count_moves_without_waiting_for_the_interval() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let (seed, clone) = seeded_remote_and_clone(&root);
+        run_git(&seed, &["commit", "--allow-empty", "-m", "upstream work"]);
+        run_git(
+            &seed,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+
+        // `seed` is a repository too and would be discovered; only `clone` is asserted on.
+        let mut app = test_app(&clone);
+        app.core.settle();
+
+        app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::NONE))
+            .expect("handle FetchNow");
+
+        repon_core::liveness::wait_for("the fetch key to land a behind count of 1", || {
+            behind_count(&app.core.snapshot(), &clone) == Some(1)
+        });
+    }
+
+    /// The count rank 3 carries is read off the `Core` every frame rather than latched when
+    /// the key fired, which is what lets it move while the cycle runs: this presses `f` and
+    /// reads the row directly, pumping no message and processing no Generation in between,
+    /// so the only thing that can change the reading is the cycle itself. A latched count
+    /// would still read `fetching` after the cycle ended.
+    #[test]
+    fn the_fetch_gesture_reads_its_count_off_the_core_rather_than_latching_it_at_the_press() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let (_seed, clone) = seeded_remote_and_clone(&root);
+
+        let mut app = test_app(&clone);
+        app.core.settle();
+
+        // Pressed each round rather than once: a cycle over a single repository can finish
+        // between the press and the read, and a press landing while one is in flight is
+        // refused, so this asks until a reading catches one live.
+        repon_core::liveness::wait_for(
+            "a live cycle counting against the one repository this Set bounds",
+            || {
+                app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::NONE))
+                    .expect("handle FetchNow");
+                let snapshot = app.core.snapshot();
+                matches!(
+                    app.status_row_content(&snapshot, &[]).gesture,
+                    Some(status_row::Gesture::Fetch {
+                        progress: Some((_, 1)),
+                    })
+                )
+            },
+        );
+
+        repon_core::liveness::wait_for("the settled cycle to drop its count", || {
+            let snapshot = app.core.snapshot();
+            matches!(
+                app.status_row_content(&snapshot, &[]).gesture,
+                Some(status_row::Gesture::Fetch { progress: None })
+            )
+        });
+    }
+
+    /// A bare "remote" seeded with one commit, the working copy that seeded it, and a clone
+    /// of it, all under `root`. Returns the seed and the clone: pushing to the seed is how a
+    /// caller moves the remote on past the clone.
+    ///
+    /// The remote's initial branch is pinned rather than left to `init.defaultBranch`: the
+    /// clone tracks whatever the bare repository's HEAD names, and a runner defaulting to
+    /// `master` would check out nothing.
+    fn seeded_remote_and_clone(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let clone = root.join("clone");
 
         std::fs::create_dir_all(&remote).expect("create remote dir");
-        // Pinned rather than left to `init.defaultBranch`: the clone tracks whatever the bare
-        // repository's HEAD names, and a runner defaulting to `master` would check out nothing.
         run_git(
-            &root,
+            root,
             &[
                 "init",
                 "--quiet",
@@ -10162,7 +10232,7 @@ mod tests {
             &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
         );
         run_git(
-            &root,
+            root,
             &[
                 "clone",
                 "--quiet",
@@ -10171,22 +10241,7 @@ mod tests {
             ],
         );
         set_test_identity(&clone);
-        run_git(&seed, &["commit", "--allow-empty", "-m", "upstream work"]);
-        run_git(
-            &seed,
-            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
-        );
-
-        // `seed` is a repository too and would be discovered; only `clone` is asserted on.
-        let mut app = test_app(&clone);
-        app.core.settle();
-
-        app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::NONE))
-            .expect("handle FetchNow");
-
-        repon_core::liveness::wait_for("the fetch key to land a behind count of 1", || {
-            behind_count(&app.core.snapshot(), &clone) == Some(1)
-        });
+        (seed, clone)
     }
 
     /// The `behind` half of a Repo's `sync` cell, or `None` while it has not settled a

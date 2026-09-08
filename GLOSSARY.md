@@ -171,6 +171,9 @@ The periodic fetch's own bounding data as the core receives it: whether it runs 
 **Fetch failures**:
 The most recently completed periodic fetch cycle's own count of repositories it could not fetch, read fresh rather than latched: a cycle where every fetch succeeds carries none. Never the underlying error text, since that text is arbitrary bytes from a remote; the individual failures, with their paths, reach the log instead. One repository's own failure never stops another's, the per-repository independence the periodic fetch already holds to.
 
+**Fetch progress**:
+How far the fetch cycle in flight has got: how many of the repositories it fans out over have finished their own attempt, against how many it started against. The denominator is the cycle's own population rather than the table's entity count, and a repository whose fetch failed counts as finished, having stopped being outstanding. Absent while no cycle runs, and gone rather than resting at its total once one ends, since a finished cycle's count says nothing a verb does not.
+
 **The fast-forward-only auto-update**:
 An optional mutation that rides the periodic fetch cycle rather than carrying a timer of its own, off by default. It acts only on a Repo that is clean, behind, not ahead and tracking an upstream; anything ineligible is reported, never fixed, by leaving its true Cells to say so on the next Generation. It never rebases, merges, commits or resets: moving the branch a fast-forward's own way (a ref update and the working-tree writes a tree diff between the two commits names) is the whole mechanism.
 

@@ -87,6 +87,7 @@ mod wire;
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
 pub use core::AutoUpdateAttempt;
 pub use core::FetchFailures;
+pub use core::FetchProgress;
 pub use core::ManagementHandle;
 pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
 pub use discovery::{Discovery, SetSpec, count, discover};
