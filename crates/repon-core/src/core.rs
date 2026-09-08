@@ -302,6 +302,20 @@ pub struct FetchFailures {
     pub failed: Vec<(PathBuf, String)>,
 }
 
+/// How far the fetch cycle in flight has got: how many of the repositories it fans out
+/// over have finished their own attempt, against how many it is fetching.
+///
+/// One value rather than a count beside [`Core::fetch_running`]'s own flag, so a consumer
+/// reading both within a frame can never be handed a count from a cycle the flag has
+/// already ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchProgress {
+    /// Attempts that have finished, successes and failures alike.
+    pub done: usize,
+    /// Every distinct fetchable common dir the cycle started against, fixed when it starts.
+    pub total: usize,
+}
+
 /// One [`Core::attempt_auto_update`] result on a single Repo: the fast-forward-only
 /// auto-update's own five eligibility rules
 /// ([config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
@@ -557,11 +571,12 @@ pub struct Core {
     /// wholesale by [`run_fetch_cycle`] every time it runs. Read through
     /// [`Core::fetch_failures`].
     fetch_failures: Arc<Mutex<FetchFailures>>,
-    /// Whether a fetch cycle is in flight right now: set as the clock starts one and
-    /// cleared as it takes it back, so the one thread that owns a cycle is the only writer.
-    /// Read through [`Core::fetch_running`] the same way `settle_gate` is read through
-    /// [`Core::refresh_running`], for the status row's own rank 3.
-    fetch_running: Arc<AtomicBool>,
+    /// The cycle in flight right now and how far it has got, `None` while none is: set as
+    /// the clock starts one and cleared as it takes it back, so the one thread that owns a
+    /// cycle is the only writer of its presence, and the fetches themselves only ever move
+    /// `done`. Read through [`Core::fetch_progress`] the same way `settle_gate` is read
+    /// through [`Core::refresh_running`], for the status row's own rank 3.
+    fetch_progress: Arc<Mutex<Option<FetchProgress>>>,
     /// Orders every spawned dispatch body this `Core` starts; see
     /// [`DispatchTurnstile`].
     turnstile: Arc<DispatchTurnstile>,
@@ -777,6 +792,9 @@ pub(crate) struct FetchBoundary {
 struct FetchBoundaryState {
     /// Set by a test before the cycle it wants held.
     armed: bool,
+    /// How many fetches this boundary lets straight through before it holds one. For a
+    /// test that needs a cycle provably partway through rather than one yet to start.
+    let_through: usize,
     /// Set by the first fetch that parked at an armed boundary.
     reached: bool,
     /// Set when the [`ArmedFetchBoundary`] drops.
@@ -791,8 +809,18 @@ impl FetchBoundary {
     /// test, before the cycle it wants held. Every flag resets here, so a second armed cycle
     /// on the same `Core` parks rather than walking through what the first one left set.
     pub(crate) fn arm(self: &Arc<Self>) -> ArmedFetchBoundary {
+        self.arm_after(0)
+    }
+
+    /// [`Self::arm`], except that the first `let_through` fetches pass straight through and
+    /// only the next one is held. Pin `fetch.concurrency` to 1 alongside it: only then does
+    /// a fetch reaching this boundary mean every fetch let through has already finished,
+    /// which is what turns "the cycle has finished exactly `let_through` of its
+    /// repositories" into a moment to assert at rather than a race to catch.
+    pub(crate) fn arm_after(self: &Arc<Self>, let_through: usize) -> ArmedFetchBoundary {
         *self.state.lock().unwrap() = FetchBoundaryState {
             armed: true,
+            let_through,
             ..FetchBoundaryState::default()
         };
         ArmedFetchBoundary(Arc::clone(self))
@@ -806,6 +834,10 @@ impl FetchBoundary {
     fn hold(&self) {
         let mut state = self.state.lock().unwrap();
         if !state.armed {
+            return;
+        }
+        if state.let_through > 0 {
+            state.let_through -= 1;
             return;
         }
         state.reached = true;
@@ -1558,10 +1590,18 @@ impl Core {
     }
 
     /// Whether a fetch cycle is in flight, whichever asked for it: the periodic one, the
-    /// immediate one enabling the fetch owes, or [`Core::fetch_now`]. Read fresh every frame
-    /// by the status row, the same way [`Self::refresh_running`] is.
+    /// immediate one enabling the fetch owes, or [`Core::fetch_now`]. The bare fact
+    /// [`Self::fetch_progress`] carries a count on, for a consumer that wants only the fact.
     pub fn fetch_running(&self) -> bool {
-        self.fetch_running.load(Ordering::Acquire)
+        self.fetch_progress().is_some()
+    }
+
+    /// How far the cycle in flight has got, or `None` while none is running. Read fresh
+    /// every frame by the status row, the same way [`Self::refresh_running`] is; a fetch
+    /// is network bound and can run for many seconds, so unlike a Refresh it has a count
+    /// worth reading while it does.
+    pub fn fetch_progress(&self) -> Option<FetchProgress> {
+        *lock_fetch_progress(&self.fetch_progress)
     }
 
     /// Runs `action` across every key in `order` that the table currently knows: each
@@ -3194,7 +3234,7 @@ fn start_internal(
     let fetch_cycle_count = Arc::new(AtomicUsize::new(0));
     let fetch_failures = Arc::new(Mutex::new(FetchFailures::default()));
     let fetch_cycles_taken_back = Arc::new(AtomicUsize::new(0));
-    let fetch_running = Arc::new(AtomicBool::new(false));
+    let fetch_progress: Arc<Mutex<Option<FetchProgress>>> = Arc::new(Mutex::new(None));
     let (fetch_finished_tx, fetch_finished_rx) = crossbeam_channel::unbounded();
     #[cfg(test)]
     let fetch_boundary = Arc::new(FetchBoundary::default());
@@ -3231,7 +3271,7 @@ fn start_internal(
         finished: fetch_finished_rx,
         finished_tx: fetch_finished_tx,
         taken_back_count: Arc::clone(&fetch_cycles_taken_back),
-        running: Arc::clone(&fetch_running),
+        progress: Arc::clone(&fetch_progress),
         #[cfg(test)]
         boundary: Arc::clone(&fetch_boundary),
     };
@@ -3354,7 +3394,7 @@ fn start_internal(
             fetch_cycle_count,
             network_default_branch,
             fetch_failures,
-            fetch_running,
+            fetch_progress,
             turnstile,
             discovery_gate,
             #[cfg(test)]
@@ -3417,8 +3457,8 @@ struct FetchSchedule {
     /// How many cycles the clock has taken back and joined, which is what lets a test
     /// observe a cycle's own end rather than infer it.
     taken_back_count: Arc<AtomicUsize>,
-    /// See [`Core::fetch_running`].
-    running: Arc<AtomicBool>,
+    /// See [`Core::fetch_progress`].
+    progress: Arc<Mutex<Option<FetchProgress>>>,
     /// See [`FetchBoundary`]. Disarmed unless a test arms it, and off the default build
     /// entirely.
     #[cfg(test)]
@@ -3526,7 +3566,7 @@ fn spawn_clock_thread(
                             dispatch_fetch_completion(&table, &fetch.refresh);
                         }
                         fetch.taken_back_count.fetch_add(1, Ordering::Release);
-                        fetch.running.store(false, Ordering::Release);
+                        *lock_fetch_progress(&fetch.progress) = None;
                     }
                 }
             }
@@ -3545,7 +3585,7 @@ fn spawn_clock_thread(
             cycle.cancel();
             cycle.join();
             fetch.taken_back_count.fetch_add(1, Ordering::Release);
-            fetch.running.store(false, Ordering::Release);
+            *lock_fetch_progress(&fetch.progress) = None;
         }
         alive.store(false, Ordering::Release);
     })
@@ -3595,12 +3635,31 @@ impl FetchCycle {
 /// panicked cycle too, caught here for the reason `Core::run_action`'s own fan-out catches
 /// one: without it a poisoned lock from an unrelated earlier panic would leave this `Core`
 /// unable to ever start another cycle.
+/// The fetch progress lock, taken poison-tolerantly. The clock thread reads and writes it at
+/// every cycle boundary, so a poisoning would end the clock rather than whatever it came
+/// from, the same reason [`start_fetch_cycle`] catches a worker's own unwind.
+fn lock_fetch_progress(
+    progress: &Mutex<Option<FetchProgress>>,
+) -> std::sync::MutexGuard<'_, Option<FetchProgress>> {
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycle {
-    fetch.running.store(true, Ordering::Release);
+    // Enumerated here on the clock rather than on the worker below, so the cycle's own
+    // population is the count from the moment it starts: a `total` the worker filled in a
+    // moment later would read as `0/0` on whichever frames landed in between.
+    let common_dirs = distinct_fetchable_common_dirs(table);
+    *lock_fetch_progress(&fetch.progress) = Some(FetchProgress {
+        done: 0,
+        total: common_dirs.len(),
+    });
     let cancel = Arc::new(AtomicBool::new(false));
     let work = FetchCycleWork {
         table: Arc::clone(table),
         concurrency: fetch.concurrency,
+        progress: Arc::clone(&fetch.progress),
         cancel: Arc::clone(&cancel),
         network_default_branch: Arc::clone(&fetch.refresh.network_default_branch),
         cycle_count: Arc::clone(&fetch.cycle_count),
@@ -3614,7 +3673,7 @@ fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> Fetch
     let finished = fetch.finished_tx.clone();
     let worker = thread::spawn(move || {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_fetch_cycle(&work);
+            run_fetch_cycle(&work, common_dirs);
         }));
         let _ = finished.send(());
     });
@@ -3648,6 +3707,8 @@ fn dispatch_fetch_completion(table: &Arc<RwLock<Table>>, refresh: &RefreshHandle
 struct FetchCycleWork {
     table: Arc<RwLock<Table>>,
     concurrency: usize,
+    /// See [`Core::fetch_progress`]. Only `done` moves here; the clock owns the rest.
+    progress: Arc<Mutex<Option<FetchProgress>>>,
     cancel: Arc<AtomicBool>,
     network_default_branch: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
     cycle_count: Arc<AtomicUsize>,
@@ -3678,10 +3739,11 @@ struct FetchCycleWork {
 /// minutes is [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// stated number, not one this crate has measured against a real population the
 /// way the poll interval and the generation deadline were.
-fn run_fetch_cycle(work: &FetchCycleWork) {
+fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
     let FetchCycleWork {
         table,
         concurrency,
+        progress,
         cancel,
         network_default_branch,
         cycle_count,
@@ -3693,7 +3755,6 @@ fn run_fetch_cycle(work: &FetchCycleWork) {
     let auto_update_enabled = *auto_update_enabled;
     cycle_count.fetch_add(1, Ordering::Release);
 
-    let common_dirs = distinct_fetchable_common_dirs(table);
     let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
     crate::fetch::run_bounded(common_dirs, (*concurrency).max(1), |common_dir| {
         // Nothing parks here unless a test armed this boundary.
@@ -3701,38 +3762,44 @@ fn run_fetch_cycle(work: &FetchCycleWork) {
         boundary.hold();
         // A cancelled cycle starts no more work: the repositories this pool has not reached
         // yet are simply not fetched.
-        if cancel.load(Ordering::Acquire) {
-            return;
-        }
-        // Every repository's own fetch result is independent: one credential
-        // failure or one unreachable remote must never stop the rest of the
-        // cycle from running, so a per-repository error is swallowed here
-        // rather than aborting the whole cycle. It is still counted below,
-        // which is the count this cycle's own [`FetchFailures`] carries.
-        match crate::fetch::fetch_and_prune(&common_dir, cancel) {
-            Ok(outcome) => {
-                // The handshake this fetch already paid for is what
-                // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
-                // "The network" means by "arrives inside a round trip already being
-                // paid for": landed here, before `refresh.dispatch` below re-runs
-                // the local chain, so the local answer always computes first and
-                // this only ever supersedes it. `Unborn` and a missing answer both
-                // leave any earlier session answer for this common dir untouched,
-                // since neither is itself a fact worth overwriting one with.
-                if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
-                    outcome.advertised_default_branch
-                {
-                    network_default_branch
+        if !cancel.load(Ordering::Acquire) {
+            // Every repository's own fetch result is independent: one credential
+            // failure or one unreachable remote must never stop the rest of the
+            // cycle from running, so a per-repository error is swallowed here
+            // rather than aborting the whole cycle. It is still counted below,
+            // which is the count this cycle's own [`FetchFailures`] carries.
+            match crate::fetch::fetch_and_prune(&common_dir, cancel) {
+                Ok(outcome) => {
+                    // The handshake this fetch already paid for is what
+                    // [default-branch.md](https://github.com/paulchiu/repon/blob/main/docs/spec/default-branch.md)'s
+                    // "The network" means by "arrives inside a round trip already being
+                    // paid for": landed here, before `refresh.dispatch` below re-runs
+                    // the local chain, so the local answer always computes first and
+                    // this only ever supersedes it. `Unborn` and a missing answer both
+                    // leave any earlier session answer for this common dir untouched,
+                    // since neither is itself a fact worth overwriting one with.
+                    if let Some(crate::fetch::AdvertisedDefaultBranch::Branch(name)) =
+                        outcome.advertised_default_branch
+                    {
+                        network_default_branch
+                            .lock()
+                            .unwrap()
+                            .insert(common_dir.clone(), Arc::from(name));
+                    }
+                }
+                Err(error) => {
+                    failed
                         .lock()
                         .unwrap()
-                        .insert(common_dir.clone(), Arc::from(name));
+                        .push((common_dir.clone(), error.to_string()));
                 }
             }
-            Err(error) => {
-                failed
-                    .lock()
-                    .unwrap()
-                    .push((common_dir.clone(), error.to_string()));
+            // Counted however the attempt ended: the question the on-screen count answers
+            // is how many repositories are still outstanding, and a failure is no more
+            // outstanding than a success. A cancelled cycle's skips are not counted, since
+            // a repository nothing reached was never attempted.
+            if let Some(progress) = lock_fetch_progress(progress).as_mut() {
+                progress.done += 1;
             }
         }
     });
@@ -12736,6 +12803,143 @@ mod tests {
                 "the cycle to be taken back and fetch_running to clear",
                 || !core.fetch_running(),
             );
+        }
+
+        /// The count the status row reads beside `fetching`: the denominator is the
+        /// population the cycle itself fans out over rather than the table's entity count,
+        /// and the whole reading goes away once the clock takes the cycle back, since a
+        /// finished cycle's count is only ever `m/m`.
+        ///
+        /// The third clone is excluded, so the table carries three entities where the cycle
+        /// fetches two: a denominator taken off the table would read 3 here.
+        #[test]
+        fn a_live_cycle_counts_against_its_own_population_and_reports_nothing_once_it_ends() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("one"));
+            clone_into(remote.path(), &root_path.join("two"));
+            let excluded = root_path.join("three");
+            clone_into(remote.path(), &excluded);
+
+            let mut spec = fetch_spec(false, root_path);
+            spec.overrides = vec![RepoOverride {
+                path: excluded,
+                default_branch: None,
+                excluded: true,
+            }];
+            let started = Core::start_for_test_with_fetch(
+                spec,
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            assert_eq!(
+                core.snapshot().entities.len(),
+                3,
+                "sanity: the excluded clone is listed, so the table is larger than the cycle"
+            );
+            assert_eq!(
+                core.fetch_progress(),
+                None,
+                "sanity: no cycle has been asked for yet"
+            );
+
+            let held = core.fetch_boundary().arm();
+            core.fetch_now();
+            held.wait_until_reached();
+            assert_eq!(
+                core.fetch_progress(),
+                Some(FetchProgress { done: 0, total: 2 }),
+                "a cycle must count against the repositories it fetches, not the table"
+            );
+
+            drop(held);
+            wait_for("the cycle to end and take its count with it", || {
+                core.fetch_progress().is_none()
+            });
+        }
+
+        /// A cycle a tick started counts exactly as one the key asked for: they are the same
+        /// cycle, and the status row has no second shape for the periodic one.
+        #[test]
+        fn a_cycle_a_tick_started_carries_the_same_count_as_one_asked_for_by_hand() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("one"));
+            clone_into(remote.path(), &root_path.join("two"));
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            // The immediate cycle enabling the fetch owes runs first; the tick below is
+            // refused while it is in flight, so this waits it out before arming.
+            wait_for("the immediate cycle to be taken back first", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+            assert_eq!(
+                core.fetch_progress(),
+                Some(FetchProgress { done: 0, total: 2 }),
+                "a tick's own cycle must report the count a key's cycle reports"
+            );
+        }
+
+        /// The numerator counts finished attempts rather than successful ones: a repository
+        /// whose fetch failed has stopped being outstanding, which is what the count on
+        /// screen is about. Both remotes are broken, so the one the cycle has finished by
+        /// the time the second parks can only be a failure.
+        #[test]
+        fn a_repository_whose_fetch_failed_still_counts_as_one_the_cycle_has_finished() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let one = root_path.join("one");
+            let two = root_path.join("two");
+            clone_into(remote.path(), &one);
+            clone_into(remote.path(), &two);
+            break_remote(&one);
+            break_remote(&two);
+
+            let mut spec = fetch_spec(false, root_path);
+            spec.fetch.concurrency = 1;
+            let started = Core::start_for_test_with_fetch(
+                spec,
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+
+            let held = core.fetch_boundary().arm_after(1);
+            core.fetch_now();
+            held.wait_until_reached();
+            assert_eq!(
+                core.fetch_progress(),
+                Some(FetchProgress { done: 1, total: 2 }),
+                "the repository the cycle has already failed on must be counted as finished"
+            );
+
+            drop(held);
+            wait_for("both repositories to be counted as unreachable", || {
+                core.fetch_failures().failed.len() == 2
+            });
         }
 
         /// The failure counting an on-demand cycle owes is the periodic one's, unchanged: one

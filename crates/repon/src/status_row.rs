@@ -66,10 +66,11 @@ pub(crate) enum Gesture {
         entity_count: usize,
         running: bool,
     },
-    /// The fetch cycle `Action::FetchNow` asked for. It carries no count: a cycle decides
-    /// for itself which repositories have a remote to reach, so there is no number this row
-    /// could stand behind.
-    Fetch { running: bool },
+    /// The fetch cycle `Action::FetchNow` asked for, and how many of the repositories it
+    /// fans out over have finished while it runs. `None` once the cycle has settled, the
+    /// same "present only while in flight" rule [`crate::header`]'s own run progress
+    /// follows, since a finished cycle's count is only ever `m/m`.
+    Fetch { progress: Option<(usize, usize)> },
 }
 
 /// Rank 1: the active Set's name and the entity count it bounds, one item so the two can
@@ -113,15 +114,17 @@ fn message_item(
 }
 
 /// Rank 3, present from the moment the refresh or fetch key fires until a later one replaces
-/// it: `refreshing`/`refreshed` for a Refresh and `fetching`/`fetched` for a cycle, the live
-/// half of each while that gesture is still running. Two states rather than a fraction of
-/// entities settled, because phases A and B cover the whole population in about 0.15 seconds
+/// it: `refreshing`/`refreshed` for a Refresh and `fetching n/m`/`fetched` for a cycle, the
+/// live half of each while that gesture is still running. A Refresh reports two states and
+/// no fraction because phases A and B cover the whole population in about 0.15 seconds
 /// ([refresh.md](../../../../docs/spec/refresh.md)'s "The phases"), so a live count would
 /// jump straight from nothing landed to everything landed with no readable state between,
-/// the same defect refresh.md already recorded once for a static per-row spinner. Persists
-/// past settling, unlike [`header::trailing_items`]'s run progress, which is the point: a
-/// Refresh that finishes inside the frame that started it must still leave something to
-/// read.
+/// the same defect refresh.md already recorded once for a static per-row spinner. A fetch is
+/// network bound and spends seconds at a time on one remote, so the same argument puts a
+/// count on it rather than taking one away. Both persist past settling, unlike
+/// [`header::trailing_items`]'s run progress, which is the point: a gesture that finishes
+/// inside the frame that started it must still leave something to read. Of the fetch's report
+/// only the verb persists; see [`Gesture::Fetch`] for the count.
 fn gesture_item(gesture: Option<&Gesture>) -> Option<degrade::Item<String>> {
     let content = match gesture? {
         Gesture::Refresh {
@@ -136,7 +139,10 @@ fn gesture_item(gesture: Option<&Gesture>) -> Option<degrade::Item<String>> {
             };
             format!("{verb} {scope} {entity_count}")
         }
-        Gesture::Fetch { running } => if *running { "fetching" } else { "fetched" }.to_string(),
+        Gesture::Fetch { progress } => match progress {
+            Some((done, total)) => format!("fetching {done}/{total}"),
+            None => "fetched".to_string(),
+        },
     };
     Some(degrade::Item {
         content,
@@ -700,24 +706,20 @@ mod tests {
     // --- criterion: the refresh item has a spec'd rank and drops by the same rule as
     // everything else on the row ---
 
-    /// The two items that both landed on this row at once, ranked deliberately rather than
-    /// by whichever arrived first: the sort drops before the Refresh's state, because a
-    /// Refresh has no other surface on the screen and a sort still has its own header arrow.
-    /// A renumbering that swapped them fails here.
-    /// The fetch key's own report, in the slot the Refresh already uses: `fetching` while
-    /// the cycle runs and `fetched` once it settles, and no count beside either, since a
-    /// cycle decides for itself which repositories have a remote to reach.
+    /// The fetch key's own report, in the slot the Refresh already uses: a live cycle
+    /// counts the repositories it has finished, in the header's own `n/m` shape, and a
+    /// settled one reads as a bare verb, since a finished cycle's count is only ever `m/m`.
     #[test]
-    fn the_fetch_gesture_reads_fetching_then_fetched_with_no_count() {
+    fn a_live_fetch_counts_its_repositories_and_a_settled_one_reads_as_fetched() {
         let bindings = bindings();
-        let row = |running| {
+        let row = |progress| {
             render(
                 &StatusRowContent {
                     set_name: "work",
                     header: empty_header(),
                     warnings: &[],
                     acknowledged: &[],
-                    gesture: Some(Gesture::Fetch { running }),
+                    gesture: Some(Gesture::Fetch { progress }),
                     sort: None,
                     range_anchor_active: false,
                 },
@@ -727,18 +729,26 @@ mod tests {
             .to_string()
         };
 
-        let running = row(true);
+        let running = row(Some((3, 12)));
         assert!(
-            running.contains("fetching") && !running.contains("fetched"),
-            "a live cycle must read as fetching, got {running:?}"
+            running.contains("fetching 3/12") && !running.contains("fetched"),
+            "a live cycle must count the repositories it has finished, got {running:?}"
         );
-        let settled = row(false);
+        let settled = row(None);
         assert!(
             settled.contains("fetched") && !settled.contains("fetching"),
             "a settled cycle must read as fetched, got {settled:?}"
         );
+        assert!(
+            !settled.contains('/'),
+            "a settled cycle must carry no count, got {settled:?}"
+        );
     }
 
+    /// The two items that both landed on this row at once, ranked deliberately rather than
+    /// by whichever arrived first: the sort drops before the Refresh's state, because a
+    /// Refresh has no other surface on the screen and a sort still has its own header arrow.
+    /// A renumbering that swapped them fails here.
     #[test]
     fn the_sort_drops_before_the_refreshes_own_state() {
         let content = StatusRowContent {
