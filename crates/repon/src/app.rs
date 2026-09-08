@@ -10175,27 +10175,25 @@ mod tests {
         // Pressed each round rather than once: a cycle over a single repository can finish
         // between the press and the read, and a press landing while one is in flight is
         // refused, so this asks until a reading catches one live.
+        // Asserted on the rendered row rather than the gesture behind it, so a numerator
+        // and denominator the wrong way round fails here rather than passing.
         repon_core::liveness::wait_for(
             "a live cycle counting against the one repository this Set bounds",
             || {
                 app.handle_key_event(press(KeyCode::Char('f'), KeyModifiers::NONE))
                     .expect("handle FetchNow");
                 let snapshot = app.core.snapshot();
-                matches!(
-                    app.status_row_content(&snapshot, &[]).gesture,
-                    Some(status_row::Gesture::Fetch {
-                        progress: Some((_, 1)),
-                    })
-                )
+                let content = app.status_row_content(&snapshot, &[]);
+                let row = status_row::render(&content, &app.bindings, 999).to_string();
+                row.contains("fetching 0/1") || row.contains("fetching 1/1")
             },
         );
 
         repon_core::liveness::wait_for("the settled cycle to drop its count", || {
             let snapshot = app.core.snapshot();
-            matches!(
-                app.status_row_content(&snapshot, &[]).gesture,
-                Some(status_row::Gesture::Fetch { progress: None })
-            )
+            let content = app.status_row_content(&snapshot, &[]);
+            let row = status_row::render(&content, &app.bindings, 999).to_string();
+            row.contains("fetched") && !row.contains("fetching")
         });
     }
 

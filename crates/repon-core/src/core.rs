@@ -310,8 +310,7 @@ pub struct FetchFailures {
 /// already ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FetchProgress {
-    /// Attempts that have finished, successes and failures alike: a repository whose fetch
-    /// failed has stopped being outstanding, which is the question this count answers.
+    /// Attempts that have finished, successes and failures alike.
     pub done: usize,
     /// Every distinct fetchable common dir the cycle started against, fixed when it starts.
     pub total: usize,
@@ -813,10 +812,11 @@ impl FetchBoundary {
         self.arm_after(0)
     }
 
-    /// [`Self::arm`], except that the first `let_through` fetches run to completion before
-    /// this holds one. With `fetch.concurrency` at 1 that makes "the cycle has finished
-    /// exactly `let_through` of its repositories" a moment to assert at rather than a race
-    /// to catch.
+    /// [`Self::arm`], except that the first `let_through` fetches pass straight through and
+    /// only the next one is held. Pin `fetch.concurrency` to 1 alongside it: only then does
+    /// a fetch reaching this boundary mean every fetch let through has already finished,
+    /// which is what turns "the cycle has finished exactly `let_through` of its
+    /// repositories" into a moment to assert at rather than a race to catch.
     pub(crate) fn arm_after(self: &Arc<Self>, let_through: usize) -> ArmedFetchBoundary {
         *self.state.lock().unwrap() = FetchBoundaryState {
             armed: true,
@@ -1601,7 +1601,7 @@ impl Core {
     /// is network bound and can run for many seconds, so unlike a Refresh it has a count
     /// worth reading while it does.
     pub fn fetch_progress(&self) -> Option<FetchProgress> {
-        *self.fetch_progress.lock().unwrap()
+        *lock_fetch_progress(&self.fetch_progress)
     }
 
     /// Runs `action` across every key in `order` that the table currently knows: each
@@ -3566,7 +3566,7 @@ fn spawn_clock_thread(
                             dispatch_fetch_completion(&table, &fetch.refresh);
                         }
                         fetch.taken_back_count.fetch_add(1, Ordering::Release);
-                        *fetch.progress.lock().unwrap() = None;
+                        *lock_fetch_progress(&fetch.progress) = None;
                     }
                 }
             }
@@ -3585,7 +3585,7 @@ fn spawn_clock_thread(
             cycle.cancel();
             cycle.join();
             fetch.taken_back_count.fetch_add(1, Ordering::Release);
-            *fetch.progress.lock().unwrap() = None;
+            *lock_fetch_progress(&fetch.progress) = None;
         }
         alive.store(false, Ordering::Release);
     })
@@ -3635,19 +3635,29 @@ impl FetchCycle {
 /// panicked cycle too, caught here for the reason `Core::run_action`'s own fan-out catches
 /// one: without it a poisoned lock from an unrelated earlier panic would leave this `Core`
 /// unable to ever start another cycle.
+/// The fetch progress lock, taken poison-tolerantly. The clock thread reads and writes it at
+/// every cycle boundary, so a poisoning would end the clock rather than whatever it came
+/// from, the same reason [`start_fetch_cycle`] catches a worker's own unwind.
+fn lock_fetch_progress(
+    progress: &Mutex<Option<FetchProgress>>,
+) -> std::sync::MutexGuard<'_, Option<FetchProgress>> {
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> FetchCycle {
     // Enumerated here on the clock rather than on the worker below, so the cycle's own
     // population is the count from the moment it starts: a `total` the worker filled in a
     // moment later would read as `0/0` on whichever frames landed in between.
     let common_dirs = distinct_fetchable_common_dirs(table);
-    *fetch.progress.lock().unwrap() = Some(FetchProgress {
+    *lock_fetch_progress(&fetch.progress) = Some(FetchProgress {
         done: 0,
         total: common_dirs.len(),
     });
     let cancel = Arc::new(AtomicBool::new(false));
     let work = FetchCycleWork {
         table: Arc::clone(table),
-        common_dirs,
         concurrency: fetch.concurrency,
         progress: Arc::clone(&fetch.progress),
         cancel: Arc::clone(&cancel),
@@ -3663,7 +3673,7 @@ fn start_fetch_cycle(table: &Arc<RwLock<Table>>, fetch: &FetchSchedule) -> Fetch
     let finished = fetch.finished_tx.clone();
     let worker = thread::spawn(move || {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_fetch_cycle(&work);
+            run_fetch_cycle(&work, common_dirs);
         }));
         let _ = finished.send(());
     });
@@ -3696,9 +3706,6 @@ fn dispatch_fetch_completion(table: &Arc<RwLock<Table>>, refresh: &RefreshHandle
 /// the whole [`RefreshHandles`], since dispatching the Generation is the clock's to fence.
 struct FetchCycleWork {
     table: Arc<RwLock<Table>>,
-    /// The population this cycle fans out over, enumerated by [`start_fetch_cycle`] so the
-    /// count it published and the work done here are the same list.
-    common_dirs: Vec<PathBuf>,
     concurrency: usize,
     /// See [`Core::fetch_progress`]. Only `done` moves here; the clock owns the rest.
     progress: Arc<Mutex<Option<FetchProgress>>>,
@@ -3732,10 +3739,9 @@ struct FetchCycleWork {
 /// minutes is [config.md](https://github.com/paulchiu/repon/blob/main/docs/spec/config.md)'s
 /// stated number, not one this crate has measured against a real population the
 /// way the poll interval and the generation deadline were.
-fn run_fetch_cycle(work: &FetchCycleWork) {
+fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
     let FetchCycleWork {
         table,
-        common_dirs,
         concurrency,
         progress,
         cancel,
@@ -3750,7 +3756,7 @@ fn run_fetch_cycle(work: &FetchCycleWork) {
     cycle_count.fetch_add(1, Ordering::Release);
 
     let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
-    crate::fetch::run_bounded(common_dirs.clone(), (*concurrency).max(1), |common_dir| {
+    crate::fetch::run_bounded(common_dirs, (*concurrency).max(1), |common_dir| {
         // Nothing parks here unless a test armed this boundary.
         #[cfg(test)]
         boundary.hold();
@@ -3788,12 +3794,13 @@ fn run_fetch_cycle(work: &FetchCycleWork) {
                         .push((common_dir.clone(), error.to_string()));
                 }
             }
-        }
-        // Counted however this attempt ended, a failure and a cancelled skip alike: the
-        // question the on-screen count answers is how many repositories are still
-        // outstanding, and neither of those is.
-        if let Some(progress) = progress.lock().unwrap().as_mut() {
-            progress.done += 1;
+            // Counted however the attempt ended: the question the on-screen count answers
+            // is how many repositories are still outstanding, and a failure is no more
+            // outstanding than a success. A cancelled cycle's skips are not counted, since
+            // a repository nothing reached was never attempted.
+            if let Some(progress) = lock_fetch_progress(progress).as_mut() {
+                progress.done += 1;
+            }
         }
     });
     // A cancelled cycle never completed, so what it reached is not
@@ -12802,6 +12809,9 @@ mod tests {
         /// population the cycle itself fans out over rather than the table's entity count,
         /// and the whole reading goes away once the clock takes the cycle back, since a
         /// finished cycle's count is only ever `m/m`.
+        ///
+        /// The third clone is excluded, so the table carries three entities where the cycle
+        /// fetches two: a denominator taken off the table would read 3 here.
         #[test]
         fn a_live_cycle_counts_against_its_own_population_and_reports_nothing_once_it_ends() {
             let remote = seeded_remote();
@@ -12809,15 +12819,28 @@ mod tests {
             let root_path = root_of(&root);
             clone_into(remote.path(), &root_path.join("one"));
             clone_into(remote.path(), &root_path.join("two"));
+            let excluded = root_path.join("three");
+            clone_into(remote.path(), &excluded);
 
+            let mut spec = fetch_spec(false, root_path);
+            spec.overrides = vec![RepoOverride {
+                path: excluded,
+                default_branch: None,
+                excluded: true,
+            }];
             let started = Core::start_for_test_with_fetch(
-                fetch_spec(false, root_path),
+                spec,
                 Duration::from_secs(3600),
                 crossbeam_channel::never(),
                 crossbeam_channel::never(),
             )
             .discovered();
             let core = started.core;
+            assert_eq!(
+                core.snapshot().entities.len(),
+                3,
+                "sanity: the excluded clone is listed, so the table is larger than the cycle"
+            );
             assert_eq!(
                 core.fetch_progress(),
                 None,
@@ -12830,13 +12853,51 @@ mod tests {
             assert_eq!(
                 core.fetch_progress(),
                 Some(FetchProgress { done: 0, total: 2 }),
-                "a cycle over two clones must count against both of them"
+                "a cycle must count against the repositories it fetches, not the table"
             );
 
             drop(held);
             wait_for("the cycle to end and take its count with it", || {
                 core.fetch_progress().is_none()
             });
+        }
+
+        /// A cycle a tick started counts exactly as one the key asked for: they are the same
+        /// cycle, and the status row has no second shape for the periodic one.
+        #[test]
+        fn a_cycle_a_tick_started_carries_the_same_count_as_one_asked_for_by_hand() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            clone_into(remote.path(), &root_path.join("one"));
+            clone_into(remote.path(), &root_path.join("two"));
+
+            let (fetch_tick_tx, fetch_tick_rx) = crossbeam_channel::unbounded();
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(true, root_path),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                fetch_tick_rx,
+            )
+            .discovered();
+            let core = started.core;
+
+            // The immediate cycle enabling the fetch owes runs first; the tick below is
+            // refused while it is in flight, so this waits it out before arming.
+            wait_for("the immediate cycle to be taken back first", || {
+                started.fetch_cycles_taken_back.load(Ordering::Acquire) >= 1
+            });
+
+            let held = core.fetch_boundary().arm();
+            fetch_tick_tx
+                .send(Instant::now())
+                .expect("send a fetch tick");
+            held.wait_until_reached();
+            assert_eq!(
+                core.fetch_progress(),
+                Some(FetchProgress { done: 0, total: 2 }),
+                "a tick's own cycle must report the count a key's cycle reports"
+            );
         }
 
         /// The numerator counts finished attempts rather than successful ones: a repository

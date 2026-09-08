@@ -123,8 +123,8 @@ fn message_item(
 /// network bound and spends seconds at a time on one remote, so the same argument puts a
 /// count on it rather than taking one away. Both persist past settling, unlike
 /// [`header::trailing_items`]'s run progress, which is the point: a gesture that finishes
-/// inside the frame that started it must still leave something to read. The fetch's count
-/// does not persist, only its verb, since a finished cycle's count is only ever `m/m`.
+/// inside the frame that started it must still leave something to read. Of the fetch's report
+/// only the verb persists; see [`Gesture::Fetch`] for the count.
 fn gesture_item(gesture: Option<&Gesture>) -> Option<degrade::Item<String>> {
     let content = match gesture? {
         Gesture::Refresh {
@@ -706,10 +706,6 @@ mod tests {
     // --- criterion: the refresh item has a spec'd rank and drops by the same rule as
     // everything else on the row ---
 
-    /// The two items that both landed on this row at once, ranked deliberately rather than
-    /// by whichever arrived first: the sort drops before the Refresh's state, because a
-    /// Refresh has no other surface on the screen and a sort still has its own header arrow.
-    /// A renumbering that swapped them fails here.
     /// The fetch key's own report, in the slot the Refresh already uses: a live cycle
     /// counts the repositories it has finished, in the header's own `n/m` shape, and a
     /// settled one reads as a bare verb, since a finished cycle's count is only ever `m/m`.
@@ -749,6 +745,10 @@ mod tests {
         );
     }
 
+    /// The two items that both landed on this row at once, ranked deliberately rather than
+    /// by whichever arrived first: the sort drops before the Refresh's state, because a
+    /// Refresh has no other surface on the screen and a sort still has its own header arrow.
+    /// A renumbering that swapped them fails here.
     #[test]
     fn the_sort_drops_before_the_refreshes_own_state() {
         let content = StatusRowContent {
