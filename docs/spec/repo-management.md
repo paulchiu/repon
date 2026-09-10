@@ -48,7 +48,7 @@ This replaces the rename-then-delete strategy an earlier design considered and d
 
 `sync` is refused on a Submodule: it tracks a pinned commit, not a branch, so there is nothing to fast-forward.
 
-`sync` is refused on a Worktree: the auto-update it reuses acts on a Repo's own branch, and `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly that reason. A Worktree sharing a common dir with a Repo is listed, never operated on, the same rule [config.md](config.md) already states for the periodic fetch's own common-dir filter, and this row says so rather than silently doing nothing.
+`sync` is refused on a Worktree: the auto-update it reuses acts on a Repo's own branch, and `repon-core`'s own `repos_eligible_for_auto_update_attempt` is Repo-only for exactly that reason. A Worktree sharing a common dir with a Repo is listed, never operated on, the same rule [config.md](config.md) already states for the periodic fetch's own common-dir filter, and this row says so rather than silently doing nothing. A checkout created inside a working tree meets this refusal only where git made it a linked worktree: a clone of its own is a Repo row and is synced like any other, wherever on disk it sits ([discovery.md](discovery.md)'s "Reaching an agent's own checkouts").
 
 A refusal is reported and counted in the confirm gate, never silent, the same way an excluded entity is subtracted and named.
 
