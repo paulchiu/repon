@@ -201,7 +201,7 @@ Execution belongs elsewhere. Output capture, the run pane, what a partial failur
 
 ## Discovery bounds
 
-There is no `max_depth`, no denylist and no wall-clock budget in the file, and there never will be. [discovery.md](discovery.md) settles the walk as boundary-stop only, leaving a Set's `roots` as the sole way to reach a repository sitting inside another repository's working tree.
+There is no `max_depth`, no denylist and no wall-clock budget in the file, and there never will be. [discovery.md](discovery.md) settles the walk as boundary-stop only, leaving a Set's `roots` as the sole way to reach a repository sitting inside another repository's working tree. That covers the checkouts agent tooling creates under a directory of its own inside one, worked through in [discovery.md](discovery.md)'s "Reaching an agent's own checkouts".
 
 Discovery counts directory entries as it walks; a separate pre-count would cost the same walk twice. At one second still walking, a warning names the count reached and the roots. At thirty seconds discovery is abandoned, Repon shows what it found, and the warning becomes persistent, reading as `discovery: stopped at 412,000 directories`. An abandoned discovery leaves the refresh path and becomes manual until `roots` change, because [refresh.md](refresh.md) re-runs discovery at the start of every Generation and a thirty second walk every two seconds is not a degraded mode.
 
