@@ -89,8 +89,10 @@ pub(crate) fn attempt(path: &Path) -> Outcome {
     if !git::has_any_remote(&repo) {
         return Outcome::Ineligible(Ineligible::NoUpstream);
     }
-    let Some(upstream_commit) = git::upstream_commit(&repo, &name) else {
-        return Outcome::Ineligible(Ineligible::NoUpstream);
+    let upstream_commit = match git::upstream_commit(&repo, &name) {
+        Ok(Some(commit)) => commit,
+        Ok(None) => return Outcome::Ineligible(Ineligible::NoUpstream),
+        Err(error) => return Outcome::Failed(error),
     };
 
     let ahead_behind = match git::ahead_behind(&repo, local_commit, upstream_commit) {

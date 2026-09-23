@@ -177,17 +177,32 @@ pub(crate) fn tracking_ref_name(
         .ok()
 }
 
-/// The commit a branch's configured upstream currently resolves to, or `None` when
+/// The commit a branch's configured upstream currently resolves to, or `Ok(None)` when
 /// there is no upstream to compare against: no `branch.<name>.merge`/`.remote`
-/// configured, or a configured tracking ref that itself no longer resolves. Both
-/// causes settle to the same [`SyncState::NoUpstream`] at the call site, since
-/// neither has a count to show. `pub(crate)` rather than private: the auto-update
-/// needs the live commit itself, not only [`resolve_sync`]'s derived counts, to know
-/// what to fast-forward to.
-pub(crate) fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
-    let tracking_ref_name = tracking_ref_name(repo, branch_name)?;
-    let mut reference = repo.find_reference(tracking_ref_name.as_ref()).ok()?;
-    reference.peel_to_id().ok().map(|id| id.detach())
+/// configured, or a tracking ref that is absent (an upstream branch deleted and pruned).
+/// A tracking ref that exists but will not read or peel is an `Err` naming it, never a
+/// branch that tracks nothing. `pub(crate)` rather than private: the auto-update needs
+/// the live commit itself, not only [`resolve_sync`]'s derived counts, to know what to
+/// fast-forward to.
+pub(crate) fn upstream_commit(
+    repo: &gix::Repository,
+    branch_name: &str,
+) -> Result<Option<gix::ObjectId>, String> {
+    let Some(tracking_ref_name) = tracking_ref_name(repo, branch_name) else {
+        return Ok(None);
+    };
+    let unreadable =
+        |error: &dyn std::fmt::Display| format!("could not read {tracking_ref_name}: {error}");
+    let Some(mut reference) = repo
+        .try_find_reference(tracking_ref_name.as_ref())
+        .map_err(|error| unreadable(&error))?
+    else {
+        return Ok(None);
+    };
+    reference
+        .peel_to_id()
+        .map(|id| Some(id.detach()))
+        .map_err(|error| unreadable(&error))
 }
 
 /// `commit`'s count of commits behind `default_commit`: commits reachable from
@@ -220,7 +235,9 @@ pub(crate) fn resolve_sync(
     let Some(Head::Branch { name, commit }) = head else {
         return Ok(SyncState::NoUpstream);
     };
-    let Some(upstream) = upstream_commit(repo, name) else {
+    let Some(upstream) =
+        upstream_commit(repo, name).map_err(|error| ProbeError::AheadBehind(error.into()))?
+    else {
         return Ok(SyncState::NoUpstream);
     };
     ahead_behind(repo, *commit, upstream)
@@ -1495,6 +1512,61 @@ mod tests {
         let sync = resolve_sync(&repo, None).expect("resolve sync");
 
         assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// An upstream branch deleted and pruned leaves its configuration behind with no
+    /// tracking ref, which is a branch with nothing to compare against, not a read failure.
+    #[test]
+    fn resolve_sync_settles_no_upstream_when_the_tracking_ref_was_pruned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        git(dir.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
+
+        assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// A configured tracking ref that exists but will not peel to a commit is a read
+    /// failure, never a branch that tracks nothing, and the error names the ref.
+    #[test]
+    fn resolve_sync_fails_when_the_tracking_ref_will_not_peel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            format!("{missing}\n"),
+        )
+        .expect("point the tracking ref at a missing object");
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head));
+
+        match sync {
+            Err(error) => assert!(
+                error.to_string().contains("refs/remotes/origin/main"),
+                "the failure should name the ref it could not read, got {error}"
+            ),
+            Ok(value) => panic!("expected a read failure, got {value:?}"),
+        }
     }
 
     #[test]
