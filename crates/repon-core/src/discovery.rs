@@ -140,7 +140,8 @@ pub(crate) fn resolve(
 /// without paying every boundary's open cost again each time: only a boundary
 /// `cache` has no entry for (a genuinely new one) is opened fresh. A boundary
 /// resolved from the cache hands back the same `Arc` `cache` gave it, never a new
-/// one, so a caller can tell reuse happened by pointer identity.
+/// one, so a caller can tell reuse happened by pointer identity. A cached handle that
+/// no longer [reads its object store](git::reads_its_object_store) is opened fresh instead.
 pub(crate) fn resolve_with_cache(
     spec: &SetSpec,
     boundaries: &[EntityKey],
@@ -157,7 +158,10 @@ pub(crate) fn resolve_with_cache(
         // the cached handle alongside when there is one, so its fields are read
         // out in the single match arm below, the one place a field added to
         // `Resolved` would need to start being threaded through here.
-        let resolved = if let Some(cached) = cache.get(key) {
+        let resolved = if let Some(cached) = cache
+            .get(key)
+            .filter(|cached| git::reads_its_object_store(cached))
+        {
             Ok((
                 git::resolve_from_open(cached.to_thread_local()),
                 Some(Arc::clone(cached)),

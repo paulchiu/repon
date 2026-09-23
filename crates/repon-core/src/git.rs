@@ -508,6 +508,19 @@ pub(crate) fn open_thread_safe(path: &Path) -> Result<gix::ThreadSafeRepository,
         .map_err(|error| ProbeError::Open(error.to_string().into()))
 }
 
+/// Whether `repo` can still look objects up in its object store as it stands on disk.
+///
+/// gix sizes a handle's pack-index slot map once, at open, so enough packs landing after
+/// that (every fetch adds one) leave the objects in the newest of them unfindable through
+/// it. Looking up an object that cannot exist makes the handle reconcile with disk, which
+/// is the step that fails.
+pub(crate) fn reads_its_object_store(repo: &gix::ThreadSafeRepository) -> bool {
+    let local = repo.to_thread_local();
+    local
+        .try_find_object(gix::ObjectId::null(local.object_hash()))
+        .is_ok()
+}
+
 /// Reads `repo`'s own `.gitmodules`, one level deep, or `None` where none exists.
 ///
 /// `Repository::open_modules_file` stats the worktree file itself and never falls
