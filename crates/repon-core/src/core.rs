@@ -12273,6 +12273,72 @@ mod tests {
         }
     }
 
+    /// A long-running session keeps reading its upstream after more external fetches than
+    /// the handle discovery opened had pack-index slots for: gix sizes that slot map once,
+    /// at open, to at least 32, and an object that only lives in a pack past it cannot be
+    /// found through that handle.
+    #[test]
+    fn a_session_reads_its_upstream_after_more_fetched_packs_than_its_handle_had_slots_for() {
+        const FETCHES: u32 = 40;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = root_of(&dir);
+        let author = base.join("author");
+        let root = base.join("root");
+        let repo = root.join("repo");
+        fs::create_dir_all(&root).expect("create root");
+        git(
+            &base,
+            &["init", "--quiet", "--bare", "-b", "main", "remote.git"],
+        );
+        git(&base, &["clone", "--quiet", "remote.git", "author"]);
+        git(&author, &["commit", "--allow-empty", "-m", "first"]);
+        git(&author, &["push", "--quiet", "origin", "HEAD:main"]);
+        git(
+            &root,
+            &["clone", "--quiet", "--no-local", "../remote.git", "repo"],
+        );
+
+        let core = Core::start_discovered(spec(vec![root]));
+        settle_launch(&core);
+        for round in 0..FETCHES {
+            git(
+                &author,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    &format!("upstream {round}"),
+                ],
+            );
+            git(&author, &["push", "--quiet", "origin", "HEAD:main"]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "fetch.unpackLimit=1",
+                    "-c",
+                    "gc.auto=0",
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                ],
+            );
+        }
+        let settled = refresh_and_settle(&core);
+
+        match sync_of(&settled, &repo) {
+            Some(Settled::Known {
+                value: SyncState::Tracking(AheadBehind { ahead, behind }),
+                at: _,
+                stale: _,
+            }) => {
+                assert_eq!(*ahead, 0);
+                assert_eq!(*behind, FETCHES);
+            }
+            other => panic!("expected 0 ahead, {FETCHES} behind, got {other:?}"),
+        }
+    }
+
     /// Named case 3 of 6: an attached branch level with its upstream.
     #[test]
     fn an_attached_branch_level_with_its_upstream_reads_in_sync() {

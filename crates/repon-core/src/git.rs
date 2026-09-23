@@ -32,8 +32,9 @@ pub enum ProbeError {
     /// The patch-equivalence check could not run: a missing or corrupt commit
     /// or tree, never a stand-in for "not equivalent".
     PatchEquivalence(Arc<str>),
-    /// The ahead/behind comparison against a live upstream could not run: a
-    /// missing or corrupt commit, never a stand-in for zero.
+    /// The ahead/behind comparison against a live upstream could not run: a tracking
+    /// ref that would not read, or a missing or corrupt commit, never a stand-in for
+    /// zero or for a branch that tracks nothing.
     AheadBehind(Arc<str>),
     /// The behind-the-default-branch comparison could not run: a missing or
     /// corrupt commit, never a stand-in for zero.
@@ -177,17 +178,32 @@ pub(crate) fn tracking_ref_name(
         .ok()
 }
 
-/// The commit a branch's configured upstream currently resolves to, or `None` when
+/// The commit a branch's configured upstream currently resolves to, or `Ok(None)` when
 /// there is no upstream to compare against: no `branch.<name>.merge`/`.remote`
-/// configured, or a configured tracking ref that itself no longer resolves. Both
-/// causes settle to the same [`SyncState::NoUpstream`] at the call site, since
-/// neither has a count to show. `pub(crate)` rather than private: the auto-update
-/// needs the live commit itself, not only [`resolve_sync`]'s derived counts, to know
-/// what to fast-forward to.
-pub(crate) fn upstream_commit(repo: &gix::Repository, branch_name: &str) -> Option<gix::ObjectId> {
-    let tracking_ref_name = tracking_ref_name(repo, branch_name)?;
-    let mut reference = repo.find_reference(tracking_ref_name.as_ref()).ok()?;
-    reference.peel_to_id().ok().map(|id| id.detach())
+/// configured, or a tracking ref that is absent (an upstream branch deleted and pruned).
+/// A tracking ref that exists but will not read or peel is an `Err` naming it, never a
+/// branch that tracks nothing. `pub(crate)` rather than private: the auto-update needs
+/// the live commit itself, not only [`resolve_sync`]'s derived counts, to know what to
+/// fast-forward to.
+pub(crate) fn upstream_commit(
+    repo: &gix::Repository,
+    branch_name: &str,
+) -> Result<Option<gix::ObjectId>, String> {
+    let Some(tracking_ref_name) = tracking_ref_name(repo, branch_name) else {
+        return Ok(None);
+    };
+    let unreadable =
+        |error: &dyn std::fmt::Display| format!("could not read {tracking_ref_name}: {error}");
+    let Some(mut reference) = repo
+        .try_find_reference(tracking_ref_name.as_ref())
+        .map_err(|error| unreadable(&error))?
+    else {
+        return Ok(None);
+    };
+    reference
+        .peel_to_id()
+        .map(|id| Some(id.detach()))
+        .map_err(|error| unreadable(&error))
 }
 
 /// `commit`'s count of commits behind `default_commit`: commits reachable from
@@ -220,7 +236,9 @@ pub(crate) fn resolve_sync(
     let Some(Head::Branch { name, commit }) = head else {
         return Ok(SyncState::NoUpstream);
     };
-    let Some(upstream) = upstream_commit(repo, name) else {
+    let Some(upstream) =
+        upstream_commit(repo, name).map_err(|error| ProbeError::AheadBehind(error.into()))?
+    else {
         return Ok(SyncState::NoUpstream);
     };
     ahead_behind(repo, *commit, upstream)
@@ -506,6 +524,19 @@ pub(crate) fn open_thread_safe(path: &Path) -> Result<gix::ThreadSafeRepository,
         .config_overrides([format!("gitoxide.objects.cacheLimit={OBJECT_CACHE_BYTES}")]);
     gix::ThreadSafeRepository::open_opts(path, options)
         .map_err(|error| ProbeError::Open(error.to_string().into()))
+}
+
+/// Whether `repo` can still look objects up in its object store as it stands on disk.
+///
+/// gix sizes a handle's pack-index slot map once, at open, so enough packs landing after
+/// that (every fetch adds one) leave the objects in the newest of them unfindable through
+/// it. Looking up an object that cannot exist makes the handle reconcile with disk, which
+/// is the step that fails.
+pub(crate) fn reads_its_object_store(repo: &gix::ThreadSafeRepository) -> bool {
+    let local = repo.to_thread_local();
+    local
+        .try_find_object(gix::ObjectId::null(local.object_hash()))
+        .is_ok()
 }
 
 /// Reads `repo`'s own `.gitmodules`, one level deep, or `None` where none exists.
@@ -1482,6 +1513,95 @@ mod tests {
         let sync = resolve_sync(&repo, None).expect("resolve sync");
 
         assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// An upstream branch deleted and pruned leaves its configuration behind with no
+    /// tracking ref, which is a branch with nothing to compare against, not a read failure.
+    #[test]
+    fn resolve_sync_settles_no_upstream_when_the_tracking_ref_was_pruned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
+
+        assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// A tracking ref whose file will not parse is a read failure too, named the same way.
+    #[test]
+    fn resolve_sync_fails_when_the_tracking_ref_will_not_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            "not a ref\n",
+        )
+        .expect("corrupt the tracking ref");
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head));
+
+        match sync {
+            Err(error) => assert!(
+                error.to_string().contains("refs/remotes/origin/main"),
+                "the failure should name the ref it could not read, got {error}"
+            ),
+            Ok(value) => panic!("expected a read failure, got {value:?}"),
+        }
+    }
+
+    /// A configured tracking ref that exists but will not peel to a commit is a read
+    /// failure, never a branch that tracks nothing, and the error names the ref.
+    #[test]
+    fn resolve_sync_fails_when_the_tracking_ref_will_not_peel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            format!("{missing}\n"),
+        )
+        .expect("point the tracking ref at a missing object");
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head));
+
+        match sync {
+            Err(error) => assert!(
+                error.to_string().contains("refs/remotes/origin/main"),
+                "the failure should name the ref it could not read, got {error}"
+            ),
+            Ok(value) => panic!("expected a read failure, got {value:?}"),
+        }
     }
 
     #[test]
