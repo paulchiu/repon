@@ -12282,7 +12282,6 @@ mod tests {
         const FETCHES: u32 = 40;
         let dir = tempfile::tempdir().expect("temp dir");
         let base = root_of(&dir);
-        let remote = base.join("remote.git");
         let author = base.join("author");
         let root = base.join("root");
         let repo = root.join("repo");

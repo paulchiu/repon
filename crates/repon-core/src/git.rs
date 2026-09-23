@@ -32,8 +32,9 @@ pub enum ProbeError {
     /// The patch-equivalence check could not run: a missing or corrupt commit
     /// or tree, never a stand-in for "not equivalent".
     PatchEquivalence(Arc<str>),
-    /// The ahead/behind comparison against a live upstream could not run: a
-    /// missing or corrupt commit, never a stand-in for zero.
+    /// The ahead/behind comparison against a live upstream could not run: a tracking
+    /// ref that would not read, or a missing or corrupt commit, never a stand-in for
+    /// zero or for a branch that tracks nothing.
     AheadBehind(Arc<str>),
     /// The behind-the-default-branch comparison could not run: a missing or
     /// corrupt commit, never a stand-in for zero.
@@ -1522,7 +1523,10 @@ mod tests {
         init_repo_with_a_commit(dir.path());
         let sha = head_sha(dir.path());
         configure_upstream(dir.path(), "main", &sha);
-        git(dir.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
         let repo = open_thread_safe(dir.path())
             .expect("open")
             .to_thread_local();
@@ -1534,6 +1538,37 @@ mod tests {
         let sync = resolve_sync(&repo, Some(&head)).expect("resolve sync");
 
         assert_eq!(sync, SyncState::NoUpstream);
+    }
+
+    /// A tracking ref whose file will not parse is a read failure too, named the same way.
+    #[test]
+    fn resolve_sync_fails_when_the_tracking_ref_will_not_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        init_repo_with_a_commit(dir.path());
+        let sha = head_sha(dir.path());
+        configure_upstream(dir.path(), "main", &sha);
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            "not a ref\n",
+        )
+        .expect("corrupt the tracking ref");
+        let repo = open_thread_safe(dir.path())
+            .expect("open")
+            .to_thread_local();
+        let head = Head::Branch {
+            name: Arc::from("main"),
+            commit: gix::ObjectId::from_hex(sha.as_bytes()).expect("parse sha"),
+        };
+
+        let sync = resolve_sync(&repo, Some(&head));
+
+        match sync {
+            Err(error) => assert!(
+                error.to_string().contains("refs/remotes/origin/main"),
+                "the failure should name the ref it could not read, got {error}"
+            ),
+            Ok(value) => panic!("expected a read failure, got {value:?}"),
+        }
     }
 
     /// A configured tracking ref that exists but will not peel to a commit is a read
