@@ -19,7 +19,7 @@ jobs:
   dependabot-auto-merge:
     name: Label and auto-merge
     if: github.actor == 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Dependabot metadata
         id: metadata
