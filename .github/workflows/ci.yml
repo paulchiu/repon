@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-26.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -43,7 +43,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -66,7 +66,7 @@ jobs:
 
   publish-check:
     name: Publish rehearsal
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -92,7 +92,7 @@ jobs:
     name: Workflow parse
     # Its own job rather than a step inside `just ci`, and Linux only, because
     # the recipe needs PyYAML and `just ci` is the recipe run on a laptop.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -113,6 +113,6 @@ jobs:
     name: CI
     if: always()
     needs: [quality-check, msrv, publish-check, workflows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
