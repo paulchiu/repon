@@ -5160,23 +5160,24 @@ mod tests {
 
     /// Criterion 1 under scrolling rather than filtering: the Repo is a candidate and would
     /// draw the connector if it were on screen, but `set_offset` has scrolled it off the top
-    /// so the Worktree is the topmost rendered row. No Repo row is visible anywhere on
+    /// so its first child is the topmost rendered row. No Repo row is visible anywhere on
     /// screen, so this must draw the orphan marker exactly as the `kind:worktree` case above
-    /// does, rather than reading connectedness from the unwindowed candidate order.
+    /// does, rather than reading connectedness from the unwindowed candidate order. Which
+    /// child comes first follows discovery order, so the test takes whichever it is.
     #[test]
     fn a_child_scrolled_to_the_top_of_the_viewport_draws_the_orphan_marker_when_its_parent_is_scrolled_off()
      {
         let (snapshot, _) = settled_snapshot_with_a_worktree_and_a_submodule();
         let (repo_row, _) = find_entity_row(&snapshot, "parent");
-        let (worktree_row, _) = find_entity_row(&snapshot, "feature-worktree");
-        assert_eq!(
-            worktree_row,
-            repo_row + 1,
-            "expected the Worktree to sit directly under its Repo in grouped order"
+        let first_child_row = repo_row + 1;
+        let order = grouped_row_order(&snapshot.entities, &every_index(&snapshot.entities));
+        assert!(
+            is_child_row(snapshot.entities[order[first_child_row]].kind),
+            "expected a child row directly under the Repo in grouped order"
         );
 
         let mut list = list_showing_submodules();
-        list.set_offset(worktree_row);
+        list.set_offset(first_child_row);
         let terminal = render_with_list(&mut list, 140, 24, &snapshot);
         let buf = terminal.backend().buffer();
 
