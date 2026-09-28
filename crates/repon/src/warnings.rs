@@ -226,7 +226,7 @@ pub(crate) const BORDER_TITLE: &str = " warnings ";
 /// and no way out advertised is what this module used to be.
 pub(crate) const CLOSE_HINT: &str = " esc closes ";
 
-/// Draws every outstanding warning, one per line, most severe first, inside the same
+/// Draws every outstanding warning ([`overlay_lines`]), most severe first, inside the same
 /// house-style bordered block every other full-frame surface draws
 /// ([`crate::help::HelpOverlay::draw`], [`crate::action_palette::ActionPalette::draw`]), in
 /// the `warn` role
@@ -255,8 +255,23 @@ pub(crate) fn draw_overlay(
         .take(interior.height as usize)
         .enumerate()
     {
-        buf.set_string(interior.x, interior.y + row as u16, line, style);
+        let fitted = fit_to_width(line, interior.width as usize, glyphs.truncated);
+        buf.set_string(interior.x, interior.y + row as u16, fitted, style);
     }
+}
+
+/// `line` with control characters blanked, cut to `width` columns with `mark` in the last
+/// one when it is longer. A fetch error is arbitrary bytes from a remote, so nothing in it
+/// may move the cursor or spill past the border.
+fn fit_to_width(line: &str, width: usize, mark: char) -> String {
+    let clean = line.chars().map(|c| if c.is_control() { ' ' } else { c });
+    if line.chars().count() <= width {
+        return clean.collect();
+    }
+    clean
+        .take(width.saturating_sub(1))
+        .chain((width > 0).then_some(mark))
+        .collect()
 }
 
 /// The expanded list's lines, most severe warning first: each warning's own text, then for a
@@ -559,7 +574,11 @@ mod tests {
     /// gets `height - 2` interior rows to place content in, the same subtraction
     /// [`draw_overlay`] itself makes.
     fn render_overlay(warnings: &[Warning], height: u16) -> Vec<String> {
-        let backend = TestBackend::new(RENDER_WIDTH, height);
+        render_overlay_at(warnings, RENDER_WIDTH, height)
+    }
+
+    fn render_overlay_at(warnings: &[Warning], width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| {
@@ -656,6 +675,29 @@ mod tests {
             1,
             "a failure with no lock carries no hint, got: {lines:?}"
         );
+    }
+
+    /// A long path, error or lock is cut at the interior's edge with the truncation glyph
+    /// rather than spilling over the right border, at the 44-column Notice budget.
+    #[test]
+    fn a_long_fetch_failure_is_truncated_to_the_interior_width_with_the_truncation_glyph() {
+        let long = "/home/someone/src/a/deeply/nested/checkout/path/that/runs/on";
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            &format!("{long}/.git"),
+            "failed to fetch: Failed to update references to their new position",
+            &[&format!("{long}/.git/refs/tags/v1.lock")],
+        )])];
+
+        let lines = render_overlay_at(&warnings, 44, 5);
+
+        let right_border = crate::glyphs::FULL.border.vertical.to_string();
+        for line in &lines[2..4] {
+            assert_eq!(line.chars().count(), 44, "got: {lines:?}");
+            assert!(
+                line.ends_with(&format!("{}{right_border}", crate::glyphs::FULL.truncated)),
+                "expected the truncation glyph against an intact right border, got: {lines:?}"
+            );
+        }
     }
 
     /// The other half of "still truncate to the available height": the height that bounds
