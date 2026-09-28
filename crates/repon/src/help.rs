@@ -973,6 +973,18 @@ mod tests {
     }
 
     #[test]
+    fn content_advertises_opening_the_app_log_from_list_and_detail() {
+        for context in [Context::List, Context::Detail] {
+            let lines = HelpOverlay::content(&default_table(), context);
+            assert!(
+                lines.iter().any(|(keys, description)| keys == "L"
+                    && *description == "Open repon.log in `$EDITOR`"),
+                "expected `L` to open repon.log in {context:?}, got {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn content_omits_bindings_not_live_in_the_given_context() {
         // Confirm never dispatches Global, so a leaked "Move down" or "Quit" line would be
         // a context-scoping bug, not merely an ordering one.

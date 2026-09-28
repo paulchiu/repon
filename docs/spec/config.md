@@ -9,7 +9,7 @@ One file, `config.toml`, holds everything Repon can be told: the theme, the glyp
 | config file | `~/.config/repon/config.toml` | `REPON_CONFIG` names the directory; `--config <path>` names the file and beats it. Either must exist if given, though a named directory holding no `config.toml` is zero config and runs |
 | themes | `~/.config/repon/themes/<name>.toml` | follows the config directory |
 | state | `~/Library/Application Support/repon/state.toml` | `REPON_DATA` |
-| log | `~/Library/Application Support/repon/repon.log` | `REPON_DATA` |
+| log | `~/Library/Application Support/repon/repon.log`, opened in `$EDITOR` by `L` ([keybindings.md](keybindings.md#opening-the-app-log)) | `REPON_DATA` |
 
 The config half resolves through `etcetera`'s `choose_base_strategy`: XDG on Unix including macOS, the native location on Windows. The data half stays on the `directories` crate's `ProjectDirs`. This settles the placement [theming.md](theming.md) left open, and it mirrors tuicr, where config sits under `~/.config` and data under Application Support, so two of the same person's tools agree about where a theme lives.
 

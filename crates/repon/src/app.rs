@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -397,6 +397,9 @@ pub struct App {
     /// a flag rather than an immediate call. Cleared the moment it is handed to
     /// [`Self::run_config_editor_handoff`], so a handoff runs at most once per press.
     pending_config_editor_handoff: bool,
+    /// `true` between `Action::OpenAppLog` (`L`) firing and [`Self::run`]'s own loop
+    /// draining it, for the same reason `pending_config_editor_handoff` is a flag.
+    pending_log_editor_handoff: bool,
     /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s` or
     /// `Tab`) and closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
@@ -676,6 +679,7 @@ impl App {
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
             pending_config_editor_handoff: false,
+            pending_log_editor_handoff: false,
             set_picker: None,
             notice: None,
             theme_warnings,
@@ -1053,6 +1057,7 @@ impl App {
                 self.pending_config_editor_handoff = false;
                 self.run_config_editor_handoff(&mut tui);
             }
+            self.run_log_editor_handoff(|path| editor::open(&mut tui, path));
             if self.should_quit {
                 tui.stop();
                 break;
@@ -1281,6 +1286,15 @@ impl App {
                     self.set_notice(action_running_notice("Edit config"));
                 } else {
                     self.pending_config_editor_handoff = true;
+                }
+                None
+            }
+            Some(Action::OpenAppLog) => {
+                let log_file = crate::logging::log_file_in(&self.data_dir);
+                if log_file.is_file() {
+                    self.pending_log_editor_handoff = true;
+                } else {
+                    self.set_notice(format!("No log at {}", log_file.display()));
                 }
                 None
             }
@@ -3152,6 +3166,18 @@ impl App {
         }
     }
 
+    /// Drains `self.pending_log_editor_handoff`, if set, by handing `repon.log` to `open`
+    /// inside [`Self::around_ad_hoc_editor_handoff`]. A failed handoff is logged.
+    fn run_log_editor_handoff(&mut self, open: impl FnOnce(&Path) -> Result<()>) {
+        if !std::mem::take(&mut self.pending_log_editor_handoff) {
+            return;
+        }
+        let path = crate::logging::log_file_in(&self.data_dir);
+        if let Err(err) = self.around_ad_hoc_editor_handoff(|| open(&path)) {
+            tracing::error!("log $EDITOR handoff failed: {err:#}");
+        }
+    }
+
     /// The text `$EDITOR` opens on for `path`: its own bytes if it exists, otherwise
     /// `repon config --example`'s own annotated example, per config.md's "If the file does
     /// not exist yet ... the first edit starts from something readable rather than an empty
@@ -3856,6 +3882,7 @@ mod tests {
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
             pending_config_editor_handoff: false,
+            pending_log_editor_handoff: false,
             set_picker: None,
             notice: None,
             theme_warnings: Vec::new(),
@@ -14216,14 +14243,15 @@ refresh_all = "z""#,
         );
     }
 
-    /// A future reader who sees `Action::OpenInEditor` or `Action::EditConfig` handled here
-    /// and wonders whether either reaches `Tui::suspend_for_child` through an implementation
-    /// of its own needs the answer sitting in this file's own source, not only in this test's
-    /// passing: exactly two calls to `editor::edit`, one per handoff, both this file's own
-    /// reuse of the Launcher's own handoff machinery, and no direct call to
-    /// `suspend_for_child` or a raw `Command` spawn attempting a third implementation.
+    /// A future reader who sees `Action::OpenInEditor`, `Action::EditConfig` or
+    /// `Action::OpenAppLog` handled here and wonders whether any reaches
+    /// `Tui::suspend_for_child` through an implementation of its own needs the answer
+    /// sitting in this file's own source, not only in this test's passing: two calls to
+    /// `editor::edit` and one to `editor::open`, all this file's own reuse of the Launcher's
+    /// own handoff machinery, and no direct call to `suspend_for_child` or a raw `Command`
+    /// spawn attempting another implementation.
     #[test]
-    fn the_editor_handoff_chords_call_editor_edit_rather_than_a_second_terminal_handover() {
+    fn the_editor_handoff_chords_call_the_editor_module_rather_than_a_second_terminal_handover() {
         let source = crate::test_support::production_source_at(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
         );
@@ -14240,12 +14268,20 @@ refresh_all = "z""#,
             "expected exactly two calls to `editor::edit` in app.rs's own production code, \
              one for the ad hoc command field and one for editing config.toml"
         );
+        assert_eq!(
+            code_lines
+                .iter()
+                .filter(|line| line.contains("editor::open("))
+                .count(),
+            1,
+            "expected exactly one call to `editor::open`, for opening repon.log"
+        );
         assert!(
             !code_lines
                 .iter()
                 .any(|line| line.contains("suspend_for_child(")),
-            "app.rs must reach the terminal handover only through `editor::edit` and \
-             `launcher::run`, never by calling `Tui::suspend_for_child` a second, direct way"
+            "app.rs must reach the terminal handover only through `editor::edit`, \
+             `editor::open` and `launcher::run`, never by calling `Tui::suspend_for_child` a second, direct way"
         );
     }
 
@@ -14272,6 +14308,215 @@ refresh_all = "z""#,
             "e must queue the handoff for `run`'s own loop"
         );
         assert_eq!(app.notice(), None, "queuing must raise no Notice");
+    }
+
+    /// An `App` over one repo whose `data_dir` is a tempdir already holding a `repon.log`.
+    fn app_with_a_log(dir: &tempfile::TempDir) -> App {
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.data_dir = root.join("data");
+        std::fs::create_dir_all(&app.data_dir).expect("create the data dir");
+        std::fs::write(app.data_dir.join("repon.log"), "a line\n").expect("write the log");
+        app
+    }
+
+    /// Presses `L`, then drains the handoff the way `run`'s loop does, returning every path
+    /// the opener was handed.
+    fn press_l_and_drain(app: &mut App) -> Vec<PathBuf> {
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L");
+        let mut opened = Vec::new();
+        app.run_log_editor_handoff(|path| {
+            opened.push(path.to_path_buf());
+            Ok(())
+        });
+        opened
+    }
+
+    /// `L` hands the editor the `repon.log` under the session's own data dir, the one
+    /// `REPON_DATA` moves, exactly once per press.
+    #[test]
+    fn shift_l_opens_the_log_under_the_data_dir_once_per_press() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+
+        let opened = press_l_and_drain(&mut app);
+
+        assert_eq!(opened, vec![app.data_dir.join("repon.log")]);
+        assert!(
+            !app.pending_config_editor_handoff,
+            "L must never queue the config handoff"
+        );
+        assert_eq!(app.notice(), None, "opening must raise no Notice");
+
+        let mut reopened = false;
+        app.run_log_editor_handoff(|_| {
+            reopened = true;
+            Ok(())
+        });
+        assert!(!reopened, "a drained press must not open the editor again");
+    }
+
+    /// The path `L` opens is the one `logging::init` writes.
+    #[test]
+    fn the_log_path_l_opens_is_the_one_logging_writes() {
+        let data_dir = std::path::Path::new("/some/data");
+        assert_eq!(
+            crate::logging::log_file_in(data_dir),
+            data_dir.join("repon.log")
+        );
+        assert_eq!(
+            crate::logging::log_file_path(),
+            crate::logging::log_file_in(&config::data_dir())
+        );
+    }
+
+    /// A data dir holding no `repon.log` answers `L` with a Notice naming the path, and
+    /// opens nothing.
+    #[test]
+    fn shift_l_names_the_missing_log_path_in_a_notice_rather_than_opening() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+        let path = app.data_dir.join("repon.log");
+        std::fs::remove_file(&path).expect("remove the log");
+
+        let opened = press_l_and_drain(&mut app);
+
+        assert!(opened.is_empty(), "a missing log must never be opened");
+        assert_eq!(
+            app.notice().map(str::to_string),
+            Some(format!("No log at {}", path.to_string_lossy()))
+        );
+    }
+
+    /// A data dir that was never created is the same missing log.
+    #[test]
+    fn shift_l_names_the_missing_log_path_when_the_data_dir_is_missing_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+        let missing = dir.path().join("never-created");
+        app.data_dir = missing.clone();
+
+        let opened = press_l_and_drain(&mut app);
+
+        assert!(opened.is_empty(), "a missing log must never be opened");
+        let notice = app.notice().expect("a Notice");
+        assert!(notice.starts_with("No log at "), "got {notice:?}");
+        assert!(
+            notice.contains(&*missing.to_string_lossy()),
+            "got {notice:?}"
+        );
+    }
+
+    /// Unlike `e`, `L` stays live while an Action is fanning out.
+    #[test]
+    fn shift_l_still_opens_while_an_action_is_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+        app.document.actions.push(slow_action("slow"));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(app.any_run_outstanding(), "sanity: the fan-out is live");
+
+        let opened = press_l_and_drain(&mut app);
+
+        assert_eq!(opened.len(), 1, "L must open the log during a fan-out");
+        assert_eq!(app.notice(), None, "L must not answer with an inert Notice");
+
+        app.core.stop_action();
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
+    }
+
+    /// Unlike `e`, `L` stays live while a management run is outstanding.
+    #[test]
+    fn shift_l_still_opens_while_a_management_run_is_outstanding() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+        open_the_management_gate(&mut app, management::Operation::Delete);
+        app.handle_key_event(press(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("press y");
+        assert!(app.management_running(), "sanity: the run is live");
+
+        let opened = press_l_and_drain(&mut app);
+
+        assert_eq!(
+            opened.len(),
+            1,
+            "L must open the log during a management run"
+        );
+        assert_eq!(app.notice(), None, "L must not answer with an inert Notice");
+
+        wait_for_management_run(&mut app);
+    }
+
+    /// The log handoff returns through the resume path every handoff shares, so a theme
+    /// changed while the editor held the terminal is reread, but a `config.toml` changed
+    /// then stays unread until `Ctrl+R` or `e`.
+    #[test]
+    fn opening_the_log_resumes_like_every_handoff_but_does_not_reload_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.data_dir = root.clone();
+        std::fs::write(root.join("repon.log"), "a line\n").expect("write the log");
+        let themes_dir = tempfile::tempdir().expect("themes dir");
+        let theme_file = themes_dir.path().join("custom.toml");
+        std::fs::write(&theme_file, "text = \"red\"\n").expect("write initial theme");
+        app.theme_name = "custom".to_string();
+        app.theme_source = theme::ThemeSource::Config;
+        app.themes_dir = themes_dir.path().to_path_buf();
+        app.reread_theme();
+        assert!(!app.document.show_submodules, "sanity: starts off");
+        let config_file = app.config_file.clone();
+        let config_text = format!(
+            "show_submodules = true\n\n[[set]]\nname = \"test\"\nroots = [\"{}\"]\n",
+            root.display()
+        );
+
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L");
+        app.run_log_editor_handoff(|_| {
+            std::fs::write(&theme_file, "text = \"blue\"\n").expect("rewrite theme");
+            std::fs::write(&config_file, &config_text).expect("rewrite config.toml");
+            Ok(())
+        });
+
+        assert_eq!(
+            app.theme.text,
+            ratatui::style::Color::Blue,
+            "returning from the log handoff must reread the theme like every handoff"
+        );
+        assert!(
+            !app.document.show_submodules,
+            "returning from the log handoff must not reload config"
+        );
+    }
+
+    /// A failed log handoff is logged rather than propagated, raises no Notice, and still
+    /// drains the press.
+    #[test]
+    fn a_failed_log_handoff_returns_normally_and_drains_the_press() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = app_with_a_log(&dir);
+
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L");
+        app.run_log_editor_handoff(|_| Err(color_eyre::eyre::eyre!("no editor")));
+
+        assert_eq!(app.notice(), None);
+        let mut reopened = false;
+        app.run_log_editor_handoff(|_| {
+            reopened = true;
+            Ok(())
+        });
+        assert!(!reopened, "a failed handoff still drains the press");
     }
 
     /// `e` ends in the identical `reload_config` a live fan-out must never race, so it is
