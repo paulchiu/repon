@@ -3617,8 +3617,12 @@ fn log_fetch_failures_once(failures: &FetchFailures, already_logged: &mut FetchF
     if failures == already_logged {
         return;
     }
-    for (path, message) in &failures.failed {
-        tracing::warn!(path = %path.display(), "periodic fetch failed: {message}");
+    for failure in &failures.failed {
+        tracing::warn!(
+            path = %failure.path.display(),
+            "periodic fetch failed: {}",
+            failure.message
+        );
     }
     *already_logged = failures.clone();
 }
@@ -11487,19 +11491,21 @@ mod tests {
     // --- `log_fetch_failures_once`: the fetch half of "every warning is reported twice",
     // mirroring `warnings::log_discovery_warning_once`'s own coverage. ---
 
+    fn fetch_failure(path: &str, message: &str, stale_locks: &[&str]) -> repon_core::FetchFailure {
+        repon_core::FetchFailure {
+            path: PathBuf::from(path),
+            message: message.to_string(),
+            stale_locks: stale_locks.iter().map(PathBuf::from).collect(),
+        }
+    }
+
     #[test]
     fn fetch_failures_are_logged_to_the_file_writer_with_their_paths() {
         let mut already_logged = FetchFailures::default();
         let failures = FetchFailures {
             failed: vec![
-                (
-                    PathBuf::from("/repos/a"),
-                    "failed to connect to remote: x".to_string(),
-                ),
-                (
-                    PathBuf::from("/repos/b"),
-                    "failed to open git repository: y".to_string(),
-                ),
+                fetch_failure("/repos/a", "failed to connect to remote: x", &[]),
+                fetch_failure("/repos/b", "failed to open git repository: y", &[]),
             ],
         };
 
@@ -11521,7 +11527,7 @@ mod tests {
     fn the_same_fetch_failures_are_logged_exactly_once_even_when_checked_every_tick() {
         let mut already_logged = FetchFailures::default();
         let failures = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
         };
 
         let logs = capture_tracing(|| {
@@ -11555,10 +11561,10 @@ mod tests {
     fn a_later_distinct_fetch_failure_set_is_logged_again() {
         let mut already_logged = FetchFailures::default();
         let first = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
         };
         let second = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/b"), "failed: y".to_string())],
+            failed: vec![fetch_failure("/repos/b", "failed: y", &[])],
         };
 
         let logs = capture_tracing(|| {

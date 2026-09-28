@@ -293,13 +293,24 @@ pub struct AutoUpdateSpec {
 /// repository `run_fetch_cycle` could not reach, never a reason another repository's
 /// own fetch was skipped.
 ///
-/// Carries the path and the underlying `FetchError`'s own text, for
-/// a consumer's log; a consumer's own screen-facing warning is expected to surface
-/// only `failed.len()`, the precedent `warnings.rs`'s `OnRefreshFailed` already sets
-/// for never putting remote-supplied text on screen.
+/// Each entry carries the path, the underlying `FetchError`'s own text and any stale ref
+/// lock found beside it, for a consumer's log and its expanded warning list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchFailures {
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<FetchFailure>,
+}
+
+/// One repository the periodic fetch could not fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchFailure {
+    /// The git common dir the cycle fetched.
+    pub path: PathBuf,
+    /// The underlying `FetchError`'s own text.
+    pub message: String,
+    /// `.lock` files left under that common dir's `refs/`, or its `packed-refs.lock`, read
+    /// after the failure: the likely cause, since an interrupted ref update leaves one behind
+    /// and every later fetch fails on it. Never deleted here.
+    pub stale_locks: Vec<PathBuf>,
 }
 
 /// How far the fetch cycle in flight has got: how many of the repositories it fans out
@@ -3755,7 +3766,7 @@ fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
     let auto_update_enabled = *auto_update_enabled;
     cycle_count.fetch_add(1, Ordering::Release);
 
-    let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    let failed: Mutex<Vec<FetchFailure>> = Mutex::new(Vec::new());
     crate::fetch::run_bounded(common_dirs, (*concurrency).max(1), |common_dir| {
         // Nothing parks here unless a test armed this boundary.
         #[cfg(test)]
@@ -3788,10 +3799,11 @@ fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
                     }
                 }
                 Err(error) => {
-                    failed
-                        .lock()
-                        .unwrap()
-                        .push((common_dir.clone(), error.to_string()));
+                    failed.lock().unwrap().push(FetchFailure {
+                        path: common_dir.clone(),
+                        message: error.to_string(),
+                        stale_locks: Vec::new(),
+                    });
                 }
             }
             // Counted however the attempt ended: the question the on-screen count answers
@@ -13044,7 +13056,7 @@ mod tests {
             );
             let failures = core.fetch_failures();
             assert!(
-                failures.failed[0].0.to_string_lossy().contains("bad"),
+                failures.failed[0].path.to_string_lossy().contains("bad"),
                 "the counted failure must name the repository that actually failed, got: {:?}",
                 failures.failed
             );
@@ -13508,7 +13520,7 @@ mod tests {
                 failures.failed
             );
             assert!(
-                failures.failed[0].0.to_string_lossy().contains("bad"),
+                failures.failed[0].path.to_string_lossy().contains("bad"),
                 "the counted failure must name the repository that actually failed, \
                  got: {:?}",
                 failures.failed
