@@ -78,6 +78,7 @@ mod landing;
 pub mod liveness;
 mod patch_equivalence;
 mod poll;
+mod ref_locks;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
@@ -86,10 +87,10 @@ mod wire;
 
 pub use cell::{Cell, Generation, Settled, Timestamp, Unknown};
 pub use core::AutoUpdateAttempt;
-pub use core::{FetchFailure, FetchFailures};
 pub use core::FetchProgress;
 pub use core::ManagementHandle;
 pub use core::{ActionSpec, AutoUpdateSpec, Core, CoreSpec, FetchSpec, RepoOverride, Step};
+pub use core::{FetchFailure, FetchFailures};
 pub use discovery::{Discovery, SetSpec, count, discover};
 pub use entity::ActionReceipt;
 pub use entity::AheadBehind;

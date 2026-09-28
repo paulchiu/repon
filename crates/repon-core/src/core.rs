@@ -3802,7 +3802,7 @@ fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
                     failed.lock().unwrap().push(FetchFailure {
                         path: common_dir.clone(),
                         message: error.to_string(),
-                        stale_locks: Vec::new(),
+                        stale_locks: crate::ref_locks::stale_ref_locks(&common_dir),
                     });
                 }
             }
@@ -13529,6 +13529,56 @@ mod tests {
             wait_for(
                 "the sibling repository to still fetch despite the other one failing",
                 || rev_parse(&good, "refs/remotes/origin/main") == good_remote_tip,
+            );
+        }
+
+        /// A failed repository holding a ref lock names it as the likely cause, and the
+        /// lock is only read, never removed. A sibling failing with no lock names none.
+        #[test]
+        fn a_failed_repository_names_the_stale_ref_locks_it_holds_and_leaves_them_in_place() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let locked = root_path.join("locked");
+            let unlocked = root_path.join("unlocked");
+            clone_into(remote.path(), &locked);
+            clone_into(remote.path(), &unlocked);
+            break_remote(&locked);
+            break_remote(&unlocked);
+            let tag_lock = locked.join(".git/refs/tags/v1.lock");
+            std::fs::create_dir_all(tag_lock.parent().unwrap()).expect("create refs/tags");
+            std::fs::write(&tag_lock, "").expect("write tag lock");
+            let packed_lock = locked.join(".git/packed-refs.lock");
+            std::fs::write(&packed_lock, "").expect("write packed-refs lock");
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path.clone()),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            core.fetch_now();
+
+            wait_for("both repositories to be counted as unreachable", || {
+                core.fetch_failures().failed.len() == 2
+            });
+            let failures = core.fetch_failures();
+            let named = |name: &str| {
+                failures
+                    .failed
+                    .iter()
+                    .find(|failure| failure.path.starts_with(root_path.join(name)))
+                    .unwrap_or_else(|| panic!("{name} failed, got: {:?}", failures.failed))
+            };
+            let mut locks = named("locked").stale_locks.clone();
+            locks.sort();
+            assert_eq!(locks, vec![packed_lock.clone(), tag_lock.clone()]);
+            assert!(named("unlocked").stale_locks.is_empty());
+            assert!(
+                tag_lock.exists() && packed_lock.exists(),
+                "locks are never removed"
             );
         }
 
