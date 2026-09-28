@@ -1016,13 +1016,14 @@ impl App {
         interior_height.saturating_sub(header_rows) as usize
     }
 
-    /// Recomputes `self.list_offset` from `self.cursor` and the current visible row count
-    /// ([`crate::list_viewport::offset_following_cursor`]). Called after every write to `self.cursor`
+    /// Clamps `self.cursor` onto the last visible row and recomputes `self.list_offset` from
+    /// it ([`crate::list_viewport::offset_following_cursor`]). Called after every write to `self.cursor`
     /// (`Self::move_cursor`, `Self::set_cursor`, which `Self::jump_cursor_to_failed_row` goes
     /// through) and everywhere else the visible row set can shrink under a standing cursor: a
     /// Filter committed or cleared, a Set switch, a config reload.
     fn follow_cursor(&mut self) {
         let row_count = self.visible_keys().len();
+        self.cursor = self.cursor.min(row_count.saturating_sub(1));
         let viewport_rows = self.list_viewport_rows();
         self.list_offset =
             offset_following_cursor(self.list_offset, self.cursor, viewport_rows, row_count);
@@ -4205,9 +4206,75 @@ mod tests {
 
         assert_eq!(
             app.list_offset, 5,
-            "the standing cursor (19) is now past the narrowed table's own end (10 rows); \
-             the offset must clamp to the largest window that still describes real rows: \
-             [5, 10)"
+            "the cursor (19) was past the narrowed table's own end (10 rows), so it clamps \
+             onto the last row and the offset to the window that contains it: [5, 10)"
+        );
+    }
+
+    /// A Filter that hides the cursor's own row and leaves fewer rows than its offset puts
+    /// the cursor on the last row still drawn, rather than on an offset naming no row.
+    #[test]
+    fn a_filter_narrowing_the_table_below_the_cursor_lands_it_on_the_last_visible_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in ["api-one", "api-two", "web-x", "web-y", "web-z"] {
+            init_repo(&root.join(name));
+        }
+        let mut app = test_app(&root);
+        app.row_order = RowOrder::cold_start();
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("dispatch / to open the filter line");
+        for c in "api".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("dispatch a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("dispatch Enter to commit the filter");
+
+        assert_eq!(
+            app.cursor_key(),
+            Some(EntityKey::new(std::sync::Arc::from(
+                root.join("api-two").as_path()
+            )))
+        );
+    }
+
+    /// With nothing checked, the Action palette opened after that Filter counts the rows the
+    /// Filter left, not zero.
+    #[test]
+    fn the_action_palette_counts_every_row_a_filter_left_below_the_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        for name in ["api-one", "api-two", "web-x", "web-y", "web-z"] {
+            init_repo(&root.join(name));
+        }
+        let mut app = test_app(&root);
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+
+        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("dispatch / to open the filter line");
+        for c in "api".chars() {
+            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .expect("dispatch a filter character");
+        }
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("dispatch Enter to commit the filter");
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+
+        let title = border_title_line(&mut app);
+        assert!(
+            title.contains("run on 2 visible"),
+            "the Filter left two rows, got: {title}"
         );
     }
 
@@ -16503,9 +16570,8 @@ refresh_all = "z""#,
     }
 
     /// Mirrors `the_viewport_stays_valid_when_a_filter_shrinks_the_table_under_a_standing_cursor`
-    /// in the opposite direction: clearing a Filter through `Alt+/` must widen the viewport
-    /// under a standing cursor exactly as the unwind rung's own call to `follow_cursor` does,
-    /// rather than leaving the window describing rows the cursor no longer sits near.
+    /// in the opposite direction: clearing a Filter through `Alt+/` must leave the viewport
+    /// containing the cursor, exactly as the unwind rung's own call to `follow_cursor` does.
     #[test]
     fn alt_slash_widens_the_viewport_under_a_standing_cursor_the_way_the_unwind_rung_does() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -16538,9 +16604,10 @@ refresh_all = "z""#,
 
         assert_eq!(app.visible_keys().len(), 20, "the full table is back");
         assert_eq!(
-            app.list_offset, 15,
-            "the viewport must widen back to a window that actually contains the standing \
-             cursor (19), the same way the unwind rung's own follow_cursor call would"
+            (app.cursor, app.list_offset),
+            (9, 5),
+            "the Filter clamped the cursor onto its last row (9), and widening the table \
+             must leave it there inside a window that still contains it"
         );
     }
 
