@@ -1061,6 +1061,10 @@ impl App {
                 self.pending_config_editor_handoff = false;
                 self.run_config_editor_handoff(&mut tui);
             }
+            if self.pending_log_editor_handoff {
+                self.pending_log_editor_handoff = false;
+                self.open_app_log_with(|path| editor::open(&mut tui, path));
+            }
             if self.should_quit {
                 tui.stop();
                 break;
@@ -3166,6 +3170,16 @@ impl App {
         match edited {
             Ok(text) => self.write_and_reload_config(text),
             Err(err) => tracing::error!("config $EDITOR handoff failed: {err:#}"),
+        }
+    }
+
+    /// Drains `self.pending_log_editor_handoff`: hands `self.log_file` to `open` inside the
+    /// same pause/resume lifecycle every `$EDITOR` handoff shares, and reloads nothing on
+    /// return, since Repon only reads the log's path. A failed handoff is logged.
+    fn open_app_log_with(&mut self, open: impl FnOnce(&std::path::Path) -> Result<()>) {
+        let path = self.log_file.clone();
+        if let Err(err) = self.around_ad_hoc_editor_handoff(|| open(&path)) {
+            tracing::error!("log $EDITOR handoff failed: {err:#}");
         }
     }
 
@@ -14235,10 +14249,10 @@ refresh_all = "z""#,
         );
     }
 
-    /// A future reader who sees `Action::OpenInEditor` or `Action::EditConfig` handled here
-    /// and wonders whether either reaches `Tui::suspend_for_child` through an implementation
-    /// of its own needs the answer sitting in this file's own source, not only in this test's
-    /// passing: exactly two calls to `editor::edit`, one per handoff, both this file's own
+    /// A future reader who sees `Action::OpenInEditor`, `Action::EditConfig` or
+    /// `Action::OpenAppLog` handled here and wonders whether any reaches
+    /// `Tui::suspend_for_child` through an implementation of its own needs the answer sitting in this file's own source, not only in this test's
+    /// passing: two calls to `editor::edit` and one to `editor::open`, all this file's own
     /// reuse of the Launcher's own handoff machinery, and no direct call to
     /// `suspend_for_child` or a raw `Command` spawn attempting a third implementation.
     #[test]
@@ -14258,6 +14272,14 @@ refresh_all = "z""#,
             edit_calls, 2,
             "expected exactly two calls to `editor::edit` in app.rs's own production code, \
              one for the ad hoc command field and one for editing config.toml"
+        );
+        assert_eq!(
+            code_lines
+                .iter()
+                .filter(|line| line.contains("editor::open("))
+                .count(),
+            1,
+            "expected exactly one call to `editor::open`, for opening repon.log"
         );
         assert!(
             !code_lines
@@ -14368,6 +14390,43 @@ refresh_all = "z""#,
         wait_for("the cancelled fan-out to finish", || {
             !app.core.action_running()
         });
+    }
+
+    /// Returning from the log handoff reloads nothing: a `config.toml` changed on disk
+    /// while the editor held the terminal stays unread until `Ctrl+R` or `e`.
+    #[test]
+    fn opening_the_app_log_hands_over_its_path_and_does_not_reload_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let config_dir = tempfile::tempdir().expect("config temp dir");
+        let mut app = test_app_with_config(&root, config_dir.path());
+        app.log_file = dir.path().join("repon.log");
+        assert!(!app.document.show_submodules, "sanity: starts off");
+        std::fs::write(
+            &app.config_file,
+            format!(
+                "show_submodules = true\n\n[[set]]\nname = \"test\"\nroots = [\"{}\"]\n",
+                root.display()
+            ),
+        )
+        .expect("rewrite config.toml under the handoff");
+
+        let mut opened = None;
+        app.open_app_log_with(|path| {
+            opened = Some(path.to_path_buf());
+            Ok(())
+        });
+
+        assert_eq!(
+            opened,
+            Some(app.log_file.clone()),
+            "the opener gets the log path"
+        );
+        assert!(
+            !app.document.show_submodules,
+            "returning from the log handoff must not reload config"
+        );
     }
 
     /// `e` ends in the identical `reload_config` a live fan-out must never race, so it is

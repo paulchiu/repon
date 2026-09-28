@@ -22,11 +22,7 @@ pub fn edit(tui: &mut Tui, initial_text: &str) -> Result<String> {
         .wrap_err("write the scratch file")?;
     file.flush().wrap_err("flush the scratch file")?;
 
-    let argv = Source::EditorChain.resolve_argv(|name| std::env::var(name).ok());
-    let mut command = command_from_argv(&argv);
-    command.arg(file.path());
-
-    tui.suspend_for_child(&mut command)?;
+    open(tui, file.path())?;
 
     let mut edited = String::new();
     std::fs::File::open(file.path())
@@ -34,6 +30,16 @@ pub fn edit(tui: &mut Tui, initial_text: &str) -> Result<String> {
         .read_to_string(&mut edited)
         .wrap_err("read the edited scratch file")?;
     Ok(edited)
+}
+
+/// Opens `path` itself, not a scratch copy, in the resolved editor chain through the same
+/// suspension [`edit`] uses, for a file the user reads in place such as `repon.log`.
+pub fn open(tui: &mut Tui, path: &std::path::Path) -> Result<()> {
+    let argv = Source::EditorChain.resolve_argv(|name| std::env::var(name).ok());
+    let mut command = command_from_argv(&argv);
+    command.arg(path);
+    tui.suspend_for_child(&mut command)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -47,5 +53,11 @@ mod tests {
     fn edit_takes_and_returns_plain_text_never_a_launcher() {
         fn assert_signature(_: fn(&mut Tui, &str) -> Result<String>) {}
         assert_signature(edit);
+    }
+
+    #[test]
+    fn open_takes_a_path_and_returns_nothing_but_success() {
+        fn assert_signature(_: fn(&mut Tui, &std::path::Path) -> Result<()>) {}
+        assert_signature(open);
     }
 }
