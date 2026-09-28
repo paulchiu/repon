@@ -3618,9 +3618,12 @@ fn log_fetch_failures_once(failures: &FetchFailures, already_logged: &mut FetchF
         return;
     }
     for failure in &failures.failed {
+        let hint = warnings::stale_lock_hint(&failure.stale_locks)
+            .map(|hint| format!(" ({hint})"))
+            .unwrap_or_default();
         tracing::warn!(
             path = %failure.path.display(),
-            "periodic fetch failed: {}",
+            "periodic fetch failed: {}{hint}",
             failure.message
         );
     }
@@ -11541,6 +11544,44 @@ mod tests {
             1,
             "expected exactly one log line despite five checks against the same still-set \
              failures, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_failure_holding_a_stale_ref_lock_logs_the_lock_as_the_likely_cause() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![fetch_failure(
+                "/repos/a/.git",
+                "failed to fetch: update refs",
+                &["/repos/a/.git/refs/tags/v1.lock"],
+            )],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&failures, &mut already_logged);
+        });
+
+        assert!(
+            logs.contains("likely a stale lock: /repos/a/.git/refs/tags/v1.lock"),
+            "expected the lock named as the likely cause, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_failure_with_no_lock_logs_no_lock_hint() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&failures, &mut already_logged);
+        });
+
+        assert!(
+            !logs.contains("lock"),
+            "expected no lock hint, got: {logs:?}"
         );
     }
 

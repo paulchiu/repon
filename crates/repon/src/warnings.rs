@@ -169,6 +169,18 @@ impl WarningSources {
     }
 }
 
+/// Names `locks` as the likely cause of a fetch failure, or `None` when there are none.
+pub(crate) fn stale_lock_hint(locks: &[std::path::PathBuf]) -> Option<String> {
+    if locks.is_empty() {
+        return None;
+    }
+    let paths: Vec<String> = locks
+        .iter()
+        .map(|lock| lock.display().to_string())
+        .collect();
+    Some(format!("likely a stale lock: {}", paths.join(", ")))
+}
+
 /// The single most severe warning in `warnings`, or `None` if there are none. Position in
 /// the slice does not matter: [`Warning::rank`] alone decides, so the most severe condition
 /// wins whether it arrived first, last, or is outnumbered by the rest.
