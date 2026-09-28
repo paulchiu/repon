@@ -28,6 +28,7 @@
 //! ([0001](../../../../docs/adr/0001-per-cell-provenance.md)).
 
 use ratatui::{Frame, layout::Rect, text::Line};
+use repon_core::FetchFailure;
 
 use crate::{
     config,
@@ -51,10 +52,9 @@ pub(crate) enum Warning {
         action: String,
         entities: usize,
     },
-    /// How many repositories the periodic fetch's most recently completed cycle could not
-    /// fetch. Never the underlying error text: it is arbitrary bytes from a remote, the same
-    /// reason [`Warning::OnRefreshFailed`] never carries a step's own captured output.
-    FetchFailed(usize),
+    /// Every repository the periodic fetch's most recently completed cycle could not fetch.
+    /// The status row shows only the count; the expanded list ([`draw_overlay`]) names each.
+    FetchFailed(Vec<FetchFailure>),
     DiscoveryAbandoned(String),
     /// How many Entities are currently Vanished
     /// rows present that no longer
@@ -100,8 +100,8 @@ impl std::fmt::Display for Warning {
             Warning::OnRefreshFailed { action, entities } => {
                 write!(f, "on_refresh `{action}` failed a step on {entities} rows")
             }
-            Warning::FetchFailed(count) => {
-                write!(f, "periodic fetch failed on {count} repositories")
+            Warning::FetchFailed(failed) => {
+                write!(f, "periodic fetch failed on {} repositories", failed.len())
             }
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
             Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
@@ -123,12 +123,12 @@ pub(crate) struct WarningSources {
     /// the condition clears itself the moment a later run replaces those receipts, the same
     /// unlatched shape `vanished` below takes.
     pub(crate) on_refresh_failed: Option<(String, usize)>,
-    /// How many repositories the periodic fetch's most recently completed cycle could not
-    /// fetch, read fresh from [`repon_core::Core::fetch_failures`] every time this struct is
-    /// built rather than latched, the same unlatched shape `vanished` below takes: a later
-    /// cycle where every fetch succeeds clears the condition with nothing to reset by hand.
-    /// Zero contributes no warning.
-    pub(crate) fetch_failed: usize,
+    /// Every repository the periodic fetch's most recently completed cycle could not fetch,
+    /// read fresh from [`repon_core::Core::fetch_failures`] every time this struct is built
+    /// rather than latched, the same unlatched shape `vanished` below takes: a later cycle
+    /// where every fetch succeeds clears the condition with nothing to reset by hand. Empty
+    /// contributes no warning.
+    pub(crate) fetch_failed: Vec<FetchFailure>,
     pub(crate) discovery_abandoned: Option<String>,
     /// How many Entities are Vanished right now, read fresh from the live snapshot every
     /// time this struct is built rather than latched, which is what lets the condition clear
@@ -154,7 +154,7 @@ impl WarningSources {
         if let Some((action, entities)) = on_refresh_failed.filter(|(_, entities)| *entities > 0) {
             warnings.push(Warning::OnRefreshFailed { action, entities });
         }
-        if fetch_failed > 0 {
+        if !fetch_failed.is_empty() {
             warnings.push(Warning::FetchFailed(fetch_failed));
         }
         warnings.extend(
@@ -250,18 +250,32 @@ pub(crate) fn draw_overlay(
     frame.render_widget(block, area);
 
     let buf = frame.buffer_mut();
-    for (row, warning) in sorted_by_severity(warnings)
+    for (row, line) in overlay_lines(warnings)
         .iter()
         .take(interior.height as usize)
         .enumerate()
     {
-        buf.set_string(
-            interior.x,
-            interior.y + row as u16,
-            warning.to_string(),
-            style,
-        );
+        buf.set_string(interior.x, interior.y + row as u16, line, style);
     }
+}
+
+/// The expanded list's lines, most severe warning first: each warning's own text, then for a
+/// fetch failure one indented line per repository naming its path and error.
+fn overlay_lines(warnings: &[Warning]) -> Vec<String> {
+    sorted_by_severity(warnings)
+        .into_iter()
+        .flat_map(|warning| {
+            let details = match warning {
+                Warning::FetchFailed(failed) => failed.iter().map(fetch_failure_line).collect(),
+                _ => Vec::new(),
+            };
+            std::iter::once(warning.to_string()).chain(details)
+        })
+        .collect()
+}
+
+fn fetch_failure_line(failure: &FetchFailure) -> String {
+    format!("  {}: {}", failure.path.display(), failure.message)
 }
 
 /// Logs `discovery_warning` to `repon.log` the first time it is observed, and never again:
@@ -314,8 +328,22 @@ mod tests {
         }
     }
 
+    fn fetch_failure(path: &str, message: &str, stale_locks: &[&str]) -> FetchFailure {
+        FetchFailure {
+            path: std::path::PathBuf::from(path),
+            message: message.to_string(),
+            stale_locks: stale_locks.iter().map(std::path::PathBuf::from).collect(),
+        }
+    }
+
+    fn failures(count: usize) -> Vec<FetchFailure> {
+        (0..count)
+            .map(|index| fetch_failure(&format!("/repos/{index}"), "failed: x", &[]))
+            .collect()
+    }
+
     fn fetch_failed(count: usize) -> Warning {
-        Warning::FetchFailed(count)
+        Warning::FetchFailed(failures(count))
     }
 
     // --- WarningSources: the compile-time forcing function ---
@@ -328,7 +356,7 @@ mod tests {
             }],
             config: vec![document::Warning::SetNamedAll],
             on_refresh_failed: Some(("sync".to_string(), 3)),
-            fetch_failed: 4,
+            fetch_failed: failures(4),
             discovery_abandoned: Some("discovery: stopped at 5 directories".to_string()),
             vanished: 2,
         };
@@ -357,7 +385,7 @@ mod tests {
             // contributes no warning, exactly as a zero Vanished count does.
             on_refresh_failed: Some(("sync".to_string(), 0)),
             // A cycle where every fetch succeeded is the same zero, contributing nothing.
-            fetch_failed: 0,
+            fetch_failed: Vec::new(),
             discovery_abandoned: None,
             vanished: 0,
         };
@@ -451,6 +479,22 @@ mod tests {
         assert!(
             line.contains("w to expand"),
             "expected the compiled default's `w` binding named, got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_failure_in_the_slot_is_its_count_alone_never_a_path_or_error() {
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            "/repos/a/.git",
+            "failed: x",
+            &["/repos/a/.git/packed-refs.lock"],
+        )])];
+
+        let line = slot_line(&warnings, &BindingTable::compiled_default());
+
+        assert_eq!(
+            line.as_deref(),
+            Some("periodic fetch failed on 1 repositories")
         );
     }
 
@@ -555,6 +599,29 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("unknown theme key `a`")),
             "expected the theme warning listed, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_expansion_lists_each_failed_repository_with_its_error_beneath_the_fetch_summary() {
+        let warnings = vec![Warning::FetchFailed(vec![
+            fetch_failure("/repos/a/.git", "failed to connect to remote: x", &[]),
+            fetch_failure("/repos/b/.git", "failed to fetch: y", &[]),
+        ])];
+
+        let lines = render_overlay(&warnings, 5);
+
+        assert!(
+            lines[1].contains("periodic fetch failed on 2 repositories"),
+            "expected the summary first, got: {lines:?}"
+        );
+        assert!(
+            lines[2].contains("/repos/a/.git: failed to connect to remote: x"),
+            "expected the first repository and its error beneath the summary, got: {lines:?}"
+        );
+        assert!(
+            lines[3].contains("/repos/b/.git: failed to fetch: y"),
+            "expected the second repository and its error, got: {lines:?}"
         );
     }
 

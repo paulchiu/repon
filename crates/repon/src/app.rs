@@ -842,7 +842,7 @@ impl App {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             on_refresh_failed,
-            fetch_failed: fetch_failures.failed.len(),
+            fetch_failed: fetch_failures.failed,
             discovery_abandoned,
             vanished,
         }
