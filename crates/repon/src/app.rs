@@ -1140,6 +1140,8 @@ impl App {
         // A Notice takes the status row from the warning slot, so one that outlives the press
         // it answered hides every warning behind it for the rest of the run.
         self.notice = None;
+        // A refresh can shrink a state Filter's table under the cursor with no keypress.
+        self.follow_cursor();
         if self.quit_confirm {
             self.handle_quit_confirm_key(key);
             return Ok(());
@@ -4211,16 +4213,13 @@ mod tests {
         );
     }
 
-    /// A Filter that hides the cursor's own row and leaves fewer rows than its offset puts
-    /// the cursor on the last row still drawn, rather than on an offset naming no row.
-    #[test]
-    fn a_filter_narrowing_the_table_below_the_cursor_lands_it_on_the_last_visible_row() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+    /// Five repos under `root` in name order, the cursor on the last (`web-z`), then the
+    /// Filter `api` committed, which leaves two rows above the cursor's old offset.
+    fn filter_to_api_from_the_last_row(root: &std::path::Path) -> App {
         for name in ["api-one", "api-two", "web-x", "web-y", "web-z"] {
             init_repo(&root.join(name));
         }
-        let mut app = test_app(&root);
+        let mut app = test_app(root);
         app.row_order = RowOrder::cold_start();
         app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
             .expect("dispatch G");
@@ -4233,6 +4232,17 @@ mod tests {
         }
         app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
             .expect("dispatch Enter to commit the filter");
+        app
+    }
+
+    /// A Filter that hides the cursor's own row and leaves fewer rows than its offset puts
+    /// the cursor on the last row still drawn, rather than on an offset naming no row.
+    #[test]
+    fn a_filter_narrowing_the_table_below_the_cursor_lands_it_on_the_last_visible_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+
+        let app = filter_to_api_from_the_last_row(&root);
 
         assert_eq!(
             app.cursor_key(),
@@ -4248,26 +4258,13 @@ mod tests {
     fn the_action_palette_counts_every_row_a_filter_left_below_the_cursor() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        for name in ["api-one", "api-two", "web-x", "web-y", "web-z"] {
-            init_repo(&root.join(name));
-        }
-        let mut app = test_app(&root);
+        let mut app = filter_to_api_from_the_last_row(&root);
         app.document.actions.push(action_config(
             "reinstall",
             true,
             std::path::Path::new("marker"),
         ));
-        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
-            .expect("dispatch G");
 
-        app.handle_key_event(press(KeyCode::Char('/'), KeyModifiers::NONE))
-            .expect("dispatch / to open the filter line");
-        for c in "api".chars() {
-            app.handle_key_event(press(KeyCode::Char(c), KeyModifiers::NONE))
-                .expect("dispatch a filter character");
-        }
-        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("dispatch Enter to commit the filter");
         app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
             .expect("open the palette");
 
@@ -4275,6 +4272,54 @@ mod tests {
         assert!(
             title.contains("run on 2 visible"),
             "the Filter left two rows, got: {title}"
+        );
+    }
+
+    /// A refresh that drops the cursor's row out of a state Filter shrinks the table with no
+    /// keypress at all; the next key still acts on a row that is drawn.
+    #[test]
+    fn a_refresh_dropping_the_cursor_row_out_of_the_filter_leaves_the_palette_a_real_count() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = canonical_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create the discovery root");
+        let _repo_a = behind_repo(&canonical_dir, &root, "repo-a");
+        let _repo_b = behind_repo(&canonical_dir, &root, "repo-b");
+
+        let mut app = test_app(&root);
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("discovery's own first probe to settle");
+        app.row_order = RowOrder::cold_start();
+        app.filter = Filter::parse("sync:behind");
+        app.document.actions.push(action_config(
+            "reinstall",
+            true,
+            std::path::Path::new("marker"),
+        ));
+        app.handle_key_event(press(KeyCode::Char('G'), KeyModifiers::SHIFT))
+            .expect("dispatch G");
+        let repo_b_key = app.cursor_key().expect("repo-b under the cursor");
+
+        app.core
+            .management_handle()
+            .attempt_auto_update(&repo_b_key);
+        app.core.refresh(std::slice::from_ref(&repo_b_key));
+        app.core
+            .try_settle(FIXTURE_LIFETIME)
+            .expect("the re-probe to settle");
+        assert_eq!(
+            app.visible_keys().len(),
+            1,
+            "sanity: repo-b caught up and left sync:behind"
+        );
+
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        let title = border_title_line(&mut app);
+        assert!(
+            title.contains("run on 1 visible"),
+            "repo-a is still drawn, got: {title}"
         );
     }
 
