@@ -59,6 +59,8 @@ Rank 9 is the **range anchor**: the literal text `range anchor`, present only wh
 
 `w` **acknowledges**. Opening the expanded list marks every currently outstanding condition seen, and the row falls back to the indicator alone, freeing the message's columns for the items below it. A condition arriving that has not been seen expands the row again. Acknowledgement is not dismissal: the indicator keeps its full count either way, and a condition leaves the row only by ceasing to be true. It is session state and never persists ([0006](../adr/0006-no-git-state-cache-session-state-by-name.md)).
 
+The expanded list shows each condition's own message, most severe first, and a periodic fetch failure adds one indented line per failed repository beneath it, naming its path and error, and one further line naming any stale ref lock found there, relative to that path ([refresh.md](refresh.md)'s "The periodic fetch"). The row itself never carries that detail. The per-repository lines get only the rows left once every outstanding condition has its own, so a long run of failures ends in a `+N more, see repon.log` line rather than hiding a less severe condition. Every line is cut to the list's interior width, measured in display columns, with the truncation glyph rather than wrapping or spilling over the border.
+
 One warning outstanding and unacknowledged, a run in flight, so every item is live:
 
 ```

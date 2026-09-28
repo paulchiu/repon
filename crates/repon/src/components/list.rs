@@ -662,7 +662,11 @@ fn write_truncating_cell(
 /// [`ratatui::text::Span::width`], the same `UnicodeWidthStr::width()` function
 /// `Buffer::set_stringn` itself budgets with (ADR 0020), so this can never disagree with what
 /// the renderer was about to cut anyway.
-fn truncate_with_mark(text: &str, max_width: u16, mark: char) -> std::borrow::Cow<'_, str> {
+pub(crate) fn truncate_with_mark(
+    text: &str,
+    max_width: u16,
+    mark: char,
+) -> std::borrow::Cow<'_, str> {
     use unicode_segmentation::UnicodeSegmentation;
 
     if ratatui::text::Span::raw(text).width() <= max_width as usize {

@@ -293,13 +293,23 @@ pub struct AutoUpdateSpec {
 /// repository `run_fetch_cycle` could not reach, never a reason another repository's
 /// own fetch was skipped.
 ///
-/// Carries the path and the underlying `FetchError`'s own text, for
-/// a consumer's log; a consumer's own screen-facing warning is expected to surface
-/// only `failed.len()`, the precedent `warnings.rs`'s `OnRefreshFailed` already sets
-/// for never putting remote-supplied text on screen.
+/// Each entry carries the path, the underlying `FetchError`'s own text and any stale ref
+/// lock found beside it, for a consumer's log and its expanded warning list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchFailures {
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<FetchFailure>,
+}
+
+/// One repository the periodic fetch could not fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchFailure {
+    /// The git common dir the cycle fetched.
+    pub path: PathBuf,
+    /// The underlying `FetchError`'s own text.
+    pub message: String,
+    /// The `.lock` files found under this repository's `refs/`, or its `packed-refs.lock`,
+    /// after the failure: the GLOSSARY's stale ref locks.
+    pub stale_locks: Vec<PathBuf>,
 }
 
 /// How far the fetch cycle in flight has got: how many of the repositories it fans out
@@ -3755,7 +3765,7 @@ fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
     let auto_update_enabled = *auto_update_enabled;
     cycle_count.fetch_add(1, Ordering::Release);
 
-    let failed: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    let failed: Mutex<Vec<FetchFailure>> = Mutex::new(Vec::new());
     crate::fetch::run_bounded(common_dirs, (*concurrency).max(1), |common_dir| {
         // Nothing parks here unless a test armed this boundary.
         #[cfg(test)]
@@ -3788,10 +3798,11 @@ fn run_fetch_cycle(work: &FetchCycleWork, common_dirs: Vec<PathBuf>) {
                     }
                 }
                 Err(error) => {
-                    failed
-                        .lock()
-                        .unwrap()
-                        .push((common_dir.clone(), error.to_string()));
+                    failed.lock().unwrap().push(FetchFailure {
+                        path: common_dir.clone(),
+                        message: error.to_string(),
+                        stale_locks: crate::ref_locks::stale_ref_locks(&common_dir),
+                    });
                 }
             }
             // Counted however the attempt ended: the question the on-screen count answers
@@ -13044,7 +13055,7 @@ mod tests {
             );
             let failures = core.fetch_failures();
             assert!(
-                failures.failed[0].0.to_string_lossy().contains("bad"),
+                failures.failed[0].path.to_string_lossy().contains("bad"),
                 "the counted failure must name the repository that actually failed, got: {:?}",
                 failures.failed
             );
@@ -13508,7 +13519,7 @@ mod tests {
                 failures.failed
             );
             assert!(
-                failures.failed[0].0.to_string_lossy().contains("bad"),
+                failures.failed[0].path.to_string_lossy().contains("bad"),
                 "the counted failure must name the repository that actually failed, \
                  got: {:?}",
                 failures.failed
@@ -13517,6 +13528,56 @@ mod tests {
             wait_for(
                 "the sibling repository to still fetch despite the other one failing",
                 || rev_parse(&good, "refs/remotes/origin/main") == good_remote_tip,
+            );
+        }
+
+        /// A failed repository holding a ref lock names it as the likely cause, and the
+        /// lock is only read, never removed. A sibling failing with no lock names none.
+        #[test]
+        fn a_failed_repository_names_the_stale_ref_locks_it_holds_and_leaves_them_in_place() {
+            let remote = seeded_remote();
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root_of(&root);
+            let locked = root_path.join("locked");
+            let unlocked = root_path.join("unlocked");
+            clone_into(remote.path(), &locked);
+            clone_into(remote.path(), &unlocked);
+            break_remote(&locked);
+            break_remote(&unlocked);
+            let tag_lock = locked.join(".git/refs/tags/v1.lock");
+            std::fs::create_dir_all(tag_lock.parent().unwrap()).expect("create refs/tags");
+            std::fs::write(&tag_lock, "").expect("write tag lock");
+            let packed_lock = locked.join(".git/packed-refs.lock");
+            std::fs::write(&packed_lock, "").expect("write packed-refs lock");
+
+            let started = Core::start_for_test_with_fetch(
+                fetch_spec(false, root_path.clone()),
+                Duration::from_secs(3600),
+                crossbeam_channel::never(),
+                crossbeam_channel::never(),
+            )
+            .discovered();
+            let core = started.core;
+            core.fetch_now();
+
+            wait_for("both repositories to be counted as unreachable", || {
+                core.fetch_failures().failed.len() == 2
+            });
+            let failures = core.fetch_failures();
+            let named = |name: &str| {
+                failures
+                    .failed
+                    .iter()
+                    .find(|failure| failure.path.starts_with(root_path.join(name)))
+                    .unwrap_or_else(|| panic!("{name} failed, got: {:?}", failures.failed))
+            };
+            let mut locks = named("locked").stale_locks.clone();
+            locks.sort();
+            assert_eq!(locks, vec![packed_lock.clone(), tag_lock.clone()]);
+            assert!(named("unlocked").stale_locks.is_empty());
+            assert!(
+                tag_lock.exists() && packed_lock.exists(),
+                "locks are never removed"
             );
         }
 

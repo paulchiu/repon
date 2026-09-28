@@ -842,7 +842,7 @@ impl App {
             theme: self.theme_warnings.clone(),
             config: self.config_warnings.clone(),
             on_refresh_failed,
-            fetch_failed: fetch_failures.failed.len(),
+            fetch_failed: fetch_failures.failed,
             discovery_abandoned,
             vanished,
         }
@@ -3610,15 +3610,28 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
 /// Logs `failures`'s own entries to `repon.log` once per distinct set of them, mirroring
 /// [`warnings::log_discovery_warning_once`]: the periodic fetch's own half of "every warning
 /// is reported twice". A cycle whose failures exactly repeat the last logged set is not
-/// re-logged, since nothing new happened to report; the path and the underlying
-/// `FetchError`'s own text both reach the log, unlike the Warning's own screen text, since
-/// neither is drawn here.
+/// re-logged, since nothing new happened to report. Each line carries the path, the
+/// underlying `FetchError`'s own text and any stale ref lock, by its absolute path.
 fn log_fetch_failures_once(failures: &FetchFailures, already_logged: &mut FetchFailures) {
     if failures == already_logged {
         return;
     }
-    for (path, message) in &failures.failed {
-        tracing::warn!(path = %path.display(), "periodic fetch failed: {message}");
+    for failure in &failures.failed {
+        let hint = if failure.stale_locks.is_empty() {
+            String::new()
+        } else {
+            let locks: Vec<String> = failure
+                .stale_locks
+                .iter()
+                .map(|lock| lock.display().to_string())
+                .collect();
+            format!(" (likely a stale lock: {})", locks.join(", "))
+        };
+        tracing::warn!(
+            path = %failure.path.display(),
+            "periodic fetch failed: {}{hint}",
+            failure.message
+        );
     }
     *already_logged = failures.clone();
 }
@@ -3697,7 +3710,9 @@ mod tests {
     use crate::{
         config::document,
         help::{HelpLayout, HelpLine},
-        test_support::{capture_tracing, production_source_at, rust_source_files, source_region},
+        test_support::{
+            capture_tracing, fetch_failure, production_source_at, rust_source_files, source_region,
+        },
     };
 
     /// Inits a real disposable git repository at `path` with one empty commit, the same
@@ -11484,6 +11499,45 @@ mod tests {
         );
     }
 
+    /// A fetch that fails beside a stale ref lock reaches the warning list with its path,
+    /// its error and the lock, straight from core.
+    #[test]
+    fn a_failed_fetch_reaches_current_warnings_with_its_path_error_and_stale_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "/nonexistent-remote"])
+            .status()
+            .expect("run git remote add");
+        assert!(status.success());
+        let lock = repo.join(".git/refs/tags/v1.lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).expect("create refs/tags");
+        std::fs::write(&lock, "").expect("write tag lock");
+        let mut app = test_app(&root);
+
+        app.core.fetch_now();
+        wait_for("the fetch to fail", || {
+            !app.core.fetch_failures().failed.is_empty()
+        });
+        let warnings = app.current_warnings(&app.core.snapshot());
+
+        let failed = warnings
+            .iter()
+            .find_map(|warning| match warning {
+                Warning::FetchFailed(failed) => Some(failed),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a fetch failure, got: {warnings:?}"));
+        assert_eq!(failed.len(), 1, "got: {failed:?}");
+        assert!(failed[0].path.starts_with(&repo), "got: {failed:?}");
+        assert!(!failed[0].message.is_empty(), "got: {failed:?}");
+        assert_eq!(failed[0].stale_locks, vec![lock]);
+    }
+
     // --- `log_fetch_failures_once`: the fetch half of "every warning is reported twice",
     // mirroring `warnings::log_discovery_warning_once`'s own coverage. ---
 
@@ -11492,14 +11546,8 @@ mod tests {
         let mut already_logged = FetchFailures::default();
         let failures = FetchFailures {
             failed: vec![
-                (
-                    PathBuf::from("/repos/a"),
-                    "failed to connect to remote: x".to_string(),
-                ),
-                (
-                    PathBuf::from("/repos/b"),
-                    "failed to open git repository: y".to_string(),
-                ),
+                fetch_failure("/repos/a", "failed to connect to remote: x", &[]),
+                fetch_failure("/repos/b", "failed to open git repository: y", &[]),
             ],
         };
 
@@ -11521,7 +11569,7 @@ mod tests {
     fn the_same_fetch_failures_are_logged_exactly_once_even_when_checked_every_tick() {
         let mut already_logged = FetchFailures::default();
         let failures = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
         };
 
         let logs = capture_tracing(|| {
@@ -11535,6 +11583,48 @@ mod tests {
             1,
             "expected exactly one log line despite five checks against the same still-set \
              failures, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_failure_holding_a_stale_ref_lock_logs_the_lock_as_the_likely_cause() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![fetch_failure(
+                "/repos/a/.git",
+                "failed to fetch: update refs",
+                &["/repos/a/.git/refs/tags/v1.lock"],
+            )],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&failures, &mut already_logged);
+        });
+
+        assert!(
+            logs.lines().any(|line| line.contains("/repos/a/.git")
+                && line.contains(
+                    "periodic fetch failed: failed to fetch: update refs \
+                     (likely a stale lock: /repos/a/.git/refs/tags/v1.lock)"
+                )),
+            "expected the lock named as the likely cause, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_failure_with_no_lock_logs_no_lock_hint() {
+        let mut already_logged = FetchFailures::default();
+        let failures = FetchFailures {
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
+        };
+
+        let logs = capture_tracing(|| {
+            log_fetch_failures_once(&failures, &mut already_logged);
+        });
+
+        assert!(
+            !logs.contains("likely a stale lock"),
+            "expected no lock hint, got: {logs:?}"
         );
     }
 
@@ -11555,10 +11645,10 @@ mod tests {
     fn a_later_distinct_fetch_failure_set_is_logged_again() {
         let mut already_logged = FetchFailures::default();
         let first = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/a"), "failed: x".to_string())],
+            failed: vec![fetch_failure("/repos/a", "failed: x", &[])],
         };
         let second = FetchFailures {
-            failed: vec![(PathBuf::from("/repos/b"), "failed: y".to_string())],
+            failed: vec![fetch_failure("/repos/b", "failed: y", &[])],
         };
 
         let logs = capture_tracing(|| {

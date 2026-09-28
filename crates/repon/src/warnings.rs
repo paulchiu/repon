@@ -28,8 +28,10 @@
 //! ([0001](../../../../docs/adr/0001-per-cell-provenance.md)).
 
 use ratatui::{Frame, layout::Rect, text::Line};
+use repon_core::FetchFailure;
 
 use crate::{
+    components::list::truncate_with_mark,
     config,
     glyphs::{BorderScratch, GlyphSet},
     keys::{self, BindingTable},
@@ -51,10 +53,9 @@ pub(crate) enum Warning {
         action: String,
         entities: usize,
     },
-    /// How many repositories the periodic fetch's most recently completed cycle could not
-    /// fetch. Never the underlying error text: it is arbitrary bytes from a remote, the same
-    /// reason [`Warning::OnRefreshFailed`] never carries a step's own captured output.
-    FetchFailed(usize),
+    /// Every repository the periodic fetch's most recently completed cycle could not fetch.
+    /// The status row shows only the count; the expanded list ([`draw_overlay`]) names each.
+    FetchFailed(Vec<FetchFailure>),
     DiscoveryAbandoned(String),
     /// How many Entities are currently Vanished
     /// rows present that no longer
@@ -100,8 +101,8 @@ impl std::fmt::Display for Warning {
             Warning::OnRefreshFailed { action, entities } => {
                 write!(f, "on_refresh `{action}` failed a step on {entities} rows")
             }
-            Warning::FetchFailed(count) => {
-                write!(f, "periodic fetch failed on {count} repositories")
+            Warning::FetchFailed(failed) => {
+                write!(f, "periodic fetch failed on {} repositories", failed.len())
             }
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
             Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
@@ -123,12 +124,12 @@ pub(crate) struct WarningSources {
     /// the condition clears itself the moment a later run replaces those receipts, the same
     /// unlatched shape `vanished` below takes.
     pub(crate) on_refresh_failed: Option<(String, usize)>,
-    /// How many repositories the periodic fetch's most recently completed cycle could not
-    /// fetch, read fresh from [`repon_core::Core::fetch_failures`] every time this struct is
-    /// built rather than latched, the same unlatched shape `vanished` below takes: a later
-    /// cycle where every fetch succeeds clears the condition with nothing to reset by hand.
-    /// Zero contributes no warning.
-    pub(crate) fetch_failed: usize,
+    /// Every repository the periodic fetch's most recently completed cycle could not fetch,
+    /// read fresh from [`repon_core::Core::fetch_failures`] every time this struct is built
+    /// rather than latched, the same unlatched shape `vanished` below takes: a later cycle
+    /// where every fetch succeeds clears the condition with nothing to reset by hand. Empty
+    /// contributes no warning.
+    pub(crate) fetch_failed: Vec<FetchFailure>,
     pub(crate) discovery_abandoned: Option<String>,
     /// How many Entities are Vanished right now, read fresh from the live snapshot every
     /// time this struct is built rather than latched, which is what lets the condition clear
@@ -154,7 +155,7 @@ impl WarningSources {
         if let Some((action, entities)) = on_refresh_failed.filter(|(_, entities)| *entities > 0) {
             warnings.push(Warning::OnRefreshFailed { action, entities });
         }
-        if fetch_failed > 0 {
+        if !fetch_failed.is_empty() {
             warnings.push(Warning::FetchFailed(fetch_failed));
         }
         warnings.extend(
@@ -214,7 +215,7 @@ pub(crate) const BORDER_TITLE: &str = " warnings ";
 /// and no way out advertised is what this module used to be.
 pub(crate) const CLOSE_HINT: &str = " esc closes ";
 
-/// Draws every outstanding warning, one per line, most severe first, inside the same
+/// Draws every outstanding warning ([`overlay_lines`]), most severe first, inside the same
 /// house-style bordered block every other full-frame surface draws
 /// ([`crate::help::HelpOverlay::draw`], [`crate::action_palette::ActionPalette::draw`]), in
 /// the `warn` role
@@ -238,18 +239,79 @@ pub(crate) fn draw_overlay(
     frame.render_widget(block, area);
 
     let buf = frame.buffer_mut();
-    for (row, warning) in sorted_by_severity(warnings)
+    let width = interior.width as usize;
+    for (row, line) in overlay_lines(warnings, interior.height as usize)
         .iter()
-        .take(interior.height as usize)
         .enumerate()
     {
-        buf.set_string(
-            interior.x,
-            interior.y + row as u16,
-            warning.to_string(),
-            style,
-        );
+        let clean: String = line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let fitted = truncate_with_mark(&clean, interior.width, glyphs.truncated);
+        buf.set_stringn(interior.x, interior.y + row as u16, fitted, width, style);
     }
+}
+
+/// The expanded list's lines, at most `height` of them, most severe warning first: each
+/// warning's own text, then beneath a fetch failure one indented line per repository naming
+/// its path and error, followed by its stale lock hint when it holds one. The
+/// per-repository detail gets only the rows left once every warning has its own, so a long
+/// run of failures ends in a `+N more` line rather than hiding a lower-ranked warning.
+fn overlay_lines(warnings: &[Warning], height: usize) -> Vec<String> {
+    let sorted = sorted_by_severity(warnings);
+    let detail_budget = height.saturating_sub(sorted.len());
+    sorted
+        .into_iter()
+        .flat_map(|warning| {
+            let details = match warning {
+                Warning::FetchFailed(failed) => fetch_failure_details(failed, detail_budget),
+                _ => Vec::new(),
+            };
+            std::iter::once(warning.to_string()).chain(details)
+        })
+        .take(height)
+        .collect()
+}
+
+/// Every failure's lines when they fit in `budget` rows; otherwise as many whole failures as
+/// fit beside a closing line counting the rest.
+fn fetch_failure_details(failed: &[FetchFailure], budget: usize) -> Vec<String> {
+    let per_failure: Vec<Vec<String>> = failed.iter().map(fetch_failure_lines).collect();
+    if per_failure.iter().map(Vec::len).sum::<usize>() <= budget {
+        return per_failure.concat();
+    }
+    let room = budget.saturating_sub(1);
+    let shown: Vec<Vec<String>> = per_failure
+        .into_iter()
+        .scan(0, |used, lines| {
+            *used += lines.len();
+            (*used <= room).then_some(lines)
+        })
+        .collect();
+    let hidden = failed.len() - shown.len();
+    let more = (budget > 0).then(|| format!("  +{hidden} more, see repon.log"));
+    shown.concat().into_iter().chain(more).collect()
+}
+
+/// A failure's error line, then its stale lock hint when it holds one. Each lock is named
+/// relative to the failed repository's path, which the line above already shows.
+fn fetch_failure_lines(failure: &FetchFailure) -> Vec<String> {
+    let error = format!("  {}: {}", failure.path.display(), failure.message);
+    let hint = (!failure.stale_locks.is_empty()).then(|| {
+        let locks: Vec<String> = failure
+            .stale_locks
+            .iter()
+            .map(|lock| {
+                lock.strip_prefix(&failure.path)
+                    .unwrap_or(lock)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        format!("    likely a stale lock: {}", locks.join(", "))
+    });
+    std::iter::once(error).chain(hint).collect()
 }
 
 /// Logs `discovery_warning` to `repon.log` the first time it is observed, and never again:
@@ -275,7 +337,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::{config::document, test_support::capture_tracing};
+    use crate::{
+        config::document,
+        test_support::{capture_tracing, fetch_failure},
+    };
 
     fn theme_unknown_key(key: &str) -> Warning {
         Warning::Theme(theme::ThemeWarning::UnknownKey {
@@ -302,8 +367,14 @@ mod tests {
         }
     }
 
+    fn failures(count: usize) -> Vec<FetchFailure> {
+        (0..count)
+            .map(|index| fetch_failure(&format!("/repos/{index}"), "failed: x", &[]))
+            .collect()
+    }
+
     fn fetch_failed(count: usize) -> Warning {
-        Warning::FetchFailed(count)
+        Warning::FetchFailed(failures(count))
     }
 
     // --- WarningSources: the compile-time forcing function ---
@@ -316,7 +387,7 @@ mod tests {
             }],
             config: vec![document::Warning::SetNamedAll],
             on_refresh_failed: Some(("sync".to_string(), 3)),
-            fetch_failed: 4,
+            fetch_failed: failures(4),
             discovery_abandoned: Some("discovery: stopped at 5 directories".to_string()),
             vanished: 2,
         };
@@ -344,8 +415,8 @@ mod tests {
             // A declared hook whose last run failed on nothing is the zero this asserts
             // contributes no warning, exactly as a zero Vanished count does.
             on_refresh_failed: Some(("sync".to_string(), 0)),
-            // A cycle where every fetch succeeded is the same zero, contributing nothing.
-            fetch_failed: 0,
+            // A cycle where every fetch succeeded carries no failures, contributing nothing.
+            fetch_failed: Vec::new(),
             discovery_abandoned: None,
             vanished: 0,
         };
@@ -443,6 +514,22 @@ mod tests {
     }
 
     #[test]
+    fn a_fetch_failure_in_the_slot_is_its_count_alone_never_a_path_or_error() {
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            "/repos/a/.git",
+            "failed: x",
+            &["/repos/a/.git/packed-refs.lock"],
+        )])];
+
+        let line = slot_line(&warnings, &BindingTable::compiled_default());
+
+        assert_eq!(
+            line.as_deref(),
+            Some("periodic fetch failed on 1 repositories")
+        );
+    }
+
+    #[test]
     fn slot_line_names_a_rebound_expand_key_rather_than_a_hardcoded_one() {
         let warnings = vec![theme_unknown_key("a"), config_set_named_all()];
         let mut context_table = toml::Table::new();
@@ -498,7 +585,11 @@ mod tests {
     /// gets `height - 2` interior rows to place content in, the same subtraction
     /// [`draw_overlay`] itself makes.
     fn render_overlay(warnings: &[Warning], height: u16) -> Vec<String> {
-        let backend = TestBackend::new(RENDER_WIDTH, height);
+        render_overlay_at(warnings, RENDER_WIDTH, height)
+    }
+
+    fn render_overlay_at(warnings: &[Warning], width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| {
@@ -544,6 +635,150 @@ mod tests {
                 .any(|line| line.contains("unknown theme key `a`")),
             "expected the theme warning listed, got: {lines:?}"
         );
+    }
+
+    #[test]
+    fn the_expansion_lists_each_failed_repository_with_its_error_beneath_the_fetch_summary() {
+        let warnings = vec![Warning::FetchFailed(vec![
+            fetch_failure("/repos/a/.git", "failed to connect to remote: x", &[]),
+            fetch_failure("/repos/b/.git", "failed to fetch: y", &[]),
+        ])];
+
+        let lines = render_overlay(&warnings, 5);
+
+        assert!(
+            lines[1].contains("periodic fetch failed on 2 repositories"),
+            "expected the summary first, got: {lines:?}"
+        );
+        assert!(
+            lines[2].contains("/repos/a/.git: failed to connect to remote: x"),
+            "expected the first repository and its error beneath the summary, got: {lines:?}"
+        );
+        assert!(
+            lines[3].contains("/repos/b/.git: failed to fetch: y"),
+            "expected the second repository and its error, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_repository_holding_a_stale_lock_names_it_beneath_its_error() {
+        let warnings = vec![Warning::FetchFailed(vec![
+            fetch_failure(
+                "/repos/a/.git",
+                "failed to fetch: y",
+                &["/repos/a/.git/refs/tags/v1.lock"],
+            ),
+            fetch_failure("/repos/b/.git", "failed to fetch: z", &[]),
+        ])];
+
+        let lines = render_overlay(&warnings, 6);
+
+        assert!(
+            lines[3].contains("likely a stale lock: refs/tags/v1.lock"),
+            "expected the lock named beneath the locked repository's error, got: {lines:?}"
+        );
+        assert!(
+            lines[4].contains("/repos/b/.git: failed to fetch: z"),
+            "expected the unlocked repository next, got: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("lock")).count(),
+            1,
+            "a failure with no lock carries no hint, got: {lines:?}"
+        );
+    }
+
+    /// A long path and error is cut at the interior's edge with the truncation glyph rather
+    /// than spilling over the right border, at the 44-column Notice budget, while its lock,
+    /// named relative to that path, still fits whole.
+    #[test]
+    fn a_long_fetch_failure_is_truncated_to_the_interior_width_with_the_truncation_glyph() {
+        let long = "/home/someone/src/a/deeply/nested/checkout/path/that/runs/on";
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            &format!("{long}/.git"),
+            "failed to fetch: Failed to update references to their new position",
+            &[&format!("{long}/.git/refs/tags/v1.lock")],
+        )])];
+
+        let lines = render_overlay_at(&warnings, 44, 5);
+
+        let right_border = crate::glyphs::FULL.border.vertical.to_string();
+        assert_eq!(lines[2].chars().count(), 44, "got: {lines:?}");
+        assert!(
+            lines[2].ends_with(&format!("{}{right_border}", crate::glyphs::FULL.truncated)),
+            "expected the truncation glyph against an intact right border, got: {lines:?}"
+        );
+        assert!(
+            lines[3].contains("likely a stale lock: refs/tags/v1.lock"),
+            "expected the lock named in full, got: {lines:?}"
+        );
+    }
+
+    /// Truncation measures display columns, not chars: a double-width path is cut before it
+    /// reaches the right border, not after.
+    #[test]
+    fn a_wide_character_fetch_failure_is_truncated_before_the_right_border() {
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            "/home/someone/src/倉庫倉庫倉庫倉庫倉庫倉庫倉庫倉庫倉庫/.git",
+            "failed to fetch: x",
+            &[],
+        )])];
+
+        let lines = render_overlay_at(&warnings, 44, 4);
+
+        let right_border = crate::glyphs::FULL.border.vertical.to_string();
+        assert!(
+            lines[2].ends_with(&right_border),
+            "expected an intact right border, got: {lines:?}"
+        );
+        assert!(
+            lines[2].contains(crate::glyphs::FULL.truncated),
+            "expected the truncation glyph, got: {lines:?}"
+        );
+    }
+
+    /// A remote's error text may hold escape sequences and newlines; each is drawn as a
+    /// blank, so it can neither restyle the terminal nor break onto another row.
+    #[test]
+    fn control_characters_in_a_fetch_error_are_drawn_as_blanks() {
+        let warnings = vec![Warning::FetchFailed(vec![fetch_failure(
+            "/repos/a/.git",
+            "\x1b[31mred\nnext\rline",
+            &[],
+        )])];
+
+        let lines = render_overlay_at(&warnings, 44, 5);
+
+        assert!(
+            lines.iter().all(|line| !line.chars().any(char::is_control)),
+            "got: {lines:?}"
+        );
+        assert!(lines[2].contains("[31mred next line"), "got: {lines:?}");
+        let right_border = crate::glyphs::FULL.border.vertical.to_string();
+        assert!(lines[2].ends_with(&right_border), "got: {lines:?}");
+        assert!(!lines[3].contains("next"), "got: {lines:?}");
+    }
+
+    /// Many failed repositories never push a lower-ranked condition out of the list: the
+    /// per-repository detail is capped to what is left once every summary has its row.
+    #[test]
+    fn many_fetch_failures_leave_a_row_for_every_lower_ranked_warning() {
+        let theme = theme_unknown_key("a");
+        let warnings = vec![Warning::FetchFailed(failures(10)), theme.clone()];
+
+        let lines = render_overlay(&warnings, 7);
+
+        assert!(
+            lines[1].contains("periodic fetch failed on 10 repositories"),
+            "got: {lines:?}"
+        );
+        assert!(lines[2].contains("/repos/0: failed: x"), "got: {lines:?}");
+        assert!(lines[3].contains("/repos/1: failed: x"), "got: {lines:?}");
+        assert!(
+            lines[4].contains("+8 more, see repon.log"),
+            "expected the hidden repositories counted, got: {lines:?}"
+        );
+        assert!(lines[5].contains(&theme.to_string()), "got: {lines:?}");
     }
 
     /// The other half of "still truncate to the available height": the height that bounds

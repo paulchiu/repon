@@ -169,7 +169,10 @@ An optional background cycle, off by default, that fetches every remote with pru
 The periodic fetch's own bounding data as the core receives it: whether it runs at all, its cadence and how many run at once, plain data with no TOML type. Not a FetchConfig, which names the consumer's parsed TOML shape rather than the core's.
 
 **Fetch failures**:
-The most recently completed periodic fetch cycle's own count of repositories it could not fetch, read fresh rather than latched: a cycle where every fetch succeeds carries none. Never the underlying error text, since that text is arbitrary bytes from a remote; the individual failures, with their paths, reach the log instead. One repository's own failure never stops another's, the per-repository independence the periodic fetch already holds to.
+The most recently completed periodic fetch cycle's own repositories it could not fetch, read fresh rather than latched: a cycle where every fetch succeeds carries none. Each carries its path, its underlying error text and any stale ref lock found beside it. The status row shows only the count; the expanded warning list and the log name each one. One repository's own failure never stops another's, the per-repository independence the periodic fetch already holds to.
+
+**Stale ref lock**:
+A `.lock` file under a git dir's `refs/`, or its `packed-refs.lock`, found beside a failed fetch. Any interrupted ref update leaves one behind and every later fetch then fails on it, so a fetch failure names it as the likely cause. Repon only reads for one and never deletes it.
 
 **Fetch progress**:
 How far the fetch cycle in flight has got: how many of the repositories it fans out over have finished their own attempt, against how many it started against. Absent while no cycle runs, and gone rather than resting at its total once one ends, since a finished cycle's count says nothing a verb does not.
