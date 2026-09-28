@@ -260,13 +260,16 @@ pub(crate) fn draw_overlay(
 }
 
 /// The expanded list's lines, most severe warning first: each warning's own text, then for a
-/// fetch failure one indented line per repository naming its path and error.
+/// fetch failure one indented line per repository naming its path and error, followed by
+/// its stale lock hint when it holds one.
 fn overlay_lines(warnings: &[Warning]) -> Vec<String> {
     sorted_by_severity(warnings)
         .into_iter()
         .flat_map(|warning| {
-            let details = match warning {
-                Warning::FetchFailed(failed) => failed.iter().map(fetch_failure_line).collect(),
+            let details: Vec<String> = match warning {
+                Warning::FetchFailed(failed) => {
+                    failed.iter().flat_map(fetch_failure_lines).collect()
+                }
                 _ => Vec::new(),
             };
             std::iter::once(warning.to_string()).chain(details)
@@ -274,8 +277,10 @@ fn overlay_lines(warnings: &[Warning]) -> Vec<String> {
         .collect()
 }
 
-fn fetch_failure_line(failure: &FetchFailure) -> String {
-    format!("  {}: {}", failure.path.display(), failure.message)
+fn fetch_failure_lines(failure: &FetchFailure) -> impl Iterator<Item = String> {
+    let error = format!("  {}: {}", failure.path.display(), failure.message);
+    let hint = stale_lock_hint(&failure.stale_locks).map(|hint| format!("    {hint}"));
+    std::iter::once(error).chain(hint)
 }
 
 /// Logs `discovery_warning` to `repon.log` the first time it is observed, and never again:
@@ -622,6 +627,34 @@ mod tests {
         assert!(
             lines[3].contains("/repos/b/.git: failed to fetch: y"),
             "expected the second repository and its error, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_repository_holding_a_stale_lock_names_it_beneath_its_error() {
+        let warnings = vec![Warning::FetchFailed(vec![
+            fetch_failure(
+                "/repos/a/.git",
+                "failed to fetch: y",
+                &["/repos/a/.git/refs/tags/v1.lock"],
+            ),
+            fetch_failure("/repos/b/.git", "failed to fetch: z", &[]),
+        ])];
+
+        let lines = render_overlay(&warnings, 6);
+
+        assert!(
+            lines[3].contains("likely a stale lock: /repos/a/.git/refs/tags/v1.lock"),
+            "expected the lock named beneath the locked repository's error, got: {lines:?}"
+        );
+        assert!(
+            lines[4].contains("/repos/b/.git: failed to fetch: z"),
+            "expected the unlocked repository next, got: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("lock")).count(),
+            1,
+            "a failure with no lock carries no hint, got: {lines:?}"
         );
     }
 
