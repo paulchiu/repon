@@ -1284,6 +1284,7 @@ impl App {
                 }
                 None
             }
+            Some(Action::OpenAppLog) => None,
             Some(Action::MoveDown) => {
                 self.move_cursor(1);
                 None

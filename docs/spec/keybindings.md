@@ -44,6 +44,7 @@ An input context takes the whole keyboard, because if `q` quit globally then typ
 | `1` to `9` | Switch to the Nth declared Set |
 | `Ctrl+R` | Reload config |
 | `e` | Edit config.toml in `$EDITOR` |
+| `L` | Open repon.log in `$EDITOR` |
 | `Shift+Tab` | Move focus between list and detail |
 | `Esc` | Unwind one level |
 
@@ -179,6 +180,8 @@ Nothing is unbuilt today: `d` ([#171](https://github.com/paulchiu/repon/issues/1
 `m` for management is free rather than fought over: it is unbound in Repon today, and `Ctrl+M` is already reserved as permanently unbindable because terminals deliver it as `Enter`, which does not reach the unmodified key. It opens the same palette `;` opens rather than a third one, so it adds a filter and not a surface, and [0008](../adr/0008-two-palettes-not-one.md)'s split is unmoved: management fans out over the Selection and can do damage, which puts it on the Action palette's side of the split.
 
 `e` for editing `config.toml` is free the same way: unbound in Global, List, Detail, Overlay and Confirm, and the table's only other `e` is `Ctrl+E` (`MoveCursorToLineEnd`, `input`'s own readline chord), which does not collide because it is a different chord.
+
+`L` for opening `repon.log` is free on the same terms: no context binds an `L` at all, and `input`'s printable catch-all keeps it as text. It is shifted rather than `l`, which is also unbound, because `l` is move-right to every vim-trained hand and a stray press should not suspend the screen for an editor; the capital also reads as the heavier, leave-the-screen member of the pair the way `R` sits beside `r`.
 
 `t` for the worktrees toggle is free on the same terms: unbound in Global, List, Detail, Input, Overlay and Confirm, so no context-specific binding is left to shadow it while `list` or `detail` has focus. Its one other appearance in the whole table is `sort`'s own `t` (`Sort by state`), a context `global` never falls back into and that never falls back into `global` either ([The contexts](#the-contexts)), so the two cannot collide at dispatch. It is also the one column key `sort` binds that carried no meaning outside the menu before this ticket; giving it one here means every column letter now reads the same way in or out of the menu, the way `b`, `s`, `n`, `d` and `a` already did.
 

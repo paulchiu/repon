@@ -59,6 +59,9 @@ pub(crate) enum Action {
     SwitchToSet(u8),
     ReloadConfig,
     EditConfig,
+    /// `L`: opens `repon.log` in `$EDITOR`. Read-only as far as Repon is concerned, so it
+    /// reloads nothing on return and stays live while a run is outstanding.
+    OpenAppLog,
     MoveFocusBetweenListAndDetail,
     Unwind,
 
@@ -212,6 +215,7 @@ pub(crate) fn description(action: Action) -> &'static str {
         Action::SwitchToSet(_) => "Switch to the Nth declared Set",
         Action::ReloadConfig => "Reload config",
         Action::EditConfig => "Edit config.toml in `$EDITOR`",
+        Action::OpenAppLog => "Open repon.log in `$EDITOR`",
         Action::MoveFocusBetweenListAndDetail => "Move focus between list and detail",
         Action::Unwind => "Unwind one level",
         Action::MoveDown => "Move down",
@@ -515,6 +519,14 @@ const BINDINGS: &[Binding] = &[
         KeyCode::Char('e'),
         NONE,
         Action::EditConfig,
+    ),
+    // `L` is free in every context; unshifted `l` stays unbound so a vim-trained
+    // move-right press never suspends the screen.
+    binding(
+        Context::Global,
+        KeyCode::Char('L'),
+        SHIFT,
+        Action::OpenAppLog,
     ),
     binding(
         Context::Global,
@@ -1076,6 +1088,7 @@ fn action_name(action: Action) -> Option<&'static str> {
         Action::SwitchToSet(_) => return None,
         Action::ReloadConfig => "reload_config",
         Action::EditConfig => "edit_config",
+        Action::OpenAppLog => "open_app_log",
         Action::MoveFocusBetweenListAndDetail => "move_focus_between_list_and_detail",
         Action::Unwind => "unwind",
         Action::MoveDown => "move_down",
@@ -1840,6 +1853,44 @@ mod tests {
 
         #[test]
         fn is_unbound_in_confirm() {
+            assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
+        }
+    }
+
+    /// `L` (`Action::OpenAppLog`) is free the same way `e` is: Global fires it from `list`
+    /// and `detail`, `input` keeps it as text, and no other context binds an `L` at all.
+    mod shift_l_is_free_across_every_context {
+        use super::*;
+
+        const PROBE: (KeyCode, KeyModifiers) = (KeyCode::Char('L'), SHIFT);
+
+        #[test]
+        fn fires_open_app_log_in_list() {
+            assert_eq!(
+                dispatch(Context::List, press(PROBE.0, PROBE.1)),
+                Some(Action::OpenAppLog)
+            );
+        }
+
+        #[test]
+        fn fires_open_app_log_in_detail() {
+            assert_eq!(
+                dispatch(Context::Detail, press(PROBE.0, PROBE.1)),
+                Some(Action::OpenAppLog)
+            );
+        }
+
+        #[test]
+        fn is_plain_text_in_input_rather_than_the_global_action() {
+            assert_eq!(
+                dispatch(Context::Input, press(PROBE.0, PROBE.1)),
+                Some(Action::Text('L'))
+            );
+        }
+
+        #[test]
+        fn is_unbound_in_overlay_and_confirm() {
+            assert_eq!(dispatch(Context::Overlay, press(PROBE.0, PROBE.1)), None);
             assert_eq!(dispatch(Context::Confirm, press(PROBE.0, PROBE.1)), None);
         }
     }
