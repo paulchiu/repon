@@ -307,9 +307,8 @@ pub struct FetchFailure {
     pub path: PathBuf,
     /// The underlying `FetchError`'s own text.
     pub message: String,
-    /// `.lock` files left under that common dir's `refs/`, or its `packed-refs.lock`, read
-    /// after the failure: the likely cause, since an interrupted ref update leaves one behind
-    /// and every later fetch fails on it. Never deleted here.
+    /// The `.lock` files found under this repository's `refs/`, or its `packed-refs.lock`,
+    /// after the failure: the GLOSSARY's stale ref locks.
     pub stale_locks: Vec<PathBuf>,
 }
 
