@@ -269,7 +269,7 @@ If the file does not exist yet, which is the zero-config default, the editor ope
 
 ## Opening the app log
 
-`L` opens `repon.log` (the path [config.md](config.md#where-it-lives) resolves, so `REPON_DATA` moves it) in `$EDITOR` through the same suspension `e` uses (`editor::open`, which hands the editor the file itself rather than `editor::edit`'s scratch copy, since there is nothing to write back). It reloads nothing on return; the screen is reclaimed and fully repainted under the [terminal-state contract](#terminal-state) exactly as after `e`. It stays live while an Action or a management run is outstanding, since it changes nothing a run depends on. A log that does not exist yet answers with a Notice naming the path it looked at rather than opening an empty buffer.
+`L` opens `repon.log` (the path [config.md](config.md#where-it-lives) resolves, so `REPON_DATA` moves it) in `$EDITOR` through the same suspension `e` uses (`editor::open`, which hands the editor the file itself rather than `editor::edit`'s scratch copy, since there is nothing to write back). It reloads nothing on return; the screen is reclaimed and fully repainted under the [terminal-state contract](#terminal-state) exactly as after `e`. It stays live while an Action or a management run is outstanding, since it changes nothing a run depends on. A missing log, say one deleted mid-session, answers with a Notice naming the path it looked at rather than opening an empty buffer. The log is for reading: Repon keeps writing to the file it opened at startup, so an editor that saves by replacing the file leaves the rest of the session's lines on the replaced one.
 
 ## The footer
 

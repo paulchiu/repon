@@ -31,7 +31,7 @@ Four failure grades, deliberately a mirror of [theming.md](theming.md)'s table w
 
 The exit path renders `toml::de::Error`, which exposes `.message()` and `.span()`, so the line and column come from the API rather than from parsing the Display output. The unknown-key path uses `serde_ignored`, which reports every unknown key in one pass; `#[serde(deny_unknown_fields)]` aborts on the first and cannot enumerate the rest.
 
-A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`, which `L` opens in `$EDITOR`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
+A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
 
 A `theme` naming a theme that does not exist warns and falls back to the default, deliberately unlike `--theme <missing>`, which still exits: a flag is a thing typed moments ago and a file is a thing you have to go and fix.
 
