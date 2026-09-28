@@ -4,7 +4,8 @@
 //! [`Tui::suspend_for_child`](crate::tui::Tui::suspend_for_child), the terminal-handoff
 //! machinery [`crate::launcher`] is the first. [`edit`]'s own signature carries plain text in
 //! and out and never mentions a Launcher, which is what proves the handoff machinery stands
-//! alone rather than belonging to the Launcher feature.
+//! alone rather than belonging to the Launcher feature. [`open`] is the same handoff for a
+//! file read in place, `repon.log` through `L`.
 
 use std::io::{Read, Write};
 

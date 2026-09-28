@@ -9,7 +9,7 @@ One file, `config.toml`, holds everything Repon can be told: the theme, the glyp
 | config file | `~/.config/repon/config.toml` | `REPON_CONFIG` names the directory; `--config <path>` names the file and beats it. Either must exist if given, though a named directory holding no `config.toml` is zero config and runs |
 | themes | `~/.config/repon/themes/<name>.toml` | follows the config directory |
 | state | `~/Library/Application Support/repon/state.toml` | `REPON_DATA` |
-| log | `~/Library/Application Support/repon/repon.log` | `REPON_DATA` |
+| log | `~/Library/Application Support/repon/repon.log`, opened in `$EDITOR` by `L` ([keybindings.md](keybindings.md#opening-the-app-log)) | `REPON_DATA` |
 
 The config half resolves through `etcetera`'s `choose_base_strategy`: XDG on Unix including macOS, the native location on Windows. The data half stays on the `directories` crate's `ProjectDirs`. This settles the placement [theming.md](theming.md) left open, and it mirrors tuicr, where config sits under `~/.config` and data under Application Support, so two of the same person's tools agree about where a theme lives.
 
@@ -31,7 +31,7 @@ Four failure grades, deliberately a mirror of [theming.md](theming.md)'s table w
 
 The exit path renders `toml::de::Error`, which exposes `.message()` and `.span()`, so the line and column come from the API rather than from parsing the Display output. The unknown-key path uses `serde_ignored`, which reports every unknown key in one pass; `#[serde(deny_unknown_fields)]` aborts on the first and cannot enumerate the rest.
 
-A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
+A partial file merges over the compiled-in defaults with `#[serde(default)]`, which deep-merges field by field through nested structs with no extra crates. Warnings surface in one status-bar slot showing the most severe outstanding condition, expanding to a list on `w` ([keybindings.md](keybindings.md)), with the detail in `repon.log`, which `L` opens in `$EDITOR`. This amends [theming.md](theming.md), which specified a dedicated `theme: 2 warnings` word; theme warnings now share the slot.
 
 A `theme` naming a theme that does not exist warns and falls back to the default, deliberately unlike `--theme <missing>`, which still exits: a flag is a thing typed moments ago and a file is a thing you have to go and fix.
 
