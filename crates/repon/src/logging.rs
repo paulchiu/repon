@@ -1,13 +1,20 @@
 //! Logs go to a file, never to the terminal: the terminal belongs to the interface.
 
+use std::path::{Path, PathBuf};
+
 use color_eyre::eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::config;
 
 /// The path [`init`] writes the log file to.
-pub fn log_file_path() -> std::path::PathBuf {
-    config::data_dir().join(concat!(env!("CARGO_PKG_NAME"), ".log"))
+pub fn log_file_path() -> PathBuf {
+    log_file_in(&config::data_dir())
+}
+
+/// Where the log sits under `data_dir`.
+pub fn log_file_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(concat!(env!("CARGO_PKG_NAME"), ".log"))
 }
 
 pub fn init() -> Result<()> {

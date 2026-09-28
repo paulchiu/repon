@@ -8,6 +8,8 @@
 //! file read in place, `repon.log` through `L`.
 
 use std::io::{Read, Write};
+use std::path::Path;
+use std::process::Command;
 
 use color_eyre::eyre::{Result, WrapErr};
 
@@ -35,12 +37,17 @@ pub fn edit(tui: &mut Tui, initial_text: &str) -> Result<String> {
 
 /// Opens `path` itself, not a scratch copy, in the resolved editor chain through the same
 /// suspension [`edit`] uses, for a file the user reads in place such as `repon.log`.
-pub fn open(tui: &mut Tui, path: &std::path::Path) -> Result<()> {
-    let argv = Source::EditorChain.resolve_argv(|name| std::env::var(name).ok());
-    let mut command = command_from_argv(&argv);
-    command.arg(path);
+pub fn open(tui: &mut Tui, path: &Path) -> Result<()> {
+    let mut command = editor_command(path, |name| std::env::var(name).ok());
     tui.suspend_for_child(&mut command)?;
     Ok(())
+}
+
+/// The editor chain's command, resolved through `lookup`, with `path` as its last argument.
+fn editor_command(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Command {
+    let mut command = command_from_argv(&Source::EditorChain.resolve_argv(lookup));
+    command.arg(path);
+    command
 }
 
 #[cfg(test)]
@@ -57,8 +64,23 @@ mod tests {
     }
 
     #[test]
-    fn open_takes_a_path_and_returns_nothing_but_success() {
-        fn assert_signature(_: fn(&mut Tui, &std::path::Path) -> Result<()>) {}
-        assert_signature(open);
+    fn the_editor_command_runs_the_resolved_editor_on_the_given_path_itself() {
+        let path = Path::new("/data/repon.log");
+        let command = editor_command(path, |name| {
+            (name == "EDITOR").then(|| "code --wait".to_string())
+        });
+
+        assert_eq!(command.get_program(), "code");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, vec!["--wait", "/data/repon.log"]);
+    }
+
+    #[test]
+    fn the_editor_command_falls_back_to_vi() {
+        let command = editor_command(Path::new("/data/repon.log"), |_| None);
+
+        assert_eq!(command.get_program(), "vi");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, vec!["/data/repon.log"]);
     }
 }
