@@ -397,6 +397,9 @@ pub struct App {
     /// a flag rather than an immediate call. Cleared the moment it is handed to
     /// [`Self::run_config_editor_handoff`], so a handoff runs at most once per press.
     pending_config_editor_handoff: bool,
+    /// `true` between `Action::OpenAppLog` (`L`) firing and [`Self::run`]'s own loop
+    /// draining it, for the same reason `pending_config_editor_handoff` is a flag.
+    pending_log_editor_handoff: bool,
     /// `Some` while the Set picker has focus, opened by `Action::OpenSetPicker` (`s` or
     /// `Tab`) and closed by `Action::Close` (`Esc` or `q`,
     /// [keybindings.md](../../../docs/spec/keybindings.md)'s `overlay` context) without
@@ -510,6 +513,9 @@ pub struct App {
     /// round trip against a directory it owns rather than the user's own configuration.
     config_dir: PathBuf,
     config_file: PathBuf,
+    /// The `repon.log` this session writes ([`crate::logging::log_file_path`]), a field so a
+    /// test can point `L` at a file it owns.
+    log_file: PathBuf,
     /// The `REPON_CONFIG` directory and `--config` file this run was started with a name for,
     /// carried so [`Self::reload_config`] can re-run [`config::check_named_paths_exist`]
     /// against them: a named path that has gone away mid-session must refuse the reload, not
@@ -676,6 +682,7 @@ impl App {
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
             pending_config_editor_handoff: false,
+            pending_log_editor_handoff: false,
             set_picker: None,
             notice: None,
             theme_warnings,
@@ -697,6 +704,7 @@ impl App {
             data_dir: config.data_dir,
             config_dir: config::config_dir(),
             config_file: config::config_file(),
+            log_file: crate::logging::log_file_path(),
             named_config_paths: config::named_paths(),
             zero_config: config.zero_config,
             cwd: config::document::working_directory(),
@@ -1284,7 +1292,15 @@ impl App {
                 }
                 None
             }
-            Some(Action::OpenAppLog) => None,
+            // Not gated on a run: opening the log changes nothing a run depends on.
+            Some(Action::OpenAppLog) => {
+                if self.log_file.is_file() {
+                    self.pending_log_editor_handoff = true;
+                } else {
+                    self.set_notice(format!("No log yet at {}", self.log_file.display()));
+                }
+                None
+            }
             Some(Action::MoveDown) => {
                 self.move_cursor(1);
                 None
@@ -3857,6 +3873,7 @@ mod tests {
             pending_launcher_handoff: None,
             pending_action_editor_handoff: false,
             pending_config_editor_handoff: false,
+            pending_log_editor_handoff: false,
             set_picker: None,
             notice: None,
             theme_warnings: Vec::new(),
@@ -3905,6 +3922,7 @@ mod tests {
             // `data_dir` and `themes_dir` above already take.
             config_dir: PathBuf::new(),
             config_file: PathBuf::new(),
+            log_file: PathBuf::new(),
             // Neither path was named, which is what a run with no `REPON_CONFIG` and no
             // `--config` carries; a test about the named-path refusal sets this itself.
             named_config_paths: config::NamedPaths::default(),
@@ -14273,6 +14291,83 @@ refresh_all = "z""#,
             "e must queue the handoff for `run`'s own loop"
         );
         assert_eq!(app.notice(), None, "queuing must raise no Notice");
+    }
+
+    /// `L` queues the log handoff for `run`'s own loop, the same shape `e` takes.
+    #[test]
+    fn shift_l_queues_the_log_editor_handoff_when_the_log_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.log_file = dir.path().join("repon.log");
+        std::fs::write(&app.log_file, "a line\n").expect("write the log");
+
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L");
+
+        assert!(
+            app.pending_log_editor_handoff,
+            "L must queue the handoff for `run`'s own loop"
+        );
+        assert!(
+            !app.pending_config_editor_handoff,
+            "L must never queue the config handoff"
+        );
+        assert_eq!(app.notice(), None, "queuing must raise no Notice");
+    }
+
+    /// A log that does not exist yet answers `L` with a Notice naming the path it looked
+    /// at, rather than handing `$EDITOR` an empty buffer.
+    #[test]
+    fn shift_l_names_the_missing_log_path_in_a_notice_rather_than_queuing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.log_file = dir.path().join("never-written").join("repon.log");
+
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L");
+
+        assert!(
+            !app.pending_log_editor_handoff,
+            "a missing log must never queue the handoff"
+        );
+        let expected = format!("No log yet at {}", app.log_file.display());
+        assert_eq!(app.notice(), Some(expected.as_str()));
+    }
+
+    /// Unlike `e`, `L` stays live while an Action is fanning out: it reloads nothing, so
+    /// there is no run for it to invalidate.
+    #[test]
+    fn shift_l_still_queues_while_an_action_is_fanning_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        init_repo(&root.join("repo-a"));
+        let mut app = test_app(&root);
+        app.log_file = dir.path().join("repon.log");
+        std::fs::write(&app.log_file, "a line\n").expect("write the log");
+        app.document.actions.push(slow_action("slow"));
+        app.handle_key_event(press(KeyCode::Char(';'), KeyModifiers::NONE))
+            .expect("open the palette");
+        app.handle_key_event(press(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm = false must start the run immediately");
+        assert!(app.any_run_outstanding(), "sanity: the fan-out is live");
+
+        app.handle_key_event(press(KeyCode::Char('L'), KeyModifiers::SHIFT))
+            .expect("press L while an Action is fanning out");
+
+        assert!(
+            app.pending_log_editor_handoff,
+            "L must queue the handoff even while a fan-out is live"
+        );
+        assert_eq!(app.notice(), None, "L must not answer with an inert Notice");
+
+        app.core.stop_action();
+        wait_for("the cancelled fan-out to finish", || {
+            !app.core.action_running()
+        });
     }
 
     /// `e` ends in the identical `reload_config` a live fan-out must never race, so it is
