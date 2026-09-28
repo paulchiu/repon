@@ -8,6 +8,20 @@
 
 use std::path::{Path, PathBuf};
 
+/// A [`repon_core::FetchFailure`] for `path`, failing with `message` and holding
+/// `stale_locks`.
+pub(crate) fn fetch_failure(
+    path: &str,
+    message: &str,
+    stale_locks: &[&str],
+) -> repon_core::FetchFailure {
+    repon_core::FetchFailure {
+        path: PathBuf::from(path),
+        message: message.to_string(),
+        stale_locks: stale_locks.iter().map(PathBuf::from).collect(),
+    }
+}
+
 /// Every `.rs` file under `dir`, recursively.
 pub(crate) fn rust_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
