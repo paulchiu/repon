@@ -40,7 +40,7 @@ globset = "0.4.20"
 # read-only invariant is scoped to the probe path"), unconditional rather than behind a cargo
 # feature: they bring gix's blocking network client, HTTP transport (reqwest, rustls) and
 # credential machinery into every build of this crate, published library included.
-gix = { version = "0.87.1", default-features = false, features = [
+gix = { version = "0.88.0", default-features = false, features = [
     "max-performance-safe",
     "sha1",
     "basic",
