@@ -88,7 +88,7 @@ const NO_FAILED_ROWS_NOTICE: &str = "no row has failed";
 /// The Notice [`Action::DismissVanished`] raises when the cursor row is not Vanished (or the
 /// list is empty): the glossary scopes a Notice to a keystroke that could not act, and `d`'s
 /// own successful case ([`App::dismiss_vanished_at_cursor`]) never raises one.
-const CURSOR_NOT_VANISHED_NOTICE: &str = "cursor row is not Vanished";
+const CURSOR_NOT_VANISHED_NOTICE: &str = "row not Vanished: filter presence:vanished";
 
 /// The Notice [`Action::ClearFilter`] raises when no committed Filter is active to clear,
 /// [ADR 0023](../../../../docs/adr/0023-an-unbuilt-binding-is-not-advertised-and-an-unavailable-one-answers-on-press.md)'s
@@ -836,7 +836,9 @@ impl App {
         );
         let fetch_failures = self.core.fetch_failures();
         log_fetch_failures_once(&fetch_failures, &mut self.fetch_failures_logged);
-        let vanished = self.core.vanished_count();
+        let vanished = shown_entities(snapshot, self.visibility())
+            .filter(|entity| entity.presence == Presence::Vanished)
+            .count();
         let on_refresh_failed = self.on_refresh_failures(snapshot);
         WarningSources {
             theme: self.theme_warnings.clone(),
@@ -858,18 +860,7 @@ impl App {
         snapshot: &Snapshot,
         visibility: crate::components::list::Visibility,
     ) -> usize {
-        snapshot
-            .entities
-            .iter()
-            .filter(|entity| {
-                crate::components::list::kind_is_visible(
-                    entity.kind,
-                    visibility.worktrees,
-                    visibility.submodules,
-                    &Filter::default(),
-                ) && (visibility.ignored || !entity.excluded)
-            })
-            .count()
+        shown_entities(snapshot, visibility).count()
     }
 
     /// The status row's own content for this frame: the active Set's name, `snapshot`'s
@@ -3608,6 +3599,22 @@ fn entity_keys(snapshot: &Snapshot) -> Vec<EntityKey> {
         .iter()
         .map(|entity| entity.key.clone())
         .collect()
+}
+
+/// `snapshot`'s entities `visibility` draws, before any Filter narrows them: the rows a
+/// keystroke can reach once the Filter is cleared.
+fn shown_entities(
+    snapshot: &Snapshot,
+    visibility: crate::components::list::Visibility,
+) -> impl Iterator<Item = &EntityState> {
+    snapshot.entities.iter().filter(move |entity| {
+        crate::components::list::kind_is_visible(
+            entity.kind,
+            visibility.worktrees,
+            visibility.submodules,
+            &Filter::default(),
+        ) && (visibility.ignored || !entity.excluded)
+    })
 }
 
 /// Logs `failures`'s own entries to `repon.log` once per distinct set of them, mirroring
@@ -8838,7 +8845,11 @@ mod tests {
             1,
             "a row that is not Vanished must not be dismissed"
         );
-        assert_eq!(app.notice(), Some(CURSOR_NOT_VANISHED_NOTICE));
+        assert_eq!(
+            app.notice(),
+            Some("row not Vanished: filter presence:vanished"),
+            "a `d` that missed must say where the Vanished rows are"
+        );
     }
 
     /// The consumer half of "`Core::start` returns before discovery has finished": the
@@ -8930,6 +8941,86 @@ mod tests {
                 .iter()
                 .any(|warning| matches!(warning, warnings::Warning::Vanished(_))),
             "expected the Vanished warning to clear itself once the last Vanished row is gone"
+        );
+    }
+
+    /// A Vanished row the table does not draw cannot be reached by `d`, so the warning must
+    /// not count it until the row is shown again.
+    #[test]
+    fn the_vanished_warning_counts_only_rows_the_table_shows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        init_repo(&repo);
+        let mut app = test_app_with_overrides(
+            &root,
+            vec![repon_core::RepoOverride {
+                path: repo.clone(),
+                default_branch: None,
+                excluded: true,
+            }],
+        );
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle();
+        vanish(&app, &repo);
+        let vanished_warnings = |app: &mut App| -> Vec<warnings::Warning> {
+            app.current_warnings(&app.core.snapshot())
+                .into_iter()
+                .filter(|warning| matches!(warning, warnings::Warning::Vanished(_)))
+                .collect()
+        };
+
+        assert_eq!(
+            vanished_warnings(&mut app),
+            Vec::new(),
+            "an ignored row is hidden by default, so its vanishing is not advertised"
+        );
+
+        show_ignored_rows(&mut app);
+
+        assert_eq!(
+            vanished_warnings(&mut app),
+            vec![warnings::Warning::Vanished(1)]
+        );
+    }
+
+    /// The Worktree half of the same rule: `t` hiding a Vanished Worktree drops it from the
+    /// count, and showing it again brings it back.
+    #[test]
+    fn the_vanished_warning_follows_the_worktrees_toggle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        let worktree = root.join("repo-a-wt");
+        init_repo(&repo);
+        worktree_add(&repo, &worktree, "feature");
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle();
+        vanish(&app, &worktree);
+        let vanished_warnings = |app: &mut App| -> Vec<warnings::Warning> {
+            app.current_warnings(&app.core.snapshot())
+                .into_iter()
+                .filter(|warning| matches!(warning, warnings::Warning::Vanished(_)))
+                .collect()
+        };
+        assert_eq!(
+            vanished_warnings(&mut app),
+            vec![warnings::Warning::Vanished(1)],
+            "sanity: the Worktree is shown by default and counted once it vanishes"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("hide Worktrees");
+        assert_eq!(vanished_warnings(&mut app), Vec::new());
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("show Worktrees");
+        assert_eq!(
+            vanished_warnings(&mut app),
+            vec![warnings::Warning::Vanished(1)]
         );
     }
 
