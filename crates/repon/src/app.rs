@@ -8845,24 +8845,10 @@ mod tests {
             1,
             "a row that is not Vanished must not be dismissed"
         );
-        assert_eq!(app.notice(), Some(CURSOR_NOT_VANISHED_NOTICE));
-    }
-
-    /// A `d` that missed has to say where the Vanished rows are, not only that this is not one.
-    #[test]
-    fn d_off_a_vanished_row_names_the_filter_that_lists_them() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        init_repo(&root.join("repo-a"));
-        let mut app = test_app(&root);
-        app.set_cursor(0);
-
-        app.handle_key_event(press(KeyCode::Char('d'), KeyModifiers::NONE))
-            .expect("dismiss");
-
         assert_eq!(
             app.notice(),
-            Some("row not Vanished: filter presence:vanished")
+            Some("row not Vanished: filter presence:vanished"),
+            "a `d` that missed must say where the Vanished rows are"
         );
     }
 
@@ -8993,6 +8979,45 @@ mod tests {
 
         show_ignored_rows(&mut app);
 
+        assert_eq!(
+            vanished_warnings(&mut app),
+            vec![warnings::Warning::Vanished(1)]
+        );
+    }
+
+    /// The Worktree half of the same rule: `t` hiding a Vanished Worktree drops it from the
+    /// count, and showing it again brings it back.
+    #[test]
+    fn the_vanished_warning_follows_the_worktrees_toggle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let repo = root.join("repo-a");
+        let worktree = root.join("repo-a-wt");
+        init_repo(&repo);
+        worktree_add(&repo, &worktree, "feature");
+        let mut app = test_app(&root);
+        let keys = entity_keys(&app.core.snapshot());
+        app.core.refresh(&keys);
+        app.core.settle();
+        vanish(&app, &worktree);
+        let vanished_warnings = |app: &mut App| -> Vec<warnings::Warning> {
+            app.current_warnings(&app.core.snapshot())
+                .into_iter()
+                .filter(|warning| matches!(warning, warnings::Warning::Vanished(_)))
+                .collect()
+        };
+        assert_eq!(
+            vanished_warnings(&mut app),
+            vec![warnings::Warning::Vanished(1)],
+            "sanity: the Worktree is shown by default and counted once it vanishes"
+        );
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("hide Worktrees");
+        assert_eq!(vanished_warnings(&mut app), Vec::new());
+
+        app.handle_key_event(press(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("show Worktrees");
         assert_eq!(
             vanished_warnings(&mut app),
             vec![warnings::Warning::Vanished(1)]
