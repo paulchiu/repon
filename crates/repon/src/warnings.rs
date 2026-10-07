@@ -105,7 +105,10 @@ impl std::fmt::Display for Warning {
                 write!(f, "periodic fetch failed on {} repositories", failed.len())
             }
             Warning::DiscoveryAbandoned(message) => write!(f, "{message}"),
-            Warning::Vanished(count) => write!(f, "{count} vanished, d to dismiss"),
+            Warning::Vanished(count) => write!(
+                f,
+                "{count} vanished: filter presence:vanished, d to dismiss"
+            ),
         }
     }
 }
@@ -1193,5 +1196,14 @@ mod tests {
                 "docs/spec/{name} still opens its ladder with the program's name"
             );
         }
+    }
+
+    /// `d` acts only on the cursor row, so the warning has to name the way to the rows too.
+    #[test]
+    fn the_vanished_warning_names_the_filter_that_lists_the_rows() {
+        assert_eq!(
+            vanished(3).to_string(),
+            "3 vanished: filter presence:vanished, d to dismiss"
+        );
     }
 }
