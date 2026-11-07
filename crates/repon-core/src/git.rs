@@ -84,13 +84,12 @@ impl std::fmt::Display for ProbeError {
 impl std::error::Error for ProbeError {}
 
 /// The checked merge base of `a` and `b`: verifies both commit objects exist
-/// before asking gix, since [`gix::Repository::merge_base`] folds a missing
-/// commit object into the same `NotFound` it uses for two commits with no
-/// shared history, which would otherwise read as a confident "no common
-/// ancestor" rather than the read error it actually is. `Ok(None)` is that
-/// real "no shared history at all" answer (including `a == b`'s reflexive
-/// case, folded in early); `Err` is reserved for an actual read error, and is
-/// a plain `String` so each caller wraps it in its own [`ProbeError`] variant.
+/// before asking gix, so a missing commit object is always reported as a read
+/// error in this crate's own wording and never as a confident "no common
+/// ancestor". `Ok(None)` is the real "no shared history at all" answer
+/// (including `a == b`'s reflexive case, folded in early); `Err` is reserved
+/// for an actual read error, and is a plain `String` so each caller wraps it
+/// in its own [`ProbeError`] variant.
 pub(crate) fn checked_merge_base(
     repo: &gix::Repository,
     a: gix::ObjectId,
@@ -104,11 +103,9 @@ pub(crate) fn checked_merge_base(
             return Err(format!("commit object not found: {id}"));
         }
     }
-    match repo.merge_base(a, b) {
-        Ok(base) => Ok(Some(base.detach())),
-        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
-        Err(other) => Err(other.to_string()),
-    }
+    repo.merge_base(a, b)
+        .map(|base| base.map(gix::Id::detach))
+        .map_err(|error| error.to_string())
 }
 
 /// Whether `repo` has any remote configured at all, read once from
@@ -562,7 +559,8 @@ fn read_gitmodules(repo: &gix::Repository) -> Result<Option<Vec<SubmoduleEntry>>
             .map_err(|error| ProbeError::Submodules(error.to_string().into()))?;
         entries.push(SubmoduleEntry {
             name: Arc::from(name.to_string()),
-            relative_path: gix::path::from_bstring(relative_path),
+            relative_path: gix::path::from_bstring(relative_path)
+                .map_err(|error| ProbeError::Submodules(error.to_string().into()))?,
         });
     }
     Ok(Some(entries))
@@ -723,15 +721,15 @@ pub(crate) fn ignored_directories_for_deletion(
             &mut ignored,
         )
         .map_err(|error| ProbeError::IgnoredDirectories(error.to_string().into()))?;
-    Ok(ignored
+    ignored
         .rela_paths
         .into_iter()
         .map(|rela_path| {
-            outcome
-                .traversal_root
-                .join(gix::path::from_bstring(rela_path))
+            gix::path::from_bstring(rela_path)
+                .map(|path| outcome.traversal_root.join(path))
+                .map_err(|error| ProbeError::IgnoredDirectories(error.to_string().into()))
         })
-        .collect())
+        .collect()
 }
 
 /// A [`gix::dir::walk::Delegate`] that keeps only the ignored entries a walk emits, rather
@@ -779,7 +777,7 @@ pub(crate) fn staged_changes(repo: &gix::Repository) -> Result<bool, ProbeError>
         gix::status::tree_index::TrackRenames::Disabled,
         |_, _, _| {
             staged = true;
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            Ok(std::ops::ControlFlow::Break(()))
         },
     )
     .map_err(|error| ProbeError::Status(error.to_string().into()))?;
