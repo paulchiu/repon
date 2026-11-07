@@ -8619,12 +8619,17 @@ mod tests {
     fn committing_a_range_whose_anchor_is_no_longer_visible_selects_nothing_and_still_releases() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
-        // Named so the anchored row sorts first and the Filter below hides it.
+        // Named so the Filter below hides the anchored row; row order follows discovery.
         init_repo(&root.join("aaa-hidden"));
         init_repo(&root.join("keep-b"));
         let mut app = test_app(&root);
-        app.set_cursor(0);
-        let anchored = app.visible_keys()[0].clone();
+        let hidden_row = app
+            .visible_keys()
+            .iter()
+            .position(|key| key.path().ends_with("aaa-hidden"))
+            .expect("aaa-hidden is visible before the Filter");
+        app.set_cursor(hidden_row);
+        let anchored = app.visible_keys()[hidden_row].clone();
 
         app.handle_key_event(press(KeyCode::Char('v'), KeyModifiers::NONE))
             .expect("anchor a range");
