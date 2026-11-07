@@ -12,6 +12,7 @@ on:
 # A Dependabot-triggered run is handed a read-only token unless the workflow
 # asks for more.
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -72,6 +73,21 @@ jobs:
           gh pr edit "$PR_URL" --add-label "$label"
 
           echo "automerge=$automerge" >> "$GITHUB_OUTPUT"
+
+      # A label added with GITHUB_TOKEN starts no new check-labels.yml run, so the
+      # one that fired on `opened`, before the label existed, would stay failed and
+      # block the required check. Rerunning it reads the labels as they are now.
+      - name: Rerun a label check that ran before the label
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run list --workflow check-labels.yml --commit "$HEAD_SHA" \
+            --json databaseId --jq '.[].databaseId' |
+            while read -r id; do
+              gh run watch "$id" --exit-status > /dev/null || gh run rerun "$id" || true
+            done
 
       # Gated on what the step above decided rather than on the metadata a
       # second time, so the label and the merge cannot drift apart. A major and
