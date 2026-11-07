@@ -215,12 +215,22 @@ fn fast_forward(
         options.track_path();
         options.track_rewrites(None);
     });
-    changes
-        .for_each_to_obtain_tree(&to_tree, |change| -> Result<Action, String> {
-            apply_change(change, work_dir)?;
-            Ok(Action::Continue(()))
+    // The first failure's own message is kept here and the diff stopped, which gix itself
+    // reports only as a cancellation.
+    let mut callback_error = None;
+    let diffed = changes.for_each_to_obtain_tree(&to_tree, |change| {
+        Ok(match apply_change(change, work_dir) {
+            Ok(()) => Action::Continue(()),
+            Err(message) => {
+                callback_error = Some(message);
+                Action::Break(())
+            }
         })
-        .map_err(describe_error_chain)?;
+    });
+    if let Some(message) = callback_error {
+        return Err(format!("The user-provided callback failed: {message}"));
+    }
+    diffed.map_err(describe_error_chain)?;
 
     let mut new_index = repo
         .index_from_tree(&to_tree_id)

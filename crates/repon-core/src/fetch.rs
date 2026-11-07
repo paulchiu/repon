@@ -47,14 +47,9 @@ impl std::fmt::Display for FetchError {
 /// Reports no credentials are available whenever gix's own resolution would otherwise
 /// need them, so a fetch fails closed rather than falling through to a terminal prompt
 /// behind the alternate screen Repon has taken.
-///
-/// A named function rather than a closure at the call site: `gix_credentials::protocol::Error`
-/// is large, and clippy's `result_large_err` fires on the type's own size regardless of the
-/// fact that this function never actually constructs one.
-#[allow(clippy::result_large_err)]
 fn refuse_credentials(
     _action: gix::credentials::helper::Action,
-) -> gix::credentials::protocol::Result {
+) -> gix::Result<Option<gix::credentials::protocol::Outcome>> {
     Ok(None)
 }
 
